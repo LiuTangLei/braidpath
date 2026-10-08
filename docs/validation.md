@@ -1,5 +1,7 @@
 # Validation plan
 
+Initial priority: latency and useful throughput. CPU consumption may be recorded for diagnosis but is not a current acceptance gate or an optimization target; optimize CPU efficiency later. Correctness, bounded memory/queues and explicit traffic limits remain required.
+
 Validate in dependency order: codec → secure datagrams → paths/relays → scheduling → reliable streams → deployment. Automated tests and reusable harness code belong in the repository. Run records, captures, benchmark outputs and feasibility notes remain local in ignored directories.
 
 ## 1. Protocol and resource invariants
@@ -52,7 +54,7 @@ Apply this gate to the native Rust HTTP/3 candidate described in [carrier design
 
 Keep application authorization, cryptographic verification and resource bounds intact while changing the wire appearance. Probe behavior from clients without credentials on authorized endpoints. A successful website retrieval establishes HTTP behavior, not unobservability or GFW reachability. Packet randomization and TLS-terminating intermediaries are separate profiles, with separate trust and reachability checks.
 
-Measure the incremental HTTP/3 cost with FEC off first, then enable identical FEC settings as the single changed factor. Match transport congestion control, physical paths, offered load, total access-link rate, crypto, MTU and batching. Count padding, website/probe responses and all control traffic. Report cold establishment separately from steady-state payload delivery. At the reference clean-path gate, require at least 90% of the minimal plain-QUIC adapter's goodput, no additional deadline misses, and a predeclared CPU/memory budget. Do not hide a slower adapter behind additional connections or a more aggressive controller.
+Measure the incremental HTTP/3 cost with FEC off first, then enable identical FEC settings as the single changed factor. Match transport congestion control, physical paths, offered load, total access-link rate, crypto, MTU and batching. Count padding, website/probe responses and all control traffic. Report cold establishment separately from steady-state payload delivery. At the reference clean-path gate, require at least 90% of the minimal plain-QUIC adapter's goodput, no additional deadline misses, and bounded memory/queue state; CPU-efficiency acceptance is deferred. Do not hide a slower adapter behind additional connections or a more aggressive controller.
 
 After that, repeat the single/multipath, packet-loss, useful-delivery, fairness and resource gates below using the complete selected carrier. The preferred HTTP/3 profile is rejected or revised if it consumes the recovery gain. A stream profile gets its own baseline and claims; it cannot pass by inheriting datagram results. Actual deployment selection still requires the reachability gate.
 
@@ -105,7 +107,7 @@ For datagrams, compare useful bytes delivered before a predeclared deadline and 
 
 Measure byte cost at named boundaries: application payload, encoded records, outer UDP/IP on client access links, relay backhaul and main-server links. Keep per-segment totals; summing both hops of a relayed packet is a resource-cost metric, not client-access overhead. Include headers, padding, retransmission, ACKs, probes and relay framing.
 
-Measure CPU per endpoint and per delivered useful byte, plus peak memory and queue age. Pin hardware, build profile, crypto backend, batching/GSO settings and logging level. Account for the QUIC and relay adapter overhead before choosing a more expensive codec.
+Record CPU per endpoint and per delivered useful byte for later optimization, plus peak memory and queue age. CPU cost does not reject an otherwise useful initial implementation. Pin hardware, build profile, crypto backend, batching/GSO settings and logging level. Account for the QUIC and relay adapter overhead before choosing a more expensive codec.
 
 ## 6. Statistical method and engineering targets
 
@@ -131,6 +133,6 @@ If a gain misses its gate, retain the simpler baseline or leave that optimizatio
 
 Reliable streams additionally require selective ACK recovery under report loss, per-flow credit, reordering bounds, final-offset acknowledgment, half-close/reset, exact byte/hash comparison and explicit failure on unrecoverable session loss. Run a short interactive flow alongside a bulk flow to check cross-flow isolation. FIN cannot overtake missing data into a false success.
 
-A release needs the relevant native-platform topology cases, sustained lifecycle/resource tests, stable wire-version negotiation and operator documentation. Pin the chosen dependency versions and verify their Rust/platform requirements; the current core's Rust 1.85 minimum is not yet a promise for future network dependencies.
+A release needs the relevant native-platform topology cases, sustained lifecycle/resource tests, stable wire-version negotiation and operator documentation. Pin the chosen dependency versions and verify their Rust/platform requirements; the current runtime requires Rust 1.88 or newer.
 
 No performance claim is promoted from a codec test, a single local probe, or successful builds alone.

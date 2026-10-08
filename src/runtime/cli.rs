@@ -42,8 +42,8 @@ enum Command {
         target: SocketAddr,
         #[arg(long, default_value_t = 10_000_000)]
         max_rate_bps: u64,
-        /// BBR is experimental; Cubic remains the default.
-        #[arg(long, value_enum, default_value_t = transport::Congestion::Cubic)]
+        /// BBR is the initial latency/throughput default; Cubic is available for comparison.
+        #[arg(long, value_enum, default_value_t = transport::Congestion::default())]
         congestion: transport::Congestion,
     },
     /// Expose a local UDP port through independently encrypted entrances.
@@ -63,7 +63,7 @@ enum Command {
         #[command(flatten)]
         policy: PolicyArgs,
         /// Select this endpoint's sending controller independently of the peer.
-        #[arg(long, value_enum, default_value_t = transport::Congestion::Cubic)]
+        #[arg(long, value_enum, default_value_t = transport::Congestion::default())]
         congestion: transport::Congestion,
     },
     /// Forward opaque UDP packets only to the configured main server.

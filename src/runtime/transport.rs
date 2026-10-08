@@ -29,8 +29,8 @@ fn key(path: &Path) -> Result<PrivateKeyDer<'static>> {
 /// BBR is an experimental implementation in the pinned Quinn release.
 #[derive(Clone, Copy, Debug, Default, clap::ValueEnum)]
 pub enum Congestion {
-    #[default]
     Cubic,
+    #[default]
     Bbr,
 }
 pub fn config(congestion: Congestion) -> TransportConfig {

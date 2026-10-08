@@ -304,7 +304,7 @@ pub async fn serve(options: ServerOptions) -> Result<()> {
     let sessions: Sessions = Arc::new(Mutex::new(HashMap::new()));
     let limit = Arc::new(Semaphore::new(128));
     let mut tasks = JoinSet::new();
-    info!(address=%endpoint.local_addr()?,target=%options.target,"HTTP/3 server ready");
+    info!(address=%endpoint.local_addr()?,target=%options.target,congestion=?options.congestion,"HTTP/3 server ready");
     loop {
         tokio::select! {
             _=tokio::signal::ctrl_c()=>break,
@@ -526,7 +526,7 @@ pub async fn client(options: ClientOptions) -> Result<()> {
     let mut decoder = Receiver::default();
     let mut tick = interval(Duration::from_secs(2));
     let mut drops = 0u64;
-    info!(listen=%socket.local_addr()?,paths=paths.lock().expect("paths lock").len(),"UDP client ready");
+    info!(listen=%socket.local_addr()?,paths=paths.lock().expect("paths lock").len(),congestion=?options.congestion,"UDP client ready");
     let result:Result<()>=async {loop {tokio::select! {
         _=tokio::signal::ctrl_c()=>break,
         _=tick.tick()=>{
@@ -649,7 +649,7 @@ async fn connect_path(
 }
 
 pub async fn get(remote: SocketAddr, name: &str, ca: &std::path::Path) -> Result<String> {
-    let endpoint = transport::client(remote, ca, None, transport::Congestion::Cubic)?;
+    let endpoint = transport::client(remote, ca, None, transport::Congestion::default())?;
     timeout(Duration::from_secs(8), async {
         let conn = endpoint.connect(remote, name)?.await?;
         let (mut driver, mut send) = h3::client::new(h3_quinn::Connection::new(conn)).await?;

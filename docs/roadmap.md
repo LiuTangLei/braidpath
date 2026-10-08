@@ -1,5 +1,7 @@
 # Roadmap
 
+The initial implementation prioritizes latency and useful throughput, with BBR as the default controller. CPU-efficiency tuning comes later; correctness and bounded queue/memory behavior remain required.
+
 The stages below are ordered by dependency. Each stage produces a usable baseline or an explicit decision before increasing scope. Checked items describe the current source tree; unchecked items are future work. Run records remain local.
 
 ## M0 — Algorithm foundation

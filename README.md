@@ -50,7 +50,9 @@ Entrance count is not independent capacity. Paths may share the last mile, trans
 - **Keep original data moving.** The encoder emits originals immediately; network transmission still obeys queue limits and congestion control.
 - **Treat direction and path quality separately.** Upload quality is not evidence of download quality. A slow path must not create unbounded reordering.
 - **Spend redundancy deliberately.** Measure FEC, retransmission, control traffic, and actual wire cost separately.
-- **Make progress measurable.** Compare application P95/P99, deadline misses, completion, goodput, and CPU under matched conditions.
+- **Make progress measurable.** Compare application P95/P99, deadline misses, completion and goodput under matched conditions. CPU-efficiency optimization comes later.
+
+BBR is the default congestion controller. The initial priority is latency and useful throughput; CPU-efficiency tuning is deferred.
 
 Each interface–entrance pair owns an end-to-end Quinn/rustls connection to the main server. HTTP/3 handles ordinary requests and authenticated session admission; unreliable HTTP Datagrams carry aggregate records. Relays forward encrypted packets to a fixed destination.
 

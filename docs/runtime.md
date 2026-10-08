@@ -54,7 +54,7 @@ On Linux, repeat `--interface eth0 --interface wlan0` to create the interface–
 | `--fec 4` (default), `--fec 0` | One XOR repair per block of at most four originals, or FEC off; maximum block size 32 |
 | `--block-ms 3` | Maximum encoder block age, driven by a 1 ms timer; originals are emitted immediately |
 | `--redundancy-percent 30` | Repair-record byte budget relative to original-record bytes, with bounded saved credit; insufficient credit skips repair |
-| `--congestion cubic` (client/server) | Default per-endpoint controller; `bbr` opts into Quinn’s experimental BBR implementation, without changing the application cap |
+| `--congestion bbr` (client/server) | Default per-endpoint controller; `cubic` remains available for comparison, with the same application cap |
 | `--rate-bps 10000000` | Per-session, per-direction aggregate pacing cap, including an estimated header allowance; independent QUIC congestion control remains active |
 | Server `--max-rate-bps` | Caps the session's server-side sender; not a server-wide or inbound traffic policer |
 | `--queue-ms 100` | Maximum age in the aggregate outgoing queue; expired records drop |
@@ -81,7 +81,7 @@ Queues and decode windows are bounded, but this is not hostile-load acceptance. 
 - BraidPath envelope: `BP`, version byte `1`, kind byte (data `0`, XOR repair `1`, plain `2`), big-endian 64-bit block ID and 8-bit shard index (or source count for repair records). The payload is the codec shard (length-protected XOR bytes for repair), or a plain record. Canonical application records contain a big-endian 32-bit flow ID, 64-bit delivery ID and UDP payload. Maximum encoded envelope: 1,027 bytes.
 - Flow/delivery IDs are scoped to the authenticated session and sending direction. Delivery IDs survive FEC reconstruction; late originals and duplicates are suppressed within the bounded window. Expired blocks cannot be reallocated by delayed shards.
 
-CUBIC remains the default controller. BBR is explicitly experimental in the pinned Quinn implementation; selecting it is not a demonstrated latency, throughput or fairness improvement. Controller selection is local to each sending endpoint, so configure the client and main server separately for a symmetric comparison.
+BBR is the default for this initial latency- and throughput-focused implementation. Quinn labels its BBR implementation experimental; the choice is not a universal performance or fairness guarantee. CUBIC remains an explicit comparison option. CPU-efficiency optimization is deferred; correctness, bounded queues and memory limits still apply. Controller selection is local to each sending endpoint, so configure the client and main server separately for a symmetric comparison.
 
 The wire profile is experimental and may change before release. The aggregate runtime currently depends directly on the Quinn carrier; a general carrier trait is still future work.
 
