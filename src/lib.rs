@@ -1,8 +1,9 @@
 //! Experimental building blocks for FEC-assisted multipath transport.
 //!
-//! This crate has no network runtime, wire format, authentication, or encryption.
-//! FEC operates on trusted in-memory shards; it detects erasures, not corruption.
+//! The codec operates on trusted shards. The experimental runtime authenticates
+//! HTTP/3 sessions before admitting their datagrams to the aggregate decoder.
 #![forbid(unsafe_code)]
 
 pub mod fec;
 pub mod path;
+pub mod runtime;

@@ -4,7 +4,7 @@ Please discuss major protocol or algorithm changes in an issue first. Small fixe
 and focused tests can go directly to a pull request.
 
 Run the formatter, Clippy and tests listed in the README. Changes to FEC or the
-future session layer must exercise loss, reordering and duplication, including
+session layer must exercise loss, reordering and duplication, including
 the failure boundary rather than only successful recovery.
 
 Performance claims need reproducible settings, baselines, both directions,

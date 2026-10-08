@@ -5,17 +5,17 @@
 [![CI](https://github.com/LiuTangLei/braidpath/actions/workflows/ci.yml/badge.svg)](https://github.com/LiuTangLei/braidpath/actions/workflows/ci.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
-[简体中文](README.zh-CN.md) · [Architecture](docs/architecture.md) · [Carrier design](docs/transports.md) · [Validation plan](docs/validation.md) · [Roadmap](docs/roadmap.md)
+[简体中文](README.zh-CN.md) · [Run it](docs/runtime.md) · [Architecture](docs/architecture.md) · [Carrier design](docs/transports.md) · [Validation plan](docs/validation.md) · [Roadmap](docs/roadmap.md)
 
 BraidPath is a Rust multipath transport project combining **forward error correction (FEC), client interface aggregation, and nearby relay entrances**. Its goal is to reduce recovery delays caused by packet loss while using available path capacity.
 
 “Braid” means weaving several imperfect paths into a more resilient connection.
 
-> **Status: an algorithm foundation.** The repository contains an executable XOR FEC codec, a path identity model, and deterministic tests. Client, server, relay integration, and network scheduling are planned. There is no deployable tunnel or established real-network performance gain yet.
+> **Status: experimental UDP tunnel.** The client, main server and fixed-target relays now run over real HTTP/3 and HTTP Datagrams, with bidirectional XOR FEC and bounded multipath scheduling. This is an engineering prototype, with no general performance or censorship-resistance guarantee.
 
 ## One interface works. Several can contribute.
 
-The intended topology is:
+The topology is:
 
 ```mermaid
 flowchart LR
@@ -52,37 +52,36 @@ Entrance count is not independent capacity. Paths may share the last mile, trans
 - **Spend redundancy deliberately.** Measure FEC, retransmission, control traffic, and actual wire cost separately.
 - **Make progress measurable.** Compare application P95/P99, deadline misses, completion, goodput, and CPU under matched conditions.
 
-The first engineering baseline uses **one end-to-end QUIC DATAGRAM connection per active path**, with Quinn as the candidate Rust implementation. QUIC provides authenticated encryption and connection-level congestion control; BraidPath owns cross-path coding and delivery.
+Each interface–entrance pair owns an end-to-end Quinn/rustls connection to the main server. HTTP/3 handles ordinary requests and authenticated session admission; unreliable HTTP Datagrams carry aggregate records. Relays forward encrypted packets to a fixed destination.
 
-The preferred deployment candidate adds **a real HTTP/3 service and authenticated HTTP Datagrams**, preserving unreliable delivery for FEC. BraidPath remains an independent Rust implementation: Xray is a reference for resistance to identification and probing, not a dependency, sidecar or compatibility target. A future HTTPS stream profile would have separate latency and recovery gates.
+**Xray is a design reference only:** no Xray dependency, sidecar or protocol compatibility. Stock Quinn does not imitate browser fingerprints, and this prototype provides no TCP fallback. An ordinary website response does not establish GFW resistance. See the [carrier analysis](docs/transports.md).
 
-**No cross-border default or censorship-resistance claim is established.** Ordinary website behavior and encryption alone do not demonstrate GFW reachability. Complete carrier profiles must pass both reachability and performance validation. See the [carrier analysis](docs/transports.md) and [architecture](docs/architecture.md). All networking capabilities remain planned, separate from the current dependency-free core.
+## Build and run
 
-## Run the foundation
-
-Rust 1.85 or newer; no third-party dependencies in the current crate.
+Rust 1.88 or newer:
 
 ```bash
 git clone https://github.com/LiuTangLei/braidpath.git
 cd braidpath
+cargo build --release --locked
+./target/release/braidpath --help
 cargo test --all-targets --locked
-cargo run --locked --example loss_recovery
 ```
 
-The example enumerates one interface and three logical entrances **in memory**, distributes four originals and one XOR repair symbol, omits one original, and recovers all four payloads. It opens no sockets and measures no latency.
+Follow the [runtime guide](docs/runtime.md) for credentials, local forwarding, multiple entrances and measurement. The independent in-memory codec example remains available with `cargo run --locked --example loss_recovery`.
 
 | Capability | Status |
 | --- | --- |
-| Systematic XOR `k + 1`, one missing original per block | Implemented |
-| Immediate encoder output and caller-driven deadline flush | Implemented |
-| Unequal lengths, reordering, per-block deduplication | Implemented |
-| Interface × entrance identifiers | Implemented; no OS binding yet |
-| Encrypted datagrams and authorized session joining | Planned |
-| Bidirectional relays and real interface binding | Planned |
-| Scheduling, redundancy budgets, adaptive FEC | Planned |
-| Session recovery, flow control, TCP/UDP adapters | Planned |
+| XOR `k + 1`, immediate originals, timed partial blocks | Implemented; at most one missing original per block |
+| HTTP/3 website, verified server identity, authenticated session joins | Implemented experimental profile |
+| Bidirectional FEC, session deduplication, UDP forwarding | Implemented; messages up to 1,000 bytes |
+| Fixed-target opaque relays with source allowlists | Implemented |
+| Interface × entrance paths | Linux interface binding; default-route sockets on other platforms |
+| Round-robin eligible paths, bounded queues, aggregate pacing, repair budget | Implemented baseline |
+| Adaptive scheduling/FEC, coupled congestion control, automatic reconnect | Planned |
+| Reliable streams, TCP, TUN, stream fallback, browser fingerprint shaping | Planned or deferred |
 
-The XOR codec is a baseline, not the final algorithm. It cannot generally recover a whole failed path. Sparse traffic creates short blocks with potentially high repair overhead. FEC does not eliminate congestion or guarantee delivery; reliable streams require additional recovery and flow control.
+XOR cannot generally recover an entire failed path. Sparse traffic may exhaust the repair budget; FEC does not guarantee delivery. Multiple connections can compete unfairly at a shared bottleneck even with an aggregate rate cap. Multi-interface capacity, competition fairness, independent HTTP/3 interoperability and deployment reachability remain separate acceptance gates.
 
 ## Inspiration
 

@@ -1,6 +1,6 @@
 # Architecture and feasibility
 
-This document defines the implementation direction and its acceptance gates. It does not describe an already implemented network stack. See the [README](../README.md) for current capabilities and the [roadmap](roadmap.md) for dependencies.
+This document defines the implementation direction and its acceptance gates. The first experimental implementation is described in the [runtime guide](runtime.md); the full design below still includes future work. See the [README](../README.md) for current capabilities and the [roadmap](roadmap.md) for dependencies.
 
 ## 1. Feasibility boundary
 
