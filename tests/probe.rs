@@ -260,7 +260,9 @@ fn reverse_stream_uses_the_registration_socket_mapping() {
             if let Ok(n) = upstream.recv(&mut b) {
                 downstream.send_to(&b[..n], peer.unwrap()).unwrap();
             }
-            thread::sleep(Duration::from_millis(1));
+            // Model coarse host timers/forwarding below the nominal 200 pps. The
+            // receiver must observe all tails, not expire at the nominal send span.
+            thread::sleep(Duration::from_millis(15));
         }
     });
     let (ok, receiver) = run(&[

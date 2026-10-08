@@ -99,10 +99,13 @@ capability, not a substitute for transport authentication or anti-spoofing.
   by `observation_seconds`. Observation includes configured drain time, but
   excludes startup registration. These byte counts include the measurement
   header and exclude UDP/IP/QUIC wire overhead.
-- `--drain-ms` defaults to 3000 and is bounded to 60000. Receive observation lasts
+- `--drain-ms` defaults to 3000 and is bounded to 60000. Receive observation starts with
   the configured send span plus drain; receipt of the source end marker permits
-  a full drain after its actual completion. Missing end markers cannot extend
-  a run indefinitely. Startup timeout is 1–60000 ms. Count is 1–100000, rate is
+  a fixed drain after its actual completion. Before that marker, each unique
+  valid packet advancing the highest sequence may extend observation according
+  to actual progress plus the remaining nominal send span and drain; duplicates,
+  invalid packets and later out-of-order packets cannot renew it. Missing end
+  markers cannot extend a run indefinitely. Startup timeout is 1–60000 ms. Count is 1–100000, rate is
   1–20000 pps, deadline is 1–10000 ms; allocations are bounded by count.
 - `--samples-file` stores exactly one bounded slot per configured sequence with
   `seq`, `send_unix_us` and `receive_unix_us`. A receiver has null timestamps for

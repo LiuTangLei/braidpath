@@ -279,16 +279,22 @@ fn valid_data(b: &[u8], id: &[u8; 16], w: &Workload) -> Option<(u32, i64)> {
     }
     Some((seq, time))
 }
-fn record(b: &[u8], id: &[u8; 16], w: &Workload, state: &mut State, echo: bool) -> Result<()> {
+fn record(
+    b: &[u8],
+    id: &[u8; 16],
+    w: &Workload,
+    state: &mut State,
+    echo: bool,
+) -> Result<Option<u32>> {
     let (seq, send) = if echo {
         if b.len() != w.size || b[..8] != id[..8] {
             state.corrupt += 1;
-            return Ok(());
+            return Ok(None);
         }
         let seq = u32::from_be_bytes(b[8..12].try_into()?);
         if seq >= state.sent || b[12..].iter().any(|x| *x != (seq % 251) as u8) {
             state.corrupt += 1;
-            return Ok(());
+            return Ok(None);
         }
         (
             seq,
@@ -301,7 +307,7 @@ fn record(b: &[u8], id: &[u8; 16], w: &Workload, state: &mut State, echo: bool) 
         v
     } else {
         state.corrupt += 1;
-        return Ok(());
+        return Ok(None);
     };
     let i = seq as usize;
     if state.samples[i]
@@ -310,7 +316,7 @@ fn record(b: &[u8], id: &[u8; 16], w: &Workload, state: &mut State, echo: bool) 
         .is_some()
     {
         state.duplicate += 1;
-        return Ok(());
+        return Ok(None);
     }
     state.samples[i] = Some(Sample {
         seq,
@@ -328,7 +334,7 @@ fn record(b: &[u8], id: &[u8; 16], w: &Workload, state: &mut State, echo: bool) 
             None
         },
     });
-    Ok(())
+    Ok(Some(seq))
 }
 fn requested_span(w: &Workload) -> f64 {
     f64::from(w.count - 1) / f64::from(w.pps)
@@ -345,6 +351,13 @@ async fn receive_stream(
         + Duration::from_millis(w.drain_ms);
     let mut b = [0u8; MAX_PAYLOAD + 1];
     let mut end_seen = false;
+    let mut highest_sequence = state
+        .samples
+        .iter()
+        .flatten()
+        .filter(|sample| sample.receive_unix_us.is_some())
+        .map(|sample| sample.seq)
+        .max();
     loop {
         tokio::select! {
             _=tokio::time::sleep_until(until)=>break,
@@ -358,7 +371,17 @@ async fn receive_stream(
                         state.control_received+=1;
                         if !end_seen {state.actual_span=Some(span as f64/1_000_000.);until=tokio::time::Instant::now()+Duration::from_millis(w.drain_ms);end_seen=true;}
                     },
-                    _=>{record(&b[..n],id,w,state,false)?;}
+                    _=>{
+                        if let Some(seq)=record(&b[..n],id,w,state,false)?
+                            && !end_seen && highest_sequence.is_none_or(|highest|seq>highest) {
+                            highest_sequence=Some(seq);
+                            // Follow actual unique sequence progress: OS timers or opaque forwarding
+                            // can pace below the requested rate. Duplicates/invalid/out-of-order data
+                            // never extend this window, and END fixes the final drain deadline.
+                            let remaining=f64::from(w.count-1-seq)/f64::from(w.pps);
+                            until=until.max(tokio::time::Instant::now()+Duration::from_secs_f64(remaining)+Duration::from_millis(w.drain_ms));
+                        }
+                    }
                 }
             }
         }
