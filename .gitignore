@@ -5,3 +5,4 @@
 !.env.example
 /local/
 /results/
+__pycache__/

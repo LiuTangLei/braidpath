@@ -501,7 +501,13 @@ pub async fn serve(options: ServerOptions) -> Result<()> {
                 let sessions=sessions.clone(); let secret=secret.clone(); let target=options.target; let max_rate=options.max_rate; let metrics=options.stats.clone();
                 tasks.spawn(async move {
                     let _permit=permit;
-                    if let Err(e)=server_connection(incoming,sessions,secret,target,max_rate,metrics).await {warn!(error=%e,"HTTP/3 connection ended");}
+                    let mut diagnostic=stats::ConnectionTrace::new(metrics.clone(),incoming.remote_address(),None,"incoming");
+                    let result=server_connection(incoming,sessions,secret,target,max_rate,metrics,&mut diagnostic).await;
+                    let normal=diagnostic.finish(result.as_ref().err());
+                    if let Err(e)=result {
+                        if normal {info!(context=%diagnostic.context(),"HTTP/3 connection closed");}
+                        else {warn!(context=%diagnostic.context(),error=%e,"HTTP/3 connection ended");}
+                    }
                 });
             },
             _=tasks.join_next(),if !tasks.is_empty()=>{}
@@ -549,35 +555,56 @@ async fn server_connection(
     target: SocketAddr,
     max_rate: u64,
     metrics: stats::Metrics,
+    diagnostic: &mut stats::ConnectionTrace,
 ) -> Result<()> {
     let conn = timeout(Duration::from_secs(5), incoming).await??;
+    diagnostic.handshake_succeeded(&conn);
+    diagnostic.enter("http3", "http3_setup");
     let mut h3 = h3::server::builder()
         .enable_datagram(true)
         .max_field_section_size(8192)
         .build::<_, Bytes>(h3_quinn::Connection::new(conn.clone()))
         .await?;
+    diagnostic.succeeded();
     let mut joined: Option<(String, Arc<Session>, u8, u64)> = None;
     let mut request: Option<h3::server::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>> = None;
     let admission_deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let admission_started = Instant::now();
+    diagnostic.enter_since("path_admission", "admission_wait", admission_started);
     let result:Result<()>=async {
         loop {
             tokio::select! {
-                _=tokio::time::sleep_until(admission_deadline),if joined.is_none()=>bail!("session admission timed out"),
+                _=tokio::time::sleep_until(admission_deadline),if joined.is_none()=>{
+                    diagnostic.enter_since("path_admission","admission_wait",admission_started);
+                    diagnostic.failed("admission_deadline_elapsed");
+                    bail!("session admission timed out")
+                },
                 accepted=h3.accept()=>{
                     let Some(resolver)=accepted? else{break};
+                    diagnostic.enter("http3_request","request_resolve");
                     let (req,mut stream)=timeout(Duration::from_secs(5),resolver.resolve_request()).await??;
+                    diagnostic.succeeded();
                     if req.method()!=Method::POST || req.uri().path()!=SESSION_PATH {
                         let ok=req.method()==Method::GET && req.uri().path()=="/";
                         stream.send_response(Response::builder().status(if ok{StatusCode::OK}else{StatusCode::NOT_FOUND}).header("content-type","text/html; charset=utf-8").body(())?).await?;
-                        stream.send_data(Bytes::from_static(if ok{WEBSITE.as_bytes()}else{b"Not found\n"})).await?; stream.finish().await?;continue
+                        stream.send_data(Bytes::from_static(if ok{WEBSITE.as_bytes()}else{b"Not found\n"})).await?; stream.finish().await?;
+                        if joined.is_some(){diagnostic.enter("established","connected");}
+                        else{diagnostic.enter_since("path_admission","admission_wait",admission_started);}
+                        continue
                     }
+                    diagnostic.begin_admission();
                     let auth=req.headers().get("authorization").map(|h|h.as_bytes()).unwrap_or_default();
                     if !bool::from(auth.ct_eq(secret.as_bytes())) {
-                        stream.send_response(Response::builder().status(404).header("content-type","text/html; charset=utf-8").body(())?).await?;stream.send_data(Bytes::from_static(b"Not found\n")).await?;stream.finish().await?;continue
+                        diagnostic.rejected("authorization_rejected");
+                        stream.send_response(Response::builder().status(404).header("content-type","text/html; charset=utf-8").body(())?).await?;stream.send_data(Bytes::from_static(b"Not found\n")).await?;stream.finish().await?;
+                        if joined.is_some(){diagnostic.enter("established","connected");}
+                        else{diagnostic.enter_since("path_admission","admission_wait",admission_started);}
+                        continue
                     }
                     ensure!(joined.is_none(),"only one aggregate request per connection");
                     // Request and control streams can arrive in either order. Drive
                     // control processing before deciding whether the peer supports DATAGRAM.
+                    diagnostic.enter("path_admission","peer_settings");
                     if !h3.settings().enable_datagram() {
                         timeout(Duration::from_secs(5), std::future::poll_fn(|cx| {
                             match h3.poll_accept_request_stream(cx) {
@@ -588,11 +615,14 @@ async fn server_connection(
                             }
                         })).await??;
                     }
+                    diagnostic.succeeded();
+                    diagnostic.enter("path_admission","admission");
                     ensure!(conn.max_datagram_size().is_some_and(|n|n>=wire::MAX_WIRE+9),"peer lacks required datagram capacity");
                     let header=|name:&str|->Result<&str>{req.headers().get(name).context("missing session header")?.to_str().context("invalid session header")};
                     ensure!(header("braidpath-version")?=="1","unsupported version");
                     let sid=header("braidpath-session")?.to_owned(); ensure!(sid.len()==32 && sid.bytes().all(|b|b.is_ascii_hexdigit()),"invalid session id");
                     let pid:u8=header("braidpath-path")?.parse()?; ensure!(usize::from(pid)<MAX_PATHS,"path limit");
+                    diagnostic.path_id(pid);
                     let policy=Policy{fec:header("braidpath-fec")?.parse()?,redundancy:header("braidpath-redundancy")?.parse()?,rate:header("braidpath-rate")?.parse::<u64>()?.min(max_rate),block_ms:header("braidpath-block-ms")?.parse()?,queue_ms:header("braidpath-queue-ms")?.parse()?};policy.validate()?;
                     let session={
                         let mut map=sessions.lock().expect("sessions lock");
@@ -615,6 +645,7 @@ async fn server_connection(
                     joined=Some((sid,session,pid,stream_id));
                     stream.send_response(Response::builder().status(200).header("braidpath-version","1").header("braidpath-max-payload",MAX_PAYLOAD).body(())?).await?;
                     request=Some(stream);
+                    diagnostic.admitted();
                     info!(path=pid,remote=%conn.remote_address(),"authenticated path joined");
                 },
                 data=conn.read_datagram()=>{
@@ -633,6 +664,8 @@ async fn server_connection(
         }
         Ok(())
     }.await;
+    // Classify the original close/error before our cleanup closes the connection.
+    diagnostic.finish(result.as_ref().err());
     conn.close(0u32.into(), b"request closed");
     if let Some((sid, session, pid, _)) = joined {
         let last = {
@@ -707,7 +740,12 @@ pub async fn client(options: ClientOptions) -> Result<()> {
             let endpoint =
                 transport::client(*entrance, &options.ca, interface, options.congestion)?;
             endpoints.push(endpoint.clone());
-            options.stats.state(|s| s.handshake_attempts += 1);
+            let mut diagnostic = stats::ConnectionTrace::new(
+                options.stats.clone(),
+                *entrance,
+                Some(pid),
+                "quic_connect",
+            );
             let connection = timeout(
                 Duration::from_secs(8),
                 connect_path(
@@ -718,12 +756,12 @@ pub async fn client(options: ClientOptions) -> Result<()> {
                     &sid,
                     pid,
                     &options.policy,
+                    &mut diagnostic,
                 ),
             )
             .await;
             match connection {
                 Ok(Ok((conn, stream, mut driver, mut request, send))) => {
-                    options.stats.state(|s| s.handshake_successes += 1);
                     options
                         .stats
                         .register(&sid, pid, stream, stats::FORWARD, &conn);
@@ -738,9 +776,9 @@ pub async fn client(options: ClientOptions) -> Result<()> {
                     tasks.spawn(async move {
                     // Dropping the last SendRequest closes the HTTP/3 connection.
                     let _send = send;
-                    loop {tokio::select! {
-                        _=driver.wait_idle()=>break,
-                        body=request.recv_data()=>{let _=body;break},
+                    let result:Result<()>=async {loop {tokio::select! {
+                        e=driver.wait_idle()=>return Err(e.into()),
+                        body=request.recv_data()=>{let _=body?;return Ok(())},
                         d=conn.read_datagram()=>match d {
                             Ok(d)=>{
                                 returning.path(pid,|p|p.http_datagrams_received+=1);
@@ -748,20 +786,23 @@ pub async fn client(options: ClientOptions) -> Result<()> {
                                     if let Err(error)=tx.try_send((pid,Bytes::copy_from_slice(p))){ingress_drops.fetch_add(1,Ordering::Relaxed);queue_error(&returning,QueueLayer::Receiver,&error,Some(pid));}
                                 }else{returning.path(pid,|p|p.invalid_http_datagrams_dropped+=1);returning.update(|d|d.records.invalid_symbols_dropped+=1);}
                             },
-                            Err(_)=>break,
+                            Err(e)=>return Err(e.into()),
                         }
-                    }}
-                    conn.close(0u32.into(),b"path ended");warn!(path=pid,"client path ended");
+                    }}}.await;
+                    let normal=diagnostic.finish(result.as_ref().err());
+                    if normal{info!(context=%diagnostic.context(),"client path closed");}
+                    else{warn!(context=%diagnostic.context(),error=?result.err(),"client path ended");}
+                    conn.close(0u32.into(),b"path ended");
                 });
                     info!(path=pid,remote=%entrance,interface=interface.unwrap_or("default"),"client path ready");
                 }
                 Ok(Err(error)) => {
-                    options.stats.state(|s| s.handshake_failures += 1);
-                    warn!(path=pid,remote=%entrance,error=%error,"path unavailable");
+                    diagnostic.finish(Some(&error));
+                    warn!(path=pid,remote=%entrance,context=%diagnostic.context(),error=%error,"path unavailable");
                 }
                 Err(error) => {
-                    options.stats.state(|s| s.handshake_failures += 1);
-                    warn!(path=pid,remote=%entrance,error=%error,"path connection timed out")
+                    diagnostic.failed("whole_path_deadline_elapsed");
+                    warn!(path=pid,remote=%entrance,context=%diagnostic.context(),error=%error,"path connection timed out")
                 }
             }
         }
@@ -881,23 +922,33 @@ async fn connect_path(
     sid: &str,
     pid: u8,
     policy: &Policy,
+    diagnostic: &mut stats::ConnectionTrace,
 ) -> Result<(quinn::Connection, u64, H3Client, H3Request, H3Send)> {
     let conn = endpoint.connect(remote, name)?.await?;
+    diagnostic.handshake_succeeded(&conn);
+    diagnostic.enter("http3", "datagram_capacity");
     ensure!(
         conn.max_datagram_size()
             .is_some_and(|n| n >= wire::MAX_WIRE + 9),
         "insufficient datagram size"
     );
+    diagnostic.succeeded();
+    diagnostic.enter("http3", "http3_setup");
     let (mut driver, mut send) = h3::client::builder()
         .enable_datagram(true)
         .max_field_section_size(8192)
         .build::<_, _, Bytes>(h3_quinn::Connection::new(conn.clone()))
         .await?;
+    diagnostic.succeeded();
+    diagnostic.enter("http3", "peer_settings");
     // Poll the driver concurrently so peer SETTINGS are processed before admission.
     tokio::select! {
         e=driver.wait_idle()=>bail!("HTTP/3 closed before settings: {e}"),
         _=async {while !send.settings().enable_datagram(){tokio::time::sleep(Duration::from_millis(1)).await;}}=>{}
     }
+    diagnostic.succeeded();
+    diagnostic.begin_admission();
+    diagnostic.enter("path_admission", "admission");
     let req = Request::builder()
         .method(Method::POST)
         .uri(format!("https://{name}{SESSION_PATH}"))
@@ -931,6 +982,7 @@ async fn connect_path(
             == Some(MAX_PAYLOAD),
         "payload size mismatch"
     );
+    diagnostic.admitted();
     Ok((conn, stream.id().into_inner(), driver, stream, send))
 }
 
