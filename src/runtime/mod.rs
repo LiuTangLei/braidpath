@@ -1,5 +1,6 @@
 //! Experimental authenticated HTTP/3 datagram transport. No reliable stream service.
 pub mod cli;
+pub mod probe;
 pub mod relay;
 pub mod stats;
 pub mod transport;
