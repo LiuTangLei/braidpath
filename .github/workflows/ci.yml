@@ -3,6 +3,11 @@ on: [push, pull_request]
 permissions:
   contents: read
 jobs:
+  bench:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 -m unittest bench.test_run bench.test_readiness
   rust:
     strategy:
       matrix:
