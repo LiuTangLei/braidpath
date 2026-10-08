@@ -26,13 +26,25 @@ fn key(path: &Path) -> Result<PrivateKeyDer<'static>> {
     rustls_pemfile::private_key(&mut BufReader::new(fs::File::open(path)?))?
         .context("missing private key")
 }
-pub fn config() -> TransportConfig {
+/// BBR is an experimental implementation in the pinned Quinn release.
+#[derive(Clone, Copy, Debug, Default, clap::ValueEnum)]
+pub enum Congestion {
+    #[default]
+    Cubic,
+    Bbr,
+}
+pub fn config(congestion: Congestion) -> TransportConfig {
     let mut t = TransportConfig::default();
+    if matches!(congestion, Congestion::Bbr) {
+        t.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
+    }
     t.max_concurrent_bidi_streams(16u32.into());
     t.max_concurrent_uni_streams(8u32.into());
     t.datagram_receive_buffer_size(Some(256 * 1200));
-    // A small transport queue bounds records that the application cannot recall.
-    t.datagram_send_buffer_size(8 * 1200);
+    // Quinn cannot expire individual queued datagrams. Keep at most one maximum-
+    // size BraidPath record (or a few small ones) beyond the application deadline
+    // queue. This bounds hidden bytes, not residence time on a stalled path.
+    t.datagram_send_buffer_size(1200);
     t.max_idle_timeout(Some(
         Duration::from_secs(15)
             .try_into()
@@ -44,17 +56,27 @@ pub fn config() -> TransportConfig {
     t.stream_receive_window((16u32 * 1024).into());
     t
 }
-pub fn server(bind: SocketAddr, cert: &Path, key_path: &Path) -> Result<Endpoint> {
+pub fn server(
+    bind: SocketAddr,
+    cert: &Path,
+    key_path: &Path,
+    congestion: Congestion,
+) -> Result<Endpoint> {
     let mut tls = rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(certificates(cert)?, key(key_path)?)?;
     tls.alpn_protocols = vec![b"h3".to_vec()];
     tls.max_early_data_size = 0;
     let mut conf = ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(tls)?));
-    conf.transport_config(Arc::new(config()));
+    conf.transport_config(Arc::new(config(congestion)));
     Ok(Endpoint::server(conf, bind)?)
 }
-pub fn client(remote: SocketAddr, ca: &Path, interface: Option<&str>) -> Result<Endpoint> {
+pub fn client(
+    remote: SocketAddr,
+    ca: &Path,
+    interface: Option<&str>,
+    congestion: Congestion,
+) -> Result<Endpoint> {
     let mut roots = rustls::RootCertStore::empty();
     for cert in certificates(ca)? {
         roots.add(cert)?;
@@ -65,7 +87,7 @@ pub fn client(remote: SocketAddr, ca: &Path, interface: Option<&str>) -> Result<
     tls.alpn_protocols = vec![b"h3".to_vec()];
     tls.enable_early_data = false;
     let mut conf = ClientConfig::new(Arc::new(QuicClientConfig::try_from(tls)?));
-    conf.transport_config(Arc::new(config()));
+    conf.transport_config(Arc::new(config(congestion)));
     let s = Socket::new(
         if remote.is_ipv4() {
             Domain::IPV4

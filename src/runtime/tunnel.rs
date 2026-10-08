@@ -232,7 +232,7 @@ async fn session_loop(
             _=tick.tick()=>{
                 flows.retain(|_,(_,t)|t.elapsed()<Duration::from_secs(60));
                 let p=session.paths.lock().expect("paths lock");
-                for path in p.iter(){let stats=path.conn.stats();info!(path=path.id,rtt_ms=path.conn.rtt().as_secs_f64()*1000.0,tx_packets=stats.udp_tx.datagrams,rx_packets=stats.udp_rx.datagrams,tx_bytes=stats.udp_tx.bytes,rx_bytes=stats.udp_rx.bytes,lost=stats.path.lost_packets,"server path statistics");}
+                for path in p.iter(){let stats=path.conn.stats();info!(path=path.id,rtt_ms=path.conn.rtt().as_secs_f64()*1000.0,tx_packets=stats.udp_tx.datagrams,rx_packets=stats.udp_rx.datagrams,tx_bytes=stats.udp_tx.bytes,rx_bytes=stats.udp_rx.bytes,lost=stats.path.lost_packets,cwnd=stats.path.cwnd,"server path statistics");}
                 info!(paths=p.len(),flows=flows.len(),originals=decoder.originals,recovered=decoder.recovered,duplicates=decoder.duplicates,invalid=decoder.invalid,dropped,ingress_drops=session.ingress_drops.load(Ordering::Relaxed),"server session");
             },
             e=events.recv()=>match e {
@@ -291,9 +291,15 @@ pub struct ServerOptions {
     pub token: std::path::PathBuf,
     pub target: SocketAddr,
     pub max_rate: u64,
+    pub congestion: transport::Congestion,
 }
 pub async fn serve(options: ServerOptions) -> Result<()> {
-    let endpoint = transport::server(options.bind, &options.cert, &options.key)?;
+    let endpoint = transport::server(
+        options.bind,
+        &options.cert,
+        &options.key,
+        options.congestion,
+    )?;
     let secret = Arc::new(format!("Bearer {}", transport::token(&options.token)?));
     let sessions: Sessions = Arc::new(Mutex::new(HashMap::new()));
     let limit = Arc::new(Semaphore::new(128));
@@ -429,6 +435,7 @@ pub struct ClientOptions {
     pub ca: std::path::PathBuf,
     pub token: std::path::PathBuf,
     pub policy: Policy,
+    pub congestion: transport::Congestion,
 }
 pub async fn client(options: ClientOptions) -> Result<()> {
     options.policy.validate()?;
@@ -456,7 +463,8 @@ pub async fn client(options: ClientOptions) -> Result<()> {
     for interface in interfaces {
         for entrance in &options.entrances {
             let pid = endpoints.len() as u8;
-            let endpoint = transport::client(*entrance, &options.ca, interface)?;
+            let endpoint =
+                transport::client(*entrance, &options.ca, interface, options.congestion)?;
             endpoints.push(endpoint.clone());
             let connection = timeout(
                 Duration::from_secs(8),
@@ -524,7 +532,7 @@ pub async fn client(options: ClientOptions) -> Result<()> {
         _=tick.tick()=>{
             peers.retain(|_,(id,last)|{if last.elapsed()<Duration::from_secs(60){true}else{reverse.remove(id);false}});
             let p=paths.lock().expect("paths lock");let live=p.iter().filter(|p|p.conn.close_reason().is_none()).count();
-            for path in p.iter(){let stats=path.conn.stats();info!(path=path.id,alive=path.conn.close_reason().is_none(),rtt_ms=path.conn.rtt().as_secs_f64()*1000.0,tx_packets=stats.udp_tx.datagrams,rx_packets=stats.udp_rx.datagrams,tx_bytes=stats.udp_tx.bytes,rx_bytes=stats.udp_rx.bytes,lost=stats.path.lost_packets,"path statistics");}
+            for path in p.iter(){let stats=path.conn.stats();info!(path=path.id,alive=path.conn.close_reason().is_none(),rtt_ms=path.conn.rtt().as_secs_f64()*1000.0,tx_packets=stats.udp_tx.datagrams,rx_packets=stats.udp_rx.datagrams,tx_bytes=stats.udp_tx.bytes,rx_bytes=stats.udp_rx.bytes,lost=stats.path.lost_packets,cwnd=stats.path.cwnd,"path statistics");}
             info!(live,originals=decoder.originals,recovered=decoder.recovered,duplicates=decoder.duplicates,invalid=decoder.invalid,drops,ingress_drops=ingress_drops.load(Ordering::Relaxed),"client statistics");
             ensure!(live>0,"all paths failed; restart creates a fresh session epoch");
         },
@@ -641,7 +649,7 @@ async fn connect_path(
 }
 
 pub async fn get(remote: SocketAddr, name: &str, ca: &std::path::Path) -> Result<String> {
-    let endpoint = transport::client(remote, ca, None)?;
+    let endpoint = transport::client(remote, ca, None, transport::Congestion::Cubic)?;
     timeout(Duration::from_secs(8), async {
         let conn = endpoint.connect(remote, name)?.await?;
         let (mut driver, mut send) = h3::client::new(h3_quinn::Connection::new(conn)).await?;

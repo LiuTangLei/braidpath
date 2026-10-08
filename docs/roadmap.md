@@ -50,7 +50,8 @@ Current protocol, commands and limits: [experimental runtime](runtime.md). Check
 
 ## M3 — Budgeted recovery and measured scheduling
 
-- [x] Introduce byte-accounted active-redundancy limits before increasing parity or adding copies.
+- [x] Bound generated-record repair credit before increasing parity or adding copies.
+- [ ] Enforce redundancy ratios on actual admitted/sent originals rather than generated records, including queue expiry.
 - [ ] Measure completion-cost scheduling against the simple M2 baseline; keep path probing bounded.
 - [ ] Compare XOR with small-block multi-erasure coding; evaluate sliding windows only if block delay or burst loss justifies them.
 - [ ] Handle sparse traffic, correlated losses, unequal RTTs and packet packing explicitly.

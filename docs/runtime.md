@@ -54,6 +54,7 @@ On Linux, repeat `--interface eth0 --interface wlan0` to create the interface–
 | `--fec 4` (default), `--fec 0` | One XOR repair per block of at most four originals, or FEC off; maximum block size 32 |
 | `--block-ms 3` | Maximum encoder block age, driven by a 1 ms timer; originals are emitted immediately |
 | `--redundancy-percent 30` | Repair-record byte budget relative to original-record bytes, with bounded saved credit; insufficient credit skips repair |
+| `--congestion cubic` (client/server) | Default per-endpoint controller; `bbr` opts into Quinn’s experimental BBR implementation, without changing the application cap |
 | `--rate-bps 10000000` | Per-session, per-direction aggregate pacing cap, including an estimated header allowance; independent QUIC congestion control remains active |
 | Server `--max-rate-bps` | Caps the session's server-side sender; not a server-wide or inbound traffic policer |
 | `--queue-ms 100` | Maximum age in the aggregate outgoing queue; expired records drop |
@@ -62,7 +63,9 @@ On Linux, repeat `--interface eth0 --interface wlan0` to create the interface–
 | Lifetimes | Decode blocks expire after 2 s; UDP flows after 60 s idle; all-path failure terminates the client |
 | Relay | Fixed destination, explicit source allowlist, 64 mappings, 32 queued packets/mapping, 30 s idle; shared bidirectional byte-rate cap |
 
-Originals are never delayed merely to fill a block. At 200 messages/s, the default 3 ms block often contains only one original: the repair budget will skip many singleton repairs. Use a deliberate larger block deadline (for example 25 ms) when comparing full four-record blocks, and count the additional recovery wait. The repair budget accounts encoded records, not exact NIC wire cost. Pacing uses an estimate; handshake, ACK, transport retransmission and relay backhaul costs require separate measurement.
+Originals are never delayed merely to fill a block. At 200 messages/s, the default 3 ms block often contains only one original: the repair budget will skip many singleton repairs. Use a deliberate larger block deadline (for example 25 ms) when comparing full four-record blocks, and count the additional recovery wait. The repair budget credits generated original records, including ones that can later expire; it is not yet a ratio enforced on actual wire transmissions. Exact sent-byte redundancy accounting remains future work. It accounts encoded records, not exact NIC wire cost. Pacing uses an estimate; handshake, ACK, transport retransmission and relay backhaul costs require separate measurement.
+
+The QUIC datagram send buffer is limited to 1,200 bytes including internal allocation overhead. It can hold one maximum-size BraidPath record or several small ones. The application cannot expire or recall a record after Quinn accepts it: this is a byte bound, not an end-to-end deadline guarantee.
 
 The current scheduler round-robins connections that have datagram buffer space and remain open. It does not estimate delivery time, detect shared bottlenecks or couple congestion windows. A blackholed path can still receive records until QUIC declares it closed; loss during this interval is expected. Surviving paths remain usable. There is no path rejoin or all-path reconnect; restart establishes a fresh session epoch.
 
@@ -77,6 +80,8 @@ Queues and decode windows are bounded, but this is not hostile-load acceptance. 
 - Each QUIC DATAGRAM contains the request's Quarter Stream ID, context ID zero and one BraidPath record. Variable-width Quarter Stream IDs are encoded and checked; contexts, versions, lengths and bounds are validated.
 - BraidPath envelope: `BP`, version byte `1`, kind byte (data `0`, XOR repair `1`, plain `2`), big-endian 64-bit block ID and 8-bit shard index (or source count for repair records). The payload is the codec shard (length-protected XOR bytes for repair), or a plain record. Canonical application records contain a big-endian 32-bit flow ID, 64-bit delivery ID and UDP payload. Maximum encoded envelope: 1,027 bytes.
 - Flow/delivery IDs are scoped to the authenticated session and sending direction. Delivery IDs survive FEC reconstruction; late originals and duplicates are suppressed within the bounded window. Expired blocks cannot be reallocated by delayed shards.
+
+CUBIC remains the default controller. BBR is explicitly experimental in the pinned Quinn implementation; selecting it is not a demonstrated latency, throughput or fairness improvement. Controller selection is local to each sending endpoint, so configure the client and main server separately for a symmetric comparison.
 
 The wire profile is experimental and may change before release. The aggregate runtime currently depends directly on the Quinn carrier; a general carrier trait is still future work.
 

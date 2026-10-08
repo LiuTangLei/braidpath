@@ -42,6 +42,9 @@ enum Command {
         target: SocketAddr,
         #[arg(long, default_value_t = 10_000_000)]
         max_rate_bps: u64,
+        /// BBR is experimental; Cubic remains the default.
+        #[arg(long, value_enum, default_value_t = transport::Congestion::Cubic)]
+        congestion: transport::Congestion,
     },
     /// Expose a local UDP port through independently encrypted entrances.
     Client {
@@ -59,6 +62,9 @@ enum Command {
         token_file: PathBuf,
         #[command(flatten)]
         policy: PolicyArgs,
+        /// Select this endpoint's sending controller independently of the peer.
+        #[arg(long, value_enum, default_value_t = transport::Congestion::Cubic)]
+        congestion: transport::Congestion,
     },
     /// Forward opaque UDP packets only to the configured main server.
     Relay {
@@ -132,6 +138,7 @@ pub async fn run() -> Result<()> {
             token_file,
             target,
             max_rate_bps,
+            congestion,
         } => {
             ensure!(
                 (64_000..=1_000_000_000).contains(&max_rate_bps),
@@ -144,6 +151,7 @@ pub async fn run() -> Result<()> {
                 token: token_file,
                 target,
                 max_rate: max_rate_bps,
+                congestion,
             })
             .await
         }
@@ -155,6 +163,7 @@ pub async fn run() -> Result<()> {
             ca,
             token_file,
             policy,
+            congestion,
         } => {
             tunnel::client(tunnel::ClientOptions {
                 listen,
@@ -163,6 +172,7 @@ pub async fn run() -> Result<()> {
                 name: server_name,
                 ca,
                 token: token_file,
+                congestion,
                 policy: tunnel::Policy {
                     fec: policy.fec,
                     redundancy: policy.redundancy_percent,
