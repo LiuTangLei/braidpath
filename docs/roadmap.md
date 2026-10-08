@@ -9,6 +9,7 @@ The stages below are ordered by dependency. Each stage produces a usable baselin
 - [x] Bounded per-block decode state and deterministic erasure/reordering/duplicate cases.
 - [x] Interface–entrance identity model and in-memory example.
 - [x] Architecture, validation methods and cross-platform codec CI.
+- [x] Source-based carrier design: Xray as a reference only, independent Rust implementation and explicit datagram/stream boundaries.
 
 **Boundary:** no wire protocol, sockets, session-wide deduplication, scheduler, security or network-performance acceptance.
 
@@ -17,20 +18,23 @@ The stages below are ordered by dependency. Each stage produces a usable baselin
 - [ ] Freeze the first bounded wire format: session epoch, direction, data/flow IDs, source/repair metadata, limits and version negotiation.
 - [ ] Select/pin Quinn and TLS dependencies for the engineering baseline; verify supported Rust versions and platforms.
 - [ ] Keep the aggregate core independent of the carrier; define authenticated-record, size, bounded-send and observation contracts.
-- [ ] For intended filtered/cross-border deployments, start the reachability comparison before selecting a default carrier; QUIC and TURN are provisional profiles.
+- [ ] Prototype native HTTP/3 plus HTTP Datagrams with an ordinary website handler, authenticated request/context mapping and server identity verification; evaluate compatible Rust libraries without adding an Xray dependency.
+- [ ] Pass the carrier semantics/cost gate against plain QUIC; trace effective settings, queue ownership, PMTU, fingerprint limitations and independent-peer behavior before selecting the deployment candidate.
+- [ ] For intended filtered/cross-border deployments, start the reachability comparison before selecting a default carrier; website behavior alone cannot establish reachability.
 - [ ] Implement authenticated session admission with operator-managed credentials and 0-RTT disabled.
 - [ ] Build minimal client/server CLI for QUIC DATAGRAM echo and load generation; FEC-off first, then XOR with canonical records.
 - [ ] Implement timer-driven block closing, path-size checks, bounded send/receive queues, expiry and session deduplication.
 - [ ] Separate original arrivals, FEC recovery and application acceptance in feedback and counters.
 
-**Exit gate:** the single-path checks in the [validation plan](validation.md#2-secure-single-path-gate) pass under bounded packet-level impairment. The service is explicitly unreliable datagrams with optional FEC. No custom reliable byte-stream claim yet.
+**Exit gate:** the single-path checks in the [validation plan](validation.md#2-secure-single-path-gate) pass under bounded packet-level impairment. The selected HTTP/3 candidate also passes the [carrier gate](validation.md#carrier-semantics-and-cost-gate). The service is explicitly unreliable datagrams with optional FEC. No custom reliable byte-stream claim yet.
 
 **Do not advance if:** authentication, queue behavior, metadata validation or MTU adaptation cannot be demonstrated. Resolve the adapter/runtime choice before adding more paths. Controlled-network development can continue while field measurements are pending, but cannot establish or finalize a cross-border deployment default.
 
 ## M2 — Real interfaces and bidirectional relay entrances
 
-- [ ] Integrate a standard authenticated TURN/UDP relay; restrict peers to the main server and test refresh, quotas and return routing.
-- [ ] Implement Quinn's relay socket adapter with correct datagram boundaries, PMTU accounting and batching behavior.
+- [ ] Select the relay profile: fixed-destination L4 entrances for the web-facing candidate; authenticated TURN/UDP remains an optional controlled-network alternative.
+- [ ] Enforce the configured main service address/port, bounded relay state/rate and return mapping. Keep proxy authentication and TLS termination on the main server for the web-facing profile.
+- [ ] Verify datagram boundaries, PMTU and batching; if TURN is selected, implement its socket adapter, authenticated allocation and refresh lifecycle.
 - [ ] Bind actual client interfaces on Linux first; validate macOS and Windows independently.
 - [ ] Add session joins, path generations, bounded reconnection and control-operation replay across surviving paths.
 - [ ] Add a simple observable scheduler, per-direction feedback, bounded per-path workers, aggregate pacing and explicit bottleneck-group caps.
@@ -73,4 +77,4 @@ The stages below are ordered by dependency. Each stage produces a usable baselin
 
 **Exit gate:** operators can deploy a documented, authenticated topology and recognize unsupported or degraded conditions without relying on private implementation knowledge.
 
-Automatic shared-bottleneck detection and coupled congestion control are separate research tracks. TUN, mobile packaging and general fragmentation are deferred until a concrete need justifies them. A different secure UDP carrier or outer encapsulation moves into the deployment track when reachability requires it; it must retain authentication, congestion and bounded-resource guarantees. The controlled-network baseline does not depend on these additional features, but cannot substitute for deployment-specific reachability acceptance.
+Automatic shared-bottleneck detection and coupled congestion control are separate research tracks. TUN, mobile packaging and general fragmentation are deferred until a concrete need justifies them. A native HTTPS stream fallback or a datagram-preserving mask moves into the deployment track when reachability requires it, with separate latency and overhead acceptance. REALITY/XHTTP inform those trade-offs; Xray integration and protocol compatibility are outside the project scope. The controlled-network baseline cannot substitute for deployment-specific reachability acceptance.

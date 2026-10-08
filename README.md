@@ -5,7 +5,7 @@
 [![CI](https://github.com/LiuTangLei/braidpath/actions/workflows/ci.yml/badge.svg)](https://github.com/LiuTangLei/braidpath/actions/workflows/ci.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
-[简体中文](README.zh-CN.md) · [Architecture](docs/architecture.md) · [Validation plan](docs/validation.md) · [Roadmap](docs/roadmap.md)
+[简体中文](README.zh-CN.md) · [Architecture](docs/architecture.md) · [Carrier design](docs/transports.md) · [Validation plan](docs/validation.md) · [Roadmap](docs/roadmap.md)
 
 BraidPath is a Rust multipath transport project combining **forward error correction (FEC), client interface aggregation, and nearby relay entrances**. Its goal is to reduce recovery delays caused by packet loss while using available path capacity.
 
@@ -52,7 +52,11 @@ Entrance count is not independent capacity. Paths may share the last mile, trans
 - **Spend redundancy deliberately.** Measure FEC, retransmission, control traffic, and actual wire cost separately.
 - **Make progress measurable.** Compare application P95/P99, deadline misses, completion, goodput, and CPU under matched conditions.
 
-The first engineering baseline uses **one end-to-end QUIC DATAGRAM connection per active path**, with Quinn as the candidate Rust implementation. QUIC provides authenticated encryption and connection-level congestion control; BraidPath owns cross-path coding and delivery. **This is not a censorship-resistance claim or a finalized cross-border transport default.** The aggregate core remains independent of the path carrier; GFW-affected deployments require separate reachability validation of the complete on-wire profile. This is a planned architecture, separate from the current dependency-free core. See the [design decisions and release gates](docs/architecture.md).
+The first engineering baseline uses **one end-to-end QUIC DATAGRAM connection per active path**, with Quinn as the candidate Rust implementation. QUIC provides authenticated encryption and connection-level congestion control; BraidPath owns cross-path coding and delivery.
+
+The preferred deployment candidate adds **a real HTTP/3 service and authenticated HTTP Datagrams**, preserving unreliable delivery for FEC. BraidPath remains an independent Rust implementation: Xray is a reference for resistance to identification and probing, not a dependency, sidecar or compatibility target. A future HTTPS stream profile would have separate latency and recovery gates.
+
+**No cross-border default or censorship-resistance claim is established.** Ordinary website behavior and encryption alone do not demonstrate GFW reachability. Complete carrier profiles must pass both reachability and performance validation. See the [carrier analysis](docs/transports.md) and [architecture](docs/architecture.md). All networking capabilities remain planned, separate from the current dependency-free core.
 
 ## Run the foundation
 

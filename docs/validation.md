@@ -34,11 +34,33 @@ Test the selected Quinn version and configuration before expanding the runtime:
 
 Use bounded loopback impairment first, then Linux network namespaces/netem for actual queueing, delay, rate and UDP-packet loss. Verify the configured impairment with counters. Application-level omissions are useful codec checks, not proof of on-wire loss handling.
 
+### Carrier semantics and cost gate
+
+Apply this gate to the native Rust HTTP/3 candidate described in [carrier design](transports.md), before committing the multipath runtime to it. Xray is a source reference, not a required test service or product dependency. Start with a plain-QUIC control and the HTTP/3 candidate; add an HTTPS stream profile only when needed.
+
+| Area | Required evidence |
+| --- | --- |
+| Real HTTP behavior | Independent HTTP/3 client can retrieve the configured website; wrong/absent proxy credentials cannot obtain aggregate service; normal errors contain no private configuration or custom diagnostic banner |
+| Datagram negotiation | Both QUIC DATAGRAM and HTTP Datagram settings are supported; authenticated request/context mapping is enforced; unsupported peers fail explicitly |
+| Delivery semantics | After actual UDP packet loss, a later independent source/repair record can reach the decoder without waiting for the missing record's retransmission; separately demonstrate any ordering delay of stream profiles |
+| Authentication | Server verification, application credentials, cross-client session rejection, invalid contexts, replay/stale epochs and no early application data; normal website access does not require mTLS |
+| Queue ownership | Saturation, cancellation and deadline expiry are observable and bounded at every layer; successful writes and deadline setters are not assumed to prove transmission or cancellation |
+| Path ownership | Distinct interfaces/entrances really use distinct sockets/connections; pooling cannot merge the supposed paths; connection replacement updates its generation |
+| Framing | Account for HTTP Datagram context/request identifiers, QUIC/IP, control messages and padding; detect PMTU changes and avoid automatic proxy fragmentation |
+| Website consistency | Verify the configured domain, certificates, ALPN, H3 settings and normal requests over the advertised protocols; if TCP HTTPS is advertised, verify its behavior too |
+| Fingerprint limits | Capture cold/repeated handshakes, QUIC parameters and Initial packet sizes/packing, plus steady-state sizes/cadence with FEC and scheduling enabled; compare with the selected reference client and record remaining differences instead of claiming a browser match from ALPN alone |
+
+Keep application authorization, cryptographic verification and resource bounds intact while changing the wire appearance. Probe behavior from clients without credentials on authorized endpoints. A successful website retrieval establishes HTTP behavior, not unobservability or GFW reachability. Packet randomization and TLS-terminating intermediaries are separate profiles, with separate trust and reachability checks.
+
+Measure the incremental HTTP/3 cost with FEC off first, then enable identical FEC settings as the single changed factor. Match transport congestion control, physical paths, offered load, total access-link rate, crypto, MTU and batching. Count padding, website/probe responses and all control traffic. Report cold establishment separately from steady-state payload delivery. At the reference clean-path gate, require at least 90% of the minimal plain-QUIC adapter's goodput, no additional deadline misses, and a predeclared CPU/memory budget. Do not hide a slower adapter behind additional connections or a more aggressive controller.
+
+After that, repeat the single/multipath, packet-loss, useful-delivery, fairness and resource gates below using the complete selected carrier. The preferred HTTP/3 profile is rejected or revised if it consumes the recovery gain. A stream profile gets its own baseline and claims; it cannot pass by inheriting datagram results. Actual deployment selection still requires the reachability gate.
+
 ## 3. Topology and platform gate
 
 Test `1×1`, `1×3`, `2×1`, then `2×3` (interfaces × entrances), in upload, download and simultaneous bidirectional traffic. Include direct and relay paths, relay-only operation and path removal/rejoin.
 
-For relays, verify authenticated TURN/UDP allocations, main-server destination restrictions, channel/allocation refresh, return routing, idle expiry, port/source changes, quotas and forbidden destinations. A transparent loopback forwarder does not satisfy TURN integration or public relay authorization.
+Test the chosen relay profile. For TURN/UDP, verify authenticated allocations, main-server destination restrictions, channel/allocation refresh, return routing, idle expiry, port/source changes, quotas and forbidden destinations. For web-facing fixed L4 entrances, verify that only the configured main service address/port is reachable, ciphertext remains end-to-end, both directions preserve the entrance, mapping/rate/state limits hold, and proxy authorization is enforced at the main server. Ordinary website requests may pass without proxy credentials. A simple loopback forwarder proves neither production profile.
 
 Capture on the selected physical interfaces and on both sides of each relay to prove the path actually used. Traffic counters from the main server alone cannot establish the client's interface. Test with competing default routes, IPv4/IPv6, NAT rebinding and interface address changes. Linux/macOS/Windows must each pass their native network cases; builds alone are insufficient.
 
@@ -48,7 +70,7 @@ Inject full path failure, relay restart and shared backhaul failure. Verify that
 
 For GFW-affected or otherwise filtered deployments, validate the complete on-wire profile separately from loss recovery. Laboratory impairment and localhost tests cannot establish censorship resistance.
 
-- Compare standard QUIC and any proposed secure carrier/encapsulation on the intended access networks, with authorized endpoints. Low-volume UDP reachability probes are a diagnostic baseline, not a deployable protocol.
+- Compare plain QUIC and the native HTTP/3 candidate on the intended access networks, with authorized endpoints; include another profile only when proposed for deployment. Low-volume UDP reachability probes are a diagnostic baseline, not a deployable protocol.
 - Record ISP/access type, direction, endpoint profile, packet-size range, time window, handshake success/time, sustained useful traffic, idle/reconnect behavior and repeatability. Use multiple time windows and relevant access networks before making a deployment-specific claim.
 - Distinguish failure to establish, failure after establishment, partial throughput, ordinary queue loss and persistent unreachability. Collect evidence at both endpoints. A failed probe alone is not proof that the GFW caused it; check routing, NAT, host firewall and provider policy too.
 - Count unsuccessful connections and full-route outages in availability results. FEC recovery rates among surviving sessions cannot hide establishment failures.

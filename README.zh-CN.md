@@ -5,7 +5,7 @@
 [![CI](https://github.com/LiuTangLei/braidpath/actions/workflows/ci.yml/badge.svg)](https://github.com/LiuTangLei/braidpath/actions/workflows/ci.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
-[English](README.md) · [架构设计](docs/architecture.md) · [验证计划](docs/validation.md) · [路线图](docs/roadmap.md)
+[English](README.md) · [架构设计](docs/architecture.md) · [传输方案](docs/transports.md) · [验证计划](docs/validation.md) · [路线图](docs/roadmap.md)
 
 BraidPath 是一个从零构建的 Rust 多路径传输项目，目标是通过 **前向纠错（FEC）、客户端多网卡聚合和同城多服务器中继**，降低丢包造成的恢复等待与尾延迟，同时利用多条路径的可用带宽。
 
@@ -89,7 +89,11 @@ Synthetic codec example only; no network performance claim.
 
 我们借鉴 [Aggligator](https://github.com/remoc-rs/aggligator) 的多链路抽象、动态链路管理、统一交付与链路统计思路；这些能力会按本项目的 datagram-first 架构逐步实现。
 
-BraidPath 独立实现聚合与修复核心；第一条工程验证基线计划使用 QUIC DATAGRAM，复用认证加密和拥塞控制，FEC 在聚合层工作。**这不代表具备抗封锁能力，也没有确定跨境部署的默认传输。** 聚合核心与路径承载分离，涉及 GFW 的部署必须另外验证完整线协议的可达性。该网络路线尚未实现。
+BraidPath 独立实现聚合与修复核心；第一条工程验证基线计划使用 QUIC DATAGRAM，复用认证加密和拥塞控制，FEC 在聚合层工作。
+
+部署候选方案是在此基础上实现**真正的 HTTP/3 服务与经过认证的 HTTP Datagrams**，保留 FEC 所需的不可靠交付语义。**Xray 只作为防识别、防探测的设计参考，不是依赖、配套运行程序或协议兼容目标。** 客户端、主服务器、聚合和传输适配由本项目独立以 Rust 实现；未来如增加 HTTPS 流承载，须单独验收其重传和排队代价。
+
+正常网站响应和加密本身不能证明抗封锁。跨境默认方案尚未确定，完整承载必须同时通过真实网络可达性与性能验证。详见[传输方案分析](docs/transports.md)。这些网络能力仍属于规划。
 
 架构、验证计划与路线图使用英文维护。测试记录与运行结果仅在本地保存，仓库保留自动化测试代码和验证方法。
 

@@ -31,9 +31,9 @@ Responsibilities are explicit:
 | BraidPath path adapter | Interface/socket binding, bounded queues, datagram size checks, measured path observations |
 | BraidPath session | Membership, logical data IDs, FEC, application receipt reports, optional reliable recovery, deduplication and flow limits |
 | Application adapter | Datagram deadlines or ordered byte-stream semantics, authorized destination mapping |
-| Relay | Authorized forwarding allocation and return mapping; no application decryption |
+| Relay | Profile-specific forwarding restrictions and return mapping; no application decryption |
 
-A custom carrier over UDP would also need a secure handshake, congestion controller, pacing and loss feedback. Retain it as a candidate when deployment reachability or measured runtime limitations justify that engineering cost; do not assume it is more reachable merely because it is not QUIC. Do not replace DATAGRAM payloads with reliable per-path streams: that would add an independent retransmission/ordering layer beneath aggregate recovery.
+A custom carrier over UDP would also need a secure handshake, congestion controller, pacing and loss feedback. Retain it as a candidate when deployment reachability or measured runtime limitations justify that engineering cost; do not assume it is more reachable merely because it is not QUIC. In the low-latency baseline, do not replace DATAGRAM payloads with reliable per-path streams: that would add an independent retransmission/ordering layer beneath aggregate recovery.
 
 ### Reachability under filtering and censorship
 
@@ -43,7 +43,9 @@ Research published in 2025 measured GFW inspection of QUIC Initial packets and S
 
 Keep three decisions separate: aggregate recovery/scheduling, secure congestion-controlled datagram transport, and the externally visible carrier/encapsulation. The aggregate core consumes authenticated records and bounded path observations; it must not depend on Quinn types, TLS certificate APIs or QUIC packet numbers. A different carrier must provide equivalent authentication, resource and congestion guarantees. Do not disable identity verification to improve handshake success.
 
-Standard QUIC, a separately evaluated datagram-preserving outer carrier, and a custom authenticated UDP transport are candidates, not preselected censorship solutions. Raw UDP probes diagnose basic reachability only. TURN allocation/authentication does not prove censorship resistance either. Any wrapper changes MTU, wire cost, queueing and possibly delivery semantics, and must be evaluated as a complete profile. If a reliable outer stream is used for reachability, expose it as a distinct mode and re-evaluate ordering delay; do not transfer the datagram baseline's latency claims to it.
+The preferred deployment candidate is an independently implemented Rust HTTP/3 service with authenticated HTTP Datagrams. It uses the same QUIC connection for security, congestion control and data delivery; it does not tunnel one QUIC stack through another. Xray is a design reference only, with no runtime dependency or wire-compatibility requirement. The [carrier design](transports.md) explains the applicable lessons from REALITY, Vision, XHTTP, Hysteria and MASQUE, including why an H3 HTTP body is not a DATAGRAM path.
+
+Plain QUIC remains the engineering control. A future HTTPS stream profile and any datagram-preserving packet mask require separate acceptance. Raw UDP probes diagnose basic reachability only. TURN allocation/authentication does not prove censorship resistance either. Any wrapper changes MTU, wire cost, queueing and possibly delivery semantics. Reliable carriers cannot inherit the datagram baseline's latency claims or silently join its coding groups.
 
 FEC helps when enough symbols arrive. It cannot recover a consistently blocked handshake or a route that drops every usable symbol. Co-located entrances may also share filtering policies, so route count is not censorship independence.
 
@@ -51,7 +53,7 @@ Before selecting a cross-border default, pass the [deployment reachability gate]
 
 ## 3. Session, path and data identity
 
-The initial deployment profile is operator-managed client/server certificates: verify the main server identity through every entrance and authenticate each client connection with TLS client authentication. Disable 0-RTT in the initial protocol. Certificate trust, rotation and revocation are deployment requirements.
+The plain-QUIC engineering profile uses operator-managed client/server certificates: verify the main server identity through every entrance and authenticate each client connection with TLS client authentication. The web-facing HTTP/3 candidate verifies the server certificate and authenticates client credentials inside the encrypted application exchange, allowing ordinary website requests without a client certificate. Both must establish an authorized client identity before session admission. Disable 0-RTT application data in the initial protocol. Credential trust, rotation and revocation are deployment requirements.
 
 The first authenticated connection creates a session. Additional connections request a join over a control stream. The server checks the same authorized client identity, session identifier, current session epoch, protocol version and negotiated limits before accepting their data. Knowing a session ID alone grants no access.
 
@@ -115,9 +117,11 @@ Sparse traffic exposes a real trade-off: closing every one-packet block with par
 
 For the QUIC engineering baseline, the reference authenticated relay route is **TURN over UDP** using an existing TURN server, with one allocation per client path and peer permission for the main server. A client adapter exposes the relayed datagrams to Quinn; QUIC still terminates at the main server. Allocation/channel refresh, idle timeouts and return mapping are mandatory. TURN over TCP/TLS is outside the initial low-latency baseline because a reliable outer stream can introduce ordering delays. [RFC 8656](https://www.rfc-editor.org/rfc/rfc8656.html)
 
-Restrict relay destinations at the server to the configured main server, with host firewall enforcement for the intended UDP port. TURN permissions alone are per IP, not a port allowlist. Bound allocations, per-client bandwidth and idle lifetime. Test wrong credentials, forbidden destinations, expiry and rebinding. An unauthenticated transparent UDP forwarder is useful on loopback or a restricted lab network only; it is not the public deployment design.
+Restrict TURN relay destinations to the configured main server, with host firewall enforcement for the intended UDP port. TURN permissions alone are per IP, not a port allowlist. Bound allocations, per-client bandwidth and idle lifetime. Test wrong credentials, forbidden destinations, expiry and rebinding. An unrestricted transparent UDP forwarder is not a public deployment design.
 
-For direct paths, supply an explicitly configured UDP socket to Quinn. For relayed paths, use its abstract socket adapter and account for TURN framing, batching and PMTU behavior. Integration must demonstrate correct per-datagram metadata and segmentation rather than assuming default GSO behavior survives a wrapper. [Quinn Endpoint API](https://docs.rs/quinn/0.11.12/quinn/struct.Endpoint.html)
+For the web-facing HTTP/3 candidate, public TURN framing would change the visible protocol. Evaluate a **fixed-destination L4 entrance** that forwards only the configured main service address/port and preserves its encrypted handshake in both directions. Authentication of proxy use remains on the main server; normal website requests are permitted without proxy credentials. Bound relay state, traffic and idle lifetime, preserve return mapping, and expose no client-selected destination. This profile has different admission and abuse controls from TURN and requires its own acceptance. TURN integration is not a prerequisite for selecting fixed L4 entrances.
+
+For direct and fixed-L4-entrance paths, supply an explicitly configured UDP socket to Quinn. For TURN paths, use its abstract socket adapter and account for TURN framing, batching and PMTU behavior. Integration must demonstrate correct per-datagram metadata and segmentation rather than assuming default GSO behavior survives a wrapper. [Quinn Endpoint API](https://docs.rs/quinn/0.11.12/quinn/struct.Endpoint.html)
 
 | Platform | Planned binding | Required evidence |
 | --- | --- | --- |
@@ -137,6 +141,6 @@ Negotiate and enforce limits for paths, flows, active blocks, symbols, pending b
 
 ## 9. What still has to be demonstrated
 
-The architecture has a practical implementation route, but runtime selection is gated on bounded queue behavior, TURN adapter feasibility and real interface binding. Cross-border carrier selection additionally requires deployment reachability evidence; QUIC and TURN remain provisional for that environment. Performance acceptance additionally requires shared-bottleneck competition, correlated loss, sparse traffic, CPU cost and both directions. Neither a successful codec test nor a local encrypted-path probe proves those properties.
+The architecture has a practical implementation route, but runtime selection is gated on bounded queue behavior, profile-specific relay feasibility and real interface binding. The HTTP/3 candidate additionally needs correct HTTP behavior, authenticated datagram mapping and measured fingerprint limitations. Cross-border selection requires deployment reachability evidence. Performance acceptance additionally requires shared-bottleneck competition, correlated loss, sparse traffic, CPU cost and both directions. Neither a successful codec test nor a local encrypted-path probe proves those properties.
 
 The [validation plan](validation.md) defines those gates. Test records and feasibility-probe outputs stay local; this document contains design decisions and methods only.
