@@ -1,0 +1,12 @@
+[package]
+name = "braidpath"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "An experimental foundation for FEC-assisted multipath transport"
+license = "Apache-2.0"
+repository = "https://github.com/LiuTangLei/braidpath"
+readme = "README.md"
+publish = false
+
+[dependencies]

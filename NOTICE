@@ -1,0 +1,10 @@
+BraidPath
+Copyright 2026 BraidPath contributors
+
+BraidPath is an independently implemented project inspired by ideas from
+Aggligator, created by Sebastian Urban and contributors:
+https://github.com/remoc-rs/aggligator
+
+The initial implementation does not incorporate Aggligator source code or Git
+history. Aggligator's name is used only for attribution. Any future incorporated
+third-party code must retain its applicable license and attribution notices.
