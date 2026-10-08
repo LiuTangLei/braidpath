@@ -1,62 +1,128 @@
-# 架构方向
+# Architecture and feasibility
 
-这是设计约束，不是已实现功能清单。当前实现以 README 状态表为准。
+This document defines the implementation direction and its acceptance gates. It does not describe an already implemented network stack. See the [README](../README.md) for current capabilities and the [roadmap](roadmap.md) for dependencies.
 
-## 1. 三个角色，一个端到端会话
+## 1. Feasibility boundary
 
-- **Client**：接收业务数据、选择接口和入口，执行发送调度、FEC、接收重排。
-- **Relay**：同地点 / 同城入口，转发到预先配置且经过授权的主服务器；保留双向路径关联。
-- **Server**：主服务器，终止端到端会话、恢复数据并接入目标业务服务。
+The topology is implementable: independently reachable client–entrance paths can carry symbols belonging to one endpoint session, and nearby relays can forward those paths to one main server. The expected latency and capacity gains remain workload- and network-dependent.
 
-路径身份为 `local_interface × server_entrance`。两个接口、三个入口意味着六条候选路径，需要分别证明可达性。路径身份不能只按远端主服务器地址去重，也不能把同接口的全部入口折叠掉。
+| Constraint | Consequence |
+| --- | --- |
+| Several entrances share the client's access link | No capacity multiplication at that bottleneck |
+| Relay backhauls converge on one server uplink | Server/backhaul capacity bounds aggregate goodput |
+| Correlated loss removes several symbols in a block | One XOR parity symbol is insufficient |
+| Repair arrives after the application's deadline | Recovery may succeed without improving useful delivery |
+| Redundancy competes with originals on a congested link | More FEC can increase delay and reduce goodput |
+| Different path RTTs create reordered arrivals | A byte stream still waits for missing earlier bytes |
 
-每个入口包含到主服务器的整个转发段。调度依据端到端结果，不能只测客户端到入口的 RTT。回程必须从对应入口返回，否则下行路径并非上行路径的反向。
+For independent original/repair symbol erasures with probability `p`, a full XOR `k+1` block leaves a particular original unrecovered with probability `p × [1 − (1 − p)^k]`. This is an analytical model, not a performance result. Correlated loss, packet packing, variable sizes, and deadlines invalidate its simplifying assumptions.
 
-## 2. datagram-first 核心
+## 2. Transport decision: encrypted unreliable paths
 
-会话层拥有 packet ID、FEC block ID、确认、去重、修复和最终交付；底层路径负责传送独立 datagram。首条实现路线使用 UDP，不依赖单路径可靠有序传输，也不套一层独立可靠协议再让聚合层重复恢复。
+Use **one end-to-end QUIC connection per active interface–entrance pair**, carrying application data and repair symbols in DATAGRAM frames. Quinn is the candidate Rust runtime. This requires neither kernel multipath support nor a Multipath QUIC extension.
 
-接口先从 datagram 交付做起；可靠字节流适配器随后引入。datagram 在恢复后可以独立交付，字节流需要序号、重排窗口、流控和明确的缺口处理。FEC 本身不保证可靠交付。
+QUIC DATAGRAM preserves unreliable delivery while sharing QUIC's security and congestion control. Its data is not automatically retransmitted. Small reliable streams carry session setup and infrequent control operations; bulk payload and time-sensitive receipt reports remain datagrams. These are protocol capabilities, not a claim that FEC defeats congestion. [RFC 9221, sections 5–6](https://www.rfc-editor.org/rfc/rfc9221.html#section-5)
 
-## 3. FEC 的位置与边界
+Responsibilities are explicit:
 
-原始包即到即发。聚合层生成跨路径修复符号，接收端用任意入口收到的符号恢复数据。修复包的路径选择独立于原始包；有可用的独立路径时优先分散风险，单路径时仍允许编码。
+| Layer | Owns |
+| --- | --- |
+| QUIC implementation | TLS keys, transport packet numbers/ACKs, transport loss detection, connection congestion control, pacing, PMTU discovery |
+| BraidPath path adapter | Interface/socket binding, bounded queues, datagram size checks, measured path observations |
+| BraidPath session | Membership, logical data IDs, FEC, application receipt reports, optional reliable recovery, deduplication and flow limits |
+| Application adapter | Datagram deadlines or ordered byte-stream semantics, authorized destination mapping |
+| Relay | Authorized forwarding allocation and return mapping; no application decryption |
 
-第一版库提供系统式 XOR：`k` 个原始数据包加一个修复符号。长度也参与 XOR，支持空包和不同长度包。一个原始包丢失可恢复；两个原始包同时丢失无法恢复，除非之后补到其中一个。修复包丢失不会阻止原始包交付。
+A raw UDP implementation would also need a secure handshake, congestion controller, pacing and loss feedback. Defer it until measurements expose a specific limitation of the selected transport. Do not replace DATAGRAM payloads with reliable per-path streams: that would add an independent retransmission/ordering layer beneath aggregate recovery.
 
-`Encoder::push` 立即返回原始包。达到 `k` 或 `max_age` 后封块；运行时须定时调用 `flush_due`，结束输入时调用 `flush`。没有后台定时器。当前单包 payload 上限 1200 字节只是内存 API 限制，不是网络 MTU 承诺，未来必须计入编码、认证和封装头。
+## 3. Session, path and data identity
 
-当前 `Decoder` 只维护一个 block，缓存最多 32 个原始包和一个修复符号。会话层必须额外限制活跃 block 总数、生命周期和总内存。单块输出是无序的，同一块内每个索引最多交付一次。接口用于可信内存数据；遇到解码错误应丢弃该 decoder，错误返回不承诺回滚状态。
+The initial deployment profile is operator-managed client/server certificates: verify the main server identity through every entrance and authenticate each client connection with TLS client authentication. Disable 0-RTT in the initial protocol. Certificate trust, rotation and revocation are deployment requirements.
 
-后续用测量决定小块 Reed–Solomon 或滑动窗口码是否优于该基线。要同时考虑编码 CPU、修复率、封块等待和冗余成本，不能只比较恢复成功率。
+The first authenticated connection creates a session. Additional connections request a join over a control stream. The server checks the same authorized client identity, session identifier, current session epoch, protocol version and negotiated limits before accepting their data. Knowing a session ID alone grants no access.
 
-## 4. 调度、修复、拥塞控制分开
+A path is a logical interface–entrance pair with a **generation**, not merely a remote IP. Replacing a socket/connection creates a new generation; stale reports must not update the replacement. NAT rebinding requires transport address validation. Interface changes must not silently turn an explicitly bound path into the default-route path.
 
-计划中的调度器估计“现在把这个包交给这条路径，何时完成交付”，输入至少包含 pacing 可用时刻、在途 / 排队字节、带宽估计、RTT、抖动、丢包和健康状态。RTT 不等同于精确单向延迟；需要时钟与测量约定。
+Use separate identity spaces:
 
-不能盲目轮询，也不能永久只用 RTT 最低的一条路径。差路径降权后保留有限探测流量，避免无法发现恢复。路径动态加入、退出、恢复不得重置业务会话。当前示例轮询仅为了展示路径身份。
+- QUIC packet numbers remain private to each connection and direction.
+- A session epoch and direction scope all BraidPath data/block IDs.
+- Logical data IDs survive FEC recovery and resending on another path.
+- Flow IDs and message IDs / byte offsets describe application delivery.
+- FEC block ID, symbol index, codec profile and actual source count describe coding.
 
-FEC、主动副本、必要重传和探测都占用实际带宽，必须进入 pacing 与拥塞控制。多入口共享瓶颈时不应按独立流量无限加压；共享瓶颈检测和耦合控制属于后续验证工作。
+Do not use the current `(block, index)` alone as a session-wide delivery identity. The session must work when FEC is disabled or a repair packet is lost. Reliable flow termination declares the final byte offset so a lost tail cannot look like successful completion.
 
-## 5. 预算与指标
+Control operations need request IDs and idempotent responses so they can be retried through another surviving path. A primary control connection must not become a permanent single point of failure. All-path loss permits bounded reconnection; expiry or main-server restart produces an explicit session failure, not silent byte-stream continuation.
 
-分别记录 original payload、original wire、repair wire、hedge wire、retransmission wire、control wire。编码比 `m/k` 只反映等长完整块的符号比例，不能充当实际字节开销。示例的 `4+1` 也不能直接声称 25% wire overhead。
+## 4. FEC and encryption order
 
-未来主动冗余预算采用有界时间窗口或令牌桶，显式约束冷启动与突发，不允许长时间累计的额度在一次突发中耗尽。稀疏流的低延迟修复与严格小预算存在取舍：预算不足时少发修复，并报告未受保护数据。
+The initial design is **canonical application record → FEC → QUIC encryption on the selected path**. Decode only authenticated records obtained from connections admitted to the session. Relays see ciphertext. Do not XOR different connections' QUIC ciphertext or reuse their keys/nonces.
 
-可靠流的必要重传单独记账，但仍受拥塞控制；不能为了保持漂亮的 FEC 比例丢弃必须交付的数据。指标至少包括：
+A source symbol must include enough coded information to recover delivery identity: flow/message ID or byte offset, flags, payload length and bytes. Block metadata is carried inside the authenticated DATAGRAM. Validate counts, lengths, codec profile, direction and block window before allocating decoder state. Recovery derives an application record from authenticated symbols; it does not reconstruct a QUIC packet or generate a transport ACK.
 
-- 应用交付 P50/P95/P99、完成率、超时率、有效吞吐。
-- FEC 恢复 / 不可恢复、重复包、迟到修复、重排深度与等待。
-- 每条路径的流量、RTT / 抖动、丢包、在途、探测、健康变化。
-- 业务字节、全部 wire 字节、CPU、内存、队列上限。
+The current codec accepts arbitrary byte payloads, emits originals immediately, and closes a block at `k` or a caller-driven deadline. A network adapter can encode a canonical record into that payload. Its 1200-byte bound is an **in-memory limit**, not a safe network payload size. The decoder is block-scoped, emits unordered deliveries, and should be discarded after an error; error returns do not promise rollback.
 
-## 6. 网络阶段的安全契约
+FEC capacity and timing are distinct. With one repair symbol, two missing originals remain missing; a failed path often removes several. Multi-erasure codes, retransmission for reliable flows, or expiration for deadline traffic must handle the remainder. Never wait indefinitely for a block to fill or for FEC before considering reliable recovery.
 
-公开网络收发之前，需要有身份认证、会话密钥、认证加密、唯一 nonce、重放窗口和有界资源管理。优先使用成熟协议与库，不自行设计密码算法。
+Small symbols can share a QUIC/UDP packet. Losing that packet can therefore erase multiple symbols from one block. The validation harness must model the actual packing boundary instead of treating every codec symbol as an independent network loss. Interleaving or larger codes are later choices, with their delay/CPU cost measured. Sliding-window coding is a candidate, not an assumed improvement. [RFC 8681](https://www.rfc-editor.org/rfc/rfc8681.html)
 
-目标为 client–server 端到端认证加密，中继转发不透明报文。需确定“编码密文还是明文”的准确线格式、恢复后的认证验证以及 packet ID / nonce 规则；未经认证的 FEC 元数据不得触发大规模分配或被视为有效修复。
+## 5. Two delivery services, two kinds of acknowledgment
 
-中继只接受授权会话和固定允许的主服务器目标，限制并发、闲置时长、放大倍数与速率，不能成为任意 UDP 开放转发器。动态目的地址与目标服务访问也必须受授权规则约束。
+Start with **unreliable datagrams with optional FEC**. Deliver originals/recovered data once within a bounded deduplication window, drop late messages by policy, and report losses. An expired or unrecoverable datagram is not a reliable-transport failure. Sender queue deadlines use its local monotonic clock; receiver expiry uses a negotiated lifetime/playout policy. Never compare raw monotonic timestamps from different machines. End-to-end deadline success is measured by the requesting application or synchronized instrumentation.
 
-这些网络安全能力当前尚未实现，因此本版本没有网络 listener。
+Add **reliable ordered streams** only with selective application ACKs, bounded retransmission, receiver credit, per-flow offsets, FIN/reset semantics and explicit failure. Retain source data until the peer has accepted responsibility for it. Receiver credit includes accepted but undelivered data; acknowledged reliable data cannot be evicted to make room. Reordering is per flow, not across unrelated streams.
+
+| Signal | Meaning | May stop reliable resending? | May erase QUIC loss? |
+| --- | --- | --- | --- |
+| QUIC ACK | A transport packet reached the peer's QUIC stack | No, by itself | QUIC handles its own state |
+| BraidPath accepted-data report | Peer retained an original or recovered record for delivery | Yes | No |
+| BraidPath original-arrival observation | An original arrived on a specific path generation | Used for path statistics | No |
+
+Recovered data must not be credited as original delivery on the failed path. Otherwise FEC hides loss and misleads scheduling. QUIC's actual loss/ECN signals remain intact. [RFC 9002](https://www.rfc-editor.org/rfc/rfc9002.html)
+
+Receipt reports are authenticated, cumulative/selective, bounded and periodically refreshed so a lost report does not cause endless retransmission. Feedback may travel over another active path; same-path probes provide attributable RTT samples. RTT/2 is only a heuristic, not a measured one-way delay.
+
+## 6. Scheduling, queues and budgets
+
+Begin with a bounded, observable scheduler; introduce adaptation after baselines exist. Prefer eligible paths with low estimated completion cost, using application queue age/bytes, transport-buffer availability, delivered original byte rate, RTT/jitter and recent health. Upstream and downstream maintain separate observations. Do not infer precise bandwidth or transmission times from undocumented runtime internals.
+
+Use one sender owner per connection and bounded queues by bytes and age. A full path must not stall all other senders. Quinn exposes datagram limits and queue space; `send_datagram` may replace older queued datagrams, while `send_datagram_wait` waits for capacity. Deliberate cancellation/drop policies and deadlines belong in the adapter. Enqueue success is not wire transmission or application delivery. Do not assume an already-enqueued datagram can be recalled: keep the runtime queue small and enforce receiver expiry too. [Quinn Connection API](https://docs.rs/quinn/0.11.12/quinn/struct.Connection.html)
+
+Maintain bounded probes on suspect paths; probe traffic counts toward the same limits. FEC, retransmissions and probes cannot bypass the transport's congestion control. Repair generation and on-wire transmission are separate timestamps.
+
+Before enabling multiple entrances, implement an aggregate pacer/rate cap plus explicitly configured bottleneck groups. All paths through one client access interface share its initial group; operators can merge other known shared routes and cap server/backhaul use. Rate caps are necessary operational bounds, **not proof of fairness**. Independent QUIC connections can still compete unfairly against one competing flow. Automatic shared-bottleneck detection and coupled congestion control are later research, informed by [RFC 6356](https://www.rfc-editor.org/rfc/rfc6356.html); its TCP algorithm cannot simply be copied into QUIC.
+
+Active redundancy uses a bounded token bucket: credit from original encoded bytes admitted for sending, debit for repair/hedge bytes with the same framing basis, fixed maximum credit and no unbounded idle accumulation. Queue drops and actual wire totals remain separate counters. No silent startup debt. Reliable retransmissions use a separate recovery allowance but still obey the overall pacer and receiver credit.
+
+Sparse traffic exposes a real trade-off: closing every one-packet block with parity costs roughly one extra symbol. A strict 10% budget cannot protect every isolated packet that way. Budget exhaustion must skip repair and report reduced coverage, or the user must explicitly select a higher-overhead policy. FEC overhead must be measured in bytes, including padding, not just `m/k`.
+
+## 7. Relay and interface integration
+
+The reference authenticated relay route is **TURN over UDP** using an existing TURN server, with one allocation per client path and peer permission for the main server. A client adapter exposes the relayed datagrams to Quinn; QUIC still terminates at the main server. Allocation/channel refresh, idle timeouts and return mapping are mandatory. TURN over TCP/TLS is outside the initial low-latency baseline because a reliable outer stream can introduce ordering delays. [RFC 8656](https://www.rfc-editor.org/rfc/rfc8656.html)
+
+Restrict relay destinations at the server to the configured main server, with host firewall enforcement for the intended UDP port. TURN permissions alone are per IP, not a port allowlist. Bound allocations, per-client bandwidth and idle lifetime. Test wrong credentials, forbidden destinations, expiry and rebinding. An unauthenticated transparent UDP forwarder is useful on loopback or a restricted lab network only; it is not the public deployment design.
+
+For direct paths, supply an explicitly configured UDP socket to Quinn. For relayed paths, use its abstract socket adapter and account for TURN framing, batching and PMTU behavior. Integration must demonstrate correct per-datagram metadata and segmentation rather than assuming default GSO behavior survives a wrapper. [Quinn Endpoint API](https://docs.rs/quinn/0.11.12/quinn/struct.Endpoint.html)
+
+| Platform | Planned binding | Required evidence |
+| --- | --- | --- |
+| Linux | Interface binding, source address and policy route where needed | Traffic on requested device, including competing default routes |
+| macOS | `IP_BOUND_IF` / IPv6 equivalent with an interface index | Capture on the actual interface and reconnection after address change |
+| Windows | `IP_UNICAST_IF` / IPv6 equivalent plus source binding | Actual egress and return delivery; not merely the selected local address |
+
+Use the supported OS APIs and fail clearly when explicit binding cannot be honored. A one-interface mode can use normal routing. See [socket2](https://docs.rs/socket2/0.6.5/socket2/struct.Socket.html#method.bind_device_by_index_v4) and [Microsoft socket options](https://learn.microsoft.com/en-us/windows/win32/winsock/ipproto-ip-socket-options). Cross-platform codec CI does not establish any of these network behaviors.
+
+## 8. MTU and bounded state
+
+For each coding group, choose a symbol size fitting all selected data/repair paths. Deduct BraidPath headers and coding length fields from the runtime's current maximum DATAGRAM payload; the relay adapter must also limit the underlying UDP size for its own outer encapsulation. QUIC needs a path capable of 1200-byte UDP payloads; a relay wrapper needs additional space. [RFC 9000, section 14](https://www.rfc-editor.org/rfc/rfc9000.html#section-14)
+
+On a smaller-path join or MTU decrease, close the current block, start a new size/profile generation, and stop sending oversized records on that path. Pending reliable records require explicit resegmentation with stable byte offsets. Initially reject oversized UDP messages with a clear counter/error; general message fragmentation/reassembly is a separate bounded feature. Never silently truncate or rely on IP fragmentation.
+
+Negotiate and enforce limits for paths, flows, active blocks, symbols, pending bytes, report ranges, retransmit state, reordering and idle time. Expired block IDs stay outside a bounded acceptance window so replaying a retired block cannot allocate it again. Full queues apply backpressure to reliable flows and explicit drop/expiry to datagrams. Authenticated peers still need size and resource checks.
+
+## 9. What still has to be demonstrated
+
+The architecture has a practical implementation route, but runtime selection is gated on bounded queue behavior, TURN adapter feasibility and real interface binding. Performance acceptance additionally requires shared-bottleneck competition, correlated loss, sparse traffic, CPU cost and both directions. Neither a successful codec test nor a local encrypted-path probe proves those properties.
+
+The [validation plan](validation.md) defines those gates. Test records and feasibility-probe outputs stay local; this document contains design decisions and methods only.

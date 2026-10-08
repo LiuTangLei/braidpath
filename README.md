@@ -5,58 +5,58 @@
 [![CI](https://github.com/LiuTangLei/braidpath/actions/workflows/ci.yml/badge.svg)](https://github.com/LiuTangLei/braidpath/actions/workflows/ci.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
-[English](README.en.md) · [架构设计](docs/architecture.md) · [验证计划](docs/validation.md) · [路线图](docs/roadmap.md)
+[简体中文](README.zh-CN.md) · [Architecture](docs/architecture.md) · [Validation plan](docs/validation.md) · [Roadmap](docs/roadmap.md)
 
-BraidPath 是一个从零构建的 Rust 多路径传输项目，目标是通过 **前向纠错（FEC）、客户端多网卡聚合和同城多服务器中继**，降低丢包造成的恢复等待与尾延迟，同时利用多条路径的可用带宽。
+BraidPath is a Rust multipath transport project combining **forward error correction (FEC), client interface aggregation, and nearby relay entrances**. Its goal is to reduce recovery delays caused by packet loss while using available path capacity.
 
-“Braid” 是编织：把多条不完美的路径编成一条更稳定的连接。
+“Braid” means weaving several imperfect paths into a more resilient connection.
 
-> **当前阶段：可运行的算法基础原型。** 已有小块 XOR FEC、即时原始包输出、按期限封块、单块去重和路径身份模型。尚无可部署的客户端、主服务器或中继程序，也没有真实网络性能承诺。
+> **Status: an algorithm foundation.** The repository contains an executable XOR FEC codec, a path identity model, and deterministic tests. Client, server, relay integration, and network scheduling are planned. There is no deployable tunnel or established real-network performance gain yet.
 
-## 一张网卡可以用，多张网卡可以聚合
+## One interface works. Several can contribute.
 
-目标拓扑如下；图中的网络连接属于后续实现：
+The intended topology is:
 
 ```mermaid
 flowchart LR
-    App[客户端应用] --> C[BraidPath 客户端]
-    C --> E[有线网卡]
-    C --> W[Wi-Fi / 蜂窝网卡，可选]
-    E --> M[主服务器入口]
-    E --> R1[同城中继 A]
-    E --> R2[同城中继 B]
+    App[Application] --> C[BraidPath client]
+    C --> E[Ethernet]
+    C --> W[Wi-Fi or cellular - optional]
+    E --> M[Main server]
+    E --> R1[Nearby relay A]
+    E --> R2[Nearby relay B]
     W --> M
     W --> R1
     W --> R2
     R1 --> M
     R2 --> M
-    M --> S[目标服务]
+    M --> S[Destination service]
 ```
 
-同地点的多台服务器给主服务器提供多个**逻辑网络入口**，在传输层模拟多网卡可选路径。中继只转发，主服务器统一处理会话、纠错和交付。回程也必须按对应入口返回。
+Nearby relays provide **logical server-side entrances**, giving one main server multiple route choices. Relays forward encrypted traffic; the client and main server own the aggregate session. Each transport path returns through its own entrance. Application downlink traffic is scheduled independently of uplink traffic.
 
-| 客户端接口 | 服务端入口 | 目标用途 |
+| Client interfaces | Server entrances | Intended use |
 | --- | --- | --- |
-| 1 | 1 | 单路径也能用 FEC 降低部分丢包的恢复等待 |
-| 1 | 多个 | 利用不同入口的路由差异，调度和分散修复流量 |
-| 多个 | 1 | 聚合有线、Wi-Fi、蜂窝等客户端路径 |
-| 多个 | 多个 | 在“客户端接口 × 服务端入口”之间调度 |
+| One | One | FEC on a single path |
+| One | Several | Route diversity where it exists |
+| Several | One | Aggregate client access links |
+| Several | Several | Schedule across interface–entrance pairs |
 
-多个入口可能共享客户端最后一公里、运营商路由或主服务器带宽。**入口数量不等于独立带宽数量。** 单网卡多入口不能突破自身接入带宽；路径分散能否改善丢包，必须实测。
+Entrance count is not independent capacity. Paths may share the last mile, transit routes, relay backhaul, or the main server's uplink. A single interface cannot exceed its access bandwidth by adding entrances.
 
-## 我们要解决什么
+## Design priorities
 
-- **丢包后的等待**：在聚合层发出修复信息，争取不等一次重传往返就恢复数据。
-- **慢路径拖累**：按预计到达时间、排队、丢包和路径健康状态调度，减少重排等待。
-- **两端能力不对称**：客户端可以多网卡，主服务器可以通过同城中继扩展逻辑入口。
-- **冗余失控**：分别统计业务数据、FEC、补发与控制流量，用可观测的预算换取延迟收益。
-- **“跑得快”缺少证据**：同时检查 P50/P95/P99、完成率、有效吞吐、开销和 CPU；上下行分别验证。
+- **Repair at the aggregate layer.** Recover across paths without waiting for retransmission when enough timely repair information is available.
+- **Keep original data moving.** The encoder emits originals immediately; network transmission still obeys queue limits and congestion control.
+- **Treat direction and path quality separately.** Upload quality is not evidence of download quality. A slow path must not create unbounded reordering.
+- **Spend redundancy deliberately.** Measure FEC, retransmission, control traffic, and actual wire cost separately.
+- **Make progress measurable.** Compare application P95/P99, deadline misses, completion, goodput, and CPU under matched conditions.
 
-FEC 是恢复手段，不能消除拥塞或保证零丢包。聚合默认分发不同数据，全部复制属于单独的策略选择。
+The first network design uses **one end-to-end QUIC DATAGRAM connection per active path**, with Quinn as the candidate Rust implementation. QUIC provides authenticated encryption and connection-level congestion control; BraidPath owns cross-path coding and delivery. This is a planned architecture, separate from the current dependency-free core. See the [design decisions and release gates](docs/architecture.md).
 
-## 已经能运行什么
+## Run the foundation
 
-需要 Rust 1.85 或更新版本；当前核心没有第三方依赖。
+Rust 1.85 or newer; no third-party dependencies in the current crate.
 
 ```bash
 git clone https://github.com/LiuTangLei/braidpath.git
@@ -65,35 +65,26 @@ cargo test --all-targets --locked
 cargo run --locked --example loss_recovery
 ```
 
-示例在内存中建立“1 个客户端接口、3 个逻辑入口”的路径列表，发送四个不同的数据包与一个 XOR 修复包，主动丢弃一个数据包，再恢复全部四个包。路径分发只是轮询演示，没有实际网络收发。
+The example enumerates one interface and three logical entrances **in memory**, distributes four originals and one XOR repair symbol, omits one original, and recovers all four payloads. It opens no sockets and measures no latency.
 
-```text
-4/4 packets delivered; one erasure repaired without retransmission.
-Synthetic codec example only; no network performance claim.
-```
-
-| 能力 | 当前状态 |
+| Capability | Status |
 | --- | --- |
-| 系统式 XOR FEC，`k + 1` | 已实现；每块最多恢复一个数据包丢失 |
-| 原始包立即输出、短块按期限封块 | 已实现；调用方须驱动定时器 |
-| 不同长度数据包、乱序、重复包 | 已实现并测试；只在单块生命周期内去重 |
-| 单网卡 / 多网卡 × 多入口身份 | 已实现候选组合；尚未绑定真实网卡 |
-| UDP 网络收发、入口转发、双向会话 | 规划中 |
-| 自适应 FEC、多包恢复、滑动窗口 | 规划中 |
-| 路径测量、调度、拥塞控制、重传 | 规划中 |
-| 认证、加密、防重放、TCP/UDP 隧道 | 规划中 |
+| Systematic XOR `k + 1`, one missing original per block | Implemented |
+| Immediate encoder output and caller-driven deadline flush | Implemented |
+| Unequal lengths, reordering, per-block deduplication | Implemented |
+| Interface × entrance identifiers | Implemented; no OS binding yet |
+| Encrypted datagrams and authorized session joining | Planned |
+| Bidirectional relays and real interface binding | Planned |
+| Scheduling, redundancy budgets, adaptive FEC | Planned |
+| Session recovery, flow control, TCP/UDP adapters | Planned |
 
-当前 `k + 1` 编码器只提供机制基线，**不代表最终算法选择**。短块可能只有一个原始包，这时一个修复包就接近整包复制成本。还没有硬性冗余预算，也没有生产网络安全边界。
+The XOR codec is a baseline, not the final algorithm. It cannot generally recover a whole failed path. Sparse traffic creates short blocks with potentially high repair overhead. FEC does not eliminate congestion or guarantee delivery; reliable streams require additional recovery and flow control.
 
-## 从 Aggligator 学到什么
+## Inspiration
 
-我们借鉴 [Aggligator](https://github.com/remoc-rs/aggligator) 的多链路抽象、动态链路管理、统一交付与链路统计思路；这些能力会按本项目的 datagram-first 架构逐步实现。
+We draw inspiration from [Aggligator](https://github.com/remoc-rs/aggligator), especially its link abstraction, dynamic link lifecycle, and observability. BraidPath implements its own aggregation and recovery core.
 
-先前的实验 fork 名称包含 `kcp`，但那一轮工作实际关注通用链路聚合、UDP 与跨路径恢复，**不能据名称将其视为 KCP 项目**。BraidPath 独立建库，不继承旧仓库历史，不依赖 Aggligator 或 KCP，也不承诺兼容旧协议。
-
-测试记录与历史实验总结仅在本地保存。公开仓库保留代码、自动化测试和验证方法，不保存实验日志或基础设施明细。
-
-## 开发与参与
+## Development
 
 ```bash
 cargo fmt --all -- --check
@@ -101,6 +92,8 @@ cargo clippy --all-targets --locked -- -D warnings
 cargo test --all-targets --locked
 ```
 
-优先贡献可复现的场景、清楚定义的指标和小范围实现。后续网络版本从“单接口直连 → 单接口多入口 → 多接口多入口”逐步验收；不会直接把实验室机制测试称为公网可用。
+Start with small, reproducible changes and explicit acceptance criteria. The [roadmap](docs/roadmap.md) separates codec correctness, network integration, multipath behavior, performance, and deployment readiness.
 
-代码按 [Apache-2.0](LICENSE) 许可发布。来源和致谢见 [NOTICE](NOTICE)。
+Test records and run results stay local. The repository contains source code, automated tests, and validation methods. See [CONTRIBUTING.md](CONTRIBUTING.md).
+
+Licensed under [Apache-2.0](LICENSE). See [NOTICE](NOTICE) for attribution.

@@ -15,4 +15,4 @@ validation methods, not test reports. Do not commit secrets, private infrastruct
 details or raw captures.
 
 Contributions are accepted under Apache-2.0. Preserve the source and license of
-any incorporated third-party code. This repository is not a compatibility fork.
+any incorporated third-party code. Architecture and validation methods must distinguish implemented capabilities from planned behavior.

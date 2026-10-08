@@ -1,47 +1,73 @@
-# 路线图
+# Roadmap
 
-## M0 · 独立算法基础（本次初始提交）
+The stages below are ordered by dependency. Each stage produces a usable baseline or an explicit decision before increasing scope. Checked items describe the current source tree; unchecked items are future work. Run records remain local.
 
-- [x] 新仓库与新历史，Rust 小型核心。
-- [x] 单 / 多接口与多入口路径身份。
-- [x] 系统式 XOR FEC，原始包立即输出，按期限封块。
-- [x] 确定性丢包 / 乱序 / 重复测试及内存示例。
-- [x] 中英文 README、架构与验证规则、CI 配置。
+## M0 — Algorithm foundation
 
-## M1 · 可验证的单路径网络闭环
+- [x] Small independent Rust crate, English default README and Chinese translation.
+- [x] XOR `k+1` codec with immediate original emission and caller-driven block deadline.
+- [x] Bounded per-block decode state and deterministic erasure/reordering/duplicate cases.
+- [x] Interface–entrance identity model and in-memory example.
+- [x] Architecture, validation methods and cross-platform codec CI.
 
-- [ ] 明确 wire format、端到端身份认证、加密与防重放方案。
-- [ ] client / server UDP datagram 收发、MTU 预算、显式定时器。
-- [ ] 有界会话 / block 缓存与过期清理；FEC 与补发的交互。
-- [ ] 拥塞控制和 pacing 基础；真实 wire 开销统计。
-- [ ] 单接口双向 loopback 与可控丢包测试，校验完整性。
+**Boundary:** no wire protocol, sockets, session-wide deduplication, scheduler, security or network-performance acceptance.
 
-验收：单路径网络环境能可靠、受控地收发；FEC 恢复机制与公网性能结论分开。
+## M1 — Secure single-path datagrams
 
-## M2 · 同城多入口与客户端多接口
+- [ ] Freeze the first bounded wire format: session epoch, direction, data/flow IDs, source/repair metadata, limits and version negotiation.
+- [ ] Select/pin Quinn and TLS dependencies; verify supported Rust versions and platforms.
+- [ ] Implement authenticated session admission with operator-managed credentials and 0-RTT disabled.
+- [ ] Build minimal client/server CLI for QUIC DATAGRAM echo and load generation; FEC-off first, then XOR with canonical records.
+- [ ] Implement timer-driven block closing, path-size checks, bounded send/receive queues, expiry and session deduplication.
+- [ ] Separate original arrivals, FEC recovery and application acceptance in feedback and counters.
 
-- [ ] 授权 relay → 固定主服务器，双向路径关联及资源限制。
-- [ ] 操作系统实际接口绑定与路由核验，不以源 IP 参数替代验收。
-- [ ] 路径探测、动态加入 / 退出、故障恢复、逐路径统计。
-- [ ] 基于实际测量的调度与跨路径恢复；检查共享瓶颈。
-- [ ] 按 1×1、1×3、2×1、2×3 逐级通过上下行完整性测试。
+**Exit gate:** the single-path checks in the [validation plan](validation.md#2-secure-single-path-gate) pass under bounded packet-level impairment. The service is explicitly unreliable datagrams with optional FEC. No custom reliable byte-stream claim yet.
 
-验收：真实流量经过预期接口和入口，路径故障可恢复，差路径不会无限堆积数据。
+**Do not advance if:** authentication, queue behavior, metadata validation or MTU adaptation cannot be demonstrated. Resolve the adapter/runtime choice before adding more paths.
 
-## M3 · 降低尾延迟
+## M2 — Real interfaces and bidirectional relay entrances
 
-- [ ] 对比 XOR、小块多擦除码和滑动窗口码。
-- [ ] 有上限的主动冗余预算；稀疏流、突发丢包、共享瓶颈测试。
-- [ ] 需要时增加延迟副本；用测量决定是否值得保留。
-- [ ] 多轮成对报告 P95/P99、完成率、goodput、wire 成本与 CPU。
+- [ ] Integrate a standard authenticated TURN/UDP relay; restrict peers to the main server and test refresh, quotas and return routing.
+- [ ] Implement Quinn's relay socket adapter with correct datagram boundaries, PMTU accounting and batching behavior.
+- [ ] Bind actual client interfaces on Linux first; validate macOS and Windows independently.
+- [ ] Add session joins, path generations, bounded reconnection and control-operation replay across surviving paths.
+- [ ] Add a simple observable scheduler, per-direction feedback, bounded per-path workers, aggregate pacing and explicit bottleneck-group caps.
+- [ ] Validate 1×1 → 1×3 → 2×1 → 2×3, including single-interface operation, relay-only operation and path/relay outages.
 
-验收：在明确场景和相同资源约束下证明收益，同时公开退化场景。
+**Exit gate:** native captures prove both directions use the requested interface/entrance; queues and state remain bounded; the multi-entrance shared-bottleneck competition test passes for the enabled policy. Datagram loss during outage remains visible.
 
-## M4 · 可用工具
+**Do not advance if:** path identity collapses at a relay, binding silently uses another route, or multiple entrances merely win by increasing their share of a common bottleneck. Keep one active data path per affected group while resolving it.
 
-- [ ] 客户端 / 主服务器 / 中继 CLI 与配置。
-- [ ] UDP tunnel 和可靠流适配；TCP 转发。
-- [ ] 可观测性、安装包、运维文档与升级策略。
-- [ ] Linux / macOS / Windows 实际网络与接口验收。
+## M3 — Budgeted recovery and measured scheduling
 
-TUN、移动平台、额外传输封装按明确需求再排期，不进入第一版核心。
+- [ ] Introduce byte-accounted active-redundancy limits before increasing parity or adding copies.
+- [ ] Measure completion-cost scheduling against the simple M2 baseline; keep path probing bounded.
+- [ ] Compare XOR with small-block multi-erasure coding; evaluate sliding windows only if block delay or burst loss justifies them.
+- [ ] Handle sparse traffic, correlated losses, unequal RTTs and packet packing explicitly.
+- [ ] Add delayed copies only as a separately measured, budgeted policy.
+- [ ] Meet the applicable datagram, capacity, fairness and resource gates in both directions; record negative scenarios locally too.
+
+**Exit gate:** useful delivery improves in the stated scenarios within the same total resource envelope. The selected default remains simple when an optimization fails its gate.
+
+**Boundary:** lower mean RTT or a higher FEC recovery count alone does not establish lower application tail latency.
+
+## M4 — Reliable flows and application adapters
+
+- [ ] Selective application ACKs, bounded retransmission and receiver credit, without synthesizing QUIC ACKs for FEC recovery.
+- [ ] Per-flow offsets, reassembly bounds, FIN/final-offset acknowledgment, reset and half-close.
+- [ ] Session survival while paths remain, bounded all-path reconnect and explicit terminal failure.
+- [ ] UDP forwarding with clear maximum-message behavior, followed by TCP forwarding on the reliable-flow service.
+- [ ] Compare FEC with the no-FEC reliable baseline; verify bytes, completion, timeout rates and latency under bulk/interactive coexistence.
+
+**Exit gate:** reliable-stream correctness and the selected latency/goodput targets pass. A UDP delivery metric cannot substitute for this gate.
+
+## M5 — Deployment readiness
+
+- [ ] Stable client/server CLI and relay provisioning instructions, configuration validation and wire-version policy.
+- [ ] Credential lifecycle, destination authorization, quotas and bounded resource behavior during hostile or accidental overload.
+- [ ] Native Linux/macOS/Windows network acceptance, installation packages and operator metrics.
+- [ ] Sustained operation, restart/upgrade/shutdown behavior and reproducible performance acceptance for supported deployment profiles.
+
+**Exit gate:** operators can deploy a documented, authenticated topology and recognize unsupported or degraded conditions without relying on private implementation knowledge.
+
+Automatic shared-bottleneck detection and coupled congestion control are separate research tracks. TUN, mobile packaging, custom raw UDP transport, additional wrappers and general fragmentation are deferred until a concrete need justifies them. No stage depends on these research features to deliver its baseline.
