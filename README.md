@@ -52,7 +52,7 @@ Entrance count is not independent capacity. Paths may share the last mile, trans
 - **Spend redundancy deliberately.** Measure FEC, retransmission, control traffic, and actual wire cost separately.
 - **Make progress measurable.** Compare application P95/P99, deadline misses, completion, goodput, and CPU under matched conditions.
 
-The first network design uses **one end-to-end QUIC DATAGRAM connection per active path**, with Quinn as the candidate Rust implementation. QUIC provides authenticated encryption and connection-level congestion control; BraidPath owns cross-path coding and delivery. This is a planned architecture, separate from the current dependency-free core. See the [design decisions and release gates](docs/architecture.md).
+The first engineering baseline uses **one end-to-end QUIC DATAGRAM connection per active path**, with Quinn as the candidate Rust implementation. QUIC provides authenticated encryption and connection-level congestion control; BraidPath owns cross-path coding and delivery. **This is not a censorship-resistance claim or a finalized cross-border transport default.** The aggregate core remains independent of the path carrier; GFW-affected deployments require separate reachability validation of the complete on-wire profile. This is a planned architecture, separate from the current dependency-free core. See the [design decisions and release gates](docs/architecture.md).
 
 ## Run the foundation
 

@@ -44,6 +44,19 @@ Capture on the selected physical interfaces and on both sides of each relay to p
 
 Inject full path failure, relay restart and shared backhaul failure. Verify that surviving paths continue, stale generations are rejected and all-path failure is bounded. For unreliable service, report the resulting losses; claim lossless failover only after the reliable-stream gate passes.
 
+### Deployment reachability gate
+
+For GFW-affected or otherwise filtered deployments, validate the complete on-wire profile separately from loss recovery. Laboratory impairment and localhost tests cannot establish censorship resistance.
+
+- Compare standard QUIC and any proposed secure carrier/encapsulation on the intended access networks, with authorized endpoints. Low-volume UDP reachability probes are a diagnostic baseline, not a deployable protocol.
+- Record ISP/access type, direction, endpoint profile, packet-size range, time window, handshake success/time, sustained useful traffic, idle/reconnect behavior and repeatability. Use multiple time windows and relevant access networks before making a deployment-specific claim.
+- Distinguish failure to establish, failure after establishment, partial throughput, ordinary queue loss and persistent unreachability. Collect evidence at both endpoints. A failed probe alone is not proof that the GFW caused it; check routing, NAT, host firewall and provider policy too.
+- Count unsuccessful connections and full-route outages in availability results. FEC recovery rates among surviving sessions cannot hide establishment failures.
+- Test direct and relayed profiles independently. Include encapsulation overhead, handshake/control traffic and return-path behavior. A TURN allocation's success is not evidence that subsequent end-to-end traffic remains usable.
+- Preserve endpoint authentication and configured rate/resource bounds. State the observation scope and date; do not extrapolate a temporary success into durable censorship resistance or probe resistance.
+
+For a claimed deployment profile, the operator must specify required establishment success, sustained availability and reconnect time before comparison. Select no cross-border default until repeated observations meet those requirements. Keep all measurements and infrastructure details local.
+
 ## 4. A staged impairment matrix
 
 Avoid starting with a huge Cartesian product. Run each mechanism alone, then selected interactions, then randomized stress.

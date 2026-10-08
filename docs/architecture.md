@@ -17,9 +17,9 @@ The topology is implementable: independently reachable client–entrance paths c
 
 For independent original/repair symbol erasures with probability `p`, a full XOR `k+1` block leaves a particular original unrecovered with probability `p × [1 − (1 − p)^k]`. This is an analytical model, not a performance result. Correlated loss, packet packing, variable sizes, and deadlines invalidate its simplifying assumptions.
 
-## 2. Transport decision: encrypted unreliable paths
+## 2. Engineering baseline: encrypted unreliable paths
 
-Use **one end-to-end QUIC connection per active interface–entrance pair**, carrying application data and repair symbols in DATAGRAM frames. Quinn is the candidate Rust runtime. This requires neither kernel multipath support nor a Multipath QUIC extension.
+For the first engineering baseline, use **one end-to-end QUIC connection per active interface–entrance pair**, carrying application data and repair symbols in DATAGRAM frames. Quinn is the candidate Rust runtime. This requires neither kernel multipath support nor a Multipath QUIC extension. The QUIC-specific choices below describe this baseline, not mandatory internals of the aggregate core or a finalized cross-border deployment profile.
 
 QUIC DATAGRAM preserves unreliable delivery while sharing QUIC's security and congestion control. Its data is not automatically retransmitted. Small reliable streams carry session setup and infrequent control operations; bulk payload and time-sensitive receipt reports remain datagrams. These are protocol capabilities, not a claim that FEC defeats congestion. [RFC 9221, sections 5–6](https://www.rfc-editor.org/rfc/rfc9221.html#section-5)
 
@@ -33,7 +33,21 @@ Responsibilities are explicit:
 | Application adapter | Datagram deadlines or ordered byte-stream semantics, authorized destination mapping |
 | Relay | Authorized forwarding allocation and return mapping; no application decryption |
 
-A raw UDP implementation would also need a secure handshake, congestion controller, pacing and loss feedback. Defer it until measurements expose a specific limitation of the selected transport. Do not replace DATAGRAM payloads with reliable per-path streams: that would add an independent retransmission/ordering layer beneath aggregate recovery.
+A custom carrier over UDP would also need a secure handshake, congestion controller, pacing and loss feedback. Retain it as a candidate when deployment reachability or measured runtime limitations justify that engineering cost; do not assume it is more reachable merely because it is not QUIC. Do not replace DATAGRAM payloads with reliable per-path streams: that would add an independent retransmission/ordering layer beneath aggregate recovery.
+
+### Reachability under filtering and censorship
+
+QUIC DATAGRAM is carried over UDP and still establishes a QUIC connection. Choosing DATAGRAM changes payload delivery semantics; it does not disguise the handshake or turn a custom application into ordinary HTTP/3 traffic. QUIC Initial protection is observable by on-path parties; it does not provide the secrecy of established traffic keys. [RFC 9001, sections 5 and 7](https://www.rfc-editor.org/rfc/rfc9001.html#section-5)
+
+Research published in 2025 measured GFW inspection of QUIC Initial packets and SNI-based blocking, including residual UDP blocking in the studied conditions. This establishes a deployment risk, not a prediction of every current route. [USENIX Security 2025 study](https://gfw.report/publications/usenixsecurity25/en/)
+
+Keep three decisions separate: aggregate recovery/scheduling, secure congestion-controlled datagram transport, and the externally visible carrier/encapsulation. The aggregate core consumes authenticated records and bounded path observations; it must not depend on Quinn types, TLS certificate APIs or QUIC packet numbers. A different carrier must provide equivalent authentication, resource and congestion guarantees. Do not disable identity verification to improve handshake success.
+
+Standard QUIC, a separately evaluated datagram-preserving outer carrier, and a custom authenticated UDP transport are candidates, not preselected censorship solutions. Raw UDP probes diagnose basic reachability only. TURN allocation/authentication does not prove censorship resistance either. Any wrapper changes MTU, wire cost, queueing and possibly delivery semantics, and must be evaluated as a complete profile. If a reliable outer stream is used for reachability, expose it as a distinct mode and re-evaluate ordering delay; do not transfer the datagram baseline's latency claims to it.
+
+FEC helps when enough symbols arrive. It cannot recover a consistently blocked handshake or a route that drops every usable symbol. Co-located entrances may also share filtering policies, so route count is not censorship independence.
+
+Before selecting a cross-border default, pass the [deployment reachability gate](validation.md#deployment-reachability-gate) on the intended networks. No current BraidPath test establishes GFW reachability or resistance to active probing. This gate precedes deployment selection; performance-only success cannot waive it.
 
 ## 3. Session, path and data identity
 
@@ -99,7 +113,7 @@ Sparse traffic exposes a real trade-off: closing every one-packet block with par
 
 ## 7. Relay and interface integration
 
-The reference authenticated relay route is **TURN over UDP** using an existing TURN server, with one allocation per client path and peer permission for the main server. A client adapter exposes the relayed datagrams to Quinn; QUIC still terminates at the main server. Allocation/channel refresh, idle timeouts and return mapping are mandatory. TURN over TCP/TLS is outside the initial low-latency baseline because a reliable outer stream can introduce ordering delays. [RFC 8656](https://www.rfc-editor.org/rfc/rfc8656.html)
+For the QUIC engineering baseline, the reference authenticated relay route is **TURN over UDP** using an existing TURN server, with one allocation per client path and peer permission for the main server. A client adapter exposes the relayed datagrams to Quinn; QUIC still terminates at the main server. Allocation/channel refresh, idle timeouts and return mapping are mandatory. TURN over TCP/TLS is outside the initial low-latency baseline because a reliable outer stream can introduce ordering delays. [RFC 8656](https://www.rfc-editor.org/rfc/rfc8656.html)
 
 Restrict relay destinations at the server to the configured main server, with host firewall enforcement for the intended UDP port. TURN permissions alone are per IP, not a port allowlist. Bound allocations, per-client bandwidth and idle lifetime. Test wrong credentials, forbidden destinations, expiry and rebinding. An unauthenticated transparent UDP forwarder is useful on loopback or a restricted lab network only; it is not the public deployment design.
 
@@ -123,6 +137,6 @@ Negotiate and enforce limits for paths, flows, active blocks, symbols, pending b
 
 ## 9. What still has to be demonstrated
 
-The architecture has a practical implementation route, but runtime selection is gated on bounded queue behavior, TURN adapter feasibility and real interface binding. Performance acceptance additionally requires shared-bottleneck competition, correlated loss, sparse traffic, CPU cost and both directions. Neither a successful codec test nor a local encrypted-path probe proves those properties.
+The architecture has a practical implementation route, but runtime selection is gated on bounded queue behavior, TURN adapter feasibility and real interface binding. Cross-border carrier selection additionally requires deployment reachability evidence; QUIC and TURN remain provisional for that environment. Performance acceptance additionally requires shared-bottleneck competition, correlated loss, sparse traffic, CPU cost and both directions. Neither a successful codec test nor a local encrypted-path probe proves those properties.
 
 The [validation plan](validation.md) defines those gates. Test records and feasibility-probe outputs stay local; this document contains design decisions and methods only.

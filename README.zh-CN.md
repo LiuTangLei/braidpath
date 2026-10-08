@@ -89,7 +89,7 @@ Synthetic codec example only; no network performance claim.
 
 我们借鉴 [Aggligator](https://github.com/remoc-rs/aggligator) 的多链路抽象、动态链路管理、统一交付与链路统计思路；这些能力会按本项目的 datagram-first 架构逐步实现。
 
-BraidPath 独立实现聚合与修复核心；第一条网络路线计划使用 QUIC DATAGRAM 承载每条路径，复用认证加密和拥塞控制，FEC 在聚合层工作。该网络路线尚未实现。
+BraidPath 独立实现聚合与修复核心；第一条工程验证基线计划使用 QUIC DATAGRAM，复用认证加密和拥塞控制，FEC 在聚合层工作。**这不代表具备抗封锁能力，也没有确定跨境部署的默认传输。** 聚合核心与路径承载分离，涉及 GFW 的部署必须另外验证完整线协议的可达性。该网络路线尚未实现。
 
 架构、验证计划与路线图使用英文维护。测试记录与运行结果仅在本地保存，仓库保留自动化测试代码和验证方法。
 

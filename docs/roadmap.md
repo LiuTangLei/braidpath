@@ -15,7 +15,9 @@ The stages below are ordered by dependency. Each stage produces a usable baselin
 ## M1 — Secure single-path datagrams
 
 - [ ] Freeze the first bounded wire format: session epoch, direction, data/flow IDs, source/repair metadata, limits and version negotiation.
-- [ ] Select/pin Quinn and TLS dependencies; verify supported Rust versions and platforms.
+- [ ] Select/pin Quinn and TLS dependencies for the engineering baseline; verify supported Rust versions and platforms.
+- [ ] Keep the aggregate core independent of the carrier; define authenticated-record, size, bounded-send and observation contracts.
+- [ ] For intended filtered/cross-border deployments, start the reachability comparison before selecting a default carrier; QUIC and TURN are provisional profiles.
 - [ ] Implement authenticated session admission with operator-managed credentials and 0-RTT disabled.
 - [ ] Build minimal client/server CLI for QUIC DATAGRAM echo and load generation; FEC-off first, then XOR with canonical records.
 - [ ] Implement timer-driven block closing, path-size checks, bounded send/receive queues, expiry and session deduplication.
@@ -23,7 +25,7 @@ The stages below are ordered by dependency. Each stage produces a usable baselin
 
 **Exit gate:** the single-path checks in the [validation plan](validation.md#2-secure-single-path-gate) pass under bounded packet-level impairment. The service is explicitly unreliable datagrams with optional FEC. No custom reliable byte-stream claim yet.
 
-**Do not advance if:** authentication, queue behavior, metadata validation or MTU adaptation cannot be demonstrated. Resolve the adapter/runtime choice before adding more paths.
+**Do not advance if:** authentication, queue behavior, metadata validation or MTU adaptation cannot be demonstrated. Resolve the adapter/runtime choice before adding more paths. Controlled-network development can continue while field measurements are pending, but cannot establish or finalize a cross-border deployment default.
 
 ## M2 — Real interfaces and bidirectional relay entrances
 
@@ -63,6 +65,7 @@ The stages below are ordered by dependency. Each stage produces a usable baselin
 
 ## M5 — Deployment readiness
 
+- [ ] Pass the deployment reachability gate for every claimed filtered/cross-border profile; no inference from encryption, port choice or FEC alone.
 - [ ] Stable client/server CLI and relay provisioning instructions, configuration validation and wire-version policy.
 - [ ] Credential lifecycle, destination authorization, quotas and bounded resource behavior during hostile or accidental overload.
 - [ ] Native Linux/macOS/Windows network acceptance, installation packages and operator metrics.
@@ -70,4 +73,4 @@ The stages below are ordered by dependency. Each stage produces a usable baselin
 
 **Exit gate:** operators can deploy a documented, authenticated topology and recognize unsupported or degraded conditions without relying on private implementation knowledge.
 
-Automatic shared-bottleneck detection and coupled congestion control are separate research tracks. TUN, mobile packaging, custom raw UDP transport, additional wrappers and general fragmentation are deferred until a concrete need justifies them. No stage depends on these research features to deliver its baseline.
+Automatic shared-bottleneck detection and coupled congestion control are separate research tracks. TUN, mobile packaging and general fragmentation are deferred until a concrete need justifies them. A different secure UDP carrier or outer encapsulation moves into the deployment track when reachability requires it; it must retain authentication, congestion and bounded-resource guarantees. The controlled-network baseline does not depend on these additional features, but cannot substitute for deployment-specific reachability acceptance.
