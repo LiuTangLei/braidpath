@@ -176,6 +176,20 @@ impl Decoder {
         }
     }
 
+    /// Observation only; accepting an identical already-held symbol emits no delivery.
+    pub(crate) fn is_duplicate(&self, shard: &Shard) -> bool {
+        match shard {
+            Shard::Data { index, payload, .. } => self
+                .data
+                .get(usize::from(*index))
+                .is_some_and(|p| p.as_ref() == Some(payload)),
+            Shard::Repair { count, coded, .. } => self
+                .repair
+                .as_ref()
+                .is_some_and(|p| p.0 == *count && p.1 == *coded),
+        }
+    }
+
     /// Each original/recovered packet is returned once during this block's life.
     pub fn receive(&mut self, shard: Shard) -> Result<Vec<Delivery>, Error> {
         if shard.block() != self.block {

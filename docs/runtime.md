@@ -94,3 +94,7 @@ The wire profile is experimental and may change before release. The aggregate ru
 Relay `--drop-every N` deterministically drops every Nth permitted incoming UDP packet, including handshake/control traffic. It is a diagnostic packet-loss injector, not an independent random-loss model or a symmetric impairment model. Do not infer FEC benefit from a single run. Compare FEC-off/on, best single entrance and aggregation at the same application load and total budget, count both directions and backhaul cost, and include unequal RTTs, shared bottlenecks and outages. Follow the broader [validation gates](validation.md).
 
 Test settings, credentials, private topology, raw captures and run results stay in ignored local directories. This runtime does not establish a GFW-resistant default: stock Quinn fingerprints, TCP website parity/fallback, independent-peer interoperability and sustained deployment acceptance remain open.
+
+## Machine-readable counters
+
+Client, server and relay support `--stats-file` for final JSON and optional `--stats-jsonl` / `--stats-interval-ms` for cumulative periodic samples. Readiness and failures are included so benchmarks can stop parsing logs. [Statistics schema and conservation boundaries](statistics.md) distinguish logical records, aggregate symbols, QUIC packets and relay datagrams. Run records belong under ignored `local/`.

@@ -155,6 +155,9 @@ pub struct Receiver {
     highest_block: u64,
     delivered: BTreeSet<u64>,
     highest_message: u64,
+    pub original_packets: u64,
+    pub repair_packets: u64,
+    pub stale: u64,
     pub originals: u64,
     pub recovered: u64,
     pub duplicates: u64,
@@ -163,12 +166,18 @@ pub struct Receiver {
 impl Receiver {
     pub fn receive(&mut self, b: &[u8], now: Instant) -> Result<Vec<Record>> {
         let decoded = decode(b)?;
+        if matches!(decoded, Some(Shard::Repair { .. })) {
+            self.repair_packets += 1;
+        } else {
+            self.original_packets += 1;
+        }
         let deliveries = if let Some(s) = decoded {
             let block = s.block();
             self.highest_block = self.highest_block.max(block);
             let floor = self.highest_block.saturating_sub(BLOCK_WINDOW - 1);
             self.blocks.retain(|k, _| *k >= floor);
             if block < floor {
+                self.stale += 1;
                 return Ok(Vec::new());
             }
             for slot in self.blocks.values_mut() {
@@ -184,13 +193,19 @@ impl Receiver {
                 .entry(block)
                 .or_insert_with(|| Some((Decoder::new(block), now)));
             let Some((decoder, _)) = slot else {
+                self.stale += 1;
                 return Ok(Vec::new());
             };
+            let duplicate = decoder.is_duplicate(&s);
             match decoder.receive(s) {
-                Ok(v) => v
-                    .into_iter()
-                    .map(|d| (d.payload, d.recovered))
-                    .collect::<Vec<_>>(),
+                Ok(v) => {
+                    if duplicate {
+                        self.duplicates += 1;
+                    }
+                    v.into_iter()
+                        .map(|d| (d.payload, d.recovered))
+                        .collect::<Vec<_>>()
+                }
                 Err(e) => {
                     *slot = None;
                     return Err(e.into());
@@ -271,6 +286,8 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+        assert_eq!(rx.duplicates, 1);
+        assert_eq!(rx.original_packets, 4);
         assert!(
             out.iter()
                 .all(|r| r.flow == 7 && r.payload == vec![r.id as u8; 17])

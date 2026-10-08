@@ -1,5 +1,7 @@
 use super::{
-    MAX_PATHS, MAX_PAYLOAD, QUEUE, transport,
+    MAX_PATHS, MAX_PAYLOAD, QUEUE,
+    stats::{self, Scope},
+    transport,
     wire::{self, Receiver, Record},
 };
 use crate::fec::Encoder;
@@ -65,56 +67,84 @@ type Paths = Arc<Mutex<Vec<OutPath>>>;
 struct Pending {
     data: Bytes,
     created: Instant,
+    ingress_created: Instant,
+    record_id: Option<u64>,
+}
+struct QueuedRecord {
+    record: Record,
+    created: Instant,
 }
 
 /// One owner for the aggregate encoder, budget, pacer and all datagram queues.
 async fn sender(
-    mut input: mpsc::Receiver<Record>,
+    mut input: mpsc::Receiver<QueuedRecord>,
     paths: Paths,
     policy: Policy,
     mut stop: watch::Receiver<bool>,
+    metrics: Scope,
 ) {
     let mut encoder = Encoder::new(policy.fec.max(1), Duration::from_millis(policy.block_ms))
         .expect("validated policy");
     let mut queue = VecDeque::<Pending>::new();
     let mut credit = 0usize;
     let mut cursor = 0usize;
-    let mut sent = 0u64;
-    let mut drops = 0u64;
-    let mut repairs = 0u64;
-    let mut skipped = 0u64;
     let mut tokens = 0f64;
     let mut last = Instant::now();
     let mut tick = interval(Duration::from_millis(1));
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    let enqueue = |data: Bytes, queue: &mut VecDeque<Pending>, drops: &mut u64| {
+    let enqueue = |data: Bytes, ingress_created: Instant, queue: &mut VecDeque<Pending>| {
+        let id = if data[3] != 1 {
+            wire::Record::decode(&data[wire::HEADER..])
+                .ok()
+                .map(|r| r.id)
+        } else {
+            None
+        };
+        metrics.update(|d| {
+            if let Some(id) = id {
+                d.generated_record_ids.add(id);
+            }
+            if queue.len() < QUEUE {
+                if id.is_some() {
+                    d.symbols.originals_enqueued += 1;
+                } else {
+                    d.symbols.repairs_enqueued += 1;
+                }
+            } else if id.is_some() {
+                d.symbols.originals_queue_full_dropped += 1;
+                d.locally_dropped_original_ids.add(id.expect("original id"));
+            } else {
+                d.symbols.repairs_queue_full_dropped += 1;
+            }
+        });
         if queue.len() < QUEUE {
             queue.push_back(Pending {
                 data,
                 created: Instant::now(),
+                ingress_created,
+                record_id: id,
             });
-        } else {
-            *drops += 1;
         }
     };
-    let mut add = |s: crate::fec::Shard,
-                   queue: &mut VecDeque<Pending>,
-                   drops: &mut u64,
-                   credit: &mut usize| {
+    let add = |s: crate::fec::Shard,
+               ingress_created: Instant,
+               queue: &mut VecDeque<Pending>,
+               credit: &mut usize| {
         let repair = matches!(s, crate::fec::Shard::Repair { .. });
         let data = wire::shard(s);
         if repair {
+            metrics.update(|d| d.symbols.repairs_generated += 1);
             if *credit < data.len() * 100 {
-                skipped += 1;
+                metrics.update(|d| d.symbols.repairs_budget_skipped += 1);
                 return;
             }
             *credit -= data.len() * 100;
-            repairs += 1;
         } else {
+            metrics.update(|d| d.symbols.originals_generated += 1);
             *credit = (*credit + data.len() * usize::from(policy.redundancy))
                 .min(2 * wire::MAX_WIRE * 100);
         }
-        enqueue(data, queue, drops);
+        enqueue(data, ingress_created, queue);
     };
     loop {
         if *stop.borrow() {
@@ -123,16 +153,15 @@ async fn sender(
         tokio::select! {
             biased;
             _=stop.changed()=>break,
-            _=tick.tick()=>{
-                if policy.fec>0&& let Some(s)=encoder.flush_due(Instant::now()){add(s,&mut queue,&mut drops,&mut credit);}
-            },
-            record=input.recv()=>{
-                let Some(record)=record else{break};
+            _=tick.tick()=>{ if policy.fec>0 && let Some(s)=encoder.flush_due(Instant::now()){add(s,Instant::now(),&mut queue,&mut credit);} },
+            queued=input.recv()=>{
+                let Some(QueuedRecord{record,created})=queued else{break};
+                metrics.update(|d| d.records.sender_input_consumed+=1);
                 if policy.fec==0 {
-                    match wire::plain(&record) {Ok(data)=>enqueue(data,&mut queue,&mut drops),Err(_)=>drops+=1}
-                }else if let Ok(data)=record.encode() {
-                    match encoder.push(&data,Instant::now()) {Ok(shards)=>for s in shards {add(s,&mut queue,&mut drops,&mut credit)},Err(_)=>drops+=1}
-                }else{drops+=1;}
+                    match wire::plain(&record) {Ok(data)=>{metrics.update(|d|d.symbols.originals_generated+=1);enqueue(data,created,&mut queue)},Err(_)=>metrics.update(|d|d.records.encoding_dropped+=1)}
+                } else if let Ok(data)=record.encode() {
+                    match encoder.push(&data,Instant::now()){Ok(shards)=>for s in shards{add(s,created,&mut queue,&mut credit)},Err(_)=>metrics.update(|d|d.records.encoding_dropped+=1)}
+                } else {metrics.update(|d|d.records.encoding_dropped+=1);}
             }
         }
         let now = Instant::now();
@@ -141,11 +170,20 @@ async fn sender(
         last = now;
         while let Some(front) = queue.front() {
             if now.duration_since(front.created) > Duration::from_millis(policy.queue_ms) {
-                queue.pop_front();
-                drops += 1;
+                let expired = queue.pop_front().expect("front");
+                metrics.update(|d| {
+                    if let Some(id) = expired.record_id {
+                        d.symbols.originals_expired_dropped += 1;
+                        d.locally_dropped_original_ids.add(id);
+                    } else {
+                        d.symbols.repairs_expired_dropped += 1;
+                    }
+                    d.symbols
+                        .expiry_wait
+                        .add(now.duration_since(expired.ingress_created));
+                });
                 continue;
             }
-            // Includes an allowance for QUIC, UDP and IP headers; capture actual cost separately.
             let cost = (front.data.len() + 80) as f64;
             if tokens < cost {
                 break;
@@ -170,12 +208,23 @@ async fn sender(
                         continue;
                     }
                     if path.conn.datagram_send_buffer_space() < data.len() {
+                        metrics.path(path.id, |p| p.send_buffer_full_attempts += 1);
                         continue;
                     }
-                    if path.conn.send_datagram(data).is_ok() {
-                        cursor = (i + 1) % p.len();
-                        admitted = true;
-                        break;
+                    match path.conn.send_datagram(data) {
+                        Ok(()) => {
+                            metrics.path(path.id, |p| {
+                                if front.record_id.is_some() {
+                                    p.quinn_admitted_originals += 1;
+                                } else {
+                                    p.quinn_admitted_repairs += 1;
+                                }
+                            });
+                            cursor = (i + 1) % p.len();
+                            admitted = true;
+                            break;
+                        }
+                        Err(_) => metrics.path(path.id, |p| p.quinn_send_error_attempts += 1),
                     }
                 }
             }
@@ -183,16 +232,114 @@ async fn sender(
                 break;
             }
             tokens -= cost;
-            sent += 1;
-            queue.pop_front();
+            let sent = queue.pop_front().expect("front");
+            metrics.update(|d| {
+                if let Some(id) = sent.record_id {
+                    d.symbols.originals_quinn_admitted += 1;
+                    d.quinn_admitted_record_ids.add(id);
+                } else {
+                    d.symbols.repairs_quinn_admitted += 1;
+                }
+                d.symbols
+                    .admitted_wait
+                    .add(now.duration_since(sent.ingress_created));
+            });
         }
     }
-    info!(sent, drops, repairs, skipped, "aggregate sender stopped");
+    for pending in queue {
+        metrics.update(|d| {
+            if let Some(id) = pending.record_id {
+                d.symbols.originals_shutdown_dropped += 1;
+                d.locally_dropped_original_ids.add(id);
+            } else {
+                d.symbols.repairs_shutdown_dropped += 1;
+            }
+        });
+    }
+    input.close();
+    while input.try_recv().is_ok() {
+        metrics.update(|d| d.records.input_shutdown_dropped += 1);
+    }
+    info!("aggregate sender stopped");
+}
+
+#[derive(Clone, Copy)]
+enum QueueLayer {
+    Ingress,
+    Sender,
+    Receiver,
+}
+fn queue_error<T>(
+    scope: &Scope,
+    layer: QueueLayer,
+    error: &mpsc::error::TrySendError<T>,
+    pid: Option<u8>,
+) {
+    let closed = matches!(error, mpsc::error::TrySendError::Closed(_));
+    scope.update(|d| match (layer, closed) {
+        (QueueLayer::Ingress, false) => d.records.ingress_queue_full_dropped += 1,
+        (QueueLayer::Ingress, true) => d.records.ingress_queue_closed_dropped += 1,
+        (QueueLayer::Sender, false) => d.records.sender_queue_full_dropped += 1,
+        (QueueLayer::Sender, true) => d.records.sender_queue_closed_dropped += 1,
+        (QueueLayer::Receiver, false) => d.records.receiver_queue_full_dropped += 1,
+        (QueueLayer::Receiver, true) => d.records.receiver_queue_closed_dropped += 1,
+    });
+    if let Some(pid) = pid {
+        scope.path(pid, |p| {
+            if closed {
+                p.receiver_queue_closed_dropped += 1;
+            } else {
+                p.receiver_queue_full_dropped += 1;
+            }
+        });
+    }
+}
+
+fn receive_records(decoder: &mut Receiver, metrics: &Scope, pid: u8, data: &[u8]) -> Vec<Record> {
+    let before = (
+        decoder.original_packets,
+        decoder.originals,
+        decoder.recovered,
+        decoder.duplicates,
+        decoder.stale,
+    );
+    let repairs_before = decoder.repair_packets;
+    let result = decoder.receive(data, Instant::now());
+    let invalid = u64::from(result.is_err());
+    if invalid > 0 {
+        decoder.invalid += 1;
+    }
+    let delta = (
+        decoder.original_packets - before.0,
+        decoder.originals - before.1,
+        decoder.recovered - before.2,
+        decoder.duplicates - before.3,
+        decoder.stale - before.4,
+    );
+    metrics.update(|d| {
+        d.records.repair_symbols_received += decoder.repair_packets - repairs_before;
+        d.records.original_packets_received += delta.0;
+        d.records.original_records_delivered += delta.1;
+        d.records.fec_records_recovered += delta.2;
+        d.records.deduplicated += delta.3;
+        d.records.stale_symbols_dropped += delta.4;
+        d.records.invalid_symbols_dropped += invalid;
+    });
+    metrics.path(pid, |p| {
+        p.repair_symbols_received += decoder.repair_packets - repairs_before;
+        p.original_packets_received += delta.0;
+        p.original_records_delivered += delta.1;
+        p.fec_records_recovered += delta.2;
+        p.deduplicated += delta.3;
+        p.stale_symbols_dropped += delta.4;
+        p.invalid_symbols_dropped += invalid;
+    });
+    result.unwrap_or_default()
 }
 
 enum Event {
-    Wire(Bytes),
-    Reply(u32, Vec<u8>),
+    Wire(u8, Bytes),
+    Reply(u32, Vec<u8>, Instant),
 }
 struct Session {
     events: mpsc::Sender<Event>,
@@ -200,6 +347,10 @@ struct Session {
     stop: watch::Sender<bool>,
     policy: Policy,
     ingress_drops: Arc<AtomicU64>,
+    forward: Scope,
+    returning: Scope,
+    finished: tokio::sync::Notify,
+    done: std::sync::atomic::AtomicBool,
 }
 type Sessions = Arc<Mutex<HashMap<String, Arc<Session>>>>;
 
@@ -215,6 +366,7 @@ async fn session_loop(
         session.paths.clone(),
         session.policy.clone(),
         session.stop.subscribe(),
+        session.returning.clone(),
     ));
     let mut stop = session.stop.subscribe();
     let mut decoder = Receiver::default();
@@ -236,15 +388,15 @@ async fn session_loop(
                 info!(paths=p.len(),flows=flows.len(),originals=decoder.originals,recovered=decoder.recovered,duplicates=decoder.duplicates,invalid=decoder.invalid,dropped,ingress_drops=session.ingress_drops.load(Ordering::Relaxed),"server session");
             },
             e=events.recv()=>match e {
-                Some(Event::Wire(data))=>{
-                    let records=match decoder.receive(&data,Instant::now()){Ok(v)=>v,Err(_)=>{decoder.invalid+=1;continue}};
+                Some(Event::Wire(pid,data))=>{
+                    let records=receive_records(&mut decoder,&session.forward,pid,&data);
                     for r in records {
                         if !flows.contains_key(&r.flow) {
-                            if flows.len()>=MAX_FLOWS{dropped+=1;continue}
+                            if flows.len()>=MAX_FLOWS{dropped+=1;session.forward.update(|d|d.records.udp_target_flow_dropped+=1);session.forward.path(pid,|p|p.udp_target_flow_dropped+=1);continue}
                             let bind=if target.is_ipv4(){"0.0.0.0:0"}else{"[::]:0"};
-                            let Ok(socket)=UdpSocket::bind(bind).await else{dropped+=1;continue};
-                            if socket.connect(target).await.is_err() || socket.writable().await.is_err(){dropped+=1;continue}
-                            let socket=Arc::new(socket); let weak=Arc::downgrade(&socket); let events=session.events.clone(); let flow=r.flow; let mut quit=session.stop.subscribe(); let ingress_drops=session.ingress_drops.clone();
+                            let Ok(socket)=UdpSocket::bind(bind).await else{dropped+=1;session.forward.update(|d|d.records.udp_target_send_dropped+=1);session.forward.path(pid,|p|p.udp_target_send_dropped+=1);continue};
+                            if socket.connect(target).await.is_err() || socket.writable().await.is_err(){dropped+=1;session.forward.update(|d|d.records.udp_target_send_dropped+=1);session.forward.path(pid,|p|p.udp_target_send_dropped+=1);continue}
+                            let socket=Arc::new(socket); let weak=Arc::downgrade(&socket); let events=session.events.clone(); let flow=r.flow; let mut quit=session.stop.subscribe(); let ingress_drops=session.ingress_drops.clone();let returning=session.returning.clone();
                             tasks.spawn(async move {
                                 let mut b=vec![0;65536];
                                 loop {
@@ -252,7 +404,12 @@ async fn session_loop(
                                     tokio::select! {
                                         _=quit.changed()=>break,
                                         value=timeout(Duration::from_secs(5),socket.recv(&mut b))=>match value {
-                                            Ok(Ok(n)) if n<=MAX_PAYLOAD=>{if events.try_send(Event::Reply(flow,b[..n].to_vec())).is_err(){ingress_drops.fetch_add(1,Ordering::Relaxed);}},
+                                            Ok(Ok(n))=>{
+                                                returning.update(|d|d.records.application_received+=1);
+                                                if n>MAX_PAYLOAD{returning.update(|d|d.records.application_oversize_dropped+=1);continue;}
+                                                let now=Instant::now();
+                                                if let Err(error)=events.try_send(Event::Reply(flow,b[..n].to_vec(),now)){ingress_drops.fetch_add(1,Ordering::Relaxed);queue_error(&returning,QueueLayer::Ingress,&error,None);}else{returning.update(|d|d.records.ingress_queue_enqueued+=1);}
+                                            },
                                             Ok(Err(_))=>break,
                                             _=>{}
                                         }
@@ -262,20 +419,44 @@ async fn session_loop(
                             flows.insert(r.flow,(socket,Instant::now()));
                         }
                         if let Some((socket,last))=flows.get_mut(&r.flow) {
-                            *last=Instant::now(); if socket.try_send(&r.payload).is_err(){dropped+=1;}
+                            *last=Instant::now(); if socket.try_send(&r.payload).is_err(){dropped+=1;session.forward.update(|d|d.records.udp_target_send_dropped+=1);session.forward.path(pid,|p|p.udp_target_send_dropped+=1);}else{session.forward.path(pid,|p|p.udp_target_delivered+=1);session.forward.update(|d|{d.records.udp_target_delivered+=1;d.records.udp_target_bytes+=r.payload.len() as u64;d.udp_delivered_record_ids.add(r.id);});}
                         }
                     }
                 },
-                Some(Event::Reply(flow,payload))=>{
-                    let Some((_,last))=flows.get_mut(&flow) else{continue}; *last=Instant::now();
+                Some(Event::Reply(flow,payload,created))=>{
+                    let Some((_,last))=flows.get_mut(&flow) else{session.returning.update(|d|d.records.application_unavailable_dropped+=1);continue}; *last=Instant::now();
                     let Some(id)=next_id.checked_add(1) else{break}; next_id=id;
-                    if tx.try_send(Record{flow,id,payload}).is_err(){dropped+=1;}
+                    if let Err(error)=tx.try_send(QueuedRecord{record:Record{flow,id,payload},created}){dropped+=1;queue_error(&session.returning,QueueLayer::Sender,&error,None);}else{session.returning.update(|d|d.records.sender_queue_enqueued+=1);}
                 },
                 None=>break,
             }
         }
         while tasks.try_join_next().is_some() {}
     }
+    let _ = session.stop.send(true);
+    events.close();
+    while let Ok(event) = events.try_recv() {
+        match event {
+            Event::Wire(_, _) => session
+                .forward
+                .update(|d| d.records.receiver_shutdown_dropped += 1),
+            Event::Reply(..) => session
+                .returning
+                .update(|d| d.records.ingress_shutdown_dropped += 1),
+        }
+    }
+    let joined = timeout(Duration::from_secs(2), async {
+        while tasks.join_next().await.is_some() {}
+    })
+    .await
+    .is_ok();
+    if !joined {
+        session.forward.metrics.state(|s| s.drain_incomplete = true);
+        tasks.abort_all();
+        while tasks.join_next().await.is_some() {}
+    }
+    session.done.store(true, Ordering::Release);
+    session.finished.notify_waiters();
     info!(
         originals = decoder.originals,
         recovered = decoder.recovered,
@@ -292,8 +473,13 @@ pub struct ServerOptions {
     pub target: SocketAddr,
     pub max_rate: u64,
     pub congestion: transport::Congestion,
+    pub stats: stats::Metrics,
 }
 pub async fn serve(options: ServerOptions) -> Result<()> {
+    ensure!(
+        (64_000..=1_000_000_000).contains(&options.max_rate),
+        "invalid server rate"
+    );
     let endpoint = transport::server(
         options.bind,
         &options.cert,
@@ -304,6 +490,7 @@ pub async fn serve(options: ServerOptions) -> Result<()> {
     let sessions: Sessions = Arc::new(Mutex::new(HashMap::new()));
     let limit = Arc::new(Semaphore::new(128));
     let mut tasks = JoinSet::new();
+    options.stats.readiness(true, 0);
     info!(address=%endpoint.local_addr()?,target=%options.target,congestion=?options.congestion,"HTTP/3 server ready");
     loop {
         tokio::select! {
@@ -311,19 +498,47 @@ pub async fn serve(options: ServerOptions) -> Result<()> {
             incoming=endpoint.accept()=>{
                 let Some(incoming)=incoming else{break};
                 let Ok(permit)=limit.clone().try_acquire_owned() else{incoming.refuse();continue};
-                let sessions=sessions.clone(); let secret=secret.clone(); let target=options.target; let max_rate=options.max_rate;
+                let sessions=sessions.clone(); let secret=secret.clone(); let target=options.target; let max_rate=options.max_rate; let metrics=options.stats.clone();
                 tasks.spawn(async move {
                     let _permit=permit;
-                    if let Err(e)=server_connection(incoming,sessions,secret,target,max_rate).await {warn!(error=%e,"HTTP/3 connection ended");}
+                    if let Err(e)=server_connection(incoming,sessions,secret,target,max_rate,metrics).await {warn!(error=%e,"HTTP/3 connection ended");}
                 });
             },
             _=tasks.join_next(),if !tasks.is_empty()=>{}
         }
     }
-    endpoint.close(0u32.into(), b"shutdown");
-    for session in sessions.lock().expect("sessions lock").values() {
+    options.stats.readiness(false, 0);
+    let active = sessions
+        .lock()
+        .expect("sessions lock")
+        .values()
+        .cloned()
+        .collect::<Vec<_>>();
+    for session in &active {
         let _ = session.stop.send(true);
     }
+    endpoint.close(0u32.into(), b"shutdown");
+    let joined = timeout(Duration::from_secs(3), async {
+        while tasks.join_next().await.is_some() {}
+        for session in active {
+            while !session.done.load(Ordering::Acquire) {
+                let notified = session.finished.notified();
+                if !session.done.load(Ordering::Acquire) {
+                    notified.await;
+                }
+            }
+        }
+    })
+    .await
+    .is_ok();
+    if !joined {
+        tasks.abort_all();
+        while tasks.join_next().await.is_some() {}
+    }
+    options.stats.state(|s| {
+        s.shutdown_complete = joined;
+        s.drain_incomplete |= !joined;
+    });
     Ok(())
 }
 
@@ -333,6 +548,7 @@ async fn server_connection(
     secret: Arc<String>,
     target: SocketAddr,
     max_rate: u64,
+    metrics: stats::Metrics,
 ) -> Result<()> {
     let conn = timeout(Duration::from_secs(5), incoming).await??;
     let mut h3 = h3::server::builder()
@@ -385,7 +601,7 @@ async fn server_connection(
                         }else{
                             ensure!(map.len()<16,"session limit");
                             let (tx,rx)=mpsc::channel(QUEUE);let (stop,_)=watch::channel(false);
-                            let s=Arc::new(Session{events:tx,paths:Arc::new(Mutex::new(Vec::new())),stop,policy,ingress_drops:Arc::new(AtomicU64::new(0))});
+                            let s=Arc::new(Session{events:tx,paths:Arc::new(Mutex::new(Vec::new())),stop,policy,ingress_drops:Arc::new(AtomicU64::new(0)),forward:metrics.scope(&sid,stats::FORWARD),returning:metrics.scope(&sid,stats::RETURN),finished:tokio::sync::Notify::new(),done:std::sync::atomic::AtomicBool::new(false)});
                             map.insert(sid.clone(),s.clone());tokio::spawn(session_loop(s.clone(),rx,target));s
                         }
                     };
@@ -395,6 +611,7 @@ async fn server_connection(
                         ensure!(paths.len()<MAX_PATHS && !paths.iter().any(|p|p.id==pid),"duplicate/path limit");
                         paths.push(OutPath{id:pid,conn:conn.clone(),stream:stream_id});
                     }
+                    metrics.register(&sid,pid,stream_id,stats::RETURN,&conn);
                     joined=Some((sid,session,pid,stream_id));
                     stream.send_response(Response::builder().status(200).header("braidpath-version","1").header("braidpath-max-payload",MAX_PAYLOAD).body(())?).await?;
                     request=Some(stream);
@@ -402,9 +619,12 @@ async fn server_connection(
                 },
                 data=conn.read_datagram()=>{
                     let data=data?;
-                    if let Some((_,session,_,stream))=&joined
-                        && let Ok(payload)=wire::http_payload(&data,*stream)
-                            && payload.len()<=wire::MAX_WIRE && session.events.try_send(Event::Wire(Bytes::copy_from_slice(payload))).is_err(){session.ingress_drops.fetch_add(1,Ordering::Relaxed);}
+                    if let Some((_,session,pid,stream))=&joined {
+                        session.forward.path(*pid,|p|p.http_datagrams_received+=1);
+                        if let Ok(payload)=wire::http_payload(&data,*stream) && payload.len()<=wire::MAX_WIRE {
+                            if let Err(error)=session.events.try_send(Event::Wire(*pid,Bytes::copy_from_slice(payload))){session.ingress_drops.fetch_add(1,Ordering::Relaxed);queue_error(&session.forward,QueueLayer::Receiver,&error,Some(*pid));}
+                        } else {session.forward.path(*pid,|p|p.invalid_http_datagrams_dropped+=1);session.forward.update(|d|d.records.invalid_symbols_dropped+=1);}
+                    }
                 },
                 body=async {request.as_mut().expect("guarded request").recv_data().await},if request.is_some()=>{
                     let _=body?; break; // No reliable data is defined for this request; FIN ends membership.
@@ -415,12 +635,30 @@ async fn server_connection(
     }.await;
     conn.close(0u32.into(), b"request closed");
     if let Some((sid, session, pid, _)) = joined {
-        let mut map = sessions.lock().expect("sessions lock");
-        let mut paths = session.paths.lock().expect("paths lock");
-        paths.retain(|p| p.id != pid);
-        if paths.is_empty() {
-            let _ = session.stop.send(true);
-            map.remove(&sid);
+        let last = {
+            let mut map = sessions.lock().expect("sessions lock");
+            let mut paths = session.paths.lock().expect("paths lock");
+            paths.retain(|p| p.id != pid);
+            let last = paths.is_empty();
+            if last {
+                let _ = session.stop.send(true);
+                map.remove(&sid);
+            }
+            last
+        };
+        if last
+            && timeout(Duration::from_secs(3), async {
+                while !session.done.load(Ordering::Acquire) {
+                    let notified = session.finished.notified();
+                    if !session.done.load(Ordering::Acquire) {
+                        notified.await;
+                    }
+                }
+            })
+            .await
+            .is_err()
+        {
+            metrics.state(|s| s.drain_incomplete = true);
         }
         info!(path = pid, "path left");
     }
@@ -436,6 +674,7 @@ pub struct ClientOptions {
     pub token: std::path::PathBuf,
     pub policy: Policy,
     pub congestion: transport::Congestion,
+    pub stats: stats::Metrics,
 }
 pub async fn client(options: ClientOptions) -> Result<()> {
     options.policy.validate()?;
@@ -447,7 +686,9 @@ pub async fn client(options: ClientOptions) -> Result<()> {
     let token = transport::token(&options.token)?;
     let sid = transport::hex(&rand::random::<[u8; 16]>());
     let paths: Paths = Arc::new(Mutex::new(Vec::new()));
-    let (wire_tx, mut wire_rx) = mpsc::channel::<Bytes>(QUEUE);
+    let forward = options.stats.scope(&sid, stats::FORWARD);
+    let returning = options.stats.scope(&sid, stats::RETURN);
+    let (wire_tx, mut wire_rx) = mpsc::channel::<(u8, Bytes)>(QUEUE);
     let mut tasks = JoinSet::new();
     let mut endpoints = Vec::new();
     let ingress_drops = Arc::new(AtomicU64::new(0));
@@ -466,6 +707,7 @@ pub async fn client(options: ClientOptions) -> Result<()> {
             let endpoint =
                 transport::client(*entrance, &options.ca, interface, options.congestion)?;
             endpoints.push(endpoint.clone());
+            options.stats.state(|s| s.handshake_attempts += 1);
             let connection = timeout(
                 Duration::from_secs(8),
                 connect_path(
@@ -481,6 +723,10 @@ pub async fn client(options: ClientOptions) -> Result<()> {
             .await;
             match connection {
                 Ok(Ok((conn, stream, mut driver, mut request, send))) => {
+                    options.stats.state(|s| s.handshake_successes += 1);
+                    options
+                        .stats
+                        .register(&sid, pid, stream, stats::FORWARD, &conn);
                     paths.lock().expect("paths lock").push(OutPath {
                         id: pid,
                         conn: conn.clone(),
@@ -488,6 +734,7 @@ pub async fn client(options: ClientOptions) -> Result<()> {
                     });
                     let tx = wire_tx.clone();
                     let ingress_drops = ingress_drops.clone();
+                    let returning = returning.clone();
                     tasks.spawn(async move {
                     // Dropping the last SendRequest closes the HTTP/3 connection.
                     let _send = send;
@@ -495,7 +742,12 @@ pub async fn client(options: ClientOptions) -> Result<()> {
                         _=driver.wait_idle()=>break,
                         body=request.recv_data()=>{let _=body;break},
                         d=conn.read_datagram()=>match d {
-                            Ok(d)=>if let Ok(p)=wire::http_payload(&d,stream)&& p.len()<=wire::MAX_WIRE && tx.try_send(Bytes::copy_from_slice(p)).is_err(){ingress_drops.fetch_add(1,Ordering::Relaxed);},
+                            Ok(d)=>{
+                                returning.path(pid,|p|p.http_datagrams_received+=1);
+                                if let Ok(p)=wire::http_payload(&d,stream) && p.len()<=wire::MAX_WIRE {
+                                    if let Err(error)=tx.try_send((pid,Bytes::copy_from_slice(p))){ingress_drops.fetch_add(1,Ordering::Relaxed);queue_error(&returning,QueueLayer::Receiver,&error,Some(pid));}
+                                }else{returning.path(pid,|p|p.invalid_http_datagrams_dropped+=1);returning.update(|d|d.records.invalid_symbols_dropped+=1);}
+                            },
                             Err(_)=>break,
                         }
                     }}
@@ -503,8 +755,12 @@ pub async fn client(options: ClientOptions) -> Result<()> {
                 });
                     info!(path=pid,remote=%entrance,interface=interface.unwrap_or("default"),"client path ready");
                 }
-                Ok(Err(error)) => warn!(path=pid,remote=%entrance,error=%error,"path unavailable"),
+                Ok(Err(error)) => {
+                    options.stats.state(|s| s.handshake_failures += 1);
+                    warn!(path=pid,remote=%entrance,error=%error,"path unavailable");
+                }
                 Err(error) => {
+                    options.stats.state(|s| s.handshake_failures += 1);
                     warn!(path=pid,remote=%entrance,error=%error,"path connection timed out")
                 }
             }
@@ -517,7 +773,13 @@ pub async fn client(options: ClientOptions) -> Result<()> {
     let socket = UdpSocket::bind(options.listen).await?;
     let (tx, rx) = mpsc::channel(QUEUE);
     let (stop, stop_rx) = watch::channel(false);
-    tasks.spawn(sender(rx, paths.clone(), options.policy, stop_rx));
+    tasks.spawn(sender(
+        rx,
+        paths.clone(),
+        options.policy,
+        stop_rx,
+        forward.clone(),
+    ));
     let mut input = vec![0; 65536];
     let mut peers: HashMap<SocketAddr, (u32, Instant)> = HashMap::new();
     let mut reverse = HashMap::new();
@@ -526,6 +788,10 @@ pub async fn client(options: ClientOptions) -> Result<()> {
     let mut decoder = Receiver::default();
     let mut tick = interval(Duration::from_secs(2));
     let mut drops = 0u64;
+    options.stats.readiness(
+        true,
+        options.entrances.len() * options.interfaces.len().max(1),
+    );
     info!(listen=%socket.local_addr()?,paths=paths.lock().expect("paths lock").len(),congestion=?options.congestion,"UDP client ready");
     let result:Result<()>=async {loop {tokio::select! {
         _=tokio::signal::ctrl_c()=>break,
@@ -538,25 +804,23 @@ pub async fn client(options: ClientOptions) -> Result<()> {
         },
         received=socket.recv_from(&mut input)=>{
             let (n,peer)=received?;
-            if n>MAX_PAYLOAD{drops+=1;continue}
+            forward.update(|d|d.records.application_received+=1);
+            if n>MAX_PAYLOAD{drops+=1;forward.update(|d|d.records.application_oversize_dropped+=1);continue}
             if !peers.contains_key(&peer){
-                if peers.len()>=MAX_FLOWS {drops+=1;continue}
+                if peers.len()>=MAX_FLOWS {drops+=1;forward.update(|d|d.records.application_flow_limit_dropped+=1);continue}
                 next_flow=next_flow.checked_add(1).context("flow id exhausted")?;peers.insert(peer,(next_flow,Instant::now()));reverse.insert(next_flow,peer);
             }
             let (flow,last)=peers.get_mut(&peer).expect("inserted peer");*last=Instant::now();
             next_id=next_id.checked_add(1).context("message id exhausted")?;
-            if tx.try_send(Record{flow:*flow,id:next_id,payload:input[..n].to_vec()}).is_err(){drops+=1;}
+            if let Err(error)=tx.try_send(QueuedRecord{record:Record{flow:*flow,id:next_id,payload:input[..n].to_vec()},created:Instant::now()}){drops+=1;queue_error(&forward,QueueLayer::Sender,&error,None);}else{forward.update(|d|{d.records.ingress_queue_enqueued+=1;d.records.sender_queue_enqueued+=1;});}
         },
         data=wire_rx.recv()=>{
-            let Some(data)=data else{bail!("all receivers ended")};
-            match decoder.receive(&data,Instant::now()) {
-                Ok(records)=>for r in records {
-                    if let Some(peer)=reverse.get(&r.flow) {
-                        if let Some((_,last))=peers.get_mut(peer) { *last=Instant::now(); }
-                        if socket.try_send_to(&r.payload,*peer).is_err(){drops+=1;}
-                    }
-                },
-                Err(_)=>decoder.invalid+=1,
+            let Some((pid,data))=data else{bail!("all receivers ended")};
+            for r in receive_records(&mut decoder,&returning,pid,&data) {
+                if let Some(peer)=reverse.get(&r.flow) {
+                    if let Some((_,last))=peers.get_mut(peer){*last=Instant::now();}
+                    if socket.try_send_to(&r.payload,*peer).is_err(){drops+=1;returning.update(|d|d.records.udp_target_send_dropped+=1);returning.path(pid,|p|p.udp_target_send_dropped+=1);}else{returning.path(pid,|p|p.udp_target_delivered+=1);returning.update(|d|{d.records.udp_target_delivered+=1;d.records.udp_target_bytes+=r.payload.len() as u64;d.udp_delivered_record_ids.add(r.id);});}
+                }else{returning.update(|d|d.records.udp_target_flow_dropped+=1);returning.path(pid,|p|p.udp_target_flow_dropped+=1);}
             }
         }
     }}Ok(())}.await;
@@ -570,6 +834,10 @@ pub async fn client(options: ClientOptions) -> Result<()> {
         "client stopped"
     );
     let _ = stop.send(true);
+    options.stats.readiness(
+        false,
+        options.entrances.len() * options.interfaces.len().max(1),
+    );
     for endpoint in &endpoints {
         endpoint.close(0u32.into(), b"client stopped");
     }
@@ -580,6 +848,24 @@ pub async fn client(options: ClientOptions) -> Result<()> {
         }
     })
     .await;
+    // Await the aggregate sender's explicit queued-record/symbol cancellation accounting.
+    let joined = timeout(Duration::from_secs(2), async {
+        while tasks.join_next().await.is_some() {}
+    })
+    .await
+    .is_ok();
+    if !joined {
+        tasks.abort_all();
+        while tasks.join_next().await.is_some() {}
+    }
+    wire_rx.close();
+    while wire_rx.try_recv().is_ok() {
+        returning.update(|d| d.records.receiver_shutdown_dropped += 1);
+    }
+    options.stats.state(|s| {
+        s.shutdown_complete = joined;
+        s.drain_incomplete = !joined;
+    });
     result
 }
 

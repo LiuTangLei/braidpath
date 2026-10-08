@@ -28,7 +28,7 @@ Current protocol, commands and limits: [experimental runtime](runtime.md). Check
 - [x] Implement authenticated session admission with operator-managed credentials and 0-RTT disabled.
 - [x] Build minimal client/server CLI for QUIC DATAGRAM echo and load generation; FEC-off first, then XOR with canonical records.
 - [x] Implement timer-driven block closing, path-size checks, bounded send/receive queues, expiry and session deduplication.
-- [ ] Separate original arrivals, FEC recovery and application acceptance in feedback and counters.
+- [x] Separate original packet arrivals, FEC recovery, deduplication and UDP application acceptance in bounded per-direction/per-path counters and JSON statistics. Receiver feedback remains M2.
 
 **Exit gate:** the single-path checks in the [validation plan](validation.md#2-secure-single-path-gate) pass under bounded packet-level impairment. The selected HTTP/3 candidate also passes the [carrier gate](validation.md#carrier-semantics-and-cost-gate). The service is explicitly unreliable datagrams with optional FEC. No custom reliable byte-stream claim yet.
 

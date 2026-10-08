@@ -1,4 +1,4 @@
-use super::{MAX_PAYLOAD, relay, transport, tunnel};
+use super::{MAX_PAYLOAD, relay, stats, transport, tunnel};
 use anyhow::{Result, ensure};
 use clap::{Args, Parser, Subcommand};
 use serde::Serialize;
@@ -45,6 +45,8 @@ enum Command {
         /// BBR is the initial latency/throughput default; Cubic is available for comparison.
         #[arg(long, value_enum, default_value_t = transport::Congestion::default())]
         congestion: transport::Congestion,
+        #[command(flatten)]
+        stats: stats::Options,
     },
     /// Expose a local UDP port through independently encrypted entrances.
     Client {
@@ -65,6 +67,8 @@ enum Command {
         /// Select this endpoint's sending controller independently of the peer.
         #[arg(long, value_enum, default_value_t = transport::Congestion::default())]
         congestion: transport::Congestion,
+        #[command(flatten)]
+        stats: stats::Options,
     },
     /// Forward opaque UDP packets only to the configured main server.
     Relay {
@@ -78,6 +82,8 @@ enum Command {
         rate_bps: u64,
         #[arg(long, default_value_t = 0)]
         drop_every: u64,
+        #[command(flatten)]
+        stats: stats::Options,
     },
     /// Retrieve the ordinary HTTP/3 website without proxy credentials.
     Get {
@@ -139,12 +145,11 @@ pub async fn run() -> Result<()> {
             target,
             max_rate_bps,
             congestion,
+            stats,
         } => {
-            ensure!(
-                (64_000..=1_000_000_000).contains(&max_rate_bps),
-                "invalid server rate"
-            );
-            tunnel::serve(tunnel::ServerOptions {
+            let reporter = stats::Reporter::new("server", stats)?;
+            let result = tunnel::serve(tunnel::ServerOptions {
+                stats: reporter.metrics.clone(),
                 bind: listen,
                 cert,
                 key,
@@ -153,7 +158,8 @@ pub async fn run() -> Result<()> {
                 max_rate: max_rate_bps,
                 congestion,
             })
-            .await
+            .await;
+            reporter.finish(result).await
         }
         Command::Client {
             listen,
@@ -164,8 +170,11 @@ pub async fn run() -> Result<()> {
             token_file,
             policy,
             congestion,
+            stats,
         } => {
-            tunnel::client(tunnel::ClientOptions {
+            let reporter = stats::Reporter::new("client", stats)?;
+            let result = tunnel::client(tunnel::ClientOptions {
+                stats: reporter.metrics.clone(),
                 listen,
                 entrances,
                 interfaces,
@@ -181,7 +190,8 @@ pub async fn run() -> Result<()> {
                     queue_ms: policy.queue_ms,
                 },
             })
-            .await
+            .await;
+            reporter.finish(result).await
         }
         Command::Relay {
             listen,
@@ -189,15 +199,19 @@ pub async fn run() -> Result<()> {
             allow,
             rate_bps,
             drop_every,
+            stats,
         } => {
-            relay::run(relay::Options {
+            let reporter = stats::Reporter::new("relay", stats)?;
+            let result = relay::run(relay::Options {
+                stats: reporter.metrics.clone(),
                 listen,
                 target,
                 allow,
                 rate: rate_bps,
                 drop_every,
             })
-            .await
+            .await;
+            reporter.finish(result).await
         }
         Command::Get {
             entrance,
