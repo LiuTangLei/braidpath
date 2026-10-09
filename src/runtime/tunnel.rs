@@ -11,12 +11,14 @@ use h3::ConnectionState;
 use http::{Method, Request, Response, StatusCode};
 use std::{
     collections::{BTreeMap, HashMap},
+    future::{Future, poll_fn},
     net::SocketAddr,
+    pin::Pin,
     sync::{
         Arc, Mutex,
         atomic::{AtomicU64, Ordering},
     },
-    task::Poll,
+    task::{Context as TaskContext, Poll},
     time::{Duration, Instant},
 };
 use subtle::ConstantTimeEq;
@@ -47,6 +49,14 @@ pub struct Policy {
     pub queue_ms: u64,
 }
 impl Policy {
+    fn admission_lifetime(&self) -> Duration {
+        Duration::from_millis(if self.adaptive {
+            self.queue_ms.min(self.latency_target_ms)
+        } else {
+            self.queue_ms
+        })
+    }
+
     pub fn validate(&self) -> Result<()> {
         ensure!(
             !self.adaptive || (self.quality_schedule && self.receiver_feedback),
@@ -255,11 +265,215 @@ fn account_expired(pending: &outbound::Pending, now: Instant, metrics: &Scope) {
     });
 }
 
+/// This item remains at the application queue head until Quinn accepts it. The
+/// sender cancels the wait before handling any other event that could move it.
+struct PreparedSend {
+    path: OutPath,
+    generation: u64,
+    front: outbound::Pending,
+    candidates: Vec<(u8, i32)>,
+    repair: bool,
+    used: u8,
+    data: Bytes,
+    feedback_reserve: usize,
+    group_reserve: usize,
+}
+
+struct WaitingSend {
+    prepared: PreparedSend,
+    send: Pin<Box<dyn Future<Output = Result<(), quinn::SendDatagramError>> + Send>>,
+}
+
+#[derive(Debug)]
+enum SendReadiness {
+    Admitted { at: Instant, next_cursor: usize },
+    Expired,
+    PathChanged,
+    GateChanged,
+    Failed,
+}
+
+impl WaitingSend {
+    fn new(prepared: PreparedSend) -> Self {
+        let conn = prepared.path.conn.clone();
+        let data = prepared.data.clone();
+        Self {
+            prepared,
+            // A pending Quinn future has not queued this datagram. Dropping it
+            // before a successful poll cancels the attempt without any debit.
+            send: Box::pin(async move { conn.send_datagram_wait(data).await }),
+        }
+    }
+
+    fn poll(
+        &mut self,
+        cx: &mut TaskContext<'_>,
+        shared_paths: &Paths,
+        lifetime: Duration,
+        mut allowed: impl FnMut(&PreparedSend, Instant) -> bool,
+    ) -> Poll<SendReadiness> {
+        let paths = shared_paths.lock().expect("paths lock");
+        let Some(index) = paths.iter().position(|path| {
+            path.id == self.prepared.path.id
+                && path.group == self.prepared.path.group
+                && path.stream == self.prepared.path.stream
+                && path.conn.stable_id() == self.prepared.path.conn.stable_id()
+                && path
+                    .quality
+                    .lock()
+                    .expect("quality lock")
+                    .snapshot
+                    .generation
+                    == self.prepared.generation
+        }) else {
+            return Poll::Ready(SendReadiness::PathChanged);
+        };
+        if paths[index].conn.close_reason().is_some() {
+            return Poll::Ready(SendReadiness::PathChanged);
+        }
+        // Take the clock after acquiring the membership locks, immediately
+        // before polling Quinn. A ready buffer must never revive an old record.
+        let now = Instant::now();
+        if now.saturating_duration_since(self.prepared.front.created) >= lifetime {
+            return Poll::Ready(SendReadiness::Expired);
+        }
+        if !allowed(&self.prepared, now) {
+            return Poll::Ready(SendReadiness::GateChanged);
+        }
+        match self.send.as_mut().poll(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Ok(())) => Poll::Ready(SendReadiness::Admitted {
+                at: Instant::now(),
+                next_cursor: (index + 1) % paths.len(),
+            }),
+            Poll::Ready(Err(_)) => Poll::Ready(SendReadiness::Failed),
+        }
+        // The membership guard is local to this synchronous poll. No mutex
+        // guard survives Pending or is held while the sender awaits a wakeup.
+    }
+
+    fn cancel(self) -> PreparedSend {
+        let Self { prepared, send } = self;
+        drop(send);
+        prepared
+    }
+}
+
+enum SenderEvent {
+    Stop,
+    Tick,
+    Input(Option<QueuedRecord>),
+    Ready(SendReadiness),
+}
+
+struct Admission<'a> {
+    path: &'a OutPath,
+    front: &'a outbound::Pending,
+    candidates: &'a [(u8, i32)],
+    repair: bool,
+    used: u8,
+    frame_bytes: usize,
+    next_cursor: usize,
+    at: Instant,
+}
+
+/// The immediate path and the readiness path share the exact same successful
+/// admission transaction. Pending, cancellation and expiry never call this.
+struct SendAccounting<'a> {
+    policy: &'a Policy,
+    metrics: &'a Scope,
+    queue: &'a mut outbound::Queue,
+    blocks: &'a mut BTreeMap<u64, BlockSend>,
+    budget: &'a mut outbound::RepairBudget,
+    scheduler: &'a mut scheduler::Scheduler,
+    controllers: &'a mut [adaptive::PathController; MAX_PATHS],
+    pacer: &'a mut outbound::Pacer,
+    groups: &'a mut [outbound::Pacer; MAX_PATHS],
+    cursor: &'a mut usize,
+    repair_turn: &'a mut bool,
+    epoch: Instant,
+}
+
+impl SendAccounting<'_> {
+    fn commit(&mut self, admission: Admission<'_>) {
+        let Admission {
+            path,
+            front,
+            candidates,
+            repair,
+            used,
+            frame_bytes,
+            next_cursor,
+            at,
+        } = admission;
+        let sent = self.queue.pop(repair).expect("admitted front");
+        debug_assert_eq!(sent.created, front.created);
+        debug_assert_eq!(sent.record_id, front.record_id);
+        debug_assert_eq!(sent.block, front.block);
+        debug_assert_eq!(sent.data, front.data);
+        let cost = frame_bytes + 80;
+        self.pacer.spend(cost);
+        self.groups[usize::from(path.group)].spend(cost);
+        if self.policy.quality_schedule {
+            self.scheduler.commit(candidates, path.id, frame_bytes);
+        }
+        if self.policy.adaptive {
+            let now_us = at
+                .saturating_duration_since(self.epoch)
+                .as_micros()
+                .min(u128::from(u64::MAX)) as u64;
+            self.controllers[usize::from(path.id)].admitted_symbol(now_us, cost, sent.data.len());
+        }
+        if self.policy.receiver_feedback {
+            path.quality
+                .lock()
+                .expect("quality lock")
+                .admitted(sent.data.len());
+        }
+        if repair {
+            self.budget.repair_admitted(frame_bytes);
+            self.metrics
+                .path(path.id, |p| p.quinn_admitted_repairs += 1);
+            if used & (1 << path.id) != 0 {
+                self.metrics
+                    .update(|d| d.symbols.repair_no_diverse_path += 1);
+            }
+            if let Some(block) = sent.block {
+                self.blocks.remove(&block);
+            }
+        } else {
+            self.budget.original_admitted(frame_bytes);
+            self.metrics
+                .path(path.id, |p| p.quinn_admitted_originals += 1);
+            if let Some(block) = sent.block
+                && let Some(meta) = self.blocks.get_mut(&block)
+            {
+                meta.paths |= 1 << path.id;
+            }
+        }
+        *self.cursor = next_cursor;
+        *self.repair_turn = !repair;
+        self.metrics.update(|d| {
+            if let Some(id) = sent.record_id {
+                d.symbols.originals_quinn_admitted += 1;
+                d.symbols.originals_quinn_admitted_bytes += frame_bytes as u64;
+                d.quinn_admitted_record_ids.add(id);
+            } else {
+                d.symbols.repairs_quinn_admitted += 1;
+                d.symbols.repairs_quinn_admitted_bytes += frame_bytes as u64;
+            }
+            d.symbols
+                .admitted_wait
+                .add(at.saturating_duration_since(sent.created));
+        });
+    }
+}
+
 /// A single owner admits every business, repair, feedback and probe datagram.
 /// Each local flow gets a turn; all classes obey the aggregate and group caps.
 async fn sender(
     mut input: mpsc::Receiver<QueuedRecord>,
-    paths: Paths,
+    shared_paths: Paths,
     policy: Policy,
     mut stop: watch::Receiver<bool>,
     metrics: Scope,
@@ -286,25 +500,90 @@ async fn sender(
     let mut repair_turn = false;
     let mut tick = interval(Duration::from_millis(1));
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    let lifetime = Duration::from_millis(if policy.adaptive {
-        policy.queue_ms.min(policy.latency_target_ms)
-    } else {
-        policy.queue_ms
-    });
+    let lifetime = policy.admission_lifetime();
+    let mut waiting: Option<WaitingSend> = None;
     loop {
         if *stop.borrow() {
             break;
         }
-        tokio::select! {
+        let event = tokio::select! {
             biased;
-            _=stop.changed()=>break,
-            _=tick.tick()=>{
-                if policy.fec > 0 && let Some(shard)=encoder.flush_due(Instant::now()) {
-                    enqueue_symbol(wire::shard(shard), Instant::now(), &mut queue, &mut blocks, &metrics);
+            _=stop.changed()=>SenderEvent::Stop,
+            _=tick.tick()=>SenderEvent::Tick,
+            ready=poll_fn(|cx| {
+                let Some(wait) = waiting.as_mut() else {
+                    return Poll::Pending;
+                };
+                wait.poll(cx, &shared_paths, lifetime, |attempt, now| {
+                    let cost = attempt.data.len() + 80;
+                    let now_us = now.saturating_duration_since(epoch).as_micros()
+                        .min(u128::from(u64::MAX)) as u64;
+                    let age = now.saturating_duration_since(attempt.front.created);
+                    pacer.available(cost + attempt.feedback_reserve)
+                        && groups[usize::from(attempt.path.group)]
+                            .available(cost + attempt.group_reserve)
+                        && (!attempt.repair || budget.can_repair(attempt.data.len()))
+                        && (!policy.adaptive
+                            || controllers[usize::from(attempt.path.id)]
+                                .allow(now_us, cost, age.as_secs_f64() * 1000.0))
+                })
+            }), if waiting.is_some()=>SenderEvent::Ready(ready),
+            item=input.recv()=>SenderEvent::Input(item),
+        };
+        // A different actor event invalidates this prepared queue head and its
+        // budget checks. Cancel the future before touching any actor state.
+        let prepared = waiting.take().map(WaitingSend::cancel);
+        match event {
+            SenderEvent::Stop => break,
+            SenderEvent::Tick => {
+                if policy.fec > 0
+                    && let Some(shard) = encoder.flush_due(Instant::now())
+                {
+                    enqueue_symbol(
+                        wire::shard(shard),
+                        Instant::now(),
+                        &mut queue,
+                        &mut blocks,
+                        &metrics,
+                    );
                 }
-            },
-            item=input.recv()=>{
-                let Some(QueuedRecord{record,created})=item else {break};
+            }
+            SenderEvent::Ready(SendReadiness::Admitted { at, next_cursor }) => {
+                let attempt = prepared.expect("selected readiness attempt");
+                SendAccounting {
+                    policy: &policy,
+                    metrics: &metrics,
+                    queue: &mut queue,
+                    blocks: &mut blocks,
+                    budget: &mut budget,
+                    scheduler: &mut scheduler,
+                    controllers: &mut controllers,
+                    pacer: &mut pacer,
+                    groups: &mut groups,
+                    cursor: &mut cursor,
+                    repair_turn: &mut repair_turn,
+                    epoch,
+                }
+                .commit(Admission {
+                    path: &attempt.path,
+                    front: &attempt.front,
+                    candidates: &attempt.candidates,
+                    repair: attempt.repair,
+                    used: attempt.used,
+                    frame_bytes: attempt.data.len(),
+                    next_cursor,
+                    at,
+                });
+            }
+            SenderEvent::Ready(SendReadiness::Failed) => {
+                let attempt = prepared.expect("selected readiness attempt");
+                metrics.path(attempt.path.id, |p| p.quinn_send_error_attempts += 1);
+            }
+            SenderEvent::Ready(_) => {}
+            SenderEvent::Input(item) => {
+                let Some(QueuedRecord { record, created }) = item else {
+                    break;
+                };
                 metrics.update(|d| d.records.sender_input_consumed += 1);
                 if created.elapsed() >= lifetime {
                     metrics.update(|d| {
@@ -314,19 +593,31 @@ async fn sender(
                     });
                     continue;
                 }
-                if policy.fec==0 {
+                if policy.fec == 0 {
                     match wire::plain(&record) {
-                        Ok(data)=>enqueue_symbol(data,created,&mut queue,&mut blocks,&metrics),
-                        Err(_)=>metrics.update(|d|d.records.encoding_dropped+=1),
+                        Ok(data) => {
+                            enqueue_symbol(data, created, &mut queue, &mut blocks, &metrics)
+                        }
+                        Err(_) => metrics.update(|d| d.records.encoding_dropped += 1),
                     }
-                } else if let Ok(data)=record.encode() {
-                    match encoder.push(&data,Instant::now()) {
-                        Ok(shards)=>for shard in shards {
-                            enqueue_symbol(wire::shard(shard),created,&mut queue,&mut blocks,&metrics);
-                        },
-                        Err(_)=>metrics.update(|d|d.records.encoding_dropped+=1),
+                } else if let Ok(data) = record.encode() {
+                    match encoder.push(&data, Instant::now()) {
+                        Ok(shards) => {
+                            for shard in shards {
+                                enqueue_symbol(
+                                    wire::shard(shard),
+                                    created,
+                                    &mut queue,
+                                    &mut blocks,
+                                    &metrics,
+                                );
+                            }
+                        }
+                        Err(_) => metrics.update(|d| d.records.encoding_dropped += 1),
                     }
-                } else {metrics.update(|d|d.records.encoding_dropped+=1);}
+                } else {
+                    metrics.update(|d| d.records.encoding_dropped += 1);
+                }
             }
         }
         let now = Instant::now();
@@ -338,7 +629,7 @@ async fn sender(
         for expired in queue.expire(now, lifetime) {
             account_expired(&expired, now, &metrics);
         }
-        let paths = paths.lock().expect("paths lock");
+        let paths = shared_paths.lock().expect("paths lock");
         if policy.adaptive && now_us >= observe_at {
             for path in paths.iter() {
                 let q = path.quality.lock().expect("quality lock");
@@ -507,6 +798,7 @@ async fn sender(
         }
         let mut stalled_originals = 0usize;
         let mut blocked_repair = false;
+        let mut next_wait = None;
         while !queue.is_empty() {
             let now = Instant::now();
             let now_us = epoch.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
@@ -599,6 +891,7 @@ async fn sender(
                 order.sort_by_key(|i| u8::from(used & (1 << paths[*i].id) != 0));
             }
             let mut accepted = None;
+            let mut wait_candidate = None;
             for i in order {
                 let path = &paths[i];
                 let id = usize::from(path.id);
@@ -641,47 +934,35 @@ async fn sender(
                 }
                 if path.conn.datagram_send_buffer_space() < data.len() {
                     metrics.path(path.id, |p| p.send_buffer_full_attempts += 1);
+                    if wait_candidate.is_none() {
+                        wait_candidate = Some(PreparedSend {
+                            path: path.clone(),
+                            generation: path
+                                .quality
+                                .lock()
+                                .expect("quality lock")
+                                .snapshot
+                                .generation,
+                            front: front.clone(),
+                            candidates: candidates.clone(),
+                            repair,
+                            used,
+                            data,
+                            feedback_reserve,
+                            group_reserve,
+                        });
+                    }
                     continue;
                 }
                 match path.conn.send_datagram(data) {
                     Ok(()) => {
-                        pacer.spend(cost);
-                        groups[usize::from(path.group)].spend(cost);
-                        if policy.quality_schedule {
-                            scheduler.commit(&candidates, path.id, frame_bytes);
-                        }
-                        if policy.adaptive {
-                            controllers[id].admitted_symbol(now_us, cost, front.data.len());
-                        }
-                        if policy.receiver_feedback {
-                            path.quality
-                                .lock()
-                                .expect("quality lock")
-                                .admitted(front.data.len());
-                        }
-                        if repair {
-                            budget.repair_admitted(frame_bytes);
-                            metrics.path(path.id, |p| p.quinn_admitted_repairs += 1);
-                            if used & (1 << path.id) != 0 {
-                                metrics.update(|d| d.symbols.repair_no_diverse_path += 1);
-                            }
-                        } else {
-                            budget.original_admitted(frame_bytes);
-                            metrics.path(path.id, |p| p.quinn_admitted_originals += 1);
-                            if let Some(block) = front.block
-                                && let Some(meta) = blocks.get_mut(&block)
-                            {
-                                meta.paths |= 1 << path.id;
-                            }
-                        }
-                        cursor = (i + 1) % paths.len();
-                        accepted = Some(frame_bytes);
+                        accepted = Some((i, frame_bytes, Instant::now()));
                         break;
                     }
                     Err(_) => metrics.path(path.id, |p| p.quinn_send_error_attempts += 1),
                 }
             }
-            let Some(frame_bytes) = accepted else {
+            let Some((index, frame_bytes, at)) = accepted else {
                 if repair {
                     blocked_repair = true;
                     if queue.front(false).is_some() {
@@ -698,28 +979,37 @@ async fn sender(
                         continue;
                     }
                 }
+                // Every immediate path (and other flow/repair head) had its
+                // chance. Only this unchanged queue head may now wait on Quinn.
+                next_wait = wait_candidate;
                 break;
             };
-            let sent = queue.pop(repair).expect("admitted front");
+            SendAccounting {
+                policy: &policy,
+                metrics: &metrics,
+                queue: &mut queue,
+                blocks: &mut blocks,
+                budget: &mut budget,
+                scheduler: &mut scheduler,
+                controllers: &mut controllers,
+                pacer: &mut pacer,
+                groups: &mut groups,
+                cursor: &mut cursor,
+                repair_turn: &mut repair_turn,
+                epoch,
+            }
+            .commit(Admission {
+                path: &paths[index],
+                front: &front,
+                candidates: &candidates,
+                repair,
+                used,
+                frame_bytes,
+                next_cursor: (index + 1) % paths.len(),
+                at,
+            });
             stalled_originals = 0;
             blocked_repair = false;
-            repair_turn = !repair;
-            if repair && let Some(block) = sent.block {
-                blocks.remove(&block);
-            }
-            metrics.update(|d| {
-                if let Some(id) = sent.record_id {
-                    d.symbols.originals_quinn_admitted += 1;
-                    d.symbols.originals_quinn_admitted_bytes += frame_bytes as u64;
-                    d.quinn_admitted_record_ids.add(id);
-                } else {
-                    d.symbols.repairs_quinn_admitted += 1;
-                    d.symbols.repairs_quinn_admitted_bytes += frame_bytes as u64;
-                }
-                d.symbols
-                    .admitted_wait
-                    .add(now.saturating_duration_since(sent.created));
-            });
         }
         for path in paths.iter() {
             let feedback = path
@@ -729,7 +1019,10 @@ async fn sender(
                 .snapshot_at(quality_time(path));
             metrics.path(path.id, |p| p.receiver_feedback = Some(feedback));
         }
+        drop(paths);
+        waiting = next_wait.map(WaitingSend::new);
     }
+    drop(waiting);
     for repair in [false, true] {
         while let Some(pending) = queue.pop(repair) {
             metrics.update(|d| {
@@ -1797,6 +2090,9 @@ pub async fn get(remote: SocketAddr, name: &str, ca: &std::path::Path) -> Result
     })
     .await?
 }
+
+#[cfg(test)]
+mod sender_ready_tests;
 
 #[cfg(test)]
 mod sender_clock_tests {
