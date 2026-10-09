@@ -345,12 +345,13 @@ class Remote:
     def __init__(self, topology):
         self.topology = topology
 
-    def command(self, host, argv, timeout=30):
-        return subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", *self.topology["hosts"][host].get("ssh_options", []), self.topology["hosts"][host]["ssh"], shlex.join(argv)], capture_output=True, text=True, timeout=timeout)
+    def command(self, host, argv, timeout=30, input_text=None):
+        return subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", *self.topology["hosts"][host].get("ssh_options", []), self.topology["hosts"][host]["ssh"], shlex.join(argv)], capture_output=True, text=True, timeout=timeout, input=input_text)
 
     def call(self, host, action, timeout=30, **kwargs):
         try:
-            result = self.command(host, ["python3", "-c", REMOTE, json.dumps({"action": action, **kwargs})], timeout)
+            loader = "import json,sys;p=json.load(sys.stdin);sys.argv=['remote',json.dumps(p['request'])];exec(p['script'])"
+            result = self.command(host, ["python3", "-c", loader], timeout, input_text=json.dumps({"script": REMOTE, "request": {"action": action, **kwargs}}))
         except subprocess.TimeoutExpired:
             raise RuntimeError(json.dumps({"error": "remote_timeout", "host": host, "action": action, "timeout_seconds": timeout})) from None
         if result.returncode:

@@ -406,6 +406,14 @@ class LifecycleTests(unittest.TestCase):
                 remote.call("source", "collect", timeout=3)
         self.assertNotIn("large-helper-code", str(caught.exception))
 
+    def test_management_helper_uses_stdin_not_large_mux_command(self):
+        with patch("bench.run.subprocess.run", return_value=subprocess.CompletedProcess([], 0, "{}", "")) as run:
+            Remote(self.topology).call("source", "fixture", large="x" * 100000)
+        self.assertLess(len(run.call_args.args[0][-1]), 512)
+        payload=json.loads(run.call_args.kwargs["input"])
+        self.assertEqual(payload["request"]["large"], "x" * 100000)
+        self.assertEqual(payload["script"], REMOTE)
+
     def test_ssh_options_are_explicit_and_preserved(self):
         self.topology["hosts"]["source"]["ssh_options"] = ["-J", "fixture-jump"]
         with patch("bench.run.subprocess.run") as run:
