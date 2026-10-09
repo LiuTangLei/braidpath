@@ -377,7 +377,13 @@ impl PathController {
             });
         let new_pressure =
             new_delay || delivery_shortfall || new_loss || (blocked_pressure && new_report);
+        // An unused allowance is not traffic that can be drained. Sparse idle
+        // echo/probe jitter must not turn its small delivery sample into a path
+        // capacity estimate. Backlog or a blocked transport still permits an
+        // immediate safety brake, including before exercise is qualified.
+        let active_demand = observation.offered_backlog || exercised || blocked_pressure;
         if self.eligible
+            && active_demand
             && new_pressure
             && self
                 .last_brake_us
@@ -393,7 +399,12 @@ impl PathController {
                 .map(|rate| rate.max(recent_drain.unwrap_or(0.0)))
                 .or(recent_drain);
             let mut desired = service_hint
-                .filter(|rate| *rate > 0.0)
+                .filter(|rate| {
+                    *rate > 0.0
+                        && (self.pressure_episode_exercised == Some(true)
+                            || delivery_shortfall
+                            || *rate >= self.rate_bps as f64)
+                })
                 .map_or(self.rate_bps as f64 * 0.8, |rate| rate * drain_fraction);
             if delay_pressure
                 && queue_rising
@@ -580,6 +591,106 @@ mod tests {
             }
         }
         admitted
+    }
+
+    #[test]
+    fn sparse_idle_jitter_preserves_unused_allowance_then_backlog_can_discover() {
+        let mut controller = PathController::new(3_000_000, 20);
+        controller.observe(&observation(0, 80.0));
+        for tick in 1..=50 {
+            let now = tick * 100_000;
+            // Twenty small records per second; actual admissions consume well
+            // below the initial allowance. RTT spikes recur while idle.
+            for send in [now - 100_000, now - 50_000] {
+                assert!(controller.allow(send, 160, 0.0));
+                controller.admitted_symbol(send, 160, 128);
+            }
+            let rtt = if tick % 10 < 5 { 100.0 } else { 80.0 };
+            let mut sample = observation(now, rtt);
+            sample.offered_backlog = false;
+            sample.delivered_bps = Some(20_480.0);
+            sample.delivered_bytes = tick * 256;
+            sample.feedback_sample_symbols = 10;
+            controller.observe(&sample);
+            assert_eq!(controller.rate_bps, START_BPS);
+            assert!(!controller.congestion_seen);
+        }
+        for tick in 1..=10 {
+            let start = 5_000_000 + (tick - 1) * 500_000;
+            let bytes = exercise_budget(&mut controller, start, 500_000);
+            let mut sample = observation(start + 500_000, 80.0);
+            sample.delivered_bps = Some(bytes as f64 * 16.0);
+            controller.observe(&sample);
+        }
+        assert!(controller.rate_bps >= 2_500_000);
+        assert!(controller.decision(10_000_000).eligible);
+    }
+
+    #[test]
+    fn exercised_pressure_still_brakes_after_an_idle_pressure_episode() {
+        let mut controller = PathController::new(3_000_000, 20);
+        controller.observe(&observation(0, 80.0));
+        let mut idle = observation(200_000, 130.0);
+        idle.offered_backlog = false;
+        idle.delivered_bps = Some(7_000.0);
+        controller.observe(&idle);
+        assert_eq!(controller.rate_bps, START_BPS);
+        assert_eq!(controller.pressure_episode_exercised, Some(false));
+        exercise_budget(&mut controller, 200_000, 200_000);
+        let mut active = observation(400_000, 150.0);
+        active.delivered_bps = Some(7_000.0);
+        active.loss_sample_rate = Some(0.25);
+        controller.observe(&active);
+        // The idle episode does not immunize subsequent real demand from safety
+        // braking, but its low delivery alone cannot select a 64 kbps capacity.
+        assert!(controller.rate_bps < START_BPS);
+        assert!(controller.rate_bps > MIN_BPS);
+        assert!(controller.decision(400_000).eligible);
+    }
+
+    #[test]
+    fn sparse_packet_briefly_visible_as_backlog_uses_bounded_backoff() {
+        let mut controller = PathController::new(3_000_000, 20);
+        controller.observe(&observation(0, 80.0));
+        for tick in 1..=20 {
+            let now = tick * 100_000;
+            for send in [now - 100_000, now - 50_000] {
+                assert!(controller.allow(send, 160, 0.0));
+                controller.admitted_symbol(send, 160, 128);
+            }
+            let mut sample = observation(now, if tick <= 4 { 100.0 } else { 80.0 });
+            // The runtime can observe a just-enqueued sparse packet as backlog.
+            sample.offered_backlog = tick == 2 || tick == 3;
+            sample.delivered_bps = Some(20_480.0);
+            sample.feedback_sample_symbols = 10;
+            controller.observe(&sample);
+            assert!(controller.rate_bps >= START_BPS * 8 / 10);
+            assert!(!controller.congestion_seen);
+        }
+        assert!(controller.rate_bps < START_BPS);
+    }
+
+    #[test]
+    fn persistent_idle_rtt_offset_still_blocks_capacity_growth() {
+        let mut controller = PathController::new(3_000_000, 20);
+        controller.observe(&observation(0, 80.0));
+        let mut idle = observation(500_000, 140.0);
+        idle.offered_backlog = false;
+        idle.delivered_bps = Some(7_000.0);
+        controller.observe(&idle);
+        assert_eq!(controller.rate_bps, START_BPS);
+        for tick in 1..=20 {
+            let start = tick * 500_000;
+            let bytes = exercise_budget(&mut controller, start, 500_000);
+            let mut active = observation(start + 500_000, 140.0);
+            active.delivered_bps = Some(bytes as f64 * 16.0);
+            controller.observe(&active);
+        }
+        // Explicit remaining limitation: this patch does not classify a lasting
+        // RTT offset as propagation or permit discovery through standing delay.
+        assert!(controller.rate_bps <= START_BPS);
+        assert!(controller.decision(10_500_000).eligible);
+        assert_eq!(controller.health, Health::Degraded);
     }
 
     #[test]
@@ -1035,8 +1146,11 @@ mod tests {
             controller.rate_bps
         );
         assert!(before_pause > START_BPS, "cold search must have started");
+        // A low application-limited sample no longer selects the brake's
+        // capacity target. Require the existing bounded safety backoff instead
+        // of the former >50% cut; recovery and FIFO performance gates are intact.
         assert!(
-            after_pause < before_pause / 2,
+            after_pause <= before_pause * 8 / 10,
             "the safety brake must still act"
         );
         assert!(
