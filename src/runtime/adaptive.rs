@@ -63,7 +63,10 @@ impl LossEvidence {
             self.batches.clear();
             return None;
         }
-        if delta.0 == 0 {
+        // A newly consumed delivery report can contain a finalized prefix that
+        // was already stale before this observation. Advance its valid baseline
+        // above, but never turn that old cohort into fresh loss evidence later.
+        if delta.0 == 0 || sample.feedback_age_us.is_none_or(|age| age > FRESH_US) {
             return None;
         }
         if self.batches.len() == LOSS_BATCHES {
@@ -123,6 +126,7 @@ pub struct Observation {
     pub now_us: u64,
     pub generation: u64,
     pub report_number: u64,
+    /// Age of newly finalized loss, not the age of positive byte delivery.
     pub feedback_age_us: Option<u64>,
     /// Positive delivery on this path, independently of all-loss report freshness.
     pub positive_delivery_age_us: Option<u64>,
@@ -290,10 +294,13 @@ impl PathController {
             self.no_delivery_confirmed_us = None;
         }
 
-        let new_report = feedback_fresh
+        // Unique byte delivery can precede sequence-prefix finalization. Consume
+        // its new authenticated report without waiting for a fresh loss cohort.
+        let new_report = (feedback_fresh || delivery_fresh)
             && self
                 .last_report
                 .is_none_or(|(number, _, _)| observation.report_number > number);
+        let new_loss_report = new_report && feedback_fresh;
         if new_report {
             let explicit = observation
                 .delivered_bps
@@ -383,7 +390,7 @@ impl PathController {
         let fast_loss = loss_batch.is_some_and(|(expected, lost)| {
             expected >= 8 && u128::from(lost) * 2 >= u128::from(expected)
         });
-        if new_report
+        if new_loss_report
             && observation.feedback_sample_symbols >= 8
             && loss >= 0.999
             && self.latest_delivery_bps == Some(0.0)
@@ -446,7 +453,7 @@ impl PathController {
         let pressure = delay_pressure || self.loss_pressure || fast_loss || blocked_pressure;
         if pressure {
             self.pressure_episode_exercised.get_or_insert(exercised);
-        } else if new_report && observation.feedback_sample_symbols > 0 {
+        } else if new_loss_report && observation.feedback_sample_symbols > 0 {
             // A clear RTT alone can precede the delayed loss report for this
             // episode. Require a genuinely new, finalized clear interval too.
             self.pressure_episode_exercised = None;
@@ -737,6 +744,243 @@ mod tests {
             finalized_lost: Some(lost),
             ..observation(now, 80.0)
         }
+    }
+
+    #[test]
+    fn delivery_freshness_008_accepts_positive_bytes_before_loss_finalizes() {
+        use crate::runtime::quality::{Report, State};
+
+        let mut quality = State::new(7);
+        let mut controller = PathController::new(3_000_000, 20);
+        let sample = |quality: &State, now_us| {
+            let estimate = &quality.snapshot.sender_estimate;
+            Observation {
+                generation: quality.snapshot.generation,
+                report_number: estimate.report_number,
+                feedback_age_us: estimate.updated_us.map(|at| now_us - at),
+                positive_delivery_age_us: estimate.delivered_updated_us.map(|at| now_us - at),
+                delivered_bytes: estimate.received_bytes,
+                delivered_bps: estimate.delivered_bps,
+                feedback_sample_symbols: estimate.sample_symbols,
+                finalized_expected: Some(estimate.expected),
+                finalized_lost: Some(estimate.lost),
+                loss_sample_rate: Some(estimate.sample_loss_rate),
+                offered_backlog: false,
+                ..observation(now_us, 80.0)
+            }
+        };
+        quality.admitted(1000);
+        let mut report = Report {
+            id: 0,
+            generation: 7,
+            sent: 0,
+            number: 1,
+            expected: 1,
+            received: 1,
+            delay_us: 0,
+            received_bytes: 1000,
+            report_time_us: 500_000,
+        };
+        quality.apply(&report, 500_000).unwrap();
+        controller.observe(&sample(&quality, 500_000));
+        for (number, now) in [(2, 1_000_000), (3, 6_000_000)] {
+            report.number = number;
+            report.report_time_us = now;
+            quality.apply(&report, now).unwrap();
+            controller.observe(&sample(&quality, now));
+        }
+        let admitted = exercise_budget(&mut controller, 6_000_000, 500_000);
+        for _ in 0..admitted / 1000 {
+            quality.admitted(1000);
+        }
+        // Like007c after idle, unique bytes are delivered immediately while the
+        // sequence prefix has not finalized any new symbols. Use real Quality
+        // timestamps/deltas rather than assigning an invented fresh loss age.
+        report.number = 4;
+        report.report_time_us = 6_500_000;
+        report.received_bytes += admitted;
+        quality.apply(&report, 6_500_000).unwrap();
+        let mut current = sample(&quality, 6_500_000);
+        current.offered_backlog = true;
+        assert_eq!(current.feedback_sample_symbols, 0);
+        assert_eq!(current.feedback_age_us, Some(6_000_000));
+        assert_eq!(current.positive_delivery_age_us, Some(0));
+        controller.observe(&current);
+        println!(
+            "008 idle-to-backlog: admitted={admitted}; current_delivery={:?}; consumed_delivery={:?}; pace={}",
+            current.delivered_bps, controller.latest_delivery_bps, controller.rate_bps
+        );
+        assert_eq!(controller.latest_delivery_bps, current.delivered_bps);
+        assert!(
+            controller.rate_bps > START_BPS,
+            "confirmed service can resume discovery"
+        );
+        assert_eq!(controller.loss_evidence.counts(), (0, 0));
+        assert!(!controller.loss_pressure);
+        assert!(!controller.congestion_seen);
+    }
+
+    #[test]
+    fn delivery_freshness_008_skipped_stale_loss_prefix_is_not_recounted() {
+        let mut evidence = LossEvidence::default();
+        evidence.observe(&finalized(0, 1, 40, 4), true);
+        let mut stale = finalized(5_000_000, 3, 140, 20);
+        stale.feedback_age_us = Some(FRESH_US + 1);
+        stale.positive_delivery_age_us = Some(0);
+        assert_eq!(evidence.observe(&stale, true), None);
+        assert_eq!(evidence.previous, Some((140, 20)));
+        assert_eq!(evidence.counts(), (0, 0));
+        assert_eq!(
+            evidence.observe(&finalized(5_500_000, 4, 160, 22), true),
+            Some((20, 2))
+        );
+        assert_eq!(evidence.counts(), (20, 2));
+        // Invalid stale counters must not replace the last valid prefix.
+        stale.now_us = 6_000_000;
+        stale.report_number = 5;
+        stale.finalized_expected = Some(150);
+        assert_eq!(evidence.observe(&stale, true), None);
+        assert_eq!(evidence.previous, Some((160, 22)));
+        assert_eq!(
+            evidence.observe(&finalized(6_500_000, 6, 180, 24), true),
+            Some((20, 2))
+        );
+        assert_eq!(evidence.counts(), (20, 2));
+        let mut empty = finalized(9_000_000, 7, 180, 24);
+        empty.feedback_sample_symbols = 0;
+        empty.loss_sample_rate = Some(1.0);
+        evidence.observe(&empty, true);
+        empty.now_us = 10_500_001;
+        evidence.observe(&empty, false);
+        assert_eq!(
+            evidence.counts(),
+            (0, 0),
+            "empty reports cannot renew loss age"
+        );
+    }
+
+    #[test]
+    fn delivery_freshness_008_keeps_report_order_and_generation_guards() {
+        let mut controller = PathController::new(3_000_000, 20);
+        let mut current = finalized(0, 10, 100, 10);
+        current.feedback_age_us = Some(FRESH_US + 1);
+        current.feedback_sample_symbols = 0;
+        current.delivered_bps = Some(256_000.0);
+        current.delivered_bytes = 1000;
+        current.offered_backlog = false;
+        controller.observe(&current);
+        assert_eq!(controller.latest_delivery_bps, Some(256_000.0));
+        assert_eq!(controller.loss_evidence.counts(), (0, 0));
+        for (now, number) in [(100_000, 10), (200_000, 9)] {
+            let mut duplicate = current.clone();
+            duplicate.now_us = now;
+            duplicate.report_number = number;
+            duplicate.delivered_bytes = 2000;
+            duplicate.delivered_bps = Some(9_000_000.0);
+            duplicate.finalized_expected = Some(200);
+            duplicate.finalized_lost = Some(40);
+            controller.observe(&duplicate);
+            assert_eq!(controller.latest_delivery_bps, Some(256_000.0));
+            assert_eq!(controller.loss_evidence.previous, Some((100, 10)));
+        }
+        current.now_us = 300_000;
+        current.report_number = 11;
+        current.delivered_bps = Some(320_000.0);
+        current.finalized_expected = Some(130);
+        current.finalized_lost = Some(13);
+        controller.observe(&current);
+        assert_eq!(controller.latest_delivery_bps, Some(320_000.0));
+        assert_eq!(controller.loss_evidence.counts(), (0, 0));
+        current.now_us = 400_000;
+        current.generation += 1;
+        current.report_number = 1;
+        current.delivered_bytes = 153;
+        current.delivered_bps = Some(64_000.0);
+        current.finalized_expected = Some(0);
+        current.finalized_lost = Some(0);
+        controller.observe(&current);
+        assert_eq!(controller.latest_delivery_bps, Some(64_000.0));
+        assert_eq!(controller.last_report.unwrap().0, 1);
+        assert_eq!(controller.loss_evidence.previous, Some((0, 0)));
+        assert_eq!(controller.loss_evidence.counts(), (0, 0));
+        assert_eq!(controller.rate_bps, START_BPS);
+    }
+
+    #[test]
+    fn delivery_freshness_008_zero_delivery_reports_cannot_revive_health() {
+        let mut controller = PathController::new(3_000_000, 20);
+        let mut sample = finalized(0, 1, 16, 0);
+        sample.delivered_bps = Some(128_000.0);
+        sample.offered_backlog = false;
+        controller.observe(&sample);
+        for n in 1..=10 {
+            let now = n * 500_000;
+            sample.now_us = now;
+            sample.report_number = n + 1;
+            sample.feedback_age_us = Some(now);
+            sample.positive_delivery_age_us = Some(now);
+            sample.probe_age_us = Some(now);
+            sample.feedback_sample_symbols = 0;
+            sample.delivered_bps = Some(0.0);
+            controller.observe(&sample);
+            assert_eq!(controller.last_evidence_us, Some(0));
+            if now > FRESH_US {
+                assert!(!controller.decision(now).eligible);
+                assert_eq!(controller.decision(now).state, Health::Probing);
+            }
+        }
+        assert_eq!(controller.loss_evidence.counts(), (0, 0));
+        sample.now_us = 5_500_000;
+        sample.report_number = 12;
+        sample.feedback_age_us = Some(0);
+        sample.positive_delivery_age_us = Some(sample.now_us);
+        sample.probe_age_us = Some(sample.now_us);
+        sample.feedback_sample_symbols = 8;
+        sample.loss_sample_rate = Some(1.0);
+        sample.finalized_expected = Some(24);
+        sample.finalized_lost = Some(8);
+        controller.observe(&sample);
+        assert!(!controller.decision(sample.now_us).eligible);
+        assert!(controller.no_delivery_confirmed_us.is_some());
+        assert_eq!(controller.last_evidence_us, Some(0));
+        // Actual positive delivery can recover the same generation, without
+        // requiring a newly finalized loss interval or a connection reset.
+        sample.now_us = 6_000_000;
+        sample.report_number = 13;
+        sample.feedback_age_us = Some(500_000);
+        sample.positive_delivery_age_us = Some(0);
+        sample.feedback_sample_symbols = 0;
+        sample.delivered_bytes += 153;
+        sample.delivered_bps = Some(2448.0);
+        controller.observe(&sample);
+        assert!(controller.decision(sample.now_us).eligible);
+        assert!(controller.no_delivery_confirmed_us.is_none());
+    }
+
+    #[test]
+    fn delivery_freshness_008_stale_loss_cannot_clear_a_pressure_episode() {
+        let mut controller = PathController::new(3_000_000, 20);
+        controller.observe(&finalized(0, 1, 0, 0));
+        let mut pressure = finalized(1_000_000, 2, 0, 0);
+        pressure.rtt_ms = 120.0;
+        pressure.probe_rtt_ms = Some(120.0);
+        pressure.probe_latest_rtt_ms = Some(120.0);
+        pressure.offered_backlog = false;
+        controller.observe(&pressure);
+        assert_eq!(controller.pressure_episode_exercised, Some(false));
+        let mut clear = finalized(5_000_000, 3, 100, 10);
+        clear.feedback_age_us = Some(FRESH_US + 1);
+        clear.delivered_bps = Some(256_000.0);
+        clear.offered_backlog = false;
+        controller.observe(&clear);
+        assert_eq!(controller.pressure_episode_exercised, Some(false));
+        clear.now_us = 5_500_000;
+        clear.report_number = 4;
+        clear.feedback_age_us = Some(0);
+        clear.feedback_sample_symbols = 16;
+        clear.finalized_expected = Some(116);
+        controller.observe(&clear);
+        assert_eq!(controller.pressure_episode_exercised, None);
     }
 
     #[test]
