@@ -39,12 +39,17 @@ def save(path, value):
 
 @contextmanager
 def cleanup_signals():
-    previous = {sig: signal.signal(sig, signal.SIG_IGN) for sig in (signal.SIGINT, signal.SIGTERM)}
+    pending = []
+    def defer(signum, frame):
+        pending.append(signum)
+    previous = {sig: signal.signal(sig, defer) for sig in (signal.SIGINT, signal.SIGTERM)}
     try:
         yield
     finally:
         for sig, handler in previous.items():
             signal.signal(sig, handler)
+        if pending:
+            raise KeyboardInterrupt(f"{signal.Signals(pending[0]).name} deferred until cleanup completed")
 
 
 def digest(value):
@@ -604,9 +609,12 @@ class Runner:
 
     def cleanup(self):
         errors, artifacts = [], {}
+        self.cleanup_unconfirmed = []
         for job in reversed(self.jobs):
+            confirmed = False
             try:
                 result = self.remote.stop(job)
+                confirmed = result["returncode"] == 0
                 if result["returncode"]:
                     errors.append(f"{job.role}: unit stop failed: {result.get('stderr', '')}")
             except Exception as error:
@@ -614,6 +622,11 @@ class Runner:
             try:
                 artifact = self.remote.collect(job)
                 artifacts[job.role] = artifact
+                unit_state = artifact.get("unit_state", {})
+                if artifact.get("alive") is True:
+                    confirmed = False
+                elif artifact.get("alive") is False and (unit_state.get("LoadState") == "not-found" or unit_state.get("ActiveState") in ("inactive", "failed")):
+                    confirmed = True
                 errors.extend(f"{job.role}: {error}" for error in artifact.get("collection_errors", []))
                 folder = self.directory / job.role
                 folder.mkdir(exist_ok=True)
@@ -633,6 +646,8 @@ class Runner:
                         errors.append(f"{job.role}: runtime cleanup incomplete")
             except Exception as error:
                 errors.append(f"{job.role}: collect: {error}")
+            if not confirmed:
+                self.cleanup_unconfirmed.append({"host": job.host, "role": job.role, "unit": job.unit})
         return errors, artifacts
 
     def attempt(self, row, ordinal):
@@ -658,25 +673,31 @@ class Runner:
             if not isinstance(error, Exception):
                 interrupted = error
         finally:
-            # Ignore a second Ctrl-C only while the bounded cleanup is in progress.
-            with cleanup_signals():
-                errors, artifacts = self.cleanup()
-                self.record["cleanup_errors"] = errors
-                try:
-                    self.record["metrics"] = aggregate_artifacts(artifacts, case["direction"], self.jobs)
-                except Exception as error:
-                    self.record["metrics"] = {"errors": [f"malformed structured metrics: {error}"]}
-                if errors or self.record["metrics"]["errors"]:
-                    if self.record["outcome"] == "ok":
-                        self.record["outcome"] = "error"
-                if self.topology.get("capture_network", False):
-                    for host in self.topology["hosts"]:
-                        try:
-                            save(self.directory / (host + "-network-after.json"), self.remote.call(host, "network"))
-                        except Exception as error:
-                            self.record.setdefault("evidence_errors", []).append(str(error))
+            try:
+                with cleanup_signals():
+                    errors, artifacts = self.cleanup()
+                    self.record["cleanup_errors"] = errors
+                    self.record["cleanup_unconfirmed"] = self.cleanup_unconfirmed
+                    self.record["cleanup_confirmed"] = not self.cleanup_unconfirmed
+                    try:
+                        self.record["metrics"] = aggregate_artifacts(artifacts, case["direction"], self.jobs)
+                    except Exception as error:
+                        self.record["metrics"] = {"errors": [f"malformed structured metrics: {error}"]}
+                    if errors or self.record["metrics"]["errors"]:
+                        if self.record["outcome"] == "ok":
                             self.record["outcome"] = "error"
-                self.record["status"] = "finished"
+                    if self.topology.get("capture_network", False):
+                        for host in self.topology["hosts"]:
+                            try:
+                                save(self.directory / (host + "-network-after.json"), self.remote.call(host, "network"))
+                            except Exception as error:
+                                self.record.setdefault("evidence_errors", []).append(str(error))
+                                self.record["outcome"] = "error"
+                    self.record["status"] = "finished"
+                    save(self.directory / "attempt.json", self.record)
+            except KeyboardInterrupt as error:
+                interrupted = error
+                self.record.update(outcome="interrupted", error=str(error))
                 save(self.directory / "attempt.json", self.record)
         if interrupted:
             raise interrupted
@@ -687,35 +708,46 @@ class Runner:
         self.directory = path.parent
         job_file = self.directory / "jobs.json"
         self.jobs = [Job(**value) for value in json.loads(job_file.read_text())] if job_file.exists() else []
-        errors, artifacts = self.cleanup()
-        case = next(c for c in self.matrix["cases"] if c["name"] == record["case"])
-        record.update(status="finished", outcome="interrupted", error="recovered unfinished attempt", cleanup_errors=errors, metrics=aggregate_artifacts(artifacts, case["direction"], self.jobs))
-        save(path, record)
+        with cleanup_signals():
+            errors, artifacts = self.cleanup()
+            case = next(c for c in self.matrix["cases"] if c["name"] == record["case"])
+            record.update(status="finished", outcome="interrupted", error="recovered unfinished attempt", cleanup_errors=errors, cleanup_unconfirmed=self.cleanup_unconfirmed, cleanup_confirmed=not self.cleanup_unconfirmed, metrics=aggregate_artifacts(artifacts, case["direction"], self.jobs))
+            save(path, record)
         return record
 
     def run_rows(self, rows):
         attempts = []
-        for path in sorted((self.output / "attempts").glob("*/attempt.json")):
-            record = json.loads(path.read_text())
-            attempts.append(record if record.get("status") == "finished" else self.recover(path, record))
-        for row in rows:
-            existing = [r for r in attempts if r["row_id"] == row["row_id"]]
-            if existing:
-                # A failed initial startup may have one separately counted retry.
-                first = min(existing, key=lambda r: r["ordinal"])
-                if len(existing) != 1 or first["ordinal"] != 0 or first["outcome"] == "ok" or first.get("cleanup_errors") or first.get("workload_started") or first["outcome"] == "interrupted" or not self.matrix.get("retry_startup", 0):
-                    continue
-                ordinal = 1
-            else:
-                ordinal = 0
-            record = self.attempt(row, ordinal)
-            attempts.append(record)
-            save(self.output / "summary.json", summary(attempts))
-            if ordinal == 0 and record["outcome"] == "error" and not record.get("cleanup_errors") and not record["workload_started"] and self.matrix.get("retry_startup", 0):
-                attempts.append(self.attempt(row, 1))
-                save(self.output / "summary.json", summary(attempts))
-        save(self.output / "summary.json", summary(attempts))
-        return attempts
+        try:
+            for path in sorted((self.output / "attempts").glob("*/attempt.json")):
+                record = json.loads(path.read_text())
+                attempts.append(record if record.get("status") == "finished" else self.recover(path, record))
+            if any(r.get("cleanup_confirmed") is False for r in attempts):
+                raise AttemptFailure("remote process cleanup unconfirmed; refusing subsequent rows")
+            for row in rows:
+                existing = [r for r in attempts if r["row_id"] == row["row_id"]]
+                if existing:
+                    # A failed initial startup may have one separately counted retry.
+                    first = min(existing, key=lambda r: r["ordinal"])
+                    if len(existing) != 1 or first["ordinal"] != 0 or first["outcome"] == "ok" or first.get("cleanup_errors") or first.get("workload_started") or first["outcome"] == "interrupted" or not self.matrix.get("retry_startup", 0):
+                        continue
+                    ordinal = 1
+                else:
+                    ordinal = 0
+                record = self.attempt(row, ordinal)
+                attempts.append(record)
+                save(self.output / "summary.json", summary(attempts, rows))
+                if record["cleanup_confirmed"] is False:
+                    raise AttemptFailure("remote process cleanup unconfirmed; refusing subsequent rows")
+                if ordinal == 0 and record["outcome"] == "error" and not record.get("cleanup_errors") and not record["workload_started"] and self.matrix.get("retry_startup", 0):
+                    retry = self.attempt(row, 1)
+                    attempts.append(retry)
+                    if retry["cleanup_confirmed"] is False:
+                        raise AttemptFailure("remote process cleanup unconfirmed; refusing subsequent rows")
+                    save(self.output / "summary.json", summary(attempts, rows))
+            return attempts
+        finally:
+            records = [json.loads(p.read_text()) for p in sorted((self.output / "attempts").glob("*/attempt.json"))]
+            save(self.output / "summary.json", summary(records, rows))
 
 
 def aggregate_artifacts(artifacts, direction, jobs=()):
@@ -800,10 +832,11 @@ def aggregate_artifacts(artifacts, direction, jobs=()):
     return out
 
 
-def summary(attempts):
+def summary(attempts, rows=()):
     def availability(values):
         return {"attempts": len(values), "successful": sum(r["outcome"] == "ok" for r in values), "workload_started": sum(bool(r.get("workload_started")) for r in values), "by_stage": {stage: sum(r.get("stage") == stage and r["outcome"] != "ok" for r in values) for stage in ("startup", "workload")}}
-    return {"schema_version": 1, "primary_availability": availability([r for r in attempts if r["ordinal"] == 0]), "retry_availability": availability([r for r in attempts if r["ordinal"] > 0]), "attempts": attempts, "interpretation": "Retries do not replace failures. Runtime JSONL is cumulative; metrics keep final counters per process/direction/path. Latency infinity strings are preserved; no performance acceptance claim."}
+    executed = {r["row_id"] for r in attempts if "row_id" in r}
+    return {"schema_version": 1, "unexecuted_rows": [row for row in rows if row["row_id"] not in executed], "primary_availability": availability([r for r in attempts if r["ordinal"] == 0]), "retry_availability": availability([r for r in attempts if r["ordinal"] > 0]), "attempts": attempts, "interpretation": "Retries do not replace failures. Runtime JSONL is cumulative; metrics keep final counters per process/direction/path. Latency infinity strings are preserved; no performance acceptance claim."}
 
 
 def main(argv=None):
@@ -854,7 +887,7 @@ def main(argv=None):
         with cleanup_signals():
             cleanup_errors = firewall.cleanup()
             records = [json.loads(p.read_text()) for p in sorted((output / "attempts").glob("*/attempt.json"))]
-            save(output / "summary.json", summary(records))
+            save(output / "summary.json", summary(records, rows))
             save(output / "run-status.json", {"error": str(error) if error else None, "firewall_cleanup_errors": cleanup_errors})
     if error:
         raise error

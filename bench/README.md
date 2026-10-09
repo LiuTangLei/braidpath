@@ -139,7 +139,15 @@ actual binary PID, remote start wall time, `/proc` start identity and exit statu
 as JSON. Finite successful/failed units are collected automatically; a missing
 unit is considered cleaned only after checking it is absent and its recorded
 process is not alive. Stop happens in reverse launch order in `finally`; errors
-and missing/stale final stats remain explicit.
+and missing/stale final stats remain explicit. `cleanup_confirmed` records whether
+remote process shutdown was confirmed, independently of workload/collection
+errors. If any process is alive or its cleanup cannot be confirmed, the runner
+aborts subsequent rows and retries, and retains `cleanup_unconfirmed` plus
+`summary.json`'s `unexecuted_rows`. A failed collection after confirmed shutdown
+still invalidates that attempt but does not imply a leftover process. An output
+containing unconfirmed cleanup also refuses to resume. SIGINT/SIGTERM received
+during cleanup is deferred until cleanup and record saving finish, then interrupts
+the run before the next row; cancellation is never discarded.
 
 For a tunnel profile, the runner first checks each relay and the server listener,
 then all unique authenticated client paths and the server's matching client

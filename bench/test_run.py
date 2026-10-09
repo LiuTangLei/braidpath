@@ -1,6 +1,7 @@
 """Offline benchmark contracts: no SSH, credentials, services, or WAN workload."""
 import io
 import json
+import signal
 import sys
 from contextlib import redirect_stdout
 from pathlib import Path
@@ -213,6 +214,82 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual(len(resumed), 2)
         self.assertEqual(summary(resumed)["primary_availability"]["attempts"], 1)
         self.assertEqual(summary(resumed)["retry_availability"]["attempts"], 1)
+
+    def test_unconfirmed_cleanup_blocks_rows_and_retry_but_evidence_errors_do_not(self):
+        self.matrix["retry_startup"] = 1
+        rows = schedule(self.matrix)
+        for scenario in ("still_alive", "unknown", "collection_error", "runtime_error", "stop_failed_but_gone"):
+            with self.subTest(scenario=scenario):
+                self.remote = FakeRemote()
+                self.runner = Runner(self.topology, self.matrix, Path(self.temp.name) / scenario, self.remote)
+                def stop(job):
+                    self.remote.stopped.append(job.role)
+                    if scenario in ("still_alive", "unknown", "stop_failed_but_gone"):
+                        raise RuntimeError("SSH reset during stop")
+                    return {"returncode": 0}
+                def collect(job):
+                    if scenario in ("unknown", "collection_error"):
+                        raise RuntimeError("artifact transfer failed")
+                    final = {"final": True, "process_id": job.pid, "sample_unix_ms": 2000, "outcome": "error", "stats": {"shutdown_complete": True}}
+                    return {"files": {"stats.json": json.dumps(final)} if scenario == "runtime_error" else {}, "alive": scenario == "still_alive", "unit_state": {"ActiveState": "active" if scenario == "still_alive" else "inactive"}}
+                def prepare(case, profile):
+                    job = self.runner.job("destination", "server", ["fixture-command"], stats=scenario == "runtime_error")
+                    self.runner.launch([job])
+                    raise AttemptFailure("startup failed")
+                with patch.object(self.runner, "prepare_runtime", side_effect=prepare), patch.object(self.remote, "stop", side_effect=stop), patch.object(self.remote, "collect", side_effect=collect), patch.object(self.runner, "workload") as workload:
+                    if scenario in ("still_alive", "unknown"):
+                        with self.assertRaisesRegex(AttemptFailure, "cleanup unconfirmed"):
+                            self.runner.run_rows(rows)
+                    else:
+                        attempts = self.runner.run_rows(rows)
+                        self.assertEqual(len(attempts), len(rows))
+                        self.assertTrue(all(r["cleanup_confirmed"] for r in attempts))
+                        self.assertTrue(all(r["outcome"] == "error" for r in attempts))
+                workload.assert_not_called()
+                saved = json.loads((self.runner.output / "summary.json").read_text())
+                if scenario in ("still_alive", "unknown"):
+                    self.assertEqual(self.remote.launched, ["server"])
+                    self.assertEqual(len(saved["attempts"]), 1)
+                    self.assertFalse(saved["attempts"][0]["cleanup_confirmed"])
+                    self.assertEqual(saved["unexecuted_rows"], rows[1:])
+                    with patch.object(self.runner, "attempt") as attempt:
+                        with self.assertRaisesRegex(AttemptFailure, "cleanup unconfirmed"):
+                            self.runner.run_rows(rows)
+                    attempt.assert_not_called()
+                else:
+                    self.assertEqual(saved["unexecuted_rows"], [])
+
+    def test_cleanup_cancellation_is_deferred_then_stops_before_next_row(self):
+        rows = schedule(self.matrix)
+        for signum in (signal.SIGTERM, signal.SIGINT):
+            with self.subTest(signal=signum):
+                self.remote = FakeRemote()
+                self.runner = Runner(self.topology, self.matrix, Path(self.temp.name) / signal.Signals(signum).name, self.remote)
+                previous = signal.getsignal(signum)
+                events = []
+                original_stop = self.remote.stop
+                def stop(job):
+                    events.append("stop:" + job.role)
+                    if job.role == "fixture-second":
+                        signal.getsignal(signum)(signum, None)
+                        events.append("cancel-received")
+                    return original_stop(job)
+                def collect(job):
+                    events.append("collect:" + job.role)
+                    return {"files": {}, "alive": False, "unit_state": {"ActiveState": "inactive"}}
+                def complete(case, profile):
+                    self.runner.record.update(stage="workload", workload_started=True)
+                with patch.object(self.runner, "prepare_runtime", side_effect=self.prepare_success), patch.object(self.runner, "workload", side_effect=complete), patch.object(self.remote, "stop", side_effect=stop), patch.object(self.remote, "collect", side_effect=collect):
+                    with self.assertRaisesRegex(KeyboardInterrupt, "deferred until cleanup completed"):
+                        self.runner.run_rows(rows)
+                self.assertEqual(events, ["stop:fixture-second", "cancel-received", "collect:fixture-second", "stop:fixture-first", "collect:fixture-first"])
+                self.assertEqual(self.remote.launched, ["fixture-first", "fixture-second"])
+                self.assertEqual(signal.getsignal(signum), previous)
+                saved = json.loads((self.runner.output / "summary.json").read_text())
+                self.assertEqual(saved["attempts"][0]["outcome"], "interrupted")
+                self.assertEqual(saved["attempts"][0]["status"], "finished")
+                self.assertTrue(saved["attempts"][0]["cleanup_confirmed"])
+                self.assertEqual(saved["unexecuted_rows"], rows[1:])
 
     def test_firewall_lease_before_create_and_only_owned_removed(self):
         rule = {"host": "source", "check": ["check-absent"], "create": ["create-rule"], "remove": ["remove-rule"], "lease_seconds": 60}
