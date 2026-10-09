@@ -1034,6 +1034,7 @@ pub async fn client(options: ClientOptions) -> Result<()> {
                         let mut diagnostic=stats::ConnectionTrace::new(metrics,remote,Some(path.id),"quic_connect");
                         let result:Result<Rejoined>=async {
                             let endpoint=transport::client(remote,&ca,interface.as_deref(),congestion)?;
+                            info!(path=path.id,generation,local=%endpoint.local_addr()?,remote=%remote,"path rejoin source socket");
                             let (conn,stream,driver,request,send)=timeout(Duration::from_secs(8),connect_path(&endpoint,remote,&name,&token,&sid,path.id,generation,true,&policy,&mut diagnostic)).await??;
                             Ok(Rejoined{endpoint,conn,stream,driver,request,send})
                         }.await;
