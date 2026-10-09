@@ -41,6 +41,7 @@ pub enum Reason {
     TransportBlocked,
     HealthLost,
     Disabled,
+    CleanServiceRestored,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -68,6 +69,7 @@ pub struct Transition {
     pub queue_delay_ms: f64,
     pub loss_expected: u64,
     pub loss_lost: u64,
+    pub clean_loss: CleanSummary,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -79,6 +81,7 @@ pub struct Snapshot {
     pub total_transitions: u64,
     pub evicted_transitions: u64,
     pub transitions: VecDeque<Transition>,
+    pub clean_loss: CleanSummary,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -162,6 +165,120 @@ impl Window {
     }
 }
 
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct CleanSummary {
+    pub reports: usize,
+    pub expected: u64,
+    pub lost: u64,
+    /// The endpoints are receiver-local report times, not arrival spacing.
+    pub first_receiver_report_us: Option<u64>,
+    pub last_receiver_report_us: Option<u64>,
+}
+
+#[derive(Default)]
+struct CleanEvidence {
+    batches: VecDeque<(u64, u64, u64)>,
+    last_report_number: Option<u64>,
+    anchored: bool,
+}
+
+impl CleanEvidence {
+    fn clear(&mut self) {
+        self.batches.clear();
+        self.anchored = false;
+    }
+
+    fn observe(&mut self, input: &Input<'_>) {
+        if input
+            .sample
+            .feedback_age_us
+            .is_none_or(|age| age > FRESH_US)
+        {
+            self.clear();
+            return;
+        }
+        if !input.new_report
+            || self
+                .last_report_number
+                .is_some_and(|n| input.sample.report_number <= n)
+        {
+            return;
+        }
+        self.last_report_number = Some(input.sample.report_number);
+        let Some(cursor) = Cursor::from_sample(input.sample) else {
+            self.clear();
+            return;
+        };
+        let Some((expected, lost)) = input.loss_batch.filter(|(expected, _)| *expected > 0) else {
+            return;
+        };
+        if !self.anchored {
+            // A cumulative prefix from before construction, idle or stale
+            // feedback establishes the cursor; it is not new clean evidence.
+            self.anchored = true;
+            return;
+        }
+        if u128::from(lost) * 50 > u128::from(expected)
+            || self
+                .batches
+                .back()
+                .is_some_and(|(at, _, _)| cursor.receiver_us <= *at)
+        {
+            self.clear();
+            // This newly consumed dirty report is a valid subsequent baseline.
+            self.anchored = true;
+            return;
+        }
+        while self
+            .batches
+            .front()
+            .is_some_and(|(at, _, _)| cursor.receiver_us.saturating_sub(*at) > FRESH_US)
+        {
+            self.batches.pop_front();
+        }
+        if self.batches.len() == 8 {
+            self.batches.pop_front();
+        }
+        self.batches.push_back((cursor.receiver_us, expected, lost));
+    }
+
+    fn summary(&self) -> CleanSummary {
+        let (expected, lost) = self
+            .batches
+            .iter()
+            .fold((0u64, 0u64), |(n, l), (_, dn, dl)| {
+                (n.saturating_add(*dn), l.saturating_add(*dl))
+            });
+        CleanSummary {
+            reports: self.batches.len(),
+            expected,
+            lost,
+            first_receiver_report_us: self.batches.front().map(|(at, _, _)| *at),
+            last_receiver_report_us: self.batches.back().map(|(at, _, _)| *at),
+        }
+    }
+
+    fn complete(&self) -> bool {
+        let proof = self.summary();
+        proof.reports >= 3
+            && proof.expected >= 32
+            && u128::from(proof.lost) * 50 <= u128::from(proof.expected)
+            && proof
+                .last_receiver_report_us
+                .zip(proof.first_receiver_report_us)
+                .is_some_and(|(end, start)| end.saturating_sub(start) >= 1_000_000)
+    }
+}
+
+#[derive(Clone)]
+struct AdmissionSample {
+    at_us: u64,
+    span_us: u64,
+    wire_bytes: u64,
+    symbol_bytes: u64,
+    allowance_bytes: f64,
+}
+
 #[derive(Clone)]
 struct Measurement {
     started_us: u64,
@@ -169,7 +286,7 @@ struct Measurement {
     window: Window,
     admitted: u64,
     allowance: f64,
-    admission_samples: VecDeque<(u64, u64, f64)>,
+    admission_samples: VecDeque<AdmissionSample>,
 }
 
 impl Measurement {
@@ -190,21 +307,21 @@ impl Measurement {
         {
             self.admitted = self.admitted.saturating_add(input.admitted);
             self.allowance += input.allowance;
-            while self
-                .admission_samples
-                .front()
-                .is_some_and(|(at, _, _)| input.sample.now_us.saturating_sub(*at) >= QUALIFY_US)
-            {
+            while self.admission_samples.front().is_some_and(|sample| {
+                input.sample.now_us.saturating_sub(sample.at_us) >= QUALIFY_US
+            }) {
                 self.admission_samples.pop_front();
             }
             if self.admission_samples.len() == 16 {
                 self.admission_samples.pop_front();
             }
-            self.admission_samples.push_back((
-                input.sample.now_us,
-                input.admitted,
-                input.allowance,
-            ));
+            self.admission_samples.push_back(AdmissionSample {
+                at_us: input.sample.now_us,
+                span_us: input.admission_span_us,
+                wire_bytes: input.admitted,
+                symbol_bytes: input.admitted_symbol_bytes,
+                allowance_bytes: input.allowance,
+            });
         }
         if input.new_report
             && input.sample.now_us >= self.settle_until_us
@@ -217,13 +334,49 @@ impl Measurement {
     }
 
     fn exercised(&self) -> bool {
-        let (admitted, allowance) = self
-            .admission_samples
-            .iter()
-            .fold((0u64, 0.0), |(a, b), (_, da, db)| {
-                (a.saturating_add(*da), b + db)
-            });
+        let (admitted, allowance) =
+            self.admission_samples
+                .iter()
+                .fold((0u64, 0.0), |(a, b), sample| {
+                    (
+                        a.saturating_add(sample.wire_bytes),
+                        b + sample.allowance_bytes,
+                    )
+                });
         allowance > 0.0 && admitted as f64 >= allowance * 0.9
+    }
+
+    fn service_keeps_up(&self, clean_after_receiver_us: Option<u64>) -> bool {
+        if !self.window.complete()
+            || !self.exercised()
+            || !self.window.cursor.zip(clean_after_receiver_us).is_some_and(
+                |(cursor, clean_after)| {
+                    cursor.receiver_us.saturating_sub(self.window.span()) >= clean_after
+                },
+            )
+        {
+            return false;
+        }
+        let (wire, symbol, allowance, span) =
+            self.admission_samples
+                .iter()
+                .fold((0u64, 0u64, 0.0, 0u64), |(w, s, a, t), sample| {
+                    (
+                        w.saturating_add(sample.wire_bytes),
+                        s.saturating_add(sample.symbol_bytes),
+                        a + sample.allowance_bytes,
+                        t.saturating_add(sample.span_us),
+                    )
+                });
+        // Both cost conversion and exercise use the same recent admission
+        // window in this settled, unchanged-pace measurement. Packet-size mix
+        // cannot borrow the conversion ratio of a single latest control tick.
+        span >= SAMPLE_US
+            && symbol > 0
+            && allowance > 0.0
+            && self.window.rate().is_some_and(|rate| {
+                rate * wire as f64 / symbol as f64 >= allowance * 8_000_000.0 / span as f64 * 0.85
+            })
     }
 }
 
@@ -243,6 +396,7 @@ enum State {
     Ready {
         reference: Reference,
         since_us: u64,
+        measure: Measurement,
     },
     Trial {
         reference: Reference,
@@ -268,14 +422,17 @@ pub(super) struct Input<'a> {
     pub fast_loss: bool,
     pub blocked: bool,
     pub ordinary_loss: bool,
+    pub last_growth_us: u64,
     pub stalled: bool,
     pub new_report: bool,
     pub control_sample: bool,
     pub admission_span_us: u64,
     pub admitted: u64,
+    pub admitted_symbol_bytes: u64,
     pub allowance: f64,
     pub loss_expected: u64,
     pub loss_lost: u64,
+    pub loss_batch: Option<(u64, u64)>,
 }
 
 #[derive(Default)]
@@ -287,6 +444,7 @@ pub(super) struct Action {
 pub(super) struct Controller {
     state: State,
     qualify: Option<Measurement>,
+    clean_loss: CleanEvidence,
     enabled: bool,
     generation: u64,
     next_attempt_us: u64,
@@ -308,6 +466,7 @@ impl Default for Controller {
         Self {
             state: State::Watching,
             qualify: None,
+            clean_loss: CleanEvidence::default(),
             enabled: false,
             generation: 0,
             next_attempt_us: 0,
@@ -409,6 +568,7 @@ impl Controller {
             queue_delay_ms: self.queue_ms,
             loss_expected: self.loss_expected,
             loss_lost: self.loss_lost,
+            clean_loss: self.clean_loss.summary(),
         };
         if self.events.len() == MAX_EVENTS {
             self.events.pop_front();
@@ -431,6 +591,7 @@ impl Controller {
         }
         self.state = State::Watching;
         self.qualify = None;
+        self.clean_loss.clear();
         maximum
     }
 
@@ -498,6 +659,7 @@ impl Controller {
             };
         }
         if !input.sample.offered_backlog {
+            self.clean_loss.clear();
             if let State::Holding { measure, idle, .. } = &mut self.state {
                 *idle = true;
                 *measure = Measurement::new(now, self.settle_us);
@@ -514,16 +676,21 @@ impl Controller {
         }
         if input.queue_ms > input.target_ms * 0.4 || input.sample.transport_blocked {
             self.qualify = None;
+            self.clean_loss.clear();
             // A trial may continue below the hard queue threshold, but cannot
             // be validated or newly granted until the lower queue objective is met.
             if matches!(self.state, State::Watching) {
                 return Action::default();
             }
+        } else {
+            self.clean_loss.observe(&input);
         }
+        let clean_service_evidence = self.clean_loss.complete() && self.candidate_allowed;
+        let clean_after_receiver_us = self.clean_loss.summary().first_receiver_report_us;
         match &mut self.state {
             State::Watching => {
                 if now < self.next_attempt_us
-                    || !(input.ordinary_loss || input.stalled)
+                    || input.rate_bps.saturating_mul(105).div_ceil(100) > input.maximum_bps
                     || self
                         .last_report_us
                         .is_none_or(|at| now.saturating_sub(at) > FRESH_US)
@@ -533,7 +700,17 @@ impl Controller {
                 }
                 let qualify = self.qualify.get_or_insert_with(|| Measurement::new(now, 0));
                 qualify.observe(&input);
-                if now.saturating_sub(qualify.started_us) >= QUALIFY_US {
+                // Low-queue, actual-use qualification is continuous regardless
+                // of temporary settling after a brake. Entry additionally
+                // requires the ordinary controller to be blocked *now*. Do not
+                // capture a healthy known-service recovery already in progress.
+                // A report can briefly lag a growth step even after the usual
+                // 600 ms settling guard. Require ordinary growth itself to be
+                // quiet, without resetting continuous demand on safety brakes.
+                if now.saturating_sub(qualify.started_us) >= QUALIFY_US
+                    && now.saturating_sub(input.last_growth_us) >= QUALIFY_US
+                    && (input.ordinary_loss || input.stalled)
+                {
                     let exercised = qualify.exercised();
                     let qualification = qualify.clone();
                     self.qualify = None;
@@ -572,6 +749,12 @@ impl Controller {
                     };
                 }
                 measure.observe(&input);
+                if clean_service_evidence && measure.service_keeps_up(clean_after_receiver_us) {
+                    return Action {
+                        maximum_rate: self.abort(now, Reason::CleanServiceRestored, false),
+                        ..Action::default()
+                    };
+                }
                 if measure.window.complete()
                     && measure.exercised()
                     && input.queue_ms <= input.target_ms * 0.4
@@ -582,24 +765,33 @@ impl Controller {
                         symbol_bps,
                         window: measure.window.clone(),
                     };
+                    let ready_measure = measure.clone();
                     self.event(now, Reason::BaselineReady, Phase::Ready);
                     self.state = State::Ready {
                         reference,
                         since_us: now,
+                        measure: ready_measure,
                     };
                 }
             }
-            State::Ready { reference, .. } => {
+            State::Ready {
+                reference, measure, ..
+            } => {
                 if reference.rate_bps != input.rate_bps {
                     return Action {
                         maximum_rate: self.abort(now, Reason::ServiceRegressed, false),
                         ..Action::default()
                     };
                 }
-                if input.new_report
-                    && let Some(cursor) = Cursor::from_sample(input.sample)
-                {
-                    reference.window.push(cursor);
+                measure.observe(&input);
+                if clean_service_evidence && measure.service_keeps_up(clean_after_receiver_us) {
+                    return Action {
+                        maximum_rate: self.abort(now, Reason::CleanServiceRestored, false),
+                        ..Action::default()
+                    };
+                }
+                if input.new_report {
+                    reference.window = measure.window.clone();
                     if reference.window.complete()
                         && reference
                             .window
@@ -627,6 +819,12 @@ impl Controller {
                 ..
             } => {
                 measure.observe(&input);
+                if clean_service_evidence && measure.service_keeps_up(clean_after_receiver_us) {
+                    return Action {
+                        maximum_rate: self.abort(now, Reason::CleanServiceRestored, false),
+                        ..Action::default()
+                    };
+                }
                 if measure.window.complete() && measure.exercised() {
                     let observed = measure.window.rate().unwrap_or(0.0);
                     let required_gain =
@@ -673,6 +871,12 @@ impl Controller {
                     *idle = false;
                 }
                 measure.observe(&input);
+                if clean_service_evidence && measure.service_keeps_up(clean_after_receiver_us) {
+                    return Action {
+                        maximum_rate: self.abort(now, Reason::CleanServiceRestored, false),
+                        ..Action::default()
+                    };
+                }
                 if self
                     .last_report_us
                     .is_none_or(|at| now.saturating_sub(at) > FRESH_US)
@@ -788,6 +992,7 @@ impl Controller {
             total_transitions: self.total_events,
             evicted_transitions: self.total_events.saturating_sub(self.events.len() as u64),
             transitions: self.events.clone(),
+            clean_loss: self.clean_loss.summary(),
         }
     }
 }
@@ -803,6 +1008,9 @@ mod tests {
         bytes: u64,
         report: u64,
         ordinary_loss: bool,
+        last_growth_us: u64,
+        loss_batch: (u64, u64),
+        loss_fresh: bool,
     }
 
     impl Driver {
@@ -814,6 +1022,9 @@ mod tests {
                 bytes: 0,
                 report: 0,
                 ordinary_loss: true,
+                last_growth_us: 0,
+                loss_batch: (20, 4),
+                loss_fresh: true,
             }
         }
 
@@ -828,7 +1039,7 @@ mod tests {
                 now_us: self.now,
                 generation: 71,
                 report_number: self.report,
-                feedback_age_us: Some(0),
+                feedback_age_us: Some(if self.loss_fresh { 0 } else { FRESH_US + 1 }),
                 positive_delivery_age_us: Some(0),
                 delivered_bytes: self.bytes,
                 delivered_bps: Some(symbol_bps as f64),
@@ -851,14 +1062,17 @@ mod tests {
                 fast_loss: false,
                 blocked: false,
                 ordinary_loss: self.ordinary_loss,
+                last_growth_us: self.last_growth_us,
                 stalled: false,
                 new_report,
                 control_sample: self.now.is_multiple_of(200_000),
                 admission_span_us: 200_000,
                 admitted: if backlog { allowance as u64 } else { 0 },
+                admitted_symbol_bytes: if backlog { allowance as u64 } else { 0 },
                 allowance,
                 loss_expected: 100,
                 loss_lost: 20,
+                loss_batch: new_report.then_some(self.loss_batch),
             });
             if let Some(maximum) = action.maximum_rate {
                 self.rate = self.rate.min(maximum);
@@ -942,7 +1156,7 @@ mod tests {
         }
         driver.ordinary_loss = false;
         for _ in 0..30 {
-            driver.tick(320_000, true);
+            driver.tick(0, false);
         }
         driver.ordinary_loss = true;
         for _ in 0..12 {
@@ -1017,5 +1231,151 @@ mod tests {
                 .iter()
                 .any(|e| e.reason == Reason::ServiceRegressed)
         );
+    }
+
+    #[test]
+    fn reprobe_009r2_clean_exit_requires_new_loss_and_exercised_receiver_service() {
+        let mut driver = Driver::holding();
+        let proven_rate = driver.rate;
+        // Fresh positive bytes at the full allowance cannot hide persistent20%
+        // finalized loss. The existing protection must remain in that case.
+        for _ in 0..25 {
+            driver.tick(proven_rate, true);
+        }
+        assert_eq!(driver.controller.phase(), Phase::Holding);
+        assert!(!driver.controller.clean_loss.complete());
+
+        driver.loss_batch = (20, 0);
+        driver.ordinary_loss = false;
+        // Clean loss alone is not enough if measured service still underuses
+        // the fully exercised operational allowance.
+        for _ in 0..25 {
+            driver.tick(proven_rate * 4 / 5, true);
+        }
+        assert!(driver.controller.clean_loss.complete());
+        assert_eq!(driver.controller.phase(), Phase::Holding);
+        for _ in 0..25 {
+            driver.tick(proven_rate, true);
+        }
+        assert_eq!(driver.controller.phase(), Phase::Watching);
+        assert_eq!(
+            driver.rate, proven_rate,
+            "clean exit cannot jump to remembered capacity"
+        );
+        let event = driver
+            .controller
+            .events
+            .iter()
+            .find(|event| event.reason == Reason::CleanServiceRestored)
+            .unwrap();
+        assert_eq!((event.from, event.to), (Phase::Holding, Phase::Watching));
+        assert!(event.clean_loss.reports >= 3 && event.clean_loss.expected >= 32);
+        assert!(event.receiver_span_us >= SAMPLE_US && event.reports >= 3);
+    }
+
+    #[test]
+    fn reprobe_009r2_qualified_watcher_does_not_capture_unblocked_normal_growth() {
+        let mut driver = Driver::new();
+        driver.ordinary_loss = false;
+        for _ in 0..50 {
+            driver.tick(driver.rate, true);
+        }
+        assert_eq!(driver.controller.phase(), Phase::Watching);
+        assert!(driver.controller.candidate(driver.now).is_none());
+        // The continuous low-queue, actual-use qualification remains intact
+        // while ordinary growth is unblocked. A later real shortfall may use
+        // it without incorrectly stitching together separate demand periods.
+        driver.ordinary_loss = true;
+        driver.tick(driver.rate * 4 / 5, true);
+        assert_eq!(driver.controller.phase(), Phase::Baseline);
+        let event = driver.controller.events.back().unwrap();
+        assert!(event.actual_admission_bytes as f64 >= event.integrated_allowance_bytes * 0.9);
+    }
+
+    #[test]
+    fn reprobe_009r3_recent_normal_growth_cannot_be_captured_by_lagged_loss() {
+        let mut driver = Driver::new();
+        driver.ordinary_loss = false;
+        for _ in 0..50 {
+            driver.tick(driver.rate, true);
+        }
+        driver.last_growth_us = driver.now;
+        driver.ordinary_loss = true;
+        // Mature physical qualification and a newly settled shortfall do not
+        // prove that recovery stopped only 600 ms after its last growth step.
+        for _ in 0..6 {
+            driver.tick(driver.rate * 4 / 5, true);
+        }
+        assert_eq!(driver.now - driver.last_growth_us, 600_000);
+        assert_eq!(driver.controller.phase(), Phase::Watching);
+        for _ in 0..13 {
+            // A brake's short settling interval may temporarily remove loss
+            // pressure, but cannot reset the independently exercised demand.
+            driver.ordinary_loss = !driver.ordinary_loss;
+            driver.tick(driver.rate * 4 / 5, true);
+        }
+        assert_eq!(driver.now - driver.last_growth_us, 1_900_000);
+        assert_eq!(driver.controller.phase(), Phase::Watching);
+        driver.ordinary_loss = true;
+        driver.tick(driver.rate * 4 / 5, true);
+        assert_eq!(driver.now - driver.last_growth_us, QUALIFY_US);
+        assert_eq!(driver.controller.phase(), Phase::Baseline);
+    }
+
+    #[test]
+    fn reprobe_009r2_first_prefix_and_stale_loss_cannot_manufacture_clean_evidence() {
+        let mut driver = Driver::new();
+        driver.ordinary_loss = false;
+        driver.loss_batch = (1_000_000, 0);
+        for _ in 0..5 {
+            driver.tick(400_000, true);
+        }
+        assert_eq!(driver.controller.clean_loss.summary().expected, 0);
+        driver.loss_batch = (1, 0);
+        for _ in 0..15 {
+            driver.tick(400_000, true);
+        }
+        assert_eq!(driver.controller.clean_loss.summary().expected, 3);
+        assert!(!driver.controller.clean_loss.complete());
+        driver.loss_fresh = false;
+        driver.loss_batch = (1_000_000, 0);
+        for _ in 0..10 {
+            driver.tick(400_000, true);
+        }
+        assert_eq!(driver.controller.clean_loss.summary().reports, 0);
+        driver.loss_fresh = true;
+        for _ in 0..5 {
+            driver.tick(400_000, true);
+        }
+        assert_eq!(
+            driver.controller.clean_loss.summary().reports,
+            0,
+            "first report after stale reset only anchors"
+        );
+    }
+
+    #[test]
+    fn reprobe_009r2_clean_trial_exit_withdraws_unvalidated_extra_credit() {
+        let mut driver = Driver::new();
+        driver.ready();
+        let request = driver.controller.candidate(driver.now).unwrap();
+        let baseline = request.baseline_bps;
+        driver.rate = driver
+            .controller
+            .start(driver.now, request.trial_bps)
+            .unwrap();
+        driver.loss_batch = (20, 0);
+        driver.ordinary_loss = false;
+        for _ in 0..39 {
+            driver.tick(driver.rate, true);
+            if driver.controller.phase() == Phase::Watching {
+                break;
+            }
+        }
+        assert_eq!(driver.controller.phase(), Phase::Watching);
+        assert_eq!(driver.rate, baseline);
+        assert!(driver.controller.events.iter().any(|event| {
+            event.reason == Reason::CleanServiceRestored && event.from == Phase::Trial
+        }));
     }
 }

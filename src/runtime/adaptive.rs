@@ -545,16 +545,19 @@ impl PathController {
             healthy: self.no_delivery_confirmed_us.is_none(),
             fast_loss,
             blocked: blocked_pressure,
-            ordinary_loss: ordinary_loss && self.congestion_seen,
+            ordinary_loss: self.loss_pressure,
+            last_growth_us: self.last_growth_us,
             stalled: self.congestion_seen
                 && now.saturating_sub(self.last_growth_us) >= LOSS_WINDOW_US,
             new_report,
             control_sample: admission_span >= CONTROL_US,
             admission_span_us: admission_span,
             admitted: self.admitted_bytes,
+            admitted_symbol_bytes: self.admitted_symbol_bytes,
             allowance: self.allowance_bytes,
             loss_expected: loss_counts.0.min(u128::from(u64::MAX)) as u64,
             loss_lost: loss_counts.1.min(u128::from(u64::MAX)) as u64,
+            loss_batch,
         });
         if let Some(maximum) = trial_action.maximum_rate {
             // Rollback can only remove trial credit. A real safety reduction
