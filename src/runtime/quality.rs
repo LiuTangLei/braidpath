@@ -173,7 +173,11 @@ impl State {
             },
             delay_variation_ms: r.delay_us as f64 / 1000.0,
             report_number: r.number,
-            updated_us: Some(now_us),
+            updated_us: if delta_expected == 0 {
+                old.updated_us
+            } else {
+                Some(now_us)
+            },
         };
         self.snapshot.controls_received += 1;
         Ok(())
@@ -249,6 +253,32 @@ mod tests {
             payload: vec![1],
         })
         .unwrap()
+    }
+    #[test]
+    fn idle_control_reports_do_not_refresh_old_quality_samples() {
+        let mut state = State::new(7);
+        state.snapshot.sent_symbols = 10;
+        let mut r = Report {
+            id: 0,
+            generation: 7,
+            sent: 0,
+            number: 1,
+            expected: 10,
+            received: 8,
+            delay_us: 1000,
+        };
+        state.apply(&r, 1000).unwrap();
+        assert_eq!(state.snapshot.sender_estimate.updated_us, Some(1000));
+        r.number = 2;
+        state.apply(&r, 10_000_000).unwrap();
+        assert_eq!(state.snapshot.sender_estimate.updated_us, Some(1000));
+        assert!((state.snapshot.sender_estimate.loss_rate - 0.2).abs() < 1e-12);
+        state.snapshot.sent_symbols = 12;
+        r.number = 3;
+        r.expected = 12;
+        r.received = 10;
+        state.apply(&r, 11_000_000).unwrap();
+        assert_eq!(state.snapshot.sender_estimate.updated_us, Some(11_000_000));
     }
     #[test]
     fn loss_reordering_duplicates_and_tail_are_finalized_without_fec_credit() {
