@@ -222,7 +222,7 @@ pub fn parse_control(b: &[u8]) -> Result<Vec<Report>> {
     );
     let mut ids = BTreeSet::new();
     let mut out = Vec::new();
-    for e in b[5..].chunks_exact(ENTRY) {
+    for e in b[5..].as_chunks::<ENTRY>().0 {
         ensure!(
             usize::from(e[0]) < MAX_PATHS && ids.insert(e[0]),
             "invalid control path"
