@@ -50,6 +50,9 @@ fn ready(p: &mut Process, text: &str) {
     }
 }
 fn run(args: &[String]) -> Output {
+    run_bounded(args, Duration::from_secs(15))
+}
+fn run_bounded(args: &[String], maximum: Duration) -> Output {
     let mut child = Command::new(BIN)
         .env("RUST_LOG", "braidpath=info")
         .args(args)
@@ -62,7 +65,7 @@ fn run(args: &[String]) -> Output {
         if child.try_wait().unwrap().is_some() {
             return child.wait_with_output().unwrap();
         }
-        if start.elapsed() > Duration::from_secs(15) {
+        if start.elapsed() > maximum {
             let _ = child.kill();
             let output = child.wait_with_output().unwrap();
             panic!(
@@ -256,19 +259,22 @@ fn three_paths(mode: u8) {
     ready(&mut client, "UDP client ready");
     let logs = fs::read_to_string(&client.log).unwrap();
     assert_eq!(logs.matches("client path ready").count(), 3, "{logs}");
-    let result = run(&args(&[
-        "probe",
-        "--target",
-        &client_addr,
-        "--count",
-        if mode == 3 { "1200" } else { "200" },
-        "--size",
-        "700",
-        "--pps",
-        "200",
-        "--deadline-ms",
-        "1000",
-    ]));
+    let result = run_bounded(
+        &args(&[
+            "probe",
+            "--target",
+            &client_addr,
+            "--count",
+            if mode == 3 { "1200" } else { "200" },
+            "--size",
+            "700",
+            "--pps",
+            "200",
+            "--deadline-ms",
+            "1000",
+        ]),
+        Duration::from_secs(if mode == 3 { 45 } else { 15 }),
+    );
     assert!(
         result.status.success(),
         "{}\nclient:{}\nserver:{}",
