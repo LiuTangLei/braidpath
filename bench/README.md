@@ -109,7 +109,7 @@ adapt it in `local/matrix.json`; topology addresses never go in the matrix.
       "path": "direct",
       "direction": "echo",
       "pps": 200,
-      "profiles": ["raw1", "bbr", "cubic"]
+      "profiles": ["raw1", "bbr"]
     }
   ],
   "profiles": {
@@ -117,7 +117,6 @@ adapt it in `local/matrix.json`; topology addresses never go in the matrix.
     "raw2": {"transport": "raw-udp", "flows": 2},
     "raw4": {"transport": "raw-udp", "flows": 4},
     "bbr": {"transport": "braidpath", "congestion": "bbr", "fec": 0, "entrances": ["@path"]},
-    "cubic": {"transport": "braidpath", "congestion": "cubic", "fec": 0, "entrances": ["@path"]},
     "three0": {"transport": "braidpath", "congestion": "bbr", "fec": 0, "entrances": ["direct", "relay_a", "relay_b"]},
     "three4": {"transport": "braidpath", "congestion": "bbr", "fec": 4, "entrances": ["direct", "relay_a", "relay_b"]}
   }
@@ -131,8 +130,13 @@ groups alternate forward/reverse order: two profiles with two groups produce
 `repeats` counts groups, so every profile runs exactly that many primary attempts.
 `@path` uses the current case path. Named entrances support best-single versus
 three-entrance FEC0/FEC4 echo comparisons at the same application rate/budget.
-BBR profiles omit `--congestion` on both endpoints to exercise the shipping
-default; CUBIC profiles explicitly pass `--congestion cubic` on both endpoints.
+Current profiles use BBR and omit the controller argument on both endpoints.
+The current harness rejects other controller values before starting services.
+Historical records remain unchanged and are not input profiles for new runs.
+
+For bounded local packet-shaping experiments with persistent sessions and a
+small RTT probe alongside bulk traffic, use `adaptive_scenario.py` and
+[the adaptive validation procedure](../docs/adaptive-validation.md).
 
 Directions are `echo`, `client_to_server`, and `server_to_client`. Count is
 `pps * duration_seconds`; `pps` is the **total** across flows. Raw echo supports

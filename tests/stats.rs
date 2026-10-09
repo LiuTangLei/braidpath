@@ -154,9 +154,7 @@ fn check_symbols(v: &Value) {
     );
     assert_eq!(
         num(v, "repairs_generated"),
-        num(v, "repairs_enqueued")
-            + num(v, "repairs_queue_full_dropped")
-            + num(v, "repairs_budget_skipped")
+        num(v, "repairs_enqueued") + num(v, "repairs_queue_full_dropped")
     );
     assert_eq!(
         num(v, "originals_enqueued"),
@@ -169,6 +167,7 @@ fn check_symbols(v: &Value) {
         num(v, "repairs_quinn_admitted")
             + num(v, "repairs_expired_dropped")
             + num(v, "repairs_shutdown_dropped")
+            + num(v, "repairs_budget_skipped")
     );
 }
 #[test]
@@ -374,7 +373,9 @@ fn http3_impairment_reconciles_queues_symbols_and_observed_logical_ids() {
     let expiry = &symbols["expiry_wait"];
     assert_eq!(
         num(expiry, "count"),
-        num(symbols, "originals_expired_dropped") + num(symbols, "repairs_expired_dropped")
+        num(symbols, "originals_expired_dropped")
+            + num(symbols, "repairs_expired_dropped")
+            + num(symbols, "originals_ingress_expired_dropped")
     );
     assert!(expiry["sum_ms"].as_f64().unwrap() > 0.);
     assert!(expiry["max_ms"].as_f64().unwrap() >= 100.);
@@ -397,6 +398,7 @@ fn http3_impairment_reconciles_queues_symbols_and_observed_logical_ids() {
             + num(symbols, "originals_queue_full_dropped")
             + num(symbols, "originals_expired_dropped")
             + num(symbols, "originals_shutdown_dropped")
+            + num(symbols, "originals_ingress_expired_dropped")
     );
     println!(
         "queue expiry conservation: application={} quinn_admitted={} expired={} shutdown={} expiry_wait_count={} expiry_wait_max_ms={}",

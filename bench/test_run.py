@@ -26,8 +26,8 @@ def configuration():
         "paths": {"direct": {"entrance": "server-entrance", "raw_entrance": "raw-entrance"}},
     }
     matrix = {"duration_seconds": 2, "repeats": 2, "order": "abba", "retry_startup": 0,
-              "cases": [{"name": "paired", "path": "direct", "direction": "echo", "pps": 12, "profiles": ["bbr", "cubic"]}],
-              "profiles": {"bbr": {"transport": "braidpath", "fec": 0, "congestion": "bbr"}, "cubic": {"transport": "braidpath", "fec": 0, "congestion": "cubic"}}}
+              "cases": [{"name": "paired", "path": "direct", "direction": "echo", "pps": 12, "profiles": ["bbr", "bbr_fec4"]}],
+              "profiles": {"bbr": {"transport": "braidpath", "fec": 0, "congestion": "bbr"}, "bbr_fec4": {"transport": "braidpath", "fec": 4, "congestion": "bbr"}}}
     return topology, matrix
 
 
@@ -45,7 +45,7 @@ def artifact(value, samples=None, code=0):
 class ScheduleTests(unittest.TestCase):
     def test_abba_and_alternating_three_profiles(self):
         _, matrix = configuration()
-        self.assertEqual([r["profile"] for r in schedule(matrix)], ["bbr", "cubic", "cubic", "bbr"])
+        self.assertEqual([r["profile"] for r in schedule(matrix)], ["bbr", "bbr_fec4", "bbr_fec4", "bbr"])
         matrix["cases"][0]["profiles"] = ["single", "three0", "three4"]
         matrix.update(order="alternating", repeats=3)
         rows = schedule(matrix)
@@ -344,20 +344,25 @@ class LifecycleTests(unittest.TestCase):
             result = json.loads(output.getvalue())
             self.assertEqual(result[0]["returncode"] if payload["action"] == "stop" else result["errors"], 0 if payload["action"] == "stop" else [])
 
-    def test_bbr_omits_controller_and_cubic_is_explicit(self):
+    def test_current_profiles_use_bbr_and_reject_other_controllers_before_launch(self):
         self.runner.directory = Path(self.temp.name)
         self.runner.attempt_id = "fixture-attempt"
         self.runner.record = {}
         case = self.matrix["cases"][0]
         from types import SimpleNamespace
-        for name in ("bbr", "cubic"):
+        for name in ("bbr", "bbr_fec4"):
             self.runner.jobs = []
             with patch.object(self.runner, "runtime_ready", return_value=SimpleNamespace(session_id="fixture-session")):
                 self.runner.prepare_runtime(case, self.matrix["profiles"][name])
             for job in self.runner.jobs:
-                self.assertEqual("--congestion" in job.argv, name == "cubic")
-                if name == "cubic":
-                    self.assertEqual(job.argv[job.argv.index("--congestion") + 1], "cubic")
+                self.assertNotIn("--congestion", job.argv)
+        self.matrix["profiles"]["bbr"]["congestion"] = "cubic"
+        with self.assertRaisesRegex(ValueError, "only BBR"):
+            validate(self.topology, self.matrix)
+        with patch.object(self.runner, "launch") as launch:
+            with self.assertRaisesRegex(ValueError, "only BBR"):
+                self.runner.prepare_runtime(case, self.matrix["profiles"]["bbr"])
+            launch.assert_not_called()
 
     def test_paired_profiles_reuse_the_group_source_port(self):
         self.runner.directory = Path(self.temp.name)

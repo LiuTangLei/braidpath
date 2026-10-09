@@ -29,15 +29,12 @@ fn key(path: &Path) -> Result<PrivateKeyDer<'static>> {
 /// BBR is an experimental implementation in the pinned Quinn release.
 #[derive(Clone, Copy, Debug, Default, clap::ValueEnum)]
 pub enum Congestion {
-    Cubic,
     #[default]
     Bbr,
 }
-pub fn config(congestion: Congestion) -> TransportConfig {
+pub fn config(_congestion: Congestion) -> TransportConfig {
     let mut t = TransportConfig::default();
-    if matches!(congestion, Congestion::Bbr) {
-        t.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
-    }
+    t.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
     t.max_concurrent_bidi_streams(16u32.into());
     t.max_concurrent_uni_streams(8u32.into());
     t.datagram_receive_buffer_size(Some(256 * 1200));

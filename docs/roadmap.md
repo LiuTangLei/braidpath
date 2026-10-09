@@ -1,6 +1,6 @@
 # Roadmap
 
-The initial implementation prioritizes latency and useful throughput, with BBR as the default controller. CPU-efficiency tuning comes later; correctness and bounded queue/memory behavior remain required.
+The initial implementation prioritizes latency and useful throughput, with BBR as the only runtime congestion controller. CPU-efficiency tuning comes later and is not an acceptance gate for the current increment; correctness and bounded queue/memory behavior remain required.
 
 The stages below are ordered by dependency. Each stage produces a usable baseline or an explicit decision before increasing scope. Checked items describe the current source tree; unchecked items are future work. Run records remain local.
 
@@ -42,11 +42,14 @@ Current protocol, commands and limits: [experimental runtime](runtime.md). Check
 - [x] Implement explicit Linux interface binding and a default-route mode.
 - [ ] Validate multiple physical interfaces and platform-specific binding independently.
 - [x] Add authenticated session joins, path generations and opt-in bounded source-port rejoin; generation replay and old-handler cleanup are validated.
-- [ ] Add general outage reconnection and reliable control-operation replay across surviving paths.
+- [x] Add opt-in adaptive startup/outage reconnection, bounded retry concurrency/backoff, a highest-generation replay guard and explicit fresh-session replacement after server expiry.
+- [ ] Add reliable control-operation replay across surviving paths where later reliable operations require it.
 - [x] Add a round-robin scheduler, bounded queues, per-path transport observations and per-direction aggregate pacing.
 - [x] Add opt-in authenticated receiver feedback with bounded per-path gap and delay-change estimates.
 - [x] Add opt-in quality weights with nonzero probe shares; keep round robin as the default pending paired field comparisons.
-- [ ] Add explicit bottleneck-group caps and demonstrate competition fairness.
+- [x] Charge weighted service to actual admitted bytes, including fallback paths; failed attempts spend no service credit.
+- [x] Add explicit per-direction bottleneck-group caps, defaulting to one group per configured interface, with probes/feedback/repair included in the same budgets.
+- [ ] Demonstrate shared-bottleneck competition fairness; group caps alone do not complete this gate.
 - [ ] Validate 1×1 → 1×3 → 2×1 → 2×3, including single-interface operation, relay-only operation and path/relay outages.
 
 **Exit gate:** native captures prove both directions use the requested interface/entrance; queues and state remain bounded; the multi-entrance shared-bottleneck competition test passes for the enabled policy. Datagram loss during outage remains visible.
@@ -55,23 +58,32 @@ Current protocol, commands and limits: [experimental runtime](runtime.md). Check
 
 ## M3 — Budgeted recovery and measured scheduling
 
-- [x] Bound generated-record repair credit before increasing parity or adding copies.
-- [ ] Enforce redundancy ratios on actual admitted/sent originals rather than generated records, including queue expiry.
-- [ ] Measure completion-cost scheduling against the simple M2 baseline; keep path probing bounded.
-- [ ] Compare XOR with small-block multi-erasure coding; evaluate sliding windows only if block delay or burst loss justifies them.
-- [ ] Handle sparse traffic, correlated losses, unequal RTTs and packet packing explicitly.
+- [x] Enforce bounded repair credit on actually admitted original HTTP-datagram bytes; pre-admission expiry cannot mint credit, and repairs prefer another eligible path when available.
+- [x] Preserve each original's local ingress deadline across input/symbol queues, use local age alone at adaptive admission, bound per-flow/repair queues, and separate receiver repair waiting from unseen-original validity.
+- [x] Add an opt-in per-path adaptive operational allowance with current local RTT, finalized interval loss, receiver byte rates and actual-admission accounting; growth requires an exercised allowance and application-limited samples do not become capacity ceilings.
+- [x] Keep fresh paths eligible during ordinary congestion, retain learned pace across same-generation stale intervals, and use bounded recovery trials followed by lower-gain exploration near retained delivery; a new generation resets its controller.
+- [x] Add independent authenticated idle probes, positive-delivery health freshness separate from all-loss report freshness, bounded early exclusion of sampled zero-delivery paths, and aggregate/group feedback reservation.
+- [x] Preserve pending drain restoration across RTT/control-tick boundaries; add deterministic observation-gap, all-loss alternate-path report, drift, repeated-evidence, overhead and delayed-feedback capacity-step regressions.
+- [x] Integrate admitted-byte utilization against the rates active within each control window; separate immediate safety brakes from persistent caution qualified at the first pressure observation, with cold-pause/delayed-loss, changing-allowance and loss-only regressions.
+- [ ] Validate RTT-baseline refresh and permanent capacity changes: the current per-generation minimum RTT has no aging, and retained delivery can still motivate bounded upward trials after a permanent reduction.
+- [ ] Validate pressure-episode retirement against further delayed-loss patterns: a new clear finalized interval currently has no sequence watermark proving that all losses preceding the episode boundary have finalized.
+- [ ] Accept adaptive scheduling against round robin, the quality baseline and the best single path under a matched total budget. Sustained clean → congested → recovered operation, deadline success and unconditional tails must pass in both directions before changing a default.
+- [ ] Compare XOR with small-block multi-erasure coding only in a later coding phase; Reed–Solomon and sliding-window work are deferred until a demonstrated loss/recovery limitation justifies them.
+- [ ] Complete sparse/bursty traffic, correlated losses, unequal RTTs and packet-packing acceptance. Implemented idle probes and queue limits do not by themselves pass these scenario gates.
 - [ ] Add delayed copies only as a separately measured, budgeted policy.
 - [ ] Meet the applicable datagram, capacity, fairness and resource gates in both directions; record negative scenarios locally too.
 
 **Exit gate:** useful delivery improves in the stated scenarios within the same total resource envelope. The selected default remains simple when an optimization fails its gate.
 
-**Boundary:** lower mean RTT or a higher FEC recovery count alone does not establish lower application tail latency.
+**Boundary:** lower mean RTT or a higher FEC recovery count alone does not establish lower application tail latency. The 20 ms local sender target is separate from the prospective mixed-flow 100 ms application round-trip screen: at least 95% on-time delivery in clean/recovered windows, 90% in the impaired window including transition, and 90% of matched-baseline target goodput in clean/recovered windows. This validation objective is not a hard cross-host SLA or an acceptance result.
+
+**Current increment:** adaptive mode is experimental and opt-in. Round robin, XOR block size 4, 3 ms block closing and the existing 30% repair setting remain unchanged defaults. The source implements the mechanisms above; no sustained WAN, capacity-aggregation or deployment result is implied by a checked implementation item.
 
 ## M4 — Reliable flows and application adapters
 
 - [ ] Selective application ACKs, bounded retransmission and receiver credit, without synthesizing QUIC ACKs for FEC recovery.
 - [ ] Per-flow offsets, reassembly bounds, FIN/final-offset acknowledgment, reset and half-close.
-- [ ] Session survival while paths remain, bounded all-path reconnect and explicit terminal failure.
+- [ ] Preserve reliable-flow acknowledgment/reassembly state across path changes and define terminal delivery failure; the existing datagram reconnection lifecycle is not a reliable-flow implementation.
 - [x] UDP forwarding to a fixed target with explicit 1,000-byte maximum messages.
 - [ ] TCP forwarding on the reliable-flow service.
 - [ ] Compare FEC with the no-FEC reliable baseline; verify bytes, completion, timeout rates and latency under bulk/interactive coexistence.

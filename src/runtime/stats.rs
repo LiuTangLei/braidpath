@@ -17,6 +17,8 @@ pub const RETURN: &str = "server_to_client";
 const MAX_SCOPES: usize = 128;
 const ID_WINDOW: u64 = 8192;
 const MAX_CONNECTION_EVENTS: usize = 128;
+const MAX_PREVIOUS_GENERATIONS: usize = 3;
+const MAX_RETIRED_SESSIONS: usize = 8;
 
 #[derive(Args, Clone, Default)]
 pub struct Options {
@@ -29,7 +31,7 @@ pub struct Options {
     #[arg(long, default_value_t = 1000)]
     pub stats_interval_ms: u64,
 }
-#[derive(Default, Serialize)]
+#[derive(Clone, Default, Serialize)]
 pub struct Wait {
     pub count: u64,
     pub sum_ms: f64,
@@ -50,7 +52,7 @@ impl Wait {
         self.histogram[i] += 1;
     }
 }
-#[derive(Default, Serialize)]
+#[derive(Clone, Default, Serialize)]
 pub struct Records {
     pub application_received: u64,
     pub application_oversize_dropped: u64,
@@ -81,7 +83,7 @@ pub struct Records {
     pub udp_target_send_dropped: u64,
     pub udp_target_flow_dropped: u64,
 }
-#[derive(Default, Serialize)]
+#[derive(Clone, Default, Serialize)]
 pub struct Symbols {
     pub originals_generated: u64,
     pub repairs_generated: u64,
@@ -91,15 +93,22 @@ pub struct Symbols {
     pub originals_queue_full_dropped: u64,
     pub repairs_queue_full_dropped: u64,
     pub originals_expired_dropped: u64,
+    pub originals_ingress_expired_dropped: u64,
     pub repairs_expired_dropped: u64,
     pub expiry_wait: Wait,
     pub originals_shutdown_dropped: u64,
     pub repairs_shutdown_dropped: u64,
     pub originals_quinn_admitted: u64,
     pub repairs_quinn_admitted: u64,
+    pub originals_quinn_admitted_bytes: u64,
+    pub repairs_quinn_admitted_bytes: u64,
+    pub feedback_deferred: u64,
+    pub feedback_admitted: u64,
+    pub probes_admitted: u64,
+    pub repair_no_diverse_path: u64,
     pub admitted_wait: Wait,
 }
-#[derive(Default, Serialize)]
+#[derive(Clone, Default, Serialize)]
 pub struct Ids {
     pub highest_id: u64,
     pub floor_id: u64,
@@ -120,7 +129,7 @@ impl Ids {
         }
     }
 }
-#[derive(Default, Serialize)]
+#[derive(Clone, Default, Serialize)]
 pub struct Direction {
     pub records: Records,
     pub symbols: Symbols,
@@ -133,7 +142,7 @@ pub struct Direction {
     #[serde(skip_serializing_if = "Ids::is_empty")]
     pub udp_delivered_record_ids: Ids,
 }
-#[derive(Default, Serialize)]
+#[derive(Clone, Default, Serialize)]
 pub struct Quinn {
     pub lost_packets: u64,
     pub congestion_events: u64,
@@ -149,7 +158,27 @@ pub struct Quinn {
     pub http_datagram_frames_rx: u64,
     pub closed: bool,
 }
-#[derive(Serialize)]
+impl Quinn {
+    fn sample(conn: &quinn::Connection) -> Self {
+        let q = conn.stats();
+        Self {
+            lost_packets: q.path.lost_packets,
+            congestion_events: q.path.congestion_events,
+            min_rtt_ms: q.path.min_rtt.as_secs_f64() * 1000.,
+            smoothed_rtt_ms: conn.rtt().as_secs_f64() * 1000.,
+            congestion_window_bytes: q.path.cwnd,
+            sent_packets: q.path.sent_packets,
+            udp_datagrams_tx: q.udp_tx.datagrams,
+            udp_datagrams_rx: q.udp_rx.datagrams,
+            udp_bytes_tx: q.udp_tx.bytes,
+            udp_bytes_rx: q.udp_rx.bytes,
+            http_datagram_frames_tx: q.frame_tx.datagram,
+            http_datagram_frames_rx: q.frame_rx.datagram,
+            closed: conn.close_reason().is_some(),
+        }
+    }
+}
+#[derive(Clone, Serialize)]
 pub struct Generation {
     pub connection_id: usize,
     pub quinn: Quinn,
@@ -157,13 +186,21 @@ pub struct Generation {
     pub peer_socket: String,
     pub quality: Option<super::quality::Snapshot>,
 }
-#[derive(Default, Serialize)]
+#[derive(Clone, Default, Serialize)]
 pub struct Path {
     pub connection_id: usize,
+    /// Includes the current generation. Re-registering the same connection is idempotent.
+    pub total_generations: u64,
+    /// All superseded generations, including those outside the bounded snapshot history.
+    pub retired_generations: u64,
     pub previous_generations: Vec<Generation>,
     pub rotation_attempts: u64,
     pub rotation_successes: u64,
     pub rotation_failures: u64,
+    pub reconnect_attempts: u64,
+    pub reconnect_successes: u64,
+    pub reconnect_failures: u64,
+    pub adaptive: Option<super::adaptive::Decision>,
     pub receiver_feedback: Option<super::quality::Snapshot>,
     pub session_id: String,
     pub path_id: u8,
@@ -195,7 +232,7 @@ pub struct Path {
     pub peer_socket: String,
     pub quinn: Quinn,
 }
-#[derive(Default, Serialize)]
+#[derive(Clone, Default, Serialize)]
 pub struct RelayDirection {
     pub received: u64,
     pub queue_enqueued: u64,
@@ -214,7 +251,7 @@ pub struct RelayDirection {
     pub mapping_expired_queue_dropped: u64,
     pub socket_send_cancelled_dropped: u64,
 }
-#[derive(Default, Serialize)]
+#[derive(Clone, Default, Serialize)]
 pub struct State {
     pub ready: bool,
     pub configured_paths: usize,
@@ -228,6 +265,11 @@ pub struct State {
     pub relay: BTreeMap<String, RelayDirection>,
     pub omitted_session_scopes: u64,
     pub omitted_path_scopes: u64,
+    /// IDs whose scalar scope snapshots are retained after all connection handles retire.
+    pub retired_sessions: VecDeque<String>,
+    pub retired_session_total: u64,
+    pub evicted_session_scopes: u64,
+    pub evicted_path_scopes: u64,
     pub handshake_attempts: u64,
     pub handshake_successes: u64,
     pub handshake_failures: u64,
@@ -240,9 +282,23 @@ pub struct State {
     pub connection_events: VecDeque<ConnectionEvent>,
     pub omitted_connection_events: u64,
 }
+impl State {
+    fn evict_oldest_retired(&mut self) -> bool {
+        let Some(session) = self.retired_sessions.pop_front() else {
+            return false;
+        };
+        if self.sessions.remove(&session).is_some() {
+            self.evicted_session_scopes += 1;
+        }
+        let before = self.paths.len();
+        self.paths.retain(|_, path| path.session_id != session);
+        self.evicted_path_scopes += (before - self.paths.len()) as u64;
+        true
+    }
+}
 
 /// Local diagnostic identifiers are independent of session credentials and IDs.
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 pub struct ConnectionEvent {
     pub connection_id: u64,
     pub phase: &'static str,
@@ -404,6 +460,24 @@ impl ConnectionTrace {
         self.event("failed", Some(reason));
         self.finished = Some(false);
     }
+    /// Explicit local cancellation is normal even before authentication finishes.
+    /// Preserve an already recorded failure and make repeated cleanup idempotent.
+    pub fn cancelled(&mut self) {
+        if self.finished.is_some() {
+            return;
+        }
+        self.metrics.state(|s| {
+            if !self.handshake_complete {
+                s.handshake_cancelled += 1;
+            }
+            if self.admission_pending {
+                s.path_admission_cancelled += 1;
+            }
+        });
+        self.admission_pending = false;
+        self.event("cancelled", Some("local_shutdown"));
+        self.finished = Some(true);
+    }
     /// A known local shutdown or an established peer's code-0 close is normal.
     /// Before admission, peer closure is still an admission failure if attempted.
     pub fn finish(&mut self, error: Option<&anyhow::Error>) -> bool {
@@ -428,17 +502,7 @@ impl ConnectionTrace {
                         .is_some_and(|e| e.is_h3_no_error())
             });
         if local {
-            self.metrics.state(|s| {
-                if !self.handshake_complete {
-                    s.handshake_cancelled += 1;
-                }
-                if self.admission_pending {
-                    s.path_admission_cancelled += 1;
-                }
-            });
-            self.admission_pending = false;
-            self.event("cancelled", Some("local_shutdown"));
-            self.finished = Some(true);
+            self.cancelled();
             return true;
         }
         if error.is_none() || (peer_normal && (self.authenticated || !self.admission_pending)) {
@@ -458,7 +522,9 @@ impl ConnectionTrace {
 }
 struct Inner {
     state: Mutex<State>,
-    connections: Mutex<Vec<(String, quinn::Connection)>>,
+    // Only the current connection per logical path is retained. Historical
+    // generations hold scalar snapshots and cannot keep retired endpoints alive.
+    connections: Mutex<BTreeMap<String, quinn::Connection>>,
     started: Instant,
     role: &'static str,
     instance_id: String,
@@ -476,7 +542,7 @@ impl Metrics {
     pub fn new(role: &'static str) -> Self {
         Self(Arc::new(Inner {
             state: Mutex::new(State::default()),
-            connections: Mutex::new(Vec::new()),
+            connections: Mutex::new(BTreeMap::new()),
             started: Instant::now(),
             role,
             instance_id: super::transport::hex(&rand::random::<[u8; 16]>()),
@@ -500,10 +566,14 @@ impl Metrics {
     }
     pub fn scope(&self, session: &str, direction: &'static str) -> Scope {
         self.state(|s| {
-            if !s.sessions.contains_key(session) && s.sessions.len() < MAX_SCOPES {
-                s.sessions.insert(session.to_owned(), BTreeMap::new());
-            } else if !s.sessions.contains_key(session) {
-                s.omitted_session_scopes += 1;
+            s.retired_sessions.retain(|id| id != session);
+            if !s.sessions.contains_key(session) {
+                while s.sessions.len() >= MAX_SCOPES && s.evict_oldest_retired() {}
+                if s.sessions.len() < MAX_SCOPES {
+                    s.sessions.insert(session.to_owned(), BTreeMap::new());
+                } else {
+                    s.omitted_session_scopes += 1;
+                }
             }
         });
         Scope {
@@ -511,6 +581,33 @@ impl Metrics {
             session: session.to_owned(),
             direction,
         }
+    }
+    /// Release a finished session's connection handles while retaining a small
+    /// tail of scalar snapshots for final reports. New active scopes take priority
+    /// over this history; process-wide direction totals are never evicted.
+    pub fn retire_session(&self, session: &str) {
+        let mut connections = self.0.connections.lock().expect("stats connections lock");
+        let mut state = self.0.state.lock().expect("stats lock");
+        let mut known = state.sessions.contains_key(session);
+        for (key, path) in state
+            .paths
+            .iter_mut()
+            .filter(|(_, path)| path.session_id == session)
+        {
+            known = true;
+            if let Some(conn) = connections.remove(key) {
+                path.peer_socket = conn.remote_address().to_string();
+                path.quinn = Quinn::sample(&conn);
+            }
+        }
+        if known && !state.retired_sessions.iter().any(|id| id == session) {
+            state.retired_sessions.push_back(session.to_owned());
+            state.retired_session_total += 1;
+        }
+        while state.retired_sessions.len() > MAX_RETIRED_SESSIONS {
+            state.evict_oldest_retired();
+        }
+        self.0.changed.notify_one();
     }
     pub fn register(
         &self,
@@ -522,13 +619,31 @@ impl Metrics {
     ) {
         let key = format!("{session}/{pid}");
         let mut connections = self.0.connections.lock().expect("stats connections lock");
-        if connections.len() == MAX_SCOPES {
+        if !connections.contains_key(&key) && connections.len() >= MAX_SCOPES {
             self.state(|s| s.omitted_path_scopes += 1);
             return;
         }
+        let mut accepted = false;
         self.state(|s| {
+            s.retired_sessions.retain(|id| id != session);
+            if !s.paths.contains_key(&key) {
+                while s.paths.len() >= MAX_SCOPES && s.evict_oldest_retired() {}
+                if s.paths.len() >= MAX_SCOPES {
+                    s.omitted_path_scopes += 1;
+                    return;
+                }
+            }
             let path = s.paths.entry(key.clone()).or_default();
-            if path.authenticated && path.previous_generations.len() < 3 {
+            if path.authenticated && path.connection_id != conn.stable_id() {
+                // Capture the old connection at retirement even when no periodic
+                // reporter sampled its final traffic. Do not retain its handle.
+                if let Some(previous) = connections.get(&key) {
+                    path.quinn = Quinn::sample(previous);
+                    path.peer_socket = previous.remote_address().to_string();
+                }
+                if path.previous_generations.len() == MAX_PREVIOUS_GENERATIONS {
+                    path.previous_generations.remove(0);
+                }
                 path.previous_generations.push(Generation {
                     connection_id: path.connection_id,
                     quinn: std::mem::take(&mut path.quinn),
@@ -536,6 +651,11 @@ impl Metrics {
                     peer_socket: path.peer_socket.clone(),
                     quality: path.receiver_feedback.take(),
                 });
+                path.retired_generations += 1;
+                path.total_generations += 1;
+                path.adaptive = None;
+            } else if !path.authenticated {
+                path.total_generations = 1;
             }
             path.connection_id = conn.stable_id();
             path.session_id = session.to_owned();
@@ -544,9 +664,13 @@ impl Metrics {
             path.authenticated = true;
             path.sending_direction = direction.to_owned();
             path.peer_socket = conn.remote_address().to_string();
+            path.quinn = Quinn::sample(conn);
+            accepted = true;
         });
-        connections.push((key, conn.clone()));
-        self.0.changed.notify_one();
+        if accepted {
+            connections.insert(key, conn.clone());
+            self.0.changed.notify_one();
+        }
     }
     pub fn snapshot(
         &self,
@@ -554,40 +678,24 @@ impl Metrics {
         outcome: &str,
         error: Option<&str>,
     ) -> Result<serde_json::Value> {
-        let connections = self.0.connections.lock().expect("stats connections lock");
-        let mut state = self.0.state.lock().expect("stats lock");
-        for (key, conn) in connections.iter() {
-            if let Some(path) = state.paths.get_mut(key) {
-                let q = conn.stats();
-                let sample = Quinn {
-                    lost_packets: q.path.lost_packets,
-                    congestion_events: q.path.congestion_events,
-                    min_rtt_ms: q.path.min_rtt.as_secs_f64() * 1000.,
-                    smoothed_rtt_ms: conn.rtt().as_secs_f64() * 1000.,
-                    congestion_window_bytes: q.path.cwnd,
-                    sent_packets: q.path.sent_packets,
-                    udp_datagrams_tx: q.udp_tx.datagrams,
-                    udp_datagrams_rx: q.udp_rx.datagrams,
-                    udp_bytes_tx: q.udp_tx.bytes,
-                    udp_bytes_rx: q.udp_rx.bytes,
-                    http_datagram_frames_tx: q.frame_tx.datagram,
-                    http_datagram_frames_rx: q.frame_rx.datagram,
-                    closed: conn.close_reason().is_some(),
-                };
-                if conn.stable_id() == path.connection_id {
+        let (state, elapsed_ms, sample_unix_ms) = {
+            let connections = self.0.connections.lock().expect("stats connections lock");
+            let mut state = self.0.state.lock().expect("stats lock");
+            for (key, conn) in connections.iter() {
+                if let Some(path) = state.paths.get_mut(key) {
                     path.peer_socket = conn.remote_address().to_string();
-                    path.quinn = sample;
-                } else if let Some(old) = path
-                    .previous_generations
-                    .iter_mut()
-                    .find(|p| p.connection_id == conn.stable_id())
-                {
-                    old.quinn = sample;
+                    path.quinn = Quinn::sample(conn);
                 }
             }
-        }
+            let elapsed_ms = self.0.started.elapsed().as_secs_f64() * 1000.;
+            let sample_unix_ms = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis();
+            // Copy bounded scalar state only. The JSON tree can contain several
+            // full ID windows and must not keep packet-path metrics locked while
+            // it allocates and serializes. No Connection handles enter this copy.
+            (state.clone(), elapsed_ms, sample_unix_ms)
+        };
         Ok(
-            serde_json::json!({"schema_version":1,"process_id":std::process::id(),"instance_id":self.0.instance_id,"bounds":{"session_scopes":MAX_SCOPES,"path_scopes":MAX_SCOPES,"connection_events":MAX_CONNECTION_EVENTS,"record_id_window":ID_WINDOW},"role":self.0.role,"final":final_snapshot,"outcome":outcome,"error":error,"elapsed_ms":self.0.started.elapsed().as_secs_f64()*1000.,"sample_unix_ms":SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis(),"counters":"cumulative; units separated by records/symbols/quinn/relay; pre-path queues have aggregate scope","stats":&*state}),
+            serde_json::json!({"schema_version":1,"process_id":std::process::id(),"instance_id":self.0.instance_id,"bounds":{"session_scopes":MAX_SCOPES,"path_scopes":MAX_SCOPES,"connection_events":MAX_CONNECTION_EVENTS,"record_id_window":ID_WINDOW,"previous_generations_per_path":MAX_PREVIOUS_GENERATIONS,"current_connection_references":MAX_SCOPES,"retired_session_snapshots":MAX_RETIRED_SESSIONS},"role":self.0.role,"final":final_snapshot,"outcome":outcome,"error":error,"elapsed_ms":elapsed_ms,"sample_unix_ms":sample_unix_ms,"counters":"cumulative; units separated by records/symbols/quinn/relay; pre-path queues have aggregate scope","stats":state}),
         )
     }
 }
@@ -701,5 +809,233 @@ impl Reporter {
             return Err(e);
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::runtime::transport::{self, Congestion};
+    use bytes::Bytes;
+    use tokio::time::timeout;
+
+    #[test]
+    fn explicit_pre_admission_cancellation_is_normal_and_counted_once() {
+        let metrics = Metrics::new("client");
+        let mut trace = ConnectionTrace::new(
+            metrics.clone(),
+            "127.0.0.1:1".parse().unwrap(),
+            Some(0),
+            "quic_connect",
+        );
+        trace.cancelled();
+        trace.cancelled();
+        assert!(trace.finish(Some(&anyhow::anyhow!("connection future cancelled"))));
+        metrics.state(|state| {
+            assert_eq!(state.handshake_attempts, 1);
+            assert_eq!(state.handshake_cancelled, 1);
+            assert_eq!(state.handshake_failures, 0);
+            assert_eq!(state.path_admission_failures, 0);
+            assert_eq!(
+                state
+                    .connection_events
+                    .iter()
+                    .filter(|event| event.outcome == "cancelled")
+                    .count(),
+                1
+            );
+            assert_eq!(
+                state.connection_events.back().unwrap().error,
+                Some("local_shutdown")
+            );
+        });
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn retired_session_history_never_blocks_new_epochs_or_loses_process_totals() {
+        let temp = tempfile::tempdir().unwrap();
+        let identity = temp.path().join("identity");
+        transport::initialize(&identity, "localhost").unwrap();
+        let server = transport::server(
+            "127.0.0.1:0".parse().unwrap(),
+            &identity.join("cert.pem"),
+            &identity.join("key.pem"),
+            Congestion::Bbr,
+        )
+        .unwrap();
+        let address = server.local_addr().unwrap();
+        let client =
+            transport::client(address, &identity.join("cert.pem"), None, Congestion::Bbr).unwrap();
+        let (outgoing, incoming) = timeout(Duration::from_secs(3), async {
+            tokio::join!(client.connect(address, "localhost").unwrap(), async {
+                server.accept().await.unwrap().await
+            })
+        })
+        .await
+        .unwrap();
+        let outgoing = outgoing.unwrap();
+        let incoming = incoming.unwrap();
+        let metrics = Metrics::new("test");
+        let epochs = MAX_SCOPES + 72;
+        for epoch in 0..epochs {
+            let sid = format!("epoch-{epoch}");
+            let scope = metrics.scope(&sid, FORWARD);
+            scope.update(|direction| {
+                direction.records.application_received += 1;
+                direction.generated_record_ids.add(0);
+            });
+            metrics.register(&sid, 0, 0, FORWARD, &outgoing);
+            assert_eq!(metrics.0.connections.lock().unwrap().len(), 1);
+            metrics.state(|state| {
+                assert!(state.sessions.contains_key(&sid));
+                assert!(state.paths.contains_key(&format!("{sid}/0")));
+                assert_eq!(state.omitted_path_scopes, 0);
+                assert_eq!(state.omitted_session_scopes, 0);
+            });
+            metrics.retire_session(&sid);
+            metrics.retire_session(&sid);
+            assert!(metrics.0.connections.lock().unwrap().is_empty());
+            metrics.state(|state| {
+                assert!(state.sessions.len() <= MAX_RETIRED_SESSIONS);
+                assert!(state.paths.len() <= MAX_RETIRED_SESSIONS);
+                assert_eq!(state.retired_session_total, (epoch + 1) as u64);
+            });
+        }
+        metrics.state(|state| {
+            assert_eq!(
+                state.directions[FORWARD].records.application_received,
+                epochs as u64
+            );
+            assert_eq!(state.retired_sessions.len(), MAX_RETIRED_SESSIONS);
+            assert_eq!(
+                state.evicted_session_scopes,
+                (epochs - MAX_RETIRED_SESSIONS) as u64
+            );
+            assert_eq!(
+                state.evicted_path_scopes,
+                (epochs - MAX_RETIRED_SESSIONS) as u64
+            );
+            assert!(
+                state
+                    .sessions
+                    .contains_key(&format!("epoch-{}", epochs - 1))
+            );
+        });
+        // At scope pressure, only retired history is evicted. Every new active
+        // scope remains observable until the actual concurrent bound is reached.
+        for active in 0..MAX_SCOPES {
+            let sid = format!("active-{active}");
+            metrics.scope(&sid, FORWARD);
+            metrics.register(&sid, 0, 0, FORWARD, &outgoing);
+            metrics.state(|state| {
+                assert!(state.sessions.len() <= MAX_SCOPES);
+                assert!(state.paths.len() <= MAX_SCOPES);
+                assert!(state.paths.contains_key(&format!("{sid}/0")));
+                assert_eq!(state.omitted_session_scopes, 0);
+                assert_eq!(state.omitted_path_scopes, 0);
+            });
+        }
+        assert_eq!(metrics.0.connections.lock().unwrap().len(), MAX_SCOPES);
+        metrics.scope("overflow", FORWARD);
+        metrics.register("overflow", 0, 0, FORWARD, &outgoing);
+        metrics.state(|state| {
+            assert!(state.retired_sessions.is_empty());
+            assert_eq!(state.omitted_session_scopes, 1);
+            assert_eq!(state.omitted_path_scopes, 1);
+            assert!(state.paths.contains_key("active-0/0"));
+            assert_eq!(
+                state.directions[FORWARD].records.application_received,
+                epochs as u64
+            );
+        });
+        outgoing.close(0u32.into(), b"test complete");
+        incoming.close(0u32.into(), b"test complete");
+        client.close(0u32.into(), b"test complete");
+        server.close(0u32.into(), b"test complete");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn repeated_rejoins_keep_current_monitoring_and_bounded_retired_snapshots() {
+        let temp = tempfile::tempdir().unwrap();
+        let identity = temp.path().join("identity");
+        transport::initialize(&identity, "localhost").unwrap();
+        let server = transport::server(
+            "127.0.0.1:0".parse().unwrap(),
+            &identity.join("cert.pem"),
+            &identity.join("key.pem"),
+            Congestion::Bbr,
+        )
+        .unwrap();
+        let address = server.local_addr().unwrap();
+        let client =
+            transport::client(address, &identity.join("cert.pem"), None, Congestion::Bbr).unwrap();
+        let metrics = Metrics::new("test");
+        let scope = metrics.scope("session", FORWARD);
+        let mut ids = Vec::new();
+        for generation in 0..140u64 {
+            let (outgoing, incoming) = timeout(Duration::from_secs(3), async {
+                tokio::join!(client.connect(address, "localhost").unwrap(), async {
+                    server.accept().await.unwrap().await
+                })
+            })
+            .await
+            .unwrap();
+            let outgoing = outgoing.unwrap();
+            let incoming = incoming.unwrap();
+            ids.push(outgoing.stable_id());
+            metrics.register("session", 0, 0, FORWARD, &outgoing);
+            // Repeated registration of one connection must not consume history.
+            metrics.register("session", 0, 0, FORWARD, &outgoing);
+            outgoing
+                .send_datagram(Bytes::from_static(b"retirement sample"))
+                .unwrap();
+            let received = timeout(Duration::from_secs(3), incoming.read_datagram())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(received.as_ref(), b"retirement sample");
+            scope.path(0, |path| path.quinn_admitted_originals += 1);
+            assert_eq!(metrics.0.connections.lock().unwrap().len(), 1);
+            metrics.state(|state| {
+                assert_eq!(state.paths.len(), 1);
+                assert_eq!(state.omitted_path_scopes, 0);
+                let path = &state.paths["session/0"];
+                assert_eq!(path.connection_id, outgoing.stable_id());
+                assert_eq!(path.total_generations, generation + 1);
+                assert_eq!(path.retired_generations, generation);
+                assert_eq!(path.quinn_admitted_originals, generation + 1);
+                let old = &ids[..ids.len() - 1];
+                let retained = &old[old.len().saturating_sub(MAX_PREVIOUS_GENERATIONS)..];
+                assert_eq!(
+                    path.previous_generations
+                        .iter()
+                        .map(|entry| entry.connection_id)
+                        .collect::<Vec<_>>(),
+                    retained
+                );
+                for old in &path.previous_generations {
+                    // No periodic snapshot was taken. Registration must sample
+                    // the old connection's traffic before releasing its handle.
+                    assert_eq!(old.quinn.http_datagram_frames_tx, 1);
+                    assert!(old.quinn.closed);
+                }
+            });
+            outgoing.close(0u32.into(), b"generation complete");
+            incoming.close(0u32.into(), b"generation complete");
+        }
+        let snapshot = metrics.snapshot(true, "stopped", None).unwrap();
+        let path = &snapshot["stats"]["paths"]["session/0"];
+        assert_eq!(path["total_generations"], 140);
+        assert_eq!(path["retired_generations"], 139);
+        assert_eq!(path["quinn"]["http_datagram_frames_tx"], 1);
+        assert_eq!(path["previous_generations"].as_array().unwrap().len(), 3);
+        assert_eq!(snapshot["stats"]["omitted_path_scopes"], 0);
+        client.close(0u32.into(), b"test complete");
+        server.close(0u32.into(), b"test complete");
+        timeout(Duration::from_secs(3), async {
+            tokio::join!(client.wait_idle(), server.wait_idle());
+        })
+        .await
+        .unwrap();
     }
 }

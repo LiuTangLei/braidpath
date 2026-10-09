@@ -127,8 +127,8 @@ def validate(topology, matrix):
             if flows > 1 and (profile["transport"] != "raw-udp" or case["direction"] != "echo"):
                 raise ValueError("multiple flows are supported only for raw UDP echo")
             if profile["transport"] == "braidpath":
-                if profile.get("congestion", "bbr") not in ("bbr", "cubic"):
-                    raise ValueError("invalid congestion")
+                if profile.get("congestion", "bbr") != "bbr":
+                    raise ValueError("only BBR is supported by the current runtime")
                 integer(profile.get("fec", 0), "fec", 0, 32)
                 entrances = profile.get("entrances", ["@path"])
                 paths = [case["path"] if p == "@path" else p for p in entrances]
@@ -535,6 +535,8 @@ class Runner:
 
     def prepare_runtime(self, case, profile):
         t, m = self.topology, self.matrix
+        if profile["transport"] == "braidpath" and profile.get("congestion", "bbr") != "bbr":
+            raise ValueError("only BBR is supported by the current runtime")
         path_names = [case["path"] if p == "@path" else p for p in profile.get("entrances", ["@path"])] if profile["transport"] == "braidpath" else [case["path"]]
         relay_jobs = []
         for index, name in enumerate(path_names):
@@ -554,11 +556,10 @@ class Runner:
             return
         a, tls = t["addresses"], t["tls"]
         # Omitting the controller explicitly exercises the shipping BBR default.
-        cc = [] if profile.get("congestion", "bbr") == "bbr" else ["--congestion", "cubic"]
-        server = self.job(t["server_host"], "server", ["server", "--listen", a["server_listen"], "--cert", tls["cert"], "--key", tls["key"], "--token-file", tls.get("server_token_file", tls["token_file"]), "--target", a["server_target"], "--max-rate-bps", m.get("rate_bps", 5000000), *cc], stats=True)
+        server = self.job(t["server_host"], "server", ["server", "--listen", a["server_listen"], "--cert", tls["cert"], "--key", tls["key"], "--token-file", tls.get("server_token_file", tls["token_file"]), "--target", a["server_target"], "--max-rate-bps", m.get("rate_bps", 5000000)], stats=True)
         self.launch([server])
         self.runtime_ready(server)
-        args = ["client", "--listen", a["client_listen"], "--server-name", tls["server_name"], "--ca", tls["ca"], "--token-file", tls.get("client_token_file", tls["token_file"]), "--fec", profile.get("fec", 0), "--block-ms", m.get("block_ms", 25), "--rate-bps", m.get("rate_bps", 5000000), *cc]
+        args = ["client", "--listen", a["client_listen"], "--server-name", tls["server_name"], "--ca", tls["ca"], "--token-file", tls.get("client_token_file", tls["token_file"]), "--fec", profile.get("fec", 0), "--block-ms", m.get("block_ms", 25), "--rate-bps", m.get("rate_bps", 5000000)]
         for option in ["receiver_feedback", "quality_schedule", "rotate_source_port"]:
             if profile.get(option):
                 args.append("--" + option.replace("_", "-"))

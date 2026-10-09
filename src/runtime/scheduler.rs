@@ -14,28 +14,41 @@ pub fn weight(estimate: &Estimate, now_us: u64, rtt_ms: f64) -> i32 {
 }
 #[derive(Default)]
 pub struct Scheduler {
-    debt: [i32; MAX_PATHS],
+    debt: [i64; MAX_PATHS],
 }
 impl Scheduler {
-    /// Smooth weighted round robin, with bounded debt and a nonzero probe share.
-    pub fn order(&mut self, candidates: &[(u8, i32)]) -> Vec<u8> {
-        let sum: i32 = candidates.iter().map(|(_, w)| *w).sum();
-        for &(id, w) in candidates {
-            self.debt[usize::from(id)] = (self.debt[usize::from(id)] + w).clamp(-256, 256);
-        }
+    /// Preview byte-weighted service order. A failed attempt spends no service credit.
+    pub fn order(&self, candidates: &[(u8, i32)], bytes: usize) -> Vec<u8> {
+        let bytes = bytes.min(65_536) as i64;
         let mut order = candidates.to_vec();
-        order.sort_by_key(|(id, _)| std::cmp::Reverse(self.debt[usize::from(*id)]));
-        if let Some((id, _)) = order.first() {
-            self.debt[usize::from(*id)] = (self.debt[usize::from(*id)] - sum).clamp(-256, 256);
-        }
+        order.sort_by_key(|(id, weight)| {
+            std::cmp::Reverse(self.debt[usize::from(*id)] + i64::from((*weight).max(1)) * bytes)
+        });
         order.into_iter().map(|(id, _)| id).collect()
+    }
+    /// Account the path that actually accepted this symbol, including a fallback.
+    pub fn commit(&mut self, candidates: &[(u8, i32)], actual: u8, bytes: usize) {
+        if !candidates.iter().any(|(id, _)| *id == actual) {
+            return;
+        }
+        const LIMIT: i64 = 1 << 28;
+        let bytes = bytes.min(65_536) as i64;
+        let sum: i64 = candidates.iter().map(|(_, w)| i64::from((*w).max(1))).sum();
+        for &(id, weight) in candidates {
+            self.debt[usize::from(id)] = (self.debt[usize::from(id)]
+                + i64::from(weight.max(1)) * bytes
+                - if id == actual { sum * bytes } else { 0 })
+            .clamp(-LIMIT, LIMIT);
+        }
     }
 }
 #[derive(Default)]
 pub struct Rotation {
-    attempts: u8,
+    failures: u8,
     inflight: bool,
     bad_since: Option<u64>,
+    next_rotation_us: u64,
+    next_retry_us: u64,
 }
 impl Rotation {
     pub fn consider(&mut self, estimate: &Estimate, path_time_us: u64, now_us: u64) -> bool {
@@ -49,10 +62,13 @@ impl Rotation {
             return false;
         }
         let since = *self.bad_since.get_or_insert(now_us);
-        if self.inflight || self.attempts >= 3 || now_us.saturating_sub(since) < 4_000_000 {
+        if self.inflight
+            || now_us < self.next_rotation_us
+            || now_us < self.next_retry_us
+            || now_us.saturating_sub(since) < 4_000_000
+        {
             return false;
         }
-        self.attempts += 1;
         self.inflight = true;
         self.bad_since = None;
         true
@@ -60,20 +76,45 @@ impl Rotation {
     pub fn finished(&mut self) {
         self.inflight = false;
     }
+    /// Disconnected/initially unavailable paths remain recoverable with bounded backoff.
+    pub fn should_retry(&mut self, now_us: u64, is_open: bool) -> bool {
+        if is_open || self.inflight || now_us < self.next_retry_us {
+            return false;
+        }
+        self.inflight = true;
+        true
+    }
+    pub fn connection_failed(&mut self, now_us: u64) {
+        self.inflight = false;
+        self.bad_since = None;
+        self.failures = self.failures.saturating_add(1).min(6);
+        let delay = (1_000_000u64 << self.failures).min(60_000_000);
+        self.next_retry_us = now_us.saturating_add(delay);
+    }
+    pub fn connection_succeeded(&mut self, now_us: u64) {
+        self.inflight = false;
+        self.failures = 0;
+        self.bad_since = None;
+        self.next_retry_us = now_us.saturating_add(1_000_000);
+    }
+    pub fn rotation_succeeded(&mut self, now_us: u64) {
+        self.connection_succeeded(now_us);
+        self.next_rotation_us = now_us.saturating_add(30_000_000);
+    }
 }
-pub fn admit_generation(history: &mut Vec<u64>, generation: u64) -> anyhow::Result<()> {
+pub fn admit_generation(highest: &mut Option<u64>, generation: u64) -> anyhow::Result<()> {
     anyhow::ensure!(
-        history.len() < 4 && !history.contains(&generation),
-        "generation replay/rejoin limit"
+        highest.is_none_or(|previous| generation > previous),
+        "generation replay or regression"
     );
-    history.push(generation);
+    *highest = Some(generation);
     Ok(())
 }
 #[cfg(test)]
 mod tests {
     use super::*;
     #[test]
-    fn persistent_quality_rotation_is_bounded_and_generations_cannot_replay() {
+    fn recovery_remains_bounded_and_available_after_many_outages() {
         let q = Estimate {
             expected: 32,
             loss_rate: 0.2,
@@ -85,21 +126,25 @@ mod tests {
         assert!(!r.consider(&q, 0, 3_999_999));
         assert!(r.consider(&q, 0, 4_000_000));
         assert!(!r.consider(&q, 0, 10_000_000));
-        r.finished();
-        assert!(r.consider(&q, 0, 14_000_000));
-        r.finished();
-        assert!(!r.consider(&q, 0, 15_000_000));
-        assert!(r.consider(&q, 0, 19_000_000));
-        r.finished();
-        assert!(!r.consider(&q, 0, 30_000_000));
-        let mut history = Vec::new();
-        admit_generation(&mut history, 7).unwrap();
-        assert!(admit_generation(&mut history, 7).is_err());
-        for n in 8..11 {
-            admit_generation(&mut history, n).unwrap();
+        r.connection_succeeded(10_000_000);
+        assert!(!r.should_retry(10_999_999, false));
+        assert!(r.should_retry(11_000_000, false));
+        r.connection_failed(11_000_000);
+        assert!(!r.should_retry(12_999_999, false));
+        assert!(r.should_retry(13_000_000, false));
+        for n in 1..100 {
+            let now = 42_000_000 + n * 60_000_000;
+            r.connection_failed(now);
+            assert!(!r.should_retry(now, false));
+            assert!(r.should_retry(now + 60_000_000, false));
         }
-        assert!(admit_generation(&mut history, 11).is_err());
-        assert_eq!(history.len(), 4);
+        let mut highest = None;
+        for generation in 7..10_000 {
+            admit_generation(&mut highest, generation).unwrap();
+            assert!(admit_generation(&mut highest, generation).is_err());
+            assert!(admit_generation(&mut highest, generation - 1).is_err());
+        }
+        assert_eq!(highest, Some(9999));
         let mut r = Rotation::default();
         assert!(!r.consider(&q, 0, 0));
         assert!(!r.consider(&q, 4_000_000, 4_000_000));
@@ -107,11 +152,31 @@ mod tests {
         assert!(r.consider(&q, 0, 8_000_000));
     }
     #[test]
+    fn initial_connection_does_not_spend_elective_rotation_cooldown() {
+        let q = Estimate {
+            expected: 32,
+            loss_rate: 0.2,
+            updated_us: Some(0),
+            ..Default::default()
+        };
+        let mut rotation = Rotation::default();
+        rotation.connection_succeeded(0);
+        assert!(!rotation.consider(&q, 0, 0));
+        assert!(rotation.consider(&q, 0, 4_000_000));
+        rotation.rotation_succeeded(4_000_000);
+        assert!(!rotation.consider(&q, 0, 5_000_000));
+        assert!(!rotation.consider(&q, 0, 9_000_000));
+        assert!(rotation.consider(&q, 0, 34_000_000));
+    }
+    #[test]
     fn bad_paths_keep_probe_share_and_recovered_quality_restores_weight() {
         let mut s = Scheduler::default();
         let mut counts = [0; 2];
         for _ in 0..330 {
-            counts[s.order(&[(0, 32), (1, 1)])[0] as usize] += 1;
+            let candidates = [(0, 32), (1, 1)];
+            let id = s.order(&candidates, 1000)[0];
+            s.commit(&candidates, id, 1000);
+            counts[id as usize] += 1;
         }
         assert_eq!(counts, [320, 10]);
         let mut q = Estimate {
@@ -125,8 +190,33 @@ mod tests {
         assert!(weight(&q, 1_000_000, 50.0) > bad);
         assert_eq!(weight(&q, 4_000_000, 50.0), 2);
         for _ in 0..1000 {
-            s.order(&[(1, 1)]);
+            s.commit(&[(1, 1)], 1, 1000);
         }
-        assert!(s.debt.iter().all(|d| d.abs() <= 256));
+        assert!(s.debt.iter().all(|d| d.abs() <= 1 << 28));
+    }
+    #[test]
+    fn failed_attempts_spend_no_credit_and_fallback_is_charged() {
+        let mut s = Scheduler::default();
+        let candidates = [(0, 1), (1, 1)];
+        for _ in 0..10_000 {
+            assert_eq!(s.order(&candidates, 1000), vec![0, 1]);
+        }
+        s.commit(&candidates, 1, 1000);
+        assert_eq!(s.order(&candidates, 1000), vec![0, 1]);
+        s.commit(&candidates, 0, 1000);
+        assert_eq!(s.debt, [0; MAX_PATHS]);
+    }
+    #[test]
+    fn mixed_packet_sizes_balance_bytes_instead_of_packet_counts() {
+        let mut s = Scheduler::default();
+        let candidates = [(0, 1), (1, 1)];
+        let mut bytes = [0i64; 2];
+        for n in 0..2000 {
+            let size = if n % 3 == 0 { 1000 } else { 64 };
+            let path = s.order(&candidates, size)[0];
+            s.commit(&candidates, path, size);
+            bytes[path as usize] += size as i64;
+        }
+        assert!((bytes[0] - bytes[1]).abs() <= 1000);
     }
 }

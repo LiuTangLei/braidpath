@@ -1,5 +1,7 @@
 //! Experimental authenticated HTTP/3 datagram transport. No reliable stream service.
+pub mod adaptive;
 pub mod cli;
+pub mod outbound;
 pub mod probe;
 pub mod quality;
 pub mod relay;

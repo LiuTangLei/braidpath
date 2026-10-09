@@ -1,5 +1,5 @@
 use super::{probe, relay, stats, transport, tunnel};
-use anyhow::Result;
+use anyhow::{Context, Result, ensure};
 use clap::{Args, Parser, Subcommand};
 use std::{
     net::{IpAddr, SocketAddr},
@@ -38,7 +38,7 @@ enum Command {
         target: SocketAddr,
         #[arg(long, default_value_t = 10_000_000)]
         max_rate_bps: u64,
-        /// BBR is the initial latency/throughput default; Cubic is available for comparison.
+        /// BBR is the supported sending controller.
         #[arg(long, value_enum, default_value_t = transport::Congestion::default())]
         congestion: transport::Congestion,
         #[command(flatten)]
@@ -55,6 +55,9 @@ enum Command {
         /// One explicit local UDP bind per interface–entrance pair, in path order.
         #[arg(long = "path-bind")]
         path_binds: Vec<SocketAddr>,
+        /// Bottleneck group per interface–entrance pair; defaults to interface index.
+        #[arg(long = "path-group")]
+        path_groups: Vec<u8>,
         #[arg(long)]
         server_name: String,
         #[arg(long)]
@@ -107,11 +110,20 @@ enum Command {
 }
 #[derive(Args)]
 struct PolicyArgs {
+    /// Adapt path pacing and eligibility to queue growth; automatically recover paths.
+    #[arg(long)]
+    adaptive: bool,
+    /// Budget for additional local/path queuing, not unavoidable propagation RTT.
+    #[arg(long, default_value_t = 20)]
+    latency_target_ms: u64,
+    /// Explicit shared bottleneck cap, GROUP:BITS_PER_SECOND. Repeated groups are rejected.
+    #[arg(long = "group-rate-bps")]
+    group_rates: Vec<String>,
     /// Shift symbols toward healthier paths while retaining bounded probes.
     #[arg(long)]
     quality_schedule: bool,
-    /// Rejoin a persistently bad path with a fresh source port, at most three times.
-    #[arg(long, requires = "quality_schedule")]
+    /// Rejoin persistent forward degradation with a fresh port and bounded cooldown.
+    #[arg(long)]
     rotate_source_port: bool,
     /// Report per-path receiver quality; data scheduling remains round robin.
     #[arg(long)]
@@ -167,6 +179,7 @@ pub async fn run() -> Result<()> {
             entrances,
             interfaces,
             path_binds,
+            path_groups,
             server_name,
             ca,
             token_file,
@@ -175,21 +188,28 @@ pub async fn run() -> Result<()> {
             stats,
         } => {
             let reporter = stats::Reporter::new("client", stats)?;
+            let group_rates = parse_group_rates(&policy.group_rates, policy.rate_bps)?;
             let result = tunnel::client(tunnel::ClientOptions {
                 stats: reporter.metrics.clone(),
                 listen,
                 entrances,
                 interfaces,
                 path_binds,
+                path_groups,
                 name: server_name,
                 ca,
                 token: token_file,
                 congestion,
                 rotate_source_port: policy.rotate_source_port,
                 policy: tunnel::Policy {
+                    adaptive: policy.adaptive,
+                    latency_target_ms: policy.latency_target_ms,
+                    group_rates,
                     fec: policy.fec,
-                    receiver_feedback: policy.receiver_feedback || policy.quality_schedule,
-                    quality_schedule: policy.quality_schedule,
+                    receiver_feedback: policy.receiver_feedback
+                        || policy.quality_schedule
+                        || policy.adaptive,
+                    quality_schedule: policy.quality_schedule || policy.adaptive,
                     redundancy: policy.redundancy_percent,
                     rate: policy.rate_bps,
                     block_ms: policy.block_ms,
@@ -230,5 +250,48 @@ pub async fn run() -> Result<()> {
         Command::Echo { listen, ready_file } => probe::echo(listen, ready_file).await,
         Command::Probe(options) => probe::run_probe(options).await,
         Command::Sink(options) => probe::run_sink(options).await,
+    }
+}
+
+fn parse_group_rates(values: &[String], aggregate: u64) -> Result<[u64; super::MAX_PATHS]> {
+    let mut rates = [aggregate; super::MAX_PATHS];
+    let mut seen = [false; super::MAX_PATHS];
+    for value in values {
+        let (group, rate) = value
+            .split_once(':')
+            .context("group rate must be GROUP:BITS_PER_SECOND")?;
+        let group: usize = group.parse()?;
+        let rate: u64 = rate.parse()?;
+        ensure!(
+            group < super::MAX_PATHS && !seen[group],
+            "invalid or duplicate bottleneck group"
+        );
+        ensure!(
+            (64_000..=aggregate).contains(&rate),
+            "group rate exceeds aggregate cap or is below 64000 bps"
+        );
+        seen[group] = true;
+        rates[group] = rate;
+    }
+    Ok(rates)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn explicit_bottleneck_caps_are_bounded_and_unambiguous() {
+        assert_eq!(
+            parse_group_rates(&["0:1000000".into()], 2000000).unwrap()[0],
+            1000000
+        );
+        for values in [
+            vec!["8:1000000".into()],
+            vec!["0:3000000".into()],
+            vec!["0:1000000".into(), "0:900000".into()],
+        ] {
+            assert!(parse_group_rates(&values, 2000000).is_err());
+        }
+        assert!(Cli::try_parse_from(["braidpath", "server", "--congestion", "cubic"]).is_err());
     }
 }

@@ -7,11 +7,11 @@
 
 [简体中文](README.zh.md) · [Run it](docs/runtime.md) · [Architecture](docs/architecture.md) · [Carrier design](docs/transports.md) · [Validation plan](docs/validation.md) · [Roadmap](docs/roadmap.md)
 
-BraidPath is a Rust multipath transport project combining **forward error correction (FEC), client interface aggregation, and nearby relay entrances**. Its goal is to reduce recovery delays caused by packet loss while using available path capacity.
+BraidPath is a Rust multipath transport project combining **forward error correction (FEC), client interface aggregation, and nearby relay entrances**. Its goal is to adapt throughout a long-running session: combine independent path capacity when routes are clear, and preserve useful low-latency delivery when routes become congested.
 
 “Braid” means weaving several imperfect paths into a more resilient connection.
 
-> **Status: experimental UDP tunnel.** The client, main server and fixed-target relays now run over real HTTP/3 and HTTP Datagrams, with bidirectional XOR FEC and bounded multipath scheduling. This is an engineering prototype, with no general performance or censorship-resistance guarantee.
+> **Status: experimental UDP tunnel.** The client, main server and fixed-target relays run over real HTTP/3 and HTTP Datagrams. Opt-in `--adaptive` adds per-path pacing, independent health probes, sender-age admission and bounded outage recovery. These mechanisms are implemented; sustained WAN benefit and deployment readiness are not established. Round robin and the existing XOR settings remain the defaults.
 
 ## One interface works. Several can contribute.
 
@@ -49,10 +49,13 @@ Entrance count is not independent capacity. Paths may share the last mile, trans
 - **Repair at the aggregate layer.** Recover across paths without waiting for retransmission when enough timely repair information is available.
 - **Keep original data moving.** The encoder emits originals immediately; network transmission still obeys queue limits and congestion control.
 - **Treat direction and path quality separately.** Upload quality is not evidence of download quality. A slow path must not create unbounded reordering.
+- **Probe without sacrificing an original.** Adaptive mode sends authenticated health probes even while application traffic is idle; probes and feedback share the same traffic budgets as business data.
 - **Spend redundancy deliberately.** Measure FEC, retransmission, control traffic, and actual wire cost separately.
 - **Make progress measurable.** Compare application P95/P99, deadline misses, completion and goodput under matched conditions. CPU-efficiency optimization comes later.
 
-BBR is the default congestion controller. The initial priority is latency and useful throughput; CPU-efficiency tuning is deferred.
+BBR is the only runtime congestion controller. The initial priority is latency and useful throughput; CPU-efficiency tuning is deferred. Adaptive pacing sets an additional operational allowance above each connection's independent congestion control. Growth requires actual use of that allowance; current local RTT and finalized interval loss can reduce the pace while fresh health keeps a path eligible. A low application-limited delivery rate does not establish a capacity ceiling.
+
+The default adaptive target is 20 ms of local sender age and an added-delay control objective. Admission uses local ingress age alone. Health requires positive delivery on that path or a valid probe reply; fresh reports of complete loss through another path do not prove reachability. Stale or confirmed zero-delivery paths become probe-only. Same-generation recovery retains learned pace, while a new generation starts a new search. A pending queue-drain recovery survives the gap between RTT observations and rate-control ticks. The separate prospective 100 ms interactive deadline is a validation objective, not a hard cross-host latency guarantee. Minimum RTT currently has no baseline aging, and permanently reduced capacity can still receive bounded upward trials. See the [adaptive policy](docs/runtime.md#adaptive-mode).
 
 Each interface–entrance pair owns an end-to-end Quinn/rustls connection to the main server. HTTP/3 handles ordinary requests and authenticated session admission; unreliable HTTP Datagrams carry aggregate records. Relays forward encrypted packets to a fixed destination.
 
@@ -79,11 +82,15 @@ Follow the [runtime guide](docs/runtime.md) for credentials, local forwarding, m
 | Bidirectional FEC, session deduplication, UDP forwarding | Implemented; messages up to 1,000 bytes |
 | Fixed-target opaque relays with source allowlists | Implemented |
 | Interface × entrance paths | Linux interface binding; default-route sockets on other platforms |
-| Round-robin eligible paths, bounded queues, aggregate pacing, repair budget | Implemented baseline |
-| Adaptive scheduling/FEC, coupled congestion control, automatic reconnect | Planned |
+| Round robin and optional quality-weighted scheduling | Implemented baselines; weighted service is charged on actual admitted bytes |
+| Per-flow queues, original-ingress deadlines, admission-based repair credit | Implemented bounded mechanisms |
+| Adaptive pacing, sender-age admission, idle health probes and feedback v2 | Implemented opt-in mode; performance acceptance pending |
+| Aggregate and explicit bottleneck-group caps | Implemented; not automatic bottleneck detection or fairness proof |
+| Startup/outage recovery and explicit session-epoch replacement | Implemented in adaptive mode; bounded backoff and server retention |
+| Adaptive FEC, multi-erasure coding and coupled congestion control | Deferred or separate research work |
 | Reliable streams, TCP, TUN, stream fallback, browser fingerprint shaping | Planned or deferred |
 
-XOR cannot generally recover an entire failed path. Sparse traffic may exhaust the repair budget; FEC does not guarantee delivery. Multiple connections can compete unfairly at a shared bottleneck even with an aggregate rate cap. Multi-interface capacity, competition fairness, independent HTTP/3 interoperability and deployment reachability remain separate acceptance gates.
+XOR cannot generally recover an entire failed path. Sparse traffic may exhaust the repair budget; FEC does not guarantee delivery. `--fec 4`, `--block-ms 3` and the 30% repair budget are unchanged; the new mechanisms do not establish a new FEC default. Multiple connections can compete unfairly at a shared bottleneck even with explicit group caps. Multi-interface capacity, competition fairness, independent HTTP/3 interoperability and deployment reachability remain separate acceptance gates.
 
 ## Inspiration
 
