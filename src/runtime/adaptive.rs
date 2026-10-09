@@ -152,6 +152,17 @@ pub enum RateReason {
     ReprobeRollback,
 }
 
+/// Diagnostic identity of the original selected absolute RTT. Exact numeric
+/// ties are labelled Quinn; this enum does not participate in control.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RttSource {
+    #[default]
+    Unavailable,
+    Quinn,
+    Probe,
+}
+
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct ControlSample {
     pub at_us: u64,
@@ -162,6 +173,24 @@ pub struct ControlSample {
     pub admitted_bytes: u64,
     pub integrated_allowance_bytes: f64,
     pub admission_span_us: u64,
+    pub local_rtt_ms: Option<f64>,
+    pub probe_rtt_ms: Option<f64>,
+    pub probe_age_us: Option<u64>,
+    pub probe_sample_id: u64,
+    pub selected_rtt_ms: Option<f64>,
+    pub rtt_source: RttSource,
+    pub mixed_min_rtt_ms: Option<f64>,
+    pub rtt_excess_ms: f64,
+    pub transport_wait_ms: f64,
+    pub rtt_fresh: bool,
+    pub probe_fresh: bool,
+    pub delivery_fresh: bool,
+    pub new_rtt: bool,
+    pub new_probe: bool,
+    pub new_queue: bool,
+    /// Diagnostic observations only, not calibrated or trusted baselines.
+    pub observed_local_min_rtt_ms: Option<f64>,
+    pub observed_probe_min_rtt_ms: Option<f64>,
     pub queue_delay_ms: f64,
     pub transport_blocked: bool,
     pub offered_backlog: bool,
@@ -225,6 +254,9 @@ pub struct PathController {
     born_us: u64,
     rate_bps: u64,
     min_rtt_ms: Option<f64>,
+    /// Diagnostic-only minima; no controller or weighting calculation reads them.
+    observed_local_min_rtt_ms: Option<f64>,
+    observed_probe_min_rtt_ms: Option<f64>,
     queue_delay_ms: f64,
     health: Health,
     eligible: bool,
@@ -278,6 +310,8 @@ impl PathController {
             born_us: 0,
             rate_bps: maximum_bps.min(START_BPS),
             min_rtt_ms: None,
+            observed_local_min_rtt_ms: None,
+            observed_probe_min_rtt_ms: None,
             queue_delay_ms: 0.0,
             health: Health::Unknown,
             eligible: true,
@@ -519,6 +553,21 @@ impl PathController {
             service_shortfall && now.saturating_sub(last_change) >= PROBE_US + BRAKE_US;
         self.loss_pressure = ordinary_loss && settled_shortfall;
         let loss_counts = self.loss_evidence.counts();
+        // Preserve the exact inputs and intermediate values at an action. These
+        // observed minima are never substituted for the original mixed minimum.
+        if fresh && let Some(local) = local_rtt {
+            let minimum = self.observed_local_min_rtt_ms.get_or_insert(local);
+            *minimum = (*minimum).min(local);
+        }
+        if new_probe && let Some(probe) = probe_rtt {
+            let minimum = self.observed_probe_min_rtt_ms.get_or_insert(probe);
+            *minimum = (*minimum).min(probe);
+        }
+        let rtt_source = match rtt {
+            Some(value) if local_rtt == Some(value) => RttSource::Quinn,
+            Some(_) => RttSource::Probe,
+            None => RttSource::Unavailable,
+        };
         self.last_control = ControlSample {
             at_us: now,
             generation: observation.generation,
@@ -528,6 +577,23 @@ impl PathController {
             admitted_bytes: self.admitted_bytes,
             integrated_allowance_bytes: self.allowance_bytes,
             admission_span_us: admission_span,
+            local_rtt_ms: local_rtt,
+            probe_rtt_ms: probe_rtt,
+            probe_age_us: observation.probe_age_us,
+            probe_sample_id: observation.probe_sample_id,
+            selected_rtt_ms: rtt,
+            rtt_source,
+            mixed_min_rtt_ms: self.min_rtt_ms,
+            rtt_excess_ms: rtt_excess,
+            transport_wait_ms: transport_wait,
+            rtt_fresh: fresh,
+            probe_fresh,
+            delivery_fresh,
+            new_rtt,
+            new_probe,
+            new_queue,
+            observed_local_min_rtt_ms: self.observed_local_min_rtt_ms,
+            observed_probe_min_rtt_ms: self.observed_probe_min_rtt_ms,
             queue_delay_ms: self.queue_delay_ms,
             transport_blocked: observation.transport_blocked,
             offered_backlog: observation.offered_backlog,
@@ -979,6 +1045,170 @@ mod tests {
             }
         }
         admitted
+    }
+
+    fn rtt_evidence_observation(
+        now: u64,
+        local: f64,
+        probe: Option<(u64, f64, u64)>,
+    ) -> Observation {
+        let mut sample = observation(now, local);
+        sample.feedback_sample_symbols = 0;
+        sample.delivered_bps = Some(START_BPS as f64);
+        sample.probe_sample_id = probe.map_or(0, |(id, _, _)| id);
+        sample.probe_rtt_ms = probe.map(|(_, rtt, _)| rtt);
+        sample.probe_latest_rtt_ms = sample.probe_rtt_ms;
+        sample.probe_age_us = probe.map(|(_, _, age)| age);
+        sample
+    }
+
+    #[test]
+    fn rtt_evidence_012_records_the_existing_mixed_baseline_brake_without_fixing_it() {
+        let mut controller = PathController::new(START_BPS, 20);
+        controller.observe(&rtt_evidence_observation(0, 100.0, Some((1, 80.0, 0))));
+        controller.observe(&rtt_evidence_observation(
+            600_000,
+            100.0,
+            Some((1, 80.0, 600_000)),
+        ));
+        assert_eq!(controller.last_control.selected_rtt_ms, Some(100.0));
+        assert!(controller.last_control.new_rtt);
+        assert!(!controller.last_control.new_probe);
+        assert!(controller.last_control.new_queue);
+        controller.observe(&rtt_evidence_observation(
+            700_000,
+            100.0,
+            Some((1, 80.0, 700_000)),
+        ));
+        // The known 009-r3 defect remains: stable estimators with different
+        // offsets still create 20ms of mixed-baseline pressure and a brake.
+        assert_eq!(controller.rate_bps, 236_800);
+        let event = controller.rate_changes.back().unwrap();
+        assert_eq!(event.at_us, 700_000);
+        assert!(matches!(event.reason, RateReason::QueueBrake));
+        let sample = &event.control;
+        assert_eq!(sample.at_us, event.at_us);
+        assert_eq!(sample.local_rtt_ms, Some(100.0));
+        assert_eq!(sample.probe_rtt_ms, Some(80.0));
+        assert_eq!(sample.probe_sample_id, 1);
+        assert_eq!(sample.probe_age_us, Some(700_000));
+        assert_eq!(sample.selected_rtt_ms, Some(100.0));
+        assert_eq!(sample.rtt_source, RttSource::Quinn);
+        assert_eq!(sample.mixed_min_rtt_ms, Some(80.0));
+        assert_eq!(sample.rtt_excess_ms, 20.0);
+        assert_eq!(sample.transport_wait_ms, 0.0);
+        assert_eq!(sample.queue_delay_ms, 20.0);
+        assert_eq!(sample.observed_local_min_rtt_ms, Some(100.0));
+        assert_eq!(sample.observed_probe_min_rtt_ms, Some(80.0));
+        assert!(sample.rtt_fresh && sample.probe_fresh && sample.delivery_fresh);
+        assert!(!sample.new_rtt && !sample.new_probe && !sample.new_queue);
+    }
+
+    #[test]
+    fn rtt_evidence_012_keeps_unknown_stale_and_generation_fields_faithful() {
+        let mut controller = PathController::new(START_BPS, 20);
+        controller.observe(&rtt_evidence_observation(0, 100.0, None));
+        assert_eq!(controller.last_control.probe_rtt_ms, None);
+        assert_eq!(controller.last_control.probe_age_us, None);
+        assert_eq!(controller.last_control.observed_probe_min_rtt_ms, None);
+        assert_eq!(controller.last_control.rtt_source, RttSource::Quinn);
+        assert!(!controller.last_control.probe_fresh);
+        let mut stale =
+            rtt_evidence_observation(4_000_000, f64::NAN, Some((7, 20.0, FRESH_US + 1)));
+        stale.positive_delivery_age_us = Some(FRESH_US + 1);
+        controller.observe(&stale);
+        let sample = &controller.last_control;
+        assert_eq!(sample.local_rtt_ms, None);
+        assert_eq!(sample.probe_rtt_ms, Some(20.0));
+        assert_eq!(sample.probe_sample_id, 7);
+        assert_eq!(sample.probe_age_us, Some(FRESH_US + 1));
+        assert_eq!(sample.selected_rtt_ms, None);
+        assert_eq!(sample.rtt_source, RttSource::Unavailable);
+        assert_eq!(sample.mixed_min_rtt_ms, Some(100.0));
+        assert_eq!(sample.rtt_excess_ms, 0.0);
+        assert_eq!(sample.observed_local_min_rtt_ms, Some(100.0));
+        assert_eq!(sample.observed_probe_min_rtt_ms, None);
+        assert!(!sample.rtt_fresh && !sample.probe_fresh && !sample.delivery_fresh);
+        assert!(!sample.new_rtt && !sample.new_probe && !sample.new_queue);
+        let mut next = rtt_evidence_observation(4_500_000, 220.0, Some((1, 200.0, 0)));
+        next.generation += 1;
+        controller.observe(&next);
+        let sample = &controller.last_control;
+        assert_eq!(sample.generation, next.generation);
+        assert_eq!(sample.observed_local_min_rtt_ms, Some(220.0));
+        assert_eq!(sample.observed_probe_min_rtt_ms, Some(200.0));
+        assert_eq!(sample.mixed_min_rtt_ms, Some(200.0));
+        assert_eq!(sample.selected_rtt_ms, Some(200.0));
+        assert_eq!(sample.rtt_source, RttSource::Probe);
+        assert_eq!(sample.rtt_excess_ms, 0.0);
+        assert!(sample.new_rtt && sample.new_probe && sample.new_queue);
+    }
+
+    #[test]
+    fn rtt_evidence_012_records_transport_pressure_and_original_event_flags() {
+        let mut controller = PathController::new(START_BPS, 20);
+        controller.observe(&rtt_evidence_observation(0, 100.0, Some((1, 100.0, 0))));
+        assert_eq!(controller.last_control.rtt_source, RttSource::Quinn);
+        let mut queued = rtt_evidence_observation(500_000, 100.0, Some((2, 100.0, 0)));
+        queued.send_queue_bytes = 5000;
+        controller.observe(&queued);
+        let event = controller.rate_changes.back().unwrap();
+        assert!(matches!(event.reason, RateReason::QueueBrake));
+        assert_eq!(event.control.selected_rtt_ms, Some(100.0));
+        assert_eq!(event.control.mixed_min_rtt_ms, Some(100.0));
+        assert_eq!(event.control.rtt_excess_ms, 0.0);
+        assert_eq!(event.control.transport_wait_ms, 81.25);
+        assert_eq!(event.control.queue_delay_ms, 81.25);
+        assert!(!event.control.new_rtt);
+        assert!(event.control.new_probe && event.control.new_queue);
+        let event_count = controller.rate_changes_total;
+        queued.now_us = 600_000;
+        queued.probe_age_us = Some(100_000);
+        controller.observe(&queued);
+        assert!(!controller.last_control.new_rtt);
+        assert!(!controller.last_control.new_probe);
+        assert!(!controller.last_control.new_queue);
+        assert_eq!(controller.last_control.rtt_excess_ms, 0.0);
+        assert_eq!(controller.last_control.transport_wait_ms, 81.25);
+        assert_eq!(controller.rate_changes_total, event_count);
+    }
+
+    #[test]
+    fn rtt_evidence_012_observed_minima_cannot_change_control_or_admission() {
+        let mut ordinary = PathController::new(2_000_000, 20);
+        let mut changed_diagnostics = PathController::new(2_000_000, 20);
+        let initial = rtt_evidence_observation(0, 100.0, Some((1, 80.0, 0)));
+        ordinary.observe(&initial);
+        changed_diagnostics.observe(&initial);
+        for now in (100_000..=2_000_000).step_by(100_000) {
+            let pressure = (500_000..1_000_000).contains(&now);
+            let local = if pressure { 140.0 } else { 100.0 };
+            let raw = if pressure { 120.0 } else { 80.0 };
+            let mut sample =
+                rtt_evidence_observation(now, local, Some((now / 500_000 + 1, raw, now % 500_000)));
+            sample.send_queue_bytes = if now >= 1_500_000 { 5000 } else { 0 };
+            // Deliberately poison only the two diagnostic scalars. No selected
+            // minimum, event, weight, queue, pace or eligibility may read them.
+            changed_diagnostics.observed_local_min_rtt_ms = Some(0.001);
+            changed_diagnostics.observed_probe_min_rtt_ms = Some(50_000.0);
+            ordinary.observe(&sample);
+            changed_diagnostics.observe(&sample);
+            assert_eq!(
+                serde_json::to_value(ordinary.decision(now)).unwrap(),
+                serde_json::to_value(changed_diagnostics.decision(now)).unwrap(),
+                "{now}"
+            );
+            assert_eq!(
+                ordinary.rate_changes_total,
+                changed_diagnostics.rate_changes_total
+            );
+            let allowed = ordinary.allow(now, 1000, 0.0);
+            assert_eq!(allowed, changed_diagnostics.allow(now, 1000, 0.0));
+            if allowed {
+                ordinary.admitted(now, 1000);
+                changed_diagnostics.admitted(now, 1000);
+            }
+        }
     }
 
     /// Actual token admission with a separate deterministic 20% erasure sink.
