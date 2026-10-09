@@ -14,5 +14,11 @@ in the ignored `local/` or `results/` directory). Commit automated test code and
 validation methods, not test reports. Do not commit secrets, private infrastructure
 details or raw captures.
 
+Use neutral identifiers such as `window_a` and `window_b` for measurement windows
+and UTC for displayed timestamps. Describe observed network conditions without
+inferring a contributor's nationality or location from language, hosts or schedules.
+Keep original packet counts, timings, failures and retries intact when editing
+report labels.
+
 Contributions are accepted under Apache-2.0. Preserve the source and license of
 any incorporated third-party code. Architecture and validation methods must distinguish implemented capabilities from planned behavior.

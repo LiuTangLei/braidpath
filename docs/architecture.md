@@ -19,7 +19,7 @@ For independent original/repair symbol erasures with probability `p`, a full XOR
 
 ## 2. Engineering baseline: encrypted unreliable paths
 
-For the first engineering baseline, use **one end-to-end QUIC connection per active interface–entrance pair**, carrying application data and repair symbols in DATAGRAM frames. Quinn is the candidate Rust runtime. This requires neither kernel multipath support nor a Multipath QUIC extension. The QUIC-specific choices below describe this baseline, not mandatory internals of the aggregate core or a finalized cross-border deployment profile.
+For the first engineering baseline, use **one end-to-end QUIC connection per active interface–entrance pair**, carrying application data and repair symbols in DATAGRAM frames. Quinn is the candidate Rust runtime. This requires neither kernel multipath support nor a Multipath QUIC extension. The QUIC-specific choices below describe this baseline, not mandatory internals of the aggregate core or a finalized deployment profile.
 
 QUIC DATAGRAM preserves unreliable delivery while sharing QUIC's security and congestion control. Its data is not automatically retransmitted. Small reliable streams carry session setup and infrequent control operations; bulk payload and time-sensitive receipt reports remain datagrams. These are protocol capabilities, not a claim that FEC defeats congestion. [RFC 9221, sections 5–6](https://www.rfc-editor.org/rfc/rfc9221.html#section-5)
 
@@ -39,8 +39,6 @@ A custom carrier over UDP would also need a secure handshake, congestion control
 
 QUIC DATAGRAM is carried over UDP and still establishes a QUIC connection. Choosing DATAGRAM changes payload delivery semantics; it does not disguise the handshake or turn a custom application into ordinary HTTP/3 traffic. QUIC Initial protection is observable by on-path parties; it does not provide the secrecy of established traffic keys. [RFC 9001, sections 5 and 7](https://www.rfc-editor.org/rfc/rfc9001.html#section-5)
 
-Research published in 2025 measured GFW inspection of QUIC Initial packets and SNI-based blocking, including residual UDP blocking in the studied conditions. This establishes a deployment risk, not a prediction of every current route. [USENIX Security 2025 study](https://gfw.report/publications/usenixsecurity25/en/)
-
 Keep three decisions separate: aggregate recovery/scheduling, secure congestion-controlled datagram transport, and the externally visible carrier/encapsulation. The aggregate core consumes authenticated records and bounded path observations; it must not depend on Quinn types, TLS certificate APIs or QUIC packet numbers. A different carrier must provide equivalent authentication, resource and congestion guarantees. Do not disable identity verification to improve handshake success.
 
 The preferred deployment candidate is an independently implemented Rust HTTP/3 service with authenticated HTTP Datagrams. It uses the same QUIC connection for security, congestion control and data delivery; it does not tunnel one QUIC stack through another. Xray is a design reference only, with no runtime dependency or wire-compatibility requirement. The [carrier design](transports.md) explains the applicable lessons from REALITY, Vision, XHTTP, Hysteria and MASQUE, including why an H3 HTTP body is not a DATAGRAM path.
@@ -49,7 +47,7 @@ Plain QUIC remains the engineering control. A future HTTPS stream profile and an
 
 FEC helps when enough symbols arrive. It cannot recover a consistently blocked handshake or a route that drops every usable symbol. Co-located entrances may also share filtering policies, so route count is not censorship independence.
 
-Before selecting a cross-border default, pass the [deployment reachability gate](validation.md#deployment-reachability-gate) on the intended networks. No current BraidPath test establishes GFW reachability or resistance to active probing. This gate precedes deployment selection; performance-only success cannot waive it.
+Before selecting a deployment default, pass the [deployment reachability gate](validation.md#deployment-reachability-gate) on the intended networks. No current BraidPath test establishes reachability on filtered networks or resistance to active probing. This gate precedes deployment selection; performance-only success cannot waive it.
 
 ## 3. Session, path and data identity
 
@@ -141,6 +139,6 @@ Negotiate and enforce limits for paths, flows, active blocks, symbols, pending b
 
 ## 9. What still has to be demonstrated
 
-The architecture has a practical implementation route, but runtime selection is gated on bounded queue behavior, profile-specific relay feasibility and real interface binding. The HTTP/3 candidate additionally needs correct HTTP behavior, authenticated datagram mapping and measured fingerprint limitations. Cross-border selection requires deployment reachability evidence. Performance acceptance additionally requires shared-bottleneck competition, correlated loss, sparse traffic and both directions. CPU-efficiency optimization is deferred until the latency/throughput behavior is established. Neither a successful codec test nor a local encrypted-path probe proves those properties.
+The architecture has a practical implementation route, but runtime selection is gated on bounded queue behavior, profile-specific relay feasibility and real interface binding. The HTTP/3 candidate additionally needs correct HTTP behavior, authenticated datagram mapping and measured fingerprint limitations. Deployment selection requires deployment reachability evidence. Performance acceptance additionally requires shared-bottleneck competition, correlated loss, sparse traffic and both directions. CPU-efficiency optimization is deferred until the latency/throughput behavior is established. Neither a successful codec test nor a local encrypted-path probe proves those properties.
 
 The [validation plan](validation.md) defines those gates. Test records and feasibility-probe outputs stay local; this document contains design decisions and methods only.

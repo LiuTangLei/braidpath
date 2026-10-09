@@ -6,7 +6,7 @@ The stages below are ordered by dependency. Each stage produces a usable baselin
 
 ## M0 — Algorithm foundation
 
-- [x] Small independent Rust crate, English default README and Chinese translation.
+- [x] Small independent Rust crate, English default README and an additional translation.
 - [x] XOR `k+1` codec with immediate original emission and caller-driven block deadline.
 - [x] Bounded per-block decode state and deterministic erasure/reordering/duplicate cases.
 - [x] Interface–entrance identity model and in-memory example.
@@ -24,7 +24,7 @@ Current protocol, commands and limits: [experimental runtime](runtime.md). Check
 - [ ] Keep the aggregate core independent of the carrier; define authenticated-record, size, bounded-send and observation contracts.
 - [x] Prototype native HTTP/3 plus HTTP Datagrams with an ordinary website handler, authenticated request/context mapping and server identity verification; evaluate compatible Rust libraries without adding an Xray dependency.
 - [ ] Pass the carrier semantics/cost gate against plain QUIC; trace effective settings, queue ownership, PMTU, fingerprint limitations and independent-peer behavior before selecting the deployment candidate.
-- [ ] For intended filtered/cross-border deployments, start the reachability comparison before selecting a default carrier; website behavior alone cannot establish reachability.
+- [ ] For intended filtered deployments, start the reachability comparison before selecting a default carrier; website behavior alone cannot establish reachability.
 - [x] Implement authenticated session admission with operator-managed credentials and 0-RTT disabled.
 - [x] Build minimal client/server CLI for QUIC DATAGRAM echo and load generation; FEC-off first, then XOR with canonical records.
 - [x] Implement timer-driven block closing, path-size checks, bounded send/receive queues, expiry and session deduplication.
@@ -32,7 +32,7 @@ Current protocol, commands and limits: [experimental runtime](runtime.md). Check
 
 **Exit gate:** the single-path checks in the [validation plan](validation.md#2-secure-single-path-gate) pass under bounded packet-level impairment. The selected HTTP/3 candidate also passes the [carrier gate](validation.md#carrier-semantics-and-cost-gate). The service is explicitly unreliable datagrams with optional FEC. No custom reliable byte-stream claim yet.
 
-**Do not advance if:** authentication, queue behavior, metadata validation or MTU adaptation cannot be demonstrated. Resolve the adapter/runtime choice before adding more paths. Controlled-network development can continue while field measurements are pending, but cannot establish or finalize a cross-border deployment default.
+**Do not advance if:** authentication, queue behavior, metadata validation or MTU adaptation cannot be demonstrated. Resolve the adapter/runtime choice before adding more paths. Controlled-network development can continue while field measurements are pending, but cannot establish or finalize a deployment default.
 
 ## M2 — Real interfaces and bidirectional relay entrances
 
@@ -77,7 +77,7 @@ Current protocol, commands and limits: [experimental runtime](runtime.md). Check
 
 ## M5 — Deployment readiness
 
-- [ ] Pass the deployment reachability gate for every claimed filtered/cross-border profile; no inference from encryption, port choice or FEC alone.
+- [ ] Pass the deployment reachability gate for every claimed filtered profile; no inference from encryption, port choice or FEC alone.
 - [ ] Stable client/server CLI and relay provisioning instructions, configuration validation and wire-version policy.
 - [ ] Credential lifecycle, destination authorization, quotas and bounded resource behavior during hostile or accidental overload.
 - [ ] Native Linux/macOS/Windows network acceptance, installation packages and operator metrics.

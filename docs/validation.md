@@ -52,7 +52,7 @@ Apply this gate to the native Rust HTTP/3 candidate described in [carrier design
 | Website consistency | Verify the configured domain, certificates, ALPN, H3 settings and normal requests over the advertised protocols; if TCP HTTPS is advertised, verify its behavior too |
 | Fingerprint limits | Capture cold/repeated handshakes, QUIC parameters and Initial packet sizes/packing, plus steady-state sizes/cadence with FEC and scheduling enabled; compare with the selected reference client and record remaining differences instead of claiming a browser match from ALPN alone |
 
-Keep application authorization, cryptographic verification and resource bounds intact while changing the wire appearance. Probe behavior from clients without credentials on authorized endpoints. A successful website retrieval establishes HTTP behavior, not unobservability or GFW reachability. Packet randomization and TLS-terminating intermediaries are separate profiles, with separate trust and reachability checks.
+Keep application authorization, cryptographic verification and resource bounds intact while changing the wire appearance. Probe behavior from clients without credentials on authorized endpoints. A successful website retrieval establishes HTTP behavior, not unobservability or reachability on filtered networks. Packet randomization and TLS-terminating intermediaries are separate profiles, with separate trust and reachability checks.
 
 Measure the incremental HTTP/3 cost with FEC off first, then enable identical FEC settings as the single changed factor. Match transport congestion control, physical paths, offered load, total access-link rate, crypto, MTU and batching. Count padding, website/probe responses and all control traffic. Report cold establishment separately from steady-state payload delivery. At the reference clean-path gate, require at least 90% of the minimal plain-QUIC adapter's goodput, no additional deadline misses, and bounded memory/queue state; CPU-efficiency acceptance is deferred. Do not hide a slower adapter behind additional connections or a more aggressive controller.
 
@@ -70,16 +70,16 @@ Inject full path failure, relay restart and shared backhaul failure. Verify that
 
 ### Deployment reachability gate
 
-For GFW-affected or otherwise filtered deployments, validate the complete on-wire profile separately from loss recovery. Laboratory impairment and localhost tests cannot establish censorship resistance.
+For filtered deployments, validate the complete on-wire profile separately from loss recovery. Laboratory impairment and localhost tests cannot establish censorship resistance.
 
 - Compare plain QUIC and the native HTTP/3 candidate on the intended access networks, with authorized endpoints; include another profile only when proposed for deployment. Low-volume UDP reachability probes are a diagnostic baseline, not a deployable protocol.
 - Record ISP/access type, direction, endpoint profile, packet-size range, time window, handshake success/time, sustained useful traffic, idle/reconnect behavior and repeatability. Use multiple time windows and relevant access networks before making a deployment-specific claim.
-- Distinguish failure to establish, failure after establishment, partial throughput, ordinary queue loss and persistent unreachability. Collect evidence at both endpoints. A failed probe alone is not proof that the GFW caused it; check routing, NAT, host firewall and provider policy too.
+- Distinguish failure to establish, failure after establishment, partial throughput, ordinary queue loss and persistent unreachability. Collect evidence at both endpoints. A failed probe alone is not proof that network filtering caused it; check routing, NAT, host firewall and provider policy too.
 - Count unsuccessful connections and full-route outages in availability results. FEC recovery rates among surviving sessions cannot hide establishment failures.
 - Test direct and relayed profiles independently. Include encapsulation overhead, handshake/control traffic and return-path behavior. A TURN allocation's success is not evidence that subsequent end-to-end traffic remains usable.
 - Preserve endpoint authentication and configured rate/resource bounds. State the observation scope and date; do not extrapolate a temporary success into durable censorship resistance or probe resistance.
 
-For a claimed deployment profile, the operator must specify required establishment success, sustained availability and reconnect time before comparison. Select no cross-border default until repeated observations meet those requirements. Keep all measurements and infrastructure details local.
+For a claimed deployment profile, the operator must specify required establishment success, sustained availability and reconnect time before comparison. Select no deployment default until repeated observations meet those requirements. Keep all measurements and infrastructure details local.
 
 ## 4. A staged impairment matrix
 

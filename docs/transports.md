@@ -1,6 +1,6 @@
 # Carrier design: lessons from Xray
 
-**Decision:** build an independent Rust HTTP/3 service with an authenticated, unreliable datagram data plane as the preferred deployment candidate. Keep plain QUIC DATAGRAM as an engineering control. Use REALITY/XHTTP as research examples for a separately evaluated HTTPS stream profile when UDP is unusable. None is a validated cross-border default yet.
+**Decision:** build an independent Rust HTTP/3 service with an authenticated, unreliable datagram data plane as the preferred deployment candidate. Keep plain QUIC DATAGRAM as an engineering control. Use REALITY/XHTTP as research examples for a separately evaluated HTTPS stream profile when UDP is unusable. None is a validated deployment default yet.
 
 **Xray is a design reference only.** BraidPath will not depend on, embed, launch or require Xray. Xray protocol compatibility is not a project goal. The aggregation, FEC, scheduler and carrier integration belong to BraidPath; established Rust networking and cryptographic libraries remain appropriate dependencies.
 
@@ -58,7 +58,7 @@ Candidate components are Quinn/rustls with [h3](https://docs.rs/h3/0.0.8/h3/serv
 
 Configuration can also override transport windows and handshake parameters. The fork contains a non-standard option to assume DATAGRAM support when a peer omits negotiation; the inspected Chrome profile itself restores advertisement of DATAGRAM support. Do not copy one switch without tracing the effective configuration. A standards-based adapter must require negotiation and pass independent-peer interoperability checks.
 
-**Visibility.** HTTP/3 content encryption does not conceal the destination IP, every handshake attribute, packet sizes, timing or connection lifetime. QUIC Initial packets do not provide established-session secrecy. A working website and correct unauthorized-request handling improve protocol consistency; they do not demonstrate resistance to traffic classification, targeted blocking or all active probes. [RFC 9001](https://www.rfc-editor.org/rfc/rfc9001.html#section-5) and [measured QUIC censorship](https://gfw.report/publications/usenixsecurity25/en/) motivate a separate deployment gate.
+**Visibility.** HTTP/3 content encryption does not conceal the destination IP, every handshake attribute, packet sizes, timing or connection lifetime. QUIC Initial packets do not provide established-session secrecy. A working website and correct unauthorized-request handling improve protocol consistency; they do not demonstrate resistance to traffic classification, targeted blocking or all active probes. [RFC 9001](https://www.rfc-editor.org/rfc/rfc9001.html#section-5) motivates a separate deployment gate.
 
 FEC and multipath scheduling also change visible packet sizes, cadence and concurrent connection patterns. Evaluate the full active workload, not only an idle handshake. Any padding or timing changes introduced for appearance consume the same byte/latency budget; they must not hold urgent originals merely to obtain a preferred traffic shape.
 
@@ -86,6 +86,6 @@ The [carrier acceptance tests](validation.md#carrier-semantics-and-cost-gate) ar
 2. Bounded queues, cancellation, negotiated sizes and independent path ownership.
 3. Matched goodput, application deadlines/tail latency, total wire cost and CPU.
 4. FEC benefit under actual packet loss, with both directions and shared bottlenecks.
-5. Repeated reachability on the intended networks before a cross-border claim.
+5. Repeated reachability on the intended networks before a deployment claim.
 
 These gates can reject the preferred candidate. If web appearance or compatibility costs consume the expected recovery benefit, retain the simpler controlled-network profile and keep the deployment claim unresolved. Test records, local integration probes, captures and endpoint details remain outside version control.
