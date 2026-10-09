@@ -83,6 +83,12 @@ capability, not a substitute for transport authentication or anti-spoofing.
   `deadline_ms`; echo uses monotonic RTT instead. `late_rate` and `loss_rate` use
   the full count denominator, not only received packets. `deadline_misses`
   includes missing plus late packets.
+- `arrival_deadlines.buckets` additionally reports inclusive 100 ms and 150 ms
+  thresholds: `on_time`, `on_time_rate`, `received_late`, `missing`,
+  `deadline_misses` and `deadline_miss_rate`. Both use the complete configured
+  request count, including unsent or missing operations as misses. The existing
+  `deadline_ms` fields retain their previous semantics. Echo uses exact monotonic
+  RTT; one-way receive modes use the relative transit measurement described above.
 - P50/P95/P99 are unconditional nearest-rank quantiles of the full population.
   Missing packets occupy positive-infinity slots, encoded as the explicit JSON
   string `"infinity"`. A loss-heavy P99 must never silently become a received-only
@@ -105,14 +111,20 @@ capability, not a substitute for transport authentication or anti-spoofing.
   valid packet advancing the highest sequence may extend observation according
   to actual progress plus the remaining nominal send span and drain; duplicates,
   invalid packets and later out-of-order packets cannot renew it. Missing end
-  markers cannot extend a run indefinitely. Startup timeout is 1–60000 ms. Count is 1–100000, rate is
-  1–20000 pps, deadline is 1–10000 ms; allocations are bounded by count.
+  markers cannot extend a run indefinitely. Startup timeout is 1–60000 ms. Count is
+  1–1000000, rate is 1–40000 pps, and requested first-to-last send span is at most
+  180 seconds; deadline is 1–10000 ms. These limits are checked before allocation.
 - `--samples-file` stores exactly one bounded slot per configured sequence with
-  `seq`, `send_unix_us` and `receive_unix_us`. A receiver has null timestamps for
+  `seq`, `send_unix_us`, `receive_unix_us` and `rtt_ms`. Echo RTT is the original
+  monotonic measurement, not a reconstruction from wall-clock timestamps. The RTT
+  field is null for missing and one-way samples. A receiver has null timestamps for
   missing packets; join with source samples by sequence to recover send times
   and correlate loss with runtime queue samples. Sender samples have null
   receive times because delivery is unknown. Samples are also saved after
   runtime errors where possible; partial evidence is not a complete measurement.
+  JSON slots are streamed through a buffered writer without building a second
+  per-record JSON object tree. State arrays and report vectors remain bounded by
+  count; test harnesses can impose smaller count and collection limits.
 - `--listen` selects the probe source address. Distinct ports support parallel
   flows through a shared BraidPath client. Ordinary raw echo supports concurrent
   source ports against the same target port. Finite one-way sinks each pin one

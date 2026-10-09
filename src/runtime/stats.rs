@@ -156,6 +156,13 @@ pub struct Quinn {
     pub udp_bytes_rx: u64,
     pub http_datagram_frames_tx: u64,
     pub http_datagram_frames_rx: u64,
+    /// Frame counts, not ACK bytes or physical egress bandwidth.
+    pub ack_frames_tx: u64,
+    pub ack_frames_rx: u64,
+    pub ack_frequency_frames_tx: u64,
+    pub ack_frequency_frames_rx: u64,
+    pub immediate_ack_frames_tx: u64,
+    pub immediate_ack_frames_rx: u64,
     pub closed: bool,
 }
 impl Quinn {
@@ -174,6 +181,12 @@ impl Quinn {
             udp_bytes_rx: q.udp_rx.bytes,
             http_datagram_frames_tx: q.frame_tx.datagram,
             http_datagram_frames_rx: q.frame_rx.datagram,
+            ack_frames_tx: q.frame_tx.acks,
+            ack_frames_rx: q.frame_rx.acks,
+            ack_frequency_frames_tx: q.frame_tx.ack_frequency,
+            ack_frequency_frames_rx: q.frame_rx.ack_frequency,
+            immediate_ack_frames_tx: q.frame_tx.immediate_ack,
+            immediate_ack_frames_rx: q.frame_rx.immediate_ack,
             closed: conn.close_reason().is_some(),
         }
     }
@@ -200,7 +213,7 @@ pub struct Path {
     pub reconnect_attempts: u64,
     pub reconnect_successes: u64,
     pub reconnect_failures: u64,
-    pub adaptive: Option<super::adaptive::Decision>,
+    pub adaptive: Option<super::adaptive::Snapshot>,
     pub receiver_feedback: Option<super::quality::Snapshot>,
     pub session_id: String,
     pub path_id: u8,

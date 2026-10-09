@@ -5,6 +5,7 @@ use clap::{Args, ValueEnum};
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::{
+    io::{BufWriter, Write},
     net::SocketAddr,
     path::{Path, PathBuf},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -18,6 +19,12 @@ const ACK: u8 = 2;
 const DATA: u8 = 3;
 const END: u8 = 4;
 const REGISTRATION_ATTEMPTS: u32 = 3;
+// Larger finite cohorts permit observing recovery in one persistent session.
+// Validation precedes the two per-record allocations, and sample output streams
+// one record at a time instead of building a second JSON object tree in memory.
+const MAX_RECORDS: u32 = 1_000_000;
+const MAX_PPS: u32 = 40_000;
+const MAX_SEND_SPAN_SECONDS: u64 = 180;
 
 #[derive(Clone, Copy, Debug, ValueEnum, Serialize, PartialEq)]
 #[serde(rename_all = "kebab-case")]
@@ -99,8 +106,9 @@ fn unix_us() -> Result<i64> {
 }
 fn run_id(w: &Workload, one_way: bool) -> Result<[u8; 16]> {
     ensure!(
-        (1..=100_000).contains(&w.count)
-            && (1..=20_000).contains(&w.pps)
+        (1..=MAX_RECORDS).contains(&w.count)
+            && (1..=MAX_PPS).contains(&w.pps)
+            && u64::from(w.count - 1) <= u64::from(w.pps) * MAX_SEND_SPAN_SECONDS
             && (if one_way { HEADER } else { 16 }..=MAX_PAYLOAD).contains(&w.size)
             && (1..=10_000).contains(&w.deadline_ms)
             && w.drain_ms <= 60_000
@@ -169,7 +177,6 @@ struct Sample {
     seq: u32,
     send_unix_us: i64,
     receive_unix_us: Option<i64>,
-    #[serde(skip_serializing)]
     rtt_ms: Option<f64>,
 }
 struct State {
@@ -487,6 +494,32 @@ fn delays(samples: &[Option<Sample>], echo: bool) -> Vec<f64> {
         .map(|v| (v - min) as f64 / 1000.)
         .collect()
 }
+
+/// These supplementary arrival buckets always retain the requested population,
+/// including unsent operations after an interrupted/failed echo workload. Legacy
+/// deadline_ms fields below retain their successfully-sent echo denominator.
+fn arrival_deadlines(values: &[f64], requested: u32, echo: bool) -> Value {
+    let population = requested as usize;
+    let missing = population.saturating_sub(values.len());
+    let buckets = [100u64, 150].map(|deadline_ms| {
+        let on_time = values.iter().filter(|v| **v <= deadline_ms as f64).count();
+        json!({
+            "deadline_ms":deadline_ms, "on_time":on_time,
+            "on_time_rate":on_time as f64 / population.max(1) as f64,
+            "received_late":values.len() - on_time, "missing":missing,
+            "deadline_misses":population.saturating_sub(on_time),
+            "deadline_miss_rate":population.saturating_sub(on_time) as f64 / population.max(1) as f64,
+        })
+    });
+    json!({
+        "population":population,
+        "denominator":"requested operations; missing and unsent operations remain deadline misses",
+        "inclusive_boundary":true, "missing_are_misses":true,
+        "measurement":if echo {"monotonic echo RTT"} else {"relative one-way transit delay after minimum subtraction; not absolute delay or RTT"},
+        "buckets":buckets,
+    })
+}
+
 fn report(
     identity: (&str, &str, &str),
     w: &Workload,
@@ -538,6 +571,10 @@ fn report(
             .zip(observed_span.iter().min())
             .map(|(max, min)| (i128::from(*max) - i128::from(*min)) as f64 / 1_000_000.);
         let v = result.as_object_mut().unwrap();
+        v.insert(
+            "arrival_deadlines".into(),
+            arrival_deadlines(&values, w.count, echo),
+        );
         v.extend(json!({"received":received,"lost":lost,"loss_rate":lost as f64/count.max(1)as f64,
             "late":late,"late_rate":late as f64/count.max(1)as f64,"deadline_misses":lost+late,
             "deadline_miss_rate":(lost+late)as f64/count.max(1)as f64,
@@ -555,25 +592,37 @@ fn report(
 }
 fn save_samples(w: &Workload, state: &State) -> Result<()> {
     if let Some(path) = &w.samples_file {
-        let samples = state
-            .samples
-            .iter()
-            .enumerate()
-            .map(|(seq, sample)| {
-                sample.as_ref().map_or(
-                    json!({"seq":seq,"send_unix_us":null,"receive_unix_us":null,"missing":true}),
-                    |s| {
-                        let mut v = serde_json::to_value(s).expect("sample serializes");
-                        v["missing"] = json!(s.receive_unix_us.is_none());
-                        v
-                    },
-                )
-            })
-            .collect::<Vec<_>>();
-        write_json(
-            Some(path),
-            &json!({"requested_count":w.count,"samples":samples}),
-        )?;
+        #[derive(Serialize)]
+        struct SampleView {
+            seq: usize,
+            send_unix_us: Option<i64>,
+            receive_unix_us: Option<i64>,
+            rtt_ms: Option<f64>,
+            missing: bool,
+        }
+        let file =
+            std::fs::File::create(path).with_context(|| format!("write {}", path.display()))?;
+        let mut writer = BufWriter::new(file);
+        write!(writer, "{{\"requested_count\":{},\"samples\":[", w.count)?;
+        for (seq, sample) in state.samples.iter().enumerate() {
+            if seq > 0 {
+                writer.write_all(b",")?;
+            }
+            let sample = sample.as_ref();
+            let receive_unix_us = sample.and_then(|s| s.receive_unix_us);
+            serde_json::to_writer(
+                &mut writer,
+                &SampleView {
+                    seq,
+                    send_unix_us: sample.map(|s| s.send_unix_us),
+                    receive_unix_us,
+                    rtt_ms: sample.and_then(|s| s.rtt_ms),
+                    missing: receive_unix_us.is_none(),
+                },
+            )?;
+        }
+        writer.write_all(b"]}")?;
+        writer.flush()?;
     }
     Ok(())
 }
@@ -945,5 +994,174 @@ mod tests {
         assert_eq!(value["loss_rate"], json!(1. / 3.));
         assert_eq!(value["late_rate"], json!(1. / 3.));
         assert_eq!(value["deadline_miss_rate"], json!(2. / 3.));
+    }
+
+    #[test]
+    fn arrival_deadlines_include_boundaries_missing_and_unsent_operations() {
+        let mut w = receive_workload();
+        w.count = 6;
+        w.deadline_ms = 125;
+        let mut state = State::new(w.count);
+        state.sent = 5;
+        for (seq, rtt_ms) in [99.999, 100., 100.001, 150., 150.001]
+            .into_iter()
+            .enumerate()
+        {
+            state.samples[seq] = Some(Sample {
+                seq: seq as u32,
+                send_unix_us: 0,
+                // A deliberately unrelated wall-clock delta must not affect RTT.
+                receive_unix_us: Some(9_000_000),
+                rtt_ms: Some(rtt_ms),
+            });
+        }
+        let value = report(("probe", "echo", "round-trip"), &w, &state, 1., true, true);
+        // Legacy requested deadline and successfully-sent denominator survive.
+        assert_eq!(value["deadline_ms"], 125);
+        assert_eq!(value["quantile_population"], 5);
+        assert_eq!(value["lost"], 0);
+        assert_eq!(value["late"], 2);
+        let arrivals = &value["arrival_deadlines"];
+        assert_eq!(arrivals["population"], 6);
+        assert_eq!(arrivals["measurement"], "monotonic echo RTT");
+        assert_eq!(arrivals["inclusive_boundary"], true);
+        assert_eq!(arrivals["missing_are_misses"], true);
+        for (i, deadline, on_time, late) in [(0, 100, 2, 3), (1, 150, 4, 1)] {
+            let bucket = &arrivals["buckets"][i];
+            assert_eq!(bucket["deadline_ms"], deadline);
+            assert_eq!(bucket["on_time"], on_time);
+            assert_eq!(bucket["on_time_rate"], json!(f64::from(on_time) / 6.));
+            assert_eq!(bucket["received_late"], late);
+            assert_eq!(bucket["missing"], 1);
+            assert_eq!(bucket["deadline_misses"], 6 - on_time);
+        }
+    }
+
+    #[test]
+    fn relative_arrival_buckets_are_not_absolute_one_way_claims() {
+        let mut w = receive_workload();
+        w.count = 5;
+        let make_state = |offset: i64| {
+            let mut state = State::new(w.count);
+            for (seq, delay_us) in [0i64, 100_000, 150_000, 150_001].into_iter().enumerate() {
+                state.samples[seq] = Some(Sample {
+                    seq: seq as u32,
+                    send_unix_us: 1_000_000,
+                    receive_unix_us: Some(990_000 + offset + delay_us),
+                    rtt_ms: None,
+                });
+            }
+            state
+        };
+        let a = report(
+            ("probe", "receive", "server_to_client"),
+            &w,
+            &make_state(0),
+            1.,
+            true,
+            false,
+        );
+        let b = report(
+            ("probe", "receive", "server_to_client"),
+            &w,
+            &make_state(9_000_000),
+            1.,
+            true,
+            false,
+        );
+        assert_eq!(a["arrival_deadlines"], b["arrival_deadlines"]);
+        assert_eq!(a["arrival_deadlines"]["buckets"][0]["on_time"], 2);
+        assert_eq!(a["arrival_deadlines"]["buckets"][1]["on_time"], 3);
+        assert_eq!(a["arrival_deadlines"]["buckets"][1]["missing"], 1);
+        assert!(
+            a["arrival_deadlines"]["measurement"]
+                .as_str()
+                .unwrap()
+                .contains("not absolute")
+        );
+    }
+
+    #[test]
+    fn no_received_operations_cannot_improve_arrival_rate() {
+        let value = arrival_deadlines(&[], 20, true);
+        for bucket in value["buckets"].as_array().unwrap() {
+            assert_eq!(bucket["on_time"], 0);
+            assert_eq!(bucket["on_time_rate"], 0.);
+            assert_eq!(bucket["missing"], 20);
+            assert_eq!(bucket["deadline_misses"], 20);
+            assert_eq!(bucket["deadline_miss_rate"], 1.);
+        }
+    }
+
+    #[test]
+    fn streamed_samples_retain_monotonic_rtt_and_explicit_missing_slots() {
+        let mut w = receive_workload();
+        w.count = 3;
+        let path = std::env::temp_dir().join(format!(
+            "braidpath-probe-samples-{:032x}.json",
+            rand::random::<u128>()
+        ));
+        w.samples_file = Some(path.clone());
+        let mut state = State::new(w.count);
+        state.samples[0] = Some(Sample {
+            seq: 0,
+            send_unix_us: 100,
+            receive_unix_us: Some(200),
+            rtt_ms: Some(150.000_000_123),
+        });
+        state.samples[1] = Some(Sample {
+            seq: 1,
+            send_unix_us: 300,
+            receive_unix_us: None,
+            rtt_ms: None,
+        });
+        save_samples(&w, &state).unwrap();
+        let value: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(value["requested_count"], 3);
+        let samples = value["samples"].as_array().unwrap();
+        assert_eq!(samples.len(), 3);
+        assert_eq!(samples[0]["rtt_ms"], json!(150.000_000_123));
+        assert_eq!(samples[0]["missing"], false);
+        assert_eq!(samples[1]["send_unix_us"], 300);
+        for (seq, sample) in samples.iter().enumerate().skip(1) {
+            assert_eq!(sample["seq"], seq);
+            assert_eq!(sample["rtt_ms"], Value::Null);
+            assert_eq!(sample["receive_unix_us"], Value::Null);
+            assert_eq!(sample["missing"], true);
+        }
+        assert_eq!(samples[2]["send_unix_us"], Value::Null);
+    }
+
+    #[test]
+    fn finite_probe_limits_bound_memory_and_nominal_duration_before_allocation() {
+        let mut w = receive_workload();
+        w.run_id = Some("11111111111111111111111111111111".into());
+        for (count, pps, valid) in [
+            (600_000, 5_000, true),
+            (1_000_000, 40_000, true),
+            (1_000_001, 40_000, false),
+            (1_000_000, 40_001, false),
+            (180_001, 1_000, true),
+            (180_002, 1_000, false),
+            (0, 1_000, false),
+        ] {
+            w.count = count;
+            w.pps = pps;
+            assert_eq!(run_id(&w, true).is_ok(), valid, "count={count}, pps={pps}");
+        }
+        // Include simultaneous State arrays, transit i128/delay f64 vectors,
+        // and observed-send-span i64 vector. JSON output holds one row only.
+        let bytes_per_record = std::mem::size_of::<Option<Sample>>()
+            + std::mem::size_of::<Option<Instant>>()
+            + 16
+            + 8
+            + 8;
+        assert!(bytes_per_record * MAX_RECORDS as usize <= 128 * 1024 * 1024);
+        eprintln!(
+            "probe conservative arrays+report bound: {} bytes for {} records; streaming sample output",
+            bytes_per_record * MAX_RECORDS as usize,
+            MAX_RECORDS
+        );
     }
 }

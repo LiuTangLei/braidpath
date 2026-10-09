@@ -106,6 +106,71 @@ type Paths = Arc<Mutex<Vec<OutPath>>>;
 fn quality_time(path: &OutPath) -> u64 {
     path.epoch.elapsed().as_micros().min(u128::from(u64::MAX)) as u64
 }
+
+#[derive(Clone, Copy)]
+struct ReprobePath {
+    id: u8,
+    group: u8,
+}
+
+/// Coordinate experiments after every live controller has observed the same
+/// sender tick. Closed/retired paths are absent, so they cannot retain a lease.
+/// Existing aggregate/group pacers still enforce every actual admission.
+fn grant_reprobes(
+    paths: &[ReprobePath],
+    controllers: &mut [adaptive::PathController; MAX_PATHS],
+    aggregate_rate: u64,
+    group_rates: &[u64; MAX_PATHS],
+    next_path: &mut usize,
+    now_us: u64,
+) {
+    let mut rates = [0u64; MAX_PATHS];
+    let mut usable = [false; MAX_PATHS];
+    let mut occupied = [false; MAX_PATHS];
+    let mut grouped = [0u64; MAX_PATHS];
+    let mut total = 0u64;
+    for path in paths {
+        let id = usize::from(path.id);
+        let group = usize::from(path.group);
+        let decision = controllers[id].decision(now_us);
+        if decision.eligible {
+            usable[id] = true;
+            rates[id] = decision.pacing_bps;
+            grouped[group] = grouped[group].saturating_add(rates[id]);
+            total = total.saturating_add(rates[id]);
+            occupied[group] |= controllers[id].reprobe_active();
+        }
+    }
+    let first = *next_path;
+    for offset in 0..MAX_PATHS {
+        let id = (first + offset) % MAX_PATHS;
+        let Some(path) = paths.iter().find(|path| usize::from(path.id) == id) else {
+            continue;
+        };
+        let group = usize::from(path.group);
+        if !usable[id] || occupied[group] {
+            continue;
+        }
+        let Some(request) = controllers[id].reprobe_candidate(now_us) else {
+            continue;
+        };
+        let headroom = aggregate_rate
+            .saturating_sub(total)
+            .min(group_rates[group].saturating_sub(grouped[group]));
+        let ceiling = request.trial_bps.min(rates[id].saturating_add(headroom));
+        if ceiling <= rates[id] || !controllers[id].start_reprobe(now_us, ceiling) {
+            continue;
+        }
+        let admitted_rate = controllers[id].decision(now_us).pacing_bps;
+        let increase = admitted_rate.saturating_sub(rates[id]);
+        total = total.saturating_add(increase);
+        grouped[group] = grouped[group].saturating_add(increase);
+        rates[id] = admitted_rate;
+        occupied[group] = true;
+        *next_path = (id + 1) % MAX_PATHS;
+    }
+}
+
 fn control_priority(path: &OutPath) -> (bool, u64) {
     let q = path.quality.lock().expect("quality lock");
     let fresh = q
@@ -494,6 +559,7 @@ async fn sender(
     let epoch = Instant::now();
     let mut cursor = 0usize;
     let mut control_cursor = 0usize;
+    let mut reprobe_cursor = 0usize;
     let mut next_feedback = 0u64;
     let mut pending_feedback: Option<Bytes> = None;
     let mut observe_at = 0u64;
@@ -646,6 +712,11 @@ async fn sender(
                         .map(|t| at.saturating_sub(t)),
                     delivered_bytes: estimate.received_bytes,
                     delivered_bps: estimate.delivered_bps,
+                    delivery_sample_span_us: estimate.sample_span_us,
+                    delivery_report_time_us: estimate.report_time_us,
+                    reprobe_enabled: policy.fec == 0
+                        && policy.redundancy == 0
+                        && path.conn.close_reason().is_none(),
                     feedback_sample_symbols: estimate.sample_symbols,
                     finalized_expected: Some(estimate.expected),
                     finalized_lost: Some(estimate.lost),
@@ -665,8 +736,26 @@ async fn sender(
                     offered_backlog: !queue.is_empty(),
                     transport_blocked: path.conn.datagram_send_buffer_space() < wire::MAX_WIRE,
                 });
-                let decision = controllers[usize::from(path.id)].decision(now_us);
-                metrics.path(path.id, |p| p.adaptive = Some(decision));
+            }
+            let live: Vec<_> = paths
+                .iter()
+                .filter(|path| path.conn.close_reason().is_none())
+                .map(|path| ReprobePath {
+                    id: path.id,
+                    group: path.group,
+                })
+                .collect();
+            grant_reprobes(
+                &live,
+                &mut controllers,
+                policy.rate,
+                &policy.group_rates,
+                &mut reprobe_cursor,
+                now_us,
+            );
+            for path in paths.iter() {
+                let snapshot = controllers[usize::from(path.id)].snapshot(now_us);
+                metrics.path(path.id, |p| p.adaptive = Some(snapshot));
             }
             observe_at = now_us.saturating_add(100_000);
         }
@@ -2093,6 +2182,9 @@ pub async fn get(remote: SocketAddr, name: &str, ca: &std::path::Path) -> Result
 
 #[cfg(test)]
 mod sender_ready_tests;
+
+#[cfg(test)]
+mod reprobe_tests;
 
 #[cfg(test)]
 mod sender_clock_tests {

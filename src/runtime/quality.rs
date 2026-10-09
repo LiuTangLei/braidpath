@@ -28,6 +28,10 @@ pub struct Estimate {
     /// Unique measured symbol bytes received before FEC; not application goodput/capacity.
     pub received_bytes: u64,
     pub delivered_bps: Option<f64>,
+    /// Receiver-local end of the latest byte report. Never compare this clock
+    /// with the sender's clock; cumulative byte deltas use matching end times.
+    /// Legacy reports have no byte clock and cannot qualify capacity trials.
+    pub report_time_us: Option<u64>,
     pub sample_span_us: u64,
     pub sample_symbols: u64,
     /// Loss in the newest finalized interval, before smoothing. Zero-symbol
@@ -199,6 +203,7 @@ impl State {
     pub fn report(&mut self, id: u8, now_us: u64) -> Report {
         self.mature(now_us);
         self.snapshot.received.report_number += 1;
+        self.snapshot.received.report_time_us = Some(now_us);
         Report {
             id,
             generation: self.snapshot.generation,
@@ -306,6 +311,7 @@ impl State {
                 old.received_bytes
             },
             delivered_bps,
+            report_time_us: (r.report_time_us != 0).then_some(r.report_time_us),
             sample_span_us,
             sample_symbols: delta_expected,
             sample_loss_rate: if delta_expected == 0 {
@@ -633,6 +639,7 @@ mod tests {
         tx.apply(&report, 19_000_000).unwrap();
         assert_eq!(tx.snapshot.sender_estimate.delivered_bps, Some(3200.0));
         assert_eq!(tx.snapshot.sender_estimate.sample_span_us, 500_000);
+        assert_eq!(tx.snapshot.sender_estimate.report_time_us, Some(600_000));
         assert_eq!(tx.snapshot.sender_estimate.sample_symbols, 2);
         assert_eq!(tx.snapshot.sender_estimate.sample_loss_rate, 0.0);
         assert!(tx.snapshot.sender_estimate.loss_rate > 0.0);
@@ -642,6 +649,22 @@ mod tests {
         report.report_time_us += 500_000;
         report.received_bytes = 1201;
         assert!(tx.apply(&report, 20_000_000).is_err());
+        assert_eq!(tx.snapshot.sender_estimate.report_time_us, Some(600_000));
+        // A controller may miss intermediate reports between two local polls.
+        // The exported cumulative clock/bytes pair remains a matching interval;
+        // the last individual sample span is not that cumulative denominator.
+        report.received_bytes = 1100;
+        tx.apply(&report, 20_000_001).unwrap();
+        report.number = 4;
+        report.received_bytes = 1200;
+        report.report_time_us += 500_000;
+        tx.apply(&report, 20_000_002).unwrap();
+        let estimate = &tx.snapshot.sender_estimate;
+        assert_eq!(estimate.report_time_us, Some(1_600_000));
+        assert_eq!(estimate.sample_span_us, 500_000);
+        let cumulative = (estimate.received_bytes - 1000) as f64 * 8_000_000.0
+            / (estimate.report_time_us.unwrap() - 600_000) as f64;
+        assert_eq!(cumulative, 1600.0);
     }
     #[test]
     fn latest_probe_exposes_drainage_before_the_diagnostic_ewma() {

@@ -2,6 +2,9 @@
 use serde::Serialize;
 use std::collections::VecDeque;
 
+mod reprobe;
+pub use reprobe::Request as ReprobeRequest;
+
 const FRESH_US: u64 = 3_000_000;
 const CONTROL_US: u64 = 200_000;
 const PROBE_US: u64 = 500_000;
@@ -121,6 +124,62 @@ pub struct Decision {
     pub cautious: bool,
 }
 
+/// Rich bounded diagnostics are cloned only for scheduled statistics. Packet
+/// admission and scheduling use the allocation-free `Decision` above.
+#[derive(Clone, Debug, Serialize)]
+pub struct Snapshot {
+    #[serde(flatten)]
+    pub decision: Decision,
+    pub reprobe: reprobe::Snapshot,
+    pub rate_changes: VecDeque<RateChange>,
+    pub rate_changes_total: u64,
+    pub rate_changes_evicted: u64,
+    pub last_control: ControlSample,
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RateReason {
+    InitialGrowth,
+    KnownServiceRecovery,
+    CautiousGrowth,
+    QueueBrake,
+    DeliveryShortfallBrake,
+    FastLossBrake,
+    LossBrake,
+    TransportBlockedBrake,
+    ReprobeStart,
+    ReprobeRollback,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct ControlSample {
+    pub at_us: u64,
+    pub generation: u64,
+    pub report_number: u64,
+    pub delivery_report_time_us: Option<u64>,
+    pub delivery_sample_span_us: u64,
+    pub admitted_bytes: u64,
+    pub integrated_allowance_bytes: f64,
+    pub admission_span_us: u64,
+    pub queue_delay_ms: f64,
+    pub transport_blocked: bool,
+    pub offered_backlog: bool,
+    pub latest_symbol_delivery_bps: Option<f64>,
+    pub ordinary_loss_pressure: bool,
+    pub fast_loss: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct RateChange {
+    pub number: u64,
+    pub at_us: u64,
+    pub previous_bps: u64,
+    pub pacing_bps: u64,
+    pub reason: RateReason,
+    pub control: ControlSample,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Observation {
     pub now_us: u64,
@@ -133,6 +192,11 @@ pub struct Observation {
     pub delivered_bytes: u64,
     /// Receiver-local report interval; feedback arrival spacing can be compressed.
     pub delivered_bps: Option<f64>,
+    /// Receiver-local delivery clock and interval, independent of loss age.
+    pub delivery_report_time_us: Option<u64>,
+    pub delivery_sample_span_us: u64,
+    /// Only original-only traffic may use raw symbol delivery to validate a trial.
+    pub reprobe_enabled: bool,
     pub feedback_sample_symbols: u64,
     /// Cumulative finalized sequence counts recover reports skipped between
     /// controller observations. They are distinct from current delivery bytes.
@@ -197,6 +261,10 @@ pub struct PathController {
     pressure_episode_exercised: Option<bool>,
     tokens: f64,
     token_us: u64,
+    reprobe: reprobe::Controller,
+    rate_changes: VecDeque<RateChange>,
+    rate_changes_total: u64,
+    last_control: ControlSample,
 }
 
 impl PathController {
@@ -243,6 +311,10 @@ impl PathController {
             pressure_episode_exercised: None,
             tokens: 2400.0,
             token_us: 0,
+            reprobe: reprobe::Controller::default(),
+            rate_changes: VecDeque::new(),
+            rate_changes_total: 0,
+            last_control: ControlSample::default(),
         }
     }
 
@@ -257,6 +329,8 @@ impl PathController {
             self.token_us = now;
         }
         self.refill(now);
+        let previous_rate = self.rate_bps;
+        let mut rate_reason = RateReason::ReprobeRollback;
         if self.admitted_symbol_bytes > 0 {
             self.wire_per_symbol =
                 (self.admitted_bytes as f64 / self.admitted_symbol_bytes as f64).clamp(1.0, 16.0);
@@ -444,13 +518,67 @@ impl PathController {
         let settled_shortfall =
             service_shortfall && now.saturating_sub(last_change) >= PROBE_US + BRAKE_US;
         self.loss_pressure = ordinary_loss && settled_shortfall;
-        let new_loss = fast_loss || (loss_batch.is_some() && self.loss_pressure);
+        let loss_counts = self.loss_evidence.counts();
+        self.last_control = ControlSample {
+            at_us: now,
+            generation: observation.generation,
+            report_number: observation.report_number,
+            delivery_report_time_us: observation.delivery_report_time_us,
+            delivery_sample_span_us: observation.delivery_sample_span_us,
+            admitted_bytes: self.admitted_bytes,
+            integrated_allowance_bytes: self.allowance_bytes,
+            admission_span_us: admission_span,
+            queue_delay_ms: self.queue_delay_ms,
+            transport_blocked: observation.transport_blocked,
+            offered_backlog: observation.offered_backlog,
+            latest_symbol_delivery_bps: self.latest_delivery_bps,
+            ordinary_loss_pressure: self.loss_pressure,
+            fast_loss,
+        };
+        let trial_action = self.reprobe.observe(reprobe::Input {
+            sample: observation,
+            rate_bps: self.rate_bps,
+            maximum_bps: self.maximum_bps,
+            queue_ms: self.queue_delay_ms,
+            target_ms: self.target_ms,
+            fresh,
+            healthy: self.no_delivery_confirmed_us.is_none(),
+            fast_loss,
+            blocked: blocked_pressure,
+            ordinary_loss: ordinary_loss && self.congestion_seen,
+            stalled: self.congestion_seen
+                && now.saturating_sub(self.last_growth_us) >= LOSS_WINDOW_US,
+            new_report,
+            control_sample: admission_span >= CONTROL_US,
+            admission_span_us: admission_span,
+            admitted: self.admitted_bytes,
+            allowance: self.allowance_bytes,
+            loss_expected: loss_counts.0.min(u128::from(u64::MAX)) as u64,
+            loss_lost: loss_counts.1.min(u128::from(u64::MAX)) as u64,
+        });
+        if let Some(maximum) = trial_action.maximum_rate {
+            // Rollback can only remove trial credit. A real safety reduction
+            // that already went below the baseline must never be undone.
+            self.rate_bps = self.rate_bps.min(maximum);
+            if self.rate_bps < previous_rate {
+                // Withdrawing trial credit is not the congestion brake. Do
+                // not start its debounce here and suppress a real brake from
+                // this same observation (fast loss, queue or transport block).
+                self.growth_not_before_us = now.saturating_add(RETRY_GROWTH_US);
+            }
+        }
+        let protect_ordinary_loss = trial_action.protect_ordinary_loss;
+        let new_loss =
+            fast_loss || (loss_batch.is_some() && self.loss_pressure && !protect_ordinary_loss);
         let loss_for_brake = if fast_loss {
             loss_batch.map_or(0.0, |(n, lost)| lost as f64 / n as f64)
         } else {
             self.loss_evidence.fraction()
         };
-        let pressure = delay_pressure || self.loss_pressure || fast_loss || blocked_pressure;
+        let pressure = delay_pressure
+            || (self.loss_pressure && !protect_ordinary_loss)
+            || fast_loss
+            || blocked_pressure;
         if pressure {
             self.pressure_episode_exercised.get_or_insert(exercised);
         } else if new_loss_report && observation.feedback_sample_symbols > 0 {
@@ -567,6 +695,17 @@ impl PathController {
                     self.drain_restore_pending = true;
                 }
                 self.rate_bps = reduced;
+                rate_reason = if fast_loss {
+                    RateReason::FastLossBrake
+                } else if new_delay {
+                    RateReason::QueueBrake
+                } else if blocked_pressure {
+                    RateReason::TransportBlockedBrake
+                } else if delivery_shortfall {
+                    RateReason::DeliveryShortfallBrake
+                } else {
+                    RateReason::LossBrake
+                };
                 self.last_brake_us = Some(now);
                 self.growth_not_before_us = now.saturating_add(RETRY_GROWTH_US);
             }
@@ -574,7 +713,12 @@ impl PathController {
 
         let elapsed = now.saturating_sub(self.last_control_us);
         if elapsed >= CONTROL_US {
-            if fresh && self.eligible && !pressure && self.drain_restore_pending {
+            if fresh
+                && self.eligible
+                && !pressure
+                && !protect_ordinary_loss
+                && self.drain_restore_pending
+            {
                 // RTT observations are more frequent than control ticks. Keep
                 // the drainage transition pending so an intervening clear RTT
                 // cannot erase restoration before the next control tick.
@@ -582,6 +726,7 @@ impl PathController {
                     let restored = (drain * 0.9).min(self.maximum_bps as f64) as u64;
                     if restored > self.rate_bps {
                         self.rate_bps = restored;
+                        rate_reason = RateReason::KnownServiceRecovery;
                         self.last_growth_us = now;
                     }
                 }
@@ -590,6 +735,8 @@ impl PathController {
             if fresh
                 && self.eligible
                 && !pressure
+                && !protect_ordinary_loss
+                && (!observation.reprobe_enabled || delivery_fresh)
                 // Credible loss with underdelivery must get a settled service
                 // observation before recovery explores further. The retained
                 // capacity shortcut otherwise bypasses receiver-keeps-up and
@@ -618,6 +765,13 @@ impl PathController {
                     self.rate_bps = ((self.rate_bps as f64 * gain).min(ceiling) as u64)
                         .max(self.rate_bps)
                         .min(self.maximum_bps);
+                    rate_reason = if !self.congestion_seen {
+                        RateReason::InitialGrowth
+                    } else if (self.rate_bps as f64) < self.remembered_bps * 0.90 {
+                        RateReason::KnownServiceRecovery
+                    } else {
+                        RateReason::CautiousGrowth
+                    };
                     self.last_growth_us = now;
                 }
             }
@@ -627,6 +781,7 @@ impl PathController {
             self.allowance_bytes = 0.0;
         }
         self.rate_bps = self.rate_bps.min(self.maximum_bps).max(1);
+        self.record_rate_change(now, previous_rate, rate_reason);
         self.last_probe_sample_id = observation.probe_sample_id;
         self.last_rtt_ms = rtt;
         self.last_local_rtt_ms = local_rtt;
@@ -661,6 +816,19 @@ impl PathController {
         }
     }
 
+    pub fn snapshot(&self, now_us: u64) -> Snapshot {
+        Snapshot {
+            decision: self.decision(now_us),
+            reprobe: self.reprobe.snapshot(),
+            rate_changes: self.rate_changes.clone(),
+            rate_changes_total: self.rate_changes_total,
+            rate_changes_evicted: self
+                .rate_changes_total
+                .saturating_sub(self.rate_changes.len() as u64),
+            last_control: self.last_control.clone(),
+        }
+    }
+
     pub fn allow(&mut self, now_us: u64, bytes: usize, queue_age_ms: f64) -> bool {
         self.refill(now_us);
         self.decision(now_us).eligible
@@ -686,13 +854,86 @@ impl PathController {
         self.admitted_symbol_bytes = self
             .admitted_symbol_bytes
             .saturating_add(measured_symbol_bytes as u64);
+        self.reprobe.admitted(wire_bytes);
     }
 
     pub fn probe_admitted(&mut self, now_us: u64) {
         self.last_probe_us = Some(now_us);
     }
 
+    pub fn reprobe_candidate(&self, now_us: u64) -> Option<ReprobeRequest> {
+        if !self.decision(now_us).eligible {
+            return None;
+        }
+        self.reprobe.candidate(now_us).filter(|request| {
+            self.generation == Some(request.generation) && self.rate_bps == request.baseline_bps
+        })
+    }
+
+    /// The sender owns all paths and grants only one trial per bottleneck group.
+    /// Its ceiling also accounts for the other live paths' operational budgets.
+    pub fn start_reprobe(&mut self, now_us: u64, maximum_trial_bps: u64) -> bool {
+        self.refill(now_us);
+        if self.reprobe_candidate(now_us).is_none() {
+            return false;
+        }
+        let previous = self.rate_bps;
+        let Some(rate) = self
+            .reprobe
+            .start(now_us, maximum_trial_bps.min(self.maximum_bps))
+        else {
+            return false;
+        };
+        self.rate_bps = rate;
+        self.last_growth_us = now_us;
+        // Do not carry the pre-trial burst into a finite extra-credit interval.
+        self.tokens = 0.0;
+        self.record_rate_change(now_us, previous, RateReason::ReprobeStart);
+        true
+    }
+
+    pub fn reprobe_active(&self) -> bool {
+        self.reprobe.active()
+    }
+
+    fn record_rate_change(&mut self, now_us: u64, previous_bps: u64, reason: RateReason) {
+        if previous_bps == self.rate_bps {
+            return;
+        }
+        self.rate_changes_total = self.rate_changes_total.saturating_add(1);
+        if self.rate_changes.len() == 16 {
+            self.rate_changes.pop_front();
+        }
+        self.rate_changes.push_back(RateChange {
+            number: self.rate_changes_total,
+            at_us: now_us,
+            previous_bps,
+            pacing_bps: self.rate_bps,
+            reason,
+            control: self.last_control.clone(),
+        });
+    }
+
     fn refill(&mut self, now_us: u64) {
+        if let Some(deadline) = self
+            .reprobe
+            .deadline()
+            .filter(|deadline| now_us >= *deadline)
+        {
+            let old_rate = self.rate_bps;
+            // Split the integral at the finite phase boundary even if the
+            // observer is delayed. Calling allow alone cannot extend a trial.
+            let before =
+                deadline.saturating_sub(self.token_us) as f64 * old_rate as f64 / 8_000_000.0;
+            self.allowance_bytes += before;
+            self.tokens = (self.tokens + before).min(2400.0);
+            self.token_us = self.token_us.max(deadline);
+            if let Some(maximum) = self.reprobe.expire(now_us) {
+                self.rate_bps = self.rate_bps.min(maximum);
+                self.growth_not_before_us = now_us.saturating_add(RETRY_GROWTH_US);
+                self.record_rate_change(now_us, old_rate, RateReason::ReprobeRollback);
+            }
+        }
         let allowance =
             now_us.saturating_sub(self.token_us) as f64 * self.rate_bps as f64 / 8_000_000.0;
         self.allowance_bytes += allowance;
@@ -735,6 +976,190 @@ mod tests {
             }
         }
         admitted
+    }
+
+    /// Actual token admission with a separate deterministic 20% erasure sink.
+    /// Receiver clocks deliberately have an unrelated offset. This helper stops
+    /// at the first granted trial so each safety test exercises a real baseline.
+    fn granted_reprobe() -> (PathController, u64, u64) {
+        let mut controller = PathController::new(20_000_000, 20);
+        let mut admitted = 0u64;
+        let mut previous_received = 0u64;
+        let mut sample = observation(0, 80.0);
+        sample.reprobe_enabled = true;
+        sample.report_number = 0;
+        sample.delivered_bytes = 0;
+        sample.finalized_expected = Some(0);
+        sample.finalized_lost = Some(0);
+        controller.observe(&sample);
+        for now in (100_000..20_000_000u64).step_by(100_000) {
+            admitted += exercise_budget(&mut controller, now - 100_000, 100_000);
+            sample.now_us = now;
+            sample.probe_age_us = Some(now % PROBE_US);
+            sample.probe_sample_id = now / PROBE_US + 1;
+            if now.is_multiple_of(PROBE_US) {
+                let sent = admitted / 1000;
+                let received = (sent - sent / 5) * 1000;
+                sample.report_number += 1;
+                sample.delivered_bps = Some((received - previous_received) as f64 * 16.0);
+                sample.delivered_bytes = received;
+                sample.delivery_report_time_us = Some(8_000_000_000 + now);
+                sample.delivery_sample_span_us = PROBE_US;
+                sample.feedback_sample_symbols = 32;
+                sample.finalized_expected = Some(sent);
+                sample.finalized_lost = Some(sent / 5);
+                sample.loss_sample_rate = Some(0.2);
+                previous_received = received;
+            }
+            sample.feedback_age_us = Some(now % PROBE_US);
+            sample.positive_delivery_age_us = Some(now % PROBE_US);
+            controller.observe(&sample);
+            if let Some(request) = controller.reprobe_candidate(now) {
+                assert!(!controller.start_reprobe(now, request.trial_bps - 1));
+                assert!(controller.start_reprobe(now, request.trial_bps));
+                assert!(controller.reprobe_active());
+                return (controller, now, request.baseline_bps);
+            }
+        }
+        panic!("fully used low-queue erasure path did not offer a bounded trial");
+    }
+
+    fn fresh_after_trial(controller: &PathController, now: u64) -> Observation {
+        let (number, bytes, _) = controller.last_report.unwrap();
+        let (expected, lost) = controller.loss_evidence.previous.unwrap();
+        Observation {
+            now_us: now,
+            report_number: number + 1,
+            delivered_bytes: bytes + 10_000,
+            delivered_bps: Some(160_000.0),
+            delivery_report_time_us: Some(
+                controller.last_control.delivery_report_time_us.unwrap() + PROBE_US,
+            ),
+            delivery_sample_span_us: PROBE_US,
+            reprobe_enabled: true,
+            finalized_expected: Some(expected + 16),
+            finalized_lost: Some(lost + 3),
+            feedback_sample_symbols: 16,
+            loss_sample_rate: Some(3.0 / 16.0),
+            ..observation(now, 80.0)
+        }
+    }
+
+    #[test]
+    fn reprobe_009_hard_queue_fast_loss_and_disable_remove_trial_before_next_admission() {
+        for condition in ["queue", "loss", "disable"] {
+            let (mut controller, started, baseline) = granted_reprobe();
+            let mut sample = fresh_after_trial(&controller, started + 100_000);
+            match condition {
+                "queue" => {
+                    sample.rtt_ms = 120.0;
+                    sample.probe_rtt_ms = Some(120.0);
+                    sample.probe_latest_rtt_ms = Some(120.0);
+                    sample.probe_sample_id += 1;
+                }
+                "loss" => {
+                    let (_, lost) = controller.loss_evidence.previous.unwrap();
+                    sample.finalized_lost = Some(lost + 16);
+                    sample.loss_sample_rate = Some(1.0);
+                }
+                _ => sample.reprobe_enabled = false,
+            }
+            controller.observe(&sample);
+            assert!(!controller.reprobe_active(), "{condition}");
+            assert!(
+                controller.rate_bps <= baseline,
+                "rollback raised a braked rate: {condition}"
+            );
+            assert!(controller.reprobe_candidate(sample.now_us).is_none());
+        }
+    }
+
+    #[test]
+    fn reprobe_009_persistent_transport_blocking_aborts_trial() {
+        let (mut controller, started, baseline) = granted_reprobe();
+        for offset in [100_000, 200_000] {
+            let mut sample = fresh_after_trial(&controller, started + offset);
+            sample.delivered_bps = Some(0.0);
+            sample.transport_blocked = true;
+            controller.observe(&sample);
+        }
+        assert!(!controller.reprobe_active());
+        assert!(controller.rate_bps <= baseline);
+        assert!(
+            controller
+                .snapshot(started + 200_000)
+                .reprobe
+                .transitions
+                .iter()
+                .any(|event| { event.reason == reprobe::Reason::TransportBlocked })
+        );
+    }
+
+    #[test]
+    fn reprobe_009_duplicate_reports_cannot_validate_and_allow_cannot_extend_deadline() {
+        let (mut controller, started, baseline) = granted_reprobe();
+        let old_report = controller.last_report.unwrap().0;
+        for offset in (100_000..4_000_000u64).step_by(100_000) {
+            let mut sample = fresh_after_trial(&controller, started + offset);
+            sample.report_number = old_report;
+            sample.delivered_bps = Some(100_000_000.0);
+            // Replayed or reordered evidence cannot become a successful trial
+            // even if an independent authenticated probe keeps the path healthy.
+            controller.observe(&sample);
+        }
+        let _ = controller.allow(started + 4_000_000, 1000, 0.0);
+        assert!(!controller.reprobe_active());
+        assert!(controller.rate_bps <= baseline);
+        assert!(
+            !controller
+                .snapshot(started + 4_000_000)
+                .reprobe
+                .transitions
+                .iter()
+                .any(|event| { event.reason == reprobe::Reason::ServiceImproved })
+        );
+
+        let (mut controller, started, baseline) = granted_reprobe();
+        // No observe calls at all: refill itself still withdraws finite credit.
+        let _ = controller.allow(started + 4_100_000, 1000, 0.0);
+        assert!(!controller.reprobe_active());
+        assert!(controller.rate_bps <= baseline);
+    }
+
+    #[test]
+    fn reprobe_009_generation_reset_discards_trial_and_its_service_reference() {
+        let (mut controller, started, _) = granted_reprobe();
+        let mut sample = observation(started + 100_000, 80.0);
+        sample.generation += 1;
+        sample.reprobe_enabled = true;
+        controller.observe(&sample);
+        assert!(!controller.reprobe_active());
+        assert_eq!(controller.rate_bps, START_BPS);
+        assert_eq!(
+            controller.snapshot(sample.now_us).reprobe.total_transitions,
+            0
+        );
+        assert!(controller.reprobe_candidate(sample.now_us).is_none());
+    }
+
+    #[test]
+    fn reprobe_009_expiry_rollback_does_not_debounce_same_observation_safety_brake() {
+        let (mut controller, started, baseline) = granted_reprobe();
+        assert!(baseline > MIN_BPS);
+        let mut sample = fresh_after_trial(&controller, started + 4_000_000);
+        let (_, lost) = controller.loss_evidence.previous.unwrap();
+        sample.finalized_lost = Some(lost + 16);
+        sample.loss_sample_rate = Some(1.0);
+        controller.observe(&sample);
+        assert!(!controller.reprobe_active());
+        assert!(
+            controller.rate_bps < baseline,
+            "expiry cannot consume the real brake's debounce interval"
+        );
+        assert!(matches!(
+            controller.rate_changes.back().unwrap().reason,
+            RateReason::FastLossBrake
+        ));
     }
 
     fn finalized(now: u64, number: u64, expected: u64, lost: u64) -> Observation {
