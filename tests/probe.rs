@@ -17,6 +17,7 @@ struct Process {
     child: Child,
     ready: PathBuf,
     result: PathBuf,
+    stderr: PathBuf,
 }
 impl Drop for Process {
     fn drop(&mut self) {
@@ -34,6 +35,7 @@ fn port() -> String {
 fn launch(args: &[&str], dir: &Path, name: &str) -> Process {
     let ready = dir.join(format!("{name}-ready.json"));
     let result = dir.join(format!("{name}-result.json"));
+    let stderr = dir.join(format!("{name}-stderr.log"));
     let mut cmd = Command::new(BIN);
     cmd.args(args)
         .args(["--ready-file", ready.to_str().unwrap()]);
@@ -43,11 +45,12 @@ fn launch(args: &[&str], dir: &Path, name: &str) -> Process {
     Process {
         child: cmd
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(fs::File::create(&stderr).unwrap())
             .spawn()
             .unwrap(),
         ready,
         result,
+        stderr,
     }
 }
 fn ready(p: &mut Process) -> Value {
@@ -62,7 +65,12 @@ fn ready(p: &mut Process) -> Value {
             assert_eq!(value["instance_id"].as_str().unwrap().len(), 32);
             return value;
         }
-        assert!(p.child.try_wait().unwrap().is_none(), "early process exit");
+        assert!(
+            p.child.try_wait().unwrap().is_none(),
+            "early process exit: result={}; stderr={}",
+            fs::read_to_string(&p.result).unwrap_or_default(),
+            fs::read_to_string(&p.stderr).unwrap_or_default()
+        );
         assert!(
             start.elapsed() < Duration::from_secs(5),
             "readiness timeout"
@@ -360,7 +368,7 @@ fn wrong_run_id_does_not_amplify_and_timeout_is_machine_readable() {
             "--size",
             "100",
             "--startup-timeout-ms",
-            "250",
+            "1500",
         ],
         dir.path(),
         "reject",
