@@ -339,6 +339,50 @@ fn record(
 fn requested_span(w: &Workload) -> f64 {
     f64::from(w.count - 1) / f64::from(w.pps)
 }
+
+/// Observation follows validated sequence progress, with a fixed drain after END.
+struct ReceiveWindow {
+    until: tokio::time::Instant,
+    highest_sequence: Option<u32>,
+    end_seen: bool,
+}
+impl ReceiveWindow {
+    fn new(w: &Workload, state: &State, now: tokio::time::Instant) -> Self {
+        Self {
+            until: now
+                + Duration::from_secs_f64(requested_span(w))
+                + Duration::from_millis(w.drain_ms),
+            highest_sequence: state
+                .samples
+                .iter()
+                .flatten()
+                .filter(|sample| sample.receive_unix_us.is_some())
+                .map(|sample| sample.seq)
+                .max(),
+            end_seen: false,
+        }
+    }
+    // Called only for a newly accepted valid record; duplicates/invalid packets
+    // never reach this method. Late out-of-order data cannot renew observation.
+    fn progress(&mut self, seq: u32, w: &Workload, now: tokio::time::Instant) {
+        if !self.end_seen && self.highest_sequence.is_none_or(|highest| seq > highest) {
+            self.highest_sequence = Some(seq);
+            let remaining = f64::from(w.count - 1 - seq) / f64::from(w.pps);
+            self.until = self
+                .until
+                .max(now + Duration::from_secs_f64(remaining) + Duration::from_millis(w.drain_ms));
+        }
+    }
+    fn end(&mut self, w: &Workload, now: tokio::time::Instant) -> bool {
+        if self.end_seen {
+            return false;
+        }
+        self.until = now + Duration::from_millis(w.drain_ms);
+        self.end_seen = true;
+        true
+    }
+}
+
 async fn receive_stream(
     socket: &UdpSocket,
     id: &[u8; 16],
@@ -346,21 +390,11 @@ async fn receive_stream(
     state: &mut State,
 ) -> Result<f64> {
     let start = Instant::now();
-    let mut until = tokio::time::Instant::now()
-        + Duration::from_secs_f64(requested_span(w))
-        + Duration::from_millis(w.drain_ms);
+    let mut window = ReceiveWindow::new(w, state, tokio::time::Instant::now());
     let mut b = [0u8; MAX_PAYLOAD + 1];
-    let mut end_seen = false;
-    let mut highest_sequence = state
-        .samples
-        .iter()
-        .flatten()
-        .filter(|sample| sample.receive_unix_us.is_some())
-        .map(|sample| sample.seq)
-        .max();
     loop {
         tokio::select! {
-            _=tokio::time::sleep_until(until)=>break,
+            _=tokio::time::sleep_until(window.until)=>break,
             _=tokio::signal::ctrl_c()=>{state.interrupted=true;break;},
             r=socket.recv(&mut b)=>{
                 let n=r?;
@@ -369,17 +403,11 @@ async fn receive_stream(
                     Some((ACK,0,0)) if n==HEADER=>{state.control_received+=1;},
                     Some((END,count,span)) if n==HEADER && count==w.count && span>=0=>{
                         state.control_received+=1;
-                        if !end_seen {state.actual_span=Some(span as f64/1_000_000.);until=tokio::time::Instant::now()+Duration::from_millis(w.drain_ms);end_seen=true;}
+                        if window.end(w,tokio::time::Instant::now()) {state.actual_span=Some(span as f64/1_000_000.);}
                     },
                     _=>{
-                        if let Some(seq)=record(&b[..n],id,w,state,false)?
-                            && !end_seen && highest_sequence.is_none_or(|highest|seq>highest) {
-                            highest_sequence=Some(seq);
-                            // Follow actual unique sequence progress: OS timers or opaque forwarding
-                            // can pace below the requested rate. Duplicates/invalid/out-of-order data
-                            // never extend this window, and END fixes the final drain deadline.
-                            let remaining=f64::from(w.count-1-seq)/f64::from(w.pps);
-                            until=until.max(tokio::time::Instant::now()+Duration::from_secs_f64(remaining)+Duration::from_millis(w.drain_ms));
+                        if let Some(seq)=record(&b[..n],id,w,state,false)? {
+                            window.progress(seq,w,tokio::time::Instant::now());
                         }
                     }
                 }
@@ -742,6 +770,87 @@ pub async fn echo(listen: SocketAddr, ready_file: Option<PathBuf>) -> Result<()>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn receive_workload() -> Workload {
+        Workload {
+            count: 12,
+            size: 100,
+            pps: 200,
+            deadline_ms: 100,
+            drain_ms: 100,
+            startup_timeout_ms: 100,
+            run_id: None,
+            transport: Transport::RawUdp,
+            result_file: None,
+            samples_file: None,
+        }
+    }
+
+    #[test]
+    fn slow_sequence_progress_keeps_tail_open_without_end_marker() {
+        let w = receive_workload();
+        let state = State::new(w.count);
+        let start = tokio::time::Instant::now();
+        let mut window = ReceiveWindow::new(&w, &state, start);
+        let nominal_until = window.until;
+        for seq in 0..w.count {
+            // Explicit instants model 15 ms forwarding at a nominal 5 ms pace;
+            // no real timer/scheduler can turn this into a fixture timeout.
+            let now = start + Duration::from_millis(15 * u64::from(seq + 1));
+            assert!(now < window.until, "sequence {seq} expired");
+            window.progress(seq, &w, now);
+        }
+        let last_arrival = start + Duration::from_millis(180);
+        assert!(last_arrival > nominal_until);
+        assert_eq!(window.until, last_arrival + Duration::from_millis(100));
+        // With no END or further valid progress, expiry remains finite.
+        let final_until = window.until;
+        window.progress(11, &w, final_until - Duration::from_millis(1));
+        assert_eq!(window.until, final_until);
+    }
+
+    #[test]
+    fn invalid_duplicate_and_out_of_order_packets_do_not_renew_observation() {
+        let w = receive_workload();
+        let id = [1; 16];
+        let mut state = State::new(w.count);
+        // Registration can have accepted the first data before receive_stream.
+        let first = packet(DATA, &id, 2, 100, w.size);
+        assert_eq!(record(&first, &id, &w, &mut state, false).unwrap(), Some(2));
+        let start = tokio::time::Instant::now();
+        let mut window = ReceiveWindow::new(&w, &state, start);
+        assert_eq!(window.highest_sequence, Some(2));
+        let until = window.until;
+        let now = until - Duration::from_millis(1);
+        let mut invalid = packet(DATA, &id, 3, 100, w.size);
+        invalid[HEADER] ^= 1;
+        for data in [first, invalid, packet(DATA, &id, 1, 100, w.size)] {
+            if let Some(seq) = record(&data, &id, &w, &mut state, false).unwrap() {
+                window.progress(seq, &w, now);
+            }
+            assert_eq!(window.until, until);
+        }
+        assert_eq!(state.duplicate, 1);
+        assert_eq!(state.corrupt, 1);
+        window.progress(3, &w, now);
+        assert!(window.until > until);
+    }
+
+    #[test]
+    fn first_end_fixes_drain_despite_later_data_or_duplicate_end() {
+        let w = receive_workload();
+        let start = tokio::time::Instant::now();
+        let mut window = ReceiveWindow::new(&w, &State::new(w.count), start);
+        let ended = start + Duration::from_millis(30);
+        assert!(window.end(&w, ended));
+        let until = ended + Duration::from_millis(w.drain_ms);
+        assert_eq!(window.until, until);
+        let late = until - Duration::from_millis(1);
+        window.progress(11, &w, late);
+        assert!(!window.end(&w, late));
+        assert_eq!(window.until, until);
+    }
+
     #[test]
     fn missing_is_infinity_and_relative_delay_is_offset_invariant() {
         let samples = |offset: i64| {

@@ -233,7 +233,7 @@ fn reverse_stream_uses_the_registration_socket_mapping() {
             "--size",
             "100",
             "--drain-ms",
-            "100",
+            "1000",
         ],
         dir.path(),
         "reverse",
@@ -252,18 +252,22 @@ fn reverse_stream_uses_the_registration_socket_mapping() {
     let relay = thread::spawn(move || {
         let mut peer = None;
         let mut b = [0u8; 1001];
+        let mut forwarded = (0, 0);
         while !stopped.load(Ordering::Relaxed) {
             if let Ok((n, from)) = downstream.recv_from(&mut b) {
                 peer = Some(from);
                 upstream.send(&b[..n]).unwrap();
+                forwarded.0 += 1;
             }
             if let Ok(n) = upstream.recv(&mut b) {
                 downstream.send_to(&b[..n], peer.unwrap()).unwrap();
+                forwarded.1 += 1;
             }
-            // Model coarse host timers/forwarding below the nominal 200 pps. The
-            // receiver must observe all tails, not expire at the nominal send span.
-            thread::sleep(Duration::from_millis(15));
+            // Mapping is exercised over real UDP. Controlled-time unit tests
+            // independently cover slow progress without host scheduling assumptions.
+            thread::sleep(Duration::from_millis(1));
         }
+        forwarded
     });
     let (ok, receiver) = run(&[
         "probe",
@@ -280,15 +284,16 @@ fn reverse_stream_uses_the_registration_socket_mapping() {
         "--size",
         "100",
         "--drain-ms",
-        "100",
+        "1000",
     ]);
     stop.store(true, Ordering::Relaxed);
-    relay.join().unwrap();
-    assert!(ok, "{receiver}");
-    assert_eq!(receiver["received"], 12);
+    let forwarded = relay.join().unwrap();
+    let source = finish(&mut sink);
+    let diagnostic = format!("receiver={receiver}; source={source}; relay={forwarded:?}");
+    assert!(ok, "{diagnostic}");
+    assert_eq!(receiver["received"], 12, "{diagnostic}");
     assert_eq!(receiver["direction"], "server_to_client");
     assert_eq!(receiver["control_datagrams_sent"], 1);
-    let source = finish(&mut sink);
     assert_eq!(source["sent"], 12);
     assert_eq!(source["peer"], mapped_peer);
     assert!(source.get("loss_rate").is_none());
