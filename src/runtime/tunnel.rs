@@ -356,6 +356,8 @@ async fn sender(
                     delivered_bytes: estimate.received_bytes,
                     delivered_bps: estimate.delivered_bps,
                     feedback_sample_symbols: estimate.sample_symbols,
+                    finalized_expected: Some(estimate.expected),
+                    finalized_lost: Some(estimate.lost),
                     loss_sample_rate: (estimate.sample_symbols > 0)
                         .then_some(estimate.sample_loss_rate),
                     loss_rate: estimate.loss_rate,

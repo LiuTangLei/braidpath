@@ -1,5 +1,6 @@
 //! Bounded per-path admission control. Rates are operational budgets, not capacity claims.
 use serde::Serialize;
+use std::collections::VecDeque;
 
 const FRESH_US: u64 = 3_000_000;
 const CONTROL_US: u64 = 200_000;
@@ -8,6 +9,90 @@ const BRAKE_US: u64 = 100_000;
 const RETRY_GROWTH_US: u64 = 500_000;
 const START_BPS: u64 = 256_000;
 const MIN_BPS: u64 = 64_000;
+const LOSS_WINDOW_US: u64 = 4_000_000;
+const LOSS_BATCHES: usize = 8;
+
+#[derive(Default)]
+struct LossEvidence {
+    // Each entry is one observed, nonempty finalized prefix delta. Report
+    // arrival batches are not assumed to be independent statistical trials.
+    batches: VecDeque<(u64, u64, u64)>,
+    previous: Option<(u64, u64)>,
+}
+
+impl LossEvidence {
+    fn observe(&mut self, sample: &Observation, new_report: bool) -> Option<(u64, u64)> {
+        while self
+            .batches
+            .front()
+            .is_some_and(|(at, _, _)| sample.now_us.saturating_sub(*at) > LOSS_WINDOW_US)
+        {
+            self.batches.pop_front();
+        }
+        if !new_report {
+            return None;
+        }
+        let delta = match (sample.finalized_expected, sample.finalized_lost) {
+            (Some(expected), Some(lost)) => {
+                let (old_expected, old_lost) = self.previous.unwrap_or((0, 0));
+                if lost > expected || expected < old_expected || lost < old_lost {
+                    self.batches.clear();
+                    return None;
+                }
+                let delta = (expected - old_expected, lost - old_lost);
+                if delta.1 > delta.0 {
+                    self.batches.clear();
+                    return None;
+                }
+                // Invalid samples cannot replace the last good prefix and
+                // cause its already-counted cohorts to be counted again.
+                self.previous = Some((expected, lost));
+                delta
+            }
+            (None, None) => {
+                // Older callers/tests supply a paired finalized interval. The
+                // live runtime uses cumulative integers, including skipped reports.
+                let loss = sample.loss_sample_rate.filter(|v| v.is_finite())?;
+                let expected = sample.feedback_sample_symbols;
+                let lost = (loss.clamp(0.0, 1.0) * expected as f64).round() as u64;
+                (expected, lost)
+            }
+            _ => return None,
+        };
+        if delta.1 > delta.0 {
+            self.batches.clear();
+            return None;
+        }
+        if delta.0 == 0 {
+            return None;
+        }
+        if self.batches.len() == LOSS_BATCHES {
+            self.batches.pop_front();
+        }
+        self.batches.push_back((sample.now_us, delta.0, delta.1));
+        Some(delta)
+    }
+
+    fn counts(&self) -> (u128, u128) {
+        self.batches.iter().fold((0, 0), |(n, lost), (_, dn, dl)| {
+            (n + u128::from(*dn), lost + u128::from(*dl))
+        })
+    }
+
+    fn ordinary(&self) -> bool {
+        let (expected, lost) = self.counts();
+        self.batches.len() >= 2 && expected >= 64 && lost * 20 > expected
+    }
+
+    fn fraction(&self) -> f64 {
+        let (expected, lost) = self.counts();
+        if expected == 0 {
+            0.0
+        } else {
+            lost as f64 / expected as f64
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -27,6 +112,10 @@ pub struct Decision {
     pub queue_delay_ms: f64,
     pub probe_due: bool,
     pub observed_delivery_bps: Option<f64>,
+    pub loss_evidence_expected: u64,
+    pub loss_evidence_lost: u64,
+    pub loss_pressure: bool,
+    pub cautious: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -41,7 +130,11 @@ pub struct Observation {
     /// Receiver-local report interval; feedback arrival spacing can be compressed.
     pub delivered_bps: Option<f64>,
     pub feedback_sample_symbols: u64,
-    /// Diagnostic EWMA. Decisions use the newest finalized loss interval below.
+    /// Cumulative finalized sequence counts recover reports skipped between
+    /// controller observations. They are distinct from current delivery bytes.
+    pub finalized_expected: Option<u64>,
+    pub finalized_lost: Option<u64>,
+    /// Diagnostic EWMA. Control uses bounded finalized-count evidence below.
     pub loss_rate: f64,
     pub loss_sample_rate: Option<f64>,
     pub rtt_ms: f64,
@@ -95,6 +188,8 @@ pub struct PathController {
     /// application-limited sample never decreases this exploration reference.
     remembered_bps: f64,
     congestion_seen: bool,
+    loss_evidence: LossEvidence,
+    loss_pressure: bool,
     pressure_episode_exercised: Option<bool>,
     tokens: f64,
     token_us: u64,
@@ -139,6 +234,8 @@ impl PathController {
             drain_restore_pending: false,
             remembered_bps: 0.0,
             congestion_seen: false,
+            loss_evidence: LossEvidence::default(),
+            loss_pressure: false,
             pressure_episode_exercised: None,
             tokens: 2400.0,
             token_us: 0,
@@ -196,7 +293,7 @@ impl PathController {
         let new_report = feedback_fresh
             && self
                 .last_report
-                .is_none_or(|(number, _, _)| number != observation.report_number);
+                .is_none_or(|(number, _, _)| observation.report_number > number);
         if new_report {
             let explicit = observation
                 .delivered_bps
@@ -222,6 +319,8 @@ impl PathController {
             }
             self.last_report = Some((observation.report_number, observation.delivered_bytes, now));
         }
+        let loss_batch = self.loss_evidence.observe(observation, new_report);
+        let ordinary_loss = self.loss_evidence.ordinary();
 
         let local_rtt = (observation.rtt_ms.is_finite() && observation.rtt_ms > 0.0)
             .then_some(observation.rtt_ms);
@@ -281,7 +380,9 @@ impl PathController {
         } else {
             0.0
         };
-        let new_loss = new_report && observation.feedback_sample_symbols > 0 && loss > 0.05;
+        let fast_loss = loss_batch.is_some_and(|(expected, lost)| {
+            expected >= 8 && u128::from(lost) * 2 >= u128::from(expected)
+        });
         if new_report
             && observation.feedback_sample_symbols >= 8
             && loss >= 0.999
@@ -315,12 +416,34 @@ impl PathController {
             self.braked_queue_ms = None;
             false
         };
-        let pressure = delay_pressure || loss > 0.05 || blocked_pressure;
         let admission_span = now.saturating_sub(self.last_control_us);
         // Integrate the allowance at the rates that actually applied. Comparing
         // old admissions with a later reduced rate can manufacture utilization.
         let exercised =
             self.allowance_bytes > 0.0 && self.admitted_bytes as f64 >= self.allowance_bytes * 0.9;
+        let allowance_rate = if admission_span == 0 {
+            0.0
+        } else {
+            self.allowance_bytes * 8_000_000.0 / admission_span as f64
+        };
+        // Finalized loss can describe an older packet cohort. Corroborate it
+        // independently with current service under an exercised, settled pace;
+        // do not interpret a delayed warmup loss as today's capacity ceiling.
+        let service_shortfall = feedback_fresh
+            && exercised
+            && allowance_rate > 0.0
+            && wire_delivery_bps.is_some_and(|rate| rate < allowance_rate * 0.85);
+        let last_change = self.last_growth_us.max(self.last_brake_us.unwrap_or(0));
+        let settled_shortfall =
+            service_shortfall && now.saturating_sub(last_change) >= PROBE_US + BRAKE_US;
+        self.loss_pressure = ordinary_loss && settled_shortfall;
+        let new_loss = fast_loss || (loss_batch.is_some() && self.loss_pressure);
+        let loss_for_brake = if fast_loss {
+            loss_batch.map_or(0.0, |(n, lost)| lost as f64 / n as f64)
+        } else {
+            self.loss_evidence.fraction()
+        };
+        let pressure = delay_pressure || self.loss_pressure || fast_loss || blocked_pressure;
         if pressure {
             self.pressure_episode_exercised.get_or_insert(exercised);
         } else if new_report && observation.feedback_sample_symbols > 0 {
@@ -417,7 +540,8 @@ impl PathController {
                 desired = desired.min(self.rate_bps as f64 * 0.75);
             }
             if new_loss {
-                desired = desired.min(self.rate_bps as f64 * (1.0 - loss * 0.5).clamp(0.5, 0.95));
+                desired = desired
+                    .min(self.rate_bps as f64 * (1.0 - loss_for_brake * 0.5).clamp(0.5, 0.95));
             }
             let floor = MIN_BPS.min(self.maximum_bps) as f64;
             let reduced = desired.max(floor).min(self.rate_bps as f64) as u64;
@@ -425,7 +549,12 @@ impl PathController {
                 // Safety always brakes. Persistent caution requires exercise
                 // captured before this episode's first reduction, not use of a
                 // later, smaller allowance while the old evidence drains.
-                self.congestion_seen |= self.pressure_episode_exercised == Some(true);
+                let capacity_evidence = new_delay
+                    || delivery_shortfall
+                    || (blocked_pressure && new_report)
+                    || (new_loss && settled_shortfall);
+                self.congestion_seen |=
+                    self.pressure_episode_exercised == Some(true) && capacity_evidence;
                 if new_delay {
                     self.braked_queue_ms = Some(self.queue_delay_ms);
                     self.drain_restore_pending = true;
@@ -438,7 +567,6 @@ impl PathController {
 
         let elapsed = now.saturating_sub(self.last_control_us);
         if elapsed >= CONTROL_US {
-            let admitted_rate = self.admitted_bytes as f64 * 8_000_000.0 / elapsed as f64;
             if fresh && self.eligible && !pressure && self.drain_restore_pending {
                 // RTT observations are more frequent than control ticks. Keep
                 // the drainage transition pending so an intervening clear RTT
@@ -455,12 +583,17 @@ impl PathController {
             if fresh
                 && self.eligible
                 && !pressure
+                // Credible loss with underdelivery must get a settled service
+                // observation before recovery explores further. The retained
+                // capacity shortcut otherwise bypasses receiver-keeps-up and
+                // can restart growth faster than loss can be corroborated.
+                && !(ordinary_loss && service_shortfall)
                 && observation.offered_backlog
                 && exercised
                 && now >= self.growth_not_before_us
             {
                 let receiver_keeps_up =
-                    wire_delivery_bps.is_some_and(|rate| rate >= admitted_rate * 0.85);
+                    wire_delivery_bps.is_some_and(|rate| rate >= allowance_rate * 0.85);
                 let (interval, gain, ceiling) = if !self.congestion_seen {
                     // The initial search is fast only when actual admissions and
                     // receiver delivery support it, not at 60% use of an unused budget.
@@ -514,6 +647,10 @@ impl PathController {
                 .last_probe_us
                 .is_none_or(|time| now_us.saturating_sub(time) >= PROBE_US),
             observed_delivery_bps: self.delivery_bps,
+            loss_evidence_expected: self.loss_evidence.counts().0.min(u128::from(u64::MAX)) as u64,
+            loss_evidence_lost: self.loss_evidence.counts().1.min(u128::from(u64::MAX)) as u64,
+            loss_pressure: self.loss_pressure,
+            cautious: self.congestion_seen,
         }
     }
 
@@ -591,6 +728,347 @@ mod tests {
             }
         }
         admitted
+    }
+
+    fn finalized(now: u64, number: u64, expected: u64, lost: u64) -> Observation {
+        Observation {
+            report_number: number,
+            finalized_expected: Some(expected),
+            finalized_lost: Some(lost),
+            ..observation(now, 80.0)
+        }
+    }
+
+    #[test]
+    fn finalized_loss_counts_are_exact_bounded_and_not_report_gap_multiples() {
+        let mut evidence = LossEvidence::default();
+        assert_eq!(
+            evidence.observe(&finalized(0, 1, 40, 2), true),
+            Some((40, 2))
+        );
+        assert_eq!(evidence.observe(&finalized(100_000, 1, 40, 2), false), None);
+        // A skipped cumulative prefix supplies one real delta, not five batches.
+        assert_eq!(
+            evidence.observe(&finalized(500_000, 6, 80, 4), true),
+            Some((40, 2))
+        );
+        assert_eq!(evidence.counts(), (80, 4));
+        assert_eq!(evidence.batches.len(), 2);
+        assert!(!evidence.ordinary(), "exactly 1/20 is not greater than 5%");
+        let mut empty = finalized(1_000_000, 7, 80, 4);
+        empty.feedback_sample_symbols = 0;
+        empty.loss_sample_rate = Some(1.0);
+        assert_eq!(evidence.observe(&empty, true), None);
+        assert_eq!(evidence.counts(), (80, 4));
+        empty.now_us = LOSS_WINDOW_US + 500_001;
+        assert_eq!(evidence.observe(&empty, false), None);
+        assert_eq!(evidence.counts(), (0, 0));
+        for n in 0..20 {
+            evidence.observe(&finalized(5_000_000 + n, n, 100 + n * 10, 5 + n), true);
+        }
+        assert_eq!(evidence.batches.len(), LOSS_BATCHES);
+        assert_eq!(evidence.counts(), (80, 8));
+        assert!(evidence.ordinary());
+    }
+
+    #[test]
+    fn invalid_finalized_prefix_preserves_the_last_good_counting_baseline() {
+        for invalid in [(90, 9), (110, 111), (101, 12)] {
+            let mut evidence = LossEvidence::default();
+            evidence.observe(&finalized(0, 1, 100, 10), true);
+            assert_eq!(
+                evidence.observe(&finalized(500_000, 2, invalid.0, invalid.1), true),
+                None
+            );
+            assert_eq!(evidence.previous, Some((100, 10)));
+            assert_eq!(
+                evidence.observe(&finalized(1_000_000, 3, 110, 11), true),
+                Some((10, 1))
+            );
+            assert_eq!(evidence.counts(), (10, 1));
+        }
+    }
+
+    #[test]
+    fn controller_ignores_reordered_reports_and_resets_loss_evidence_with_generation() {
+        let mut controller = PathController::new(3_000_000, 20);
+        controller.observe(&finalized(0, 3, 100, 10));
+        controller.observe(&finalized(500_000, 2, 200, 50));
+        assert_eq!(controller.loss_evidence.counts(), (100, 10));
+        controller.observe(&finalized(1_000_000, 4, 120, 12));
+        assert_eq!(controller.loss_evidence.counts(), (120, 12));
+        let mut fresh_generation = finalized(1_500_000, 1, 8, 0);
+        fresh_generation.generation += 1;
+        controller.observe(&fresh_generation);
+        assert_eq!(controller.loss_evidence.counts(), (8, 0));
+        assert!(!controller.congestion_seen);
+    }
+
+    #[test]
+    fn datagram_burst_does_not_manufacture_current_service_shortfall() {
+        let mut controller = PathController::new(3_000_000, 20);
+        controller.observe(&finalized(0, 1, 0, 0));
+        controller.rate_bps = 150_000;
+        let mut sample = finalized(600_000, 2, 40, 4);
+        sample.delivered_bps = Some(145_000.0);
+        controller.observe(&sample);
+        for now in [600_000, 800_000] {
+            for _ in 0..2 {
+                assert!(controller.allow(now, 1138, 0.0));
+                controller.admitted(now, 1138);
+            }
+            if now == 600_000 {
+                sample = finalized(700_000, 3, 80, 8);
+                sample.delivered_bps = Some(145_000.0);
+                controller.observe(&sample);
+                // 2276 bytes / 100 ms = 182080 bps, but the exercised
+                // allowance is 150000 bps and delivered service is 145000.
+                assert!(!controller.loss_pressure);
+                assert_eq!(controller.rate_bps, 150_000);
+            }
+        }
+        sample = finalized(800_000, 4, 120, 12);
+        sample.delivered_bps = Some(145_000.0);
+        controller.observe(&sample);
+        assert!(!controller.loss_pressure);
+        assert!(!controller.congestion_seen);
+        assert_eq!(controller.rate_bps, 225_000);
+    }
+
+    #[test]
+    fn newest_severe_loss_brakes_even_after_a_large_clean_finalized_prefix() {
+        let mut controller = PathController::new(3_000_000, 20);
+        controller.observe(&finalized(0, 1, 10_000, 0));
+        exercise_budget(&mut controller, 0, 500_000);
+        let mut sample = finalized(500_000, 2, 10_008, 8);
+        sample.feedback_sample_symbols = 8;
+        sample.loss_sample_rate = Some(1.0);
+        sample.delivered_bps = Some(256_000.0);
+        controller.observe(&sample);
+        assert_eq!(controller.rate_bps, START_BPS / 2);
+        assert!(
+            !controller.congestion_seen,
+            "old finalized loss alone is not a current capacity limit"
+        );
+        assert!(
+            controller.eligible,
+            "a fresh positive probe keeps reachability independent"
+        );
+    }
+
+    #[test]
+    fn delayed_candidate005_small_loss_cohorts_do_not_set_a_healthy_startup_ceiling() {
+        let mut controller = PathController::new(3_000_000, 20);
+        controller.observe(&finalized(0, 1, 0, 0));
+        let cohorts = [(18, 1), (14, 1), (23, 2), (19, 3), (20, 1), (17, 3)];
+        let (mut expected, mut lost) = (0, 0);
+        for n in 0..20 {
+            let start = n * 500_000;
+            let bytes = exercise_budget(&mut controller, start, 500_000);
+            let (dn, dl) = cohorts[n as usize % cohorts.len()];
+            expected += dn;
+            lost += dl;
+            let mut sample = finalized(start + 500_000, n + 2, expected, lost);
+            sample.feedback_sample_symbols = dn;
+            sample.loss_sample_rate = Some(dl as f64 / dn as f64);
+            // This is a finalized-cohort replay with independent healthy current
+            // delivery, not a replay of every WAN timing/queue observation.
+            sample.delivered_bps = Some(bytes as f64 * 16.0 * 0.95);
+            controller.observe(&sample);
+            assert!(!controller.congestion_seen);
+            assert!(!controller.loss_pressure);
+        }
+        assert_eq!(controller.rate_bps, 3_000_000);
+    }
+
+    /// A separate no-queue packet model: real admission/token accounting,
+    /// deterministic load-independent erasure, and an optional flat-RTT policer.
+    /// Delivery intervals and delayed finalized loss counts remain distinct.
+    struct FlatLane {
+        controller: PathController,
+        report: Option<SimReport>,
+        reports: VecDeque<SimReport>,
+        pending_loss: (u64, u64),
+        expected: u64,
+        lost: u64,
+        interval_sent: u64,
+        interval_lost: u64,
+        interval_received: u64,
+        sent_bytes: u64,
+        received_bytes: u64,
+        tokens: f64,
+        erasure_credit: u64,
+        positive_at: Option<u64>,
+        rtt_us: u64,
+        compressed: bool,
+    }
+
+    impl FlatLane {
+        fn new(rtt_us: u64, compressed: bool) -> Self {
+            Self {
+                controller: PathController::new(3_000_000, 20),
+                report: None,
+                reports: VecDeque::new(),
+                pending_loss: (0, 0),
+                expected: 0,
+                lost: 0,
+                interval_sent: 0,
+                interval_lost: 0,
+                interval_received: 0,
+                sent_bytes: 0,
+                received_bytes: 0,
+                tokens: 2400.0,
+                erasure_credit: 0,
+                positive_at: None,
+                rtt_us,
+                compressed,
+            }
+        }
+
+        fn tick(&mut self, now: u64, capacity: u64, erasure_per_thousand: u64) {
+            while self.reports.front().is_some_and(|r| r.due <= now) {
+                let report = self.reports.pop_front().unwrap();
+                if self.report.is_none_or(|old| report.number > old.number) {
+                    if report.bytes > self.report.map_or(0, |old| old.bytes) {
+                        self.positive_at = Some(now);
+                    }
+                    self.report = Some(report);
+                }
+            }
+            if now.is_multiple_of(100_000) {
+                self.controller.observe(&Observation {
+                    now_us: now,
+                    generation: 7,
+                    report_number: self.report.map_or(0, |r| r.number),
+                    feedback_age_us: self.report.map(|r| now.saturating_sub(r.due)),
+                    positive_delivery_age_us: self.positive_at.map(|at| now - at),
+                    delivered_bytes: self.report.map_or(0, |r| r.bytes),
+                    delivered_bps: self.report.map(|r| r.rate),
+                    feedback_sample_symbols: self.report.map_or(0, |r| r.symbols),
+                    loss_sample_rate: self.report.map(|r| r.loss),
+                    finalized_expected: self.report.map(|r| r.expected),
+                    finalized_lost: self.report.map(|r| r.lost),
+                    rtt_ms: self.rtt_us as f64 / 1000.0,
+                    probe_latest_rtt_ms: Some(self.rtt_us as f64 / 1000.0),
+                    probe_sample_id: now / PROBE_US + 1,
+                    probe_age_us: Some(now % PROBE_US),
+                    offered_backlog: true,
+                    ..Default::default()
+                });
+                assert!(self.controller.decision(now).eligible);
+            }
+            self.tokens = (self.tokens + capacity as f64 / 8000.0).min(2400.0);
+            while self.controller.allow(now, 1000, 0.0) {
+                self.controller.admitted(now, 1000);
+                self.sent_bytes += 1000;
+                self.interval_sent += 1;
+                let policed = self.tokens < 1000.0;
+                if !policed {
+                    self.tokens -= 1000.0;
+                }
+                self.erasure_credit += erasure_per_thousand;
+                let erased = self.erasure_credit >= 1000;
+                if erased {
+                    self.erasure_credit -= 1000;
+                }
+                if policed || erased {
+                    self.interval_lost += 1;
+                } else {
+                    self.received_bytes += 1000;
+                    self.interval_received += 1;
+                }
+            }
+            if now > 0 && now.is_multiple_of(PROBE_US) {
+                let number = now / PROBE_US;
+                let (n, lost) = self.pending_loss;
+                self.expected += n;
+                self.lost += lost;
+                let extra = if self.compressed && number % 6 == 5 {
+                    PROBE_US
+                } else {
+                    0
+                };
+                self.reports.push_back(SimReport {
+                    number,
+                    due: now + self.rtt_us + extra,
+                    bytes: self.received_bytes,
+                    rate: self.interval_received as f64 * 16_000.0,
+                    symbols: n,
+                    loss: if n == 0 { 0.0 } else { lost as f64 / n as f64 },
+                    expected: self.expected,
+                    lost: self.lost,
+                });
+                self.pending_loss = (self.interval_sent, self.interval_lost);
+                self.interval_sent = 0;
+                self.interval_lost = 0;
+                self.interval_received = 0;
+            }
+        }
+    }
+
+    #[test]
+    fn independent_erasure_does_not_disable_cold_discovery_with_delayed_reports() {
+        for (erasure, rtt_us, compressed) in [(60, 80_000, false), (100, 300_000, true)] {
+            let mut lane = FlatLane::new(rtt_us, compressed);
+            let mut discovered = None;
+            let mut tail_bytes = 0;
+            for now in (0..60_000_000).step_by(1000) {
+                let before = lane.received_bytes;
+                lane.tick(now, 3_000_000, erasure);
+                if lane.controller.rate_bps >= 2_700_000 {
+                    discovered.get_or_insert(now);
+                }
+                if now >= 50_000_000 {
+                    tail_bytes += lane.received_bytes - before;
+                }
+            }
+            let tail_bps = tail_bytes as f64 * 0.8;
+            eprintln!(
+                "flat erasure={erasure}/1000 rtt_us={rtt_us} compressed={compressed}: discovery={discovered:?}; final={} cautious={} tail_bps={tail_bps}",
+                lane.controller.rate_bps, lane.controller.congestion_seen
+            );
+            assert!(discovered.is_some_and(|at| at <= 12_000_000));
+            assert!(!lane.controller.congestion_seen);
+            assert!(tail_bps >= 3_000_000.0 * (1.0 - erasure as f64 / 1000.0) * 0.90);
+        }
+    }
+
+    #[test]
+    fn flat_rtt_policer_bounds_cold_and_retained_capacity_exploration() {
+        for retained in [false, true] {
+            let mut lane = FlatLane::new(300_000, true);
+            lane.tick(0, 3_000_000, 0);
+            if retained {
+                lane.controller.rate_bps = 3_000_000;
+                lane.controller.remembered_bps = 3_000_000.0;
+                lane.controller.congestion_seen = true;
+            }
+            let (mut tail_sent, mut tail_received, mut tail_max) = (0, 0, 0);
+            for now in (1000..40_000_000).step_by(1000) {
+                let before = (lane.sent_bytes, lane.received_bytes);
+                lane.tick(now, 700_000, 0);
+                if now >= 30_000_000 {
+                    tail_sent += lane.sent_bytes - before.0;
+                    tail_received += lane.received_bytes - before.1;
+                    tail_max = tail_max.max(lane.controller.rate_bps);
+                }
+            }
+            let (sent, received) = (tail_sent as f64 * 0.8, tail_received as f64 * 0.8);
+            eprintln!(
+                "flat policer retained={retained}: sent={sent} received={received} tail_max={tail_max} final={} cautious={}",
+                lane.controller.rate_bps, lane.controller.congestion_seen
+            );
+            assert!(lane.controller.congestion_seen);
+            assert!(
+                sent <= 700_000.0 * 1.5,
+                "persistent oversupply under flat RTT"
+            );
+            assert!(
+                tail_max <= 700_000 * 2,
+                "recovery must not blindly refill the old capacity"
+            );
+            assert!(received >= 700_000.0 * 0.75);
+        }
     }
 
     #[test]
@@ -1198,17 +1676,27 @@ mod tests {
         controller.observe(&loss);
         assert_eq!(controller.queue_delay_ms, 0.0);
         assert_eq!(controller.pressure_episode_exercised, Some(true));
-        assert!(controller.congestion_seen);
+        // The first severe interval still brakes immediately, but can describe
+        // delayed warmup loss. It does not prove a settled current capacity.
+        assert!(!controller.congestion_seen);
         let reduced = controller.rate_bps;
         assert!(reduced < 1_000_000);
+        exercise_budget(&mut controller, 500_000, 700_000);
+        let mut persistent = observation(1_200_000, 20.0);
+        persistent.delivered_bps = Some(250_000.0);
+        persistent.feedback_sample_symbols = 64;
+        persistent.loss_sample_rate = Some(0.25);
+        controller.observe(&persistent);
+        assert!(controller.congestion_seen);
+        assert!(controller.rate_bps < reduced);
         for n in 0..5 {
-            let start = 500_000 + n * CONTROL_US;
+            let start = 1_200_000 + n * CONTROL_US;
             let bytes = exercise_budget(&mut controller, start, CONTROL_US);
             let mut clear = observation(start + CONTROL_US, 20.0);
             clear.delivered_bps = Some(bytes as f64 * 8_000_000.0 / CONTROL_US as f64);
             controller.observe(&clear);
         }
-        assert!(controller.rate_bps <= (reduced as f64 * 1.1) as u64);
+        assert!(controller.rate_bps <= 550_000);
         assert!(controller.congestion_seen);
     }
 
@@ -1220,6 +1708,8 @@ mod tests {
         due: u64,
         symbols: u64,
         loss: f64,
+        expected: u64,
+        lost: u64,
     }
 
     struct SimPacket {
@@ -1245,7 +1735,9 @@ mod tests {
         report: Option<SimReport>,
         last_positive_delivery_at: Option<u64>,
         reports: VecDeque<SimReport>,
-        pending_loss: f64,
+        pending_loss: (u64, u64),
+        finalized_expected: u64,
+        finalized_lost: u64,
         interval_received: u64,
         interval_lost: u64,
         dropped: u64,
@@ -1277,7 +1769,9 @@ mod tests {
                 report: None,
                 last_positive_delivery_at: None,
                 reports: VecDeque::new(),
-                pending_loss: 0.0,
+                pending_loss: (0, 0),
+                finalized_expected: 0,
+                finalized_lost: 0,
                 interval_received: 0,
                 interval_lost: 0,
                 dropped: 0,
@@ -1370,6 +1864,8 @@ mod tests {
                         .map(|at| now.saturating_sub(at)),
                     feedback_sample_symbols: self.report.map_or(0, |v| v.symbols),
                     loss_sample_rate: self.report.map(|v| v.loss),
+                    finalized_expected: self.report.map(|v| v.expected),
+                    finalized_lost: self.report.map(|v| v.lost),
                     rtt_ms: self.quinn_rtt_ms,
                     probe_latest_rtt_ms: self.probe.map(|v| v.1),
                     probe_rtt_ms: self.probe.map(|v| v.1),
@@ -1429,20 +1925,26 @@ mod tests {
                 let rate = (self.delivered_symbol_bytes - self.report_bytes) as f64 * 16.0;
                 self.report_bytes = self.delivered_symbol_bytes;
                 let symbols = self.interval_received + self.interval_lost;
+                let (finalized_symbols, finalized_lost) = self.pending_loss;
+                self.finalized_expected += finalized_symbols;
+                self.finalized_lost += finalized_lost;
                 self.reports.push_back(SimReport {
                     due: now + (rtt * 1000.0) as u64,
                     number: self.report_number,
                     bytes: self.delivered_symbol_bytes,
                     rate,
-                    symbols,
-                    // Tail loss needs a further feedback interval to finalize.
-                    loss: self.pending_loss,
+                    symbols: finalized_symbols,
+                    // Tail loss needs a further feedback interval to finalize;
+                    // its numerator and denominator must travel together.
+                    loss: if finalized_symbols == 0 {
+                        0.0
+                    } else {
+                        finalized_lost as f64 / finalized_symbols as f64
+                    },
+                    expected: self.finalized_expected,
+                    lost: self.finalized_lost,
                 });
-                self.pending_loss = if symbols == 0 {
-                    0.0
-                } else {
-                    self.interval_lost as f64 / symbols as f64
-                };
+                self.pending_loss = (symbols, self.interval_lost);
                 self.interval_received = 0;
                 self.interval_lost = 0;
             }
@@ -1450,6 +1952,7 @@ mod tests {
     }
 
     fn capacity_step(bounded: bool) -> ([f64; 3], [u64; 2]) {
+        let trace = std::env::var_os("BRAIDPATH_TRACE_ADAPTIVE").is_some();
         let mut lanes = [Lane::new(bounded), Lane::new(bounded)];
         let mut phase_bytes = [0u64; 3];
         let mut maximum_queue_ms: f64 = 0.0;
@@ -1462,7 +1965,24 @@ mod tests {
                     3_000_000.0
                 };
                 let before = lane.delivered_app_bytes;
+                let before_rate = lane.controller.rate_bps;
+                let before_use = lane.controller.admitted_bytes;
+                let before_allowance = lane.controller.allowance_bytes;
                 lane.tick(now, capacity);
+                if trace && bounded && id == 0 && now >= 26_000_000 && now.is_multiple_of(100_000) {
+                    eprintln!(
+                        "fifo t={now} rate={before_rate}->{} used={before_use}/{before_allowance:.0} delivery={:?} q={:.2} loss={:?} loss_pressure={} evidence={:?} last_growth={} last_brake={:?} report={:?}",
+                        lane.controller.rate_bps,
+                        lane.controller.latest_delivery_bps,
+                        lane.controller.queue_delay_ms,
+                        lane.report.map(|r| (r.symbols, r.loss)),
+                        lane.controller.loss_pressure,
+                        lane.controller.loss_evidence.counts(),
+                        lane.controller.last_growth_us,
+                        lane.controller.last_brake_us,
+                        lane.report.map(|r| r.number)
+                    );
+                }
                 if now >= 4_000_000 {
                     let phase = ((now - 4_000_000) / 12_000_000) as usize;
                     phase_bytes[phase] += lane.delivered_app_bytes - before;
