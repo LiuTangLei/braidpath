@@ -21,6 +21,12 @@ Schema version 1 contains `role`, `process_id`, a random process-stable `instanc
 
 ## Connection and admission diagnostics
 
+Each path records the current `peer_socket`. Clients additionally record
+`local_socket`, including the actual bound UDP port. A wildcard bind does not
+identify the egress IP; confirm that independently when needed. On the server,
+the peer socket exposes a relay's upstream mapping rather than the original
+client socket. Retain both endpoints when comparing repeated five-tuples.
+
 `stats.connection_events` retains the latest 128 events in chronological order. `omitted_connection_events` counts evicted events; `bounds.connection_events` declares the limit. A local `connection_id` correlates stages within a process. Events contain `remote`, optional `path_id`, `phase`, `stage`, `outcome`, a controlled `error` reason code, and monotonic milliseconds: `elapsed_ms` for the current stage, `total_elapsed_ms` for the connection, and `process_elapsed_ms` for the event's position in the run. They contain no authorization headers, bearer tokens, session IDs or arbitrary peer close text. Events trigger JSONL output; retained histories appear again in subsequent cumulative snapshots, so do not count the same event twice.
 
 Server stages identify `incoming` QUIC negotiation (5 seconds), `http3_setup` (no new timeout), `request_resolve` (5 seconds), `peer_settings` (5 seconds), and `admission_wait` (the existing 60-second admission deadline). Client stages identify `quic_connect`, datagram-capacity checking, HTTP/3 setup, peer SETTINGS and authenticated admission, all inside the unchanged 8-second whole-path limit. `timeout_ms` and `timeout_scope` distinguish a stage timeout from the whole-path/admission budget; a null timeout means no additional stage timer. Human diagnostics include remote/path, phase/stage and elapsed times. These fields locate the failed operation; they do not prove a firewall, relay, host or network cause.

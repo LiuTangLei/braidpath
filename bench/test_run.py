@@ -57,6 +57,15 @@ class ScheduleTests(unittest.TestCase):
         self.assertEqual(sum(p for p, _ in split_load(25, 15, 4)), 25)
         self.assertEqual(sum(c for _, c in split_load(25, 15, 4)), 375)
 
+    def test_source_port_pools_are_topology_only_and_bounded(self):
+        topology, matrix = configuration()
+        topology["path_bind_ports"] = {"direct": [40000, 40001]}
+        validate(topology, matrix)
+        for ports in [[], [40000,40000], [0], [65536]]:
+            topology["path_bind_ports"]["direct"] = ports
+            with self.assertRaises(ValueError):
+                validate(topology, matrix)
+
     def test_validation_rejects_multiflow_direction_and_matrix_addresses(self):
         topology, matrix = configuration()
         validate(topology, matrix)
@@ -339,6 +348,19 @@ class LifecycleTests(unittest.TestCase):
                 self.assertEqual("--congestion" in job.argv, name == "cubic")
                 if name == "cubic":
                     self.assertEqual(job.argv[job.argv.index("--congestion") + 1], "cubic")
+
+    def test_paired_profiles_reuse_the_group_source_port(self):
+        self.runner.directory = Path(self.temp.name)
+        self.runner.attempt_id = "fixture-bound"
+        self.runner.record = {"group": 1}
+        self.topology["path_bind_ports"] = {"direct": [40000,40001]}
+        from types import SimpleNamespace
+        for profile in self.matrix["profiles"].values():
+            self.runner.jobs = []
+            with patch.object(self.runner, "runtime_ready", return_value=SimpleNamespace(session_id="fixture-session")):
+                self.runner.prepare_runtime(self.matrix["cases"][0], profile)
+            client = next(j for j in self.runner.jobs if j.role == "client")
+            self.assertEqual(client.argv[client.argv.index("--path-bind")+1], "0.0.0.0:40001")
 
     def test_immediate_child_exit_still_records_launch_and_exit(self):
         child = unittest.mock.Mock(pid=123)

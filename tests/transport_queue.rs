@@ -23,8 +23,18 @@ async fn bounded_transport_queue_preserves_maximum_plain_and_repair_frames() {
         )
         .unwrap();
         let address = server.local_addr().unwrap();
-        let client =
-            transport::client(address, &identity.join("cert.pem"), None, congestion).unwrap();
+        let bound = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let bind = bound.local_addr().unwrap();
+        drop(bound);
+        let client = transport::client_bound(
+            address,
+            &identity.join("cert.pem"),
+            None,
+            congestion,
+            Some(bind),
+        )
+        .unwrap();
+        assert_eq!(client.local_addr().unwrap(), bind);
         let (outgoing, incoming) = timeout(Duration::from_secs(3), async {
             tokio::join!(client.connect(address, "localhost").unwrap(), async {
                 server.accept().await.unwrap().await
@@ -34,6 +44,7 @@ async fn bounded_transport_queue_preserves_maximum_plain_and_repair_frames() {
         .unwrap();
         let outgoing = outgoing.unwrap();
         let incoming = incoming.unwrap();
+        assert_eq!(incoming.remote_address(), bind);
         let original = Record {
             flow: 1,
             id: 0,

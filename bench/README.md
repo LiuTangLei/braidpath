@@ -34,6 +34,16 @@ errors; there is no automatic route change.
 
 ## Private topology schema
 
+`sticky_worker.py` is a finite raw-UDP diagnostic endpoint for a private
+coordinator. It uses eight fixed client sockets, 375 records per flow at 25 pps,
+and 1,000-byte DATA with 49-byte same-socket receipts. Receiver counts measure
+directional delivery; source monotonic receipts measure RTT. The coordinator
+must preserve or verify both relay legs' tuples, register finite rounds and
+timing before sending, retain management failures, and stop all owned units.
+Small ten-second keepalives preserve idle mappings and are separate from DATA.
+Keep its bearer configuration, commands, samples and result tables private.
+`python3 -m unittest bench.test_sticky` checks framing and missing RTT semantics.
+
 The following field descriptions are intentionally address-free. All command
 fields contain argv lists, not shell strings.
 
@@ -41,6 +51,10 @@ fields contain argv lists, not shell strings.
   `workdir`; optional `ssh_options` argv (for an explicit jump host), optional
   client `interface` (one interface; omission uses the default route).
 - `client_host`, `server_host`: names in `hosts`.
+- Optional `path_bind_ports`: path-name map of unique source-port pools. The
+  runner uses `group % pool_length` for each path, keeping the same client port
+  across profiles in a paired group. Supply all paths used by the comparison.
+  Actual client sockets and server-observed relay peers remain in `path_tuples`.
 - `tls`: `server_name`, client `ca`, server `cert`/`key`, and `token_file`.
   Optional `client_token_file`/`server_token_file` override the common path.
   The runner references existing files and never reads or copies their secrets.

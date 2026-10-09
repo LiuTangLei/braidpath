@@ -77,6 +77,16 @@ pub fn client(
     interface: Option<&str>,
     congestion: Congestion,
 ) -> Result<Endpoint> {
+    client_bound(remote, ca, interface, congestion, None)
+}
+
+pub fn client_bound(
+    remote: SocketAddr,
+    ca: &Path,
+    interface: Option<&str>,
+    congestion: Congestion,
+    bind: Option<SocketAddr>,
+) -> Result<Endpoint> {
     let mut roots = rustls::RootCertStore::empty();
     for cert in certificates(ca)? {
         roots.add(cert)?;
@@ -104,12 +114,18 @@ pub fn client(
         #[cfg(not(target_os = "linux"))]
         anyhow::bail!("explicit interface binding is currently supported only on Linux: {name}");
     }
-    let bind: SocketAddr = if remote.is_ipv4() {
-        "0.0.0.0:0"
-    } else {
-        "[::]:0"
-    }
-    .parse()?;
+    let bind: SocketAddr = bind.unwrap_or(
+        if remote.is_ipv4() {
+            "0.0.0.0:0"
+        } else {
+            "[::]:0"
+        }
+        .parse()?,
+    );
+    ensure!(
+        bind.is_ipv4() == remote.is_ipv4(),
+        "path bind address family differs from entrance"
+    );
     s.bind(&bind.into())?;
     s.set_nonblocking(true)?;
     let mut endpoint = Endpoint::new(

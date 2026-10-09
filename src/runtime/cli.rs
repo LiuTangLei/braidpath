@@ -52,6 +52,9 @@ enum Command {
         entrances: Vec<SocketAddr>,
         #[arg(long = "interface")]
         interfaces: Vec<String>,
+        /// One explicit local UDP bind per interface–entrance pair, in path order.
+        #[arg(long = "path-bind")]
+        path_binds: Vec<SocketAddr>,
         #[arg(long)]
         server_name: String,
         #[arg(long)]
@@ -154,6 +157,7 @@ pub async fn run() -> Result<()> {
             listen,
             entrances,
             interfaces,
+            path_binds,
             server_name,
             ca,
             token_file,
@@ -167,6 +171,7 @@ pub async fn run() -> Result<()> {
                 listen,
                 entrances,
                 interfaces,
+                path_binds,
                 name: server_name,
                 ca,
                 token: token_file,

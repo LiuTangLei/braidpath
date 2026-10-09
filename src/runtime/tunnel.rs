@@ -702,6 +702,7 @@ pub struct ClientOptions {
     pub listen: SocketAddr,
     pub entrances: Vec<SocketAddr>,
     pub interfaces: Vec<String>,
+    pub path_binds: Vec<SocketAddr>,
     pub name: String,
     pub ca: std::path::PathBuf,
     pub token: std::path::PathBuf,
@@ -717,6 +718,12 @@ pub async fn client(options: ClientOptions) -> Result<()> {
         "need 1..8 interface/entrance pairs"
     );
     let token = transport::token(&options.token)?;
+    ensure!(
+        options.path_binds.is_empty()
+            || options.path_binds.len()
+                == options.entrances.len() * options.interfaces.len().max(1),
+        "path binds must match interface–entrance pair count"
+    );
     let sid = transport::hex(&rand::random::<[u8; 16]>());
     let paths: Paths = Arc::new(Mutex::new(Vec::new()));
     let forward = options.stats.scope(&sid, stats::FORWARD);
@@ -737,8 +744,13 @@ pub async fn client(options: ClientOptions) -> Result<()> {
     for interface in interfaces {
         for entrance in &options.entrances {
             let pid = endpoints.len() as u8;
-            let endpoint =
-                transport::client(*entrance, &options.ca, interface, options.congestion)?;
+            let endpoint = transport::client_bound(
+                *entrance,
+                &options.ca,
+                interface,
+                options.congestion,
+                options.path_binds.get(usize::from(pid)).copied(),
+            )?;
             endpoints.push(endpoint.clone());
             let mut diagnostic = stats::ConnectionTrace::new(
                 options.stats.clone(),
@@ -765,6 +777,9 @@ pub async fn client(options: ClientOptions) -> Result<()> {
                     options
                         .stats
                         .register(&sid, pid, stream, stats::FORWARD, &conn);
+                    forward.path(pid, |p| {
+                        p.local_socket = endpoint.local_addr().ok().map(|a| a.to_string())
+                    });
                     paths.lock().expect("paths lock").push(OutPath {
                         id: pid,
                         conn: conn.clone(),

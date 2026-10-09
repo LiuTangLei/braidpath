@@ -177,6 +177,8 @@ pub struct Path {
     pub udp_target_send_dropped: u64,
     pub udp_target_flow_dropped: u64,
     pub sending_direction: String,
+    pub local_socket: Option<String>,
+    pub peer_socket: String,
     pub quinn: Quinn,
 }
 #[derive(Default, Serialize)]
@@ -519,6 +521,7 @@ impl Metrics {
                     request_stream_id: stream,
                     authenticated: true,
                     sending_direction: direction.to_owned(),
+                    peer_socket: conn.remote_address().to_string(),
                     ..Default::default()
                 },
             );
@@ -537,6 +540,7 @@ impl Metrics {
         for (key, conn) in connections.iter() {
             if let Some(path) = state.paths.get_mut(key) {
                 let q = conn.stats();
+                path.peer_socket = conn.remote_address().to_string();
                 path.quinn = Quinn {
                     lost_packets: q.path.lost_packets,
                     congestion_events: q.path.congestion_events,

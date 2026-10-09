@@ -142,8 +142,13 @@ def validate(topology, matrix):
         for key in ("check", "create", "remove"):
             if not isinstance(rule[key], list) or not rule[key] or not all(isinstance(x, str) for x in rule[key]):
                 raise ValueError("firewall commands must be nonempty argv lists")
+    for path_name, ports in topology.get("path_bind_ports", {}).items():
+        if path_name not in topology["paths"] or not isinstance(ports, list) or not ports or len(set(ports)) != len(ports):
+            raise ValueError("path bind ports need a known path and a nonempty unique port list")
+        for port in ports:
+            integer(port, "path bind port", 1, 65535)
     # Infrastructure belongs exclusively in topology, including probe source binds.
-    forbidden = {"ssh", "host", "hosts", "port", "listen", "target", "interface", "addresses", "firewall", "binary", "workdir"}
+    forbidden = {"ssh", "host", "hosts", "port", "listen", "target", "interface", "addresses", "firewall", "binary", "workdir", "path_bind_ports"}
     def inspect(value):
         if isinstance(value, dict):
             if forbidden.intersection(value):
@@ -558,6 +563,12 @@ class Runner:
             args += ["--interface", interface]
         for name in path_names:
             args += ["--entrance", t["paths"][name]["entrance"]]
+        if t.get("path_bind_ports"):
+            for name in path_names:
+                ports = t["path_bind_ports"][name]
+                port = ports[self.record["group"] % len(ports)]
+                entrance = t["paths"][name]["entrance"]
+                args += ["--path-bind", ("[::]:" if entrance.startswith("[") else "0.0.0.0:") + str(port)]
         client = self.job(t["client_host"], "client", args, stats=True)
         self.launch([client])
         ready = self.runtime_ready(client, range(len(path_names)))
@@ -791,6 +802,10 @@ def aggregate_artifacts(artifacts, direction, jobs=()):
     for role, snapshot in out["runtime"].items():
         stats = snapshot.get("stats", {})
         out["handshake"][role] = {key: stats.get(key, 0) for key in keys}
+    out["path_tuples"] = [{"role": role, "path_key": key, "path_id": path.get("path_id"),
+        "local_socket": path.get("local_socket"), "peer_socket": path.get("peer_socket"),
+        "sending_direction": path.get("sending_direction")}
+        for role, snapshot in out["runtime"].items() for key, path in snapshot.get("stats", {}).get("paths", {}).items()]
     probes = [report for role, report in out["reports"].items() if role.startswith("probe")]
     if direction == "echo":
         delivered = probes

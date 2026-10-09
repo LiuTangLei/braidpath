@@ -97,4 +97,12 @@ Test settings, credentials, private topology, raw captures and run results stay 
 
 ## Machine-readable counters
 
+For fixed-tuple comparisons, the client accepts one `--path-bind ADDRESS:PORT`
+per interface–entrance pair, in the same path order as its interfaces and
+entrances. Omit it for kernel-assigned ports. Binding failures are explicit; a
+requested source port is never silently replaced. Client path statistics record
+`local_socket`; both endpoints record `peer_socket`, exposing the relay's
+upstream mapping at the server. A repeated client port does not by itself prove
+an unchanged relay-side tuple.
+
 Client, server and relay support `--stats-file` for final JSON and optional `--stats-jsonl` / `--stats-interval-ms` for cumulative periodic samples. Readiness and failures are included so benchmarks can stop parsing logs. [Statistics schema and conservation boundaries](statistics.md) distinguish logical records, aggregate symbols, QUIC packets and relay datagrams. Run records belong under ignored `local/`.

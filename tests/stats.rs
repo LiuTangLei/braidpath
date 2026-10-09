@@ -425,6 +425,22 @@ fn http3_impairment_reconciles_queues_symbols_and_observed_logical_ids() {
         num(&send["symbols"], "originals_quinn_admitted")
     );
     assert!(path["quinn"]["min_rtt_ms"].as_f64().is_some());
+    let local: std::net::SocketAddr = path["local_socket"].as_str().unwrap().parse().unwrap();
+    assert_ne!(local.port(), 0);
+    assert_eq!(path["peer_socket"].as_str().unwrap(), relayaddr);
+    let server_path = s["stats"]["paths"]
+        .as_object()
+        .unwrap()
+        .values()
+        .next()
+        .unwrap();
+    assert!(
+        server_path["peer_socket"]
+            .as_str()
+            .unwrap()
+            .parse::<std::net::SocketAddr>()
+            .is_ok()
+    );
     assert!(path["quinn"]["congestion_events"].as_u64().is_some());
 }
 #[test]
