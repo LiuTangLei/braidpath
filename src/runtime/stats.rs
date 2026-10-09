@@ -151,6 +151,7 @@ pub struct Quinn {
 }
 #[derive(Default, Serialize)]
 pub struct Path {
+    pub receiver_feedback: Option<super::quality::Snapshot>,
     pub session_id: String,
     pub path_id: u8,
     pub request_stream_id: u64,

@@ -85,6 +85,13 @@ fn args(v: &[&str]) -> Vec<String> {
 }
 #[test]
 fn authenticated_http3_three_paths_and_udp_integrity() {
+    three_paths(false);
+}
+#[test]
+fn authenticated_receiver_feedback_both_directions() {
+    three_paths(true);
+}
+fn three_paths(feedback: bool) {
     let dir = tempfile::tempdir().unwrap();
     let identity = dir.path().join("identity");
     let ident = identity.to_str().unwrap();
@@ -103,9 +110,15 @@ fn authenticated_http3_three_paths_and_udp_integrity() {
     let client_addr = port();
     let mut echo = launch(&args(&["echo", "--listen", &echo_addr]), dir.path(), "echo");
     ready(&mut echo, "test echo ready");
+    let server_stats = dir.path().join("server-stats.jsonl");
+    let client_stats = dir.path().join("client-stats.jsonl");
     let mut server = launch(
         &args(&[
             "server",
+            "--stats-jsonl",
+            server_stats.to_str().unwrap(),
+            "--stats-interval-ms",
+            "100",
             "--listen",
             &main_addr,
             "--cert",
@@ -196,31 +209,35 @@ fn authenticated_http3_three_paths_and_udp_integrity() {
         "relay2",
     );
     ready(&mut relay2, "fixed-target relay ready");
-    let mut client = launch(
-        &args(&[
-            "client",
-            "--listen",
-            &client_addr,
-            "--entrance",
-            &main_addr,
-            "--entrance",
-            &relay_addr,
-            "--entrance",
-            &relay2_addr,
-            "--server-name",
-            "localhost",
-            "--ca",
-            cert.to_str().unwrap(),
-            "--token-file",
-            token.to_str().unwrap(),
-            "--block-ms",
-            "25",
-            "--redundancy-percent",
-            "50",
-        ]),
-        dir.path(),
+    let mut client_args = args(&[
         "client",
-    );
+        "--stats-jsonl",
+        client_stats.to_str().unwrap(),
+        "--stats-interval-ms",
+        "100",
+        "--listen",
+        &client_addr,
+        "--entrance",
+        &main_addr,
+        "--entrance",
+        &relay_addr,
+        "--entrance",
+        &relay2_addr,
+        "--server-name",
+        "localhost",
+        "--ca",
+        cert.to_str().unwrap(),
+        "--token-file",
+        token.to_str().unwrap(),
+        "--block-ms",
+        "25",
+        "--redundancy-percent",
+        "50",
+    ]);
+    if feedback {
+        client_args.push("--receiver-feedback".into());
+    }
+    let mut client = launch(&client_args, dir.path(), "client");
     ready(&mut client, "UDP client ready");
     let logs = fs::read_to_string(&client.log).unwrap();
     assert_eq!(logs.matches("client path ready").count(), 3, "{logs}");
@@ -248,6 +265,39 @@ fn authenticated_http3_three_paths_and_udp_integrity() {
     assert_eq!(stats["corrupt"], 0);
     assert_eq!(stats["duplicate"], 0);
     assert!(stats["received"].as_u64().unwrap() > 150, "{stats}");
+    if feedback {
+        let until = Instant::now() + Duration::from_secs(4);
+        loop {
+            let enough = [&client_stats, &server_stats].iter().all(|file| {
+                let text = fs::read_to_string(file).unwrap();
+                let snapshot = text
+                    .lines()
+                    .rev()
+                    .find_map(|line| serde_json::from_str::<Value>(line).ok())
+                    .unwrap();
+                let paths = snapshot["stats"]["paths"].as_object().unwrap();
+                paths.len() == 3
+                    && paths.values().all(|p| {
+                        p["receiver_feedback"]["sender_estimate"]["expected"]
+                            .as_u64()
+                            .unwrap_or(0)
+                            > 0
+                            && p["receiver_feedback"]["received"]["expected"]
+                                .as_u64()
+                                .unwrap_or(0)
+                                > 0
+                    })
+            });
+            if enough {
+                break;
+            }
+            assert!(
+                Instant::now() < until,
+                "feedback did not reach both senders"
+            );
+            thread::sleep(Duration::from_millis(50));
+        }
+    }
     // Losing a relay must not terminate the surviving independent paths.
     drop(relay2);
     let result = run(&args(&[

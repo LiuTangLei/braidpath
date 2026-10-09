@@ -1,5 +1,5 @@
 use super::{
-    MAX_PATHS, MAX_PAYLOAD, QUEUE,
+    MAX_PATHS, MAX_PAYLOAD, QUEUE, quality,
     stats::{self, Scope},
     transport,
     wire::{self, Receiver, Record},
@@ -34,6 +34,7 @@ const WEBSITE: &str = "<!doctype html><html lang=\"en\"><meta charset=\"utf-8\">
 
 #[derive(Clone, Debug)]
 pub struct Policy {
+    pub receiver_feedback: bool,
     pub fec: u8,
     pub redundancy: u8,
     pub rate: u64,
@@ -62,8 +63,47 @@ struct OutPath {
     id: u8,
     conn: quinn::Connection,
     stream: u64,
+    quality: Arc<Mutex<quality::State>>,
+    epoch: Instant,
 }
 type Paths = Arc<Mutex<Vec<OutPath>>>;
+
+fn quality_time(path: &OutPath) -> u64 {
+    path.epoch.elapsed().as_micros().min(u128::from(u64::MAX)) as u64
+}
+fn measured_payload(
+    paths: &Paths,
+    pid: u8,
+    payload: &[u8],
+    enabled: bool,
+    scope: &Scope,
+) -> Result<Option<Bytes>> {
+    if !enabled {
+        return Ok(Some(Bytes::copy_from_slice(payload)));
+    }
+    let paths = paths.lock().expect("paths lock");
+    if payload.starts_with(b"BQ1C") {
+        for report in quality::parse_control(payload)? {
+            if let Some(path) = paths.iter().find(|p| p.id == report.id) {
+                let mut q = path.quality.lock().expect("quality lock");
+                if q.apply(&report, quality_time(path)).is_err() {
+                    q.snapshot.invalid_controls += 1;
+                }
+                scope.path(path.id, |p| p.receiver_feedback = Some(q.snapshot.clone()));
+            }
+        }
+        return Ok(None);
+    }
+    let path = paths
+        .iter()
+        .find(|p| p.id == pid)
+        .context("missing measurement path")?;
+    let mut q = path.quality.lock().expect("quality lock");
+    let inner = q.receive(payload, quality_time(path))?;
+    scope.path(pid, |p| p.receiver_feedback = Some(q.snapshot.clone()));
+    Ok(Some(Bytes::copy_from_slice(inner)))
+}
+
 struct Pending {
     data: Bytes,
     created: Instant,
@@ -88,6 +128,8 @@ async fn sender(
     let mut queue = VecDeque::<Pending>::new();
     let mut credit = 0usize;
     let mut cursor = 0usize;
+    let mut control_cursor = 0usize;
+    let mut next_feedback = Instant::now();
     let mut tokens = 0f64;
     let mut last = Instant::now();
     let mut tick = interval(Duration::from_millis(1));
@@ -168,6 +210,51 @@ async fn sender(
         tokens = (tokens + now.duration_since(last).as_secs_f64() * policy.rate as f64 / 8.0)
             .min(8.0 * 1200.0);
         last = now;
+        if policy.receiver_feedback && now >= next_feedback {
+            let p = paths.lock().expect("paths lock");
+            let reports: Vec<_> = p
+                .iter()
+                .map(|path| {
+                    path.quality
+                        .lock()
+                        .expect("quality lock")
+                        .report(path.id, quality_time(path))
+                })
+                .collect();
+            let frame = quality::control(&reports);
+            let cost = (frame.len() + 80) as f64;
+            if !p.is_empty() && tokens >= cost {
+                for n in 0..p.len() {
+                    let i = (control_cursor + n) % p.len();
+                    let path = &p[i];
+                    let data = wire::http_datagram(path.stream, &frame).expect("admitted stream");
+                    if path.conn.close_reason().is_none()
+                        && path
+                            .conn
+                            .max_datagram_size()
+                            .is_some_and(|m| m >= data.len())
+                        && path.conn.datagram_send_buffer_space() >= data.len()
+                        && path.conn.send_datagram(data).is_ok()
+                    {
+                        tokens -= cost;
+                        control_cursor = (i + 1) % p.len();
+                        path.quality
+                            .lock()
+                            .expect("quality lock")
+                            .snapshot
+                            .controls_sent += 1;
+                        break;
+                    }
+                }
+            }
+            for path in p.iter() {
+                metrics.path(path.id, |s| {
+                    s.receiver_feedback =
+                        Some(path.quality.lock().expect("quality lock").snapshot.clone())
+                });
+            }
+            next_feedback = now + Duration::from_micros(quality::INTERVAL_US);
+        }
         while let Some(front) = queue.front() {
             if now.duration_since(front.created) > Duration::from_millis(policy.queue_ms) {
                 let expired = queue.pop_front().expect("front");
@@ -184,7 +271,13 @@ async fn sender(
                 });
                 continue;
             }
-            let cost = (front.data.len() + 80) as f64;
+            let cost = (front.data.len()
+                + 80
+                + if policy.receiver_feedback {
+                    quality::HEADER
+                } else {
+                    0
+                }) as f64;
             if tokens < cost {
                 break;
             }
@@ -197,7 +290,15 @@ async fn sender(
                     if path.conn.close_reason().is_some() {
                         continue;
                     }
-                    let Ok(data) = wire::http_datagram(path.stream, &front.data) else {
+                    let payload = if policy.receiver_feedback {
+                        path.quality
+                            .lock()
+                            .expect("quality lock")
+                            .wrap(&front.data, quality_time(path))
+                    } else {
+                        front.data.clone()
+                    };
+                    let Ok(data) = wire::http_datagram(path.stream, &payload) else {
                         continue;
                     };
                     if path
@@ -213,6 +314,13 @@ async fn sender(
                     }
                     match path.conn.send_datagram(data) {
                         Ok(()) => {
+                            if policy.receiver_feedback {
+                                path.quality
+                                    .lock()
+                                    .expect("quality lock")
+                                    .snapshot
+                                    .sent_symbols += 1;
+                            }
                             metrics.path(path.id, |p| {
                                 if front.record_id.is_some() {
                                     p.quinn_admitted_originals += 1;
@@ -623,11 +731,14 @@ async fn server_connection(
                     let sid=header("braidpath-session")?.to_owned(); ensure!(sid.len()==32 && sid.bytes().all(|b|b.is_ascii_hexdigit()),"invalid session id");
                     let pid:u8=header("braidpath-path")?.parse()?; ensure!(usize::from(pid)<MAX_PATHS,"path limit");
                     diagnostic.path_id(pid);
-                    let policy=Policy{fec:header("braidpath-fec")?.parse()?,redundancy:header("braidpath-redundancy")?.parse()?,rate:header("braidpath-rate")?.parse::<u64>()?.min(max_rate),block_ms:header("braidpath-block-ms")?.parse()?,queue_ms:header("braidpath-queue-ms")?.parse()?};policy.validate()?;
+                    let feedback=req.headers().get("braidpath-feedback").map(|v|v.to_str()).transpose()?;ensure!(feedback.is_none() || feedback==Some("1"),"unsupported feedback version");
+                    let generation=if feedback.is_some(){header("braidpath-generation")?.parse::<u64>()?}else{0};
+                    ensure!(feedback.is_none() || conn.max_datagram_size().is_some_and(|n|n>=quality::MAX_FRAME+9),"peer lacks feedback datagram capacity");
+                    let policy=Policy{receiver_feedback:feedback.is_some(),fec:header("braidpath-fec")?.parse()?,redundancy:header("braidpath-redundancy")?.parse()?,rate:header("braidpath-rate")?.parse::<u64>()?.min(max_rate),block_ms:header("braidpath-block-ms")?.parse()?,queue_ms:header("braidpath-queue-ms")?.parse()?};policy.validate()?;
                     let session={
                         let mut map=sessions.lock().expect("sessions lock");
                         if let Some(session)=map.get(&sid){
-                            ensure!(session.policy.fec==policy.fec && session.policy.redundancy==policy.redundancy && session.policy.rate==policy.rate && session.policy.block_ms==policy.block_ms && session.policy.queue_ms==policy.queue_ms,"session policy mismatch"); session.clone()
+                            ensure!(session.policy.receiver_feedback==policy.receiver_feedback && session.policy.fec==policy.fec && session.policy.redundancy==policy.redundancy && session.policy.rate==policy.rate && session.policy.block_ms==policy.block_ms && session.policy.queue_ms==policy.queue_ms,"session policy mismatch"); session.clone()
                         }else{
                             ensure!(map.len()<16,"session limit");
                             let (tx,rx)=mpsc::channel(QUEUE);let (stop,_)=watch::channel(false);
@@ -639,11 +750,11 @@ async fn server_connection(
                     {
                         let mut paths=session.paths.lock().expect("paths lock");
                         ensure!(paths.len()<MAX_PATHS && !paths.iter().any(|p|p.id==pid),"duplicate/path limit");
-                        paths.push(OutPath{id:pid,conn:conn.clone(),stream:stream_id});
+                        paths.push(OutPath{id:pid,conn:conn.clone(),stream:stream_id,quality:Arc::new(Mutex::new(quality::State::new(generation))),epoch:Instant::now()});
                     }
                     metrics.register(&sid,pid,stream_id,stats::RETURN,&conn);
                     joined=Some((sid,session,pid,stream_id));
-                    stream.send_response(Response::builder().status(200).header("braidpath-version","1").header("braidpath-max-payload",MAX_PAYLOAD).body(())?).await?;
+                    let mut response=Response::builder().status(200).header("braidpath-version","1").header("braidpath-max-payload",MAX_PAYLOAD);if feedback.is_some(){response=response.header("braidpath-feedback","1");}stream.send_response(response.body(())?).await?;
                     request=Some(stream);
                     diagnostic.admitted();
                     info!(path=pid,remote=%conn.remote_address(),"authenticated path joined");
@@ -652,8 +763,9 @@ async fn server_connection(
                     let data=data?;
                     if let Some((_,session,pid,stream))=&joined {
                         session.forward.path(*pid,|p|p.http_datagrams_received+=1);
-                        if let Ok(payload)=wire::http_payload(&data,*stream) && payload.len()<=wire::MAX_WIRE {
-                            if let Err(error)=session.events.try_send(Event::Wire(*pid,Bytes::copy_from_slice(payload))){session.ingress_drops.fetch_add(1,Ordering::Relaxed);queue_error(&session.forward,QueueLayer::Receiver,&error,Some(*pid));}
+                        if let Ok(payload)=wire::http_payload(&data,*stream) && payload.len()<=(if session.policy.receiver_feedback{quality::MAX_FRAME}else{wire::MAX_WIRE}) {
+                            match measured_payload(&session.paths,*pid,payload,session.policy.receiver_feedback,&session.returning) {
+                            Ok(Some(payload))=>{if let Err(error)=session.events.try_send(Event::Wire(*pid,payload)){session.ingress_drops.fetch_add(1,Ordering::Relaxed);queue_error(&session.forward,QueueLayer::Receiver,&error,Some(*pid));}},Ok(None)=>{},Err(_)=>session.forward.path(*pid,|p|p.invalid_http_datagrams_dropped+=1)}
                         } else {session.forward.path(*pid,|p|p.invalid_http_datagrams_dropped+=1);session.forward.update(|d|d.records.invalid_symbols_dropped+=1);}
                     }
                 },
@@ -744,6 +856,7 @@ pub async fn client(options: ClientOptions) -> Result<()> {
     for interface in interfaces {
         for entrance in &options.entrances {
             let pid = endpoints.len() as u8;
+            let generation = rand::random::<u64>();
             let endpoint = transport::client_bound(
                 *entrance,
                 &options.ca,
@@ -767,6 +880,7 @@ pub async fn client(options: ClientOptions) -> Result<()> {
                     &token,
                     &sid,
                     pid,
+                    generation,
                     &options.policy,
                     &mut diagnostic,
                 ),
@@ -784,10 +898,15 @@ pub async fn client(options: ClientOptions) -> Result<()> {
                         id: pid,
                         conn: conn.clone(),
                         stream,
+                        quality: Arc::new(Mutex::new(quality::State::new(generation))),
+                        epoch: Instant::now(),
                     });
                     let tx = wire_tx.clone();
                     let ingress_drops = ingress_drops.clone();
                     let returning = returning.clone();
+                    let measurement_scope = forward.clone();
+                    let path_view = paths.clone();
+                    let feedback = options.policy.receiver_feedback;
                     tasks.spawn(async move {
                     // Dropping the last SendRequest closes the HTTP/3 connection.
                     let _send = send;
@@ -797,8 +916,8 @@ pub async fn client(options: ClientOptions) -> Result<()> {
                         d=conn.read_datagram()=>match d {
                             Ok(d)=>{
                                 returning.path(pid,|p|p.http_datagrams_received+=1);
-                                if let Ok(p)=wire::http_payload(&d,stream) && p.len()<=wire::MAX_WIRE {
-                                    if let Err(error)=tx.try_send((pid,Bytes::copy_from_slice(p))){ingress_drops.fetch_add(1,Ordering::Relaxed);queue_error(&returning,QueueLayer::Receiver,&error,Some(pid));}
+                                if let Ok(p)=wire::http_payload(&d,stream) && p.len()<=(if feedback{quality::MAX_FRAME}else{wire::MAX_WIRE}) {
+                                    match measured_payload(&path_view,pid,p,feedback,&measurement_scope) {Ok(Some(p))=>{if let Err(error)=tx.try_send((pid,p)){ingress_drops.fetch_add(1,Ordering::Relaxed);queue_error(&returning,QueueLayer::Receiver,&error,Some(pid));}},Ok(None)=>{},Err(_)=>returning.path(pid,|p|p.invalid_http_datagrams_dropped+=1)}
                                 }else{returning.path(pid,|p|p.invalid_http_datagrams_dropped+=1);returning.update(|d|d.records.invalid_symbols_dropped+=1);}
                             },
                             Err(e)=>return Err(e.into()),
@@ -936,6 +1055,7 @@ async fn connect_path(
     token: &str,
     sid: &str,
     pid: u8,
+    generation: u64,
     policy: &Policy,
     diagnostic: &mut stats::ConnectionTrace,
 ) -> Result<(quinn::Connection, u64, H3Client, H3Request, H3Send)> {
@@ -943,8 +1063,12 @@ async fn connect_path(
     diagnostic.handshake_succeeded(&conn);
     diagnostic.enter("http3", "datagram_capacity");
     ensure!(
-        conn.max_datagram_size()
-            .is_some_and(|n| n >= wire::MAX_WIRE + 9),
+        conn.max_datagram_size().is_some_and(|n| n
+            >= (if policy.receiver_feedback {
+                quality::MAX_FRAME
+            } else {
+                wire::MAX_WIRE
+            }) + 9),
         "insufficient datagram size"
     );
     diagnostic.succeeded();
@@ -964,7 +1088,7 @@ async fn connect_path(
     diagnostic.succeeded();
     diagnostic.begin_admission();
     diagnostic.enter("path_admission", "admission");
-    let req = Request::builder()
+    let mut req = Request::builder()
         .method(Method::POST)
         .uri(format!("https://{name}{SESSION_PATH}"))
         .header("authorization", format!("Bearer {token}"))
@@ -975,8 +1099,13 @@ async fn connect_path(
         .header("braidpath-redundancy", u16::from(policy.redundancy))
         .header("braidpath-rate", policy.rate)
         .header("braidpath-block-ms", policy.block_ms)
-        .header("braidpath-queue-ms", policy.queue_ms)
-        .body(())?;
+        .header("braidpath-queue-ms", policy.queue_ms);
+    if policy.receiver_feedback {
+        req = req
+            .header("braidpath-feedback", "1")
+            .header("braidpath-generation", generation);
+    }
+    let req = req.body(())?;
     let mut stream = send.send_request(req).await?;
     let response = tokio::select! {e=driver.wait_idle()=>bail!("HTTP/3 closed during admission: {e}"),r=stream.recv_response()=>r?};
     ensure!(
@@ -996,6 +1125,14 @@ async fn connect_path(
             .and_then(|v| v.parse::<usize>().ok())
             == Some(MAX_PAYLOAD),
         "payload size mismatch"
+    );
+    ensure!(
+        !policy.receiver_feedback
+            || response
+                .headers()
+                .get("braidpath-feedback")
+                .is_some_and(|v| v == "1"),
+        "receiver feedback not negotiated"
     );
     diagnostic.admitted();
     Ok((conn, stream.id().into_inner(), driver, stream, send))

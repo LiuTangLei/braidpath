@@ -107,6 +107,9 @@ enum Command {
 }
 #[derive(Args)]
 struct PolicyArgs {
+    /// Report per-path receiver quality; data scheduling remains round robin.
+    #[arg(long)]
+    receiver_feedback: bool,
     #[arg(long, default_value_t = 4)]
     fec: u8,
     #[arg(long, default_value_t = 30)]
@@ -178,6 +181,7 @@ pub async fn run() -> Result<()> {
                 congestion,
                 policy: tunnel::Policy {
                     fec: policy.fec,
+                    receiver_feedback: policy.receiver_feedback,
                     redundancy: policy.redundancy_percent,
                     rate: policy.rate_bps,
                     block_ms: policy.block_ms,

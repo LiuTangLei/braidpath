@@ -43,7 +43,8 @@ Current protocol, commands and limits: [experimental runtime](runtime.md). Check
 - [ ] Validate multiple physical interfaces and platform-specific binding independently.
 - [ ] Add session joins, path generations, bounded reconnection and control-operation replay across surviving paths.
 - [x] Add a round-robin scheduler, bounded queues, per-path transport observations and per-direction aggregate pacing.
-- [ ] Add receiver feedback, delivery-time scheduling and explicit bottleneck-group caps; demonstrate competition fairness.
+- [x] Add opt-in authenticated receiver feedback with bounded per-path gap and delay-change estimates.
+- [ ] Add delivery-time scheduling and explicit bottleneck-group caps; demonstrate competition fairness.
 - [ ] Validate 1×1 → 1×3 → 2×1 → 2×3, including single-interface operation, relay-only operation and path/relay outages.
 
 **Exit gate:** native captures prove both directions use the requested interface/entrance; queues and state remain bounded; the multi-entrance shared-bottleneck competition test passes for the enabled policy. Datagram loss during outage remains visible.

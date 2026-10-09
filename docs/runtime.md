@@ -106,3 +106,5 @@ upstream mapping at the server. A repeated client port does not by itself prove
 an unchanged relay-side tuple.
 
 Client, server and relay support `--stats-file` for final JSON and optional `--stats-jsonl` / `--stats-interval-ms` for cumulative periodic samples. Readiness and failures are included so benchmarks can stop parsing logs. [Statistics schema and conservation boundaries](statistics.md) distinguish logical records, aggregate symbols, QUIC packets and relay datagrams. Run records belong under ignored `local/`.
+
+`client --receiver-feedback` negotiates per-path measurement with the authenticated peer. Sequence gaps and delay variation are reported through bounded control datagrams, independently of FEC delivery. This opt-in mode does not change data scheduling. Both peers must support it; rejected negotiation is an explicit path admission failure. See [statistics](statistics.md) for counters, bounds and clock limitations.
