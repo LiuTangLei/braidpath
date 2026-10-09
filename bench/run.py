@@ -559,6 +559,9 @@ class Runner:
         self.launch([server])
         self.runtime_ready(server)
         args = ["client", "--listen", a["client_listen"], "--server-name", tls["server_name"], "--ca", tls["ca"], "--token-file", tls.get("client_token_file", tls["token_file"]), "--fec", profile.get("fec", 0), "--block-ms", m.get("block_ms", 25), "--rate-bps", m.get("rate_bps", 5000000), *cc]
+        for option in ["receiver_feedback", "quality_schedule", "rotate_source_port"]:
+            if profile.get(option):
+                args.append("--" + option.replace("_", "-"))
         interface = t["hosts"][t["client_host"]].get("interface")
         if interface:
             args += ["--interface", interface]
@@ -805,7 +808,7 @@ def aggregate_artifacts(artifacts, direction, jobs=()):
         out["handshake"][role] = {key: stats.get(key, 0) for key in keys}
     out["path_tuples"] = [{"role": role, "path_key": key, "path_id": path.get("path_id"),
         "local_socket": path.get("local_socket"), "peer_socket": path.get("peer_socket"),
-        "sending_direction": path.get("sending_direction")}
+        "sending_direction": path.get("sending_direction"), "previous_generations": path.get("previous_generations", [])}
         for role, snapshot in out["runtime"].items() for key, path in snapshot.get("stats", {}).get("paths", {}).items()]
     probes = [report for role, report in out["reports"].items() if role.startswith("probe")]
     if direction == "echo":

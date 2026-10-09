@@ -149,8 +149,21 @@ pub struct Quinn {
     pub http_datagram_frames_rx: u64,
     pub closed: bool,
 }
+#[derive(Serialize)]
+pub struct Generation {
+    pub connection_id: usize,
+    pub quinn: Quinn,
+    pub local_socket: Option<String>,
+    pub peer_socket: String,
+    pub quality: Option<super::quality::Snapshot>,
+}
 #[derive(Default, Serialize)]
 pub struct Path {
+    pub connection_id: usize,
+    pub previous_generations: Vec<Generation>,
+    pub rotation_attempts: u64,
+    pub rotation_successes: u64,
+    pub rotation_failures: u64,
     pub receiver_feedback: Option<super::quality::Snapshot>,
     pub session_id: String,
     pub path_id: u8,
@@ -514,18 +527,23 @@ impl Metrics {
             return;
         }
         self.state(|s| {
-            s.paths.insert(
-                key.clone(),
-                Path {
-                    session_id: session.to_owned(),
-                    path_id: pid,
-                    request_stream_id: stream,
-                    authenticated: true,
-                    sending_direction: direction.to_owned(),
-                    peer_socket: conn.remote_address().to_string(),
-                    ..Default::default()
-                },
-            );
+            let path = s.paths.entry(key.clone()).or_default();
+            if path.authenticated && path.previous_generations.len() < 3 {
+                path.previous_generations.push(Generation {
+                    connection_id: path.connection_id,
+                    quinn: std::mem::take(&mut path.quinn),
+                    local_socket: path.local_socket.take(),
+                    peer_socket: path.peer_socket.clone(),
+                    quality: path.receiver_feedback.take(),
+                });
+            }
+            path.connection_id = conn.stable_id();
+            path.session_id = session.to_owned();
+            path.path_id = pid;
+            path.request_stream_id = stream;
+            path.authenticated = true;
+            path.sending_direction = direction.to_owned();
+            path.peer_socket = conn.remote_address().to_string();
         });
         connections.push((key, conn.clone()));
         self.0.changed.notify_one();
@@ -541,8 +559,7 @@ impl Metrics {
         for (key, conn) in connections.iter() {
             if let Some(path) = state.paths.get_mut(key) {
                 let q = conn.stats();
-                path.peer_socket = conn.remote_address().to_string();
-                path.quinn = Quinn {
+                let sample = Quinn {
                     lost_packets: q.path.lost_packets,
                     congestion_events: q.path.congestion_events,
                     min_rtt_ms: q.path.min_rtt.as_secs_f64() * 1000.,
@@ -557,6 +574,16 @@ impl Metrics {
                     http_datagram_frames_rx: q.frame_rx.datagram,
                     closed: conn.close_reason().is_some(),
                 };
+                if conn.stable_id() == path.connection_id {
+                    path.peer_socket = conn.remote_address().to_string();
+                    path.quinn = sample;
+                } else if let Some(old) = path
+                    .previous_generations
+                    .iter_mut()
+                    .find(|p| p.connection_id == conn.stable_id())
+                {
+                    old.quinn = sample;
+                }
             }
         }
         Ok(

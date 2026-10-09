@@ -3,6 +3,7 @@ pub mod cli;
 pub mod probe;
 pub mod quality;
 pub mod relay;
+pub mod scheduler;
 pub mod stats;
 pub mod transport;
 pub mod tunnel;

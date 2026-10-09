@@ -85,13 +85,22 @@ fn args(v: &[&str]) -> Vec<String> {
 }
 #[test]
 fn authenticated_http3_three_paths_and_udp_integrity() {
-    three_paths(false);
+    three_paths(0);
 }
 #[test]
 fn authenticated_receiver_feedback_both_directions() {
-    three_paths(true);
+    three_paths(1);
 }
-fn three_paths(feedback: bool) {
+#[test]
+fn quality_scheduler_retains_bidirectional_integrity() {
+    three_paths(2);
+}
+#[test]
+fn persistent_bad_path_rejoins_with_new_udp_port() {
+    three_paths(3);
+}
+fn three_paths(mode: u8) {
+    let feedback = mode > 0;
     let dir = tempfile::tempdir().unwrap();
     let identity = dir.path().join("identity");
     let ident = identity.to_str().unwrap();
@@ -203,7 +212,7 @@ fn three_paths(feedback: bool) {
             "--allow-source",
             "127.0.0.1",
             "--drop-every",
-            "17",
+            if mode == 3 { "5" } else { "17" },
         ]),
         dir.path(),
         "relay2",
@@ -237,6 +246,12 @@ fn three_paths(feedback: bool) {
     if feedback {
         client_args.push("--receiver-feedback".into());
     }
+    if mode >= 2 {
+        client_args.push("--quality-schedule".into());
+    }
+    if mode == 3 {
+        client_args.push("--rotate-source-port".into());
+    }
     let mut client = launch(&client_args, dir.path(), "client");
     ready(&mut client, "UDP client ready");
     let logs = fs::read_to_string(&client.log).unwrap();
@@ -246,7 +261,7 @@ fn three_paths(feedback: bool) {
         "--target",
         &client_addr,
         "--count",
-        "200",
+        if mode == 3 { "1200" } else { "200" },
         "--size",
         "700",
         "--pps",
@@ -264,8 +279,11 @@ fn three_paths(feedback: bool) {
     let stats: Value = serde_json::from_slice(&result.stdout).unwrap();
     assert_eq!(stats["corrupt"], 0);
     assert_eq!(stats["duplicate"], 0);
-    assert!(stats["received"].as_u64().unwrap() > 150, "{stats}");
-    if feedback {
+    assert!(
+        stats["received"].as_u64().unwrap() > if mode == 3 { 900 } else { 150 },
+        "{stats}"
+    );
+    if feedback && mode != 3 {
         let until = Instant::now() + Duration::from_secs(4);
         loop {
             let enough = [&client_stats, &server_stats].iter().all(|file| {
@@ -296,6 +314,78 @@ fn three_paths(feedback: bool) {
                 "feedback did not reach both senders"
             );
             thread::sleep(Duration::from_millis(50));
+        }
+    }
+    if mode == 3 {
+        let until = Instant::now() + Duration::from_secs(12);
+        loop {
+            let text = fs::read_to_string(&client_stats).unwrap();
+            let snapshot = text
+                .lines()
+                .rev()
+                .find_map(|l| serde_json::from_str::<Value>(l).ok())
+                .unwrap();
+            let paths = snapshot["stats"]["paths"].as_object().unwrap();
+            if let Some(path) = paths
+                .values()
+                .find(|p| p["rotation_successes"].as_u64().unwrap_or(0) > 0)
+            {
+                let old = path["previous_generations"].as_array().unwrap();
+                assert!(!old.is_empty());
+                assert_ne!(old[0]["local_socket"], path["local_socket"]);
+                let pid = path["path_id"].as_u64().unwrap();
+                let fresh = run(&args(&[
+                    "probe",
+                    "--target",
+                    &client_addr,
+                    "--count",
+                    "200",
+                    "--size",
+                    "700",
+                    "--pps",
+                    "200",
+                    "--deadline-ms",
+                    "1000",
+                ]));
+                assert!(
+                    fresh.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&fresh.stderr)
+                );
+                let verified_until = Instant::now() + Duration::from_secs(4);
+                loop {
+                    let text = fs::read_to_string(&client_stats).unwrap();
+                    let current = text
+                        .lines()
+                        .rev()
+                        .find_map(|l| serde_json::from_str::<Value>(l).ok())
+                        .unwrap();
+                    let current = current["stats"]["paths"]
+                        .as_object()
+                        .unwrap()
+                        .values()
+                        .find(|p| p["path_id"].as_u64() == Some(pid))
+                        .unwrap();
+                    if current["receiver_feedback"]["sender_estimate"]["expected"]
+                        .as_u64()
+                        .unwrap_or(0)
+                        > 0
+                    {
+                        break;
+                    }
+                    assert!(
+                        Instant::now() < verified_until,
+                        "new generation was removed by old path cleanup"
+                    );
+                    thread::sleep(Duration::from_millis(50));
+                }
+                break;
+            }
+            assert!(
+                Instant::now() < until,
+                "persistent bad path never rejoined: {snapshot}"
+            );
+            thread::sleep(Duration::from_millis(100));
         }
     }
     // Losing a relay must not terminate the surviving independent paths.

@@ -181,6 +181,16 @@ class LifecycleTests(unittest.TestCase):
         b = self.runner.job("source", "fixture-second", ["fixture-command"])
         self.runner.launch([a, b])
 
+    def test_optional_runtime_switches_are_explicit_and_off_by_default(self):
+        for enabled in (False, True):
+            self.runner.attempt_id="switch-fixture";self.runner.directory=Path(self.temp.name);self.runner.record={"group":0};self.runner.jobs=[]
+            profile={"transport":"braidpath","fec":4,"entrances":["direct"],"receiver_feedback":enabled,"quality_schedule":enabled,"rotate_source_port":enabled}
+            with patch.object(self.runner,"runtime_ready",return_value=type("Ready",(),{"session_id":"session"})()):
+                self.runner.prepare_runtime(self.matrix["cases"][0],profile)
+            client=next(j for j in self.runner.jobs if j.role=="client")
+            for option in ("--receiver-feedback","--quality-schedule","--rotate-source-port"):
+                self.assertEqual(option in client.argv,enabled)
+
     def test_startup_failure_cleans_registered_process(self):
         with patch.object(self.runner, "prepare_runtime", side_effect=self.prepare_failure), patch.object(self.runner, "workload") as workload:
             result = self.runner.attempt(self.row, 0)

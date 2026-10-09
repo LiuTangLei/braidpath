@@ -1,5 +1,5 @@
 use super::{
-    MAX_PATHS, MAX_PAYLOAD, QUEUE, quality,
+    MAX_PATHS, MAX_PAYLOAD, QUEUE, quality, scheduler,
     stats::{self, Scope},
     transport,
     wire::{self, Receiver, Record},
@@ -35,6 +35,7 @@ const WEBSITE: &str = "<!doctype html><html lang=\"en\"><meta charset=\"utf-8\">
 #[derive(Clone, Debug)]
 pub struct Policy {
     pub receiver_feedback: bool,
+    pub quality_schedule: bool,
     pub fec: u8,
     pub redundancy: u8,
     pub rate: u64,
@@ -43,6 +44,10 @@ pub struct Policy {
 }
 impl Policy {
     pub fn validate(&self) -> Result<()> {
+        ensure!(
+            !self.quality_schedule || self.receiver_feedback,
+            "quality scheduler requires receiver feedback"
+        );
         ensure!(
             self.fec <= 32 && self.redundancy <= 100,
             "invalid FEC configuration"
@@ -127,6 +132,7 @@ async fn sender(
         .expect("validated policy");
     let mut queue = VecDeque::<Pending>::new();
     let mut credit = 0usize;
+    let mut scheduler = scheduler::Scheduler::default();
     let mut cursor = 0usize;
     let mut control_cursor = 0usize;
     let mut next_feedback = Instant::now();
@@ -248,10 +254,8 @@ async fn sender(
                 }
             }
             for path in p.iter() {
-                metrics.path(path.id, |s| {
-                    s.receiver_feedback =
-                        Some(path.quality.lock().expect("quality lock").snapshot.clone())
-                });
+                let snapshot = path.quality.lock().expect("quality lock").snapshot.clone();
+                metrics.path(path.id, |s| s.receiver_feedback = Some(snapshot));
             }
             next_feedback = now + Duration::from_micros(quality::INTERVAL_US);
         }
@@ -284,8 +288,35 @@ async fn sender(
             let mut admitted = false;
             {
                 let p = paths.lock().expect("paths lock");
-                for n in 0..p.len() {
-                    let i = (cursor + n) % p.len();
+                let order = if policy.quality_schedule {
+                    let candidates: Vec<_> = p
+                        .iter()
+                        .filter(|path| path.conn.close_reason().is_none())
+                        .map(|path| {
+                            (
+                                path.id,
+                                scheduler::weight(
+                                    &path
+                                        .quality
+                                        .lock()
+                                        .expect("quality lock")
+                                        .snapshot
+                                        .sender_estimate,
+                                    quality_time(path),
+                                    path.conn.rtt().as_secs_f64() * 1000.0,
+                                ),
+                            )
+                        })
+                        .collect();
+                    scheduler
+                        .order(&candidates)
+                        .into_iter()
+                        .filter_map(|id| p.iter().position(|path| path.id == id))
+                        .collect::<Vec<_>>()
+                } else {
+                    (0..p.len()).map(|n| (cursor + n) % p.len()).collect()
+                };
+                for i in order {
                     let path = &p[i];
                     if path.conn.close_reason().is_some() {
                         continue;
@@ -450,6 +481,7 @@ enum Event {
     Reply(u32, Vec<u8>, Instant),
 }
 struct Session {
+    generations: Mutex<[Vec<u64>; MAX_PATHS]>,
     events: mpsc::Sender<Event>,
     paths: Paths,
     stop: watch::Sender<bool>,
@@ -734,27 +766,36 @@ async fn server_connection(
                     let feedback=req.headers().get("braidpath-feedback").map(|v|v.to_str()).transpose()?;ensure!(feedback.is_none() || feedback==Some("1"),"unsupported feedback version");
                     let generation=if feedback.is_some(){header("braidpath-generation")?.parse::<u64>()?}else{0};
                     ensure!(feedback.is_none() || conn.max_datagram_size().is_some_and(|n|n>=quality::MAX_FRAME+9),"peer lacks feedback datagram capacity");
-                    let policy=Policy{receiver_feedback:feedback.is_some(),fec:header("braidpath-fec")?.parse()?,redundancy:header("braidpath-redundancy")?.parse()?,rate:header("braidpath-rate")?.parse::<u64>()?.min(max_rate),block_ms:header("braidpath-block-ms")?.parse()?,queue_ms:header("braidpath-queue-ms")?.parse()?};policy.validate()?;
+                    let quality_schedule=req.headers().get("braidpath-scheduler").map(|v|v.to_str()).transpose()?;ensure!(quality_schedule.is_none() || quality_schedule==Some("quality"),"unknown scheduler");ensure!(quality_schedule.is_none() || feedback.is_some(),"quality scheduler requires feedback");
+                    let policy=Policy{quality_schedule:quality_schedule.is_some(),receiver_feedback:feedback.is_some(),fec:header("braidpath-fec")?.parse()?,redundancy:header("braidpath-redundancy")?.parse()?,rate:header("braidpath-rate")?.parse::<u64>()?.min(max_rate),block_ms:header("braidpath-block-ms")?.parse()?,queue_ms:header("braidpath-queue-ms")?.parse()?};policy.validate()?;
                     let session={
                         let mut map=sessions.lock().expect("sessions lock");
                         if let Some(session)=map.get(&sid){
-                            ensure!(session.policy.receiver_feedback==policy.receiver_feedback && session.policy.fec==policy.fec && session.policy.redundancy==policy.redundancy && session.policy.rate==policy.rate && session.policy.block_ms==policy.block_ms && session.policy.queue_ms==policy.queue_ms,"session policy mismatch"); session.clone()
+                            ensure!(session.policy.quality_schedule==policy.quality_schedule && session.policy.receiver_feedback==policy.receiver_feedback && session.policy.fec==policy.fec && session.policy.redundancy==policy.redundancy && session.policy.rate==policy.rate && session.policy.block_ms==policy.block_ms && session.policy.queue_ms==policy.queue_ms,"session policy mismatch"); session.clone()
                         }else{
                             ensure!(map.len()<16,"session limit");
                             let (tx,rx)=mpsc::channel(QUEUE);let (stop,_)=watch::channel(false);
-                            let s=Arc::new(Session{events:tx,paths:Arc::new(Mutex::new(Vec::new())),stop,policy,ingress_drops:Arc::new(AtomicU64::new(0)),forward:metrics.scope(&sid,stats::FORWARD),returning:metrics.scope(&sid,stats::RETURN),finished:tokio::sync::Notify::new(),done:std::sync::atomic::AtomicBool::new(false)});
+                            let s=Arc::new(Session{generations:Mutex::new(std::array::from_fn(|_|Vec::new())),events:tx,paths:Arc::new(Mutex::new(Vec::new())),stop,policy,ingress_drops:Arc::new(AtomicU64::new(0)),forward:metrics.scope(&sid,stats::FORWARD),returning:metrics.scope(&sid,stats::RETURN),finished:tokio::sync::Notify::new(),done:std::sync::atomic::AtomicBool::new(false)});
                             map.insert(sid.clone(),s.clone());tokio::spawn(session_loop(s.clone(),rx,target));s
                         }
                     };
                     let stream_id=stream.id().into_inner();
                     {
                         let mut paths=session.paths.lock().expect("paths lock");
-                        ensure!(paths.len()<MAX_PATHS && !paths.iter().any(|p|p.id==pid),"duplicate/path limit");
+                        let rejoin=req.headers().get("braidpath-rejoin").is_some_and(|v|v=="1");
+                        let existing=paths.iter().position(|p|p.id==pid);
+                        ensure!(existing.is_none() || (rejoin && feedback.is_some()),"duplicate path");
+                        let mut generations=session.generations.lock().expect("generation lock");
+                        let history=&mut generations[usize::from(pid)];
+
+                        ensure!(existing.is_some() || paths.len()<MAX_PATHS,"path limit");scheduler::admit_generation(history,generation)?;
+                        if let Some(i)=existing {let old=paths.remove(i);old.conn.close(0u32.into(),b"path rejoined");}
                         paths.push(OutPath{id:pid,conn:conn.clone(),stream:stream_id,quality:Arc::new(Mutex::new(quality::State::new(generation))),epoch:Instant::now()});
                     }
                     metrics.register(&sid,pid,stream_id,stats::RETURN,&conn);
                     joined=Some((sid,session,pid,stream_id));
-                    let mut response=Response::builder().status(200).header("braidpath-version","1").header("braidpath-max-payload",MAX_PAYLOAD);if feedback.is_some(){response=response.header("braidpath-feedback","1");}stream.send_response(response.body(())?).await?;
+                    let mut response=Response::builder().status(200).header("braidpath-version","1").header("braidpath-max-payload",MAX_PAYLOAD);if feedback.is_some(){response=response.header("braidpath-feedback","1");}
+                    if quality_schedule.is_some(){response=response.header("braidpath-scheduler","quality");}stream.send_response(response.body(())?).await?;
                     request=Some(stream);
                     diagnostic.admitted();
                     info!(path=pid,remote=%conn.remote_address(),"authenticated path joined");
@@ -783,7 +824,7 @@ async fn server_connection(
         let last = {
             let mut map = sessions.lock().expect("sessions lock");
             let mut paths = session.paths.lock().expect("paths lock");
-            paths.retain(|p| p.id != pid);
+            paths.retain(|p| p.id != pid || p.conn.stable_id() != conn.stable_id());
             let last = paths.is_empty();
             if last {
                 let _ = session.stop.send(true);
@@ -810,7 +851,17 @@ async fn server_connection(
     result
 }
 
+struct Rejoined {
+    endpoint: quinn::Endpoint,
+    conn: quinn::Connection,
+    stream: u64,
+    driver: H3Client,
+    request: H3Request,
+    send: H3Send,
+}
+
 pub struct ClientOptions {
+    pub rotate_source_port: bool,
     pub listen: SocketAddr,
     pub entrances: Vec<SocketAddr>,
     pub interfaces: Vec<String>,
@@ -843,6 +894,12 @@ pub async fn client(options: ClientOptions) -> Result<()> {
     let (wire_tx, mut wire_rx) = mpsc::channel::<(u8, Bytes)>(QUEUE);
     let mut tasks = JoinSet::new();
     let mut endpoints = Vec::new();
+    let mut configs: Vec<(SocketAddr, Option<String>)> = Vec::new();
+    let mut rotations: [scheduler::Rotation; MAX_PATHS] =
+        std::array::from_fn(|_| Default::default());
+    let rotation_epoch = Instant::now();
+    let (rejoin_tx, mut rejoin_rx) =
+        mpsc::channel::<(u8, u64, Result<(Rejoined, stats::ConnectionTrace)>)>(MAX_PATHS);
     let ingress_drops = Arc::new(AtomicU64::new(0));
     let interfaces: Vec<Option<&str>> = if options.interfaces.is_empty() {
         vec![None]
@@ -856,6 +913,7 @@ pub async fn client(options: ClientOptions) -> Result<()> {
     for interface in interfaces {
         for entrance in &options.entrances {
             let pid = endpoints.len() as u8;
+            configs.push((*entrance, interface.map(str::to_owned)));
             let generation = rand::random::<u64>();
             let endpoint = transport::client_bound(
                 *entrance,
@@ -881,13 +939,14 @@ pub async fn client(options: ClientOptions) -> Result<()> {
                     &sid,
                     pid,
                     generation,
+                    false,
                     &options.policy,
                     &mut diagnostic,
                 ),
             )
             .await;
             match connection {
-                Ok(Ok((conn, stream, mut driver, mut request, send))) => {
+                Ok(Ok((conn, stream, driver, request, send))) => {
                     options
                         .stats
                         .register(&sid, pid, stream, stats::FORWARD, &conn);
@@ -901,33 +960,21 @@ pub async fn client(options: ClientOptions) -> Result<()> {
                         quality: Arc::new(Mutex::new(quality::State::new(generation))),
                         epoch: Instant::now(),
                     });
-                    let tx = wire_tx.clone();
-                    let ingress_drops = ingress_drops.clone();
-                    let returning = returning.clone();
-                    let measurement_scope = forward.clone();
-                    let path_view = paths.clone();
-                    let feedback = options.policy.receiver_feedback;
-                    tasks.spawn(async move {
-                    // Dropping the last SendRequest closes the HTTP/3 connection.
-                    let _send = send;
-                    let result:Result<()>=async {loop {tokio::select! {
-                        e=driver.wait_idle()=>return Err(e.into()),
-                        body=request.recv_data()=>{let _=body?;return Ok(())},
-                        d=conn.read_datagram()=>match d {
-                            Ok(d)=>{
-                                returning.path(pid,|p|p.http_datagrams_received+=1);
-                                if let Ok(p)=wire::http_payload(&d,stream) && p.len()<=(if feedback{quality::MAX_FRAME}else{wire::MAX_WIRE}) {
-                                    match measured_payload(&path_view,pid,p,feedback,&measurement_scope) {Ok(Some(p))=>{if let Err(error)=tx.try_send((pid,p)){ingress_drops.fetch_add(1,Ordering::Relaxed);queue_error(&returning,QueueLayer::Receiver,&error,Some(pid));}},Ok(None)=>{},Err(_)=>returning.path(pid,|p|p.invalid_http_datagrams_dropped+=1)}
-                                }else{returning.path(pid,|p|p.invalid_http_datagrams_dropped+=1);returning.update(|d|d.records.invalid_symbols_dropped+=1);}
-                            },
-                            Err(e)=>return Err(e.into()),
-                        }
-                    }}}.await;
-                    let normal=diagnostic.finish(result.as_ref().err());
-                    if normal{info!(context=%diagnostic.context(),"client path closed");}
-                    else{warn!(context=%diagnostic.context(),error=?result.err(),"client path ended");}
-                    conn.close(0u32.into(),b"path ended");
-                });
+                    tasks.spawn(drive_client_path(
+                        conn,
+                        stream,
+                        driver,
+                        request,
+                        send,
+                        diagnostic,
+                        pid,
+                        wire_tx.clone(),
+                        ingress_drops.clone(),
+                        returning.clone(),
+                        forward.clone(),
+                        paths.clone(),
+                        options.policy.receiver_feedback,
+                    ));
                     info!(path=pid,remote=%entrance,interface=interface.unwrap_or("default"),"client path ready");
                 }
                 Ok(Err(error)) => {
@@ -951,7 +998,7 @@ pub async fn client(options: ClientOptions) -> Result<()> {
     tasks.spawn(sender(
         rx,
         paths.clone(),
-        options.policy,
+        options.policy.clone(),
         stop_rx,
         forward.clone(),
     ));
@@ -974,9 +1021,48 @@ pub async fn client(options: ClientOptions) -> Result<()> {
             peers.retain(|_,(id,last)|{if last.elapsed()<Duration::from_secs(60){true}else{reverse.remove(id);false}});
             let p=paths.lock().expect("paths lock");let live=p.iter().filter(|p|p.conn.close_reason().is_none()).count();
             for path in p.iter(){let stats=path.conn.stats();info!(path=path.id,alive=path.conn.close_reason().is_none(),rtt_ms=path.conn.rtt().as_secs_f64()*1000.0,tx_packets=stats.udp_tx.datagrams,rx_packets=stats.udp_rx.datagrams,tx_bytes=stats.udp_tx.bytes,rx_bytes=stats.udp_rx.bytes,lost=stats.path.lost_packets,cwnd=stats.path.cwnd,"path statistics");}
+
+            drop(p);
+            if options.rotate_source_port {
+                let candidates=paths.lock().expect("paths lock").clone();
+                for path in candidates {
+                    let id=usize::from(path.id);let estimate=path.quality.lock().expect("quality lock").snapshot.sender_estimate.clone();
+                    if !rotations[id].consider(&estimate,quality_time(&path),rotation_epoch.elapsed().as_micros() as u64) {continue;}
+                    forward.path(path.id,|p|p.rotation_attempts+=1);
+                    let (remote,interface)=configs[id].clone();let ca=options.ca.clone();let congestion=options.congestion;let name=options.name.clone();let token=token.clone();let sid=sid.clone();let policy=options.policy.clone();let metrics=options.stats.clone();let tx=rejoin_tx.clone();let generation=rand::random::<u64>();
+                    tasks.spawn(async move {
+                        let mut diagnostic=stats::ConnectionTrace::new(metrics,remote,Some(path.id),"quic_connect");
+                        let result:Result<Rejoined>=async {
+                            let endpoint=transport::client(remote,&ca,interface.as_deref(),congestion)?;
+                            let (conn,stream,driver,request,send)=timeout(Duration::from_secs(8),connect_path(&endpoint,remote,&name,&token,&sid,path.id,generation,true,&policy,&mut diagnostic)).await??;
+                            Ok(Rejoined{endpoint,conn,stream,driver,request,send})
+                        }.await;
+                        if let Err(error)=&result {diagnostic.finish(Some(error));}
+                        let _=tx.try_send((path.id,generation,result.map(|value|(value,diagnostic))));
+                    });
+                }
+            }
+
             info!(live,originals=decoder.originals,recovered=decoder.recovered,duplicates=decoder.duplicates,invalid=decoder.invalid,drops,ingress_drops=ingress_drops.load(Ordering::Relaxed),"client statistics");
             ensure!(live>0,"all paths failed; restart creates a fresh session epoch");
         },
+
+        rebuilt=rejoin_rx.recv()=>{
+            if let Some((pid,generation,result))=rebuilt {
+                rotations[usize::from(pid)].finished();
+                match result {
+                    Ok((value,diagnostic))=>{
+                        options.stats.register(&sid,pid,value.stream,stats::FORWARD,&value.conn);
+                        forward.path(pid,|p|{p.local_socket=value.endpoint.local_addr().ok().map(|a|a.to_string());p.rotation_successes+=1;});
+                        {let mut p=paths.lock().expect("paths lock");p.retain(|path|path.id!=pid);p.push(OutPath{id:pid,conn:value.conn.clone(),stream:value.stream,quality:Arc::new(Mutex::new(quality::State::new(generation))),epoch:Instant::now()});}
+                        endpoints.push(value.endpoint);
+                        tasks.spawn(drive_client_path(value.conn,value.stream,value.driver,value.request,value.send,diagnostic,pid,wire_tx.clone(),ingress_drops.clone(),returning.clone(),forward.clone(),paths.clone(),options.policy.receiver_feedback));
+                    },
+                    Err(error)=>{forward.path(pid,|p|p.rotation_failures+=1);warn!(path=pid,error=%error,"path rejoin failed");}
+                }
+            }
+        },
+
         received=socket.recv_from(&mut input)=>{
             let (n,peer)=received?;
             forward.update(|d|d.records.application_received+=1);
@@ -1044,6 +1130,46 @@ pub async fn client(options: ClientOptions) -> Result<()> {
     result
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn drive_client_path(
+    conn: quinn::Connection,
+    stream: u64,
+    mut driver: H3Client,
+    mut request: H3Request,
+    send: H3Send,
+    mut diagnostic: stats::ConnectionTrace,
+    pid: u8,
+    tx: mpsc::Sender<(u8, Bytes)>,
+    ingress_drops: Arc<AtomicU64>,
+    returning: Scope,
+    measurement_scope: Scope,
+    path_view: Paths,
+    feedback: bool,
+) {
+    // Dropping the last SendRequest closes the HTTP/3 connection.
+    let _send = send;
+    let result:Result<()>=async {loop {tokio::select! {
+                        e=driver.wait_idle()=>return Err(e.into()),
+                        body=request.recv_data()=>{let _=body?;return Ok(())},
+                        d=conn.read_datagram()=>match d {
+                            Ok(d)=>{
+                                returning.path(pid,|p|p.http_datagrams_received+=1);
+                                if let Ok(p)=wire::http_payload(&d,stream) && p.len()<=(if feedback{quality::MAX_FRAME}else{wire::MAX_WIRE}) {
+                                    match measured_payload(&path_view,pid,p,feedback,&measurement_scope) {Ok(Some(p))=>{if let Err(error)=tx.try_send((pid,p)){ingress_drops.fetch_add(1,Ordering::Relaxed);queue_error(&returning,QueueLayer::Receiver,&error,Some(pid));}},Ok(None)=>{},Err(_)=>returning.path(pid,|p|p.invalid_http_datagrams_dropped+=1)}
+                                }else{returning.path(pid,|p|p.invalid_http_datagrams_dropped+=1);returning.update(|d|d.records.invalid_symbols_dropped+=1);}
+                            },
+                            Err(e)=>return Err(e.into()),
+                        }
+                    }}}.await;
+    let normal = diagnostic.finish(result.as_ref().err());
+    if normal {
+        info!(context=%diagnostic.context(),"client path closed");
+    } else {
+        warn!(context=%diagnostic.context(),error=?result.err(),"client path ended");
+    }
+    conn.close(0u32.into(), b"path ended");
+}
+
 type H3Client = h3::client::Connection<h3_quinn::Connection, Bytes>;
 type H3Send = h3::client::SendRequest<h3_quinn::OpenStreams, Bytes>;
 type H3Request = h3::client::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>;
@@ -1056,6 +1182,7 @@ async fn connect_path(
     sid: &str,
     pid: u8,
     generation: u64,
+    rejoin: bool,
     policy: &Policy,
     diagnostic: &mut stats::ConnectionTrace,
 ) -> Result<(quinn::Connection, u64, H3Client, H3Request, H3Send)> {
@@ -1105,6 +1232,12 @@ async fn connect_path(
             .header("braidpath-feedback", "1")
             .header("braidpath-generation", generation);
     }
+    if rejoin {
+        req = req.header("braidpath-rejoin", "1");
+    }
+    if policy.quality_schedule {
+        req = req.header("braidpath-scheduler", "quality");
+    }
     let req = req.body(())?;
     let mut stream = send.send_request(req).await?;
     let response = tokio::select! {e=driver.wait_idle()=>bail!("HTTP/3 closed during admission: {e}"),r=stream.recv_response()=>r?};
@@ -1133,6 +1266,14 @@ async fn connect_path(
                 .get("braidpath-feedback")
                 .is_some_and(|v| v == "1"),
         "receiver feedback not negotiated"
+    );
+    ensure!(
+        !policy.quality_schedule
+            || response
+                .headers()
+                .get("braidpath-scheduler")
+                .is_some_and(|v| v == "quality"),
+        "quality scheduling not negotiated"
     );
     diagnostic.admitted();
     Ok((conn, stream.id().into_inner(), driver, stream, send))

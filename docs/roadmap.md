@@ -41,10 +41,12 @@ Current protocol, commands and limits: [experimental runtime](runtime.md). Check
 - [ ] Verify datagram boundaries, PMTU and batching; if TURN is selected, implement its socket adapter, authenticated allocation and refresh lifecycle.
 - [x] Implement explicit Linux interface binding and a default-route mode.
 - [ ] Validate multiple physical interfaces and platform-specific binding independently.
-- [ ] Add session joins, path generations, bounded reconnection and control-operation replay across surviving paths.
+- [x] Add authenticated session joins, path generations and opt-in bounded source-port rejoin; generation replay and old-handler cleanup are validated.
+- [ ] Add general outage reconnection and reliable control-operation replay across surviving paths.
 - [x] Add a round-robin scheduler, bounded queues, per-path transport observations and per-direction aggregate pacing.
 - [x] Add opt-in authenticated receiver feedback with bounded per-path gap and delay-change estimates.
-- [ ] Add delivery-time scheduling and explicit bottleneck-group caps; demonstrate competition fairness.
+- [x] Add opt-in quality weights with nonzero probe shares; keep round robin as the default pending paired field comparisons.
+- [ ] Add explicit bottleneck-group caps and demonstrate competition fairness.
 - [ ] Validate 1×1 → 1×3 → 2×1 → 2×3, including single-interface operation, relay-only operation and path/relay outages.
 
 **Exit gate:** native captures prove both directions use the requested interface/entrance; queues and state remain bounded; the multi-entrance shared-bottleneck competition test passes for the enabled policy. Datagram loss during outage remains visible.

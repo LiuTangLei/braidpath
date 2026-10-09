@@ -107,6 +107,12 @@ enum Command {
 }
 #[derive(Args)]
 struct PolicyArgs {
+    /// Shift symbols toward healthier paths while retaining bounded probes.
+    #[arg(long)]
+    quality_schedule: bool,
+    /// Rejoin a persistently bad path with a fresh source port, at most three times.
+    #[arg(long, requires = "quality_schedule")]
+    rotate_source_port: bool,
     /// Report per-path receiver quality; data scheduling remains round robin.
     #[arg(long)]
     receiver_feedback: bool,
@@ -179,9 +185,11 @@ pub async fn run() -> Result<()> {
                 ca,
                 token: token_file,
                 congestion,
+                rotate_source_port: policy.rotate_source_port,
                 policy: tunnel::Policy {
                     fec: policy.fec,
-                    receiver_feedback: policy.receiver_feedback,
+                    receiver_feedback: policy.receiver_feedback || policy.quality_schedule,
+                    quality_schedule: policy.quality_schedule,
                     redundancy: policy.redundancy_percent,
                     rate: policy.rate_bps,
                     block_ms: policy.block_ms,
