@@ -511,7 +511,7 @@ fn report(
         "loss_denominator":if echo {"successfully sent operations"}else{"configured sender count; reconcile with sender result"},
         "late_definition":if echo {"received RTT above deadline"}else{"received relative one-way delay above deadline"},
         "requested_offered_load_bps":f64::from(w.pps)*(w.size*8)as f64,
-        "actual_offered_load_bps":state.actual_span.filter(|v|*v>0.).map(|span|f64::from(state.sent)*(w.size*8)as f64/span),
+        "actual_offered_load_bps":state.actual_span.filter(|v|*v>0. && state.sent>1).map(|span|f64::from(state.sent-1)*(w.size*8)as f64/span),
     });
     if delivery {
         let mut values = delays(&state.samples, echo);
@@ -849,6 +849,47 @@ mod tests {
         window.progress(11, &w, late);
         assert!(!window.end(&w, late));
         assert_eq!(window.until, until);
+    }
+
+    #[test]
+    fn actual_offered_load_uses_successful_send_intervals() {
+        let mut w = receive_workload();
+        w.count = 100;
+        let mut state = State::new(w.count);
+        // Partial send: use the actual successful sends, not configured count.
+        state.sent = 3;
+        state.actual_span = Some(0.01);
+        let sender = report(
+            ("probe", "send", "client_to_server"),
+            &w,
+            &state,
+            1.,
+            false,
+            false,
+        );
+        assert_eq!(sender["actual_offered_load_bps"], json!(160_000.));
+        let receiver = report(
+            ("sink", "receive", "client_to_server"),
+            &w,
+            &state,
+            1.,
+            true,
+            false,
+        );
+        assert_eq!(receiver["actual_offered_load_bps"], Value::Null);
+        for (sent, span) in [(0, Some(0.01)), (1, Some(0.01)), (3, Some(0.)), (3, None)] {
+            state.sent = sent;
+            state.actual_span = span;
+            let value = report(
+                ("probe", "send", "client_to_server"),
+                &w,
+                &state,
+                1.,
+                false,
+                false,
+            );
+            assert_eq!(value["actual_offered_load_bps"], Value::Null);
+        }
     }
 
     #[test]
