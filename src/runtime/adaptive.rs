@@ -219,6 +219,7 @@ pub enum RateReason {
     KnownServiceRecovery,
     CautiousGrowth,
     ServiceDiscovery,
+    GrowthWithdrawalBrake,
     QueueBrake,
     DeliveryShortfallBrake,
     FastLossBrake,
@@ -302,6 +303,122 @@ pub struct ServiceAdmission {
     pub deficit: bool,
 }
 
+#[derive(Clone, Debug, Serialize)]
+pub struct GrowthMonitorReply {
+    /// Quality's authenticated, deduplicated reply count, not a wire nonce.
+    pub sample_id: u64,
+    pub observed_us: u64,
+    pub age_us: u64,
+    pub inferred_request_us: u64,
+    pub rtt_ms: f64,
+}
+
+/// Two observations of one actual ordinary increase, not a capacity estimate.
+#[derive(Clone, Debug, Serialize)]
+pub struct GrowthMonitor {
+    pub generation: u64,
+    pub armed_us: u64,
+    pub latest_observed_us: u64,
+    pub previous_bps: u64,
+    pub pacing_bps: u64,
+    pub last_probe_sample_id: u64,
+    pub successful_request_us: [Option<u64>; 2],
+    pub first_reply: Option<GrowthMonitorReply>,
+    pub second_reply: Option<GrowthMonitorReply>,
+    pub withdrawn: bool,
+}
+
+impl GrowthMonitor {
+    fn arm(sample: &Observation, previous_bps: u64, pacing_bps: u64) -> Self {
+        Self {
+            generation: sample.generation,
+            armed_us: sample.now_us,
+            latest_observed_us: sample.now_us,
+            previous_bps,
+            pacing_bps,
+            last_probe_sample_id: sample.probe_sample_id,
+            successful_request_us: [None, None],
+            first_reply: None,
+            second_reply: None,
+            withdrawn: false,
+        }
+    }
+
+    fn live_at(&self, now_us: u64) -> bool {
+        now_us
+            .checked_sub(self.armed_us)
+            .is_some_and(|age| age <= FRESH_US)
+    }
+
+    fn request_due(&self, now_us: u64) -> bool {
+        self.live_at(now_us)
+            && now_us >= self.latest_observed_us
+            && now_us >= self.armed_us.saturating_add(FAST_PROBE_US)
+            && self.successful_request_us[1].is_none()
+    }
+
+    fn probe_admitted(&mut self, now_us: u64) {
+        if !self.live_at(now_us)
+            || now_us < self.latest_observed_us
+            || now_us < self.armed_us.saturating_add(FAST_PROBE_US)
+        {
+            return;
+        }
+        if self.successful_request_us[0].is_none() {
+            self.successful_request_us[0] = Some(now_us);
+        } else if self.successful_request_us[0]
+            .is_some_and(|first| now_us >= first.saturating_add(FAST_PROBE_US))
+            && self.successful_request_us[1].is_none()
+        {
+            self.successful_request_us[1] = Some(now_us);
+        }
+    }
+
+    fn observe(&mut self, sample: &Observation, probe_rtt_ms: f64) -> bool {
+        if sample.generation != self.generation
+            || !self.live_at(sample.now_us)
+            || sample
+                .now_us
+                .checked_sub(self.latest_observed_us)
+                .is_none_or(|gap| gap > FRESH_US)
+            || sample.probe_sample_id < self.last_probe_sample_id
+        {
+            return false;
+        }
+        self.latest_observed_us = sample.now_us;
+        if sample.probe_sample_id > self.last_probe_sample_id {
+            self.last_probe_sample_id = sample.probe_sample_id;
+            if let Some(age_us) = sample.probe_age_us.filter(|age| *age <= CONTROL_US)
+                && let Some(request_us) = sample
+                    .now_us
+                    .checked_sub(age_us)
+                    .and_then(|at| at.checked_sub((probe_rtt_ms * 1000.0).ceil() as u64))
+                && request_us >= self.armed_us.saturating_add(FAST_PROBE_US)
+                && self.successful_request_us[0].is_some()
+                && self.first_reply.as_ref().is_none_or(|first| {
+                    sample.probe_sample_id > first.sample_id
+                        && request_us > first.inferred_request_us
+                })
+            {
+                // A skipped reply counter contributes only this visible reply.
+                let reply = GrowthMonitorReply {
+                    sample_id: sample.probe_sample_id,
+                    observed_us: sample.now_us,
+                    age_us,
+                    inferred_request_us: request_us,
+                    rtt_ms: probe_rtt_ms,
+                };
+                if self.first_reply.is_none() {
+                    self.first_reply = Some(reply);
+                } else if self.successful_request_us[1].is_some() {
+                    self.second_reply = Some(reply);
+                }
+            }
+        }
+        true
+    }
+}
+
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct ControlSample {
     pub at_us: u64,
@@ -349,6 +466,9 @@ pub struct ControlSample {
     /// Actual one-use restoration from the latest qualified post-brake service.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub drain_service_target_bps: Option<u64>,
+    /// Actual two-reply evidence for the latest ordinary growth increment.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub growth_monitor: Option<GrowthMonitor>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub startup_probe_excess_ms: Option<f64>,
     pub ordinary_loss_pressure: bool,
@@ -455,6 +575,7 @@ pub struct PathController {
     /// the report and its cumulative positive bytes must advance for another.
     last_initial_growth_report: Option<(u64, u64)>,
     initial_delivery_credit: Option<InitialDeliveryCredit>,
+    growth_monitor: Option<GrowthMonitor>,
     last_growth_probe: Option<u64>,
     fast_feedback_seen: bool,
     fast_probe_min_rtt_ms: Option<f64>,
@@ -524,6 +645,7 @@ impl PathController {
             last_growth_us: 0,
             last_initial_growth_report: None,
             initial_delivery_credit: None,
+            growth_monitor: None,
             last_growth_probe: None,
             fast_feedback_seen: false,
             fast_probe_min_rtt_ms: None,
@@ -991,6 +1113,7 @@ impl PathController {
             service_sample_span_us: service_sample.map(|sample| sample.span_us),
             service_admission: None,
             drain_service_target_bps: None,
+            growth_monitor: None,
             startup_probe_excess_ms: startup_probe_excess,
             ordinary_loss_pressure: self.loss_pressure,
             fast_loss,
@@ -1284,25 +1407,52 @@ impl PathController {
                 } else {
                     RateReason::LossBrake
                 };
-                self.last_brake_us = Some(now);
-                self.last_brake_admitted_symbols = self
-                    .fast_feedback_seen
-                    .then_some(observation.admitted_symbols)
-                    .flatten()
-                    .filter(|admitted| {
-                        self.last_brake_admitted_symbols
-                            .is_none_or(|boundary| *admitted >= boundary)
-                            && observation
-                                .finalized_expected
-                                .zip(observation.finalized_lost)
-                                .is_some_and(|(expected, lost)| {
-                                    lost <= expected && expected <= *admitted
-                                })
-                    });
-                self.growth_not_before_us = now.saturating_add(RETRY_GROWTH_US);
+                self.record_brake(observation);
             }
         }
 
+        // Independent brakes have already run. Only the still-owned increment
+        // can be withdrawn; small queue changes leave its second observation due.
+        let mut monitor_withdrawn = false;
+        if !self.fast_feedback_seen
+            || !self.congestion_seen
+            || !self.eligible
+            || !observation.offered_backlog
+            || !observation_contiguous
+            || !fresh
+            || !probe_fresh
+            || self.rate_bps != previous_rate
+            || self.rate_bps != rate_before_refill
+            || self.growth_monitor.as_mut().is_some_and(|monitor| {
+                monitor.pacing_bps != self.rate_bps
+                    || !monitor.observe(observation, probe_rtt.unwrap_or(f64::INFINITY))
+            })
+        {
+            self.growth_monitor = None;
+        }
+        if self
+            .growth_monitor
+            .as_ref()
+            .is_some_and(|monitor| monitor.second_reply.is_some())
+        {
+            let mut monitor = self.growth_monitor.take().unwrap();
+            let rising = monitor
+                .first_reply
+                .as_ref()
+                .zip(monitor.second_reply.as_ref())
+                .is_some_and(|(first, second)| second.rtt_ms > first.rtt_ms + 0.25);
+            if rising && self.queue_delay_ms > self.target_ms * 0.25 {
+                self.rate_bps = monitor.previous_bps;
+                rate_reason = RateReason::GrowthWithdrawalBrake;
+                monitor.withdrawn = true;
+                monitor_withdrawn = true;
+                self.record_brake(observation);
+            }
+            self.last_control.growth_monitor = Some(monitor);
+        } else {
+            self.last_control.growth_monitor = self.growth_monitor.clone();
+        }
+        let mut ordinary_growth = false;
         let unused_growth_probe = probe_fresh
             && observation
                 .probe_age_us
@@ -1337,7 +1487,8 @@ impl PathController {
         };
         let elapsed = now.saturating_sub(self.last_control_us);
         if elapsed >= CONTROL_US {
-            if fresh
+            if !monitor_withdrawn
+                && fresh
                 && self.eligible
                 && !pressure
                 && !protect_ordinary_loss
@@ -1396,6 +1547,7 @@ impl PathController {
                     };
                     let restored = (drain * 0.9).min(self.maximum_bps as f64).min(ceiling) as u64;
                     if restored > self.rate_bps {
+                        ordinary_growth = true;
                         self.rate_bps = restored;
                         rate_reason = RateReason::KnownServiceRecovery;
                         self.last_growth_us = now;
@@ -1405,7 +1557,8 @@ impl PathController {
                     self.drain_restore_pending = false;
                 }
             }
-            if fresh
+            if !monitor_withdrawn
+                && fresh
                 && self.eligible
                 && !pressure
                 && !protect_ordinary_loss
@@ -1496,6 +1649,7 @@ impl PathController {
                     self.rate_bps = ((self.rate_bps as f64 * gain).min(ceiling) as u64)
                         .max(self.rate_bps)
                         .min(self.maximum_bps);
+                    ordinary_growth |= self.rate_bps > before_growth;
                     rate_reason = if !self.congestion_seen {
                         if self.rate_bps > before_growth || !self.fast_feedback_seen {
                             let supporting_report = if short_delivery_interval
@@ -1544,6 +1698,17 @@ impl PathController {
         }
         self.rate_bps = self.rate_bps.min(self.maximum_bps).max(1);
         self.record_rate_change(now, previous_rate, rate_reason);
+        if ordinary_growth
+            && self.rate_bps > previous_rate
+            && self.fast_feedback_seen
+            && self.congestion_seen
+        {
+            self.growth_monitor = Some(GrowthMonitor::arm(
+                observation,
+                previous_rate,
+                self.rate_bps,
+            ));
+        }
         self.last_probe_sample_id = observation.probe_sample_id;
         self.last_rtt_ms = rtt;
         self.last_local_rtt_ms = local_rtt;
@@ -1593,12 +1758,10 @@ impl PathController {
             || self.queue_delay_ms > self.target_ms * 0.25
             || self.last_control.transport_blocked
             || self.reprobe.active()
-            || self.rate_changes.back().is_some_and(|change| {
-                change.pacing_bps > change.previous_bps
-                    && now_us
-                        .checked_sub(change.at_us)
-                        .is_some_and(|age| age < CONTROL_US)
-            });
+            || self
+                .growth_monitor
+                .as_ref()
+                .is_some_and(|monitor| monitor.request_due(now_us));
         let phase_repair = active
             && self.congestion_seen
             && now_us >= self.last_control.at_us
@@ -1713,6 +1876,9 @@ impl PathController {
 
     pub fn probe_admitted(&mut self, now_us: u64) {
         self.last_probe_us = Some(now_us);
+        if let Some(monitor) = self.growth_monitor.as_mut() {
+            monitor.probe_admitted(now_us);
+        }
     }
 
     pub fn reprobe_candidate(&self, now_us: u64) -> Option<ReprobeRequest> {
@@ -1750,11 +1916,29 @@ impl PathController {
         self.reprobe.active()
     }
 
+    fn record_brake(&mut self, observation: &Observation) {
+        self.last_brake_us = Some(observation.now_us);
+        self.last_brake_admitted_symbols = self
+            .fast_feedback_seen
+            .then_some(observation.admitted_symbols)
+            .flatten()
+            .filter(|admitted| {
+                self.last_brake_admitted_symbols
+                    .is_none_or(|boundary| *admitted >= boundary)
+                    && observation
+                        .finalized_expected
+                        .zip(observation.finalized_lost)
+                        .is_some_and(|(expected, lost)| lost <= expected && expected <= *admitted)
+            });
+        self.growth_not_before_us = observation.now_us.saturating_add(RETRY_GROWTH_US);
+    }
+
     fn record_rate_change(&mut self, now_us: u64, previous_bps: u64, reason: RateReason) {
         if previous_bps == self.rate_bps {
             return;
         }
         self.initial_delivery_credit = None;
+        self.growth_monitor = None;
         self.rate_changes_total = self.rate_changes_total.saturating_add(1);
         if self.rate_changes.len() == 16 {
             self.rate_changes.pop_front();
@@ -1897,6 +2081,341 @@ mod tests {
             500_000
         );
         (controller, sample)
+    }
+
+    fn monitored_growth_034() -> (PathController, Observation) {
+        let (mut controller, sample) = service_endpoint_032();
+        let sample = admitted_report_026(&mut controller, &sample, 600_000, u64::MAX);
+        controller.observe(&sample);
+        assert_eq!(controller.rate_bps, 368_640);
+        let monitor = controller.growth_monitor.as_ref().unwrap();
+        assert_eq!(
+            (monitor.previous_bps, monitor.pacing_bps),
+            (307_200, 368_640)
+        );
+        assert_eq!(monitor.armed_us, 600_000);
+        assert!(!controller.drain_restore_pending);
+        (controller, sample)
+    }
+
+    fn monitor_reply_034(
+        controller: &mut PathController,
+        previous: &Observation,
+        now: u64,
+        rtt_ms: f64,
+        request_us: u64,
+    ) -> Observation {
+        let mut sample = admitted_report_026(controller, previous, now, u64::MAX);
+        // This fixture uses the actual probe source, without a synthetic Quinn
+        // RTT that could mask its queue in the selected minimum.
+        sample.rtt_ms = 0.0;
+        sample.probe_rtt_ms = Some(rtt_ms);
+        sample.probe_latest_rtt_ms = Some(rtt_ms);
+        sample.probe_age_us = Some(now - request_us - (rtt_ms * 1000.0).ceil() as u64);
+        sample
+    }
+
+    fn first_monitored_reply_034(rtt_ms: f64) -> (PathController, Observation) {
+        let (mut controller, sample) = monitored_growth_034();
+        controller.probe_admitted(600_000);
+        assert_eq!(
+            controller
+                .growth_monitor
+                .as_ref()
+                .unwrap()
+                .successful_request_us,
+            [None, None]
+        );
+        let mut held = admitted_report_026(&mut controller, &sample, 700_000, u64::MAX);
+        held.probe_sample_id = sample.probe_sample_id;
+        held.probe_age_us = Some(100_000);
+        controller.observe(&held);
+        controller.probe_admitted(700_000);
+        let sample = monitor_reply_034(&mut controller, &held, 800_000, rtt_ms, 700_000);
+        controller.observe(&sample);
+        assert_eq!(controller.rate_bps, 368_640);
+        let monitor = controller.growth_monitor.as_ref().unwrap();
+        assert!(monitor.first_reply.is_some());
+        assert!(monitor.second_reply.is_none());
+        controller.probe_admitted(800_000);
+        (controller, sample)
+    }
+
+    #[test]
+    fn growth_monitor_034_withdraws_only_its_increment_after_original_brakes() {
+        let (mut controller, sample) = first_monitored_reply_034(84.0);
+        assert_eq!(
+            controller.queue_delay_ms, 4.0,
+            "first rise retains monitoring"
+        );
+        let remembered = controller.remembered_bps;
+        let draining = controller.draining_bps;
+        let count = controller.rate_changes_total;
+        let sample = monitor_reply_034(&mut controller, &sample, 900_000, 86.0, 800_000);
+        controller.observe(&sample);
+        assert_eq!(controller.rate_bps, 307_200);
+        assert_eq!(controller.rate_changes_total, count + 1);
+        assert!(matches!(
+            controller.rate_changes.back().unwrap().reason,
+            RateReason::GrowthWithdrawalBrake
+        ));
+        assert_eq!(controller.last_brake_us, Some(900_000));
+        assert_eq!(
+            controller.last_brake_admitted_symbols,
+            sample.admitted_symbols
+        );
+        assert_eq!(controller.growth_not_before_us, 900_000 + RETRY_GROWTH_US);
+        assert_eq!(controller.last_growth_us, 600_000);
+        assert_eq!(controller.remembered_bps, remembered);
+        assert_eq!(controller.draining_bps, draining);
+        assert!(!controller.drain_restore_pending);
+        let evidence = controller.last_control.growth_monitor.as_ref().unwrap();
+        assert!(evidence.withdrawn);
+        assert_eq!(
+            evidence.first_reply.as_ref().unwrap().inferred_request_us,
+            700_000
+        );
+        assert_eq!(
+            evidence.second_reply.as_ref().unwrap().inferred_request_us,
+            800_000
+        );
+        assert!(controller.growth_monitor.is_none());
+        controller.observe(&sample);
+        assert_eq!(controller.rate_bps, 307_200);
+        assert_eq!(controller.rate_changes_total, count + 1);
+        assert!(controller.last_control.growth_monitor.is_none());
+        controller.probe_admitted(900_000);
+        let clear = monitor_reply_034(&mut controller, &sample, 1_000_000, 80.0, 900_000);
+        controller.observe(&clear);
+        assert_eq!(
+            controller.rate_bps, 307_200,
+            "cooldown prevents immediate re-increase"
+        );
+
+        let (mut controller, sample) = first_monitored_reply_034(95.0);
+        let previous = controller.growth_monitor.as_ref().unwrap().previous_bps;
+        let sample = monitor_reply_034(&mut controller, &sample, 900_000, 100.0, 800_000);
+        controller.observe(&sample);
+        assert!(
+            controller.rate_bps < previous,
+            "original queue brake may reduce further"
+        );
+        assert!(matches!(
+            controller.rate_changes.back().unwrap().reason,
+            RateReason::QueueBrake
+        ));
+        assert_eq!(controller.last_brake_us, Some(900_000));
+        assert!(controller.growth_monitor.is_none());
+        assert!(
+            controller.last_control.growth_monitor.is_none(),
+            "never undo the original brake"
+        );
+    }
+
+    #[test]
+    fn growth_monitor_034_keeps_small_rises_and_releases_completed_samples() {
+        for (first, second) in [(80.2, 84.9), (85.5, 85.75), (86.0, 85.5)] {
+            let (mut controller, sample) = first_monitored_reply_034(first);
+            let count = controller.rate_changes_total;
+            let sample = monitor_reply_034(&mut controller, &sample, 900_000, second, 800_000);
+            controller.observe(&sample);
+            assert_eq!(controller.rate_bps, 368_640, "{first} -> {second}");
+            assert_eq!(controller.rate_changes_total, count);
+            let evidence = controller.last_control.growth_monitor.as_ref().unwrap();
+            assert!(evidence.second_reply.is_some());
+            assert!(!evidence.withdrawn);
+            assert!(controller.growth_monitor.is_none());
+            controller.observe(&sample);
+            assert!(controller.last_control.growth_monitor.is_none());
+        }
+    }
+
+    #[test]
+    fn growth_monitor_034_bounds_requests_and_actual_reply_evidence() {
+        let (mut controller, sample) = monitored_growth_034();
+        controller.probe_admitted(600_000);
+        assert_eq!(
+            controller
+                .growth_monitor
+                .as_ref()
+                .unwrap()
+                .successful_request_us,
+            [None, None]
+        );
+        for _ in 0..2 {
+            assert!(controller.decision(700_000).probe_due);
+            assert_eq!(controller.last_probe_us, Some(600_000));
+            assert_eq!(
+                controller
+                    .growth_monitor
+                    .as_ref()
+                    .unwrap()
+                    .successful_request_us,
+                [None, None]
+            );
+        }
+        controller.probe_admitted(700_000);
+        let mut spacing = controller.growth_monitor.clone().unwrap();
+        spacing.probe_admitted(799_999);
+        assert_eq!(spacing.successful_request_us, [Some(700_000), None]);
+        spacing.probe_admitted(800_000);
+        spacing.probe_admitted(900_000);
+        assert_eq!(
+            spacing.successful_request_us,
+            [Some(700_000), Some(800_000)]
+        );
+        assert!(!controller.decision(799_999).probe_due);
+        assert!(controller.decision(800_000).probe_due);
+        controller.probe_admitted(800_000);
+        for now in [900_000, 1_299_999] {
+            assert!(
+                !controller.decision(now).probe_due,
+                "missing reply at {now}"
+            );
+        }
+        assert!(
+            controller.decision(1_300_000).probe_due,
+            "health deadline is independent"
+        );
+
+        // Start from the monitor armed by a real increase. Component evidence
+        // isolates authenticated visible reply ids from unrelated control ticks.
+        let mut monitor = controller.growth_monitor.clone().unwrap();
+        let mut reply = sample.clone();
+        reply.now_us = 800_000;
+        reply.probe_sample_id += 2;
+        reply.probe_age_us = Some(16_000);
+        assert!(monitor.observe(&reply, 84.0));
+        assert_eq!(
+            monitor.first_reply.as_ref().unwrap().sample_id,
+            reply.probe_sample_id
+        );
+        assert!(
+            monitor.second_reply.is_none(),
+            "a skipped id is only one visible reply"
+        );
+        assert!(monitor.observe(&reply, 84.0));
+        assert!(monitor.second_reply.is_none(), "duplicate id");
+        reply.now_us = 900_000;
+        reply.probe_sample_id += 1;
+        reply.probe_age_us = Some(116_000);
+        assert!(monitor.observe(&reply, 84.0));
+        assert!(
+            monitor.second_reply.is_none(),
+            "same inferred request origin"
+        );
+        reply.now_us = 1_000_000;
+        reply.probe_sample_id += 1;
+        reply.probe_age_us = Some(114_000);
+        assert!(monitor.observe(&reply, 86.0));
+        let first = monitor.first_reply.as_ref().unwrap();
+        assert!(first.age_us + reply.now_us - first.observed_us > CONTROL_US);
+        assert_eq!(first.inferred_request_us, 700_000);
+        assert_eq!(
+            monitor.second_reply.as_ref().unwrap().inferred_request_us,
+            800_000
+        );
+
+        let mut unrenewed = controller.growth_monitor.clone().unwrap();
+        let mut held = sample;
+        held.now_us = unrenewed.armed_us + FRESH_US;
+        assert!(unrenewed.observe(&held, 80.0));
+        held.now_us += 1;
+        assert!(
+            !unrenewed.observe(&held, 80.0),
+            "observation cannot renew the fixed lifetime"
+        );
+    }
+
+    #[test]
+    fn growth_monitor_034_releases_lifecycle_without_blocking_growth() {
+        for invalid in ["idle", "probe", "clock", "gap", "generation"] {
+            let (mut controller, mut sample) = monitored_growth_034();
+            match invalid {
+                "idle" => sample.offered_backlog = false,
+                "probe" => sample.probe_age_us = Some(FRESH_US + 1),
+                "clock" => sample.now_us -= 1,
+                "gap" => sample.now_us += FRESH_US + 1,
+                "generation" => sample.generation += 1,
+                _ => unreachable!(),
+            }
+            controller.observe(&sample);
+            assert!(controller.growth_monitor.is_none(), "{invalid}");
+            assert!(
+                controller.last_control.growth_monitor.is_none(),
+                "{invalid}"
+            );
+        }
+        let (mut controller, _) = monitored_growth_034();
+        let before = controller.rate_bps;
+        controller.record_rate_change(700_000, before, RateReason::CautiousGrowth);
+        assert_eq!(
+            controller.growth_monitor.as_ref().unwrap().armed_us,
+            600_000,
+            "no-op does not renew"
+        );
+        controller.rate_bps -= 1;
+        controller.record_rate_change(700_000, before, RateReason::ReprobeRollback);
+        assert!(
+            controller.growth_monitor.is_none(),
+            "any actual recorded pace change releases ownership"
+        );
+
+        let (mut controller, mut sample) = monitored_growth_034();
+        let reply_id = sample.probe_sample_id;
+        for now in [700_000, 800_000, 900_000] {
+            sample = admitted_report_026(&mut controller, &sample, now, u64::MAX);
+            sample.probe_sample_id = reply_id;
+            sample.probe_age_us = Some(now - 600_000);
+            controller.observe(&sample);
+        }
+        controller.probe_admitted(900_000);
+        sample = monitor_reply_034(&mut controller, &sample, 1_000_000, 80.0, 900_000);
+        controller.observe(&sample);
+        assert_eq!(
+            controller.rate_bps, 442_368,
+            "next qualified endpoint need not wait for the second reply"
+        );
+        let evidence = controller.last_control.growth_monitor.as_ref().unwrap();
+        assert_eq!(evidence.armed_us, 600_000);
+        assert!(evidence.first_reply.is_some());
+        assert!(evidence.second_reply.is_none());
+        let current = controller.growth_monitor.as_ref().unwrap();
+        assert_eq!(current.armed_us, 1_000_000);
+        assert_eq!(current.successful_request_us, [None, None]);
+
+        let (mut controller, sample) = initial_credit_026(20_000_000);
+        let next = admitted_report_026(&mut controller, &sample, 400_000, u64::MAX);
+        controller.observe(&next);
+        assert_eq!(controller.rate_bps, 368_640);
+        assert!(
+            controller.growth_monitor.is_none(),
+            "initial search is unchanged"
+        );
+
+        let mut controller = PathController::new(20_000_000, 20);
+        controller.observe(&observation(0, 80.0));
+        controller.rate_bps = 500_000;
+        controller.remembered_bps = 4_000_000.0;
+        controller.congestion_seen = true;
+        exercise_budget(&mut controller, 0, CONTROL_US);
+        controller.observe(&observation(CONTROL_US, 80.0));
+        assert_eq!(controller.rate_bps, 625_000);
+        assert!(
+            controller.growth_monitor.is_none(),
+            "legacy growth is unchanged"
+        );
+
+        let (mut controller, sample) = draining_service_029(0, 1_000_000);
+        controller.observe(&sample);
+        assert_eq!(
+            controller.last_control.drain_service_target_bps,
+            Some(controller.rate_bps)
+        );
+        assert!(
+            controller.growth_monitor.is_none(),
+            "independent measured restoration is not armed"
+        );
     }
 
     #[test]
@@ -2068,7 +2587,7 @@ mod tests {
         // fixture. A request on the growth tick is only a safety observation.
         controller.probe_admitted(100_000);
         assert!(!controller.decision(199_999).probe_due);
-        assert!(controller.decision(200_000).probe_due);
+        assert!(!controller.decision(200_000).probe_due);
         controller.probe_admitted(200_000);
         assert!(!controller.decision(299_999).probe_due);
         assert!(controller.decision(300_000).probe_due);
@@ -2089,7 +2608,7 @@ mod tests {
             controller.congestion_seen = true;
             controller.remembered_bps = controller.rate_bps as f64;
             controller.probe_admitted(250_000);
-            assert!(controller.decision(350_000).probe_due);
+            assert!(!controller.decision(350_000).probe_due);
             let previous = controller.rate_bps;
             controller.rate_bps -= 1;
             controller.record_rate_change(300_000, previous, reason);
@@ -2104,7 +2623,7 @@ mod tests {
         controller.rate_bps += 1;
         controller.record_rate_change(350_000, previous, RateReason::CautiousGrowth);
         assert!(!controller.decision(340_000).probe_due, "future change");
-        assert!(controller.decision(350_000).probe_due);
+        assert!(!controller.decision(350_000).probe_due);
         controller.last_control.offered_backlog = false;
         assert!(!controller.decision(350_000).probe_due, "idle");
         controller.last_control.offered_backlog = true;
@@ -2120,7 +2639,7 @@ mod tests {
             controller.congestion_seen = true;
             controller.remembered_bps = controller.rate_bps as f64 * 2.0;
             controller.probe_admitted(100_000);
-            assert!(controller.decision(200_000).probe_due);
+            assert!(!controller.decision(200_000).probe_due);
             controller.probe_admitted(200_000);
             let previous = controller.rate_bps;
             let used = controller.last_growth_probe;
@@ -2497,9 +3016,10 @@ mod tests {
             "rejected request keeps its opportunity"
         );
         controller.probe_admitted(700_000);
-        for now in [800_000, 900_000, 1_199_999] {
-            assert!(
-                !controller.decision(now).probe_due,
+        for (now, due) in [(800_000, true), (900_000, false), (1_199_999, false)] {
+            assert_eq!(
+                controller.decision(now).probe_due,
+                due,
                 "missing reply at {now}"
             );
         }
