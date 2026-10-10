@@ -652,6 +652,7 @@ pub struct PathController {
     delay_since_us: Option<u64>,
     braked_queue_ms: Option<f64>,
     last_report: Option<(u64, u64, u64)>,
+    last_positive_report_us: Option<u64>,
     delivery_bps: Option<f64>,
     latest_delivery_bps: Option<f64>,
     service_window: service::Window,
@@ -723,6 +724,7 @@ impl PathController {
             delay_since_us: None,
             braked_queue_ms: None,
             last_report: None,
+            last_positive_report_us: None,
             delivery_bps: None,
             latest_delivery_bps: None,
             service_window: service::Window::default(),
@@ -856,6 +858,11 @@ impl PathController {
                 .is_some_and(|rate| rate.is_finite() && rate > 0.0);
         let mut new_service_report = false;
         if new_report {
+            if observation.delivered_bytes > previous_report.map_or(0, |(_, bytes, _)| bytes) {
+                self.last_positive_report_us = observation
+                    .positive_delivery_age_us
+                    .and_then(|age| now.checked_sub(age));
+            }
             if !self.fast_feedback_seen && short_delivery_interval && !self.pressure_episode_braked
             {
                 // Do not import a legacy transient's provisional flag when
@@ -2356,10 +2363,10 @@ impl PathController {
                 })
     }
 
-    /// Ordinary busy discovery already measures business service. Keep one low
-    /// pilot allowance per group until loss, a paired delivery deficit or lost
-    /// eligibility calls for independent data measurement. Idle measurement and
-    /// expired observations keep their separate allowance.
+    /// Complete busy business delivery already measures current service. Hold
+    /// redundant data probes while that evidence stays young; otherwise retain
+    /// the low pilot or the separately requested independent measurement budget.
+    /// Health requests have their own schedule, including while this is zero.
     pub fn independent_probe_ceiling(
         &self,
         now_us: u64,
@@ -2371,6 +2378,32 @@ impl PathController {
             .is_some_and(|age| age <= CONTROL_US);
         let needs_measurement = self.independent_probe_fast_feedback(now_us);
         if current && self.last_control.offered_backlog && !needs_measurement {
+            let business_measured = !self.last_control.transport_blocked
+                && self
+                    .last_positive_report_us
+                    .is_some_and(|at| now_us.checked_sub(at).is_some_and(|age| age <= CONTROL_US))
+                && self
+                    .service_window
+                    .discovery_with_counts(now_us, 8, 1)
+                    .is_some_and(|sample| {
+                        now_us
+                            .checked_sub(sample.observed_us)
+                            .is_some_and(|age| age <= CONTROL_US)
+                            && sample.admission.is_some_and(|sent| {
+                                sent.bps > 0.0
+                                    && sample.bps >= sent.bps * 0.85
+                                    && self
+                                        .backlog_since_us
+                                        .is_some_and(|since| since <= sent.started_us)
+                                    && self
+                                        .demand_activity
+                                        .since_us
+                                        .is_some_and(|since| since <= sent.started_us)
+                            })
+                    });
+            if business_measured {
+                return 0;
+            }
             configured.min(MIN_BPS / group_paths.max(1) as u64)
         } else {
             configured
@@ -7674,8 +7707,129 @@ mod tests {
         assert!(!healthy.independent_probe_fast_feedback(sample.now_us));
         assert_eq!(
             healthy.independent_probe_ceiling(sample.now_us, 4_375_000, 4),
-            MIN_BPS / 4
+            0
         );
+    }
+
+    fn busy_business_measurement_070() -> (PathController, Observation) {
+        let mut controller = PathController::new(START_BPS, 20);
+        let mut sample = short_observation_022(0, 80.0);
+        sample.delivered_bytes = 0;
+        sample.delivered_bps = Some(0.0);
+        sample.admitted_symbol_bytes = Some(0);
+        sample.admitted_symbols = Some(0);
+        sample.finalized_expected = Some(0);
+        sample.finalized_lost = Some(0);
+        controller.observe(&sample);
+        controller.tokens = 0.0;
+        for now in (100_000..=500_000).step_by(100_000) {
+            controller.probe_admitted(now - 100_000);
+            sample = wire_admitted_report_060(&mut controller, &sample, now);
+            sample.probe_age_us = Some(20_000);
+            sample.finalized_expected = sample.admitted_symbols;
+            sample.finalized_lost = Some(0);
+            controller.observe(&sample);
+            if now < 500_000 {
+                assert_eq!(
+                    controller.independent_probe_ceiling(now, 4_375_000, 4),
+                    MIN_BPS / 4
+                );
+            }
+        }
+        (controller, sample)
+    }
+
+    #[test]
+    fn complete_busy_delivery_releases_redundant_probe_data_but_keeps_health_requests() {
+        let (mut controller, sample) = busy_business_measurement_070();
+        let paired = controller
+            .service_window
+            .discovery_with_counts(500_000, 8, 1)
+            .unwrap();
+        assert!(paired.bps >= paired.admission.unwrap().bps * 0.85);
+        assert_eq!(
+            controller.independent_probe_ceiling(500_000, 4_375_000, 4),
+            0,
+            "a complete busy business measurement must not also reserve redundant probe-data traffic"
+        );
+        assert!(
+            controller.decision(500_000).probe_due,
+            "health requests remain independent"
+        );
+        let mut loss = wire_admitted_report_060(&mut controller, &sample, 600_000);
+        loss.finalized_expected = loss.admitted_symbols;
+        loss.finalized_lost = Some(1);
+        loss.delivered_bytes -= 1025;
+        controller.observe(&loss);
+        assert_eq!(
+            controller.independent_probe_ceiling(600_000, 4_375_000, 4),
+            4_375_000,
+            "observed loss restores independent measurement immediately"
+        );
+    }
+
+    #[test]
+    fn busy_measurement_cannot_hide_stale_idle_blocked_or_missing_evidence() {
+        for invalid in [
+            "idle",
+            "blocked",
+            "old_positive",
+            "missing_sender",
+            "generation",
+            "shortfall",
+        ] {
+            let (mut controller, sample) = busy_business_measurement_070();
+            let mut next = wire_admitted_report_060(&mut controller, &sample, 600_000);
+            next.finalized_expected = next.admitted_symbols;
+            next.finalized_lost = Some(0);
+            match invalid {
+                "idle" => next.offered_backlog = false,
+                "blocked" => next.transport_blocked = true,
+                "old_positive" => next.positive_delivery_age_us = Some(CONTROL_US + 1),
+                "missing_sender" => next.admitted_symbol_bytes = None,
+                "generation" => next.generation += 1,
+                "shortfall" => {
+                    next.delivered_bytes = sample.delivered_bytes;
+                    next.delivered_bps = Some(0.0);
+                    next.finalized_expected = sample.finalized_expected;
+                    controller.observe(&next);
+                    // One empty short report can remain within the original
+                    // 15% tolerance. Continue real admissions without delivery
+                    // until the complete paired interval proves a deficit.
+                    next = wire_admitted_report_060(&mut controller, &next, 700_000);
+                    next.delivered_bytes = sample.delivered_bytes;
+                    next.delivered_bps = Some(0.0);
+                    next.finalized_expected = sample.finalized_expected;
+                    next.finalized_lost = Some(0);
+                    next.positive_delivery_age_us = Some(200_000);
+                }
+                _ => unreachable!(),
+            }
+            controller.observe(&next);
+            assert!(
+                controller.independent_probe_ceiling(next.now_us, 4_375_000, 4) > 0,
+                "{invalid}"
+            );
+        }
+        for new_number in [false, true] {
+            let (mut controller, mut sample) = busy_business_measurement_070();
+            assert_eq!(
+                controller.independent_probe_ceiling(700_000, 4_375_000, 4),
+                0
+            );
+            sample.now_us = 700_001;
+            sample.report_number += u64::from(new_number);
+            sample.positive_delivery_age_us = Some(0);
+            // A duplicate/empty report with a younger claimed age must not
+            // refresh the last time actual cumulative bytes advanced.
+            controller.observe(&sample);
+            assert_eq!(controller.last_positive_report_us, Some(500_000));
+            assert!(controller.independent_probe_ceiling(sample.now_us, 4_375_000, 4) > 0);
+            assert_eq!(
+                controller.independent_probe_ceiling(499_999, 4_375_000, 4),
+                4_375_000
+            );
+        }
     }
 
     #[test]

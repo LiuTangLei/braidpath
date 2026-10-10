@@ -160,7 +160,8 @@ impl Controller {
         }
     }
     pub fn available(&mut self, now: u64, cost: usize) -> bool {
-        if self.state.generation.is_none() || now < self.last_clock_us {
+        if self.state.generation.is_none() || self.state.pacing_bps == 0 || now < self.last_clock_us
+        {
             return false;
         }
         self.last_clock_us = now;
@@ -198,6 +199,27 @@ impl Controller {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn zero_data_allocation_holds_earned_credit_and_restarts_without_new_delivery() {
+        let mut controller = Controller::new(64_000);
+        controller.observe(&demand(0, true), 64_000);
+        assert!(controller.available(300_000, 1089));
+        controller.observe(&demand(300_000, true), 0);
+        assert!(!controller.available(400_000, 1089));
+        assert!(!controller.rtt_request_due(400_000));
+        controller.observe(&demand(500_000, true), 64_000);
+        assert_eq!(controller.snapshot().pacing_bps, 64_000);
+        // At most the original bounded two-packet credit survived the pause.
+        let mut packets = 0;
+        while controller.available(500_000, 1089) {
+            controller.admitted(1089);
+            packets += 1;
+        }
+        assert_eq!(packets, 2);
+        assert!(!controller.available(500_001, 1089));
+        assert!(controller.available(640_000, 1089));
+    }
+
     #[test]
     fn sufficient_measurement_holds_data_growth_but_keeps_probe_requests_and_resumes() {
         let mut controller = Controller::new(4_000_000);
