@@ -1898,7 +1898,9 @@ impl PathController {
             // A no-op waiting for evidence is not a new pacing interval. Keep
             // the paired admission/allowance history until the first delivery
             // report, or until the probe requested for a young service endpoint
-            // returns. Otherwise the next control tick can outlive that endpoint.
+            // returns. Independently covered recovery keeps a complete 500 ms
+            // admission interval even when that reply arrives earlier. Otherwise the
+            // next control tick can outlive that endpoint.
             // No evidence age is renewed, and an actual rate change, pressure,
             // idle or expiry still settles this bounded window.
             let pending_evidence = self.fast_feedback_seen
@@ -1911,7 +1913,8 @@ impl PathController {
                 && ((!self.congestion_seen
                     && self.last_initial_growth_report.is_none()
                     && elapsed < FRESH_US)
-                    || (!growth_probe_ready && self.discovery_service_window(now).is_some()));
+                    || (!growth_probe_ready && self.discovery_service_window(now).is_some())
+                    || (probe_covered_loss && elapsed < PROBE_US));
             if !pending_evidence {
                 self.last_control_us = now;
                 self.admitted_bytes = 0;
@@ -6225,6 +6228,96 @@ mod tests {
             }
         }
         (controller, admitted, sample)
+    }
+
+    #[test]
+    fn guided_recovery_retains_unspent_admission_credit_through_early_control_tick() {
+        let (mut controller, _, mut sample) = guided_erasure_session(true);
+        let epoch = sample.now_us;
+        let rate = controller.rate_bps;
+        // Reproduce the stable recovery phase after a prior safety brake.
+        controller.congestion_seen = true;
+        controller.growth_not_before_us = epoch + PROBE_US;
+        controller.last_control_us = epoch;
+        controller.admitted_bytes = 0;
+        controller.admitted_symbol_bytes = 0;
+        controller.allowance_bytes = 0.0;
+        let mut probe = probe_service::tests::probe(300);
+        let mut total = 0;
+        controller.probe_admitted(epoch + 1_000);
+        for now in (epoch + 20_000..=epoch + CONTROL_US).step_by(20_000) {
+            let bytes = exercise_budget(&mut controller, sample.now_us, now - sample.now_us);
+            total += bytes;
+            sample.admitted_symbols = Some(sample.admitted_symbols.unwrap() + bytes / 1000);
+            sample.admitted_symbol_bytes = Some(sample.admitted_symbol_bytes.unwrap() + bytes);
+            sample.now_us = now;
+            sample.feedback_age_us = Some(now - epoch);
+            sample.positive_delivery_age_us = Some(now - epoch);
+            sample.probe_age_us = Some(20_000 + now - epoch);
+            if now >= epoch + 81_000 {
+                sample.probe_sample_id = 301;
+                sample.probe_age_us = Some(now - epoch - 81_000);
+            }
+            // No new delivery reports. The actual request receives a reply after 80 ms;
+            // all delivery evidence ages normally through the control tick.
+            probe.sampled_us = now;
+            probe.sent_symbols = now / 2000;
+            probe.sent_bytes = probe.sent_symbols * 972;
+            controller.observe_with_delivery_probe(&sample, &probe);
+            assert!(controller.last_control.probe_covered_loss);
+            assert_eq!(
+                controller.rate_bps, rate,
+                "pending growth is not an increase"
+            );
+            assert_eq!(
+                controller.last_control_us, epoch,
+                "extra observation cleared the interval"
+            );
+            assert_eq!(controller.admitted_bytes, total);
+            assert!(
+                (controller.allowance_bytes - (now - epoch) as f64 * rate as f64 / 8_000_000.0)
+                    .abs()
+                    < 0.01
+            );
+        }
+    }
+
+    #[test]
+    fn guided_recovery_still_settles_bounded_or_unsafe_admission_intervals() {
+        for condition in 0..5 {
+            let (mut controller, _, mut sample) = guided_erasure_session(true);
+            let epoch = sample.now_us;
+            controller.congestion_seen = true;
+            controller.growth_not_before_us = epoch + PROBE_US;
+            controller.last_control_us = epoch;
+            controller.admitted_bytes = 0;
+            controller.admitted_symbol_bytes = 0;
+            controller.allowance_bytes = 0.0;
+            sample.now_us = epoch + CONTROL_US;
+            sample.probe_sample_id += 1;
+            sample.probe_age_us = Some(0);
+            let mut probe = probe_service::tests::probe(302);
+            match condition {
+                0 => {
+                    sample.now_us = epoch + PROBE_US;
+                    probe = probe_service::tests::probe(305);
+                }
+                1 => sample.offered_backlog = false,
+                2 => {
+                    sample.transport_blocked = true;
+                    sample.send_queue_bytes = 10_000;
+                }
+                3 => sample.generation += 1,
+                _ => probe.sender_estimate.delivered_updated_us = Some(epoch - 1),
+            }
+            controller.observe_with_delivery_probe(&sample, &probe);
+            assert_eq!(
+                controller.last_control_us, sample.now_us,
+                "condition={condition}"
+            );
+            assert_eq!(controller.admitted_bytes, 0);
+            assert_eq!(controller.allowance_bytes, 0.0);
+        }
     }
 
     #[test]
