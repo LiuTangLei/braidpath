@@ -2,7 +2,7 @@
 use serde_json::{Value, json};
 use std::{
     fs,
-    net::UdpSocket,
+    net::{SocketAddr, UdpSocket},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::{
@@ -24,13 +24,6 @@ impl Drop for Process {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
-}
-fn port() -> String {
-    UdpSocket::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .to_string()
 }
 fn launch(args: &[&str], dir: &Path, name: &str) -> Process {
     let ready = dir.join(format!("{name}-ready.json"));
@@ -63,6 +56,9 @@ fn ready(p: &mut Process) -> Value {
             assert_eq!(value["pid"], p.child.id());
             assert!(value["sample_unix_ms"].as_i64().unwrap() > 0);
             assert_eq!(value["instance_id"].as_str().unwrap().len(), 32);
+            let listen: SocketAddr = value["listen"].as_str().unwrap().parse().unwrap();
+            assert_eq!(listen.ip().to_string(), "127.0.0.1");
+            assert_ne!(listen.port(), 0);
             return value;
         }
         assert!(
@@ -118,16 +114,16 @@ fn run_id() -> String {
 #[test]
 fn ordinary_echo_raw_metadata_and_monotonic_rtt() {
     let dir = tempfile::tempdir().unwrap();
-    let target = port();
-    let listen = port();
-    let mut echo = launch(&["echo", "--listen", &target], dir.path(), "echo");
-    ready(&mut echo);
+    // Let the process own its ephemeral bind; dropping a temporary reservation
+    // before spawn lets concurrent tests claim that same port.
+    let mut echo = launch(&["echo", "--listen", "127.0.0.1:0"], dir.path(), "echo");
+    let target = ready(&mut echo)["listen"].as_str().unwrap().to_owned();
     let (ok, v) = run(&[
         "probe",
         "--target",
         &target,
         "--listen",
-        &listen,
+        "127.0.0.1:0",
         "--transport",
         "raw-udp",
         "--count",
@@ -141,8 +137,10 @@ fn ordinary_echo_raw_metadata_and_monotonic_rtt() {
     ]);
     assert!(ok, "{v}");
     assert_eq!(v["transport"], "raw-udp");
-    assert_eq!(v["listen"], listen);
-    assert_eq!(v["local_addr"], listen);
+    assert_eq!(v["listen"], v["local_addr"]);
+    let local: SocketAddr = v["local_addr"].as_str().unwrap().parse().unwrap();
+    assert_eq!(local.ip().to_string(), "127.0.0.1");
+    assert_ne!(local.port(), 0);
     assert_eq!(v["peer_addr"], target);
     assert_eq!(v["sent"], 12);
     assert_eq!(v["received"], 12);
@@ -154,14 +152,13 @@ fn ordinary_echo_raw_metadata_and_monotonic_rtt() {
 #[test]
 fn forward_one_way_sink_is_authoritative_and_samples_are_bounded() {
     let dir = tempfile::tempdir().unwrap();
-    let target = port();
     let id = run_id();
     let samples = dir.path().join("samples.json");
     let mut sink = launch(
         &[
             "sink",
             "--listen",
-            &target,
+            "127.0.0.1:0",
             "--run-id",
             &id,
             "--count",
@@ -178,7 +175,9 @@ fn forward_one_way_sink_is_authoritative_and_samples_are_bounded() {
         dir.path(),
         "forward",
     );
-    assert_eq!(ready(&mut sink)["run_id"], id);
+    let listening = ready(&mut sink);
+    assert_eq!(listening["run_id"], id);
+    let target = listening["listen"].as_str().unwrap().to_owned();
     let (ok, sender) = run(&[
         "probe",
         "--mode",
@@ -223,7 +222,6 @@ fn forward_one_way_sink_is_authoritative_and_samples_are_bounded() {
 #[test]
 fn reverse_stream_uses_the_registration_socket_mapping() {
     let dir = tempfile::tempdir().unwrap();
-    let target = port();
     let id = run_id();
     let mut sink = launch(
         &[
@@ -231,7 +229,7 @@ fn reverse_stream_uses_the_registration_socket_mapping() {
             "--role",
             "reverse-source",
             "--listen",
-            &target,
+            "127.0.0.1:0",
             "--run-id",
             &id,
             "--count",
@@ -246,7 +244,7 @@ fn reverse_stream_uses_the_registration_socket_mapping() {
         dir.path(),
         "reverse",
     );
-    ready(&mut sink);
+    let target = ready(&mut sink)["listen"].as_str().unwrap().to_owned();
     // Opaque UDP mapping: the upstream source socket is created once and reused.
     let downstream = UdpSocket::bind("127.0.0.1:0").unwrap();
     let upstream = UdpSocket::bind("127.0.0.1:0").unwrap();
@@ -349,7 +347,6 @@ fn missing_echo_operations_have_explicit_infinite_quantiles() {
 #[test]
 fn wrong_run_id_does_not_amplify_and_timeout_is_machine_readable() {
     let dir = tempfile::tempdir().unwrap();
-    let target = port();
     let id = run_id();
     let wrong = run_id();
     let mut sink = launch(
@@ -358,7 +355,7 @@ fn wrong_run_id_does_not_amplify_and_timeout_is_machine_readable() {
             "--role",
             "reverse-source",
             "--listen",
-            &target,
+            "127.0.0.1:0",
             "--run-id",
             &id,
             "--count",
@@ -373,7 +370,7 @@ fn wrong_run_id_does_not_amplify_and_timeout_is_machine_readable() {
         dir.path(),
         "reject",
     );
-    ready(&mut sink);
+    let target = ready(&mut sink)["listen"].as_str().unwrap().to_owned();
     let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
     socket.connect(&target).unwrap();
     socket

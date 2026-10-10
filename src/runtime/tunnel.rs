@@ -721,6 +721,7 @@ async fn sender(
                     finalized_expected: Some(estimate.expected),
                     finalized_lost: Some(estimate.lost),
                     admitted_symbols: Some(snapshot.sent_symbols),
+                    admitted_symbol_bytes: Some(snapshot.sent_bytes),
                     loss_sample_rate: (estimate.sample_symbols > 0)
                         .then_some(estimate.sample_loss_rate),
                     loss_rate: estimate.loss_rate,

@@ -290,6 +290,18 @@ impl BrakeLoss {
     }
 }
 
+#[derive(Clone, Debug, Serialize)]
+pub struct ServiceAdmission {
+    pub symbol_bytes: u64,
+    pub symbols: u64,
+    pub symbol_bps: f64,
+    pub span_us: u64,
+    pub started_us: u64,
+    pub backlog_since_us: Option<u64>,
+    pub last_pace_change_us: u64,
+    pub deficit: bool,
+}
+
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct ControlSample {
     pub at_us: u64,
@@ -328,6 +340,8 @@ pub struct ControlSample {
     pub service_symbol_delivery_bps: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub service_sample_span_us: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub service_admission: Option<ServiceAdmission>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub startup_probe_excess_ms: Option<f64>,
     pub ordinary_loss_pressure: bool,
@@ -371,6 +385,9 @@ pub struct Observation {
     /// Successful sequence count from this generation's authoritative Quality
     /// State. A controller-local mirror can miss admissions before first observe.
     pub admitted_symbols: Option<u64>,
+    /// Cumulative successful measured-symbol bytes in this Quality generation,
+    /// in the same units as delivered_bytes, not the control-round wire count.
+    pub admitted_symbol_bytes: Option<u64>,
     /// Quality-share EWMA. Pacing brakes use bounded finalized-count evidence.
     pub loss_rate: f64,
     pub loss_sample_rate: Option<f64>,
@@ -426,6 +443,7 @@ pub struct PathController {
     allowance_bytes: f64,
     wire_per_symbol: f64,
     blocked_since_us: Option<u64>,
+    backlog_since_us: Option<u64>,
     delay_since_us: Option<u64>,
     braked_queue_ms: Option<f64>,
     last_report: Option<(u64, u64, u64)>,
@@ -491,6 +509,7 @@ impl PathController {
             allowance_bytes: 0.0,
             wire_per_symbol: 1.0,
             blocked_since_us: None,
+            backlog_since_us: None,
             delay_since_us: None,
             braked_queue_ms: None,
             last_report: None,
@@ -527,6 +546,18 @@ impl PathController {
             self.token_us = now;
         }
         self.refill(now);
+        if observation.offered_backlog {
+            if now
+                .checked_sub(self.last_control.at_us)
+                .is_none_or(|elapsed| elapsed > FRESH_US)
+            {
+                self.backlog_since_us = Some(now);
+            } else {
+                self.backlog_since_us.get_or_insert(now);
+            }
+        } else {
+            self.backlog_since_us = None;
+        }
         let previous_rate = self.rate_bps;
         let mut rate_reason = RateReason::ReprobeRollback;
         if self.admitted_symbol_bytes > 0 {
@@ -593,6 +624,9 @@ impl PathController {
                 observation.delivery_report_time_us,
                 observation.delivered_bytes,
                 now,
+                observation
+                    .admitted_symbol_bytes
+                    .zip(observation.admitted_symbols),
             );
             new_service_report = !self.fast_feedback_seen || accumulated;
             let explicit = observation
@@ -893,6 +927,7 @@ impl PathController {
             latest_symbol_delivery_bps: self.latest_delivery_bps,
             service_symbol_delivery_bps: service_sample.map(|sample| sample.bps),
             service_sample_span_us: service_sample.map(|sample| sample.span_us),
+            service_admission: None,
             startup_probe_excess_ms: startup_probe_excess,
             ordinary_loss_pressure: self.loss_pressure,
             fast_loss,
@@ -941,10 +976,48 @@ impl PathController {
         } else {
             self.loss_evidence.fraction()
         };
+        // A fresh receiver interval can expose a service collapse even when
+        // probes are lost and the configured allowance exceeds actual demand.
+        // Compare actual symbol rates over each clock's own paired interval.
+        // A full stable local interval and observed continuous backlog avoid
+        // treating idle traffic or an earlier pace as current capacity evidence.
+        let last_pace_change = self
+            .rate_changes
+            .back()
+            .map_or(last_change, |change| last_change.max(change.at_us));
+        let service_admission = service_sample.and_then(|sample| {
+            sample.admission.map(|admission| ServiceAdmission {
+                symbol_bytes: admission.symbol_bytes,
+                symbols: admission.symbols,
+                symbol_bps: admission.bps,
+                span_us: admission.span_us,
+                started_us: admission.started_us,
+                backlog_since_us: self.backlog_since_us,
+                last_pace_change_us: last_pace_change,
+                deficit: new_service_report
+                    && admission.span_us >= PROBE_US
+                    && admission.symbols >= 8
+                    && admission.bps > 0.0
+                    && admission.started_us >= last_pace_change
+                    && self
+                        .backlog_since_us
+                        .is_some_and(|since| since <= admission.started_us)
+                    && sample.bps < admission.bps * 0.85
+                    && wire_delivery_bps
+                        .is_some_and(|rate| rate < self.rate_bps as f64 * 0.85)
+                    // A rollback in this observation has not yet been logged.
+                    && self.rate_bps == previous_rate,
+            })
+        });
+        let service_deficit = service_admission
+            .as_ref()
+            .is_some_and(|sample| sample.deficit);
+        self.last_control.service_admission = service_admission;
         let pressure = delay_pressure
             || (self.loss_pressure && !protect_ordinary_loss)
             || fast_loss
-            || blocked_pressure;
+            || blocked_pressure
+            || service_deficit;
         if pressure {
             if !self.fast_feedback_seen {
                 self.pressure_episode_exercised.get_or_insert(exercised);
@@ -955,16 +1028,16 @@ impl PathController {
             self.pressure_episode_exercised = None;
             self.pressure_episode_braked = false;
         }
-        let delivery_shortfall = new_service_report
+        let delivery_shortfall = (new_service_report
             && delay_pressure
             && admission_span > 0
             && now.saturating_sub(self.last_growth_us) >= PROBE_US + BRAKE_US
             && exercised
-            && wire_delivery_bps.is_some_and(|rate| rate < self.rate_bps as f64 * 0.85);
+            && wire_delivery_bps.is_some_and(|rate| rate < self.rate_bps as f64 * 0.85))
+            || service_deficit;
         if delivery_shortfall {
-            // A new underdelivery report, exercised integrated allowance and
-            // no recent growth can replace an older, higher drain hint. A
-            // recent safety brake can still have changed the active rate.
+            // Current exercised underdelivery or a qualified paired service
+            // deficit replaces an older high hint, including with zero service.
             self.draining_bps = wire_delivery_bps.map(|rate| (rate, now));
         }
         if new_service_report
@@ -1083,8 +1156,8 @@ impl PathController {
                     || delivery_shortfall
                     || (blocked_pressure && new_service_report)
                     || (new_loss && settled_shortfall);
-                self.congestion_seen |=
-                    self.pressure_episode_exercised == Some(true) && capacity_evidence;
+                self.congestion_seen |= service_deficit
+                    || (self.pressure_episode_exercised == Some(true) && capacity_evidence);
                 if new_delay {
                     self.braked_queue_ms = Some(self.queue_delay_ms);
                     self.drain_restore_pending = true;
@@ -1135,11 +1208,13 @@ impl PathController {
             });
         let growth_probe_ready = !self.fast_feedback_seen || unused_growth_probe;
         // Near the service rate, an increment held for one RTT can add about
-        // (gain - 1) * RTT of queue. Leave headroom within the local target.
+        // (gain - 1) * RTT of queue. Subtract the queue already occupying the
+        // target before allowing that increment; a clear path keeps its gain.
         // This is a step-size heuristic: sampling and shared traffic can make
         // the real feedback loop longer than one RTT, so it is not a bound.
         let growth_gain_limit = if self.fast_feedback_seen {
-            probe_rtt.map_or(1.0, |rtt| 1.0 + (self.target_ms * 0.8 / rtt).min(0.5))
+            let headroom = (self.target_ms * 0.8 - self.queue_delay_ms).max(0.0);
+            probe_rtt.map_or(1.0, |rtt| 1.0 + (headroom / rtt).min(0.5))
         } else {
             1.5
         };
@@ -1511,6 +1586,175 @@ mod tests {
             }
         }
         admitted
+    }
+
+    fn paired_controller_023(mode: &str) -> (PathController, Observation) {
+        let mut quality = crate::runtime::quality::State::new(7);
+        let mut controller = PathController::new(20_000_000, 20);
+        let mut sample = short_observation_022(0, 80.0);
+        sample.admitted_symbol_bytes = Some(0);
+        controller.observe(&sample);
+        controller.rate_bps = 2_000_000;
+        let mut received = 0;
+        for step in 1..=10 {
+            let now = step * 100_000;
+            let sparse = mode == "sparse" && step > 5;
+            for at in (now - 100_000..now).step_by(if sparse { 100_000 } else { 10_000 }) {
+                assert!(controller.allow(at, 1000, 0.0));
+                controller.admitted_symbol(at, 1000, 1000);
+                quality.admitted(1000);
+            }
+            let delivered = if step <= 5 || mode == "normal" {
+                10_000
+            } else if mode == "zero" || sparse {
+                0
+            } else {
+                1_000
+            };
+            received += delivered;
+            sample.now_us = now;
+            sample.report_number = step + 1;
+            sample.delivery_report_time_us = Some(100_000_000 + now);
+            sample.delivered_bytes = received;
+            sample.delivered_bps = Some(delivered as f64 * 80.0);
+            sample.admitted_symbols = Some(quality.snapshot.sent_symbols);
+            sample.admitted_symbol_bytes = Some(quality.snapshot.sent_bytes);
+            // Probe replies stop after the stable baseline. The old flat RTT
+            // alone cannot reveal the later collapse in receiver service.
+            sample.probe_sample_id = 1;
+            sample.probe_age_us = Some(now);
+            sample.positive_delivery_age_us = Some(if delivered == 0 { now - 500_000 } else { 0 });
+            sample.offered_backlog = mode != "idle" && !(mode == "interrupted" && step == 7);
+            if step == 10 {
+                controller.draining_bps = Some((5_000_000.0, now - 100_000));
+            }
+            controller.observe(&sample);
+            if mode == "pace_change" && step == 8 {
+                let previous = controller.rate_bps;
+                controller.rate_bps = 1_600_000;
+                controller.record_rate_change(now, previous, RateReason::ReprobeRollback);
+            }
+        }
+        (controller, sample)
+    }
+
+    #[test]
+    fn service_deficit_023_brakes_real_admissions_without_new_probes_or_exercised_allowance() {
+        for (mode, expected_rate) in [("collapse", 77_600), ("zero", 1_600_000)] {
+            let (mut controller, mut sample) = paired_controller_023(mode);
+            let control = &controller.last_control;
+            assert_eq!(control.queue_delay_ms, 0.0);
+            assert!(!control.new_probe);
+            assert!((control.admitted_bytes as f64) < control.integrated_allowance_bytes * 0.9);
+            let paired = control.service_admission.as_ref().unwrap();
+            assert!(paired.deficit);
+            assert_eq!(paired.symbols, 50);
+            assert_eq!(paired.started_us, 500_000);
+            assert_eq!(controller.rate_bps, expected_rate);
+            assert!(controller.congestion_seen);
+            assert_eq!(controller.pressure_episode_exercised, Some(false));
+            assert!(matches!(
+                controller.rate_changes.back().unwrap().reason,
+                RateReason::DeliveryShortfallBrake
+            ));
+            assert_eq!(
+                controller.draining_bps.unwrap().0,
+                if mode == "zero" { 0.0 } else { 80_000.0 }
+            );
+
+            let changes = controller.rate_changes_total;
+            sample.now_us += 100_000;
+            controller.observe(&sample);
+            assert_eq!(controller.rate_bps, expected_rate);
+            assert_eq!(controller.rate_changes_total, changes);
+            assert!(
+                !controller
+                    .last_control
+                    .service_admission
+                    .as_ref()
+                    .unwrap()
+                    .deficit
+            );
+        }
+    }
+
+    #[test]
+    fn service_deficit_023_rejects_idle_sparse_interrupted_and_transition_windows() {
+        for mode in ["normal", "idle", "sparse", "interrupted", "pace_change"] {
+            let (controller, _) = paired_controller_023(mode);
+            assert!(
+                !controller
+                    .last_control
+                    .service_admission
+                    .as_ref()
+                    .unwrap()
+                    .deficit,
+                "{mode}"
+            );
+            assert!(!controller.congestion_seen, "{mode}");
+            assert_eq!(
+                controller.rate_bps,
+                if mode == "pace_change" {
+                    1_600_000
+                } else {
+                    2_000_000
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn service_deficit_023_resets_pairing_and_backlog_after_generation_or_observation_gap() {
+        for generation_change in [false, true] {
+            let (mut controller, mut sample) = paired_controller_023("normal");
+            let now = sample.now_us + FRESH_US + 1;
+            sample.now_us = now;
+            sample.report_number += 1;
+            sample.delivery_report_time_us = Some(100_000_000 + now);
+            if generation_change {
+                sample.generation += 1;
+                sample.admitted_symbols = Some(0);
+                sample.admitted_symbol_bytes = Some(0);
+                sample.delivered_bytes = 0;
+            }
+            controller.observe(&sample);
+            assert_eq!(controller.backlog_since_us, Some(now));
+            assert!(controller.last_control.service_admission.is_none());
+            assert!(controller.service_window.latest(now).is_none());
+            assert!(!controller.congestion_seen);
+        }
+    }
+
+    #[test]
+    fn growth_headroom_023_accounts_for_existing_queue_in_search_and_drain_restore() {
+        for restoring in [false, true] {
+            let mut controller = PathController::new(20_000_000, 20);
+            let mut sample = short_observation_022(0, 80.0);
+            controller.observe(&sample);
+            if restoring {
+                controller.rate_bps = 500_000;
+                controller.congestion_seen = true;
+                controller.remembered_bps = 4_000_000.0;
+                controller.draining_bps = Some((2_000_000.0, 0));
+                controller.drain_restore_pending = true;
+            }
+            let previous = controller.rate_bps;
+            let delivered = exercise_budget(&mut controller, 0, CONTROL_US);
+            sample = short_observation_022(CONTROL_US, 88.0);
+            sample.rtt_ms = 88.0;
+            sample.delivered_bytes = delivered;
+            sample.delivered_bps = Some(previous as f64);
+            controller.observe(&sample);
+            assert_eq!(controller.queue_delay_ms, 8.0);
+            assert_eq!(
+                controller.rate_bps,
+                if restoring { 545_454 } else { 279_272 }
+            );
+            assert_eq!(controller.last_growth_probe, Some(sample.probe_sample_id));
+            if restoring {
+                assert!(!controller.drain_restore_pending);
+            }
+        }
     }
 
     fn short_observation_022(now: u64, probe_ms: f64) -> Observation {
