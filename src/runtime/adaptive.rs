@@ -1723,22 +1723,24 @@ impl PathController {
                     }
                 }
             }
-            // Before the first fast-feedback increase, a failed attempt is not
-            // a new pacing interval. Keep the actual admission/allowance pair
-            // so a late first delivery report can qualify on arrival. Idle,
-            // pressure, expiry or an actual change settles it as usual; it can
-            // never retain more than one freshness window of startup history.
-            let pending_startup = self.fast_feedback_seen
-                && !self.congestion_seen
-                && self.last_initial_growth_report.is_none()
+            // A no-op waiting for evidence is not a new pacing interval. Keep
+            // the paired admission/allowance history until the first delivery
+            // report, or until the probe requested for a young service endpoint
+            // returns. Otherwise the next control tick can outlive that endpoint.
+            // No evidence age is renewed, and an actual rate change, pressure,
+            // idle or expiry still settles this bounded window.
+            let pending_evidence = self.fast_feedback_seen
                 && self.rate_bps == previous_rate
                 && observation_contiguous
                 && fresh
                 && self.eligible
                 && observation.offered_backlog
                 && !pressure
-                && elapsed < FRESH_US;
-            if !pending_startup {
+                && ((!self.congestion_seen
+                    && self.last_initial_growth_report.is_none()
+                    && elapsed < FRESH_US)
+                    || (!growth_probe_ready && self.discovery_service_window(now).is_some()));
+            if !pending_evidence {
                 self.last_control_us = now;
                 self.admitted_bytes = 0;
                 self.admitted_symbol_bytes = 0;
@@ -2141,6 +2143,33 @@ mod tests {
             controller.rate_bps, grown,
             "actual growth still waits 200ms"
         );
+    }
+
+    #[test]
+    fn service_probe_arrival_can_use_the_completed_control_window() {
+        let (mut controller, sample) = service_endpoint_032();
+        let before = controller.rate_bps;
+        let mut waiting = admitted_report_026(&mut controller, &sample, 600_000, u64::MAX);
+        waiting.probe_sample_id = sample.probe_sample_id;
+        waiting.probe_age_us = Some(CONTROL_US + 1);
+        controller.observe(&waiting);
+        assert_eq!(controller.rate_bps, before);
+        assert!(controller.discovery_service_window(600_000).is_some());
+        // The probe requested for the 500ms service endpoint arrives between
+        // ticks. Both that endpoint and this real reply are still young.
+        controller.probe_admitted(600_000);
+        let mut ready = monitor_reply_034(&mut controller, &waiting, 680_000, 80.0, 600_000);
+        ready.probe_sample_id = sample.probe_sample_id + 1;
+        controller.observe(&ready);
+        assert!(
+            controller.rate_bps > before,
+            "a no-op must not postpone this usable pair until the endpoint expires"
+        );
+        assert_eq!(controller.last_growth_us, 680_000);
+        let grown = controller.rate_bps;
+        controller.observe(&ready);
+        assert_eq!(controller.rate_bps, grown);
+        assert!(controller.discovery_service_window(680_000).is_none());
     }
 
     #[test]
