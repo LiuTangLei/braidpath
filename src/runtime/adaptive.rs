@@ -1639,15 +1639,21 @@ impl PathController {
                 || !self.congestion_seen
                 || self.discovery_service_window(now).is_some());
         // Near service, an increment adds (gain - 1) * held_time of queue.
-        // Ordinary cautious growth needs two replies to settle its monitor:
-        // even immediate requests hold the increment for their spacing + RTT.
+        // Ordinary cautious growth needs two replies to settle its monitor.
+        // A recent successful request can also postpone the first owned
+        // request; that remaining spacing is part of the held increment.
         // Initial byte-feedback growth does not use that two-reply monitor.
         // This remains a heuristic: scheduling and shared traffic can extend
         // the feedback horizon; it is not a hard queue or capacity bound.
+        let first_request_wait_us = self.last_probe_us.map_or(0, |last| {
+            last.saturating_add(FAST_PROBE_US).saturating_sub(now)
+        });
+        let monitored_reply_spacing_ms =
+            FAST_PROBE_US.saturating_add(first_request_wait_us) as f64 / 1000.0;
         let growth_gain_limit = if self.fast_feedback_seen {
             let headroom = (self.target_ms * 0.8 - self.queue_delay_ms).max(0.0);
             let reply_spacing_ms = if self.congestion_seen {
-                FAST_PROBE_US as f64 / 1000.0
+                monitored_reply_spacing_ms
             } else {
                 0.0
             };
@@ -1920,7 +1926,7 @@ impl PathController {
                 let headroom = (self.target_ms * 0.8 - self.queue_delay_ms).max(0.0);
                 let guided_gain = 1.0
                     + (headroom
-                        / (probe_rtt.unwrap_or(f64::INFINITY) + FAST_PROBE_US as f64 / 1000.0))
+                        / (probe_rtt.unwrap_or(f64::INFINITY) + monitored_reply_spacing_ms))
                         .min(0.25);
                 let proposed = ((self.rate_bps as f64 * guided_gain) as u64)
                     .min(reference.budget_bps)
@@ -2085,11 +2091,19 @@ impl PathController {
             && self
                 .discovery_service_window(now_us)
                 .is_some_and(|sample| last_probe_us < sample.observed_us);
+        let monitor_request = active
+            && probe_age.is_some_and(|age| age <= FRESH_US)
+            && self.growth_monitor.as_ref().is_some_and(|monitor| {
+                monitor.successful_request_us[0].is_none() && monitor.request_due(now_us)
+            });
         // These opportunities are independent. New service cannot cancel an
         // owed request after growth just because the old reply aged past 200ms.
         // Only probe_admitted spends the repair; without a reply the original
         // 500ms health deadline remains, rather than repeated stale retries.
-        (young && fast_opportunity) || service_request || phase_repair
+        // The first owned request cannot depend on the older reply remaining
+        // young while it waits for spacing. A missing first reply still keeps
+        // the original second-request/health cadence and admission-only count.
+        (young && fast_opportunity) || service_request || phase_repair || monitor_request
     }
 
     pub fn decision(&self, now_us: u64) -> Decision {
@@ -2952,6 +2966,56 @@ mod tests {
             added_queue_ms <= controller.target_ms * 0.8 + 0.001,
             "increment held for {held_ms}ms adds {added_queue_ms}ms of queue"
         );
+    }
+
+    #[test]
+    fn monitored_growth_accounts_for_the_first_requests_remaining_spacing() {
+        for last_request in [500_000, 550_000, 590_000, 599_000] {
+            let (mut controller, previous) = service_endpoint_032();
+            controller.probe_admitted(last_request);
+            let mut sample = admitted_report_026(&mut controller, &previous, 600_000, u64::MAX);
+            // The recent request is still outstanding. Growth uses the real
+            // previous clear reply, whose original arrival age is not renewed.
+            sample.probe_sample_id = previous.probe_sample_id;
+            sample.probe_age_us = Some(previous.probe_age_us.unwrap() + 100_000);
+            let baseline = controller.rate_bps;
+            controller.observe(&sample);
+            let grown = controller.rate_bps;
+            assert!(grown > baseline);
+            let armed = controller.growth_monitor.as_ref().unwrap().armed_us;
+            let first_request = (last_request + FAST_PROBE_US).max(armed + 1);
+            assert!(!controller.decision(first_request - 1).probe_due);
+            assert!(controller.decision(first_request).probe_due);
+            controller.probe_admitted(first_request);
+            let mut first = monitor_reply_034(
+                &mut controller,
+                &sample,
+                first_request + 80_000,
+                80.0,
+                first_request,
+            );
+            first.probe_sample_id = sample.probe_sample_id + 1;
+            controller.observe(&first);
+            let second_request = first_request + FAST_PROBE_US;
+            assert!(!controller.decision(second_request - 1).probe_due);
+            assert!(controller.decision(second_request).probe_due);
+            controller.probe_admitted(second_request);
+            let mut second = monitor_reply_034(
+                &mut controller,
+                &first,
+                second_request + 80_000,
+                80.0,
+                second_request,
+            );
+            second.probe_sample_id = first.probe_sample_id + 1;
+            controller.observe(&second);
+            let held_ms = (second.now_us - armed) as f64 / 1000.0;
+            let added_queue_ms = (grown - baseline) as f64 / baseline as f64 * held_ms;
+            assert!(
+                added_queue_ms <= controller.target_ms * 0.8 + 0.001,
+                "request at {last_request}: held {held_ms}ms adds {added_queue_ms}ms beyond the original headroom"
+            );
+        }
     }
 
     #[test]
