@@ -834,6 +834,15 @@ impl Controller {
                 measure,
                 ..
             } => {
+                // Receiver evidence belongs to the pace actually exercised.
+                // A safety reduction (or another pace change) invalidates the
+                // trial before delayed reports can certify its nominal rate.
+                if *rate != input.rate_bps {
+                    return Action {
+                        maximum_rate: self.abort(now, Reason::ServiceRegressed, false),
+                        ..Action::default()
+                    };
+                }
                 measure.observe(&input);
                 if clean_service_evidence && measure.service_keeps_up(clean_after_receiver_us) {
                     return Action {
@@ -1121,6 +1130,72 @@ mod tests {
             }
             panic!("growing receiver service did not validate the trial");
         }
+    }
+
+    #[test]
+    fn reprobe_rate_change_revokes_trial_before_more_measurement() {
+        for changed_rate in [300_000, 450_000, 700_000] {
+            let mut driver = Driver::new();
+            driver.ready();
+            let request = driver.controller.candidate(driver.now).unwrap();
+            driver.rate = driver
+                .controller
+                .start(driver.now, request.trial_bps)
+                .unwrap();
+            assert_eq!(driver.controller.phase(), Phase::Trial);
+
+            driver.rate = changed_rate;
+            driver.tick(request.trial_bps * 4 / 5, true);
+
+            assert_eq!(driver.controller.phase(), Phase::Watching);
+            assert_eq!(driver.rate, changed_rate.min(request.baseline_bps));
+            assert!(!driver.controller.active());
+            assert!(driver.controller.candidate(driver.now).is_none());
+            assert_eq!(
+                driver.controller.events.back().unwrap().reason,
+                Reason::ServiceRegressed
+            );
+            assert!(
+                driver
+                    .controller
+                    .events
+                    .iter()
+                    .all(|event| event.reason != Reason::ServiceImproved)
+            );
+        }
+    }
+
+    #[test]
+    fn reprobe_rate_change_cannot_certify_an_old_completed_trial_window() {
+        let unchanged = Driver::holding();
+        let success_at = unchanged.now;
+        assert_eq!(unchanged.controller.phase(), Phase::Holding);
+
+        let mut driver = Driver::new();
+        driver.ready();
+        let request = driver.controller.candidate(driver.now).unwrap();
+        driver.rate = driver
+            .controller
+            .start(driver.now, request.trial_bps)
+            .unwrap();
+        while driver.now + 100_000 < success_at {
+            driver.tick(request.trial_bps * 4 / 5, true);
+            assert_eq!(driver.controller.phase(), Phase::Trial);
+        }
+        // A safety reduction leaves a pace between the old baseline and trial.
+        // The delayed receiver interval still carries the old trial's gain.
+        driver.rate = 450_000;
+        driver.tick(request.trial_bps * 4 / 5, true);
+        assert_eq!(driver.now, success_at);
+        assert_eq!(driver.controller.phase(), Phase::Watching);
+        assert_eq!(driver.rate, request.baseline_bps);
+        assert!(
+            driver
+                .controller
+                .events
+                .iter()
+                .all(|event| event.reason != Reason::ServiceImproved)
+        );
     }
 
     #[test]
