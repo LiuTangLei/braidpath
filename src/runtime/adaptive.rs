@@ -494,7 +494,7 @@ pub struct ControlSample {
     /// Actual two-reply evidence for the latest ordinary growth increment.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub growth_monitor: Option<GrowthMonitor>,
-    /// A one-use smaller retry after withdrawing an increment at this pace.
+    /// The current retry step ceiling after withdrawing an increment.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub growth_retry_ceiling_bps: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -581,7 +581,7 @@ pub struct Observation {
     pub transport_blocked: bool,
 }
 
-struct RejectedGrowth {
+struct GrowthRetry {
     baseline_bps: u64,
     increment_bps: u64,
     observed_us: u64,
@@ -610,7 +610,7 @@ pub struct PathController {
     last_initial_growth_report: Option<(u64, u64)>,
     initial_delivery_credit: Option<InitialDeliveryCredit>,
     growth_monitor: Option<GrowthMonitor>,
-    rejected_growth: Option<RejectedGrowth>,
+    growth_retry: Option<GrowthRetry>,
     last_growth_probe: Option<u64>,
     fast_feedback_seen: bool,
     fast_probe_min_rtt_ms: Option<f64>,
@@ -682,7 +682,7 @@ impl PathController {
             last_initial_growth_report: None,
             initial_delivery_credit: None,
             growth_monitor: None,
-            rejected_growth: None,
+            growth_retry: None,
             last_growth_probe: None,
             fast_feedback_seen: false,
             fast_probe_min_rtt_ms: None,
@@ -1484,12 +1484,12 @@ impl PathController {
             || !observation.offered_backlog
             || !observation_contiguous
             || !fresh
-            || self.rejected_growth.as_ref().is_some_and(|rejected| {
+            || self.growth_retry.as_ref().is_some_and(|rejected| {
                 now.checked_sub(rejected.observed_us)
                     .is_none_or(|age| age > FRESH_US)
             })
         {
-            self.rejected_growth = None;
+            self.growth_retry = None;
         }
         let mut monitor_withdrawn = false;
         if !self.fast_feedback_seen
@@ -1525,11 +1525,20 @@ impl PathController {
                 monitor.withdrawn = true;
                 monitor_withdrawn = true;
                 self.record_brake(observation);
-                self.rejected_growth = Some(RejectedGrowth {
+                self.growth_retry = Some(GrowthRetry {
                     baseline_bps: monitor.previous_bps,
                     increment_bps: monitor.pacing_bps - monitor.previous_bps,
                     observed_us: now,
                 });
+            } else if let Some(rejected) = self
+                .growth_retry
+                .as_mut()
+                .filter(|rejected| rejected.baseline_bps == monitor.pacing_bps)
+            {
+                // Only the owned retry's two actual clear replies can recover
+                // its step. Do not forget a failed gain after one smaller step.
+                rejected.increment_bps = rejected.increment_bps.saturating_mul(2);
+                rejected.observed_us = now;
             }
             self.last_control.growth_monitor = Some(monitor);
         } else {
@@ -1803,6 +1812,14 @@ impl PathController {
             self.last_growth_probe = Some(observation.probe_sample_id);
         }
         self.rate_bps = self.rate_bps.min(self.maximum_bps).max(1);
+        if ordinary_growth
+            && self.rate_bps > previous_rate
+            && self.last_control.growth_retry_ceiling_bps.is_some()
+            && let Some(rejected) = self.growth_retry.as_mut()
+        {
+            rejected.baseline_bps = self.rate_bps;
+            rejected.increment_bps = (self.rate_bps - previous_rate).saturating_mul(2);
+        }
         self.record_rate_change(now, previous_rate, rate_reason);
         if ordinary_growth
             && self.rate_bps > previous_rate
@@ -1827,7 +1844,7 @@ impl PathController {
     }
 
     fn limit_growth_retry(&mut self, proposed_bps: u64, now_us: u64) -> u64 {
-        if let Some(rejected) = self.rejected_growth.as_ref().filter(|rejected| {
+        if let Some(rejected) = self.growth_retry.as_ref().filter(|rejected| {
             rejected.baseline_bps == self.rate_bps
                 && now_us
                     .checked_sub(rejected.observed_us)
@@ -1835,7 +1852,9 @@ impl PathController {
         }) {
             // Bisect only the rejected increment, never raise the rollback
             // baseline or infer a capacity ceiling from shared queue growth.
-            let ceiling = rejected.baseline_bps + rejected.increment_bps / 2;
+            let ceiling = rejected
+                .baseline_bps
+                .saturating_add(rejected.increment_bps / 2);
             self.last_control.growth_retry_ceiling_bps = Some(ceiling);
             proposed_bps.min(ceiling)
         } else {
@@ -2064,8 +2083,19 @@ impl PathController {
         }
         self.initial_delivery_credit = None;
         self.growth_monitor = None;
-        if !matches!(reason, RateReason::GrowthWithdrawalBrake) {
-            self.rejected_growth = None;
+        let owned_retry = self.last_control.growth_retry_ceiling_bps.is_some()
+            && self
+                .growth_retry
+                .as_ref()
+                .is_some_and(|rejected| rejected.baseline_bps == self.rate_bps)
+            && matches!(
+                reason,
+                RateReason::ServiceDiscovery
+                    | RateReason::KnownServiceRecovery
+                    | RateReason::CautiousGrowth
+            );
+        if !matches!(reason, RateReason::GrowthWithdrawalBrake) && !owned_retry {
+            self.growth_retry = None;
         }
         self.rate_changes_total = self.rate_changes_total.saturating_add(1);
         if self.rate_changes.len() == 16 {
@@ -2639,9 +2669,9 @@ mod tests {
                     controller.last_control.growth_retry_ceiling_bps,
                     Some(controller.rate_bps)
                 );
-                assert!(
-                    controller.rejected_growth.is_none(),
-                    "an actual retry spends the cap"
+                assert_eq!(
+                    controller.growth_retry.as_ref().unwrap().baseline_bps,
+                    controller.rate_bps
                 );
                 let retry = controller.rate_bps;
                 for next in [now + 100_000, now + 200_000] {
@@ -2659,7 +2689,7 @@ mod tests {
                         monitor_reply_034(&mut controller, &sample, next, 80.0, next - 100_000);
                     controller.observe(&sample);
                     if controller.rate_bps > retry {
-                        assert!(controller.last_control.growth_retry_ceiling_bps.is_none());
+                        assert!(controller.rate_bps <= retry + 2 * (retry - baseline));
                         return;
                     }
                 }
@@ -2670,7 +2700,87 @@ mod tests {
     }
 
     #[test]
-    fn rejected_growth_does_not_survive_idle_stale_generation_or_other_pace_changes() {
+    fn successful_smaller_retry_recovers_its_step_without_jumping_to_the_rejected_gain() {
+        let (mut controller, sample) = first_monitored_reply_034(84.0);
+        let mut sample = monitor_reply_034(&mut controller, &sample, 900_000, 86.0, 800_000);
+        controller.observe(&sample);
+        let baseline = controller.rate_bps;
+        let mut retry_at = None;
+        for now in (1_000_000..=2_000_000).step_by(100_000) {
+            controller.probe_admitted(now - 100_000);
+            sample = monitor_reply_034(&mut controller, &sample, now, 80.0, now - 100_000);
+            controller.observe(&sample);
+            if controller.rate_bps > baseline {
+                retry_at = Some(now);
+                break;
+            }
+        }
+        let at = retry_at.expect("fresh service must authorize the smaller retry");
+        let retry = controller.rate_bps;
+        for now in [at + 100_000, at + 200_000] {
+            controller.probe_admitted(now - 99_000);
+            sample = monitor_reply_034(&mut controller, &sample, now, 80.0, now - 99_000);
+            controller.observe(&sample);
+        }
+        assert!(controller.growth_monitor.is_none());
+        for now in (at + 300_000..=at + 1_000_000).step_by(100_000) {
+            controller.probe_admitted(now - 100_000);
+            sample = monitor_reply_034(&mut controller, &sample, now, 80.0, now - 100_000);
+            controller.observe(&sample);
+            if controller.rate_bps > retry {
+                assert!(
+                    controller.rate_bps <= retry + 2 * (retry - baseline),
+                    "two clear replies recover at most twice the confirmed increment"
+                );
+                assert!(controller.last_control.growth_retry_ceiling_bps.is_some());
+                return;
+            }
+        }
+        panic!("confirmation must permit step recovery, not permanently freeze growth");
+    }
+
+    #[test]
+    fn another_retry_withdrawal_halves_only_the_new_failed_increment() {
+        let (mut controller, sample) = first_monitored_reply_034(84.0);
+        let mut sample = monitor_reply_034(&mut controller, &sample, 900_000, 86.0, 800_000);
+        controller.observe(&sample);
+        let baseline = controller.rate_bps;
+        let mut retry_at = None;
+        for now in (1_000_000..=2_000_000).step_by(100_000) {
+            controller.probe_admitted(now - 100_000);
+            sample = monitor_reply_034(&mut controller, &sample, now, 80.0, now - 100_000);
+            controller.observe(&sample);
+            if controller.rate_bps > baseline {
+                retry_at = Some(now);
+                break;
+            }
+        }
+        let at = retry_at.unwrap();
+        let increment = controller.rate_bps - baseline;
+        for (now, rtt) in [(at + 100_000, 84.0), (at + 200_000, 86.0)] {
+            controller.probe_admitted(now - 99_000);
+            sample = monitor_reply_034(&mut controller, &sample, now, rtt, now - 99_000);
+            controller.observe(&sample);
+        }
+        assert_eq!(
+            controller.rate_bps, baseline,
+            "withdraw only the owned retry"
+        );
+        for now in (at + 300_000..=at + 1_300_000).step_by(100_000) {
+            controller.probe_admitted(now - 100_000);
+            sample = monitor_reply_034(&mut controller, &sample, now, 80.0, now - 100_000);
+            controller.observe(&sample);
+            if controller.rate_bps > baseline {
+                assert!(now >= at + 200_000 + RETRY_GROWTH_US);
+                assert_eq!(controller.rate_bps, baseline + increment / 2);
+                return;
+            }
+        }
+        panic!("the smaller step must remain discoverable after cooldown");
+    }
+
+    #[test]
+    fn growth_retry_does_not_survive_idle_stale_generation_or_other_pace_changes() {
         for boundary in [
             "idle",
             "stale",
@@ -2682,7 +2792,7 @@ mod tests {
             let (mut controller, sample) = first_monitored_reply_034(84.0);
             let mut sample = monitor_reply_034(&mut controller, &sample, 900_000, 86.0, 800_000);
             controller.observe(&sample);
-            assert!(controller.rejected_growth.is_some());
+            assert!(controller.growth_retry.is_some());
             sample.now_us = 1_000_000;
             match boundary {
                 "idle" => sample.offered_backlog = false,
@@ -2708,7 +2818,7 @@ mod tests {
                 sample.probe_sample_id += 1;
                 controller.observe(&sample);
             }
-            assert!(controller.rejected_growth.is_none(), "{boundary}");
+            assert!(controller.growth_retry.is_none(), "{boundary}");
             if boundary == "queue_brake" {
                 assert!(controller.rate_bps < 307_200);
                 assert!(matches!(
