@@ -291,6 +291,32 @@ impl BrakeLoss {
     }
 }
 
+/// Recent successful business or queued demand, independent of whether one
+/// observation happens to find the queue empty. This is not capacity evidence.
+#[derive(Clone, Debug, Default)]
+struct DemandActivity {
+    since_us: Option<u64>,
+    last_activity_us: Option<u64>,
+}
+
+impl DemandActivity {
+    fn update(&mut self, now_us: u64, active: bool) {
+        // Expire before refreshing: an event at the boundary starts a new
+        // segment and cannot retroactively cover an inactive interval.
+        if self.last_activity_us.is_some_and(|last| {
+            now_us
+                .checked_sub(last)
+                .is_none_or(|elapsed| elapsed >= CONTROL_US)
+        }) {
+            *self = Self::default();
+        }
+        if active {
+            self.since_us.get_or_insert(now_us);
+            self.last_activity_us = Some(now_us);
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct ServiceAdmission {
     pub symbol_bytes: u64,
@@ -299,6 +325,8 @@ pub struct ServiceAdmission {
     pub span_us: u64,
     pub started_us: u64,
     pub backlog_since_us: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub activity_since_us: Option<u64>,
     pub last_pace_change_us: u64,
     pub deficit: bool,
 }
@@ -595,6 +623,7 @@ pub struct PathController {
     wire_per_symbol: f64,
     blocked_since_us: Option<u64>,
     backlog_since_us: Option<u64>,
+    demand_activity: DemandActivity,
     delay_since_us: Option<u64>,
     braked_queue_ms: Option<f64>,
     last_report: Option<(u64, u64, u64)>,
@@ -663,6 +692,7 @@ impl PathController {
             wire_per_symbol: 1.0,
             blocked_since_us: None,
             backlog_since_us: None,
+            demand_activity: DemandActivity::default(),
             delay_since_us: None,
             braked_queue_ms: None,
             last_report: None,
@@ -703,6 +733,11 @@ impl PathController {
         let observation_contiguous = now
             .checked_sub(self.last_control.at_us)
             .is_some_and(|elapsed| elapsed <= FRESH_US);
+        if !observation_contiguous {
+            self.demand_activity = DemandActivity::default();
+        }
+        self.demand_activity
+            .update(now, observation.offered_backlog);
         if observation.offered_backlog {
             if now
                 .checked_sub(self.last_control.at_us)
@@ -1165,12 +1200,17 @@ impl PathController {
         // A fresh receiver interval can expose a service collapse even when
         // probes are lost and the configured allowance exceeds actual demand.
         // Compare actual symbol rates over each clock's own paired interval.
-        // A full stable local interval and observed continuous backlog avoid
+        // A full stable local interval and recent actual business activity avoid
         // treating idle traffic or an earlier pace as current capacity evidence.
         let last_pace_change = self
             .rate_changes
             .back()
             .map_or(last_change, |change| last_change.max(change.at_us));
+        let activity_since_us = if self.fast_feedback_seen {
+            self.demand_activity.since_us
+        } else {
+            None
+        };
         let service_admission = service_sample.and_then(|sample| {
             sample.admission.map(|admission| ServiceAdmission {
                 symbol_bytes: admission.symbol_bytes,
@@ -1179,15 +1219,14 @@ impl PathController {
                 span_us: admission.span_us,
                 started_us: admission.started_us,
                 backlog_since_us: self.backlog_since_us,
+                activity_since_us,
                 last_pace_change_us: last_pace_change,
                 deficit: new_service_report
                     && admission.span_us >= PROBE_US
                     && admission.symbols >= 8
                     && admission.bps > 0.0
                     && admission.started_us >= last_pace_change
-                    && self
-                        .backlog_since_us
-                        .is_some_and(|since| since <= admission.started_us)
+                    && activity_since_us.is_some_and(|since| since <= admission.started_us)
                     && sample.bps < admission.bps * 0.85
                     && wire_delivery_bps
                         .is_some_and(|rate| rate < self.rate_bps as f64 * 0.85)
@@ -1333,9 +1372,10 @@ impl PathController {
             new_delay || delivery_shortfall || new_loss || (blocked_pressure && new_service_report);
         // An unused allowance is not traffic that can be drained. Sparse idle
         // echo/probe jitter must not turn its small delivery sample into a path
-        // capacity estimate. Backlog or a blocked transport still permits an
-        // immediate safety brake, including before exercise is qualified.
-        let active_demand = observation.offered_backlog || exercised || blocked_pressure;
+        // capacity estimate. Backlog, blocked transport or the separately
+        // qualified actual-admission deficit still permits a safety brake.
+        let active_demand =
+            observation.offered_backlog || exercised || blocked_pressure || service_deficit;
         if self.eligible
             && active_demand
             && new_pressure
@@ -1866,6 +1906,8 @@ impl PathController {
         measured_symbol_bytes: usize,
     ) {
         self.refill(now_us);
+        self.demand_activity
+            .update(now_us, wire_bytes > 0 && measured_symbol_bytes > 0);
         self.tokens = (self.tokens - wire_bytes as f64).max(0.0);
         self.admitted_bytes = self.admitted_bytes.saturating_add(wire_bytes as u64);
         self.admitted_symbol_bytes = self
@@ -3682,14 +3724,18 @@ mod tests {
         for step in 1..=10 {
             let now = step * 100_000;
             let sparse = mode == "sparse" && step > 5;
-            for at in (now - 100_000..now).step_by(if sparse { 100_000 } else { 10_000 }) {
-                assert!(controller.allow(at, 1000, 0.0));
-                controller.admitted_symbol(at, 1000, 1000);
-                quality.admitted(1000);
+            let inactive =
+                (mode == "idle" && step > 5) || (mode == "interrupted" && (6..=7).contains(&step));
+            if !inactive {
+                for at in (now - 100_000..now).step_by(if sparse { 100_000 } else { 10_000 }) {
+                    assert!(controller.allow(at, 1000, 0.0));
+                    controller.admitted_symbol(at, 1000, 1000);
+                    quality.admitted(1000);
+                }
             }
             let delivered = if step <= 5 || mode == "normal" {
                 10_000
-            } else if mode == "zero" || sparse {
+            } else if mode == "zero" || sparse || inactive {
                 0
             } else {
                 1_000
@@ -3707,7 +3753,9 @@ mod tests {
             sample.probe_sample_id = 1;
             sample.probe_age_us = Some(now);
             sample.positive_delivery_age_us = Some(if delivered == 0 { now - 500_000 } else { 0 });
-            sample.offered_backlog = mode != "idle" && !(mode == "interrupted" && step == 7);
+            sample.offered_backlog = mode != "idle"
+                && !(mode == "interrupted" && (6..=7).contains(&step))
+                && !(mode == "empty_active" && step % 2 == 0);
             if step == 10 {
                 controller.draining_bps = Some((5_000_000.0, now - 100_000));
             }
@@ -3719,6 +3767,235 @@ mod tests {
             }
         }
         (controller, sample)
+    }
+
+    #[test]
+    fn demand_activity_037_brakes_empty_queues_with_real_admission_progress() {
+        let (mut controller, mut sample) = paired_controller_023("empty_active");
+        let control = &controller.last_control;
+        assert!(controller.fast_feedback_seen);
+        assert!(!control.offered_backlog);
+        assert_eq!(control.queue_delay_ms, 0.0);
+        assert!(!control.new_probe);
+        assert!((control.admitted_bytes as f64) < control.integrated_allowance_bytes * 0.9);
+        let paired = control.service_admission.as_ref().unwrap();
+        assert_eq!(paired.backlog_since_us, None);
+        assert_eq!(paired.activity_since_us, Some(0));
+        assert_eq!(
+            (paired.started_us, paired.span_us, paired.symbols),
+            (500_000, 500_000, 50)
+        );
+        assert!(paired.deficit);
+        assert_eq!(controller.rate_bps, 77_600);
+        assert_eq!(controller.last_brake_us, Some(1_000_000));
+        assert_eq!(
+            controller.last_brake_admitted_symbols,
+            sample.admitted_symbols
+        );
+        assert_eq!(controller.pressure_episode_exercised, Some(false));
+        assert!(controller.congestion_seen);
+        assert!(matches!(
+            controller.rate_changes.back().unwrap().reason,
+            RateReason::DeliveryShortfallBrake
+        ));
+
+        // A later observation of this same endpoint cannot spend it again.
+        let changes = controller.rate_changes_total;
+        sample.now_us += 100_000;
+        controller.observe(&sample);
+        assert_eq!(controller.rate_bps, 77_600);
+        assert_eq!(controller.rate_changes_total, changes);
+        assert!(
+            !controller
+                .last_control
+                .service_admission
+                .as_ref()
+                .unwrap()
+                .deficit
+        );
+    }
+
+    #[test]
+    fn demand_activity_037_expires_before_refresh_and_ignores_control_only_work() {
+        for gap in [CONTROL_US - 1, CONTROL_US] {
+            let mut activity = DemandActivity::default();
+            activity.update(10_000, true);
+            activity.update(10_000 + gap, true);
+            assert_eq!(
+                activity.since_us,
+                Some(if gap < CONTROL_US {
+                    10_000
+                } else {
+                    10_000 + gap
+                })
+            );
+            assert_eq!(activity.last_activity_us, Some(10_000 + gap));
+        }
+
+        let mut controller = PathController::new(20_000_000, 20);
+        let mut sample = short_observation_022(0, 80.0);
+        sample.delivered_bytes = 0;
+        sample.delivered_bps = Some(0.0);
+        sample.admitted_symbol_bytes = Some(0);
+        controller.observe(&sample);
+        assert_eq!(controller.demand_activity.since_us, Some(0));
+        sample.offered_backlog = false;
+        for now in [100_000, CONTROL_US - 1, CONTROL_US] {
+            // Successful probes, new control reports, budget queries and a
+            // zero-byte callback cannot replace actual business activity.
+            if now % 100_000 == 0 {
+                controller.probe_admitted(now);
+            }
+            assert!(controller.allow(now, 100, 0.0));
+            controller.admitted_symbol(now, 0, 0);
+            sample.now_us = now;
+            sample.report_number += 1;
+            sample.delivery_report_time_us = Some(100_000_000 + now);
+            sample.probe_age_us = Some(now);
+            sample.positive_delivery_age_us = Some(now);
+            controller.observe(&sample);
+            assert_eq!(
+                controller.demand_activity.since_us,
+                (now < CONTROL_US).then_some(0)
+            );
+            assert_eq!(
+                controller.demand_activity.last_activity_us,
+                controller.demand_activity.since_us
+            );
+        }
+        sample.now_us = CONTROL_US + 1;
+        sample.offered_backlog = true;
+        controller.observe(&sample);
+        assert_eq!(controller.demand_activity.since_us, Some(CONTROL_US + 1));
+
+        let (idle, _) = paired_controller_023("idle");
+        assert_eq!(idle.demand_activity.since_us, None);
+        let (interrupted, _) = paired_controller_023("interrupted");
+        let paired = interrupted.last_control.service_admission.as_ref().unwrap();
+        assert_eq!(paired.activity_since_us, Some(700_000));
+        assert_eq!(paired.started_us, 500_000);
+        assert!(!paired.deficit);
+    }
+
+    #[test]
+    fn demand_activity_037_resets_at_generation_clock_and_observation_gaps() {
+        let (mut controller, _) = initial_credit_026(20_000_000);
+        for (now, since) in [(300_000, 0), (500_000, 500_000), (499_999, 499_999)] {
+            assert!(controller.allow(now, 100, 0.0));
+            controller.admitted_symbol(now, 100, 100);
+            assert_eq!(controller.demand_activity.since_us, Some(since));
+            assert_eq!(controller.demand_activity.last_activity_us, Some(now));
+        }
+
+        for boundary in ["generation", "clock", "gap"] {
+            let (mut controller, mut sample) = initial_credit_026(20_000_000);
+            assert_eq!(controller.demand_activity.since_us, Some(0));
+            sample.offered_backlog = false;
+            match boundary {
+                "generation" => {
+                    sample.now_us += 1;
+                    sample.generation += 1;
+                    sample.report_number = 1;
+                    sample.delivered_bytes = 0;
+                    sample.delivered_bps = Some(0.0);
+                    sample.admitted_symbols = Some(0);
+                    sample.admitted_symbol_bytes = Some(0);
+                }
+                "clock" => sample.now_us -= 1,
+                "gap" => {
+                    sample.now_us += FRESH_US + 1;
+                    // Even recent success cannot bridge a missing controller
+                    // observation interval beyond the existing freshness bound.
+                    assert!(controller.allow(sample.now_us - 1, 100, 0.0));
+                    controller.admitted_symbol(sample.now_us - 1, 100, 100);
+                    assert_eq!(controller.demand_activity.since_us, Some(sample.now_us - 1));
+                    sample.admitted_symbols = Some(sample.admitted_symbols.unwrap() + 1);
+                    sample.admitted_symbol_bytes =
+                        Some(sample.admitted_symbol_bytes.unwrap() + 100);
+                }
+                _ => unreachable!(),
+            }
+            controller.observe(&sample);
+            assert_eq!(controller.demand_activity.since_us, None, "{boundary}");
+            assert_eq!(
+                controller.demand_activity.last_activity_us, None,
+                "{boundary}"
+            );
+            if boundary == "generation" {
+                assert_eq!(controller.generation, Some(sample.generation));
+                assert!(controller.last_control.service_admission.is_none());
+                assert!(controller.last_brake_us.is_none());
+            }
+            sample.now_us += 1;
+            sample.offered_backlog = true;
+            controller.observe(&sample);
+            assert_eq!(
+                controller.demand_activity.since_us,
+                Some(sample.now_us),
+                "{boundary}"
+            );
+        }
+    }
+
+    #[test]
+    fn demand_activity_037_preserves_numeric_legacy_and_growth_guards() {
+        for mode in ["normal", "sparse", "pace_change"] {
+            let (controller, _) = paired_controller_023(mode);
+            let paired = controller.last_control.service_admission.as_ref().unwrap();
+            assert_eq!(paired.activity_since_us, Some(0), "{mode}");
+            assert!(!paired.deficit, "{mode}");
+            assert!(!controller.congestion_seen, "{mode}");
+            match mode {
+                "normal" => assert!(
+                    controller.last_control.service_symbol_delivery_bps.unwrap()
+                        >= paired.symbol_bps * 0.85
+                ),
+                "sparse" => assert_eq!(paired.symbols, 5),
+                "pace_change" => assert!(paired.started_us < paired.last_pace_change_us),
+                _ => unreachable!(),
+            }
+        }
+
+        let mut legacy = PathController::new(20_000_000, 20);
+        let mut sample = observation(0, 80.0);
+        sample.delivery_sample_span_us = PROBE_US;
+        sample.admitted_symbols = Some(0);
+        sample.admitted_symbol_bytes = Some(0);
+        legacy.observe(&sample);
+        let admitted = exercise_budget(&mut legacy, 0, PROBE_US);
+        sample = observation(PROBE_US, 80.0);
+        sample.delivery_sample_span_us = PROBE_US;
+        sample.delivered_bytes = admitted;
+        sample.delivered_bps = Some(admitted as f64 * 8_000_000.0 / PROBE_US as f64);
+        sample.delivery_report_time_us = Some(100_000_000 + PROBE_US);
+        sample.admitted_symbols = Some(admitted / 1000);
+        sample.admitted_symbol_bytes = Some(admitted);
+        legacy.observe(&sample);
+        assert!(legacy.demand_activity.since_us.is_some());
+        assert!(!legacy.fast_feedback_seen);
+        assert!(legacy.last_control.service_admission.is_none());
+        assert!(
+            !serde_json::to_string(&legacy.last_control)
+                .unwrap()
+                .contains("activity_since_us")
+        );
+
+        let (mut initial, sample) = initial_credit_026(20_000_000);
+        let before = initial.rate_bps;
+        let mut empty = admitted_report_026(&mut initial, &sample, 400_000, u64::MAX);
+        empty.offered_backlog = false;
+        initial.observe(&empty);
+        assert_eq!(initial.demand_activity.since_us, Some(0));
+        assert_eq!(initial.backlog_since_us, None);
+        assert_eq!(initial.rate_bps, before);
+        assert_eq!(initial.last_growth_us, 200_000);
+
+        let (mut restoring, mut sample) = draining_service_029(0, 1_000_000);
+        sample.offered_backlog = false;
+        restoring.observe(&sample);
+        assert!(restoring.demand_activity.since_us.is_some());
+        assert_eq!(restoring.backlog_since_us, None);
+        assert_eq!(restoring.last_control.drain_service_target_bps, None);
     }
 
     #[test]
