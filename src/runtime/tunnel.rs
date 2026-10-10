@@ -944,6 +944,15 @@ async fn sender(
                         .max(1) as u64;
                     let ceiling = (policy.capacity_probe_bps / paths.len().max(1) as u64)
                         .min(policy.group_rates[usize::from(path.group)] / 20 / group_paths);
+                    let ceiling = if policy.probe_guided_recovery {
+                        controllers[usize::from(path.id)].independent_probe_ceiling(
+                            now_us,
+                            ceiling,
+                            group_paths as usize,
+                        )
+                    } else {
+                        ceiling
+                    };
                     let queue_ms = controllers[usize::from(path.id)]
                         .decision(now_us)
                         .queue_delay_ms;

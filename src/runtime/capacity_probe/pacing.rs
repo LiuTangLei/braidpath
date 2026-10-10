@@ -96,7 +96,10 @@ impl Controller {
         }
         let minimum = ceiling.min(LOW_BPS);
         let previous = self.state.pacing_bps;
-        let mut next = previous.min(ceiling);
+        // A larger allocation must restart a zero/small pilot without needing
+        // delivery from packets that its old allowance cannot send. This is a
+        // bounded configured startup rate, not measured capacity or free tokens.
+        let mut next = previous.clamp(minimum, ceiling);
         let rtt = demand.rtt_ms.filter(|rtt| rtt.is_finite() && *rtt > 0.0);
         self.rtt_request_interval_us =
             rtt.map_or(BRAKE_US, |rtt| ((rtt * 500.0).ceil() as u64).max(BRAKE_US));
@@ -122,10 +125,11 @@ impl Controller {
             && now - self.state.last_change_us >= BRAKE_US
         {
             next = (next * 4 / 5).max(minimum);
-        } else if self
-            .state
-            .backlog_since_us
-            .is_some_and(|at| now - at >= GROWTH_US)
+        } else if next == previous
+            && self
+                .state
+                .backlog_since_us
+                .is_some_and(|at| now - at >= GROWTH_US)
             && now - self.state.last_change_us >= GROWTH_US
             && new_reply
             && valid_queue
@@ -207,6 +211,59 @@ mod tests {
             ..Default::default()
         }
     }
+    #[test]
+    fn restored_probe_allocation_resumes_at_the_bounded_startup_rate_without_credit() {
+        for initial_ceiling in [0, LOW_BPS / 4] {
+            let mut controller = Controller::new(initial_ceiling);
+            for now in (0..=500_000).step_by(1000) {
+                if now % 100_000 == 0 {
+                    let mut sample = demand(now, true);
+                    sample.received_probe_bytes = 0;
+                    sample.positive_probe_age_us = None;
+                    controller.observe(&sample, initial_ceiling);
+                }
+                while controller.available(now, 1082) {
+                    controller.admitted(1082);
+                }
+            }
+            let mut sample = demand(500_000, true);
+            sample.received_probe_bytes = 0;
+            sample.positive_probe_age_us = None;
+            controller.observe(&sample, 4_375_000);
+            assert_eq!(controller.snapshot().pacing_bps, LOW_BPS);
+            assert!(
+                !controller.available(500_000, 1082),
+                "rate restoration minted credit"
+            );
+        }
+    }
+
+    #[test]
+    fn allocation_restore_cannot_spend_a_reply_from_the_smaller_pilot() {
+        let mut controller = Controller::new(LOW_BPS / 4);
+        let mut symbols = 0;
+        let mut last_arrival = 0;
+        for now in (0..=1_000_000).step_by(1000) {
+            if now % 100_000 == 0 {
+                let mut sample = demand(now, true);
+                sample.received_probe_bytes = 0;
+                sample.positive_probe_age_us = None;
+                controller.observe(&sample, LOW_BPS / 4);
+            }
+            while controller.available(now, 1082) {
+                controller.admitted(1082);
+                symbols += 1;
+                last_arrival = now + 80_000;
+            }
+        }
+        assert_eq!(symbols, 1);
+        let mut sample = demand(1_000_000, true);
+        sample.received_probe_bytes = symbols * 972;
+        sample.positive_probe_age_us = Some(sample.now_us - last_arrival);
+        controller.observe(&sample, 4_375_000);
+        assert_eq!(controller.snapshot().pacing_bps, LOW_BPS);
+    }
+
     #[test]
     fn sustained_measurement_requests_rtt_even_without_recent_reply() {
         let mut controller = Controller::new(4_375_000);

@@ -2092,6 +2092,33 @@ impl PathController {
         }
     }
 
+    /// Ordinary busy discovery already measures business service. Keep one low
+    /// pilot allowance per group until loss, a paired delivery deficit or lost
+    /// eligibility calls for independent data measurement. Idle measurement and
+    /// expired observations keep their separate allowance.
+    pub fn independent_probe_ceiling(
+        &self,
+        now_us: u64,
+        configured: u64,
+        group_paths: usize,
+    ) -> u64 {
+        let current = now_us
+            .checked_sub(self.last_control.at_us)
+            .is_some_and(|age| age <= CONTROL_US);
+        let needs_measurement = !self.decision(now_us).eligible
+            || self.loss_evidence.counts().1 > 0
+            || self
+                .last_control
+                .service_admission
+                .as_ref()
+                .is_some_and(|sample| sample.deficit);
+        if current && self.last_control.offered_backlog && !needs_measurement {
+            configured.min(MIN_BPS / group_paths.max(1) as u64)
+        } else {
+            configured
+        }
+    }
+
     pub fn snapshot(&self, now_us: u64) -> Snapshot {
         Snapshot {
             decision: self.decision(now_us),
@@ -6228,6 +6255,51 @@ mod tests {
             }
         }
         (controller, admitted, sample)
+    }
+
+    #[test]
+    fn busy_business_without_impairment_keeps_one_low_probe_allowance_per_group() {
+        let mut controller = PathController::new(20_000_000, 20);
+        controller.observe(&short_observation_022(0, 80.0));
+        assert_eq!(
+            controller.independent_probe_ceiling(0, 4_375_000, 4),
+            MIN_BPS / 4
+        );
+    }
+
+    #[test]
+    fn independent_measurement_returns_for_loss_idle_stale_or_ineligible_business() {
+        for condition in 0..4 {
+            let mut controller = PathController::new(20_000_000, 20);
+            controller.observe(&short_observation_022(0, 80.0));
+            let bytes = exercise_budget(&mut controller, 0, CONTROL_US);
+            let mut sample = short_observation_022(CONTROL_US, 80.0);
+            sample.admitted_symbols = Some(bytes / 1000);
+            sample.admitted_symbol_bytes = Some(bytes);
+            sample.delivered_bytes = bytes;
+            match condition {
+                0 => {
+                    sample.finalized_expected = Some(bytes / 1000);
+                    sample.finalized_lost = Some(1);
+                    sample.delivered_bytes -= 1000;
+                }
+                1 => sample.offered_backlog = false,
+                2 => {}
+                _ => {
+                    sample.now_us += FRESH_US;
+                    sample.positive_delivery_age_us = Some(FRESH_US + 1);
+                    sample.probe_age_us = Some(FRESH_US + 1);
+                    sample.feedback_age_us = Some(FRESH_US + 1);
+                }
+            }
+            controller.observe(&sample);
+            let at = sample.now_us + if condition == 2 { CONTROL_US + 1 } else { 0 };
+            assert_eq!(
+                controller.independent_probe_ceiling(at, 4_375_000, 4),
+                4_375_000,
+                "condition={condition}"
+            );
+        }
     }
 
     #[test]
