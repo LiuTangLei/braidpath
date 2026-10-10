@@ -1419,14 +1419,32 @@ impl PathController {
                     self.pressure_episode_exercised.get_or_insert(exercised);
                 }
                 self.pressure_episode_braked = true;
-                // Safety always brakes. Persistent caution requires exercise
-                // captured before this episode's first reduction, not use of a
-                // later, smaller allowance while the old evidence drains.
+                // Safety always brakes. Exercise qualification is captured
+                // before the first reduction, never manufactured from use of
+                // a later, smaller allowance while the old evidence drains.
                 let capacity_evidence = new_delay
                     || delivery_shortfall
                     || (blocked_pressure && new_service_report)
                     || (new_loss && settled_shortfall);
+                // Shared admission can keep a busy path below 90% of its own
+                // allowance. A real queue brake plus a recent, continuously
+                // backlogged business interval still establishes congestion.
+                // This changes caution, not the measured service or brake rate.
+                let backlogged_queue = self.fast_feedback_seen
+                    && new_delay
+                    && service_sample.is_some_and(|sample| {
+                        now.saturating_sub(sample.observed_us) <= PROBE_US
+                            && sample.admission.is_some_and(|admission| {
+                                admission.span_us >= PROBE_US
+                                    && admission.symbols >= 8
+                                    && admission.symbol_bytes > 0
+                                    && self
+                                        .backlog_since_us
+                                        .is_some_and(|since| since <= admission.started_us)
+                            })
+                    });
                 self.congestion_seen |= service_deficit
+                    || backlogged_queue
                     || (self.pressure_episode_exercised == Some(true) && capacity_evidence);
                 if new_delay {
                     self.braked_queue_ms = Some(self.queue_delay_ms);
@@ -2170,6 +2188,48 @@ mod tests {
         controller.observe(&ready);
         assert_eq!(controller.rate_bps, grown);
         assert!(controller.discovery_service_window(680_000).is_none());
+    }
+
+    #[test]
+    fn shared_admission_below_path_allowance_still_confirms_a_backlogged_queue() {
+        for demand in ["continuous", "sparse", "interrupted"] {
+            let mut controller = PathController::new(START_BPS, 20);
+            let mut delivered = 0;
+            let mut reported = 0;
+            for now in (0..=600_000).step_by(1000) {
+                if now > 0 && now % 40_000 == 0 && controller.allow(now, 1000, 0.0) {
+                    controller.admitted(now, 1000);
+                    delivered += 1000;
+                }
+                if now % 100_000 != 0 {
+                    continue;
+                }
+                let mut sample =
+                    short_observation_022(now, if now == 600_000 { 110.0 } else { 80.0 });
+                sample.delivered_bytes = delivered;
+                sample.delivered_bps = Some((delivered - reported) as f64 * 80.0);
+                sample.admitted_symbol_bytes = Some(delivered);
+                sample.admitted_symbols = Some(delivered / 1000);
+                sample.offered_backlog =
+                    demand != "sparse" && !(demand == "interrupted" && now == 300_000);
+                controller.observe(&sample);
+                reported = delivered;
+            }
+            assert!(
+                (controller.last_control.admitted_bytes as f64)
+                    < controller.last_control.integrated_allowance_bytes * 0.9
+            );
+            assert_eq!(
+                controller.congestion_seen,
+                demand == "continuous",
+                "{demand}"
+            );
+            if demand == "continuous" {
+                assert_eq!(controller.last_brake_us, Some(600_000));
+                assert_eq!(controller.pressure_episode_exercised, Some(false));
+                assert!(controller.rate_bps < START_BPS);
+            }
+        }
     }
 
     #[test]
