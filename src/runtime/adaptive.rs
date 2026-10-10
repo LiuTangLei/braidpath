@@ -1952,7 +1952,19 @@ impl PathController {
                     && self.last_initial_growth_report.is_none()
                     && elapsed < FRESH_US)
                     || (!growth_probe_ready && self.discovery_service_window(now).is_some())
-                    || (probe_covered_loss && elapsed < PROBE_US));
+                    || (probe_covered_loss && elapsed < PROBE_US)
+                    // Whole datagrams can underfill one short tick despite
+                    // continuous demand. Keep actual admissions at the same
+                    // pace for at most one service horizon; the original 90%
+                    // floor and evidence ages still apply to any increase.
+                    || (self.congestion_seen
+                        && !exercised
+                        && self.admitted_symbol_bytes > 0
+                        && growth_probe_ready
+                        && self.growth_monitor.is_none()
+                        && self.rate_bps == rate_before_refill
+                        && elapsed < PROBE_US
+                        && self.discovery_service_window(now).is_some()));
             if !pending_evidence {
                 self.last_control_us = now;
                 self.admitted_bytes = 0;
@@ -2436,6 +2448,135 @@ mod tests {
             controller.observe(&sample);
         }
         (controller, sample)
+    }
+
+    fn wire_admitted_report_060(
+        controller: &mut PathController,
+        previous: &Observation,
+        now: u64,
+    ) -> Observation {
+        let mut symbols = 0;
+        for at in (previous.now_us..now).step_by(1000) {
+            while controller.allow(at, 1135, 0.0) {
+                controller.admitted_symbol(at, 1135, 1025);
+                symbols += 1;
+            }
+        }
+        let bytes = symbols * 1025;
+        let mut sample = short_observation_022(now, 80.0);
+        sample.delivered_bytes = previous.delivered_bytes + bytes;
+        sample.delivered_bps = Some(bytes as f64 * 8_000_000.0 / (now - previous.now_us) as f64);
+        sample.admitted_symbols = Some(previous.admitted_symbols.unwrap_or(0) + symbols);
+        sample.admitted_symbol_bytes = Some(previous.admitted_symbol_bytes.unwrap_or(0) + bytes);
+        sample
+    }
+
+    fn quantized_admission_060() -> (PathController, Observation) {
+        let mut controller = PathController::new(123_695, 20);
+        let mut sample = short_observation_022(0, 80.0);
+        sample.delivered_bytes = 0;
+        sample.delivered_bps = Some(0.0);
+        sample.admitted_symbols = Some(0);
+        sample.admitted_symbol_bytes = Some(0);
+        controller.observe(&sample);
+        controller.tokens = 0.0;
+        for now in (100_000..=1_000_000).step_by(100_000) {
+            controller.probe_admitted(now - 100_000);
+            sample = wire_admitted_report_060(&mut controller, &sample, now);
+            sample.probe_age_us = Some(20_000);
+            controller.observe(&sample);
+        }
+        assert_eq!(controller.rate_bps, 123_695);
+        controller.maximum_bps = 20_000_000;
+        controller.congestion_seen = true;
+        // Discard remaining burst credit; all following admissions must be
+        // earned at the unchanged pace, with whole business datagrams.
+        controller.tokens = 0.0;
+        controller.last_control_us = sample.now_us;
+        controller.admitted_bytes = 0;
+        controller.admitted_symbol_bytes = 0;
+        controller.allowance_bytes = 0.0;
+        (controller, sample)
+    }
+
+    #[test]
+    fn quantized_business_admission_can_complete_the_original_exercise_floor() {
+        let (mut controller, mut sample) = quantized_admission_060();
+        let baseline = controller.rate_bps;
+        for now in [1_100_000, 1_200_000, 1_300_000] {
+            controller.probe_admitted(now - 100_000);
+            sample = wire_admitted_report_060(&mut controller, &sample, now);
+            sample.probe_age_us = Some(20_000);
+            controller.observe(&sample);
+            if now <= 1_200_000 {
+                assert_eq!(controller.rate_bps, baseline);
+            }
+            if now == 1_200_000 {
+                assert_eq!(controller.last_control.admission_span_us, CONTROL_US);
+                assert!(
+                    (controller.last_control.admitted_bytes as f64)
+                        < controller.last_control.integrated_allowance_bytes * 0.9
+                );
+                assert!(controller.discovery_service_window(now).is_some());
+            }
+        }
+        assert!(
+            controller.rate_bps > baseline,
+            "a no-op cannot discard the actual admissions needed to reach 90% at 300ms"
+        );
+        assert_eq!(controller.last_control.admission_span_us, 300_000);
+        assert!(
+            (controller.last_control.admitted_bytes as f64)
+                >= controller.last_control.integrated_allowance_bytes * 0.9
+        );
+    }
+
+    #[test]
+    fn quantized_admission_retention_is_bounded_and_does_not_hide_unsafe_events() {
+        for boundary in ["underuse", "idle", "pressure", "stale", "generation"] {
+            let (mut controller, mut sample) = quantized_admission_060();
+            let baseline = controller.rate_bps;
+            for now in [1_100_000, 1_200_000] {
+                controller.probe_admitted(now - 100_000);
+                sample = wire_admitted_report_060(&mut controller, &sample, now);
+                sample.probe_age_us = Some(20_000);
+                controller.observe(&sample);
+            }
+            assert_eq!(controller.last_control_us, 1_000_000);
+            for now in [1_300_000, 1_400_000, 1_500_000] {
+                controller.probe_admitted(now - 100_000);
+                let mut next = short_observation_022(now, 80.0);
+                next.delivered_bytes = sample.delivered_bytes;
+                next.delivered_bps = Some(0.0);
+                next.admitted_symbols = sample.admitted_symbols;
+                next.admitted_symbol_bytes = sample.admitted_symbol_bytes;
+                next.probe_age_us = Some(20_000);
+                next.positive_delivery_age_us = Some(now - 1_200_000);
+                match boundary {
+                    "idle" => next.offered_backlog = false,
+                    "pressure" => next.send_queue_bytes = 10_000,
+                    "stale" => {
+                        next.feedback_age_us = Some(FRESH_US + 1);
+                        next.positive_delivery_age_us = Some(FRESH_US + 1);
+                        next.probe_age_us = Some(FRESH_US + 1);
+                    }
+                    "generation" => next.generation += 1,
+                    _ => {}
+                }
+                controller.observe(&next);
+                if boundary != "underuse" || now == 1_500_000 {
+                    assert_eq!(controller.last_control_us, now, "{boundary}");
+                    assert_eq!(controller.admitted_bytes, 0, "{boundary}");
+                    assert_eq!(controller.allowance_bytes, 0.0, "{boundary}");
+                    if boundary != "generation" {
+                        assert!(controller.rate_bps <= baseline, "{boundary}");
+                    }
+                    break;
+                }
+                assert_eq!(controller.rate_bps, baseline);
+                sample = next;
+            }
+        }
     }
 
     #[test]
