@@ -215,6 +215,8 @@ pub struct Path {
     pub reconnect_failures: u64,
     pub adaptive: Option<super::adaptive::Snapshot>,
     pub receiver_feedback: Option<super::quality::Snapshot>,
+    /// Independent probe payload delivery, never business goodput or a capacity estimate.
+    pub capacity_probe: Option<super::quality::Snapshot>,
     pub session_id: String,
     pub path_id: u8,
     pub request_stream_id: u64,
@@ -667,6 +669,7 @@ impl Metrics {
                 path.retired_generations += 1;
                 path.total_generations += 1;
                 path.adaptive = None;
+                path.capacity_probe = None;
             } else if !path.authenticated {
                 path.total_generations = 1;
             }

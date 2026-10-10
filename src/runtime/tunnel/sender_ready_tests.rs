@@ -57,6 +57,8 @@ impl Pair {
             conn: self.outgoing.clone(),
             stream: 0,
             quality: Arc::new(Mutex::new(quality::State::new(7))),
+            capacity_probe: Arc::new(Mutex::new(capacity_probe::State::new(7))),
+            capacity_probe_enabled: false,
             epoch: Instant::now(),
             probe_reply: Arc::new(Mutex::new(None)),
         }
@@ -125,6 +127,7 @@ fn block_and_poll(
 fn policy() -> Policy {
     Policy {
         adaptive: false,
+        capacity_probe_bps: 0,
         latency_target_ms: 20,
         group_rates: [10_000_000; MAX_PATHS],
         receiver_feedback: true,
@@ -680,4 +683,55 @@ async fn event_observation_036_notifies_only_the_owner_on_accepted_wire_evidence
         !notified(&other_sender),
         "quality-only mode has no observation owner"
     );
+}
+
+#[test]
+fn capacity_probe_policy_requires_negotiated_adaptive_fec0_and_bounded_allowance() {
+    let mut configured = policy();
+    configured.capacity_probe_bps = configured.rate / 20;
+    assert!(configured.validate().is_err());
+    configured.adaptive = true;
+    assert!(configured.validate().is_err());
+    configured.fec = 0;
+    assert!(configured.validate().is_ok());
+    configured.capacity_probe_bps += 1;
+    assert!(configured.validate().is_err());
+    configured.capacity_probe_bps = 0;
+    assert!(configured.validate().is_ok());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn capacity_frames_are_negotiated_and_never_refresh_business_delivery() {
+    let pair = Pair::connect().await;
+    let mut path = pair.path();
+    let paths = Arc::new(Mutex::new(vec![path.clone()]));
+    let scope = stats::Metrics::new("client").scope("capacity-probe", stats::FORWARD);
+    let mut peer = capacity_probe::State::new(7);
+    let frame = peer.prepare(1000);
+    peer.admitted();
+    assert!(measured_payload(&paths, 0, &frame, true, &scope, None).is_err());
+    path.capacity_probe_enabled = true;
+    *paths.lock().unwrap() = vec![path.clone()];
+    assert!(
+        measured_payload(&paths, 0, &frame, true, &scope, None)
+            .unwrap()
+            .is_none()
+    );
+    // Replay is idempotent in the independent bounded window.
+    assert!(
+        measured_payload(&paths, 0, &frame, true, &scope, None)
+            .unwrap()
+            .is_none()
+    );
+    let measured = path
+        .capacity_probe
+        .lock()
+        .unwrap()
+        .snapshot(quality_time(&path));
+    assert_eq!(measured.received.received_bytes, 972);
+    let business = path.quality.lock().unwrap();
+    assert_eq!(business.snapshot.sent_symbols, 0);
+    assert_eq!(business.snapshot.received.received_bytes, 0);
+    assert_eq!(business.snapshot.sender_estimate.received_bytes, 0);
+    assert_eq!(business.snapshot.controls_received, 0);
 }

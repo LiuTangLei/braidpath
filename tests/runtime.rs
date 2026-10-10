@@ -415,3 +415,137 @@ fn three_paths(mode: u8) {
         String::from_utf8_lossy(&result.stderr)
     );
 }
+
+#[test]
+fn independent_probe_negotiates_and_measures_without_application_records() {
+    let dir = tempfile::tempdir().unwrap();
+    let identity = dir.path().join("identity");
+    assert!(
+        run(&args(&[
+            "init",
+            "--dir",
+            identity.to_str().unwrap(),
+            "--name",
+            "localhost"
+        ]))
+        .status
+        .success()
+    );
+    let cert = identity.join("cert.pem");
+    let key = identity.join("key.pem");
+    let token = identity.join("token");
+    let target = UdpSocket::bind("127.0.0.1:0").unwrap();
+    target
+        .set_read_timeout(Some(Duration::from_millis(50)))
+        .unwrap();
+    let target_addr = target.local_addr().unwrap().to_string();
+    let main_addr = port();
+    let client_addr = port();
+    let client_stats = dir.path().join("client.jsonl");
+    let server_stats = dir.path().join("server.jsonl");
+    let mut server = launch(
+        &args(&[
+            "server",
+            "--listen",
+            &main_addr,
+            "--cert",
+            cert.to_str().unwrap(),
+            "--key",
+            key.to_str().unwrap(),
+            "--token-file",
+            token.to_str().unwrap(),
+            "--target",
+            &target_addr,
+            "--max-rate-bps",
+            "2000000",
+            "--stats-jsonl",
+            server_stats.to_str().unwrap(),
+            "--stats-interval-ms",
+            "100",
+        ]),
+        dir.path(),
+        "server",
+    );
+    ready(&mut server, "HTTP/3 server ready");
+    let mut client = launch(
+        &args(&[
+            "client",
+            "--listen",
+            &client_addr,
+            "--entrance",
+            &main_addr,
+            "--server-name",
+            "localhost",
+            "--ca",
+            cert.to_str().unwrap(),
+            "--token-file",
+            token.to_str().unwrap(),
+            "--adaptive",
+            "--fec",
+            "0",
+            "--rate-bps",
+            "2000000",
+            "--capacity-probe-bps",
+            "64000",
+            "--stats-jsonl",
+            client_stats.to_str().unwrap(),
+            "--stats-interval-ms",
+            "100",
+        ]),
+        dir.path(),
+        "client",
+    );
+    ready(&mut client, "UDP client ready");
+    let deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        let mut measured = 0;
+        for file in [&client_stats, &server_stats] {
+            let text = fs::read_to_string(file).unwrap_or_default();
+            if let Some(snapshot) = text
+                .lines()
+                .rev()
+                .find_map(|l| serde_json::from_str::<Value>(l).ok())
+                && let Some(paths) = snapshot["stats"]["paths"].as_object()
+            {
+                for path in paths.values() {
+                    let probe = &path["capacity_probe"];
+                    if probe["sender_estimate"]["received_bytes"]
+                        .as_u64()
+                        .unwrap_or(0)
+                        > 0
+                        && probe["sender_estimate"]["delivered_bps"]
+                            .as_f64()
+                            .unwrap_or(0.0)
+                            > 0.0
+                    {
+                        assert_eq!(path["receiver_feedback"]["sent_symbols"], 0);
+                        assert_eq!(path["receiver_feedback"]["received"]["received_bytes"], 0);
+                        assert_eq!(
+                            path["receiver_feedback"]["sender_estimate"]["received_bytes"],
+                            0
+                        );
+                        assert_eq!(path["quinn_admitted_originals"], 0);
+                        assert!(probe["sent_symbols"].as_u64().unwrap() > 0);
+                        measured += 1;
+                    }
+                }
+            }
+        }
+        if measured == 2 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "probe feedback failed: client={} server={}",
+            fs::read_to_string(&client.log).unwrap(),
+            fs::read_to_string(&server.log).unwrap()
+        );
+        assert!(client.child.try_wait().unwrap().is_none());
+        assert!(server.child.try_wait().unwrap().is_none());
+        thread::sleep(Duration::from_millis(30));
+    }
+    assert!(
+        target.recv_from(&mut [0; 2048]).is_err(),
+        "probe reached the application target"
+    );
+}

@@ -56,7 +56,8 @@ On Linux, repeat `--interface eth0 --interface wlan0` to create the interface–
 | `--redundancy-percent 30` | Repair HTTP-datagram byte budget credited only by successfully admitted originals; saved credit is bounded |
 | `--congestion bbr` (client/server) | BBR is the only runtime congestion controller; each QUIC connection still controls its own congestion window |
 | `--rate-bps 10000000` | Per-session, per-direction aggregate pacing cap, including an estimated header allowance; independent QUIC congestion control remains active |
-| `--adaptive` | Opt-in per-path pacing, sender-age admission, fresh-health eligibility, independent probes and automatic startup/outage recovery |
+| `--adaptive` | Opt-in per-path pacing, sender-age admission, fresh-health eligibility, independent RTT probes and automatic startup/outage recovery |
+| `--capacity-probe-bps 0` | Optional independent delivery samples; disabled by default, requires adaptive FEC0, capped at 5% of aggregate and each group budget |
 | `--latency-target-ms 20` | Local sender-age limit and added-delay control objective; does not bound propagation RTT or end-to-end delivery |
 | `--path-group GROUP` | One group ID per interface–entrance pair; omitted assignments default to the interface index |
 | `--group-rate-bps GROUP:BITS_PER_SECOND` | Shared per-direction cap for every path in that group; repeat for different groups; each cap is 64,000..aggregate bits/s |
@@ -67,6 +68,8 @@ On Linux, repeat `--interface eth0 --interface wlan0` to create the interface–
 | Sender symbol queue | At most 256 total symbols, 64 originals per flow and 64 repairs; admitted flows receive turns |
 | Lifetimes | Receiver repair waiting uses `--queue-ms`; UDP flows expire after 60 s idle; adaptive sessions retain an empty-path epoch for approximately 120 s |
 | Relay | Fixed destination, explicit source allowlist, 64 mappings, 32 queued packets/mapping, 30 s idle; shared bidirectional byte-rate cap |
+
+`--capacity-probe-bps` negotiates fixed 1,000-byte measurement frames in both directions. Its separate allowance charges HTTP-datagram bytes plus the same estimated header cost as other traffic. It has no startup credit, spends only on successful Quinn admission, and also obeys aggregate, group, transport and feedback-reserve limits. Frames have their own sequence, receiver clock, bounded replay window and generation. They never reach the UDP application or count as business symbols, service, health or pacing evidence. Feedback shares the existing pending control record and reserved aggregate/group budget; that control cost is outside the additional probe-data allowance. `capacity_probe` path statistics count the 972-byte measurement body and its observed delivery, which does not establish available capacity. This option currently measures only; it does not change scheduling. A peer that does not negotiate it is rejected.
 
 The client requests one rate cap for both sending directions. The server uses the smaller of that request and `--max-rate-bps`; increasing the server maximum cannot undo a smaller client request. Group caps are negotiated in the same way. Separate upload and download ceilings are not currently configurable. For an asymmetric measurement, choose a cap that permits the intended download, constrain the upload workload independently, and measure transport ACK/control traffic at the client interface.
 

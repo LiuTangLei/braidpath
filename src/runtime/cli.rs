@@ -113,6 +113,9 @@ struct PolicyArgs {
     /// Adapt path pacing and eligibility to queue growth; automatically recover paths.
     #[arg(long)]
     adaptive: bool,
+    /// Independent delivery samples; off by default, capped at 5% with adaptive FEC0.
+    #[arg(long, default_value_t = 0)]
+    capacity_probe_bps: u64,
     /// Budget for additional local/path queuing, not unavoidable propagation RTT.
     #[arg(long, default_value_t = 20)]
     latency_target_ms: u64,
@@ -203,6 +206,7 @@ pub async fn run() -> Result<()> {
                 rotate_source_port: policy.rotate_source_port,
                 policy: tunnel::Policy {
                     adaptive: policy.adaptive,
+                    capacity_probe_bps: policy.capacity_probe_bps,
                     latency_target_ms: policy.latency_target_ms,
                     group_rates,
                     fec: policy.fec,

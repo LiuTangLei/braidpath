@@ -1,5 +1,5 @@
 use super::{
-    MAX_PATHS, MAX_PAYLOAD, QUEUE, adaptive, outbound, quality, scheduler,
+    MAX_PATHS, MAX_PAYLOAD, QUEUE, adaptive, capacity_probe, outbound, quality, scheduler,
     stats::{self, Scope},
     transport,
     wire::{self, Receiver, Record},
@@ -51,6 +51,7 @@ const WEBSITE: &str = "<!doctype html><html lang=\"en\"><meta charset=\"utf-8\">
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Policy {
     pub adaptive: bool,
+    pub capacity_probe_bps: u64,
     pub latency_target_ms: u64,
     pub group_rates: [u64; MAX_PATHS],
     pub receiver_feedback: bool,
@@ -71,6 +72,11 @@ impl Policy {
     }
 
     pub fn validate(&self) -> Result<()> {
+        ensure!(
+            self.capacity_probe_bps == 0
+                || (self.adaptive && self.fec == 0 && self.capacity_probe_bps <= self.rate / 20),
+            "capacity probes require adaptive FEC0 and at most 5% aggregate budget"
+        );
         ensure!(
             !self.adaptive || (self.quality_schedule && self.receiver_feedback),
             "adaptive policy requires feedback and scheduling"
@@ -111,6 +117,8 @@ struct OutPath {
     conn: quinn::Connection,
     stream: u64,
     quality: Arc<Mutex<quality::State>>,
+    capacity_probe: Arc<Mutex<capacity_probe::State>>,
+    capacity_probe_enabled: bool,
     epoch: Instant,
     probe_reply: Arc<Mutex<Option<quality::Probe>>>,
 }
@@ -204,9 +212,20 @@ fn measured_payload(
         return Ok(Some(Bytes::copy_from_slice(payload)));
     }
     let paths = paths.lock().expect("paths lock");
-    if payload.starts_with(b"BQ1C") || payload.starts_with(b"BQ2C") {
+    if payload.starts_with(b"BQ1C") || payload.starts_with(b"BQ2C") || payload.starts_with(b"BQ3C")
+    {
+        let (reports, capacity_reports) = if payload.starts_with(b"BQ3C") {
+            ensure!(
+                paths.iter().all(|p| p.capacity_probe_enabled),
+                "capacity probes not negotiated"
+            );
+            let (business, probes) = capacity_probe::parse_control(payload)?;
+            (business, Some(probes))
+        } else {
+            (quality::parse_control(payload)?, None)
+        };
         let mut accepted = false;
-        for report in quality::parse_control(payload)? {
+        for report in reports {
             if let Some(path) = paths.iter().find(|p| p.id == report.id) {
                 let mut q = path.quality.lock().expect("quality lock");
                 if q.apply(&report, quality_time(path)).is_err() {
@@ -217,6 +236,16 @@ fn measured_payload(
                 let feedback = q.snapshot_at(quality_time(path));
                 drop(q);
                 scope.path(path.id, |p| p.receiver_feedback = Some(feedback));
+                if let Some(probes) = &capacity_reports {
+                    let report = probes
+                        .iter()
+                        .find(|probe| probe.id == path.id)
+                        .expect("validated probe membership");
+                    let mut state = path.capacity_probe.lock().expect("capacity probe lock");
+                    let _ = state.apply(report, quality_time(path));
+                    let snapshot = state.snapshot(quality_time(path));
+                    scope.path(path.id, |p| p.capacity_probe = Some(snapshot));
+                }
             }
         }
         drop(paths);
@@ -229,6 +258,17 @@ fn measured_payload(
         .iter()
         .find(|p| p.id == pid)
         .context("missing measurement path")?;
+    if payload.starts_with(b"BQ3D") {
+        ensure!(
+            path.capacity_probe_enabled,
+            "capacity probes not negotiated"
+        );
+        let mut state = path.capacity_probe.lock().expect("capacity probe lock");
+        state.receive(payload, quality_time(path))?;
+        let snapshot = state.snapshot(quality_time(path));
+        scope.path(pid, |p| p.capacity_probe = Some(snapshot));
+        return Ok(None);
+    }
     let mut q = path.quality.lock().expect("quality lock");
     if payload.starts_with(b"BQ2P") || payload.starts_with(b"BQ2R") {
         let probe = quality::parse_probe(payload)?;
@@ -619,6 +659,9 @@ async fn sender(
     let mut cursor = 0usize;
     let mut control_cursor = 0usize;
     let mut reprobe_cursor = 0usize;
+    let mut capacity_cursor = 0usize;
+    let mut capacity_budget =
+        capacity_probe::Budget::new(policy.capacity_probe_bps, policy.group_rates);
     let mut feedback_schedule = quality::FeedbackSchedule::default();
     let mut pending_feedback: Option<(Bytes, quality::ReportKind)> = None;
     let mut observation_schedule = policy.adaptive.then(outbound::ObservationSchedule::default);
@@ -843,6 +886,16 @@ async fn sender(
             }
         }
         update_business_pacer(&mut business, &paths, &controllers, now_us);
+        if policy.capacity_probe_bps > 0 {
+            for path in paths.iter() {
+                let snapshot = path
+                    .capacity_probe
+                    .lock()
+                    .expect("capacity probe lock")
+                    .snapshot(quality_time(path));
+                metrics.path(path.id, |p| p.capacity_probe = Some(snapshot));
+            }
+        }
         if policy.receiver_feedback
             && pending_feedback.is_none()
             && feedback_schedule.should_check(now_us, policy.adaptive)
@@ -854,6 +907,14 @@ async fn sender(
                         .lock()
                         .expect("quality lock")
                         .unreported_received_bytes()
+                        .saturating_add(if policy.capacity_probe_bps > 0 {
+                            path.capacity_probe
+                                .lock()
+                                .expect("capacity probe lock")
+                                .unreported_received_bytes()
+                        } else {
+                            0
+                        })
                 })
                 .fold(0u64, u64::saturating_add);
             if let Some(kind) = feedback_schedule.due(now_us, policy.adaptive, unreported_bytes) {
@@ -869,7 +930,21 @@ async fn sender(
                     })
                     .collect();
                 if !reports.is_empty() {
-                    pending_feedback = Some((quality::control_v2(&reports), kind));
+                    let frame = if policy.capacity_probe_bps > 0 {
+                        let probes: Vec<_> = paths
+                            .iter()
+                            .map(|path| {
+                                path.capacity_probe
+                                    .lock()
+                                    .expect("capacity probe lock")
+                                    .report(path.id, kind, quality_time(path))
+                            })
+                            .collect();
+                        capacity_probe::control(&reports, &probes)
+                    } else {
+                        quality::control_v2(&reports)
+                    };
+                    pending_feedback = Some((frame, kind));
                 }
             }
         }
@@ -904,6 +979,12 @@ async fn sender(
                         .expect("quality lock")
                         .snapshot
                         .controls_sent += 1;
+                    if policy.capacity_probe_bps > 0 {
+                        path.capacity_probe
+                            .lock()
+                            .expect("capacity probe lock")
+                            .control_admitted();
+                    }
                     metrics.update(|d| d.symbols.feedback_admitted += 1);
                     control_cursor = (i + 1) % paths.len();
                     admitted = true;
@@ -982,6 +1063,49 @@ async fn sender(
                         controllers[id].probe_admitted(now_us);
                     }
                     metrics.update(|d| d.symbols.probes_admitted += 1);
+                }
+            }
+        }
+        if policy.capacity_probe_bps > 0 && !paths.is_empty() {
+            let first = capacity_cursor;
+            for offset in 0..paths.len() {
+                let index = (first + offset) % paths.len();
+                let path = &paths[index];
+                if path.conn.close_reason().is_some() {
+                    continue;
+                }
+                let frame = path
+                    .capacity_probe
+                    .lock()
+                    .expect("capacity probe lock")
+                    .prepare(quality_time(path));
+                let data =
+                    wire::http_datagram(path.stream, &frame).expect("capacity probe mapping");
+                let cost = data.len() + 80;
+                let reserve = if Some(path.group) == reserved_group {
+                    feedback_reserve
+                } else {
+                    0
+                };
+                let group = &mut groups[usize::from(path.group)];
+                if capacity_budget.available(now_us, path.group, cost)
+                    && pacer.available(cost + feedback_reserve)
+                    && group.available(cost + reserve)
+                    && path.conn.datagram_send_buffer_space() >= data.len()
+                    && path
+                        .conn
+                        .max_datagram_size()
+                        .is_some_and(|size| size >= data.len())
+                    && path.conn.send_datagram(data).is_ok()
+                {
+                    pacer.spend(cost);
+                    group.spend(cost);
+                    capacity_budget.admitted(path.group, cost);
+                    path.capacity_probe
+                        .lock()
+                        .expect("capacity probe lock")
+                        .admitted();
+                    capacity_cursor = (index + 1) % paths.len();
                 }
             }
         }
@@ -1640,7 +1764,8 @@ async fn server_connection(
                     let group=req.headers().get("braidpath-group").map(|v|v.to_str()).transpose()?.unwrap_or("0").parse::<u8>()?;
                     ensure!(usize::from(group)<MAX_PATHS,"invalid path group");
                     let latency_target_ms=req.headers().get("braidpath-latency-ms").map(|v|v.to_str()).transpose()?.unwrap_or("20").parse::<u64>()?;
-                    let policy=Policy{adaptive:quality_schedule==Some("adaptive"),latency_target_ms,group_rates,quality_schedule:quality_schedule.is_some(),receiver_feedback:feedback.is_some(),fec:header("braidpath-fec")?.parse()?,redundancy:header("braidpath-redundancy")?.parse()?,rate,block_ms:header("braidpath-block-ms")?.parse()?,queue_ms:header("braidpath-queue-ms")?.parse()?};policy.validate()?;
+                    let capacity_probe_bps=req.headers().get("braidpath-capacity-probe-bps").map(|v|v.to_str()).transpose()?.unwrap_or("0").parse::<u64>()?;
+                    let policy=Policy{capacity_probe_bps,adaptive:quality_schedule==Some("adaptive"),latency_target_ms,group_rates,quality_schedule:quality_schedule.is_some(),receiver_feedback:feedback.is_some(),fec:header("braidpath-fec")?.parse()?,redundancy:header("braidpath-redundancy")?.parse()?,rate,block_ms:header("braidpath-block-ms")?.parse()?,queue_ms:header("braidpath-queue-ms")?.parse()?};policy.validate()?;
                     let rejoin=req.headers().get("braidpath-rejoin").is_some_and(|v|v=="1");
                     let stream_id=stream.id().into_inner();
                     // Membership and idle expiry share one map -> paths -> generation lock order.
@@ -1670,7 +1795,7 @@ async fn server_connection(
                                 let mut generations=session.generations.lock().expect("generation lock");
                                 scheduler::admit_generation(&mut generations[usize::from(pid)],generation)?;
                                 if let Some(i)=existing {paths.remove(i).conn.close(0u32.into(),b"path rejoined");}
-                                paths.push(OutPath{id:pid,group,conn:conn.clone(),stream:stream_id,quality:Arc::new(Mutex::new(quality::State::new(generation))),epoch:Instant::now(),probe_reply:Arc::new(Mutex::new(None))});
+                                paths.push(OutPath{id:pid,group,conn:conn.clone(),stream:stream_id,quality:Arc::new(Mutex::new(quality::State::new(generation))),capacity_probe:Arc::new(Mutex::new(capacity_probe::State::new(generation))),capacity_probe_enabled:capacity_probe_bps>0,epoch:Instant::now(),probe_reply:Arc::new(Mutex::new(None))});
                                 *session.empty_since.lock().expect("empty time lock")=None;
                             }
                             Some(session)
@@ -1688,6 +1813,7 @@ async fn server_connection(
                     metrics.register(&sid,pid,stream_id,stats::RETURN,&conn);
                     joined=Some((sid,session,pid,stream_id));
                     let mut response=Response::builder().status(200).header("braidpath-version","1").header("braidpath-max-payload",MAX_PAYLOAD);if feedback.is_some(){response=response.header("braidpath-feedback","2");}
+                    if capacity_probe_bps>0 {response=response.header("braidpath-capacity-probe-bps",capacity_probe_bps);}
                     if let Some(scheduler)=quality_schedule {response=response.header("braidpath-scheduler",scheduler);}stream.send_response(response.body(())?).await?;
                     request=Some(stream);
                     diagnostic.admitted();
@@ -2011,7 +2137,7 @@ async fn client_session(
                             for old in active.iter().filter(|p|p.id==pid) {old.conn.close(0u32.into(),b"path replaced");}
                             active.retain(|p|p.id!=pid);
                             active.push(OutPath{id:pid,group:configs[id].group,conn:value.conn.clone(),stream:value.stream,
-                                quality:Arc::new(Mutex::new(quality::State::new(generation))),epoch:Instant::now(),
+                                quality:Arc::new(Mutex::new(quality::State::new(generation))),capacity_probe:Arc::new(Mutex::new(capacity_probe::State::new(generation))),capacity_probe_enabled:options.policy.capacity_probe_bps>0,epoch:Instant::now(),
                                 probe_reply:Arc::new(Mutex::new(None))});
                         }
                         if let Some(old)=endpoints[id].replace(value.endpoint) {old.close(0u32.into(),b"path replaced");}
@@ -2220,6 +2346,9 @@ async fn connect_path(
             },
         );
     }
+    if policy.capacity_probe_bps > 0 {
+        req = req.header("braidpath-capacity-probe-bps", policy.capacity_probe_bps);
+    }
     let req = req.body(())?;
     let mut stream = send.send_request(req).await?;
     let response = tokio::select! {e=driver.wait_idle()=>bail!("HTTP/3 closed during admission: {e}"),r=stream.recv_response()=>r?};
@@ -2266,6 +2395,16 @@ async fn connect_path(
                         "quality"
                     }),
         "quality scheduling not negotiated"
+    );
+    ensure!(
+        policy.capacity_probe_bps == 0
+            || response
+                .headers()
+                .get("braidpath-capacity-probe-bps")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.parse::<u64>().ok())
+                == Some(policy.capacity_probe_bps),
+        "capacity probe budget not negotiated"
     );
     diagnostic.admitted();
     Ok((conn, stream.id().into_inner(), driver, stream, send))
