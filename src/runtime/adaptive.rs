@@ -1676,12 +1676,37 @@ impl PathController {
                 // A first speculative step would restart the stable local
                 // interval before it can meet the existing service horizon.
                 // Wait only for a fresh actual drainage pair crossing this
-                // brake, and only until its first post-brake horizon exists.
+                // brake, until the original time and symbol floors both
+                // exist after it, bounded by the existing freshness limit.
+                let drain_horizon_us = self
+                    .service_window
+                    .discovery_with_counts(now, 8, 1)
+                    .or(service_sample)
+                    .and_then(|sample| sample.admission)
+                    .filter(|admission| admission.symbols > 0)
+                    .map_or(PROBE_US, |admission| {
+                        ((admission.symbol_bytes as f64 / admission.symbols as f64)
+                            * self.wire_per_symbol
+                            * 8.0
+                            * 8_000_000.0
+                            / self.rate_bps as f64)
+                            .ceil() as u64
+                    })
+                    .clamp(PROBE_US, FRESH_US);
                 waiting_for_drain_window = self.last_brake_us.is_some_and(|brake| {
                     self.fast_feedback_seen
                         && recent_drain.is_some()
                         && self.last_growth_us <= brake
-                        && now.saturating_sub(brake) < PROBE_US
+                        && now.saturating_sub(brake) < drain_horizon_us
+                        && !self
+                            .service_window
+                            .discovery_with_counts(now, 8, 1)
+                            .is_some_and(|sample| {
+                                sample.admission.is_some_and(|admission| {
+                                    admission.started_us >= brake
+                                        && admission.started_us >= last_pace_change
+                                })
+                            })
                         && self.rate_bps == rate_before_refill
                         && self.rate_bps == previous_rate
                         && [
@@ -1744,9 +1769,9 @@ impl PathController {
                         })
                 };
                 // A disjoint capacity sample can age out or still straddle
-                // the actual brake while current paired endpoints already
-                // prove post-brake drainage. Prefer the fresh sample unless
-                // it crosses that brake; later pace changes and interrupted
+                // the actual brake, or lack the original symbol floor, while
+                // current paired endpoints already prove post-brake drainage.
+                // Prefer other fresh samples; later pace changes and interrupted
                 // backlog retain their original guards. Capacity memory and
                 // pressure observations still use the disjoint sample.
                 let measured_restore = service_sample.and_then(qualify_restore).or_else(|| {
@@ -1756,6 +1781,7 @@ impl PathController {
                             && !sample.admission.is_some_and(|admission| {
                                 self.last_brake_us
                                     .is_some_and(|brake| admission.started_us < brake)
+                                    || admission.symbols < 8
                             })
                     }) {
                         return None;
@@ -4192,6 +4218,26 @@ mod tests {
         drain_slices: u64,
         warmup_us: u64,
     ) -> (PathController, Observation) {
+        draining_service_packets_064(
+            start_us,
+            start_bps,
+            clear_step,
+            drain_start,
+            drain_slices,
+            warmup_us,
+            500,
+        )
+    }
+
+    fn draining_service_packets_064(
+        start_us: u64,
+        start_bps: u64,
+        clear_step: u64,
+        drain_start: u64,
+        drain_slices: u64,
+        warmup_us: u64,
+        packet_bytes: u64,
+    ) -> (PathController, Observation) {
         let mut controller = PathController::new(start_bps * 4, 20);
         let mut quality = crate::runtime::quality::State::new(7);
         let mut sample = short_observation_022(start_us - warmup_us, 80.0);
@@ -4224,17 +4270,17 @@ mod tests {
             }
             let before = quality.snapshot.sent_bytes;
             for at in (now - 100_000..now).step_by(1000) {
-                while controller.allow(at, 500, 0.0) {
-                    controller.admitted_symbol(at, 500, 500);
-                    quality.admitted(500);
+                while controller.allow(at, packet_bytes as usize, 0.0) {
+                    controller.admitted_symbol(at, packet_bytes as usize, packet_bytes as usize);
+                    quality.admitted(packet_bytes as usize);
                 }
             }
             let admitted = quality.snapshot.sent_bytes - before;
             let previous_received = received;
             received = if step <= 5 {
-                (quality.snapshot.sent_symbols - quality.snapshot.sent_symbols / 10) * 500
+                (quality.snapshot.sent_symbols - quality.snapshot.sent_symbols / 10) * packet_bytes
             } else if step == 6 {
-                received + admitted / 5 / 500 * 500
+                received + admitted / 5 / packet_bytes * packet_bytes
             } else if (drain_start..drain_start + drain_slices.min(5)).contains(&step) {
                 received + admitted + extra_drain
             } else {
@@ -4242,7 +4288,9 @@ mod tests {
             };
             assert!(received <= quality.snapshot.sent_bytes);
             if step == 6 {
-                extra_drain = (quality.snapshot.sent_bytes - received) / drain_slices / 500 * 500;
+                extra_drain =
+                    (quality.snapshot.sent_bytes - received) / drain_slices / packet_bytes
+                        * packet_bytes;
             }
             sample = short_observation_022(
                 now,
@@ -4335,6 +4383,45 @@ mod tests {
             );
         }
         assert!(controller.decision(1_200_000).probe_due);
+    }
+
+    #[test]
+    fn post_brake_wait_preserves_the_original_symbol_floor_at_low_rates() {
+        let (mut controller, sample) = draining_service_packets_064(0, 400_000, 12, 8, 3, 0, 1000);
+        let before = controller.rate_bps;
+        assert_eq!(controller.last_brake_us, Some(600_000));
+        controller.observe(&sample);
+        let current = controller
+            .service_window
+            .discovery_with_counts(sample.now_us, 8, 1)
+            .unwrap();
+        assert!(
+            current.admission.unwrap().started_us < 600_000,
+            "eight actual symbols still require pre-brake admissions"
+        );
+        assert_eq!(
+            controller.rate_bps, before,
+            "500ms alone cannot replace the original eight-symbol floor"
+        );
+        assert!(controller.drain_restore_pending);
+        controller.probe_admitted(1_500_000);
+        let mut next = admitted_report_026(&mut controller, &sample, 1_600_000, u64::MAX);
+        next.probe_age_us = Some(20_000);
+        controller.observe(&next);
+        let current = controller
+            .service_window
+            .discovery_with_counts(next.now_us, 8, 1)
+            .unwrap();
+        assert!(current.admission.unwrap().started_us >= 600_000);
+        assert!(current.admission.unwrap().symbols >= 8);
+        assert!(current.bps > current.admission.unwrap().bps * 1.1);
+        let target = (current.bps * controller.wire_per_symbol * 0.9) as u64;
+        assert!(target > before);
+        assert_eq!(
+            controller.last_control.drain_service_target_bps,
+            Some(target)
+        );
+        assert_eq!(controller.rate_bps, target);
     }
 
     #[test]
