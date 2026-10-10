@@ -8,26 +8,50 @@ pub use pacing::{Controller, Demand, RateSnapshot};
 
 pub const FRAME_BYTES: usize = 1000;
 const MARKER: &[u8; 8] = b"BP3PROBE";
+const FAST_MARKER: &[u8; 8] = b"BP3FAST!";
+pub const FORMAT: &str = "2";
+const REQUEST_US: u64 = 3_000_000;
+
+pub fn validate_format(budget: u64, format: Option<&str>) -> Result<()> {
+    ensure!(
+        budget == 0 || format == Some(FORMAT),
+        "capacity probe format not negotiated"
+    );
+    Ok(())
+}
 
 /// Own counters, replay window and receiver clock; business/FEC estimates cannot
 /// be refreshed or inflated by this stream. All bounds are inherited from Quality.
 pub struct State {
     inner: quality::State,
+    last_fast_request_us: Option<u64>,
 }
 
 impl State {
     pub fn new(generation: u64) -> Self {
         Self {
             inner: quality::State::new(generation),
+            last_fast_request_us: None,
         }
     }
 
     pub fn prepare(&self, now_us: u64) -> Bytes {
+        self.prepare_with_feedback(now_us, false)
+    }
+
+    pub fn prepare_with_feedback(&self, now_us: u64, fast: bool) -> Bytes {
         let mut body = [0; FRAME_BYTES - quality::HEADER];
-        body[..MARKER.len()].copy_from_slice(MARKER);
+        body[..MARKER.len()].copy_from_slice(if fast { FAST_MARKER } else { MARKER });
         let mut frame = self.inner.wrap(&body, now_us).to_vec();
         frame[..4].copy_from_slice(b"BQ3D");
         frame.into()
+    }
+
+    pub fn include_feedback(&self, kind: quality::ReportKind, now_us: u64) -> bool {
+        matches!(kind, quality::ReportKind::Full)
+            || self
+                .last_fast_request_us
+                .is_some_and(|at| now_us.checked_sub(at).is_some_and(|age| age <= REQUEST_US))
     }
 
     pub fn admitted(&mut self) {
@@ -39,8 +63,9 @@ impl State {
             frame.len() == FRAME_BYTES && &frame[..4] == b"BQ3D",
             "invalid capacity probe"
         );
+        let marker = &frame[quality::HEADER..quality::HEADER + MARKER.len()];
         ensure!(
-            &frame[quality::HEADER..quality::HEADER + MARKER.len()] == MARKER
+            (marker == MARKER || marker == FAST_MARKER)
                 && frame[quality::HEADER + MARKER.len()..]
                     .iter()
                     .all(|byte| *byte == 0),
@@ -49,7 +74,13 @@ impl State {
         let mut data = [0; FRAME_BYTES];
         data.copy_from_slice(frame);
         data[..4].copy_from_slice(b"BQ1D");
+        let before = self.inner.snapshot.received.received_bytes;
         self.inner.receive(&data, now_us)?;
+        // Only a newly accepted body requests reporting. Replay/late/invalid
+        // packets cannot renew the bounded receiver-local request lifetime.
+        if marker == FAST_MARKER && self.inner.snapshot.received.received_bytes > before {
+            self.last_fast_request_us = Some(now_us);
+        }
         Ok(())
     }
 
@@ -160,6 +191,46 @@ impl Budget {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quiet_probe_data_does_not_require_a_second_fast_report_stream() {
+        let mut sender = State::new(7);
+        let mut receiver = State::new(7);
+        let frame = sender.prepare_with_feedback(0, false);
+        sender.admitted();
+        receiver.receive(&frame, 9_000_000_000).unwrap();
+        assert!(receiver.include_feedback(quality::ReportKind::Full, 9_000_000_000));
+        assert!(!receiver.include_feedback(quality::ReportKind::Delivery, 9_000_000_000));
+    }
+
+    #[test]
+    fn requested_fast_feedback_expires_and_replay_cannot_renew_it() {
+        let sender = State::new(7);
+        let mut receiver = State::new(7);
+        let frame = sender.prepare_with_feedback(0, true);
+        let at = 9_000_000_000;
+        receiver.receive(&frame, at).unwrap();
+        assert!(receiver.include_feedback(quality::ReportKind::Delivery, at));
+        receiver.receive(&frame, at + 2_000_000).unwrap();
+        assert!(receiver.include_feedback(quality::ReportKind::Delivery, at + 3_000_000));
+        assert!(!receiver.include_feedback(quality::ReportKind::Delivery, at + 3_000_001));
+        assert!(!receiver.include_feedback(quality::ReportKind::Delivery, at - 1));
+        assert!(receiver.include_feedback(quality::ReportKind::Full, at + 3_000_001));
+        assert_eq!(receiver.snapshot(at).received.received_bytes, 972);
+    }
+
+    #[test]
+    fn fast_feedback_format_must_be_negotiated_before_independent_data() {
+        assert!(validate_format(0, None).is_ok());
+        assert!(validate_format(64_000, None).is_err());
+        assert!(validate_format(64_000, Some("1")).is_err());
+        assert!(validate_format(64_000, Some(FORMAT)).is_ok());
+        let mut receiver = State::new(7);
+        let stale = State::new(8).prepare_with_feedback(0, true);
+        assert!(receiver.receive(&stale, 1000).is_err());
+        assert!(!receiver.include_feedback(quality::ReportKind::Delivery, 1000));
+        assert_eq!(State::new(8).last_fast_request_us, None);
+    }
 
     #[test]
     fn independent_stream_measures_erasure_with_unrelated_clocks_and_no_business_bytes() {

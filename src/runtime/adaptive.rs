@@ -2092,6 +2092,22 @@ impl PathController {
         }
     }
 
+    /// Request fast independent reports only while busy service needs measurement.
+    pub fn independent_probe_fast_feedback(&self, now_us: u64) -> bool {
+        let current = now_us
+            .checked_sub(self.last_control.at_us)
+            .is_some_and(|age| age <= CONTROL_US);
+        self.last_control.offered_backlog
+            && (!current
+                || !self.decision(now_us).eligible
+                || self.loss_evidence.counts().1 > 0
+                || self
+                    .last_control
+                    .service_admission
+                    .as_ref()
+                    .is_some_and(|sample| sample.deficit))
+    }
+
     /// Ordinary busy discovery already measures business service. Keep one low
     /// pilot allowance per group until loss, a paired delivery deficit or lost
     /// eligibility calls for independent data measurement. Idle measurement and
@@ -2105,13 +2121,7 @@ impl PathController {
         let current = now_us
             .checked_sub(self.last_control.at_us)
             .is_some_and(|age| age <= CONTROL_US);
-        let needs_measurement = !self.decision(now_us).eligible
-            || self.loss_evidence.counts().1 > 0
-            || self
-                .last_control
-                .service_admission
-                .as_ref()
-                .is_some_and(|sample| sample.deficit);
+        let needs_measurement = self.independent_probe_fast_feedback(now_us);
         if current && self.last_control.offered_backlog && !needs_measurement {
             configured.min(MIN_BPS / group_paths.max(1) as u64)
         } else {

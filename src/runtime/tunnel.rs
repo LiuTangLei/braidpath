@@ -1023,10 +1023,14 @@ async fn sender(
                         .expect("quality lock")
                         .unreported_received_bytes()
                         .saturating_add(if policy.capacity_probe_bps > 0 {
-                            path.capacity_probe
-                                .lock()
-                                .expect("capacity probe lock")
-                                .unreported_received_bytes()
+                            let state = path.capacity_probe.lock().expect("capacity probe lock");
+                            if state
+                                .include_feedback(quality::ReportKind::Delivery, quality_time(path))
+                            {
+                                state.unreported_received_bytes()
+                            } else {
+                                0
+                            }
                         } else {
                             0
                         })
@@ -1045,7 +1049,14 @@ async fn sender(
                     })
                     .collect();
                 if !reports.is_empty() {
-                    let frame = if policy.capacity_probe_bps > 0 {
+                    let include_probes = policy.capacity_probe_bps > 0
+                        && paths.iter().any(|path| {
+                            path.capacity_probe
+                                .lock()
+                                .expect("capacity probe lock")
+                                .include_feedback(kind, quality_time(path))
+                        });
+                    let frame = if include_probes {
                         let probes: Vec<_> = paths
                             .iter()
                             .map(|path| {
@@ -1094,7 +1105,7 @@ async fn sender(
                         .expect("quality lock")
                         .snapshot
                         .controls_sent += 1;
-                    if policy.capacity_probe_bps > 0 {
+                    if frame.starts_with(b"BQ3C") {
                         path.capacity_probe
                             .lock()
                             .expect("capacity probe lock")
@@ -1213,7 +1224,12 @@ async fn sender(
                     .capacity_probe
                     .lock()
                     .expect("capacity probe lock")
-                    .prepare(quality_time(path));
+                    .prepare_with_feedback(
+                        quality_time(path),
+                        !policy.probe_guided_recovery
+                            || controllers[usize::from(path.id)]
+                                .independent_probe_fast_feedback(now_us),
+                    );
                 let data =
                     wire::http_datagram(path.stream, &frame).expect("capacity probe mapping");
                 let cost = data.len() + 80;
@@ -1923,6 +1939,7 @@ async fn server_connection(
                     ensure!(usize::from(group)<MAX_PATHS,"invalid path group");
                     let latency_target_ms=req.headers().get("braidpath-latency-ms").map(|v|v.to_str()).transpose()?.unwrap_or("20").parse::<u64>()?;
                     let capacity_probe_bps=req.headers().get("braidpath-capacity-probe-bps").map(|v|v.to_str()).transpose()?.unwrap_or("0").parse::<u64>()?;
+                    capacity_probe::validate_format(capacity_probe_bps,req.headers().get("braidpath-capacity-probe-format").map(|v|v.to_str()).transpose()?)?;
                     let guided=req.headers().get("braidpath-probe-guided-recovery").map(|v|v.to_str()).transpose()?;
                     ensure!(guided.is_none() || guided==Some("1"),"invalid probe-guided recovery header");
                     let probe_guided_recovery=guided.is_some();
@@ -1974,7 +1991,7 @@ async fn server_connection(
                     metrics.register(&sid,pid,stream_id,stats::RETURN,&conn);
                     joined=Some((sid,session,pid,stream_id));
                     let mut response=Response::builder().status(200).header("braidpath-version","1").header("braidpath-max-payload",MAX_PAYLOAD);if feedback.is_some(){response=response.header("braidpath-feedback","2");}
-                    if capacity_probe_bps>0 {response=response.header("braidpath-capacity-probe-bps",capacity_probe_bps);}
+                    if capacity_probe_bps>0 {response=response.header("braidpath-capacity-probe-bps",capacity_probe_bps).header("braidpath-capacity-probe-format",capacity_probe::FORMAT);}
                     if probe_guided_recovery {response=response.header("braidpath-probe-guided-recovery","1");}
                     if let Some(scheduler)=quality_schedule {response=response.header("braidpath-scheduler",scheduler);}stream.send_response(response.body(())?).await?;
                     request=Some(stream);
@@ -2512,7 +2529,9 @@ async fn connect_path(
         req = req.header("braidpath-probe-guided-recovery", "1");
     }
     if policy.capacity_probe_bps > 0 {
-        req = req.header("braidpath-capacity-probe-bps", policy.capacity_probe_bps);
+        req = req
+            .header("braidpath-capacity-probe-bps", policy.capacity_probe_bps)
+            .header("braidpath-capacity-probe-format", capacity_probe::FORMAT);
     }
     let req = req.body(())?;
     let mut stream = send.send_request(req).await?;
@@ -2580,6 +2599,13 @@ async fn connect_path(
                 == Some(policy.capacity_probe_bps),
         "capacity probe budget not negotiated"
     );
+    capacity_probe::validate_format(
+        policy.capacity_probe_bps,
+        response
+            .headers()
+            .get("braidpath-capacity-probe-format")
+            .and_then(|v| v.to_str().ok()),
+    )?;
     diagnostic.admitted();
     Ok((conn, stream.id().into_inner(), driver, stream, send))
 }

@@ -751,3 +751,46 @@ fn guided_recovery_requires_measurement_and_original_only_negotiation() {
     p.capacity_probe_bps = 0;
     assert!(p.validate().is_err());
 }
+
+#[tokio::test]
+async fn business_only_feedback_does_not_renew_independent_probe_evidence() {
+    let pair = Pair::connect().await;
+    let mut path = pair.path();
+    path.capacity_probe_enabled = true;
+    let paths = Arc::new(Mutex::new(vec![path.clone()]));
+    let scope = stats::Metrics::new("client").scope("selective-feedback", stats::FORWARD);
+    let mut body_receiver = capacity_probe::State::new(7);
+    let frame = {
+        let mut sender = path.capacity_probe.lock().unwrap();
+        let frame = sender.prepare(0);
+        sender.admitted();
+        frame
+    };
+    body_receiver.receive(&frame, 1000).unwrap();
+    let mut business_peer = quality::State::new(7);
+    let combined = capacity_probe::control(
+        &[business_peer.report(0, 1000)],
+        &[body_receiver.report(0, quality::ReportKind::Full, 1000)],
+    );
+    measured_payload(&paths, 0, &combined, true, &scope, None).unwrap();
+    let before = path
+        .capacity_probe
+        .lock()
+        .unwrap()
+        .snapshot(quality_time(&path));
+    assert_eq!(before.sender_estimate.received_bytes, 972);
+    assert!(before.sender_estimate.delivered_updated_us.is_some());
+    let business_only = quality::control_v2(&[business_peer.delivery_report(0, 2000)]);
+    measured_payload(&paths, 0, &business_only, true, &scope, None).unwrap();
+    let after = path
+        .capacity_probe
+        .lock()
+        .unwrap()
+        .snapshot(quality_time(&path));
+    assert_eq!(
+        serde_json::to_value(&before.sender_estimate).unwrap(),
+        serde_json::to_value(&after.sender_estimate).unwrap()
+    );
+    assert_eq!(before.controls_received, after.controls_received);
+    assert_eq!(path.quality.lock().unwrap().snapshot.controls_received, 2);
+}
