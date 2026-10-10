@@ -112,11 +112,20 @@ impl Cursor {
 #[derive(Clone, Default)]
 struct Window {
     cursor: Option<Cursor>,
+    latest: Option<Cursor>,
     samples: VecDeque<(u64, u64)>,
 }
 
 impl Window {
     fn push(&mut self, current: Cursor) -> bool {
+        if self.latest.is_some_and(|latest| {
+            current.number <= latest.number
+                || current.receiver_us <= latest.receiver_us
+                || current.bytes < latest.bytes
+        }) {
+            return false;
+        }
+        self.latest = Some(current);
         let Some(previous) = self.cursor else {
             self.cursor = Some(current);
             return false;
@@ -129,11 +138,18 @@ impl Window {
         }
         let span = current.receiver_us - previous.receiver_us;
         let bytes = current.bytes - previous.bytes;
-        self.cursor = Some(current);
         if span > FRESH_US {
+            self.cursor = Some(current);
             self.samples.clear();
             return false;
         }
+        // Extra byte reports must not shrink four stored samples to 400 ms and
+        // make the 1.5-second service gate unreachable. Accumulate exact matching
+        // cumulative endpoints into at least 500 ms per bounded sample instead.
+        if span < 500_000 {
+            return false;
+        }
+        self.cursor = Some(current);
         if self.samples.len() == MAX_SAMPLES {
             self.samples.pop_front();
         }
@@ -1146,6 +1162,52 @@ mod tests {
         }
         assert_eq!(window.samples.len(), MAX_SAMPLES);
         assert_eq!(window.rate(), Some(800_000.0));
+    }
+
+    #[test]
+    fn reprobe_018_fast_reports_preserve_full_service_duration_and_bounds() {
+        let mut window = Window::default();
+        for number in 0..=15 {
+            window.push(Cursor {
+                number: number + 1,
+                receiver_us: 70_000_000 + number * 100_000,
+                bytes: 10_000 + number * 10_000,
+            });
+            if number < 15 {
+                assert!(!window.complete());
+            }
+        }
+        assert!(window.complete());
+        assert_eq!(window.span(), 1_500_000);
+        assert_eq!(window.samples.len(), 3);
+        assert_eq!(window.rate(), Some(800_000.0));
+        assert!(!window.push(Cursor {
+            number: 18,
+            receiver_us: 71_700_000,
+            bytes: 180_000,
+        }));
+        assert!(!window.push(Cursor {
+            number: 17,
+            receiver_us: 71_600_000,
+            bytes: 170_000,
+        }));
+        for number in 18..50 {
+            window.push(Cursor {
+                number: number + 1,
+                receiver_us: 70_000_000 + number * 100_000,
+                bytes: 10_000 + number * 10_000,
+            });
+        }
+        assert_eq!(window.samples.len(), MAX_SAMPLES);
+        assert_eq!(window.rate(), Some(800_000.0));
+
+        assert!(!window.push(Cursor {
+            number: 60,
+            receiver_us: 80_000_000,
+            bytes: 610_000,
+        }));
+        assert!(!window.complete());
+        assert_eq!(window.span(), 0);
     }
 
     #[test]

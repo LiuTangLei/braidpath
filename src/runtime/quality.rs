@@ -8,9 +8,51 @@ use std::collections::{BTreeSet, VecDeque};
 pub const HEADER: usize = 28;
 pub const MAX_FRAME: usize = wire::MAX_WIRE + HEADER;
 pub const INTERVAL_US: u64 = 500_000;
+const DELIVERY_INTERVAL_US: u64 = 100_000;
+const DELIVERY_MIN_BYTES: u64 = 4096;
 const WINDOW: u64 = 512;
 const ENTRY: usize = 49;
 const ENTRY_V2: usize = 65;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReportKind {
+    Full,
+    Delivery,
+}
+
+/// Additional byte progress must not postpone the regular loss/watermark report.
+/// The sender keeps one pending frame and advances this clock only on admission.
+#[derive(Default)]
+pub struct FeedbackSchedule {
+    next_full_us: u64,
+    next_delivery_us: u64,
+}
+
+impl FeedbackSchedule {
+    pub fn should_check(&self, now_us: u64, adaptive: bool) -> bool {
+        now_us >= self.next_full_us
+            || (adaptive
+                && now_us >= self.next_delivery_us
+                && now_us.saturating_add(DELIVERY_INTERVAL_US) <= self.next_full_us)
+    }
+
+    pub fn due(&self, now_us: u64, adaptive: bool, unreported_bytes: u64) -> Option<ReportKind> {
+        if now_us >= self.next_full_us {
+            Some(ReportKind::Full)
+        } else if self.should_check(now_us, adaptive) && unreported_bytes >= DELIVERY_MIN_BYTES {
+            Some(ReportKind::Delivery)
+        } else {
+            None
+        }
+    }
+
+    pub fn admitted(&mut self, kind: ReportKind, now_us: u64) {
+        if kind == ReportKind::Full {
+            self.next_full_us = now_us.saturating_add(INTERVAL_US);
+        }
+        self.next_delivery_us = now_us.saturating_add(DELIVERY_INTERVAL_US);
+    }
+}
 
 #[derive(Clone, Default, Debug, Serialize)]
 pub struct Estimate {
@@ -67,6 +109,8 @@ pub struct State {
     transit_min: Option<i128>,
     peer_report: u64,
     peer_report_time_us: Option<u64>,
+    last_full_report: Option<Report>,
+    last_reported_received_bytes: u64,
     probes: VecDeque<(u64, u64)>,
     last_probe_reply_nonce: Option<u64>,
 }
@@ -83,6 +127,8 @@ impl State {
             transit_min: None,
             peer_report: 0,
             peer_report_time_us: None,
+            last_full_report: None,
+            last_reported_received_bytes: 0,
             probes: VecDeque::new(),
             last_probe_reply_nonce: None,
         }
@@ -204,7 +250,7 @@ impl State {
         self.mature(now_us);
         self.snapshot.received.report_number += 1;
         self.snapshot.received.report_time_us = Some(now_us);
-        Report {
+        let report = Report {
             id,
             generation: self.snapshot.generation,
             sent: self.snapshot.sent_symbols,
@@ -216,7 +262,34 @@ impl State {
             delay_us: ((self.snapshot.received.delay_variation_ms * 1000.0) as u64).min(60_000_000),
             received_bytes: self.snapshot.received.received_bytes,
             report_time_us: now_us,
-        }
+        };
+        self.last_full_report = Some(report.clone());
+        self.last_reported_received_bytes = report.received_bytes;
+        report
+    }
+    pub fn unreported_received_bytes(&self) -> u64 {
+        self.snapshot
+            .received
+            .received_bytes
+            .saturating_sub(self.last_reported_received_bytes)
+    }
+    pub fn delivery_report(&mut self, id: u8, now_us: u64) -> Report {
+        let Some(mut report) = self.last_full_report.clone() else {
+            // A new path/generation first announces its full baseline, even
+            // when another path's byte progress triggered this shared frame.
+            return self.report(id, now_us);
+        };
+        self.snapshot.received.report_number += 1;
+        self.snapshot.received.report_time_us = Some(now_us);
+        report.id = id;
+        report.number = self.snapshot.received.report_number;
+        report.received_bytes = self.snapshot.received.received_bytes;
+        report.report_time_us = now_us;
+        // Retain the last full sent watermark and finalized counts. In
+        // particular, extra reports cannot fill the four-watermark queue or
+        // publish loss before its normal 500 ms reporting opportunity.
+        self.last_reported_received_bytes = report.received_bytes;
+        report
     }
     pub fn apply(&mut self, r: &Report, now_us: u64) -> Result<()> {
         let old = self.snapshot.sender_estimate.clone();
@@ -285,7 +358,9 @@ impl State {
             expected: r.expected,
             received: r.received,
             lost: r.expected - r.received,
-            loss_rate: if old.updated_us.is_none() {
+            loss_rate: if delta_expected == 0 {
+                old.loss_rate
+            } else if old.updated_us.is_none() {
                 rate
             } else {
                 old.loss_rate * 0.75 + rate * 0.25
@@ -435,6 +510,181 @@ mod tests {
         })
         .unwrap()
     }
+    fn apply_wire_report(state: &mut State, report: Report, now_us: u64) {
+        let decoded = parse_control(&control_v2(&[report])).unwrap();
+        state.apply(&decoded[0], now_us).unwrap();
+    }
+
+    #[test]
+    fn feedback_schedule_018_preserves_full_deadline_and_bounds_extra_checks() {
+        let mut schedule = FeedbackSchedule::default();
+        assert!(schedule.should_check(0, false));
+        assert_eq!(schedule.due(0, false, 0), Some(ReportKind::Full));
+        // Constructing or deferring a frame cannot spend either clock.
+        assert_eq!(schedule.due(50_000, true, 8192), Some(ReportKind::Full));
+        schedule.admitted(ReportKind::Full, 0);
+        assert!(!schedule.should_check(99_999, true));
+        assert!(!schedule.should_check(100_000, false));
+        assert!(schedule.should_check(100_000, true));
+        assert_eq!(schedule.due(100_000, true, 4095), None);
+        assert_eq!(schedule.due(100_000, false, 4096), None);
+        for now_us in [100_000, 200_000, 300_000, 400_000] {
+            assert_eq!(schedule.due(now_us, true, 4096), Some(ReportKind::Delivery));
+            schedule.admitted(ReportKind::Delivery, now_us);
+            assert!(!schedule.should_check(now_us + 1, true));
+        }
+        assert_eq!(schedule.due(499_999, true, 8192), None);
+        assert_eq!(schedule.due(500_000, true, 0), Some(ReportKind::Full));
+
+        let mut near_full = FeedbackSchedule::default();
+        near_full.admitted(ReportKind::Full, 0);
+        assert_eq!(
+            near_full.due(400_000, true, 4096),
+            Some(ReportKind::Delivery)
+        );
+        assert!(!near_full.should_check(400_001, true));
+        assert_eq!(near_full.due(400_001, true, 8192), None);
+        // If that pending extra is transport-blocked past the regular deadline,
+        // admitting it must not postpone the already overdue full report.
+        near_full.admitted(ReportKind::Delivery, 600_000);
+        assert_eq!(near_full.due(600_001, false, 0), Some(ReportKind::Full));
+    }
+
+    #[test]
+    fn delivery_reports_018_do_not_advance_watermarks_or_finalize_reordering_early() {
+        let mut left = State::new(7);
+        let mut right = State::new(7);
+        let held: Vec<_> = (0..2)
+            .map(|at| {
+                let packet = left.wrap(&payload(), at);
+                left.admitted(packet.len() - HEADER);
+                packet
+            })
+            .collect();
+        let full = left.report(0, 10);
+        apply_wire_report(&mut right, full.clone(), 20);
+        for n in 1..=4 {
+            let at = n * DELIVERY_INTERVAL_US;
+            let packet = left.wrap(&payload(), at);
+            left.admitted(packet.len() - HEADER);
+            right.receive(&packet, at + 1).unwrap();
+            let reverse = right.wrap(&payload(), at + 2);
+            right.admitted(reverse.len() - HEADER);
+            left.receive(&reverse, at + 3).unwrap();
+            let extra = left.delivery_report(0, at + 10);
+            assert_eq!(
+                (extra.sent, extra.expected, extra.received, extra.delay_us),
+                (full.sent, full.expected, full.received, full.delay_us)
+            );
+            assert!(extra.received_bytes > full.received_bytes);
+            apply_wire_report(&mut right, extra, at + 20);
+            assert_eq!(right.pending.len(), 1);
+            assert_eq!(right.snapshot.received.expected, 0);
+            assert_eq!(right.snapshot.sender_estimate.sample_symbols, 0);
+            assert_eq!(right.snapshot.sender_estimate.updated_us, None);
+            assert_eq!(
+                right.snapshot.sender_estimate.delivered_updated_us,
+                Some(at + 20)
+            );
+        }
+        right.receive(&held[0], 400_030).unwrap();
+        right.receive(&held[1], 400_031).unwrap();
+        right.mature(500_019);
+        assert_eq!(right.snapshot.received.expected, 0);
+        right.mature(500_020);
+        assert_eq!(
+            (
+                right.snapshot.received.expected,
+                right.snapshot.received.received,
+                right.snapshot.received.lost,
+                right.snapshot.late
+            ),
+            (2, 2, 0, 0)
+        );
+    }
+
+    #[test]
+    fn delivery_reports_018_keep_new_loss_private_until_full_and_preserve_its_age() {
+        let mut left = State::new(7);
+        let mut right = State::new(7);
+        apply_wire_report(&mut right, left.report(0, 10), 20);
+        for n in 0..2 {
+            let packet = right.wrap(&payload(), 30 + n);
+            right.admitted(packet.len() - HEADER);
+            if n == 0 {
+                left.receive(&packet, 40).unwrap();
+            }
+        }
+        apply_wire_report(&mut left, right.report(0, 50), 60);
+        left.mature(500_060);
+        assert_eq!(left.snapshot.received.lost, 1);
+        let extra = left.delivery_report(0, 500_070);
+        assert_eq!((extra.expected, extra.received), (0, 0));
+        apply_wire_report(&mut right, extra, 500_080);
+        assert_eq!(right.snapshot.sender_estimate.updated_us, None);
+        assert_eq!(
+            right.snapshot.sender_estimate.delivered_updated_us,
+            Some(500_080)
+        );
+        apply_wire_report(&mut right, left.report(0, 600_000), 600_010);
+        let before = right.snapshot.sender_estimate.clone();
+        assert_eq!(
+            (before.expected, before.received, before.loss_rate),
+            (2, 1, 0.5)
+        );
+        assert_eq!(before.updated_us, Some(600_010));
+
+        let packet = right.wrap(&payload(), 610_000);
+        right.admitted(packet.len() - HEADER);
+        left.receive(&packet, 610_010).unwrap();
+        apply_wire_report(&mut right, left.delivery_report(0, 700_000), 700_010);
+        let after = &right.snapshot.sender_estimate;
+        assert_eq!(after.sample_span_us, 100_000);
+        assert_eq!(after.sample_symbols, 0);
+        assert_eq!(after.loss_rate.to_bits(), before.loss_rate.to_bits());
+        assert_eq!(after.sample_loss_rate, before.sample_loss_rate);
+        assert_eq!(after.updated_us, before.updated_us);
+        assert_eq!(after.delivered_updated_us, Some(700_010));
+        assert!(after.delivered_bps.is_some_and(|rate| rate > 0.0));
+    }
+
+    #[test]
+    fn delivery_reports_018_use_unique_byte_progress_and_reset_with_generation() {
+        let mut sender = State::new(7);
+        let mut receiver = State::new(7);
+        let packet = sender.wrap(&payload(), 10);
+        sender.admitted(packet.len() - HEADER);
+        receiver.receive(&packet, 20).unwrap();
+        receiver.receive(&packet, 21).unwrap();
+        assert_eq!(receiver.unreported_received_bytes(), payload().len() as u64);
+        let reply = receiver.wrap(&payload(), 30);
+        receiver.admitted(reply.len() - HEADER);
+        // A path first included in another path's extra report still supplies
+        // a full baseline, including its own admitted watermark.
+        let first = receiver.delivery_report(3, 40);
+        assert_eq!(
+            (first.id, first.generation, first.sent, first.number),
+            (3, 7, 1, 1)
+        );
+        assert_eq!(receiver.unreported_received_bytes(), 0);
+        apply_wire_report(&mut sender, first, 50);
+        receiver.receive(&packet, 60).unwrap();
+        assert_eq!(receiver.unreported_received_bytes(), 0);
+        let mut restarted = State::new(8);
+        let reset = restarted.delivery_report(3, 70);
+        assert_eq!(
+            (
+                reset.generation,
+                reset.sent,
+                reset.number,
+                reset.received_bytes
+            ),
+            (8, 0, 1, 0)
+        );
+        assert_eq!(restarted.unreported_received_bytes(), 0);
+        assert!(restarted.receive(&packet, 80).is_err());
+    }
+
     #[test]
     fn idle_control_reports_do_not_refresh_old_quality_samples() {
         let mut state = State::new(7);

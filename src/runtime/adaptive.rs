@@ -338,6 +338,9 @@ pub struct PathController {
     last_probe_us: Option<u64>,
     last_control_us: u64,
     last_growth_us: u64,
+    /// A short receiver interval grants at most one initial-growth step. Both
+    /// the report and its cumulative positive bytes must advance for another.
+    last_initial_growth_report: Option<(u64, u64)>,
     growth_not_before_us: u64,
     last_brake_us: Option<u64>,
     last_probe_sample_id: u64,
@@ -395,6 +398,7 @@ impl PathController {
             last_probe_us: None,
             last_control_us: 0,
             last_growth_us: 0,
+            last_initial_growth_report: None,
             growth_not_before_us: 0,
             last_brake_us: None,
             last_probe_sample_id: 0,
@@ -916,10 +920,37 @@ impl PathController {
             {
                 let receiver_keeps_up =
                     wire_delivery_bps.is_some_and(|rate| rate >= allowance_rate * 0.85);
+                let short_delivery_interval = observation.delivery_report_time_us.is_some()
+                    && observation.delivery_sample_span_us > 0
+                    && observation.delivery_sample_span_us <= CONTROL_US
+                    && observation
+                        .delivered_bps
+                        .is_some_and(|rate| rate.is_finite() && rate > 0.0);
+                let unused_short_report = self.last_report.is_some_and(|(number, bytes, at)| {
+                    number == observation.report_number
+                        && bytes > 0
+                        && now.saturating_sub(at) <= CONTROL_US
+                        && observation
+                            .positive_delivery_age_us
+                            .is_some_and(|age| age <= CONTROL_US)
+                        && self
+                            .last_initial_growth_report
+                            .is_none_or(|(used, delivered)| number > used && bytes > delivered)
+                });
                 let (interval, gain, ceiling) = if !self.congestion_seen {
                     // The initial search is fast only when actual admissions and
                     // receiver delivery support it, not at 60% use of an unused budget.
-                    (400_000, 1.5, self.maximum_bps as f64)
+                    // Short authenticated byte reports close the loop sooner;
+                    // they do not increase the gain or bypass a congestion brake.
+                    (
+                        if short_delivery_interval {
+                            CONTROL_US
+                        } else {
+                            400_000
+                        },
+                        1.5,
+                        self.maximum_bps as f64,
+                    )
                 } else if (self.rate_bps as f64) < self.remembered_bps * 0.90 {
                     // Revisit a previously exercised range in small, observable
                     // steps. A failed trial brakes and waits before another attempt.
@@ -929,11 +960,14 @@ impl PathController {
                 };
                 if now.saturating_sub(self.last_growth_us) >= interval
                     && (self.congestion_seen || receiver_keeps_up)
+                    && (self.congestion_seen || !short_delivery_interval || unused_short_report)
                 {
                     self.rate_bps = ((self.rate_bps as f64 * gain).min(ceiling) as u64)
                         .max(self.rate_bps)
                         .min(self.maximum_bps);
                     rate_reason = if !self.congestion_seen {
+                        self.last_initial_growth_report =
+                            self.last_report.map(|(number, bytes, _)| (number, bytes));
                         RateReason::InitialGrowth
                     } else if (self.rate_bps as f64) < self.remembered_bps * 0.90 {
                         RateReason::KnownServiceRecovery
@@ -1169,6 +1203,95 @@ mod tests {
             }
         }
         admitted
+    }
+
+    #[test]
+    fn fast_delivery_growth_018_requires_new_bytes_and_cannot_reuse_a_report() {
+        let mut controller = PathController::new(20_000_000, 20);
+        let mut sample = observation(0, 20.0);
+        sample.delivery_sample_span_us = 100_000;
+        sample.delivery_report_time_us = Some(100_000_000);
+        sample.delivered_bps = Some(START_BPS as f64);
+        controller.observe(&sample);
+
+        exercise_budget(&mut controller, 0, CONTROL_US);
+        sample.now_us = CONTROL_US;
+        sample.report_number = 2;
+        sample.delivered_bytes = 6400;
+        sample.delivery_report_time_us = Some(100_200_000);
+        controller.observe(&sample);
+        let first = controller.decision(sample.now_us).pacing_bps;
+        assert!(first > START_BPS);
+
+        // Neither replaying a fast report nor increasing only its number may
+        // fund another step, even with backlog and an exercised allowance.
+        for step in 2..=4 {
+            let start = (step - 1) * CONTROL_US;
+            exercise_budget(&mut controller, start, CONTROL_US);
+            sample.now_us = step * CONTROL_US;
+            sample.positive_delivery_age_us = Some(sample.now_us - CONTROL_US);
+            if step == 4 {
+                sample.report_number = 3;
+                sample.delivery_report_time_us = Some(100_800_000);
+                sample.positive_delivery_age_us = Some(0);
+                sample.delivered_bps = Some(first as f64);
+            }
+            controller.observe(&sample);
+            assert_eq!(controller.decision(sample.now_us).pacing_bps, first);
+        }
+
+        exercise_budget(&mut controller, 800_000, CONTROL_US);
+        sample.now_us = 1_000_000;
+        sample.report_number = 4;
+        sample.delivered_bytes += first / 40;
+        sample.delivery_report_time_us = Some(101_000_000);
+        controller.observe(&sample);
+        assert!(controller.decision(sample.now_us).pacing_bps > first);
+    }
+
+    #[test]
+    fn fast_delivery_growth_018_does_not_override_queue_brakes_or_idle_demand() {
+        let mut controller = PathController::new(20_000_000, 20);
+        let mut sample = observation(0, 20.0);
+        sample.delivery_sample_span_us = 100_000;
+        sample.delivery_report_time_us = Some(100_000_000);
+        sample.delivered_bps = Some(START_BPS as f64);
+        sample.offered_backlog = false;
+        controller.observe(&sample);
+        sample.now_us = CONTROL_US;
+        sample.report_number = 2;
+        sample.delivered_bytes = 64;
+        sample.delivery_report_time_us = Some(100_200_000);
+        controller.observe(&sample);
+        assert_eq!(controller.decision(sample.now_us).pacing_bps, START_BPS);
+
+        sample.offered_backlog = true;
+        exercise_budget(&mut controller, CONTROL_US, CONTROL_US);
+        sample.now_us = 400_000;
+        sample.report_number = 3;
+        sample.delivered_bytes += 6400;
+        sample.delivery_report_time_us = Some(100_400_000);
+        sample.rtt_ms = 120.0;
+        sample.probe_rtt_ms = Some(120.0);
+        sample.probe_latest_rtt_ms = Some(120.0);
+        sample.probe_sample_id += 1;
+        controller.observe(&sample);
+        let braked = controller.decision(sample.now_us).pacing_bps;
+        assert!(braked < START_BPS);
+        assert!(matches!(
+            controller.rate_changes.back().unwrap().reason,
+            RateReason::QueueBrake
+        ));
+
+        // A new generation starts from the original bound; a previous fast
+        // report cannot become initial-growth credit on the replacement path.
+        sample.generation += 1;
+        sample.now_us += 100_000;
+        sample.report_number = 1;
+        sample.delivered_bytes = 0;
+        controller.observe(&sample);
+        assert_eq!(controller.decision(sample.now_us).pacing_bps, START_BPS);
+        assert!(controller.last_initial_growth_report.is_none());
     }
 
     fn weight_observation_016(

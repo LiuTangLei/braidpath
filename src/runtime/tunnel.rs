@@ -560,8 +560,8 @@ async fn sender(
     let mut cursor = 0usize;
     let mut control_cursor = 0usize;
     let mut reprobe_cursor = 0usize;
-    let mut next_feedback = 0u64;
-    let mut pending_feedback: Option<Bytes> = None;
+    let mut feedback_schedule = quality::FeedbackSchedule::default();
+    let mut pending_feedback: Option<(Bytes, quality::ReportKind)> = None;
     let mut observe_at = 0u64;
     let mut repair_turn = false;
     let mut tick = interval(Duration::from_millis(1));
@@ -759,21 +759,37 @@ async fn sender(
             }
             observe_at = now_us.saturating_add(100_000);
         }
-        if policy.receiver_feedback && pending_feedback.is_none() && now_us >= next_feedback {
-            let reports: Vec<_> = paths
+        if policy.receiver_feedback
+            && pending_feedback.is_none()
+            && feedback_schedule.should_check(now_us, policy.adaptive)
+        {
+            let unreported_bytes = paths
                 .iter()
                 .map(|path| {
                     path.quality
                         .lock()
                         .expect("quality lock")
-                        .report(path.id, quality_time(path))
+                        .unreported_received_bytes()
                 })
-                .collect();
-            if !reports.is_empty() {
-                pending_feedback = Some(quality::control_v2(&reports));
+                .fold(0u64, u64::saturating_add);
+            if let Some(kind) = feedback_schedule.due(now_us, policy.adaptive, unreported_bytes) {
+                let reports: Vec<_> = paths
+                    .iter()
+                    .map(|path| {
+                        let mut state = path.quality.lock().expect("quality lock");
+                        let at = quality_time(path);
+                        match kind {
+                            quality::ReportKind::Full => state.report(path.id, at),
+                            quality::ReportKind::Delivery => state.delivery_report(path.id, at),
+                        }
+                    })
+                    .collect();
+                if !reports.is_empty() {
+                    pending_feedback = Some((quality::control_v2(&reports), kind));
+                }
             }
         }
-        if let Some(frame) = &pending_feedback {
+        if let Some((frame, kind)) = &pending_feedback {
             let mut admitted = false;
             let mut control_order: Vec<_> = (0..paths.len())
                 .map(|n| (control_cursor + n) % paths.len())
@@ -811,8 +827,8 @@ async fn sender(
                 }
             }
             if admitted {
+                feedback_schedule.admitted(*kind, now_us);
                 pending_feedback = None;
-                next_feedback = now_us.saturating_add(quality::INTERVAL_US);
             } else {
                 metrics.update(|d| d.symbols.feedback_deferred += 1);
             }
@@ -821,7 +837,7 @@ async fn sender(
         // Small business/probe datagrams otherwise can starve a larger report forever.
         let feedback_reserve = pending_feedback
             .as_ref()
-            .map_or(0, |frame| frame.len() + 89);
+            .map_or(0, |(frame, _)| frame.len() + 89);
         let reserved_group = if feedback_reserve > 0 {
             paths
                 .iter()
