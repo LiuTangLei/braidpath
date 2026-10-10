@@ -3,11 +3,13 @@ use serde::Serialize;
 use std::collections::VecDeque;
 
 mod reprobe;
+mod service;
 pub use reprobe::Request as ReprobeRequest;
 
 const FRESH_US: u64 = 3_000_000;
 const CONTROL_US: u64 = 200_000;
 const PROBE_US: u64 = 500_000;
+const FAST_PROBE_US: u64 = 100_000;
 const BRAKE_US: u64 = 100_000;
 const RETRY_GROWTH_US: u64 = 500_000;
 const START_BPS: u64 = 256_000;
@@ -268,6 +270,14 @@ pub struct ControlSample {
     pub transport_blocked: bool,
     pub offered_backlog: bool,
     pub latest_symbol_delivery_bps: Option<f64>,
+    /// Short reports remain raw startup evidence; service decisions use this
+    /// independently accumulated interval once fast feedback has been seen.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub service_symbol_delivery_bps: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub service_sample_span_us: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub startup_probe_excess_ms: Option<f64>,
     pub ordinary_loss_pressure: bool,
     pub fast_loss: bool,
 }
@@ -341,6 +351,12 @@ pub struct PathController {
     /// A short receiver interval grants at most one initial-growth step. Both
     /// the report and its cumulative positive bytes must advance for another.
     last_initial_growth_report: Option<(u64, u64)>,
+    last_initial_growth_probe: Option<u64>,
+    fast_feedback_seen: bool,
+    fast_probe_min_rtt_ms: Option<f64>,
+    /// A queue established by a startup probe survives the switch to caution
+    /// until a new probe observes drainage or the original evidence expires.
+    startup_probe_pressure: Option<(f64, u64)>,
     growth_not_before_us: u64,
     last_brake_us: Option<u64>,
     last_probe_sample_id: u64,
@@ -357,6 +373,7 @@ pub struct PathController {
     last_report: Option<(u64, u64, u64)>,
     delivery_bps: Option<f64>,
     latest_delivery_bps: Option<f64>,
+    service_window: service::Window,
     /// Short-lived service measured while bytes left faster than we admitted.
     draining_bps: Option<(f64, u64)>,
     drain_restore_pending: bool,
@@ -399,6 +416,10 @@ impl PathController {
             last_control_us: 0,
             last_growth_us: 0,
             last_initial_growth_report: None,
+            last_initial_growth_probe: None,
+            fast_feedback_seen: false,
+            fast_probe_min_rtt_ms: None,
+            startup_probe_pressure: None,
             growth_not_before_us: 0,
             last_brake_us: None,
             last_probe_sample_id: 0,
@@ -415,6 +436,7 @@ impl PathController {
             last_report: None,
             delivery_bps: None,
             latest_delivery_bps: None,
+            service_window: service::Window::default(),
             draining_bps: None,
             drain_restore_pending: false,
             remembered_bps: 0.0,
@@ -490,7 +512,22 @@ impl PathController {
                 .last_report
                 .is_none_or(|(number, _, _)| observation.report_number > number);
         let new_loss_report = new_report && feedback_fresh;
+        let short_delivery_interval = observation.delivery_report_time_us.is_some()
+            && observation.delivery_sample_span_us > 0
+            && observation.delivery_sample_span_us <= CONTROL_US
+            && observation
+                .delivered_bps
+                .is_some_and(|rate| rate.is_finite() && rate > 0.0);
+        let mut new_service_report = false;
         if new_report {
+            self.fast_feedback_seen |= short_delivery_interval;
+            let accumulated = self.service_window.observe(
+                observation.report_number,
+                observation.delivery_report_time_us,
+                observation.delivered_bytes,
+                now,
+            );
+            new_service_report = !self.fast_feedback_seen || accumulated;
             let explicit = observation
                 .delivered_bps
                 .filter(|rate| rate.is_finite() && *rate >= 0.0);
@@ -507,10 +544,18 @@ impl PathController {
                 self.latest_delivery_bps = Some(rate);
                 self.delivery_bps =
                     Some(self.delivery_bps.map_or(rate, |old| old * 0.5 + rate * 0.5));
-                if observation.offered_backlog {
+                let service = if self.fast_feedback_seen {
+                    self.service_window.latest(now).map(|sample| sample.bps)
+                } else {
+                    Some(rate)
+                };
+                if observation.offered_backlog
+                    && new_service_report
+                    && let Some(service) = service
+                {
                     self.remembered_bps = self
                         .remembered_bps
-                        .max((rate * self.wire_per_symbol).min(self.maximum_bps as f64));
+                        .max((service * self.wire_per_symbol).min(self.maximum_bps as f64));
                 }
             }
             self.last_report = Some((observation.report_number, observation.delivered_bytes, now));
@@ -573,15 +618,59 @@ impl PathController {
             *minimum = (*minimum).min(rtt);
             rtt_excess = (rtt - *minimum).max(0.0);
         }
-        let wire_delivery_bps = self
-            .latest_delivery_bps
-            .map(|rate| rate * self.wire_per_symbol);
+        let service_sample = self
+            .fast_feedback_seen
+            .then(|| self.service_window.latest(now))
+            .flatten();
+        let service_bps = if self.fast_feedback_seen {
+            service_sample.map(|sample| sample.bps)
+        } else {
+            self.latest_delivery_bps
+        };
+        let wire_delivery_bps = service_bps.map(|rate| rate * self.wire_per_symbol);
+        let fast_initial = self.fast_feedback_seen && !self.congestion_seen;
+        if self
+            .startup_probe_pressure
+            .is_some_and(|(_, at)| now.saturating_sub(at) > FRESH_US)
+        {
+            self.startup_probe_pressure = None;
+        }
+        let startup_probe_excess = if (fast_initial || self.startup_probe_pressure.is_some())
+            && probe_fresh
+            && observation
+                .probe_age_us
+                .is_some_and(|age| age <= CONTROL_US)
+        {
+            probe_rtt.map(|probe| {
+                let minimum = self.fast_probe_min_rtt_ms.get_or_insert(probe);
+                *minimum = (*minimum).min(probe);
+                (probe - *minimum).max(0.0)
+            })
+        } else {
+            None
+        };
+        if new_probe && let Some(excess) = startup_probe_excess {
+            self.startup_probe_pressure = if excess > self.target_ms * 0.5 {
+                Some((
+                    excess,
+                    now.saturating_sub(observation.probe_age_us.unwrap_or(0)),
+                ))
+            } else {
+                None
+            };
+        }
+        let startup_probe_excess = self
+            .startup_probe_pressure
+            .map(|(excess, _)| excess)
+            .or_else(|| fast_initial.then_some(startup_probe_excess).flatten());
         let drain_hint = wire_delivery_bps.unwrap_or(0.0).max(self.rate_bps as f64);
         // A bounded two-datagram burst briefly waiting for Quinn's driver is not congestion.
         let queued_beyond_burst = observation.send_queue_bytes.saturating_sub(2400);
         let transport_wait = queued_beyond_burst as f64 * 8000.0 / drain_hint;
         let previous_queue = self.queue_delay_ms;
-        self.queue_delay_ms = rtt_excess.max(transport_wait);
+        self.queue_delay_ms = rtt_excess
+            .max(transport_wait)
+            .max(startup_probe_excess.unwrap_or(0.0));
         let queue_rising = self.queue_delay_ms > previous_queue + 0.25;
         let new_queue =
             new_rtt || new_probe || (transport_wait - self.last_transport_wait_ms).abs() > 0.25;
@@ -628,7 +717,11 @@ impl PathController {
         let delay_pressure = self.queue_delay_ms > self.target_ms * 0.5;
         let persistent_delay = if delay_pressure {
             let since = *self.delay_since_us.get_or_insert(now);
-            now.saturating_sub(since) >= BRAKE_US || self.queue_delay_ms >= self.target_ms * 4.0
+            now.saturating_sub(since) >= BRAKE_US
+                || self.queue_delay_ms >= self.target_ms * 4.0
+                // Fast startup must not spend another probe interval building
+                // a queue after a new authenticated sample already sees it rise.
+                || (fast_initial && new_probe && queue_rising)
         } else {
             self.delay_since_us = None;
             self.braked_queue_ms = None;
@@ -701,6 +794,9 @@ impl PathController {
             transport_blocked: observation.transport_blocked,
             offered_backlog: observation.offered_backlog,
             latest_symbol_delivery_bps: self.latest_delivery_bps,
+            service_symbol_delivery_bps: service_sample.map(|sample| sample.bps),
+            service_sample_span_us: service_sample.map(|sample| sample.span_us),
+            startup_probe_excess_ms: startup_probe_excess,
             ordinary_loss_pressure: self.loss_pressure,
             fast_loss,
         };
@@ -758,7 +854,7 @@ impl PathController {
             // episode. Require a genuinely new, finalized clear interval too.
             self.pressure_episode_exercised = None;
         }
-        let delivery_shortfall = new_report
+        let delivery_shortfall = new_service_report
             && delay_pressure
             && admission_span > 0
             && now.saturating_sub(self.last_growth_us) >= PROBE_US + BRAKE_US
@@ -770,7 +866,7 @@ impl PathController {
             // recent safety brake can still have changed the active rate.
             self.draining_bps = wire_delivery_bps.map(|rate| (rate, now));
         }
-        if new_report
+        if new_service_report
             && delay_pressure
             && let Some(delivery) =
                 wire_delivery_bps.filter(|rate| *rate > self.rate_bps as f64 * 1.1)
@@ -806,7 +902,7 @@ impl PathController {
                 new_queue && self.queue_delay_ms > last + (self.target_ms * 0.1).max(1.0)
             });
         let new_pressure =
-            new_delay || delivery_shortfall || new_loss || (blocked_pressure && new_report);
+            new_delay || delivery_shortfall || new_loss || (blocked_pressure && new_service_report);
         // An unused allowance is not traffic that can be drained. Sparse idle
         // echo/probe jitter must not turn its small delivery sample into a path
         // capacity estimate. Backlog or a blocked transport still permits an
@@ -858,7 +954,7 @@ impl PathController {
                 // later, smaller allowance while the old evidence drains.
                 let capacity_evidence = new_delay
                     || delivery_shortfall
-                    || (blocked_pressure && new_report)
+                    || (blocked_pressure && new_service_report)
                     || (new_loss && settled_shortfall);
                 self.congestion_seen |=
                     self.pressure_episode_exercised == Some(true) && capacity_evidence;
@@ -918,14 +1014,11 @@ impl PathController {
                 && exercised
                 && now >= self.growth_not_before_us
             {
+                let initial_delivery_bps = self
+                    .latest_delivery_bps
+                    .map(|rate| rate * self.wire_per_symbol);
                 let receiver_keeps_up =
-                    wire_delivery_bps.is_some_and(|rate| rate >= allowance_rate * 0.85);
-                let short_delivery_interval = observation.delivery_report_time_us.is_some()
-                    && observation.delivery_sample_span_us > 0
-                    && observation.delivery_sample_span_us <= CONTROL_US
-                    && observation
-                        .delivered_bps
-                        .is_some_and(|rate| rate.is_finite() && rate > 0.0);
+                    initial_delivery_bps.is_some_and(|rate| rate >= allowance_rate * 0.85);
                 let unused_short_report = self.last_report.is_some_and(|(number, bytes, at)| {
                     number == observation.report_number
                         && bytes > 0
@@ -937,6 +1030,19 @@ impl PathController {
                             .last_initial_growth_report
                             .is_none_or(|(used, delivered)| number > used && bytes > delivered)
                 });
+                let unused_probe = probe_fresh
+                    && observation
+                        .probe_age_us
+                        .is_some_and(|age| age <= CONTROL_US)
+                    && self.last_initial_growth_probe.is_none_or(|used| {
+                        observation.probe_sample_id > used
+                            && probe_rtt.is_some_and(|rtt| {
+                                let sent_us = now
+                                    .saturating_sub(observation.probe_age_us.unwrap_or(u64::MAX))
+                                    .saturating_sub((rtt * 1000.0).ceil() as u64);
+                                sent_us > self.last_growth_us
+                            })
+                    });
                 let (interval, gain, ceiling) = if !self.congestion_seen {
                     // The initial search is fast only when actual admissions and
                     // receiver delivery support it, not at 60% use of an unused budget.
@@ -961,6 +1067,7 @@ impl PathController {
                 if now.saturating_sub(self.last_growth_us) >= interval
                     && (self.congestion_seen || receiver_keeps_up)
                     && (self.congestion_seen || !short_delivery_interval || unused_short_report)
+                    && (self.congestion_seen || !self.fast_feedback_seen || unused_probe)
                 {
                     self.rate_bps = ((self.rate_bps as f64 * gain).min(ceiling) as u64)
                         .max(self.rate_bps)
@@ -968,6 +1075,7 @@ impl PathController {
                     rate_reason = if !self.congestion_seen {
                         self.last_initial_growth_report =
                             self.last_report.map(|(number, bytes, _)| (number, bytes));
+                        self.last_initial_growth_probe = Some(observation.probe_sample_id);
                         RateReason::InitialGrowth
                     } else if (self.rate_bps as f64) < self.remembered_bps * 0.90 {
                         RateReason::KnownServiceRecovery
@@ -1032,9 +1140,25 @@ impl PathController {
             }),
             state: if stale { Health::Probing } else { self.health },
             queue_delay_ms: self.queue_delay_ms,
-            probe_due: self
-                .last_probe_us
-                .is_none_or(|time| now_us.saturating_sub(time) >= PROBE_US),
+            probe_due: self.last_probe_us.is_none_or(|time| {
+                let interval = if self.fast_feedback_seen
+                    && !self.congestion_seen
+                    && self.eligible
+                    && !stale
+                    && self.last_control.offered_backlog
+                    && self.last_control.probe_rtt_ms.is_some_and(|rtt| {
+                        rtt.is_finite() && rtt > 0.0 && rtt * 1000.0 <= CONTROL_US as f64
+                    })
+                    && self.last_control.probe_age_us.is_some_and(|age| {
+                        age.saturating_add(now_us.saturating_sub(self.last_control.at_us))
+                            <= CONTROL_US
+                    }) {
+                    FAST_PROBE_US
+                } else {
+                    PROBE_US
+                };
+                now_us.saturating_sub(time) >= interval
+            }),
             observed_delivery_bps: self.delivery_bps,
             loss_evidence_expected: self.loss_evidence.counts().0.min(u128::from(u64::MAX)) as u64,
             loss_evidence_lost: self.loss_evidence.counts().1.min(u128::from(u64::MAX)) as u64,
@@ -1206,6 +1330,120 @@ mod tests {
     }
 
     #[test]
+    fn fast_growth_019_requires_a_young_probe_started_after_previous_growth() {
+        let mut controller = PathController::new(20_000_000, 20);
+        let mut sample = observation(0, 20.0);
+        sample.delivery_sample_span_us = 100_000;
+        sample.delivery_report_time_us = Some(100_000_000);
+        sample.delivered_bps = Some(START_BPS as f64);
+        controller.observe(&sample);
+        exercise_budget(&mut controller, 0, CONTROL_US);
+        sample.now_us = CONTROL_US;
+        sample.report_number = 2;
+        sample.delivered_bytes = 6400;
+        sample.delivery_report_time_us = Some(100_200_000);
+        controller.observe(&sample);
+        let first = controller.rate_bps;
+        assert!(first > START_BPS);
+
+        exercise_budget(&mut controller, CONTROL_US, CONTROL_US);
+        sample.now_us = 400_000;
+        sample.report_number = 3;
+        sample.delivered_bytes += first / 40;
+        sample.delivered_bps = Some(first as f64);
+        sample.delivery_report_time_us = Some(100_400_000);
+        sample.probe_sample_id = 2;
+        sample.probe_age_us = Some(190_000);
+        // The response is new and young, but its request began at190ms,
+        // before the200ms growth. It cannot validate that increased pace.
+        controller.observe(&sample);
+        assert_eq!(controller.rate_bps, first);
+
+        exercise_budget(&mut controller, 400_000, CONTROL_US);
+        sample.now_us = 600_000;
+        sample.report_number = 4;
+        sample.delivered_bytes += first / 40;
+        sample.delivery_report_time_us = Some(100_600_000);
+        sample.probe_sample_id = 3;
+        sample.probe_age_us = Some(0);
+        controller.observe(&sample);
+        assert!(controller.rate_bps > first);
+        controller.probe_admitted(600_000);
+        assert!(!controller.decision(699_999).probe_due);
+        assert!(controller.decision(700_000).probe_due);
+        controller.eligible = false;
+        assert!(!controller.decision(700_000).probe_due);
+        controller.eligible = true;
+        controller.last_control.probe_rtt_ms = Some(450.0);
+        assert!(!controller.decision(700_000).probe_due);
+        controller.last_control.probe_rtt_ms = Some(20.0);
+        controller.last_control.offered_backlog = false;
+        assert!(!controller.decision(700_000).probe_due);
+        assert!(controller.decision(1_100_000).probe_due);
+    }
+
+    #[test]
+    fn fast_growth_019_brakes_on_new_probe_queue_before_smoothed_quinn_rtt() {
+        let mut controller = PathController::new(20_000_000, 20);
+        let mut sample = observation(0, 20.0);
+        sample.delivery_sample_span_us = 100_000;
+        sample.delivery_report_time_us = Some(100_000_000);
+        sample.delivered_bps = Some(START_BPS as f64);
+        controller.observe(&sample);
+        exercise_budget(&mut controller, 0, CONTROL_US);
+        sample.now_us = CONTROL_US;
+        sample.report_number = 2;
+        sample.delivered_bytes = 6400;
+        sample.delivery_report_time_us = Some(100_200_000);
+        sample.probe_sample_id = 2;
+        controller.observe(&sample);
+        let grown = controller.rate_bps;
+
+        exercise_budget(&mut controller, CONTROL_US, CONTROL_US);
+        sample.now_us = 400_000;
+        sample.report_number = 3;
+        sample.delivered_bytes += grown / 40;
+        sample.delivery_report_time_us = Some(100_400_000);
+        sample.delivered_bps = Some(grown as f64);
+        sample.probe_sample_id = 3;
+        sample.probe_rtt_ms = Some(40.0);
+        sample.probe_latest_rtt_ms = Some(40.0);
+        // Quinn is still20ms; the new real probe has gained20ms of queue.
+        // The first observation of that rise must brake the fast search.
+        controller.observe(&sample);
+        assert!(controller.rate_bps < grown);
+        assert_eq!(controller.last_control.selected_rtt_ms, Some(20.0));
+        assert_eq!(controller.last_control.startup_probe_excess_ms, Some(20.0));
+        assert_eq!(controller.last_control.queue_delay_ms, 20.0);
+        assert!(matches!(
+            controller.rate_changes.back().unwrap().reason,
+            RateReason::QueueBrake
+        ));
+        assert!(controller.congestion_seen);
+        assert!(controller.service_window.latest(sample.now_us).is_none());
+        assert_eq!(controller.remembered_bps, 0.0);
+        let braked = controller.rate_bps;
+        // Entering caution cannot erase the queue while the same probe is
+        // still the newest observation and Quinn remains at its old20ms.
+        sample.now_us = 500_000;
+        sample.probe_age_us = Some(100_000);
+        controller.observe(&sample);
+        assert_eq!(controller.last_control.queue_delay_ms, 20.0);
+        assert!(controller.rate_bps <= braked);
+        sample.now_us = 600_000;
+        sample.probe_sample_id += 1;
+        sample.probe_rtt_ms = Some(20.0);
+        sample.probe_latest_rtt_ms = Some(20.0);
+        sample.probe_age_us = Some(0);
+        controller.observe(&sample);
+        assert_eq!(controller.last_control.queue_delay_ms, 0.0);
+        assert!(controller.startup_probe_pressure.is_none());
+        controller.probe_admitted(600_000);
+        assert!(!controller.decision(700_000).probe_due);
+        assert!(controller.decision(1_100_000).probe_due);
+    }
+
+    #[test]
     fn fast_delivery_growth_018_requires_new_bytes_and_cannot_reuse_a_report() {
         let mut controller = PathController::new(20_000_000, 20);
         let mut sample = observation(0, 20.0);
@@ -1245,6 +1483,7 @@ mod tests {
         sample.report_number = 4;
         sample.delivered_bytes += first / 40;
         sample.delivery_report_time_us = Some(101_000_000);
+        sample.probe_sample_id += 1;
         controller.observe(&sample);
         assert!(controller.decision(sample.now_us).pacing_bps > first);
     }
