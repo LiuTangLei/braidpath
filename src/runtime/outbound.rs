@@ -224,6 +224,11 @@ impl Pacer {
             .min(self.burst);
         self.last_us = now_us;
     }
+    /// Integrate the old rate before replacing it; a change creates no credit.
+    pub fn set_rate(&mut self, now_us: u64, rate: u64) {
+        self.refill(now_us.max(self.last_us));
+        self.rate = rate;
+    }
     pub fn available(&self, bytes: usize) -> bool {
         self.tokens >= bytes as f64
     }

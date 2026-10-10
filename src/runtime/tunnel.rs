@@ -669,6 +669,8 @@ async fn sender(
     let mut control_cursor = 0usize;
     let mut reprobe_cursor = 0usize;
     let mut capacity_cursor = 0usize;
+    let mut capacity_pacing: [capacity_probe::Controller; MAX_PATHS] =
+        std::array::from_fn(|_| capacity_probe::Controller::new(0));
     let mut capacity_budget =
         capacity_probe::Budget::new(policy.capacity_probe_bps, policy.group_rates);
     let mut feedback_schedule = quality::FeedbackSchedule::default();
@@ -873,16 +875,49 @@ async fn sender(
                     offered_backlog: !queue.is_empty(),
                     transport_blocked: path.conn.datagram_send_buffer_space() < wire::MAX_WIRE,
                 };
+                let probe_snapshot = path
+                    .capacity_probe
+                    .lock()
+                    .expect("capacity probe lock")
+                    .snapshot(at);
                 if policy.probe_guided_recovery {
-                    let probe = path
-                        .capacity_probe
-                        .lock()
-                        .expect("capacity probe lock")
-                        .snapshot(at);
                     controllers[usize::from(path.id)]
-                        .observe_with_delivery_probe(&observation, &probe);
+                        .observe_with_delivery_probe(&observation, &probe_snapshot);
                 } else {
                     controllers[usize::from(path.id)].observe(&observation);
+                }
+                if policy.capacity_probe_bps > 0 {
+                    let group_paths = paths
+                        .iter()
+                        .filter(|p| p.group == path.group)
+                        .count()
+                        .max(1) as u64;
+                    let ceiling = (policy.capacity_probe_bps / paths.len().max(1) as u64)
+                        .min(policy.group_rates[usize::from(path.group)] / 20 / group_paths);
+                    let queue_ms = controllers[usize::from(path.id)]
+                        .decision(now_us)
+                        .queue_delay_ms;
+                    capacity_pacing[usize::from(path.id)].observe(
+                        &capacity_probe::Demand {
+                            now_us,
+                            generation: snapshot.generation,
+                            backlog: observation.offered_backlog,
+                            blocked: observation.transport_blocked,
+                            queue_ms,
+                            target_ms: policy.latency_target_ms as f64,
+                            rtt_ms: observation.probe_latest_rtt_ms,
+                            rtt_age_us: observation.probe_age_us,
+                            rtt_sample_id: observation.probe_sample_id,
+                            received_probe_bytes: probe_snapshot.sender_estimate.received_bytes,
+                            positive_probe_age_us: probe_snapshot
+                                .sender_estimate
+                                .delivered_updated_us
+                                .and_then(|t| at.checked_sub(t)),
+                        },
+                        ceiling,
+                    );
+                    let rate = capacity_pacing[usize::from(path.id)].snapshot();
+                    metrics.path(path.id, |p| p.capacity_probe_rate = Some(rate));
                 }
             }
             let live: Vec<_> = paths
@@ -1095,6 +1130,11 @@ async fn sender(
                 if path.conn.close_reason().is_some() {
                     continue;
                 }
+                if !capacity_pacing[usize::from(path.id)]
+                    .available(now_us, capacity_probe::FRAME_BYTES + 82)
+                {
+                    continue;
+                }
                 let frame = path
                     .capacity_probe
                     .lock()
@@ -1109,7 +1149,8 @@ async fn sender(
                     0
                 };
                 let group = &mut groups[usize::from(path.group)];
-                if capacity_budget.available(now_us, path.group, cost)
+                if capacity_pacing[usize::from(path.id)].available(now_us, cost)
+                    && capacity_budget.available(now_us, path.group, cost)
                     && pacer.available(cost + feedback_reserve)
                     && group.available(cost + reserve)
                     && path.conn.datagram_send_buffer_space() >= data.len()
@@ -1122,6 +1163,7 @@ async fn sender(
                     pacer.spend(cost);
                     group.spend(cost);
                     capacity_budget.admitted(path.group, cost);
+                    capacity_pacing[usize::from(path.id)].admitted(cost);
                     path.capacity_probe
                         .lock()
                         .expect("capacity probe lock")

@@ -3,6 +3,9 @@ use super::{MAX_PATHS, outbound, quality};
 use anyhow::{Result, ensure};
 use bytes::Bytes;
 
+mod pacing;
+pub use pacing::{Controller, Demand, RateSnapshot};
+
 pub const FRAME_BYTES: usize = 1000;
 const MARKER: &[u8; 8] = b"BP3PROBE";
 
