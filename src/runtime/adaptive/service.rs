@@ -10,6 +10,8 @@ const SAMPLE_US: u64 = 500_000;
 pub(super) struct Sample {
     pub(super) bps: f64,
     pub(super) span_us: u64,
+    /// Local arrival of the completed receiver interval, not its start time.
+    pub(super) observed_us: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -24,7 +26,7 @@ struct Endpoint {
 pub(super) struct Window {
     cursor: Option<Endpoint>,
     latest: Option<Endpoint>,
-    sample: Option<(Sample, u64)>,
+    sample: Option<Sample>,
 }
 
 impl Window {
@@ -71,19 +73,18 @@ impl Window {
             return false;
         }
         self.cursor = Some(current);
-        self.sample = Some((
-            Sample {
-                bps: (bytes - previous.bytes) as f64 * 8_000_000.0 / span_us as f64,
-                span_us,
-            },
-            now_us,
-        ));
+        self.sample = Some(Sample {
+            bps: (bytes - previous.bytes) as f64 * 8_000_000.0 / span_us as f64,
+            span_us,
+            observed_us: now_us,
+        });
         true
     }
 
     pub(super) fn latest(&self, now_us: u64) -> Option<Sample> {
-        self.sample.and_then(|(sample, observed_us)| {
-            (now_us >= observed_us && now_us - observed_us <= FRESH_US).then_some(sample)
+        self.sample.and_then(|sample| {
+            (now_us >= sample.observed_us && now_us - sample.observed_us <= FRESH_US)
+                .then_some(sample)
         })
     }
 }

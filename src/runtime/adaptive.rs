@@ -218,6 +218,7 @@ pub enum RateReason {
     InitialGrowth,
     KnownServiceRecovery,
     CautiousGrowth,
+    ServiceDiscovery,
     QueueBrake,
     DeliveryShortfallBrake,
     FastLossBrake,
@@ -719,9 +720,12 @@ impl PathController {
             let since = *self.delay_since_us.get_or_insert(now);
             now.saturating_sub(since) >= BRAKE_US
                 || self.queue_delay_ms >= self.target_ms * 4.0
-                // Fast startup must not spend another probe interval building
-                // a queue after a new authenticated sample already sees it rise.
-                || (fast_initial && new_probe && queue_rising)
+                // A sub-target pulse still holds growth but must persist before
+                // braking. At the target, a rising startup probe brakes at once.
+                || (fast_initial
+                    && new_probe
+                    && queue_rising
+                    && self.queue_delay_ms >= self.target_ms)
         } else {
             self.delay_since_us = None;
             self.braked_queue_ms = None;
@@ -1062,6 +1066,22 @@ impl PathController {
                             .last_initial_growth_report
                             .is_none_or(|(used, delivered)| number > used && bytes > delivered)
                 });
+                // A new qualified service endpoint can support one bounded
+                // discovery beyond retained delivery. Its arrival may precede
+                // this control tick; an intervening increase spends the credit.
+                // The receiver interval itself can overlap an earlier pace.
+                let service_discovery = self.fast_feedback_seen
+                    && self.congestion_seen
+                    && !ordinary_loss
+                    && self.queue_delay_ms <= self.target_ms * 0.25
+                    && observation
+                        .positive_delivery_age_us
+                        .is_some_and(|age| age <= CONTROL_US)
+                    && service_sample.is_some_and(|sample| {
+                        sample.observed_us > self.last_growth_us
+                            && now.saturating_sub(sample.observed_us) <= CONTROL_US
+                            && sample.bps * self.wire_per_symbol >= allowance_rate * 0.85
+                    });
                 let (interval, gain, ceiling): (u64, f64, f64) = if !self.congestion_seen {
                     // The initial search is fast only when actual admissions and
                     // receiver delivery support it, not at 60% use of an unused budget.
@@ -1076,6 +1096,8 @@ impl PathController {
                         1.5,
                         self.maximum_bps as f64,
                     )
+                } else if service_discovery {
+                    (CONTROL_US, 1.25, self.maximum_bps as f64)
                 } else if (self.rate_bps as f64) < self.remembered_bps * 0.90 {
                     // Revisit a previously exercised range in small, observable
                     // steps. A failed trial brakes and waits before another attempt.
@@ -1096,6 +1118,8 @@ impl PathController {
                         self.last_initial_growth_report =
                             self.last_report.map(|(number, bytes, _)| (number, bytes));
                         RateReason::InitialGrowth
+                    } else if service_discovery {
+                        RateReason::ServiceDiscovery
                     } else if (self.rate_bps as f64) < self.remembered_bps * 0.90 {
                         RateReason::KnownServiceRecovery
                     } else {
@@ -1350,6 +1374,140 @@ mod tests {
             }
         }
         admitted
+    }
+
+    fn cautious_service_021(qualified_at_us: u64, positive_age_us: u64) -> PathController {
+        let mut controller = PathController::new(20_000_000, 20);
+        let mut sample = observation(0, 80.0);
+        sample.delivery_sample_span_us = 100_000;
+        sample.delivery_report_time_us = Some(100_000_000);
+        sample.delivered_bps = Some(500_000.0);
+        controller.observe(&sample);
+        controller.rate_bps = 500_000;
+        controller.remembered_bps = 500_000.0;
+        controller.congestion_seen = true;
+        let mut delivered_bytes = 0;
+        for now in (100_000..=600_000).step_by(100_000) {
+            delivered_bytes += exercise_budget(&mut controller, now - 100_000, 100_000);
+            sample.now_us = now;
+            sample.report_number = now / 100_000 + 1;
+            sample.probe_sample_id = sample.report_number;
+            sample.delivered_bytes = delivered_bytes;
+            sample.delivery_report_time_us = if now == 500_000 && qualified_at_us == 600_000 {
+                None
+            } else {
+                Some(100_000_000 + now)
+            };
+            sample.positive_delivery_age_us =
+                Some(if now == 600_000 { positive_age_us } else { 0 });
+            controller.observe(&sample);
+        }
+        controller
+    }
+
+    #[test]
+    fn service_discovery_021_keeps_off_tick_evidence_and_requires_young_delivery() {
+        let controller = cautious_service_021(500_000, 0);
+        assert!(controller.congestion_seen);
+        assert_eq!(controller.rate_bps, 600_000);
+        assert_eq!(
+            controller
+                .service_window
+                .latest(600_000)
+                .unwrap()
+                .observed_us,
+            500_000
+        );
+        assert!(matches!(
+            controller.rate_changes.back().unwrap().reason,
+            RateReason::ServiceDiscovery
+        ));
+        // A recent local consumption time cannot make old positive delivery
+        // qualify for discovery. The pre-existing cautious step is still valid.
+        let stale = cautious_service_021(500_000, CONTROL_US + 1);
+        assert_eq!(stale.rate_bps, 515_000);
+        assert!(matches!(
+            stale.rate_changes.back().unwrap().reason,
+            RateReason::CautiousGrowth
+        ));
+    }
+
+    #[test]
+    fn service_discovery_021_cannot_reuse_a_qualified_interval_with_a_new_probe() {
+        let mut controller = cautious_service_021(600_000, 0);
+        assert_eq!(controller.rate_bps, 600_000);
+        assert_eq!(
+            controller
+                .service_window
+                .latest(600_000)
+                .unwrap()
+                .observed_us,
+            600_000
+        );
+        let previous_bytes = controller.last_report.unwrap().1;
+        let admitted = exercise_budget(&mut controller, 600_000, CONTROL_US);
+        let mut sample = observation(800_000, 80.0);
+        sample.delivery_sample_span_us = 100_000;
+        sample.delivery_report_time_us = Some(100_800_000);
+        sample.report_number = 9;
+        sample.probe_sample_id = 9;
+        sample.delivered_bytes = previous_bytes + admitted;
+        sample.delivered_bps = Some(600_000.0);
+        controller.observe(&sample);
+        // The probe is new and began after growth. The still-young service
+        // endpoint was already consumed, so it cannot fund another increment.
+        assert_eq!(controller.rate_bps, 600_000);
+        assert_eq!(controller.last_growth_us, 600_000);
+        assert_eq!(controller.rate_changes_total, 1);
+    }
+
+    #[test]
+    fn startup_probe_021_distinguishes_transient_persistent_and_over_target_delay() {
+        for persistent in [false, true] {
+            let mut controller = PathController::new(20_000_000, 20);
+            let mut sample = observation(0, 80.0);
+            sample.delivery_sample_span_us = 100_000;
+            sample.delivery_report_time_us = Some(100_000_000);
+            sample.delivered_bps = Some(START_BPS as f64);
+            controller.observe(&sample);
+            sample.delivered_bytes = exercise_budget(&mut controller, 0, CONTROL_US);
+            sample.now_us = CONTROL_US;
+            sample.report_number = 2;
+            sample.probe_sample_id = 2;
+            sample.delivery_report_time_us = Some(100_200_000);
+            sample.probe_latest_rtt_ms = Some(95.0);
+            controller.observe(&sample);
+            assert_eq!(controller.rate_bps, START_BPS);
+            assert_eq!(controller.queue_delay_ms, 15.0);
+
+            sample.delivered_bytes += exercise_budget(&mut controller, 200_000, 100_000);
+            sample.now_us = 300_000;
+            sample.report_number = 3;
+            sample.probe_sample_id = 3;
+            sample.delivery_report_time_us = Some(100_300_000);
+            sample.probe_latest_rtt_ms = Some(if persistent { 95.0 } else { 80.0 });
+            controller.observe(&sample);
+            if persistent {
+                assert!(controller.rate_bps < START_BPS);
+                assert!(matches!(
+                    controller.rate_changes.back().unwrap().reason,
+                    RateReason::QueueBrake
+                ));
+            } else {
+                assert_eq!(controller.rate_bps, START_BPS);
+                assert_eq!(controller.queue_delay_ms, 0.0);
+                sample.delivered_bytes += exercise_budget(&mut controller, 300_000, 100_000);
+                sample.now_us = 400_000;
+                sample.report_number = 4;
+                sample.probe_sample_id = 4;
+                sample.delivery_report_time_us = Some(100_400_000);
+                sample.probe_latest_rtt_ms = Some(110.0);
+                controller.observe(&sample);
+                assert!(controller.rate_bps < START_BPS);
+                assert_eq!(controller.queue_delay_ms, 30.0);
+                assert_eq!(controller.last_brake_us, Some(400_000));
+            }
+        }
     }
 
     #[test]
