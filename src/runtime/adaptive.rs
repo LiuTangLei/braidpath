@@ -1669,7 +1669,7 @@ impl PathController {
                 // RTT observations are more frequent than control ticks. Keep
                 // the drainage transition pending so an intervening clear RTT
                 // cannot erase restoration before the next control tick.
-                let measured_restore = service_sample.and_then(|sample| {
+                let qualify_restore = |sample: service::Sample| {
                     let braked_at = self.last_brake_us?;
                     let admission = sample.admission?;
                     let sent_us = now
@@ -1702,6 +1702,22 @@ impl PathController {
                             (sample.bps * self.wire_per_symbol * 0.9).min(self.maximum_bps as f64)
                                 as u64
                         })
+                };
+                // A disjoint capacity sample can age out while newer paired
+                // endpoints already prove post-brake drainage. Retain the
+                // existing fresh sample first, then use the shortest current
+                // interval under the same restoration guards. This
+                // does not change capacity memory or pressure observations.
+                let measured_restore = service_sample.and_then(qualify_restore).or_else(|| {
+                    if service_sample.is_some_and(|sample| {
+                        now.checked_sub(sample.observed_us)
+                            .is_some_and(|age| age <= CONTROL_US)
+                    }) {
+                        return None;
+                    }
+                    self.service_window
+                        .discovery_with_counts(now, 8, 1)
+                        .and_then(qualify_restore)
                 });
                 if let Some(restored) = measured_restore.filter(|target| *target > self.rate_bps) {
                     self.rate_bps = restored;
@@ -3893,6 +3909,14 @@ mod tests {
     // initially withholds every tenth symbol, then drains those real bytes
     // after a severe probe has actually reduced the established allowance.
     fn draining_service_029(start_us: u64, start_bps: u64) -> (PathController, Observation) {
+        draining_service_until_029(start_us, start_bps, 16)
+    }
+
+    fn draining_service_until_029(
+        start_us: u64,
+        start_bps: u64,
+        clear_step: u64,
+    ) -> (PathController, Observation) {
         let mut controller = PathController::new(start_bps * 4, 20);
         let mut quality = crate::runtime::quality::State::new(7);
         let mut sample = short_observation_022(start_us, 80.0);
@@ -3907,9 +3931,9 @@ mod tests {
         controller.last_growth_probe = Some(1);
         let mut received = 0;
         let mut extra_drain = 0;
-        for step in 1..=16 {
+        for step in 1..=clear_step {
             let now = start_us + step * 100_000;
-            if step == 16 {
+            if step == clear_step {
                 controller.probe_admitted(now - 100_000);
             }
             let before = quality.snapshot.sent_bytes;
@@ -3934,19 +3958,26 @@ mod tests {
             if step == 6 {
                 extra_drain = (quality.snapshot.sent_bytes - received) / 6 / 500 * 500;
             }
-            sample = short_observation_022(now, if step < 6 || step == 16 { 80.0 } else { 280.0 });
+            sample = short_observation_022(
+                now,
+                if step < 6 || step == clear_step {
+                    80.0
+                } else {
+                    280.0
+                },
+            );
             sample.report_number = step + 1;
             sample.rtt_ms = 0.0;
             sample.probe_sample_id = if step < 6 {
                 1
-            } else if step == 16 {
+            } else if step == clear_step {
                 3
             } else {
                 2
             };
             sample.probe_age_us = Some(if step < 6 {
                 now - start_us
-            } else if step == 16 {
+            } else if step == clear_step {
                 20_000
             } else {
                 now - start_us - 600_000
@@ -3955,11 +3986,13 @@ mod tests {
             sample.delivered_bps = Some((received - previous_received) as f64 * 80.0);
             sample.admitted_symbols = Some(quality.snapshot.sent_symbols);
             sample.admitted_symbol_bytes = Some(quality.snapshot.sent_bytes);
-            if step == 16 {
+            if step == clear_step {
                 let latest = controller.service_window.latest(now).unwrap();
                 let admitted = latest.admission.unwrap();
-                assert_eq!(latest.observed_us, start_us + 1_500_000);
-                assert_eq!(admitted.started_us, start_us + 1_000_000);
+                if clear_step == 16 {
+                    assert_eq!(latest.observed_us, start_us + 1_500_000);
+                    assert_eq!(admitted.started_us, start_us + 1_000_000);
+                }
                 assert!(admitted.symbols >= 8);
                 assert!(latest.bps > admitted.bps * 1.1);
                 assert!(controller.drain_restore_pending);
@@ -4014,6 +4047,76 @@ mod tests {
             );
         }
         assert!(controller.decision(1_200_000).probe_due);
+    }
+
+    #[test]
+    fn fresh_paired_drain_window_is_not_hidden_by_an_old_disjoint_sample() {
+        let (mut controller, sample) = draining_service_until_029(0, 1_000_000, 18);
+        let old = controller.service_window.latest(sample.now_us).unwrap();
+        assert!(sample.now_us - old.observed_us > CONTROL_US);
+        let before = controller.rate_bps;
+        controller.observe(&sample);
+        let current = controller
+            .service_window
+            .discovery_with_counts(sample.now_us, 8, 1)
+            .unwrap();
+        assert!(sample.now_us - current.observed_us <= CONTROL_US);
+        assert!(current.admission.unwrap().started_us >= controller.last_brake_us.unwrap());
+        assert!(current.bps > current.admission.unwrap().bps * 1.1);
+        let target = (current.bps * controller.wire_per_symbol * 0.9)
+            .min(controller.maximum_bps as f64) as u64;
+        assert!(target > before);
+        assert_eq!(
+            controller.last_control.drain_service_target_bps,
+            Some(target)
+        );
+        assert_eq!(controller.rate_bps, target);
+        let mut repeated = sample.clone();
+        repeated.now_us += CONTROL_US;
+        repeated.probe_age_us = Some(CONTROL_US + 20_000);
+        controller.observe(&repeated);
+        assert_eq!(controller.rate_bps, target);
+        assert_eq!(controller.last_control.drain_service_target_bps, None);
+    }
+
+    #[test]
+    fn current_drain_window_preserves_reply_and_pace_guards() {
+        for guard in [
+            "used_probe",
+            "old_probe",
+            "positive_age",
+            "pace",
+            "interrupted",
+        ] {
+            let (mut controller, mut sample) = draining_service_until_029(0, 1_000_000, 18);
+            let before = controller.rate_bps;
+            let latest = controller.service_window.latest(sample.now_us).unwrap();
+            assert!(sample.now_us - latest.observed_us > CONTROL_US);
+            match guard {
+                "used_probe" => controller.last_growth_probe = Some(sample.probe_sample_id),
+                "old_probe" => sample.probe_age_us = Some(CONTROL_US + 1),
+                "positive_age" => sample.positive_delivery_age_us = Some(CONTROL_US + 1),
+                "pace" => {
+                    controller.rate_bps -= 1;
+                    controller.record_rate_change(
+                        sample.now_us - PROBE_US + 1,
+                        before,
+                        RateReason::ReprobeRollback,
+                    );
+                }
+                "interrupted" => controller.backlog_since_us = Some(sample.now_us - PROBE_US + 1),
+                _ => unreachable!(),
+            }
+            controller.observe(&sample);
+            assert_eq!(
+                controller.last_control.drain_service_target_bps, None,
+                "{guard}"
+            );
+            assert!(
+                controller.rate_bps <= (before as f64 * 1.2) as u64,
+                "{guard}"
+            );
+        }
     }
 
     #[test]
