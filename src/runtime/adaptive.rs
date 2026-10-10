@@ -1664,6 +1664,7 @@ impl PathController {
             1.5
         };
         let elapsed = now.saturating_sub(self.last_control_us);
+        let mut waiting_for_drain_window = false;
         if elapsed >= CONTROL_US {
             if !monitor_withdrawn
                 && fresh
@@ -1672,6 +1673,39 @@ impl PathController {
                 && !protect_ordinary_loss
                 && self.drain_restore_pending
             {
+                // A first speculative step would restart the stable local
+                // interval before it can meet the existing service horizon.
+                // Wait only for a fresh actual drainage pair crossing this
+                // brake, and only until its first post-brake horizon exists.
+                waiting_for_drain_window = self.last_brake_us.is_some_and(|brake| {
+                    self.fast_feedback_seen
+                        && recent_drain.is_some()
+                        && self.last_growth_us <= brake
+                        && now.saturating_sub(brake) < PROBE_US
+                        && self.rate_bps == rate_before_refill
+                        && self.rate_bps == previous_rate
+                        && [
+                            service_sample,
+                            self.service_window.discovery_with_counts(now, 8, 1),
+                        ]
+                        .into_iter()
+                        .flatten()
+                        .any(|sample| {
+                            now.checked_sub(sample.observed_us)
+                                .is_some_and(|age| age <= CONTROL_US)
+                                && sample.span_us >= PROBE_US
+                                && sample.admission.is_some_and(|admission| {
+                                    admission.span_us >= PROBE_US
+                                        && admission.symbols >= 8
+                                        && admission.bps > 0.0
+                                        && admission.started_us < brake
+                                        && self
+                                            .backlog_since_us
+                                            .is_some_and(|since| since <= admission.started_us)
+                                        && sample.bps > admission.bps * 1.1
+                                })
+                        })
+                });
                 // RTT observations are more frequent than control ticks. Keep
                 // the drainage transition pending so an intervening clear RTT
                 // cannot erase restoration before the next control tick.
@@ -1737,6 +1771,7 @@ impl PathController {
                     self.drain_restore_pending = false;
                     self.last_control.drain_service_target_bps = Some(restored);
                 } else if let Some(drain) = recent_drain
+                    && !waiting_for_drain_window
                     && ordinary_growth_ready
                     && (self
                         .last_brake_us
@@ -1782,6 +1817,7 @@ impl PathController {
                 }
             }
             if !monitor_withdrawn
+                && !waiting_for_drain_window
                 && fresh
                 && self.eligible
                 && !pressure
@@ -1964,6 +2000,7 @@ impl PathController {
                     && elapsed < FRESH_US)
                     || (!growth_probe_ready && self.discovery_service_window(now).is_some())
                     || (probe_covered_loss && elapsed < PROBE_US)
+                    || (waiting_for_drain_window && elapsed < PROBE_US)
                     // Whole datagrams can underfill one short tick despite
                     // continuous demand. Keep actual admissions at the same
                     // pace for at most one service horizon; the original 90%
@@ -4137,18 +4174,47 @@ mod tests {
         drain_start: u64,
         drain_slices: u64,
     ) -> (PathController, Observation) {
+        draining_service_after_idle_063(
+            start_us,
+            start_bps,
+            clear_step,
+            drain_start,
+            drain_slices,
+            0,
+        )
+    }
+
+    fn draining_service_after_idle_063(
+        start_us: u64,
+        start_bps: u64,
+        clear_step: u64,
+        drain_start: u64,
+        drain_slices: u64,
+        warmup_us: u64,
+    ) -> (PathController, Observation) {
         let mut controller = PathController::new(start_bps * 4, 20);
         let mut quality = crate::runtime::quality::State::new(7);
-        let mut sample = short_observation_022(start_us, 80.0);
+        let mut sample = short_observation_022(start_us - warmup_us, 80.0);
         sample.report_number = 1;
         sample.probe_sample_id = 1;
         sample.delivered_bytes = 0;
         sample.delivered_bps = Some(0.0);
         sample.admitted_symbol_bytes = Some(0);
+        sample.offered_backlog = warmup_us == 0;
         controller.observe(&sample);
         controller.rate_bps = start_bps;
         controller.tokens = 0.0;
         controller.last_growth_probe = Some(1);
+        if warmup_us > 0 {
+            // The initially idle receiver endpoint offsets disjoint reports;
+            // actual business pacing starts here, with no idle allowance.
+            controller.token_us = start_us;
+            controller.last_control_us = start_us;
+            controller.allowance_bytes = 0.0;
+            sample.now_us = start_us;
+            sample.offered_backlog = true;
+            controller.observe(&sample);
+        }
         let mut received = 0;
         let mut extra_drain = 0;
         for step in 1..=clear_step {
@@ -4269,6 +4335,107 @@ mod tests {
             );
         }
         assert!(controller.decision(1_200_000).probe_due);
+    }
+
+    #[test]
+    fn first_partial_recovery_waits_for_the_original_post_brake_horizon() {
+        let (mut controller, sample) =
+            draining_service_after_idle_063(100_000, 1_000_000, 10, 7, 3, 100_000);
+        let before = controller.rate_bps;
+        assert!(before < 1_000_000);
+        assert_eq!(controller.last_brake_us, Some(700_000));
+        assert_eq!(sample.now_us, 1_100_000);
+        let old = controller.service_window.latest(sample.now_us).unwrap();
+        assert_eq!(old.observed_us, 1_000_000);
+        assert_eq!(old.admission.unwrap().started_us, 500_000);
+        assert!(old.bps > old.admission.unwrap().bps * 1.1);
+        let hint = controller.draining_bps;
+        assert!(hint.is_some());
+        controller.observe(&sample);
+        assert_eq!(controller.last_control.drain_service_target_bps, None);
+        assert_eq!(
+            controller.rate_bps, before,
+            "do not interrupt the first actual 500ms post-brake interval"
+        );
+        assert!(controller.drain_restore_pending);
+        assert_eq!(
+            controller.draining_bps, hint,
+            "waiting does not renew the hint"
+        );
+        controller.probe_admitted(1_200_000);
+        let mut next = admitted_report_026(&mut controller, &sample, 1_300_000, u64::MAX);
+        next.probe_age_us = Some(20_000);
+        controller.observe(&next);
+        let current = controller
+            .service_window
+            .discovery_with_counts(next.now_us, 8, 1)
+            .unwrap();
+        assert!(current.admission.unwrap().started_us >= 700_000);
+        assert!(current.bps > current.admission.unwrap().bps * 1.1);
+        let target = (current.bps * controller.wire_per_symbol * 0.9) as u64;
+        assert!(target > before);
+        assert_eq!(
+            controller.last_control.drain_service_target_bps,
+            Some(target)
+        );
+        assert_eq!(controller.rate_bps, target);
+    }
+
+    #[test]
+    fn post_brake_wait_is_bounded_and_never_suppresses_new_queue_pressure() {
+        for mode in ["pressure", "interrupted", "idle"] {
+            let (mut controller, sample) =
+                draining_service_after_idle_063(100_000, 1_000_000, 10, 7, 3, 100_000);
+            let before = controller.rate_bps;
+            let tokens = controller.tokens;
+            controller.observe(&sample);
+            assert_eq!(controller.rate_bps, before);
+            assert!(controller.tokens <= tokens + before as f64 * 100_000.0 / 8_000_000.0);
+            let now = if mode == "pressure" {
+                1_200_000
+            } else {
+                1_300_000
+            };
+            controller.probe_admitted(now - 100_000);
+            let mut next = admitted_report_026(&mut controller, &sample, now, u64::MAX);
+            next.probe_age_us = Some(20_000);
+            match mode {
+                "pressure" => {
+                    next.rtt_ms = 0.0;
+                    next.probe_latest_rtt_ms = Some(280.0);
+                    next.probe_rtt_ms = Some(280.0);
+                }
+                "interrupted" => controller.backlog_since_us = Some(now - PROBE_US + 1),
+                "idle" => next.offered_backlog = false,
+                _ => unreachable!(),
+            }
+            controller.observe(&next);
+            assert_eq!(
+                controller.last_control.drain_service_target_bps, None,
+                "{mode}"
+            );
+            match mode {
+                "pressure" => {
+                    assert!(controller.rate_bps < before);
+                    assert_eq!(controller.last_brake_us, Some(now));
+                    assert!(matches!(
+                        controller.rate_changes.back().unwrap().reason,
+                        RateReason::QueueBrake
+                    ));
+                }
+                "interrupted" => assert!(
+                    controller.rate_bps > before,
+                    "the finite wait ends after 500ms"
+                ),
+                "idle" => {
+                    // Preserve the existing bounded fallback; idle ends the
+                    // measurement wait and cannot qualify full restoration.
+                    assert!(controller.rate_bps <= (before as f64 * 1.2) as u64);
+                    assert_eq!(controller.last_control_us, now);
+                }
+                _ => unreachable!(),
+            }
+        }
     }
 
     #[test]
