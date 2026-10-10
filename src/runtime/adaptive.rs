@@ -1566,14 +1566,22 @@ impl PathController {
             && (!self.fast_feedback_seen
                 || !self.congestion_seen
                 || self.discovery_service_window(now).is_some());
-        // Near the service rate, an increment held for one RTT can add about
-        // (gain - 1) * RTT of queue. Subtract the queue already occupying the
-        // target before allowing that increment; a clear path keeps its gain.
-        // This is a step-size heuristic: sampling and shared traffic can make
-        // the real feedback loop longer than one RTT, so it is not a bound.
+        // Near service, an increment adds (gain - 1) * held_time of queue.
+        // Ordinary cautious growth needs two replies to settle its monitor:
+        // even immediate requests hold the increment for their spacing + RTT.
+        // Initial byte-feedback growth does not use that two-reply monitor.
+        // This remains a heuristic: scheduling and shared traffic can extend
+        // the feedback horizon; it is not a hard queue or capacity bound.
         let growth_gain_limit = if self.fast_feedback_seen {
             let headroom = (self.target_ms * 0.8 - self.queue_delay_ms).max(0.0);
-            probe_rtt.map_or(1.0, |rtt| 1.0 + (headroom / rtt).min(0.5))
+            let reply_spacing_ms = if self.congestion_seen {
+                FAST_PROBE_US as f64 / 1000.0
+            } else {
+                0.0
+            };
+            probe_rtt.map_or(1.0, |rtt| {
+                1.0 + (headroom / (rtt + reply_spacing_ms)).min(0.5)
+            })
         } else {
             1.5
         };
@@ -2326,7 +2334,7 @@ mod tests {
         let mut first = monitor_reply_034(&mut controller, &sample, 685_000, 84.0, 601_000);
         first.probe_sample_id = sample.probe_sample_id + 1;
         controller.observe(&first);
-        assert_eq!(controller.rate_bps, 368_640);
+        assert_eq!(controller.rate_bps, 334_506);
         assert!(controller.decision(701_000).probe_due);
         controller.probe_admitted(701_000);
         let mut second = monitor_reply_034(&mut controller, &first, 787_000, 86.0, 701_000);
@@ -2513,15 +2521,76 @@ mod tests {
         let (mut controller, sample) = service_endpoint_032();
         let sample = admitted_report_026(&mut controller, &sample, 600_000, u64::MAX);
         controller.observe(&sample);
-        assert_eq!(controller.rate_bps, 368_640);
+        assert_eq!(controller.rate_bps, 334_506);
         let monitor = controller.growth_monitor.as_ref().unwrap();
         assert_eq!(
             (monitor.previous_bps, monitor.pacing_bps),
-            (307_200, 368_640)
+            (307_200, 334_506)
         );
         assert_eq!(monitor.armed_us, 600_000);
         assert!(!controller.drain_restore_pending);
         (controller, sample)
+    }
+
+    #[test]
+    fn monitored_growth_accounts_for_two_reply_feedback_horizon() {
+        let (mut controller, previous) = service_endpoint_032();
+        let sample = admitted_report_026(&mut controller, &previous, 600_000, u64::MAX);
+        let baseline = controller.rate_bps;
+        controller.observe(&sample);
+        let grown = controller.rate_bps;
+        assert!(grown > baseline);
+        let armed = controller.growth_monitor.as_ref().unwrap().armed_us;
+        let first_request = armed + 1;
+        controller.probe_admitted(first_request);
+        let mut first = monitor_reply_034(
+            &mut controller,
+            &sample,
+            first_request + 80_000,
+            80.0,
+            first_request,
+        );
+        first.probe_sample_id = sample.probe_sample_id + 1;
+        first.report_number = sample.report_number + 1;
+        controller.observe(&first);
+        assert!(
+            controller
+                .growth_monitor
+                .as_ref()
+                .unwrap()
+                .first_reply
+                .is_some()
+        );
+        assert!(
+            controller
+                .growth_monitor
+                .as_ref()
+                .unwrap()
+                .second_reply
+                .is_none()
+        );
+        let second_request = first_request + FAST_PROBE_US;
+        controller.probe_admitted(second_request);
+        let mut second = monitor_reply_034(
+            &mut controller,
+            &first,
+            second_request + 80_000,
+            80.0,
+            second_request,
+        );
+        second.probe_sample_id = first.probe_sample_id + 1;
+        second.report_number = first.report_number + 1;
+        controller.observe(&second);
+        assert!(controller.growth_monitor.is_none());
+        assert_eq!(controller.rate_bps, grown);
+        // A bottleneck serving the exercised baseline accumulates this extra
+        // queue until the second real reply can settle the owned increment.
+        let held_ms = (second.now_us - armed) as f64 / 1000.0;
+        let added_queue_ms = (grown - baseline) as f64 / baseline as f64 * held_ms;
+        assert!(
+            added_queue_ms <= controller.target_ms * 0.8 + 0.001,
+            "increment held for {held_ms}ms adds {added_queue_ms}ms of queue"
+        );
     }
 
     fn monitor_reply_034(
@@ -2559,7 +2628,7 @@ mod tests {
         controller.probe_admitted(700_000);
         let sample = monitor_reply_034(&mut controller, &held, 800_000, rtt_ms, 700_000);
         controller.observe(&sample);
-        assert_eq!(controller.rate_bps, 368_640);
+        assert_eq!(controller.rate_bps, 334_506);
         let monitor = controller.growth_monitor.as_ref().unwrap();
         assert!(monitor.first_reply.is_some());
         assert!(monitor.second_reply.is_none());
@@ -2836,7 +2905,7 @@ mod tests {
             let count = controller.rate_changes_total;
             let sample = monitor_reply_034(&mut controller, &sample, 900_000, second, 800_000);
             controller.observe(&sample);
-            assert_eq!(controller.rate_bps, 368_640, "{first} -> {second}");
+            assert_eq!(controller.rate_bps, 334_506, "{first} -> {second}");
             assert_eq!(controller.rate_changes_total, count);
             let evidence = controller.last_control.growth_monitor.as_ref().unwrap();
             assert!(evidence.second_reply.is_some());
@@ -2990,7 +3059,7 @@ mod tests {
         sample = monitor_reply_034(&mut controller, &sample, 1_000_000, 80.0, 900_000);
         controller.observe(&sample);
         assert_eq!(
-            controller.rate_bps, 442_368,
+            controller.rate_bps, 364_239,
             "next qualified endpoint need not wait for the second reply"
         );
         let evidence = controller.last_control.growth_monitor.as_ref().unwrap();
@@ -3088,7 +3157,7 @@ mod tests {
             sample.probe_latest_rtt_ms = Some(88.0);
             controller.observe(&sample);
             let first = controller.rate_bps;
-            assert_eq!(first, (before as f64 * (1.0 + 8.0 / 88.0)) as u64);
+            assert_eq!(first, (before as f64 * (1.0 + 8.0 / 188.0)) as u64);
             assert_eq!(controller.last_growth_us, 600_000);
             assert!(matches!(
                 controller.rate_changes.back().unwrap().reason,
@@ -3289,7 +3358,7 @@ mod tests {
                 next = admitted_report_026(&mut controller, &next, 600_000, u64::MAX);
                 next.probe_age_us = Some(20_000);
                 controller.observe(&next);
-                assert_eq!(controller.rate_bps, 368_640);
+                assert_eq!(controller.rate_bps, 334_506);
                 assert_eq!(controller.last_growth_us, 600_000);
                 assert_eq!(controller.last_growth_probe, Some(next.probe_sample_id));
             }
@@ -3795,7 +3864,7 @@ mod tests {
                 if matches!(invalid, "old" | "receiver_span") {
                     before
                 } else {
-                    (before as f64 * 1.2) as u64
+                    (before as f64 * (1.0 + 16.0 / 180.0)) as u64
                 },
                 "old fallback: {invalid}"
             );
@@ -4613,7 +4682,7 @@ mod tests {
             assert_eq!(controller.queue_delay_ms, 8.0);
             assert_eq!(
                 controller.rate_bps,
-                if restoring { 545_454 } else { 279_272 }
+                if restoring { 521_276 } else { 279_272 }
             );
             assert_eq!(controller.last_growth_probe, Some(sample.probe_sample_id));
             if restoring {
@@ -4873,7 +4942,7 @@ mod tests {
     fn service_discovery_021_keeps_off_tick_evidence_and_requires_young_delivery() {
         let controller = cautious_service_021(500_000, 0);
         assert!(controller.congestion_seen);
-        assert_eq!(controller.rate_bps, 600_000);
+        assert_eq!(controller.rate_bps, 544_444);
         assert_eq!(
             controller
                 .service_window
@@ -4899,7 +4968,7 @@ mod tests {
     #[test]
     fn service_discovery_021_cannot_reuse_a_qualified_interval_with_a_new_probe() {
         let mut controller = cautious_service_021(600_000, 0);
-        assert_eq!(controller.rate_bps, 600_000);
+        assert_eq!(controller.rate_bps, 544_444);
         assert_eq!(
             controller
                 .service_window
@@ -4920,7 +4989,7 @@ mod tests {
         controller.observe(&sample);
         // The probe is new and began after growth. The still-young service
         // endpoint was already consumed, so it cannot fund another increment.
-        assert_eq!(controller.rate_bps, 600_000);
+        assert_eq!(controller.rate_bps, 544_444);
         assert_eq!(controller.last_growth_us, 600_000);
         assert_eq!(controller.rate_changes_total, 1);
     }
@@ -5027,7 +5096,7 @@ mod tests {
         sample.probe_sample_id += 1;
         sample.probe_age_us = Some(20_000);
         controller.observe(&sample);
-        assert_eq!(controller.rate_bps, 600_000);
+        assert_eq!(controller.rate_bps, 544_444);
         assert!(!controller.drain_restore_pending);
         assert_eq!(controller.last_growth_probe, Some(sample.probe_sample_id));
 
@@ -5038,7 +5107,7 @@ mod tests {
         sample.delivered_bps = Some(600_000.0);
         sample.delivery_report_time_us = Some(100_800_000);
         controller.observe(&sample);
-        assert_eq!(controller.rate_bps, 600_000);
+        assert_eq!(controller.rate_bps, 544_444);
         assert!(controller.drain_restore_pending);
 
         sample.delivered_bytes += exercise_budget(&mut controller, 800_000, CONTROL_US);
@@ -5050,7 +5119,7 @@ mod tests {
         controller.observe(&sample);
         // The old 2 Mbps hint cannot jump directly to 1.8 Mbps or stack a
         // second recovery step on the same tick and authenticated reply.
-        assert_eq!(controller.rate_bps, 720_000);
+        assert_eq!(controller.rate_bps, 592_839);
         assert!(!controller.drain_restore_pending);
         controller.probe_admitted(1_000_000);
         assert!(!controller.decision(1_099_999).probe_due);
