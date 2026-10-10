@@ -33,6 +33,19 @@ use tracing::{info, warn};
 const MAX_FLOWS: usize = 64;
 const SESSION_IDLE_GRACE: Duration = Duration::from_secs(120);
 const SESSION_PATH: &str = "/session";
+
+/// Keep one interrupt subscription across control branches and session epochs.
+struct Shutdown(Pin<Box<dyn Future<Output = std::io::Result<()>> + Send>>);
+
+impl Shutdown {
+    fn new() -> Self {
+        Self(Box::pin(tokio::signal::ctrl_c()))
+    }
+
+    async fn wait(&mut self) {
+        let _ = self.0.as_mut().await;
+    }
+}
 const WEBSITE: &str = "<!doctype html><html lang=\"en\"><meta charset=\"utf-8\"><title>Welcome</title><h1>Welcome</h1><p>This service is online.</p></html>\n";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1458,11 +1471,12 @@ pub async fn serve(options: ServerOptions) -> Result<()> {
     let limit = Arc::new(Semaphore::new(128));
     let mut tasks = JoinSet::new();
     let mut maintenance = interval(Duration::from_secs(1));
+    let mut shutdown = Shutdown::new();
     options.stats.readiness(true, 0);
     info!(address=%endpoint.local_addr()?,target=%options.target,congestion=?options.congestion,"HTTP/3 server ready");
     loop {
         tokio::select! {
-            _=tokio::signal::ctrl_c()=>break,
+            _=shutdown.wait()=>break,
             _=maintenance.tick()=>{
                 let mut map=sessions.lock().expect("sessions lock");
                 map.retain(|sid,session| {
@@ -1808,8 +1822,9 @@ pub async fn client(options: ClientOptions) -> Result<()> {
         "invalid bottleneck group"
     );
     let socket = Arc::new(UdpSocket::bind(options.listen).await?);
+    let mut shutdown = Shutdown::new();
     loop {
-        let result = client_session(&options, socket.clone()).await;
+        let result = client_session(&options, socket.clone(), &mut shutdown).await;
         if options.policy.adaptive
             && result
                 .as_ref()
@@ -1820,7 +1835,7 @@ pub async fn client(options: ClientOptions) -> Result<()> {
                 "server session expired; creating a fresh authenticated epoch on the existing local listener"
             );
             tokio::select! {
-                _=tokio::signal::ctrl_c()=>return Ok(()),
+                _=shutdown.wait()=>return Ok(()),
                 _=tokio::time::sleep(Duration::from_secs(1))=>{}
             }
             continue;
@@ -1829,7 +1844,11 @@ pub async fn client(options: ClientOptions) -> Result<()> {
     }
 }
 
-async fn client_session(options: &ClientOptions, socket: Arc<UdpSocket>) -> Result<()> {
+async fn client_session(
+    options: &ClientOptions,
+    socket: Arc<UdpSocket>,
+    shutdown: &mut Shutdown,
+) -> Result<()> {
     let token = transport::token(&options.token)?;
     let sid = transport::hex(&rand::random::<[u8; 16]>());
     let paths: Paths = Arc::new(Mutex::new(Vec::new()));
@@ -1895,7 +1914,7 @@ async fn client_session(options: &ClientOptions, socket: Arc<UdpSocket>) -> Resu
     let mut last_stats = 0u64;
     let result:Result<()>=async {loop {
         tokio::select! {
-            _=tokio::signal::ctrl_c()=>break,
+            _=shutdown.wait()=>break,
             _=tick.tick()=>{
                 let now_us=epoch.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
                 peers.retain(|_,(id,last)|{if last.elapsed()<Duration::from_secs(60){true}else{reverse.remove(id);false}});
@@ -2287,6 +2306,9 @@ mod sender_ready_tests;
 
 #[cfg(test)]
 mod reprobe_tests;
+
+#[cfg(all(test, unix))]
+mod shutdown_tests;
 
 #[cfg(test)]
 mod sender_clock_tests {
