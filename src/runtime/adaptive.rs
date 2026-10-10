@@ -498,6 +498,10 @@ pub struct ControlSample {
     pub service_sample_span_us: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub service_admission: Option<ServiceAdmission>,
+    /// Current paired delivery used for a queue-only brake after the retained
+    /// disjoint interval aged out of the control horizon.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub queue_brake_symbol_delivery_bps: Option<f64>,
     /// Actual one-use restoration from the latest qualified post-brake service.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub drain_service_target_bps: Option<u64>,
@@ -1212,6 +1216,7 @@ impl PathController {
             service_symbol_delivery_bps: service_sample.map(|sample| sample.bps),
             service_sample_span_us: service_sample.map(|sample| sample.span_us),
             service_admission: None,
+            queue_brake_symbol_delivery_bps: None,
             drain_service_target_bps: None,
             growth_monitor: None,
             growth_retry_ceiling_bps: None,
@@ -1465,9 +1470,43 @@ impl PathController {
             let drain_fraction = (1.0
                 - (self.queue_delay_ms - self.target_ms * 0.25).max(0.0) / 200.0)
                 .clamp(0.25, 0.97);
-            let service_hint = wire_delivery_bps
-                .map(|rate| rate.max(recent_drain.unwrap_or(0.0)))
-                .or(recent_drain);
+            // Startup can raise the real delivered rate while the retained
+            // disjoint interval still describes the earlier low allowance.
+            // A current, busy paired interval can size this queue-only brake;
+            // it does not change pressure, capacity memory, or recovery credit.
+            let current_queue_service = (new_delay
+                && !new_loss
+                && !delivery_shortfall
+                && !blocked_pressure
+                && positive_young
+                && observation.offered_backlog
+                && self.rate_bps == previous_rate
+                && self.rate_bps == rate_before_refill
+                && service_sample.is_some_and(|sample| {
+                    now.checked_sub(sample.observed_us)
+                        .is_some_and(|age| age > CONTROL_US)
+                }))
+            .then(|| self.service_window.discovery_with_counts(now, 8, 1))
+            .flatten()
+            .filter(|sample| {
+                now.checked_sub(sample.observed_us)
+                    .is_some_and(|age| age <= CONTROL_US)
+                    && sample.admission.is_some_and(|admission| {
+                        admission.bps > 0.0
+                            && sample.bps >= admission.bps * 0.85
+                            && self
+                                .backlog_since_us
+                                .is_some_and(|since| since <= admission.started_us)
+                            && activity_since_us.is_some_and(|since| since <= admission.started_us)
+                    })
+            });
+            let service_hint = current_queue_service
+                .map(|sample| sample.bps * self.wire_per_symbol)
+                .or_else(|| {
+                    wire_delivery_bps
+                        .map(|rate| rate.max(recent_drain.unwrap_or(0.0)))
+                        .or(recent_drain)
+                });
             let episode_exercised = self.pressure_episode_exercised.unwrap_or(exercised);
             let mut desired = service_hint
                 .filter(|rate| {
@@ -1494,6 +1533,8 @@ impl PathController {
             let floor = MIN_BPS.min(self.maximum_bps) as f64;
             let reduced = desired.max(floor).min(self.rate_bps as f64) as u64;
             if reduced < self.rate_bps {
+                self.last_control.queue_brake_symbol_delivery_bps =
+                    current_queue_service.map(|sample| sample.bps);
                 if self.fast_feedback_seen {
                     self.pressure_episode_exercised.get_or_insert(exercised);
                 }
@@ -4383,6 +4424,138 @@ mod tests {
             );
         }
         assert!(controller.decision(1_200_000).probe_due);
+    }
+
+    fn startup_brake_065() -> (PathController, Observation) {
+        let (mut controller, mut sample) = initial_credit_026(20_000_000);
+        for now in (300_000..=1_300_000).step_by(100_000) {
+            sample = admitted_report_026(&mut controller, &sample, now, u64::MAX);
+            sample.rtt_ms = 0.0;
+            if now == 1_300_000 {
+                sample.probe_rtt_ms = Some(95.0);
+                sample.probe_latest_rtt_ms = Some(95.0);
+            }
+            controller.observe(&sample);
+        }
+        assert!(controller.last_brake_us.is_none());
+        let mut next = admitted_report_026(&mut controller, &sample, 1_400_000, u64::MAX);
+        next.rtt_ms = 0.0;
+        next.probe_rtt_ms = Some(98.0);
+        next.probe_latest_rtt_ms = Some(98.0);
+        (controller, next)
+    }
+
+    #[test]
+    fn queue_brake_uses_current_paired_delivery_when_disjoint_service_has_aged() {
+        let (mut controller, sample) = startup_brake_065();
+        let before = controller.rate_bps;
+        let old = controller.service_window.latest(sample.now_us).unwrap();
+        assert!(sample.now_us - old.observed_us > CONTROL_US);
+        controller.observe(&sample);
+        let current = controller
+            .service_window
+            .discovery_with_counts(sample.now_us, 8, 1)
+            .unwrap();
+        let admission = current.admission.unwrap();
+        assert!(current.bps > old.bps);
+        assert!(current.bps >= admission.bps * 0.85);
+        assert_eq!(
+            current.bps, admission.bps,
+            "every delivered byte was actually admitted"
+        );
+        assert_eq!(controller.queue_delay_ms, 18.0);
+        // Queue rose from 15 to 18ms; the original sudden-jump cap does not
+        // apply. The unchanged drain fraction is 1 - (18 - 5) / 200.
+        let expected = (current.bps * controller.wire_per_symbol * 0.935) as u64;
+        assert!(expected < before);
+        assert_eq!(
+            controller.rate_bps, expected,
+            "brake from actual current delivery, not the older warmup allowance"
+        );
+        assert!(matches!(
+            controller.rate_changes.back().unwrap().reason,
+            RateReason::QueueBrake
+        ));
+        assert_eq!(controller.last_brake_us, Some(sample.now_us));
+        assert_eq!(
+            controller.last_control.service_symbol_delivery_bps,
+            Some(old.bps),
+            "capacity and pressure still use the disjoint sample"
+        );
+    }
+
+    #[test]
+    fn current_queue_brake_keeps_loss_blocking_and_measurement_guards() {
+        for mode in [
+            "loss",
+            "blocked",
+            "old_positive",
+            "idle",
+            "missing_sender",
+            "underdelivery",
+        ] {
+            let (mut controller, mut sample) = startup_brake_065();
+            let before = controller.rate_bps;
+            match mode {
+                "loss" => {
+                    sample.finalized_expected = Some(16);
+                    sample.finalized_lost = Some(8);
+                    sample.loss_sample_rate = Some(0.5);
+                    sample.feedback_sample_symbols = 16;
+                }
+                "blocked" => {
+                    controller.blocked_since_us = Some(sample.now_us - BRAKE_US);
+                    sample.transport_blocked = true;
+                }
+                "old_positive" => sample.positive_delivery_age_us = Some(CONTROL_US + 1),
+                "idle" => sample.offered_backlog = false,
+                "missing_sender" => sample.admitted_symbols = None,
+                "underdelivery" => {
+                    sample.delivered_bytes = controller.last_report.unwrap().1;
+                    sample.delivered_bps = Some(0.0);
+                    sample.positive_delivery_age_us = Some(100_000);
+                }
+                _ => unreachable!(),
+            }
+            controller.observe(&sample);
+            assert!(
+                controller.rate_bps < before,
+                "{mode}: pressure still brakes"
+            );
+            assert_eq!(
+                controller.last_control.queue_brake_symbol_delivery_bps, None,
+                "{mode}"
+            );
+        }
+    }
+
+    #[test]
+    fn current_queue_brake_keeps_the_sudden_jump_cap_and_duplicate_guard() {
+        let (mut controller, mut sample) = startup_brake_065();
+        let before = controller.rate_bps;
+        sample.probe_latest_rtt_ms = Some(106.0);
+        sample.probe_rtt_ms = Some(106.0);
+        controller.observe(&sample);
+        assert_eq!(controller.queue_delay_ms, 26.0);
+        assert!(
+            controller
+                .last_control
+                .queue_brake_symbol_delivery_bps
+                .is_some()
+        );
+        assert_eq!(controller.rate_bps, (before as f64 * 0.75) as u64);
+        let reduced = controller.rate_bps;
+        let brake = controller.last_brake_us;
+        let mut repeated = sample.clone();
+        repeated.now_us += BRAKE_US;
+        repeated.probe_age_us = Some(BRAKE_US);
+        controller.observe(&repeated);
+        assert_eq!(controller.rate_bps, reduced);
+        assert_eq!(controller.last_brake_us, brake);
+        assert_eq!(
+            controller.last_control.queue_brake_symbol_delivery_bps,
+            None
+        );
     }
 
     #[test]
