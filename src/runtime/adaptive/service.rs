@@ -3,8 +3,10 @@
 //! Short byte reports may confirm startup progress. Capacity memory and drain
 //! hints instead need an interval long enough not to promote a brief burst.
 use super::FRESH_US;
+use std::collections::VecDeque;
 
 const SAMPLE_US: u64 = 500_000;
+const ENDPOINTS: usize = 32;
 
 #[derive(Clone, Copy, Debug)]
 pub(super) struct Sample {
@@ -39,6 +41,10 @@ pub(super) struct Window {
     cursor: Option<Endpoint>,
     latest: Option<Endpoint>,
     sample: Option<Sample>,
+    // Discovery can use a new endpoint over the same minimum observation
+    // horizon. Capacity memory/drain retain the disjoint sample above.
+    recent: VecDeque<Endpoint>,
+    discovery: Option<Sample>,
 }
 
 impl Window {
@@ -82,11 +88,15 @@ impl Window {
             if let Some(cursor) = &mut self.cursor {
                 cursor.admitted = None;
             }
+            for endpoint in &mut self.recent {
+                endpoint.admitted = None;
+            }
         }
         let gap = self.latest.is_some_and(|latest| {
             receiver_us - latest.receiver_us > FRESH_US || now_us - latest.observed_us > FRESH_US
         });
         self.latest = Some(current);
+        self.update_discovery(current, gap);
         let Some(previous) = self.cursor else {
             // No byte/time delta exists before the first real endpoint.
             self.cursor = Some(current);
@@ -134,11 +144,154 @@ impl Window {
                 .then_some(sample)
         })
     }
+
+    fn update_discovery(&mut self, current: Endpoint, gap: bool) {
+        if gap {
+            self.recent.clear();
+        }
+        while self.recent.front().is_some_and(|previous| {
+            current.receiver_us - previous.receiver_us > FRESH_US
+                || current.observed_us - previous.observed_us > FRESH_US
+        }) {
+            self.recent.pop_front();
+        }
+        if self.recent.len() == ENDPOINTS {
+            self.recent.pop_front();
+        }
+        self.recent.push_back(current);
+        self.discovery = self.recent.iter().rev().find_map(|previous| {
+            let span_us = current.receiver_us.checked_sub(previous.receiver_us)?;
+            if span_us < SAMPLE_US {
+                return None;
+            }
+            let local_span = current.observed_us.checked_sub(previous.observed_us)?;
+            if local_span == 0 {
+                return None;
+            }
+            let admission = previous.admitted.zip(current.admitted).map(
+                |((start_bytes, start_symbols), (end_bytes, end_symbols))| Admission {
+                    symbol_bytes: end_bytes - start_bytes,
+                    symbols: end_symbols - start_symbols,
+                    bps: (end_bytes - start_bytes) as f64 * 8_000_000.0 / local_span as f64,
+                    span_us: local_span,
+                    started_us: previous.observed_us,
+                },
+            );
+            Some(Sample {
+                bps: (current.bytes - previous.bytes) as f64 * 8_000_000.0 / span_us as f64,
+                span_us,
+                observed_us: current.observed_us,
+                admission,
+            })
+        });
+    }
+
+    pub(super) fn discovery_latest(&self, now_us: u64) -> Option<Sample> {
+        self.discovery.filter(|sample| {
+            now_us >= sample.observed_us && now_us - sample.observed_us <= FRESH_US
+        })
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rolling_discovery_keeps_the_horizon_without_renewing_capacity_or_duplicate_reports() {
+        let mut window = Window::default();
+        for step in 0..=8 {
+            let now = step * 100_000;
+            window.observe(
+                step + 1,
+                Some(100_000_000 + now),
+                step * 10_000,
+                now,
+                Some((step * 12_000, step * 12)),
+            );
+            if step < 5 {
+                assert!(window.discovery_latest(now).is_none());
+            } else {
+                let sample = window.discovery_latest(now).unwrap();
+                assert_eq!(sample.observed_us, now);
+                assert_eq!(sample.span_us, SAMPLE_US);
+                assert_eq!(sample.bps, 800_000.0);
+                assert_eq!(sample.admission.unwrap().symbols, 60);
+                assert_eq!(window.latest(now).unwrap().observed_us, 500_000);
+            }
+        }
+        assert!(!window.observe(9, Some(100_900_000), 90_000, 900_000, Some((108_000, 108))));
+        assert_eq!(
+            window.discovery_latest(900_000).unwrap().observed_us,
+            800_000
+        );
+        assert!(window.discovery_latest(800_001 + FRESH_US).is_none());
+        assert!(window.discovery_latest(799_999).is_none());
+    }
+
+    #[test]
+    fn rolling_history_is_bounded_and_does_not_bridge_missing_admission_or_clock_gaps() {
+        let mut window = Window::default();
+        for step in 0..100 {
+            let now = step * 20_000;
+            window.observe(
+                step + 1,
+                Some(100_000_000 + now),
+                step * 1000,
+                now,
+                Some((step * 2000, step * 2)),
+            );
+            assert!(window.recent.len() <= ENDPOINTS);
+        }
+        assert!(
+            window
+                .discovery_latest(1_980_000)
+                .unwrap()
+                .admission
+                .is_some()
+        );
+        window.observe(101, Some(102_000_000), 100_000, 2_000_000, None);
+        window.observe(
+            102,
+            Some(102_100_000),
+            101_000,
+            2_100_000,
+            Some((202_000, 202)),
+        );
+        assert!(
+            window
+                .discovery_latest(2_100_000)
+                .unwrap()
+                .admission
+                .is_none()
+        );
+        let after_gap = 2_100_001 + FRESH_US;
+        window.observe(
+            103,
+            Some(100_000_000 + after_gap),
+            102_000,
+            after_gap,
+            Some((204_000, 204)),
+        );
+        assert!(window.discovery_latest(after_gap).is_none());
+        assert_eq!(window.recent.len(), 1);
+        window.observe(
+            104,
+            Some(100_500_000 + after_gap),
+            103_000,
+            after_gap + SAMPLE_US,
+            Some((206_000, 206)),
+        );
+        assert_eq!(
+            window
+                .discovery_latest(after_gap + SAMPLE_US)
+                .unwrap()
+                .admission
+                .unwrap()
+                .symbols,
+            2
+        );
+    }
 
     #[test]
     fn paired_service_023_keeps_each_clock_and_allows_old_traffic_to_drain() {

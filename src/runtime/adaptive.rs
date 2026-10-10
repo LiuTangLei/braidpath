@@ -1563,6 +1563,7 @@ impl PathController {
         // The independently measured post-brake restoration below keeps its
         // own stricter service qualification and the original probe guard.
         let ordinary_growth_ready = growth_probe_ready
+            && self.growth_monitor.is_none()
             && (!self.fast_feedback_seen
                 || !self.congestion_seen
                 || self.discovery_service_window(now).is_some());
@@ -1872,7 +1873,7 @@ impl PathController {
 
     fn discovery_service_window(&self, now_us: u64) -> Option<service::Sample> {
         (self.fast_feedback_seen && self.congestion_seen)
-            .then(|| self.service_window.latest(now_us))
+            .then(|| self.service_window.discovery_latest(now_us))
             .flatten()
             .filter(|sample| {
                 sample.observed_us > self.last_growth_us
@@ -2593,6 +2594,72 @@ mod tests {
         );
     }
 
+    #[test]
+    fn clear_monitored_growth_uses_new_rolling_service_without_waiting_for_capacity_tick() {
+        let (mut controller, sample) = monitored_growth_034();
+        let grown = controller.rate_bps;
+        controller.probe_admitted(601_000);
+        let mut first = monitor_reply_034(&mut controller, &sample, 681_000, 80.0, 601_000);
+        first.probe_sample_id = sample.probe_sample_id + 1;
+        controller.observe(&first);
+        controller.probe_admitted(701_000);
+        let mut second = monitor_reply_034(&mut controller, &first, 781_000, 80.0, 701_000);
+        second.probe_sample_id = first.probe_sample_id + 1;
+        controller.observe(&second);
+        assert!(controller.growth_monitor.is_none());
+        let mut next = monitor_reply_034(&mut controller, &second, 800_000, 80.0, 701_000);
+        next.probe_sample_id = second.probe_sample_id;
+        controller.observe(&next);
+        assert!(
+            controller.rate_bps > grown,
+            "new 500ms rolling delivery and two actual clear replies must not wait for the next disjoint capacity interval"
+        );
+        assert_eq!(controller.last_growth_us, 800_000);
+        assert_eq!(
+            controller
+                .service_window
+                .latest(800_000)
+                .unwrap()
+                .observed_us,
+            500_000,
+            "capacity memory retains its original disjoint interval"
+        );
+    }
+
+    #[test]
+    fn new_service_endpoint_cannot_replace_an_unsettled_growth_monitor() {
+        let (mut controller, mut sample) = monitored_growth_034();
+        let grown = controller.rate_bps;
+        let original = controller.growth_monitor.clone().unwrap();
+        let reply_id = sample.probe_sample_id;
+        for now in [700_000, 800_000, 900_000] {
+            sample = admitted_report_026(&mut controller, &sample, now, u64::MAX);
+            sample.probe_sample_id = reply_id;
+            sample.probe_age_us = Some(now - 600_000);
+            controller.observe(&sample);
+        }
+        controller.probe_admitted(900_000);
+        let mut first = monitor_reply_034(&mut controller, &sample, 1_000_000, 80.0, 900_000);
+        first.probe_sample_id = reply_id + 1;
+        controller.observe(&first);
+        assert_eq!(
+            controller.rate_bps, grown,
+            "one clear reply cannot replace the increment still awaiting its second actual reply"
+        );
+        assert_eq!(
+            controller.growth_monitor.as_ref().unwrap().armed_us,
+            original.armed_us
+        );
+        assert!(
+            controller
+                .growth_monitor
+                .as_ref()
+                .unwrap()
+                .first_reply
+                .is_some()
+        );
+    }
+
     fn monitor_reply_034(
         controller: &mut PathController,
         previous: &Observation,
@@ -2749,8 +2816,14 @@ mod tests {
                     controller.observe(&sample);
                 }
                 assert!(
-                    controller.growth_monitor.is_none(),
-                    "clear replies complete the retry"
+                    controller
+                        .last_control
+                        .growth_monitor
+                        .as_ref()
+                        .is_some_and(|monitor| monitor.armed_us == now
+                            && monitor.second_reply.is_some()
+                            && !monitor.withdrawn),
+                    "two clear replies complete the owned retry before another gain"
                 );
                 for next in (now + 300_000..=now + 1_000_000).step_by(100_000) {
                     controller.probe_admitted(next - 100_000);
@@ -2791,7 +2864,20 @@ mod tests {
             sample = monitor_reply_034(&mut controller, &sample, now, 80.0, now - 99_000);
             controller.observe(&sample);
         }
-        assert!(controller.growth_monitor.is_none());
+        assert!(
+            controller
+                .last_control
+                .growth_monitor
+                .as_ref()
+                .is_some_and(|monitor| monitor.armed_us == at
+                    && monitor.second_reply.is_some()
+                    && !monitor.withdrawn)
+        );
+        if controller.rate_bps > retry {
+            assert!(controller.rate_bps <= retry + 2 * (retry - baseline));
+            assert!(controller.last_control.growth_retry_ceiling_bps.is_some());
+            return;
+        }
         for now in (at + 300_000..=at + 1_000_000).step_by(100_000) {
             controller.probe_admitted(now - 100_000);
             sample = monitor_reply_034(&mut controller, &sample, now, 80.0, now - 100_000);
@@ -3059,16 +3145,29 @@ mod tests {
         sample = monitor_reply_034(&mut controller, &sample, 1_000_000, 80.0, 900_000);
         controller.observe(&sample);
         assert_eq!(
-            controller.rate_bps, 364_239,
-            "next qualified endpoint need not wait for the second reply"
+            controller.rate_bps, 334_506,
+            "a new service endpoint cannot replace the owned monitor after one reply"
         );
         let evidence = controller.last_control.growth_monitor.as_ref().unwrap();
         assert_eq!(evidence.armed_us, 600_000);
         assert!(evidence.first_reply.is_some());
         assert!(evidence.second_reply.is_none());
         let current = controller.growth_monitor.as_ref().unwrap();
-        assert_eq!(current.armed_us, 1_000_000);
-        assert_eq!(current.successful_request_us, [None, None]);
+        assert_eq!(current.armed_us, 600_000);
+        controller.probe_admitted(1_100_000);
+        sample = monitor_reply_034(&mut controller, &sample, 1_200_000, 80.0, 1_100_000);
+        controller.observe(&sample);
+        assert!(controller.rate_bps > 334_506);
+        assert_eq!(controller.last_growth_us, 1_200_000);
+        assert!(
+            controller
+                .last_control
+                .growth_monitor
+                .as_ref()
+                .unwrap()
+                .second_reply
+                .is_some()
+        );
 
         let (mut controller, sample) = initial_credit_026(20_000_000);
         let next = admitted_report_026(&mut controller, &sample, 400_000, u64::MAX);
@@ -3169,10 +3268,8 @@ mod tests {
                 controller.drain_restore_pending = true;
             }
             for now in [800_000, 1_000_000] {
-                sample = admitted_report_026(&mut controller, &sample, now, u64::MAX);
-                sample.rtt_ms = 88.0;
-                sample.probe_rtt_ms = Some(88.0);
-                sample.probe_latest_rtt_ms = Some(88.0);
+                controller.probe_admitted(now - 100_000);
+                sample = monitor_reply_034(&mut controller, &sample, now, 88.0, now - 100_000);
                 controller.observe(&sample);
                 if now == 800_000 {
                     assert_eq!(controller.rate_bps, first, "endpoint already consumed");
@@ -3200,7 +3297,11 @@ mod tests {
             controller.decision(600_000).probe_due,
             "it can request new evidence"
         );
-        next = admitted_report_026(&mut controller, &next, 800_000, u64::MAX);
+        // A new probe alone cannot refresh the receiver endpoint.
+        exercise_budget(&mut controller, 600_000, 200_001);
+        next.now_us = 800_001;
+        next.probe_sample_id += 1;
+        next.probe_age_us = Some(0);
         controller.observe(&next);
         assert_eq!(
             controller.rate_bps, before,
@@ -5101,7 +5202,9 @@ mod tests {
         assert_eq!(controller.last_growth_probe, Some(sample.probe_sample_id));
 
         controller.drain_restore_pending = true;
+        controller.probe_admitted(700_000);
         sample.delivered_bytes += exercise_budget(&mut controller, 600_000, CONTROL_US);
+        sample.probe_sample_id += 1;
         sample.now_us = 800_000;
         sample.report_number = 8;
         sample.delivered_bps = Some(600_000.0);
