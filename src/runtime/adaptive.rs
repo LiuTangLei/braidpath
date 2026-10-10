@@ -381,15 +381,12 @@ impl GrowthMonitor {
     fn request_due(&self, now_us: u64) -> bool {
         self.live_at(now_us)
             && now_us >= self.latest_observed_us
-            && now_us >= self.armed_us.saturating_add(FAST_PROBE_US)
+            && now_us > self.armed_us
             && self.successful_request_us[1].is_none()
     }
 
     fn probe_admitted(&mut self, now_us: u64) {
-        if !self.live_at(now_us)
-            || now_us < self.latest_observed_us
-            || now_us < self.armed_us.saturating_add(FAST_PROBE_US)
-        {
+        if !self.live_at(now_us) || now_us < self.latest_observed_us || now_us <= self.armed_us {
             return;
         }
         if self.successful_request_us[0].is_none() {
@@ -421,7 +418,7 @@ impl GrowthMonitor {
                     .now_us
                     .checked_sub(age_us)
                     .and_then(|at| at.checked_sub((probe_rtt_ms * 1000.0).ceil() as u64))
-                && request_us >= self.armed_us.saturating_add(FAST_PROBE_US)
+                && request_us > self.armed_us
                 && self.successful_request_us[0].is_some()
                 && self.first_reply.as_ref().is_none_or(|first| {
                     sample.probe_sample_id > first.sample_id
@@ -1726,10 +1723,27 @@ impl PathController {
                     }
                 }
             }
-            self.last_control_us = now;
-            self.admitted_bytes = 0;
-            self.admitted_symbol_bytes = 0;
-            self.allowance_bytes = 0.0;
+            // Before the first fast-feedback increase, a failed attempt is not
+            // a new pacing interval. Keep the actual admission/allowance pair
+            // so a late first delivery report can qualify on arrival. Idle,
+            // pressure, expiry or an actual change settles it as usual; it can
+            // never retain more than one freshness window of startup history.
+            let pending_startup = self.fast_feedback_seen
+                && !self.congestion_seen
+                && self.last_initial_growth_report.is_none()
+                && self.rate_bps == previous_rate
+                && observation_contiguous
+                && fresh
+                && self.eligible
+                && observation.offered_backlog
+                && !pressure
+                && elapsed < FRESH_US;
+            if !pending_startup {
+                self.last_control_us = now;
+                self.admitted_bytes = 0;
+                self.admitted_symbol_bytes = 0;
+                self.allowance_bytes = 0.0;
+            }
         }
         if self.rate_bps > previous_rate {
             // Ordinary search and both recovery paths spend the same probe
@@ -2092,6 +2106,120 @@ mod tests {
             controller.observe(&sample);
         }
         (controller, sample)
+    }
+
+    #[test]
+    fn startup_pending_evidence_keeps_the_exercised_window() {
+        let mut controller = PathController::new(20_000_000, 20);
+        let mut sample = short_observation_022(0, 80.0);
+        sample.delivered_bytes = 0;
+        sample.delivered_bps = Some(0.0);
+        sample.admitted_symbol_bytes = Some(0);
+        controller.observe(&sample);
+        controller.tokens = 0.0;
+        // Real business keeps using the initial allowance, but the receiver's
+        // first reports cover only the leading part of that business.
+        for now in [100_000, 200_000] {
+            sample = admitted_report_026(&mut controller, &sample, now, 1000);
+            controller.observe(&sample);
+        }
+        assert_eq!(controller.rate_bps, START_BPS);
+        assert!(controller.last_initial_growth_report.is_none());
+        sample = admitted_report_026(&mut controller, &sample, 300_000, u64::MAX);
+        controller.observe(&sample);
+        assert!(
+            controller.rate_bps > START_BPS,
+            "a no-op at 200ms must not defer the first usable evidence to 400ms"
+        );
+        assert_eq!(controller.last_control.admission_span_us, 300_000);
+        assert_eq!(controller.last_growth_us, 300_000);
+        let grown = controller.rate_bps;
+        controller.observe(&sample);
+        sample = admitted_report_026(&mut controller, &sample, 400_000, u64::MAX);
+        controller.observe(&sample);
+        assert_eq!(
+            controller.rate_bps, grown,
+            "actual growth still waits 200ms"
+        );
+    }
+
+    #[test]
+    fn growth_monitor_observes_the_first_post_growth_request_without_extra_wait() {
+        let (mut controller, sample) = monitored_growth_034();
+        // Last successful request was 400ms. The global 100ms spacing has
+        // already elapsed when this growth occurs at 600ms.
+        assert!(!controller.decision(600_000).probe_due);
+        assert!(controller.decision(601_000).probe_due);
+        controller.probe_admitted(601_000);
+        assert!(!controller.decision(700_999).probe_due);
+        let mut first = monitor_reply_034(&mut controller, &sample, 685_000, 84.0, 601_000);
+        first.probe_sample_id = sample.probe_sample_id + 1;
+        controller.observe(&first);
+        assert_eq!(controller.rate_bps, 368_640);
+        assert!(controller.decision(701_000).probe_due);
+        controller.probe_admitted(701_000);
+        let mut second = monitor_reply_034(&mut controller, &first, 787_000, 86.0, 701_000);
+        second.probe_sample_id = first.probe_sample_id + 1;
+        controller.observe(&second);
+        assert_eq!(controller.rate_bps, 307_200);
+        assert!(matches!(
+            controller.rate_changes.back().unwrap().reason,
+            RateReason::GrowthWithdrawalBrake
+        ));
+        let monitor = controller.last_control.growth_monitor.as_ref().unwrap();
+        assert_eq!(
+            monitor.successful_request_us,
+            [Some(601_000), Some(701_000)]
+        );
+        assert_eq!(
+            monitor.first_reply.as_ref().unwrap().inferred_request_us,
+            601_000
+        );
+        assert_eq!(
+            monitor.second_reply.as_ref().unwrap().inferred_request_us,
+            701_000
+        );
+    }
+
+    #[test]
+    fn startup_pending_evidence_does_not_retain_idle_pressure_or_old_windows() {
+        for boundary in ["idle", "pressure", "expired", "legacy"] {
+            let mut controller = PathController::new(20_000_000, 20);
+            let mut sample = short_observation_022(0, 80.0);
+            sample.delivered_bytes = 0;
+            sample.delivered_bps = Some(0.0);
+            controller.observe(&sample);
+            controller.tokens = 0.0;
+            for now in [100_000, 200_000] {
+                sample = admitted_report_026(&mut controller, &sample, now, 1000);
+                controller.observe(&sample);
+            }
+            assert_eq!(controller.last_control_us, 0);
+            let now = if boundary == "expired" {
+                FRESH_US
+            } else {
+                300_000
+            };
+            sample = admitted_report_026(&mut controller, &sample, now, 1000);
+            match boundary {
+                "idle" => sample.offered_backlog = false,
+                "pressure" => {
+                    sample.rtt_ms = 110.0;
+                    sample.probe_rtt_ms = Some(110.0);
+                    sample.probe_latest_rtt_ms = Some(110.0);
+                }
+                "legacy" => {
+                    controller.fast_feedback_seen = false;
+                    sample.delivery_sample_span_us = PROBE_US;
+                }
+                _ => {}
+            }
+            controller.observe(&sample);
+            assert_eq!(controller.last_control_us, now, "{boundary}");
+            assert_eq!(controller.admitted_bytes, 0, "{boundary}");
+            assert_eq!(controller.allowance_bytes, 0.0, "{boundary}");
+            assert!(controller.rate_bps <= START_BPS, "{boundary}");
+        }
     }
 
     #[test]
