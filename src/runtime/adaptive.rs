@@ -1444,11 +1444,44 @@ impl PathController {
             && probe_began_us
                 .zip(self.last_brake_us)
                 .is_some_and(|(began, brake)| began <= brake);
-        let new_delay = persistent_delay
-            && !pre_brake_probe_pressure
-            && self.braked_queue_ms.is_none_or(|last| {
-                new_queue && self.queue_delay_ms > last + (self.target_ms * 0.1).max(1.0)
+        // A fresh post-brake request can show that a severe queue is still
+        // lingering even though it is below the previous peak. Require a
+        // complete stable business interval without convincing drainage;
+        // replayed/old requests and pre-brake traffic cannot repeat the brake.
+        let lingering_queue_service = (self.fast_feedback_seen
+            && severe_probe
+            && observation.probe_sample_id > self.last_probe_sample_id
+            && observation
+                .probe_age_us
+                .is_some_and(|age| age <= CONTROL_US)
+            && positive_young
+            && observation.offered_backlog
+            && self.rate_bps == previous_rate
+            && self.rate_bps == rate_before_refill)
+            .then(|| self.service_window.discovery_with_counts(now, 8, 1))
+            .flatten()
+            .filter(|sample| {
+                now.checked_sub(sample.observed_us)
+                    .is_some_and(|age| age <= CONTROL_US)
+                    && sample.admission.is_some_and(|admission| {
+                        admission.bps > 0.0
+                            && sample.bps <= admission.bps * 1.1
+                            && self
+                                .last_brake_us
+                                .is_some_and(|brake| admission.started_us >= brake)
+                            && admission.started_us >= last_pace_change
+                            && self
+                                .backlog_since_us
+                                .is_some_and(|since| since <= admission.started_us)
+                            && activity_since_us.is_some_and(|since| since <= admission.started_us)
+                    })
             });
+        let new_delay = lingering_queue_service.is_some()
+            || (persistent_delay
+                && !pre_brake_probe_pressure
+                && self.braked_queue_ms.is_none_or(|last| {
+                    new_queue && self.queue_delay_ms > last + (self.target_ms * 0.1).max(1.0)
+                }));
         let new_pressure =
             new_delay || delivery_shortfall || new_loss || (blocked_pressure && new_service_report);
         // An unused allowance is not traffic that can be drained. Sparse idle
@@ -1474,31 +1507,34 @@ impl PathController {
             // disjoint interval still describes the earlier low allowance.
             // A current, busy paired interval can size this queue-only brake;
             // it does not change pressure, capacity memory, or recovery credit.
-            let current_queue_service = (new_delay
-                && !new_loss
-                && !delivery_shortfall
-                && !blocked_pressure
-                && positive_young
-                && observation.offered_backlog
-                && self.rate_bps == previous_rate
-                && self.rate_bps == rate_before_refill
-                && service_sample.is_some_and(|sample| {
+            let current_queue_service = lingering_queue_service.or_else(|| {
+                (new_delay
+                    && !new_loss
+                    && !delivery_shortfall
+                    && !blocked_pressure
+                    && positive_young
+                    && observation.offered_backlog
+                    && self.rate_bps == previous_rate
+                    && self.rate_bps == rate_before_refill
+                    && service_sample.is_some_and(|sample| {
+                        now.checked_sub(sample.observed_us)
+                            .is_some_and(|age| age > CONTROL_US)
+                    }))
+                .then(|| self.service_window.discovery_with_counts(now, 8, 1))
+                .flatten()
+                .filter(|sample| {
                     now.checked_sub(sample.observed_us)
-                        .is_some_and(|age| age > CONTROL_US)
-                }))
-            .then(|| self.service_window.discovery_with_counts(now, 8, 1))
-            .flatten()
-            .filter(|sample| {
-                now.checked_sub(sample.observed_us)
-                    .is_some_and(|age| age <= CONTROL_US)
-                    && sample.admission.is_some_and(|admission| {
-                        admission.bps > 0.0
-                            && sample.bps >= admission.bps * 0.85
-                            && self
-                                .backlog_since_us
-                                .is_some_and(|since| since <= admission.started_us)
-                            && activity_since_us.is_some_and(|since| since <= admission.started_us)
-                    })
+                        .is_some_and(|age| age <= CONTROL_US)
+                        && sample.admission.is_some_and(|admission| {
+                            admission.bps > 0.0
+                                && sample.bps >= admission.bps * 0.85
+                                && self
+                                    .backlog_since_us
+                                    .is_some_and(|since| since <= admission.started_us)
+                                && activity_since_us
+                                    .is_some_and(|since| since <= admission.started_us)
+                        })
+                })
             });
             let service_hint = current_queue_service
                 .map(|sample| sample.bps * self.wire_per_symbol)
@@ -4424,6 +4460,179 @@ mod tests {
             );
         }
         assert!(controller.decision(1_200_000).probe_due);
+    }
+
+    fn lingering_queue_066(
+        start_bps: u64,
+        release_withheld: bool,
+    ) -> (PathController, Observation) {
+        let mut controller = PathController::new(start_bps * 4, 20);
+        let mut quality = crate::runtime::quality::State::new(7);
+        let mut sample = short_observation_022(0, 80.0);
+        sample.delivered_bytes = 0;
+        sample.delivered_bps = Some(0.0);
+        sample.admitted_symbol_bytes = Some(0);
+        sample.rtt_ms = 0.0;
+        controller.observe(&sample);
+        controller.rate_bps = start_bps;
+        controller.tokens = 0.0;
+        controller.last_growth_probe = Some(1);
+        let mut received = 0;
+        for step in 1..=11 {
+            let now = step * 100_000;
+            let before = quality.snapshot.sent_bytes;
+            for at in (now - 100_000..now).step_by(1000) {
+                if at == 320_000 || at == 840_000 {
+                    controller.probe_admitted(at);
+                }
+                while controller.allow(at, 1000, 0.0) {
+                    controller.admitted_symbol(at, 1000, 1000);
+                    quality.admitted(1000);
+                }
+            }
+            let previous_received = received;
+            if release_withheld && step <= 5 {
+                received =
+                    (quality.snapshot.sent_symbols - quality.snapshot.sent_symbols / 10) * 1000;
+            } else if release_withheld && step == 11 {
+                received = quality.snapshot.sent_bytes;
+            } else {
+                received += quality.snapshot.sent_bytes - before;
+            }
+            assert!(received <= quality.snapshot.sent_bytes);
+            let rtt = if step < 6 {
+                80.0
+            } else if step == 11 {
+                260.0
+            } else {
+                280.0
+            };
+            sample = short_observation_022(now, rtt);
+            sample.rtt_ms = 0.0;
+            sample.probe_rtt_ms = Some(rtt);
+            sample.probe_sample_id = if step < 6 {
+                1
+            } else if step == 11 {
+                3
+            } else {
+                2
+            };
+            sample.probe_age_us = Some(if step < 6 {
+                now
+            } else if step == 11 {
+                0
+            } else {
+                now - 600_000
+            });
+            sample.admitted_symbols = Some(quality.snapshot.sent_symbols);
+            sample.admitted_symbol_bytes = Some(quality.snapshot.sent_bytes);
+            sample.delivered_bytes = received;
+            sample.delivered_bps = Some((received - previous_received) as f64 * 80.0);
+            if step == 11 {
+                return (controller, sample);
+            }
+            controller.observe(&sample);
+            if step >= 6 {
+                assert_eq!(controller.last_brake_us, Some(600_000));
+            }
+        }
+        unreachable!()
+    }
+
+    #[test]
+    fn fresh_post_brake_probe_continues_draining_a_lingering_severe_queue() {
+        let (mut controller, sample) = lingering_queue_066(1_000_000, false);
+        let before = controller.rate_bps;
+        assert_eq!(controller.braked_queue_ms, Some(200.0));
+        controller.observe(&sample);
+        let current = controller
+            .service_window
+            .discovery_with_counts(sample.now_us, 8, 1)
+            .unwrap();
+        let admission = current.admission.unwrap();
+        assert_eq!(admission.started_us, 600_000);
+        assert_eq!(current.bps, admission.bps);
+        assert_eq!(controller.queue_delay_ms, 180.0);
+        let expected = (current.bps * controller.wire_per_symbol * 0.25).max(MIN_BPS as f64) as u64;
+        assert!(expected < before);
+        assert_eq!(
+            controller.rate_bps, expected,
+            "new post-brake evidence still shows a severe queue without adequate drainage"
+        );
+        assert_eq!(controller.last_brake_us, Some(sample.now_us));
+        assert_eq!(
+            controller.last_control.queue_brake_symbol_delivery_bps,
+            Some(current.bps)
+        );
+        let mut duplicate = sample.clone();
+        duplicate.now_us += BRAKE_US;
+        duplicate.probe_age_us = Some(BRAKE_US);
+        duplicate.positive_delivery_age_us = Some(BRAKE_US);
+        controller.observe(&duplicate);
+        assert_eq!(controller.rate_bps, expected);
+        assert_eq!(controller.last_brake_us, Some(sample.now_us));
+    }
+
+    #[test]
+    fn lingering_queue_requires_new_severe_probe_and_complete_post_brake_evidence() {
+        for mode in [
+            "duplicate",
+            "reordered",
+            "old_probe",
+            "old_positive",
+            "pre_brake",
+            "idle",
+            "interrupted",
+            "pace",
+            "missing_sender",
+            "draining",
+            "sparse",
+            "below_severe",
+        ] {
+            let (mut controller, mut sample) = lingering_queue_066(
+                if mode == "sparse" { 400_000 } else { 1_000_000 },
+                mode == "draining",
+            );
+            match mode {
+                "duplicate" => sample.probe_sample_id = 2,
+                "reordered" => sample.probe_sample_id = 1,
+                "old_probe" => sample.probe_age_us = Some(CONTROL_US + 1),
+                "old_positive" => sample.positive_delivery_age_us = Some(CONTROL_US + 1),
+                "pre_brake" => {
+                    // With zero age, this request began at the actual brake.
+                    sample.probe_latest_rtt_ms = Some(500.0);
+                    sample.probe_rtt_ms = Some(500.0);
+                }
+                "idle" => sample.offered_backlog = false,
+                "interrupted" => controller.backlog_since_us = Some(600_001),
+                "pace" => {
+                    let before = controller.rate_bps;
+                    controller.rate_bps -= 1;
+                    controller.record_rate_change(600_001, before, RateReason::ReprobeRollback);
+                }
+                "missing_sender" => sample.admitted_symbols = None,
+                "below_severe" => {
+                    sample.probe_latest_rtt_ms = Some(140.0);
+                    sample.probe_rtt_ms = Some(140.0);
+                }
+                "draining" | "sparse" => {}
+                _ => unreachable!(),
+            }
+            let before = controller.rate_bps;
+            controller.observe(&sample);
+            assert_eq!(
+                controller.last_control.queue_brake_symbol_delivery_bps, None,
+                "{mode}"
+            );
+            if mode == "pre_brake" {
+                // Existing emergency safety can still react to the larger
+                // absolute queue; it receives no current post-brake credit.
+                assert!(controller.rate_bps < before);
+            } else {
+                assert_eq!(controller.rate_bps, before, "{mode}");
+                assert_eq!(controller.last_brake_us, Some(600_000), "{mode}");
+            }
+        }
     }
 
     fn startup_brake_065() -> (PathController, Observation) {
