@@ -972,6 +972,9 @@ async fn sender(
                                 .sender_estimate
                                 .delivered_updated_us
                                 .and_then(|t| at.checked_sub(t)),
+                            measurement_sufficient: policy.probe_guided_recovery
+                                && controllers[usize::from(path.id)]
+                                    .independent_probe_measurement_sufficient(now_us),
                         },
                         ceiling,
                     );

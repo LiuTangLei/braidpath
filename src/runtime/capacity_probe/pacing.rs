@@ -18,6 +18,7 @@ pub struct Demand {
     pub rtt_sample_id: u64,
     pub received_probe_bytes: u64,
     pub positive_probe_age_us: Option<u64>,
+    pub measurement_sufficient: bool,
 }
 #[derive(Clone, Default, Serialize)]
 pub struct RateSnapshot {
@@ -126,6 +127,7 @@ impl Controller {
         {
             next = (next * 4 / 5).max(minimum);
         } else if next == previous
+            && !demand.measurement_sufficient
             && self
                 .state
                 .backlog_since_us
@@ -196,6 +198,23 @@ impl Controller {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn sufficient_measurement_holds_data_growth_but_keeps_probe_requests_and_resumes() {
+        let mut controller = Controller::new(4_000_000);
+        controller.observe(&demand(0, true), 4_000_000);
+        let mut enough = demand(500_000, true);
+        enough.measurement_sufficient = true;
+        controller.observe(&enough, 4_000_000);
+        assert_eq!(controller.snapshot().pacing_bps, LOW_BPS);
+        assert_eq!(controller.snapshot().increases, 0);
+        assert!(controller.rtt_request_due(500_000));
+        controller.rtt_request_admitted(500_000);
+        assert!(!controller.rtt_request_due(599_999));
+        controller.observe(&demand(600_000, true), 4_000_000);
+        assert!(controller.rtt_request_due(600_000));
+        assert!(controller.snapshot().pacing_bps > LOW_BPS);
+    }
+
     fn demand(now: u64, backlog: bool) -> Demand {
         Demand {
             now_us: now,

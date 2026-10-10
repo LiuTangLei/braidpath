@@ -2128,6 +2128,21 @@ impl PathController {
                     .is_some_and(|sample| sample.deficit))
     }
 
+    /// Enough independent service for this budget's next bounded exploration.
+    /// Holding probe growth grants no business growth or capacity credit.
+    pub fn independent_probe_measurement_sufficient(&self, now_us: u64) -> bool {
+        self.last_control.offered_backlog
+            && now_us
+                .checked_sub(self.last_control.at_us)
+                .is_some_and(|age| age <= CONTROL_US)
+            && self
+                .probe_service
+                .reference(now_us)
+                .is_some_and(|reference| {
+                    u128::from(reference.budget_bps) * 4 >= u128::from(self.rate_bps) * 5
+                })
+    }
+
     /// Ordinary busy discovery already measures business service. Keep one low
     /// pilot allowance per group until loss, a paired delivery deficit or lost
     /// eligibility calls for independent data measurement. Idle measurement and
@@ -6285,6 +6300,32 @@ mod tests {
             }
         }
         (controller, admitted, sample)
+    }
+
+    #[test]
+    fn sufficient_measurement_requires_current_owned_probe_service_and_business_margin() {
+        let mut controller = PathController::new(20_000_000, 20);
+        for step in 0..=30 {
+            let now = step * 100_000;
+            controller.observe_with_delivery_probe(
+                &short_observation_022(now, 80.0),
+                &probe_service::tests::probe(step),
+            );
+        }
+        let now = 3_000_000;
+        let reference = controller.probe_service.reference(now).unwrap();
+        controller.rate_bps = reference.budget_bps * 4 / 5;
+        assert!(controller.independent_probe_measurement_sufficient(now));
+        controller.rate_bps += 1;
+        assert!(!controller.independent_probe_measurement_sufficient(now));
+        controller.rate_bps = START_BPS;
+        assert!(!controller.independent_probe_measurement_sufficient(now + CONTROL_US + 1));
+        assert!(!controller.independent_probe_measurement_sufficient(now - 1));
+        assert!(!PathController::new(20_000_000, 20).independent_probe_measurement_sufficient(now));
+        let mut restarted = short_observation_022(now + 1, 80.0);
+        restarted.generation += 1;
+        controller.observe_with_delivery_probe(&restarted, &probe_service::tests::probe(30));
+        assert!(!controller.independent_probe_measurement_sufficient(now + 1));
     }
 
     #[test]
