@@ -52,6 +52,7 @@ const WEBSITE: &str = "<!doctype html><html lang=\"en\"><meta charset=\"utf-8\">
 pub struct Policy {
     pub adaptive: bool,
     pub capacity_probe_bps: u64,
+    pub probe_guided_recovery: bool,
     pub latency_target_ms: u64,
     pub group_rates: [u64; MAX_PATHS],
     pub receiver_feedback: bool,
@@ -72,6 +73,14 @@ impl Policy {
     }
 
     pub fn validate(&self) -> Result<()> {
+        ensure!(
+            !self.probe_guided_recovery
+                || (self.capacity_probe_bps > 0
+                    && self.adaptive
+                    && self.fec == 0
+                    && self.redundancy == 0),
+            "probe-guided recovery requires independent probes and adaptive original-only traffic"
+        );
         ensure!(
             self.capacity_probe_bps == 0
                 || (self.adaptive && self.fec == 0 && self.capacity_probe_bps <= self.rate / 20),
@@ -827,7 +836,7 @@ async fn sender(
                 let snapshot = &q.snapshot;
                 let estimate = &snapshot.sender_estimate;
                 let at = quality_time(path);
-                controllers[usize::from(path.id)].observe(&adaptive::Observation {
+                let observation = adaptive::Observation {
                     now_us,
                     generation: snapshot.generation,
                     report_number: estimate.report_number,
@@ -839,7 +848,8 @@ async fn sender(
                     delivered_bps: estimate.delivered_bps,
                     delivery_sample_span_us: estimate.sample_span_us,
                     delivery_report_time_us: estimate.report_time_us,
-                    reprobe_enabled: policy.fec == 0
+                    reprobe_enabled: !policy.probe_guided_recovery
+                        && policy.fec == 0
                         && policy.redundancy == 0
                         && path.conn.close_reason().is_none(),
                     feedback_sample_symbols: estimate.sample_symbols,
@@ -862,7 +872,18 @@ async fn sender(
                         .saturating_sub(path.conn.datagram_send_buffer_space()),
                     offered_backlog: !queue.is_empty(),
                     transport_blocked: path.conn.datagram_send_buffer_space() < wire::MAX_WIRE,
-                });
+                };
+                if policy.probe_guided_recovery {
+                    let probe = path
+                        .capacity_probe
+                        .lock()
+                        .expect("capacity probe lock")
+                        .snapshot(at);
+                    controllers[usize::from(path.id)]
+                        .observe_with_delivery_probe(&observation, &probe);
+                } else {
+                    controllers[usize::from(path.id)].observe(&observation);
+                }
             }
             let live: Vec<_> = paths
                 .iter()
@@ -1765,7 +1786,10 @@ async fn server_connection(
                     ensure!(usize::from(group)<MAX_PATHS,"invalid path group");
                     let latency_target_ms=req.headers().get("braidpath-latency-ms").map(|v|v.to_str()).transpose()?.unwrap_or("20").parse::<u64>()?;
                     let capacity_probe_bps=req.headers().get("braidpath-capacity-probe-bps").map(|v|v.to_str()).transpose()?.unwrap_or("0").parse::<u64>()?;
-                    let policy=Policy{capacity_probe_bps,adaptive:quality_schedule==Some("adaptive"),latency_target_ms,group_rates,quality_schedule:quality_schedule.is_some(),receiver_feedback:feedback.is_some(),fec:header("braidpath-fec")?.parse()?,redundancy:header("braidpath-redundancy")?.parse()?,rate,block_ms:header("braidpath-block-ms")?.parse()?,queue_ms:header("braidpath-queue-ms")?.parse()?};policy.validate()?;
+                    let guided=req.headers().get("braidpath-probe-guided-recovery").map(|v|v.to_str()).transpose()?;
+                    ensure!(guided.is_none() || guided==Some("1"),"invalid probe-guided recovery header");
+                    let probe_guided_recovery=guided.is_some();
+                    let policy=Policy{probe_guided_recovery,capacity_probe_bps,adaptive:quality_schedule==Some("adaptive"),latency_target_ms,group_rates,quality_schedule:quality_schedule.is_some(),receiver_feedback:feedback.is_some(),fec:header("braidpath-fec")?.parse()?,redundancy:header("braidpath-redundancy")?.parse()?,rate,block_ms:header("braidpath-block-ms")?.parse()?,queue_ms:header("braidpath-queue-ms")?.parse()?};policy.validate()?;
                     let rejoin=req.headers().get("braidpath-rejoin").is_some_and(|v|v=="1");
                     let stream_id=stream.id().into_inner();
                     // Membership and idle expiry share one map -> paths -> generation lock order.
@@ -1814,6 +1838,7 @@ async fn server_connection(
                     joined=Some((sid,session,pid,stream_id));
                     let mut response=Response::builder().status(200).header("braidpath-version","1").header("braidpath-max-payload",MAX_PAYLOAD);if feedback.is_some(){response=response.header("braidpath-feedback","2");}
                     if capacity_probe_bps>0 {response=response.header("braidpath-capacity-probe-bps",capacity_probe_bps);}
+                    if probe_guided_recovery {response=response.header("braidpath-probe-guided-recovery","1");}
                     if let Some(scheduler)=quality_schedule {response=response.header("braidpath-scheduler",scheduler);}stream.send_response(response.body(())?).await?;
                     request=Some(stream);
                     diagnostic.admitted();
@@ -2346,6 +2371,9 @@ async fn connect_path(
             },
         );
     }
+    if policy.probe_guided_recovery {
+        req = req.header("braidpath-probe-guided-recovery", "1");
+    }
     if policy.capacity_probe_bps > 0 {
         req = req.header("braidpath-capacity-probe-bps", policy.capacity_probe_bps);
     }
@@ -2395,6 +2423,15 @@ async fn connect_path(
                         "quality"
                     }),
         "quality scheduling not negotiated"
+    );
+    ensure!(
+        !policy.probe_guided_recovery
+            || response
+                .headers()
+                .get("braidpath-probe-guided-recovery")
+                .and_then(|v| v.to_str().ok())
+                == Some("1"),
+        "probe-guided recovery not negotiated"
     );
     ensure!(
         policy.capacity_probe_bps == 0

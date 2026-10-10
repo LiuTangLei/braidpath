@@ -2,6 +2,7 @@
 use serde::Serialize;
 use std::collections::VecDeque;
 
+mod probe_service;
 mod reprobe;
 mod service;
 pub use reprobe::Request as ReprobeRequest;
@@ -206,6 +207,7 @@ pub struct Snapshot {
     #[serde(flatten)]
     pub decision: Decision,
     pub reprobe: reprobe::Snapshot,
+    pub probe_service: Option<probe_service::Reference>,
     pub rate_changes: VecDeque<RateChange>,
     pub rate_changes_total: u64,
     pub rate_changes_evicted: u64,
@@ -219,6 +221,7 @@ pub enum RateReason {
     KnownServiceRecovery,
     CautiousGrowth,
     ServiceDiscovery,
+    ProbeServiceRecovery,
     GrowthWithdrawalBrake,
     QueueBrake,
     DeliveryShortfallBrake,
@@ -345,6 +348,7 @@ pub struct GrowthMonitorReply {
 #[derive(Clone, Debug, Serialize)]
 pub struct GrowthMonitor {
     pub generation: u64,
+    pub independent_service_credit: bool,
     pub armed_us: u64,
     pub latest_observed_us: u64,
     pub previous_bps: u64,
@@ -357,9 +361,15 @@ pub struct GrowthMonitor {
 }
 
 impl GrowthMonitor {
-    fn arm(sample: &Observation, previous_bps: u64, pacing_bps: u64) -> Self {
+    fn arm(
+        sample: &Observation,
+        previous_bps: u64,
+        pacing_bps: u64,
+        independent_service_credit: bool,
+    ) -> Self {
         Self {
             generation: sample.generation,
+            independent_service_credit,
             armed_us: sample.now_us,
             latest_observed_us: sample.now_us,
             previous_bps,
@@ -501,6 +511,7 @@ pub struct ControlSample {
     pub startup_probe_excess_ms: Option<f64>,
     pub ordinary_loss_pressure: bool,
     pub fast_loss: bool,
+    pub probe_covered_loss: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub brake_loss: Option<BrakeLoss>,
 }
@@ -653,6 +664,7 @@ pub struct PathController {
     tokens: f64,
     token_us: u64,
     reprobe: reprobe::Controller,
+    probe_service: probe_service::Window,
     rate_changes: VecDeque<RateChange>,
     rate_changes_total: u64,
     last_control: ControlSample,
@@ -720,6 +732,7 @@ impl PathController {
             tokens: 2400.0,
             token_us: 0,
             reprobe: reprobe::Controller::default(),
+            probe_service: probe_service::Window::default(),
             rate_changes: VecDeque::new(),
             rate_changes_total: 0,
             last_control: ControlSample::default(),
@@ -727,6 +740,23 @@ impl PathController {
     }
 
     pub fn observe(&mut self, observation: &Observation) {
+        self.observe_inner(observation, None);
+    }
+
+    /// Opt-in independent-stream credit. Ordinary callers retain every old gate.
+    pub fn observe_with_delivery_probe(
+        &mut self,
+        observation: &Observation,
+        probe: &super::quality::Snapshot,
+    ) {
+        self.observe_inner(observation, Some(probe));
+    }
+
+    fn observe_inner(
+        &mut self,
+        observation: &Observation,
+        probe: Option<&super::quality::Snapshot>,
+    ) {
         let now = observation.now_us;
         if self.generation != Some(observation.generation) {
             *self = Self::new(self.maximum_bps, self.target_ms as u64);
@@ -735,6 +765,12 @@ impl PathController {
             self.last_control_us = now;
             self.last_growth_us = now;
             self.token_us = now;
+        }
+        if let Some(probe) = probe {
+            self.probe_service
+                .observe(probe, now, observation.generation);
+        } else {
+            self.probe_service = probe_service::Window::default();
         }
         let rate_before_refill = self.rate_bps;
         self.refill(now);
@@ -1092,9 +1128,31 @@ impl PathController {
                     severe_pressure || blocked_pressure || settled_shortfall,
                 )
             });
-        let fast_loss_actionable = brake_loss
-            .as_ref()
-            .map_or(fast_loss, |evidence| evidence.actionable);
+        let loss_counts = self.loss_evidence.counts();
+        let probe_reference = self.probe_service.reference(now);
+        let probe_covered_loss = probe_reference.is_some_and(|reference| {
+            self.rate_bps <= reference.budget_bps
+                && reference.covers_loss(loss_counts.0, loss_counts.1)
+                && loss_batch.is_none_or(|(expected, lost)| {
+                    expected < 8
+                        || (lost < expected && reference.within_count_resolution(expected, lost))
+                })
+                && observation.finalized_expected.is_some()
+                && observation.finalized_lost.is_some()
+                && fresh
+                && probe_fresh
+                && observation
+                    .probe_age_us
+                    .is_some_and(|age| age <= CONTROL_US)
+                && self.queue_delay_ms <= self.target_ms * 0.25
+                && !blocked_pressure
+                && !observation.transport_blocked
+                && wire_delivery_bps.is_some_and(|bps| bps > 0.0)
+        });
+        let fast_loss_actionable = !probe_covered_loss
+            && brake_loss
+                .as_ref()
+                .map_or(fast_loss, |evidence| evidence.actionable);
         let actionable_loss_fraction = brake_loss.as_ref().map_or_else(
             || loss_batch.map_or(0.0, |(n, lost)| lost as f64 / n as f64),
             |evidence| {
@@ -1105,7 +1163,6 @@ impl PathController {
                 }
             },
         );
-        let loss_counts = self.loss_evidence.counts();
         // Preserve the exact inputs and intermediate values at an action. These
         // observed minima are never substituted for the original mixed minimum.
         if fresh && let Some(local) = local_rtt {
@@ -1161,6 +1218,7 @@ impl PathController {
             startup_probe_excess_ms: startup_probe_excess,
             ordinary_loss_pressure: self.loss_pressure,
             fast_loss,
+            probe_covered_loss,
             brake_loss,
         };
         let trial_action = self.reprobe.observe(reprobe::Input {
@@ -1200,7 +1258,10 @@ impl PathController {
         }
         let protect_ordinary_loss = trial_action.protect_ordinary_loss;
         let new_loss = fast_loss_actionable
-            || (loss_batch.is_some() && self.loss_pressure && !protect_ordinary_loss);
+            || (loss_batch.is_some()
+                && self.loss_pressure
+                && !protect_ordinary_loss
+                && !probe_covered_loss);
         let loss_for_brake = if fast_loss_actionable {
             actionable_loss_fraction
         } else {
@@ -1251,11 +1312,11 @@ impl PathController {
         // at its baseline/trial pace. Braking it before that comparison can
         // invalidate every measurement. Zero service remains an immediate
         // deficit; queue, fast-loss and blocked-transport protections still run.
-        let service_deficit_actionable =
-            service_deficit && (!protect_ordinary_loss || service_bps == Some(0.0));
+        let service_deficit_actionable = service_deficit
+            && ((!protect_ordinary_loss && !probe_covered_loss) || service_bps == Some(0.0));
         let pressure = delay_pressure
-            || (self.loss_pressure && !protect_ordinary_loss)
-            || fast_loss
+            || (self.loss_pressure && !protect_ordinary_loss && !probe_covered_loss)
+            || (fast_loss && !probe_covered_loss)
             || blocked_pressure
             || service_deficit_actionable;
         if pressure {
@@ -1499,7 +1560,11 @@ impl PathController {
         }
         let mut monitor_withdrawn = false;
         if !self.fast_feedback_seen
-            || !self.congestion_seen
+            || (!self.congestion_seen
+                && !self
+                    .growth_monitor
+                    .as_ref()
+                    .is_some_and(|monitor| monitor.independent_service_credit))
             || !self.eligible
             || !observation.offered_backlog
             || !observation_contiguous
@@ -1797,6 +1862,39 @@ impl PathController {
                     }
                 }
             }
+            if probe_covered_loss
+                && !monitor_withdrawn
+                && !pressure
+                && self.eligible
+                && observation.offered_backlog
+                && observation_contiguous
+                && exercised
+                && growth_probe_ready
+                && self.growth_monitor.is_none()
+                && now >= self.growth_not_before_us
+                && self.rate_bps == previous_rate
+                && self.rate_bps == rate_before_refill
+                && let Some(reference) = probe_reference.filter(|reference| {
+                    reference.local_started_us >= self.last_growth_us
+                        && reference.observed_us > self.last_growth_us
+                })
+            {
+                let headroom = (self.target_ms * 0.8 - self.queue_delay_ms).max(0.0);
+                let guided_gain = 1.0
+                    + (headroom
+                        / (probe_rtt.unwrap_or(f64::INFINITY) + FAST_PROBE_US as f64 / 1000.0))
+                        .min(0.25);
+                let proposed = ((self.rate_bps as f64 * guided_gain) as u64)
+                    .min(reference.budget_bps)
+                    .min(self.maximum_bps);
+                let increased = self.limit_growth_retry(proposed, now);
+                if increased > self.rate_bps {
+                    self.rate_bps = increased;
+                    self.last_growth_us = now;
+                    ordinary_growth = true;
+                    rate_reason = RateReason::ProbeServiceRecovery;
+                }
+            }
             // A no-op waiting for evidence is not a new pacing interval. Keep
             // the paired admission/allowance history until the first delivery
             // report, or until the probe requested for a young service endpoint
@@ -1839,12 +1937,13 @@ impl PathController {
         if ordinary_growth
             && self.rate_bps > previous_rate
             && self.fast_feedback_seen
-            && self.congestion_seen
+            && (self.congestion_seen || matches!(rate_reason, RateReason::ProbeServiceRecovery))
         {
             self.growth_monitor = Some(GrowthMonitor::arm(
                 observation,
                 previous_rate,
                 self.rate_bps,
+                matches!(rate_reason, RateReason::ProbeServiceRecovery),
             ));
         }
         self.last_probe_sample_id = observation.probe_sample_id;
@@ -1994,6 +2093,7 @@ impl PathController {
         Snapshot {
             decision: self.decision(now_us),
             reprobe: self.reprobe.snapshot(),
+            probe_service: self.probe_service.reference(now_us),
             rate_changes: self.rate_changes.clone(),
             rate_changes_total: self.rate_changes_total,
             rate_changes_evicted: self
@@ -6050,6 +6150,179 @@ mod tests {
             }
         }
         panic!("fully used low-queue erasure path did not offer a bounded trial");
+    }
+
+    fn guided_erasure_session(guided: bool) -> (PathController, u64, Observation) {
+        let mut controller = PathController::new(20_000_000, 20);
+        let mut sample = short_observation_022(0, 80.0);
+        sample.reprobe_enabled = false;
+        sample.report_number = 0;
+        sample.delivered_bytes = 0;
+        sample.admitted_symbol_bytes = Some(0);
+        sample.admitted_symbols = Some(0);
+        sample.finalized_expected = Some(0);
+        sample.finalized_lost = Some(0);
+        controller.observe(&sample);
+        let mut admitted = 0;
+        let mut received = 0;
+        let mut probe_received = 0;
+        for step in 1..=300 {
+            let now = step * 100_000;
+            controller.probe_admitted(now - 100_000);
+            admitted += exercise_budget(&mut controller, now - 100_000, 100_000);
+            let sent = admitted / 1000;
+            let delivered = (sent - sent * 2 / 3) * 1000;
+            sample.now_us = now;
+            sample.report_number += 1;
+            sample.delivery_report_time_us = Some(8_000_000_000 + now);
+            sample.delivery_sample_span_us = 100_000;
+            sample.delivered_bytes = delivered;
+            sample.delivered_bps = Some((delivered - received) as f64 * 80.0);
+            sample.admitted_symbol_bytes = Some(admitted);
+            sample.admitted_symbols = Some(sent);
+            sample.probe_sample_id += 1;
+            sample.probe_age_us = Some(20_000);
+            sample.positive_delivery_age_us = Some(0);
+            sample.feedback_age_us = Some(now % PROBE_US);
+            if now % PROBE_US == 0 {
+                sample.feedback_sample_symbols = sent - sample.finalized_expected.unwrap();
+                sample.finalized_expected = Some(sent);
+                sample.finalized_lost = Some(sent * 2 / 3);
+                sample.loss_sample_rate = Some(2.0 / 3.0);
+            } else {
+                sample.feedback_sample_symbols = 0;
+                sample.loss_sample_rate = None;
+            }
+            received = delivered;
+            let probe_sent = step * 50;
+            let next_probe_received = (probe_sent - probe_sent * 2 / 3) * 972;
+            let finalized = step.saturating_sub(5) / 5 * 250;
+            let probe = super::super::quality::Snapshot {
+                generation: 7,
+                sampled_us: now,
+                sent_symbols: probe_sent,
+                sent_bytes: probe_sent * 972,
+                sender_estimate: super::super::quality::Estimate {
+                    expected: finalized,
+                    lost: finalized * 2 / 3,
+                    received: finalized - finalized * 2 / 3,
+                    report_number: step + 1,
+                    report_time_us: Some(9_000_000_000 + now),
+                    received_bytes: next_probe_received,
+                    delivered_bps: Some((next_probe_received - probe_received) as f64 * 80.0),
+                    sample_span_us: 100_000,
+                    updated_us: Some(now - now % PROBE_US),
+                    delivered_updated_us: Some(now),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            probe_received = next_probe_received;
+            if guided {
+                controller.observe_with_delivery_probe(&sample, &probe);
+            } else {
+                controller.observe(&sample);
+            }
+        }
+        (controller, admitted, sample)
+    }
+
+    #[test]
+    fn independent_delivery_credit_does_not_mask_real_safety_events() {
+        for condition in 0..5 {
+            let (mut controller, _, mut sample) = guided_erasure_session(true);
+            let old = controller.rate_bps;
+            for step in 301..=306 {
+                let now = step * 100_000;
+                sample = admitted_report_026(&mut controller, &sample, now, u64::MAX);
+                sample.feedback_age_us = Some(0);
+                sample.positive_delivery_age_us = Some(0);
+                sample.probe_age_us = Some(0);
+                sample.probe_sample_id += 1;
+                let mut probe = probe_service::tests::probe(step);
+                match condition {
+                    0 => {
+                        sample.rtt_ms = 200.0;
+                        sample.probe_latest_rtt_ms = Some(200.0);
+                    }
+                    1 => {
+                        sample.transport_blocked = true;
+                        sample.send_queue_bytes = 1200;
+                    }
+                    2 => {
+                        probe.sender_estimate.delivered_updated_us = Some(now - CONTROL_US - 1);
+                    }
+                    3 => {
+                        probe.generation = 8;
+                    }
+                    _ => {
+                        probe.sender_estimate.delivered_bps = Some(0.0);
+                    }
+                }
+                sample.finalized_expected = sample.admitted_symbols;
+                let delta = sample.finalized_expected.unwrap()
+                    - controller.loss_evidence.previous.unwrap().0;
+                sample.finalized_lost =
+                    Some(controller.loss_evidence.previous.unwrap().1 + delta * 3 / 4);
+                sample.feedback_sample_symbols = delta;
+                sample.loss_sample_rate = Some(0.75);
+                controller.observe_with_delivery_probe(&sample, &probe);
+                assert!(
+                    !controller.last_control.probe_covered_loss,
+                    "condition={condition}"
+                );
+            }
+            assert!(
+                controller.rate_bps < old,
+                "condition={condition}, old={old}, now={}",
+                controller.rate_bps
+            );
+        }
+    }
+
+    #[test]
+    fn probe_credit_cannot_mask_an_all_lost_business_cohort_or_zero_business_service() {
+        for zero_service in [false, true] {
+            let (mut controller, _, mut sample) = guided_erasure_session(true);
+            let old = controller.rate_bps;
+            let received = sample.delivered_bytes;
+            let now = sample.now_us + if zero_service { PROBE_US } else { 100_000 };
+            sample = admitted_report_026(&mut controller, &sample, now, u64::MAX);
+            sample.feedback_age_us = Some(0);
+            sample.positive_delivery_age_us = Some(0);
+            let (old_expected, old_lost) = controller.loss_evidence.previous.unwrap();
+            let expected = sample.admitted_symbols.unwrap();
+            let delta = expected - old_expected;
+            assert!(delta >= 8);
+            sample.finalized_expected = Some(expected);
+            sample.finalized_lost = Some(old_lost + delta);
+            sample.feedback_sample_symbols = delta;
+            sample.loss_sample_rate = Some(1.0);
+            if zero_service {
+                sample.delivered_bytes = received;
+                sample.delivered_bps = Some(0.0);
+            }
+            controller
+                .observe_with_delivery_probe(&sample, &probe_service::tests::probe(now / 100_000));
+            assert!(controller.last_control.fast_loss);
+            assert!(!controller.last_control.probe_covered_loss);
+            assert!(controller.rate_bps < old);
+        }
+    }
+
+    #[test]
+    fn independent_delivery_evidence_recovers_erasure_floor_without_claiming_capacity() {
+        let (baseline, admitted_before, _) = guided_erasure_session(false);
+        let (candidate, admitted_after, _) = guided_erasure_session(true);
+        assert!(baseline.rate_bps <= MIN_BPS * 2);
+        assert!(
+            candidate.rate_bps > START_BPS,
+            "independent actual delivery must escape the erasure floor; pace={} admitted_before={} admitted_after={}",
+            candidate.rate_bps,
+            admitted_before,
+            admitted_after
+        );
+        assert!(admitted_after > admitted_before * 2);
     }
 
     #[test]

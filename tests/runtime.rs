@@ -418,6 +418,15 @@ fn three_paths(mode: u8) {
 
 #[test]
 fn independent_probe_negotiates_and_measures_without_application_records() {
+    independent_probe_session(false);
+}
+
+#[test]
+fn guided_recovery_negotiates_without_promoting_idle_probe_bytes_to_business() {
+    independent_probe_session(true);
+}
+
+fn independent_probe_session(guided: bool) {
     let dir = tempfile::tempdir().unwrap();
     let identity = dir.path().join("identity");
     assert!(
@@ -467,34 +476,36 @@ fn independent_probe_negotiates_and_measures_without_application_records() {
         "server",
     );
     ready(&mut server, "HTTP/3 server ready");
-    let mut client = launch(
-        &args(&[
-            "client",
-            "--listen",
-            &client_addr,
-            "--entrance",
-            &main_addr,
-            "--server-name",
-            "localhost",
-            "--ca",
-            cert.to_str().unwrap(),
-            "--token-file",
-            token.to_str().unwrap(),
-            "--adaptive",
-            "--fec",
-            "0",
-            "--rate-bps",
-            "2000000",
-            "--capacity-probe-bps",
-            "64000",
-            "--stats-jsonl",
-            client_stats.to_str().unwrap(),
-            "--stats-interval-ms",
-            "100",
-        ]),
-        dir.path(),
+    let mut client_args = args(&[
         "client",
-    );
+        "--listen",
+        &client_addr,
+        "--entrance",
+        &main_addr,
+        "--server-name",
+        "localhost",
+        "--ca",
+        cert.to_str().unwrap(),
+        "--token-file",
+        token.to_str().unwrap(),
+        "--adaptive",
+        "--fec",
+        "0",
+        "--redundancy-percent",
+        "0",
+        "--rate-bps",
+        "2000000",
+        "--capacity-probe-bps",
+        "64000",
+        "--stats-jsonl",
+        client_stats.to_str().unwrap(),
+        "--stats-interval-ms",
+        "100",
+    ]);
+    if guided {
+        client_args.push("--probe-guided-recovery".into());
+    }
+    let mut client = launch(&client_args, dir.path(), "client");
     ready(&mut client, "UDP client ready");
     let deadline = Instant::now() + Duration::from_secs(8);
     loop {

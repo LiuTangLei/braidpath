@@ -128,6 +128,7 @@ fn policy() -> Policy {
     Policy {
         adaptive: false,
         capacity_probe_bps: 0,
+        probe_guided_recovery: false,
         latency_target_ms: 20,
         group_rates: [10_000_000; MAX_PATHS],
         receiver_feedback: true,
@@ -734,4 +735,19 @@ async fn capacity_frames_are_negotiated_and_never_refresh_business_delivery() {
     assert_eq!(business.snapshot.received.received_bytes, 0);
     assert_eq!(business.snapshot.sender_estimate.received_bytes, 0);
     assert_eq!(business.snapshot.controls_received, 0);
+}
+
+#[test]
+fn guided_recovery_requires_measurement_and_original_only_negotiation() {
+    let mut p = policy();
+    p.probe_guided_recovery = true;
+    assert!(p.validate().is_err());
+    p.adaptive = true;
+    p.fec = 0;
+    p.capacity_probe_bps = p.rate / 20;
+    assert!(p.validate().is_err());
+    p.redundancy = 0;
+    assert!(p.validate().is_ok());
+    p.capacity_probe_bps = 0;
+    assert!(p.validate().is_err());
 }

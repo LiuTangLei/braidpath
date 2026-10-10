@@ -116,6 +116,9 @@ struct PolicyArgs {
     /// Independent delivery samples; off by default, capped at 5% with adaptive FEC0.
     #[arg(long, default_value_t = 0)]
     capacity_probe_bps: u64,
+    /// Recover cautiously using independent delivery samples; requires original-only probes.
+    #[arg(long)]
+    probe_guided_recovery: bool,
     /// Budget for additional local/path queuing, not unavoidable propagation RTT.
     #[arg(long, default_value_t = 20)]
     latency_target_ms: u64,
@@ -207,6 +210,7 @@ pub async fn run() -> Result<()> {
                 policy: tunnel::Policy {
                     adaptive: policy.adaptive,
                     capacity_probe_bps: policy.capacity_probe_bps,
+                    probe_guided_recovery: policy.probe_guided_recovery,
                     latency_target_ms: policy.latency_target_ms,
                     group_rates,
                     fec: policy.fec,
