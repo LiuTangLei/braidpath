@@ -1317,6 +1317,13 @@ impl PathController {
                     })
             });
         let growth_probe_ready = !self.fast_feedback_seen || unused_growth_probe;
+        // Ordinary cautious growth spends one completed service endpoint.
+        // The independently measured post-brake restoration below keeps its
+        // own stricter service qualification and the original probe guard.
+        let ordinary_growth_ready = growth_probe_ready
+            && (!self.fast_feedback_seen
+                || !self.congestion_seen
+                || self.discovery_service_window(now).is_some());
         // Near the service rate, an increment held for one RTT can add about
         // (gain - 1) * RTT of queue. Subtract the queue already occupying the
         // target before allowing that increment; a clear path keeps its gain.
@@ -1380,7 +1387,7 @@ impl PathController {
                     self.drain_restore_pending = false;
                     self.last_control.drain_service_target_bps = Some(restored);
                 } else if let Some(drain) = recent_drain
-                    && growth_probe_ready
+                    && ordinary_growth_ready
                 {
                     let ceiling = if self.fast_feedback_seen {
                         self.rate_bps as f64 * growth_gain_limit
@@ -1483,7 +1490,7 @@ impl PathController {
                         || !short_delivery_interval
                         || unused_short_report
                         || retained_support)
-                    && growth_probe_ready
+                    && ordinary_growth_ready
                 {
                     let before_growth = self.rate_bps;
                     self.rate_bps = ((self.rate_bps as f64 * gain).min(ceiling) as u64)
@@ -1586,7 +1593,6 @@ impl PathController {
             || self.queue_delay_ms > self.target_ms * 0.25
             || self.last_control.transport_blocked
             || self.reprobe.active()
-            || self.drain_restore_pending
             || self.rate_changes.back().is_some_and(|change| {
                 change.pacing_bps > change.previous_bps
                     && now_us
@@ -1599,13 +1605,19 @@ impl PathController {
             && last_probe_us <= self.last_growth_us
             && now_us >= self.last_growth_us.saturating_add(FAST_PROBE_US)
             && probe_age.is_some_and(|age| age <= FRESH_US);
+        let service_request = active
+            && self.congestion_seen
+            && now_us >= self.last_control.at_us
+            && elapsed >= CONTROL_US
+            && probe_age.is_some_and(|age| age <= FRESH_US)
+            && self
+                .discovery_service_window(now_us)
+                .is_some_and(|sample| last_probe_us < sample.observed_us);
         // These opportunities are independent. New service cannot cancel an
         // owed request after growth just because the old reply aged past 200ms.
         // Only probe_admitted spends the repair; without a reply the original
         // 500ms health deadline remains, rather than repeated stale retries.
-        (young && fast_opportunity)
-            || (young && self.congestion_seen && elapsed >= CONTROL_US)
-            || phase_repair
+        (young && fast_opportunity) || service_request || phase_repair
     }
 
     pub fn decision(&self, now_us: u64) -> Decision {
@@ -1871,6 +1883,179 @@ mod tests {
         (controller, sample)
     }
 
+    fn service_endpoint_032() -> (PathController, Observation) {
+        let (mut controller, sample) = cautious_probe_028();
+        controller.probe_admitted(400_000);
+        let mut sample = admitted_report_026(&mut controller, &sample, 500_000, u64::MAX);
+        sample.probe_age_us = Some(20_000);
+        controller.observe(&sample);
+        assert_eq!(
+            controller
+                .discovery_service_window(500_000)
+                .unwrap()
+                .observed_us,
+            500_000
+        );
+        (controller, sample)
+    }
+
+    #[test]
+    fn service_clock_032_requests_once_per_endpoint_with_bounded_old_reply() {
+        let (controller, _) = cautious_probe_028();
+        assert!(!controller.decision(500_000).probe_due, "no endpoint");
+        assert!(controller.decision(800_000).probe_due, "health deadline");
+
+        for age in [100_000, CONTROL_US + 1, FRESH_US, FRESH_US + 1] {
+            let (mut controller, _) = service_endpoint_032();
+            // A quiet pending restoration also obtains its replacement from
+            // this endpoint, without an independent 100ms polling stream.
+            controller.drain_restore_pending = age == CONTROL_US + 1;
+            // Isolate the existing response-age boundary at the query time.
+            // The new service still comes from the real admitted-byte fixture.
+            controller.last_control.probe_age_us = Some(age - 100_000);
+            assert!(!controller.decision(599_999).probe_due);
+            assert_eq!(controller.decision(600_000).probe_due, age <= FRESH_US);
+            if age <= FRESH_US {
+                let rate = controller.rate_bps;
+                for _ in 0..2 {
+                    assert!(controller.decision(600_000).probe_due);
+                    assert_eq!(controller.last_probe_us, Some(400_000));
+                    assert_eq!(controller.rate_bps, rate);
+                }
+                controller.probe_admitted(600_000);
+                for now in [700_000, 800_000, 1_099_999] {
+                    assert!(
+                        !controller.decision(now).probe_due,
+                        "same endpoint at {now}"
+                    );
+                }
+                assert!(controller.decision(1_100_000).probe_due);
+            } else {
+                assert!(controller.decision(900_000).probe_due);
+            }
+        }
+    }
+
+    #[test]
+    fn service_clock_032_growth_spends_endpoint_and_still_requires_young_probe() {
+        for hint in [false, true] {
+            let (mut controller, mut sample) = service_endpoint_032();
+            controller.remembered_bps = 4_000_000.0;
+            if hint {
+                controller.draining_bps = Some((2_000_000.0, sample.now_us));
+                controller.drain_restore_pending = true;
+            }
+            let before = controller.rate_bps;
+            sample = admitted_report_026(&mut controller, &sample, 600_000, u64::MAX);
+            sample.rtt_ms = 88.0;
+            sample.probe_rtt_ms = Some(88.0);
+            sample.probe_latest_rtt_ms = Some(88.0);
+            controller.observe(&sample);
+            let first = controller.rate_bps;
+            assert_eq!(first, (before as f64 * (1.0 + 8.0 / 88.0)) as u64);
+            assert_eq!(controller.last_growth_us, 600_000);
+            assert!(matches!(
+                controller.rate_changes.back().unwrap().reason,
+                RateReason::KnownServiceRecovery
+            ));
+            assert!(!controller.drain_restore_pending);
+
+            if hint {
+                controller.drain_restore_pending = true;
+            }
+            for now in [800_000, 1_000_000] {
+                sample = admitted_report_026(&mut controller, &sample, now, u64::MAX);
+                sample.rtt_ms = 88.0;
+                sample.probe_rtt_ms = Some(88.0);
+                sample.probe_latest_rtt_ms = Some(88.0);
+                controller.observe(&sample);
+                if now == 800_000 {
+                    assert_eq!(controller.rate_bps, first, "endpoint already consumed");
+                    assert_eq!(controller.last_growth_us, 600_000);
+                    assert_eq!(controller.drain_restore_pending, hint);
+                } else {
+                    assert!(controller.rate_bps > first, "new completed interval");
+                    assert_eq!(controller.last_growth_us, now);
+                    assert!(!controller.drain_restore_pending);
+                }
+            }
+        }
+
+        let (mut controller, sample) = service_endpoint_032();
+        controller.remembered_bps = 4_000_000.0;
+        let before = controller.rate_bps;
+        let mut next = admitted_report_026(&mut controller, &sample, 600_000, u64::MAX);
+        next.probe_age_us = Some(CONTROL_US + 1);
+        controller.observe(&next);
+        assert_eq!(
+            controller.rate_bps, before,
+            "old reply cannot approve growth"
+        );
+        assert!(
+            controller.decision(600_000).probe_due,
+            "it can request new evidence"
+        );
+        next = admitted_report_026(&mut controller, &next, 800_000, u64::MAX);
+        controller.observe(&next);
+        assert_eq!(
+            controller.rate_bps, before,
+            "young reply cannot renew old service"
+        );
+    }
+
+    #[test]
+    fn service_clock_032_preserves_initial_legacy_safety_and_measured_drain() {
+        let (mut controller, sample) = initial_credit_026(20_000_000);
+        let next = admitted_report_026(&mut controller, &sample, 400_000, u64::MAX);
+        controller.observe(&next);
+        assert_eq!(controller.rate_bps, 368_640);
+        assert!(controller.service_window.latest(400_000).is_none());
+        controller.congestion_seen = true;
+        controller.probe_admitted(400_000);
+        assert!(
+            controller.decision(700_000).probe_due,
+            "independent phase repair"
+        );
+
+        let (mut controller, _) = cautious_probe_028();
+        assert!(!controller.decision(400_000).probe_due);
+        controller.queue_delay_ms = 6.0;
+        assert!(
+            controller.decision(400_000).probe_due,
+            "pressure remains fast"
+        );
+
+        let mut controller = PathController::new(20_000_000, 20);
+        controller.observe(&observation(0, 80.0));
+        controller.rate_bps = 500_000;
+        controller.remembered_bps = 4_000_000.0;
+        controller.congestion_seen = true;
+        exercise_budget(&mut controller, 0, CONTROL_US);
+        controller.observe(&observation(CONTROL_US, 80.0));
+        assert!(!controller.fast_feedback_seen);
+        assert!(controller.service_window.latest(CONTROL_US).is_none());
+        assert_eq!(controller.rate_bps, 625_000);
+
+        let (mut controller, sample) = draining_service_029(0, 1_000_000);
+        let before = controller.rate_bps;
+        let latest = controller.service_window.latest(sample.now_us).unwrap();
+        let target = (latest.bps * controller.wire_per_symbol * 0.9) as u64;
+        controller.observe(&sample);
+        assert!(target > (before as f64 * 1.2) as u64);
+        assert_eq!(controller.rate_bps, target);
+        assert_eq!(
+            controller.last_control.drain_service_target_bps,
+            Some(target)
+        );
+        assert!(!controller.drain_restore_pending);
+        let mut repeated = sample.clone();
+        repeated.now_us += 100_000;
+        repeated.probe_age_us = Some(120_000);
+        controller.observe(&repeated);
+        assert_eq!(controller.rate_bps, target);
+        assert_eq!(controller.last_control.drain_service_target_bps, None);
+    }
+
     #[test]
     fn growth_monitor_030_follows_actual_changes_and_expires() {
         let (mut controller, _) = initial_credit_026(20_000_000);
@@ -1953,14 +2138,25 @@ mod tests {
             let mut next = admitted_report_026(&mut controller, &sample, 400_000, u64::MAX);
             next.probe_age_us = Some(if post_growth { 20_000 } else { 120_000 });
             controller.observe(&next);
-            assert_eq!(
-                controller.rate_bps,
-                if post_growth { 368_640 } else { 307_200 }
-            );
-            assert_eq!(
-                controller.last_growth_us,
-                if post_growth { 400_000 } else { 200_000 }
-            );
+            // 032 also needs a completed service interval before cautious growth.
+            assert_eq!(controller.rate_bps, 307_200);
+            assert_eq!(controller.last_growth_us, 200_000);
+            assert_eq!(controller.last_growth_probe, used);
+            if post_growth {
+                let reply = next.probe_sample_id;
+                next = admitted_report_026(&mut controller, &next, 500_000, u64::MAX);
+                next.probe_sample_id = reply;
+                next.probe_age_us = Some(120_000);
+                controller.observe(&next);
+                assert!(controller.discovery_service_window(500_000).is_some());
+                controller.probe_admitted(500_000);
+                next = admitted_report_026(&mut controller, &next, 600_000, u64::MAX);
+                next.probe_age_us = Some(20_000);
+                controller.observe(&next);
+                assert_eq!(controller.rate_bps, 368_640);
+                assert_eq!(controller.last_growth_us, 600_000);
+                assert_eq!(controller.last_growth_probe, Some(next.probe_sample_id));
+            }
         }
 
         let (mut controller, sample) = initial_credit_026(20_000_000);
@@ -1998,7 +2194,8 @@ mod tests {
         assert!(!controller.decision(399_999).probe_due);
         assert!(!controller.decision(400_000).probe_due);
         assert!(!controller.decision(499_999).probe_due);
-        assert!(controller.decision(500_000).probe_due);
+        assert!(!controller.decision(500_000).probe_due);
+        assert!(controller.decision(800_000).probe_due);
 
         for opportunity in ["initial", "queue", "health", "blocked", "drain", "known"] {
             let (mut controller, _) = cautious_probe_028();
@@ -2014,12 +2211,13 @@ mod tests {
             assert!(!controller.decision(399_999).probe_due, "{opportunity}");
             assert_eq!(
                 controller.decision(400_000).probe_due,
-                opportunity != "known",
+                !matches!(opportunity, "known" | "drain"),
                 "{opportunity}"
             );
-            if opportunity == "known" {
+            if matches!(opportunity, "known" | "drain") {
                 assert!(!controller.decision(499_999).probe_due);
-                assert!(controller.decision(500_000).probe_due);
+                assert!(!controller.decision(500_000).probe_due);
+                assert!(controller.decision(800_000).probe_due);
             }
         }
 
@@ -2457,9 +2655,16 @@ mod tests {
             );
             assert_eq!(
                 controller.rate_bps,
-                (before as f64 * 1.2) as u64,
+                if matches!(invalid, "old" | "receiver_span") {
+                    before
+                } else {
+                    (before as f64 * 1.2) as u64
+                },
                 "old fallback: {invalid}"
             );
+            if matches!(invalid, "old" | "receiver_span") {
+                assert!(controller.drain_restore_pending, "{invalid}");
+            }
         }
     }
 
@@ -3018,6 +3223,21 @@ mod tests {
             sample.delivered_bytes = delivered;
             sample.delivered_bps = Some(previous as f64);
             controller.observe(&sample);
+            if restoring {
+                assert_eq!(controller.rate_bps, 500_000);
+                assert!(controller.drain_restore_pending);
+                let mut delivered = delivered;
+                for now in (300_000..=600_000).step_by(100_000) {
+                    let admitted = exercise_budget(&mut controller, now - 100_000, 100_000);
+                    delivered += admitted;
+                    sample = short_observation_022(now, 88.0);
+                    sample.rtt_ms = 88.0;
+                    sample.delivered_bytes = delivered;
+                    sample.delivered_bps = Some(admitted as f64 * 80.0);
+                    controller.observe(&sample);
+                }
+                assert_eq!(controller.last_growth_us, 600_000);
+            }
             assert_eq!(controller.queue_delay_ms, 8.0);
             assert_eq!(
                 controller.rate_bps,
@@ -3415,41 +3635,54 @@ mod tests {
         controller.draining_bps = Some((2_000_000.0, 0));
         controller.drain_restore_pending = true;
 
-        exercise_budget(&mut controller, 0, CONTROL_US);
-        sample.now_us = CONTROL_US;
-        sample.report_number = 2;
-        sample.delivered_bytes = 12_500;
-        sample.delivery_report_time_us = Some(100_200_000);
+        // 032 waits for actual cumulative delivery to complete the first 500ms
+        // service interval. The original gain and one-probe assertions follow.
+        for now in (100_000..=500_000).step_by(100_000) {
+            sample.delivered_bytes += exercise_budget(&mut controller, now - 100_000, 100_000);
+            sample.now_us = now;
+            sample.report_number = now / 100_000 + 1;
+            sample.delivery_report_time_us = Some(100_000_000 + now);
+            sample.probe_age_us = Some(now);
+            controller.observe(&sample);
+            assert_eq!(controller.rate_bps, 500_000);
+            assert!(controller.drain_restore_pending);
+        }
+        controller.probe_admitted(500_000);
+        sample.delivered_bytes += exercise_budget(&mut controller, 500_000, 100_000);
+        sample.now_us = 600_000;
+        sample.report_number = 7;
+        sample.delivery_report_time_us = Some(100_600_000);
+        sample.probe_sample_id += 1;
+        sample.probe_age_us = Some(20_000);
         controller.observe(&sample);
         assert_eq!(controller.rate_bps, 600_000);
         assert!(!controller.drain_restore_pending);
         assert_eq!(controller.last_growth_probe, Some(sample.probe_sample_id));
 
         controller.drain_restore_pending = true;
-        exercise_budget(&mut controller, CONTROL_US, CONTROL_US);
-        sample.now_us = 400_000;
-        sample.report_number = 3;
-        sample.delivered_bytes += 15_000;
+        sample.delivered_bytes += exercise_budget(&mut controller, 600_000, CONTROL_US);
+        sample.now_us = 800_000;
+        sample.report_number = 8;
         sample.delivered_bps = Some(600_000.0);
-        sample.delivery_report_time_us = Some(100_400_000);
+        sample.delivery_report_time_us = Some(100_800_000);
         controller.observe(&sample);
         assert_eq!(controller.rate_bps, 600_000);
         assert!(controller.drain_restore_pending);
 
-        exercise_budget(&mut controller, 400_000, CONTROL_US);
-        sample.now_us = 600_000;
-        sample.report_number = 4;
-        sample.delivered_bytes += 15_000;
-        sample.delivery_report_time_us = Some(100_600_000);
+        sample.delivered_bytes += exercise_budget(&mut controller, 800_000, CONTROL_US);
+        controller.probe_admitted(900_000);
+        sample.now_us = 1_000_000;
+        sample.report_number = 9;
+        sample.delivery_report_time_us = Some(101_000_000);
         sample.probe_sample_id += 1;
         controller.observe(&sample);
         // The old 2 Mbps hint cannot jump directly to 1.8 Mbps or stack a
         // second recovery step on the same tick and authenticated reply.
         assert_eq!(controller.rate_bps, 720_000);
         assert!(!controller.drain_restore_pending);
-        controller.probe_admitted(600_000);
-        assert!(!controller.decision(699_999).probe_due);
-        assert!(controller.decision(700_000).probe_due);
+        controller.probe_admitted(1_000_000);
+        assert!(!controller.decision(1_099_999).probe_due);
+        assert!(controller.decision(1_100_000).probe_due);
     }
 
     #[test]
@@ -3563,11 +3796,12 @@ mod tests {
         assert!(controller.startup_probe_pressure.is_none());
         controller.probe_admitted(600_000);
         assert!(!controller.decision(699_999).probe_due);
-        // The queue has cleared and the last request is after growth, so
-        // cautious sampling now follows the 200ms control cadence.
+        // 032 has no new service endpoint here after the queue clears.
+        // The existing 500ms health deadline remains independently available.
         assert!(!controller.decision(700_000).probe_due);
         assert!(!controller.decision(799_999).probe_due);
-        assert!(controller.decision(800_000).probe_due);
+        assert!(!controller.decision(800_000).probe_due);
+        assert!(controller.decision(1_100_000).probe_due);
     }
 
     #[test]
