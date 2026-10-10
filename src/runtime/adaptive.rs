@@ -2097,9 +2097,29 @@ impl PathController {
         let current = now_us
             .checked_sub(self.last_control.at_us)
             .is_some_and(|age| age <= CONTROL_US);
+        // A sparse or pace-crossing pair cannot authorize a congestion brake,
+        // but missing that qualification is not proof that business keeps up.
+        // Use its actual paired bytes only to request independent measurement;
+        // it supplies no rate, growth credit or congestion classification.
+        let uncertain_service = self
+            .last_control
+            .service_admission
+            .as_ref()
+            .is_some_and(|sent| {
+                sent.symbol_bytes > 0
+                    && self
+                        .last_control
+                        .service_symbol_delivery_bps
+                        .is_some_and(|received| {
+                            received.is_finite()
+                                && received >= 0.0
+                                && received < sent.symbol_bps * 0.85
+                        })
+            });
         self.last_control.offered_backlog
             && (!current
                 || !self.decision(now_us).eligible
+                || uncertain_service
                 || self.loss_evidence.counts().1 > 0
                 || self
                     .last_control
@@ -6265,6 +6285,40 @@ mod tests {
             }
         }
         (controller, admitted, sample)
+    }
+
+    #[test]
+    fn uncertain_under_delivery_still_requests_independent_measurement_without_a_brake() {
+        for mode in ["sparse", "pace_change"] {
+            let (controller, sample) = paired_controller_023(mode);
+            let paired = controller.last_control.service_admission.as_ref().unwrap();
+            assert!(
+                !paired.deficit,
+                "the existing brake qualification stays intact"
+            );
+            assert!(controller.loss_evidence.counts().1 == 0);
+            assert!(controller.decision(sample.now_us).eligible);
+            assert!(controller.last_control.offered_backlog);
+            assert!(
+                controller.last_control.service_symbol_delivery_bps.unwrap()
+                    < paired.symbol_bps * 0.85
+            );
+            assert!(
+                controller.independent_probe_fast_feedback(sample.now_us),
+                "{mode}"
+            );
+            assert_eq!(
+                controller.independent_probe_ceiling(sample.now_us, 4_375_000, 4),
+                4_375_000,
+                "{mode}"
+            );
+        }
+        let (healthy, sample) = paired_controller_023("normal");
+        assert!(!healthy.independent_probe_fast_feedback(sample.now_us));
+        assert_eq!(
+            healthy.independent_probe_ceiling(sample.now_us, 4_375_000, 4),
+            MIN_BPS / 4
+        );
     }
 
     #[test]
