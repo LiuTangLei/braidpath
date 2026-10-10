@@ -115,6 +115,8 @@ pub fn parse_control(frame: &[u8]) -> Result<(Vec<quality::Report>, Vec<quality:
 /// This additional byte allowance never depends on business eligibility. The
 /// ordinary aggregate/group/transport limits must also accept each datagram.
 pub struct Budget {
+    aggregate_ceiling: u64,
+    group_ceilings: [u64; MAX_PATHS],
     aggregate: outbound::Pacer,
     groups: [outbound::Pacer; MAX_PATHS],
 }
@@ -122,11 +124,24 @@ pub struct Budget {
 impl Budget {
     pub fn new(rate_bps: u64, group_rates: [u64; MAX_PATHS]) -> Self {
         Self {
-            aggregate: outbound::Pacer::new(rate_bps, 2 * (FRAME_BYTES + 89)),
-            groups: std::array::from_fn(|id| {
-                outbound::Pacer::new(rate_bps.min(group_rates[id] / 20), 2 * (FRAME_BYTES + 89))
-            }),
+            aggregate_ceiling: rate_bps,
+            group_ceilings: std::array::from_fn(|id| rate_bps.min(group_rates[id] / 20)),
+            aggregate: outbound::Pacer::new(0, 2 * (FRAME_BYTES + 89)),
+            groups: std::array::from_fn(|_| outbound::Pacer::new(0, 2 * (FRAME_BYTES + 89))),
         }
+    }
+
+    /// Follow the sum of current independent path allowances, below the configured
+    /// caps. Integrating the old rate first gives a pace change no new credit.
+    pub fn set_rates(&mut self, now_us: u64, group_pacing_bps: [u64; MAX_PATHS]) {
+        let mut aggregate = 0u64;
+        for (id, rate) in group_pacing_bps.into_iter().enumerate() {
+            let bounded = rate.min(self.group_ceilings[id]);
+            self.groups[id].set_rate(now_us, bounded);
+            aggregate = aggregate.saturating_add(bounded);
+        }
+        self.aggregate
+            .set_rate(now_us, aggregate.min(self.aggregate_ceiling));
     }
 
     pub fn available(&mut self, now_us: u64, group: u8, bytes: usize) -> bool {
@@ -200,6 +215,7 @@ mod tests {
     fn budget_has_no_startup_credit_and_never_exceeds_aggregate_or_group_share() {
         let mut budget = Budget::new(64_000, [320_000; MAX_PATHS]);
         let cost = FRAME_BYTES + 89;
+        budget.set_rates(0, [64_000; MAX_PATHS]);
         assert!(!budget.available(0, 0, cost));
         let mut admitted = [0usize; MAX_PATHS];
         for now in (1000..=1_000_000).step_by(1000) {
@@ -215,6 +231,61 @@ mod tests {
         assert!(admitted.iter().sum::<usize>() > 0);
         let mut off = Budget::new(0, [1_000_000; MAX_PATHS]);
         assert!(!off.available(10_000_000, 0, cost));
+    }
+
+    #[test]
+    fn aggregate_probe_pacing_cannot_release_all_four_initial_packets_as_a_pulse() {
+        let mut budget = Budget::new(17_500_000, [350_000_000; MAX_PATHS]);
+        let mut paths: [Controller; 4] = std::array::from_fn(|_| Controller::new(4_375_000));
+        for path in &mut paths {
+            path.observe(
+                &Demand {
+                    generation: 7,
+                    backlog: true,
+                    target_ms: 20.0,
+                    ..Default::default()
+                },
+                4_375_000,
+            );
+        }
+        let cost = FRAME_BYTES + 82;
+        let mut initial_packets = 0;
+        for now in (0..=140_000).step_by(1000) {
+            let mut rates = [0; MAX_PATHS];
+            rates[0] = paths.iter().map(|path| path.snapshot().pacing_bps).sum();
+            budget.set_rates(now, rates);
+            for path in &mut paths {
+                if path.available(now, cost) && budget.available(now, 0, cost) {
+                    path.admitted(cost);
+                    budget.admitted(0, cost);
+                    initial_packets += 1;
+                }
+            }
+        }
+        assert_eq!(
+            initial_packets, 2,
+            "a configured cap must not refill at an unmeasured rate"
+        );
+    }
+
+    #[test]
+    fn changing_probe_budget_rates_cannot_mint_credit_or_charge_failed_attempts() {
+        let mut budget = Budget::new(1_000_000, [20_000_000; MAX_PATHS]);
+        let mut rates = [0; MAX_PATHS];
+        rates[0] = 64_000;
+        budget.set_rates(0, rates);
+        assert!(!budget.available(100_000, 0, 1000));
+        rates[0] = 128_000;
+        budget.set_rates(100_000, rates);
+        assert!(!budget.available(100_000, 0, 1000));
+        assert!(budget.available(112_500, 0, 1000));
+        assert!(budget.available(112_500, 0, 1000));
+        budget.admitted(0, 1000);
+        budget.set_rates(112_500, [0; MAX_PATHS]);
+        assert!(!budget.available(1_000_000, 0, 1));
+        budget.set_rates(1_000_000, rates);
+        assert!(!budget.available(1_000_000, 0, 1000));
+        assert!(budget.available(1_062_500, 0, 1000));
     }
 
     #[test]

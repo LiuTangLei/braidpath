@@ -1179,6 +1179,15 @@ async fn sender(
             }
         }
         if policy.capacity_probe_bps > 0 && !paths.is_empty() {
+            let mut probe_rates = [0u64; MAX_PATHS];
+            for path in paths.iter() {
+                if path.conn.close_reason().is_none() {
+                    let rate = capacity_pacing[usize::from(path.id)].snapshot().pacing_bps;
+                    probe_rates[usize::from(path.group)] =
+                        probe_rates[usize::from(path.group)].saturating_add(rate);
+                }
+            }
+            capacity_budget.set_rates(now_us, probe_rates);
             let first = capacity_cursor;
             for offset in 0..paths.len() {
                 let index = (first + offset) % paths.len();
