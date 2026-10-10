@@ -1586,7 +1586,13 @@ impl PathController {
             || self.queue_delay_ms > self.target_ms * 0.25
             || self.last_control.transport_blocked
             || self.reprobe.active()
-            || self.drain_restore_pending;
+            || self.drain_restore_pending
+            || self.rate_changes.back().is_some_and(|change| {
+                change.pacing_bps > change.previous_bps
+                    && now_us
+                        .checked_sub(change.at_us)
+                        .is_some_and(|age| age < CONTROL_US)
+            });
         let phase_repair = active
             && self.congestion_seen
             && now_us >= self.last_control.at_us
@@ -1863,6 +1869,127 @@ mod tests {
         assert_eq!(controller.health, Health::Healthy);
         assert!(controller.service_window.latest(400_000).is_none());
         (controller, sample)
+    }
+
+    #[test]
+    fn growth_monitor_030_follows_actual_changes_and_expires() {
+        let (mut controller, _) = initial_credit_026(20_000_000);
+        controller.congestion_seen = true;
+        controller.remembered_bps = controller.rate_bps as f64;
+        let change = controller.rate_changes.back().unwrap();
+        assert_eq!(change.at_us, 200_000);
+        assert!(change.pacing_bps > change.previous_bps);
+        // Supply the preceding successful request to the existing real-growth
+        // fixture. A request on the growth tick is only a safety observation.
+        controller.probe_admitted(100_000);
+        assert!(!controller.decision(199_999).probe_due);
+        assert!(controller.decision(200_000).probe_due);
+        controller.probe_admitted(200_000);
+        assert!(!controller.decision(299_999).probe_due);
+        assert!(controller.decision(300_000).probe_due);
+        controller.probe_admitted(300_000);
+        assert!(!controller.decision(400_000).probe_due);
+
+        // Cautious no-ops can advance last_growth_us, but must neither append
+        // a real rate change nor renew its strictly shorter-than-200ms window.
+        let count = controller.rate_changes_total;
+        controller.last_growth_us = 400_000;
+        controller.record_rate_change(400_000, controller.rate_bps, RateReason::CautiousGrowth);
+        assert_eq!(controller.rate_changes_total, count);
+        assert_eq!(controller.rate_changes.back().unwrap().at_us, 200_000);
+        assert!(!controller.decision(400_000).probe_due);
+
+        for reason in [RateReason::QueueBrake, RateReason::ReprobeRollback] {
+            let (mut controller, _) = initial_credit_026(20_000_000);
+            controller.congestion_seen = true;
+            controller.remembered_bps = controller.rate_bps as f64;
+            controller.probe_admitted(250_000);
+            assert!(controller.decision(350_000).probe_due);
+            let previous = controller.rate_bps;
+            controller.rate_bps -= 1;
+            controller.record_rate_change(300_000, previous, reason);
+            assert!(!controller.decision(350_000).probe_due);
+        }
+
+        let (mut controller, _) = initial_credit_026(20_000_000);
+        controller.congestion_seen = true;
+        controller.remembered_bps = controller.rate_bps as f64;
+        controller.probe_admitted(240_000);
+        let previous = controller.rate_bps;
+        controller.rate_bps += 1;
+        controller.record_rate_change(350_000, previous, RateReason::CautiousGrowth);
+        assert!(!controller.decision(340_000).probe_due, "future change");
+        assert!(controller.decision(350_000).probe_due);
+        controller.last_control.offered_backlog = false;
+        assert!(!controller.decision(350_000).probe_due, "idle");
+        controller.last_control.offered_backlog = true;
+        assert!(!controller.probe_request_due(350_000, true), "stale path");
+        controller.last_control.probe_age_us = Some(CONTROL_US);
+        assert!(!controller.decision(350_000).probe_due, "old reply");
+    }
+
+    #[test]
+    fn growth_monitor_030_preserves_probe_credit_and_phase_repair() {
+        for post_growth in [false, true] {
+            let (mut controller, sample) = initial_credit_026(20_000_000);
+            controller.congestion_seen = true;
+            controller.remembered_bps = controller.rate_bps as f64 * 2.0;
+            controller.probe_admitted(100_000);
+            assert!(controller.decision(200_000).probe_due);
+            controller.probe_admitted(200_000);
+            let previous = controller.rate_bps;
+            let used = controller.last_growth_probe;
+            for _ in 0..2 {
+                assert!(controller.decision(300_000).probe_due);
+                assert_eq!(controller.last_probe_us, Some(200_000));
+                assert_eq!(controller.last_growth_probe, used);
+                assert_eq!(controller.rate_bps, previous);
+            }
+            // A rejected request leaves the opportunity intact. A successful
+            // repair gives a distinct, strictly post-growth request origin.
+            if post_growth {
+                controller.probe_admitted(300_000);
+            }
+            let mut next = admitted_report_026(&mut controller, &sample, 400_000, u64::MAX);
+            next.probe_age_us = Some(if post_growth { 20_000 } else { 120_000 });
+            controller.observe(&next);
+            assert_eq!(
+                controller.rate_bps,
+                if post_growth { 368_640 } else { 307_200 }
+            );
+            assert_eq!(
+                controller.last_growth_us,
+                if post_growth { 400_000 } else { 200_000 }
+            );
+        }
+
+        let (mut controller, sample) = initial_credit_026(20_000_000);
+        controller.congestion_seen = true;
+        controller.remembered_bps = controller.rate_bps as f64;
+        controller.probe_admitted(200_000);
+        assert!(controller.decision(300_000).probe_due);
+        controller.probe_admitted(300_000);
+        for now in [400_000, 500_000, 799_999] {
+            assert!(!controller.decision(now).probe_due, "no reply at {now}");
+        }
+        assert!(controller.decision(800_000).probe_due);
+
+        let mut next = short_observation_022(900_000, 80.0);
+        next.generation = sample.generation + 1;
+        next.report_number = 1;
+        next.delivered_bytes = 0;
+        next.delivered_bps = Some(0.0);
+        next.admitted_symbols = Some(0);
+        next.admitted_symbol_bytes = Some(0);
+        next.probe_rtt_ms = None;
+        next.probe_latest_rtt_ms = None;
+        next.probe_sample_id = 0;
+        next.probe_age_us = None;
+        controller.observe(&next);
+        assert!(controller.rate_changes.is_empty());
+        assert!(controller.last_probe_us.is_none());
+        assert_eq!(controller.rate_bps, START_BPS);
+        assert!(controller.decision(900_000).probe_due);
     }
 
     #[test]
