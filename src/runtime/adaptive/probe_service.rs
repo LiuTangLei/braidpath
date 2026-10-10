@@ -78,7 +78,7 @@ impl Window {
         );
         if let Some(sample) = self
             .service
-            .discovery_latest(now_us)
+            .discovery_with_counts(now_us, 32, 16 * 972)
             .filter(|sample| sample.observed_us == now_us)
         {
             let lower = self
@@ -104,7 +104,7 @@ impl Window {
         if !self.valid {
             return None;
         }
-        let sample = self.service.discovery_latest(now_us)?;
+        let sample = self.service.discovery_with_counts(now_us, 32, 16 * 972)?;
         let admission = sample.admission?;
         let (expected, lost) = self.loss.counts();
         if now_us.checked_sub(sample.observed_us)? > CONTROL_US
@@ -166,6 +166,52 @@ pub(super) mod tests {
             window.observe(&probe(step), step * 100_000, 7);
         }
         window
+    }
+    #[test]
+    fn sufficient_probe_counts_in_a_longer_bounded_interval_are_not_hidden_by_500ms_sampling() {
+        let mut window = Window::default();
+        for step in 0..=30 {
+            let mut sample = probe(step);
+            let sent = step * 6;
+            let expected = step.saturating_sub(5) / 5 * 30;
+            sample.sent_symbols = sent;
+            sample.sent_bytes = sent * 972;
+            sample.sender_estimate.expected = expected;
+            sample.sender_estimate.lost = expected * 2 / 3;
+            sample.sender_estimate.received = expected / 3;
+            sample.sender_estimate.received_bytes = step * 2 * 972;
+            sample.sender_estimate.delivered_bps = Some(155_520.0);
+            window.observe(&sample, step * 100_000, 7);
+        }
+        // 500ms holds only 30 admissions and 10 bodies; 800ms holds 48/16.
+        let reference = window
+            .reference(3_000_000)
+            .expect("qualified bounded interval");
+        assert_eq!(reference.receiver_span_us, 800_000);
+        assert_eq!(reference.local_span_us, 800_000);
+        assert_eq!(reference.admitted_probe_symbols, 48);
+        assert_eq!(reference.budget_bps, 77_760);
+        assert!(reference.probe_loss_expected >= 64);
+        assert!(window.reference(3_200_001).is_none(), "no freshness loan");
+    }
+    #[test]
+    fn cumulative_probe_counts_cannot_borrow_delivery_older_than_the_existing_horizon() {
+        let mut window = Window::default();
+        for step in 0..=200 {
+            let mut sample = probe(step);
+            sample.sent_symbols = step * 6;
+            sample.sent_bytes = sample.sent_symbols * 972;
+            let expected = step.saturating_sub(5) / 5 * 30;
+            sample.sender_estimate.expected = expected;
+            sample.sender_estimate.received = expected / 12;
+            sample.sender_estimate.lost = expected - expected / 12;
+            sample.sender_estimate.received_bytes = step / 2 * 972;
+            sample.sender_estimate.delivered_bps = Some(if step % 2 == 0 { 77_760.0 } else { 0.0 });
+            window.observe(&sample, step * 100_000, 7);
+        }
+        // One hundred cumulative received bodies exist, but at most fifteen
+        // are in the three-second horizon. Never relax the sixteen-body floor.
+        assert!(window.reference(20_000_000).is_none());
     }
     #[test]
     fn only_paired_positive_probe_intervals_provide_conservative_credit() {

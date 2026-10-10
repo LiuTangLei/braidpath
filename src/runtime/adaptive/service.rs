@@ -186,6 +186,49 @@ impl Window {
         });
     }
 
+    /// Choose the shortest retained interval meeting the caller's count floors.
+    /// Each clock and admission coordinate remains paired; history is unchanged.
+    pub(super) fn discovery_with_counts(
+        &self,
+        now_us: u64,
+        minimum_symbols: u64,
+        minimum_received_bytes: u64,
+    ) -> Option<Sample> {
+        let current = self.recent.back()?;
+        if now_us.checked_sub(current.observed_us)? > FRESH_US {
+            return None;
+        }
+        self.recent.iter().rev().find_map(|previous| {
+            let span_us = current.receiver_us.checked_sub(previous.receiver_us)?;
+            let local_span = current.observed_us.checked_sub(previous.observed_us)?;
+            if !(SAMPLE_US..=FRESH_US).contains(&span_us)
+                || !(SAMPLE_US..=FRESH_US).contains(&local_span)
+            {
+                return None;
+            }
+            let ((start_bytes, start_symbols), (end_bytes, end_symbols)) =
+                previous.admitted.zip(current.admitted)?;
+            let symbols = end_symbols.checked_sub(start_symbols)?;
+            let received_bytes = current.bytes.checked_sub(previous.bytes)?;
+            if symbols < minimum_symbols || received_bytes < minimum_received_bytes {
+                return None;
+            }
+            let symbol_bytes = end_bytes.checked_sub(start_bytes)?;
+            Some(Sample {
+                bps: received_bytes as f64 * 8_000_000.0 / span_us as f64,
+                span_us,
+                observed_us: current.observed_us,
+                admission: Some(Admission {
+                    symbol_bytes,
+                    symbols,
+                    bps: symbol_bytes as f64 * 8_000_000.0 / local_span as f64,
+                    span_us: local_span,
+                    started_us: previous.observed_us,
+                }),
+            })
+        })
+    }
+
     pub(super) fn discovery_latest(&self, now_us: u64) -> Option<Sample> {
         self.discovery.filter(|sample| {
             now_us >= sample.observed_us && now_us - sample.observed_us <= FRESH_US
