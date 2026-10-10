@@ -1247,11 +1247,17 @@ impl PathController {
             .as_ref()
             .is_some_and(|sample| sample.deficit);
         self.last_control.service_admission = service_admission;
+        // Positive underdelivery is exactly what the bounded reprobe compares
+        // at its baseline/trial pace. Braking it before that comparison can
+        // invalidate every measurement. Zero service remains an immediate
+        // deficit; queue, fast-loss and blocked-transport protections still run.
+        let service_deficit_actionable =
+            service_deficit && (!protect_ordinary_loss || service_bps == Some(0.0));
         let pressure = delay_pressure
             || (self.loss_pressure && !protect_ordinary_loss)
             || fast_loss
             || blocked_pressure
-            || service_deficit;
+            || service_deficit_actionable;
         if pressure {
             if !self.fast_feedback_seen {
                 self.pressure_episode_exercised.get_or_insert(exercised);
@@ -1268,7 +1274,7 @@ impl PathController {
             && now.saturating_sub(self.last_growth_us) >= PROBE_US + BRAKE_US
             && exercised
             && wire_delivery_bps.is_some_and(|rate| rate < self.rate_bps as f64 * 0.85))
-            || service_deficit;
+            || service_deficit_actionable;
         if delivery_shortfall {
             // Current exercised underdelivery or a qualified paired service
             // deficit replaces an older high hint, including with zero service.
@@ -6046,6 +6052,83 @@ mod tests {
         panic!("fully used low-queue erasure path did not offer a bounded trial");
     }
 
+    #[test]
+    fn short_byte_feedback_does_not_cancel_positive_service_validated_reprobes() {
+        let mut controller = PathController::new(20_000_000, 20);
+        let mut sample = short_observation_022(0, 80.0);
+        sample.reprobe_enabled = true;
+        sample.report_number = 0;
+        sample.delivered_bytes = 0;
+        sample.admitted_symbol_bytes = Some(0);
+        sample.admitted_symbols = Some(0);
+        sample.finalized_expected = Some(0);
+        sample.finalized_lost = Some(0);
+        controller.observe(&sample);
+        let mut admitted = 0;
+        let mut received = 0;
+        let mut confirmed_trials = 0;
+        let mut last_transition = 0;
+        let mut positive_at = 0;
+        for now in (100_000..=30_000_000).step_by(100_000) {
+            controller.probe_admitted(now - 100_000);
+            admitted += exercise_budget(&mut controller, now - 100_000, 100_000);
+            let sent = admitted / 1000;
+            let next_received = (sent - sent / 5) * 1000;
+            sample.now_us = now;
+            sample.report_number += 1;
+            sample.delivery_report_time_us = Some(8_000_000_000 + now);
+            sample.delivery_sample_span_us = 100_000;
+            sample.delivered_bytes = next_received;
+            sample.delivered_bps = Some((next_received - received) as f64 * 80.0);
+            sample.admitted_symbol_bytes = Some(admitted);
+            sample.admitted_symbols = Some(sent);
+            sample.probe_sample_id += 1;
+            sample.probe_age_us = Some(20_000);
+            if next_received > received {
+                positive_at = now;
+            }
+            sample.positive_delivery_age_us = Some(now - positive_at);
+            sample.feedback_age_us = Some(now % PROBE_US);
+            if now % PROBE_US == 0 {
+                let previous = sample.finalized_expected.unwrap();
+                sample.finalized_expected = Some(sent);
+                sample.finalized_lost = Some(sent / 5);
+                sample.feedback_sample_symbols = sent - previous;
+                sample.loss_sample_rate = Some(0.2);
+            } else {
+                sample.feedback_sample_symbols = 0;
+                sample.loss_sample_rate = None;
+            }
+            received = next_received;
+            controller.observe(&sample);
+            if let Some(request) = controller.reprobe_candidate(now) {
+                assert!(controller.start_reprobe(now, request.trial_bps));
+            }
+            let snapshot = controller.reprobe.snapshot();
+            for event in &snapshot.transitions {
+                if event.number > last_transition
+                    && event.reason == reprobe::Reason::ServiceImproved
+                {
+                    confirmed_trials += 1;
+                    assert!(
+                        event.measured_symbol_bps.unwrap() > event.baseline_symbol_bps.unwrap()
+                    );
+                    assert!(event.receiver_span_us >= 1_500_000);
+                }
+            }
+            last_transition = snapshot.total_transitions;
+        }
+        assert!(
+            confirmed_trials >= 3,
+            "positive measured service must allow repeated bounded recovery; confirmed={confirmed_trials}, pace={}",
+            controller.rate_bps
+        );
+        assert!(
+            controller.rate_bps > START_BPS,
+            "a measured erasure path must not remain pinned to the floor"
+        );
+    }
+
     fn fresh_after_trial(controller: &PathController, now: u64) -> Observation {
         let (number, bytes, _) = controller.last_report.unwrap();
         let (expected, lost) = controller.loss_evidence.previous.unwrap();
@@ -6065,6 +6148,55 @@ mod tests {
             loss_sample_rate: Some(3.0 / 16.0),
             ..observation(now, 80.0)
         }
+    }
+
+    #[test]
+    fn reprobe_protection_cannot_hide_a_paired_zero_service_deficit() {
+        let (mut controller, started, _) = granted_reprobe();
+        let trial_rate = controller.rate_bps;
+        let (number, received, _) = controller.last_report.unwrap();
+        let (expected, lost) = controller.loss_evidence.previous.unwrap();
+        let receiver_us = controller.last_control.delivery_report_time_us.unwrap();
+        let mut admitted = expected * 1000;
+        let mut braked = false;
+        for step in 1..=12 {
+            let now = started + step * 100_000;
+            controller.probe_admitted(now - 100_000);
+            admitted += exercise_budget(&mut controller, now - 100_000, 100_000);
+            let mut sample = short_observation_022(now, 80.0);
+            sample.reprobe_enabled = true;
+            sample.probe_age_us = Some(20_000);
+            sample.report_number = number + step;
+            // A real positive short report activates the byte-feedback API;
+            // all subsequent successfully admitted symbols are missing.
+            sample.delivered_bytes = received + 2000;
+            sample.delivered_bps = Some(if step == 1 { 160_000.0 } else { 0.0 });
+            sample.delivery_report_time_us = Some(receiver_us + step * 100_000);
+            sample.admitted_symbols = Some(admitted / 1000);
+            sample.admitted_symbol_bytes = Some(admitted);
+            sample.finalized_expected = Some(expected);
+            sample.finalized_lost = Some(lost);
+            sample.feedback_sample_symbols = 0;
+            sample.loss_sample_rate = None;
+            sample.positive_delivery_age_us = Some((step - 1) * 100_000);
+            controller.observe(&sample);
+            braked |= controller.rate_changes.back().is_some_and(|event| {
+                event.at_us == now
+                    && matches!(event.reason, RateReason::DeliveryShortfallBrake)
+                    && event.control.service_symbol_delivery_bps == Some(0.0)
+                    && event
+                        .control
+                        .service_admission
+                        .as_ref()
+                        .is_some_and(|a| a.deficit)
+            });
+        }
+        assert!(
+            braked,
+            "a bounded trial must not shield fully missing current service"
+        );
+        assert!(controller.rate_bps < trial_rate);
+        assert!(!controller.reprobe_active());
     }
 
     #[test]
