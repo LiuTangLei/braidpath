@@ -2119,14 +2119,19 @@ impl PathController {
                     // continuous demand. Keep actual admissions at the same
                     // pace for at most one service horizon; the original 90%
                     // floor and evidence ages still apply to any increase.
-                    || (self.congestion_seen
-                        && !exercised
+                    || (!exercised
                         && self.admitted_symbol_bytes > 0
                         && growth_probe_ready
                         && self.growth_monitor.is_none()
                         && self.rate_bps == rate_before_refill
                         && elapsed < PROBE_US
-                        && self.discovery_service_window(now).is_some()));
+                        && ((self.congestion_seen
+                            && self.discovery_service_window(now).is_some())
+                            || (!self.congestion_seen
+                                && self.initial_delivery_credit.is_some_and(|credit| {
+                                    credit.fresh_at(now)
+                                        && credit.wire_delivery_bps >= allowance_rate * 0.85
+                                })))));
             if !pending_evidence {
                 self.last_control_us = now;
                 self.admitted_bytes = 0;
@@ -2668,6 +2673,87 @@ mod tests {
         controller.admitted_symbol_bytes = 0;
         controller.allowance_bytes = 0.0;
         (controller, sample)
+    }
+
+    #[test]
+    fn startup_whole_packets_can_complete_the_unchanged_exercise_floor() {
+        let (mut controller, mut sample) = initial_credit_026(20_000_000);
+        assert_eq!(controller.rate_bps, 307_200);
+        assert!(controller.last_initial_growth_report.is_some());
+        assert!(!controller.congestion_seen);
+        // All subsequent wire-sized packets must earn their tokens; the first
+        // increase has already consumed its distinct delivery report.
+        controller.tokens = 0.0;
+        let baseline = controller.rate_bps;
+        for now in [300_000, 400_000, 500_000] {
+            controller.probe_admitted(now - 100_000);
+            sample = wire_admitted_report_060(&mut controller, &sample, now);
+            sample.probe_age_us = Some(20_000);
+            controller.observe(&sample);
+            if now <= 400_000 {
+                assert_eq!(controller.rate_bps, baseline);
+            }
+            if now == 400_000 {
+                assert!(controller.initial_delivery_credit.is_some());
+                assert!(
+                    (controller.last_control.admitted_bytes as f64)
+                        < controller.last_control.integrated_allowance_bytes * 0.9
+                );
+            }
+        }
+        assert!(
+            controller.rate_bps > baseline,
+            "a startup no-op must keep earned packet admissions until the original 90% floor is met"
+        );
+        assert_eq!(controller.last_control.admission_span_us, 300_000);
+        assert!(
+            (controller.last_control.admitted_bytes as f64)
+                >= controller.last_control.integrated_allowance_bytes * 0.9
+        );
+    }
+
+    #[test]
+    fn startup_packet_window_retention_keeps_its_evidence_and_safety_bounds() {
+        for boundary in ["underuse", "idle", "pressure", "stale", "generation"] {
+            let (mut controller, mut sample) = initial_credit_026(20_000_000);
+            controller.tokens = 0.0;
+            let baseline = controller.rate_bps;
+            for now in [300_000, 400_000] {
+                controller.probe_admitted(now - 100_000);
+                sample = wire_admitted_report_060(&mut controller, &sample, now);
+                sample.probe_age_us = Some(20_000);
+                controller.observe(&sample);
+            }
+            assert_eq!(controller.last_control_us, 200_000);
+            for now in [500_000, 600_000, 700_000] {
+                // No more business is admitted or delivered. New RTT replies
+                // cannot manufacture byte feedback or renew its original age.
+                let mut next = sample.clone();
+                next.now_us = now;
+                next.positive_delivery_age_us = Some(now - 400_000);
+                next.feedback_age_us = Some(now - 400_000);
+                controller.probe_admitted(now - 100_000);
+                next.probe_sample_id += (now - 400_000) / 100_000;
+                next.probe_age_us = Some(20_000);
+                match boundary {
+                    "idle" => next.offered_backlog = false,
+                    "pressure" => next.send_queue_bytes = 10_000,
+                    "stale" => next.positive_delivery_age_us = Some(FRESH_US + 1),
+                    "generation" => next.generation += 1,
+                    _ => {}
+                }
+                controller.observe(&next);
+                if boundary != "generation" {
+                    assert!(controller.rate_bps <= baseline, "{boundary}");
+                }
+                if boundary != "underuse" || now == 700_000 {
+                    assert_eq!(controller.last_control_us, now, "{boundary}");
+                    assert_eq!(controller.admitted_bytes, 0, "{boundary}");
+                    assert_eq!(controller.allowance_bytes, 0.0, "{boundary}");
+                    break;
+                }
+            }
+        }
     }
 
     #[test]
