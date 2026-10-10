@@ -1932,6 +1932,34 @@ impl PathController {
                     self.drain_restore_pending = false;
                 }
             }
+            let current_recovery_service = !observation.transport_blocked
+                && observation_contiguous
+                && self
+                    .last_positive_report_us
+                    .is_some_and(|at| now.checked_sub(at).is_some_and(|age| age <= CONTROL_US))
+                && service_sample.is_some_and(|old| {
+                    old.admission
+                        .is_some_and(|sent| sent.started_us < last_pace_change)
+                        && self
+                            .service_window
+                            .discovery_with_counts(now, 8, 1)
+                            .is_some_and(|current| {
+                                current.observed_us > old.observed_us
+                                    && now.saturating_sub(current.observed_us) <= CONTROL_US
+                                    && current.bps * self.wire_per_symbol >= allowance_rate * 0.85
+                                    && current.admission.is_some_and(|sent| {
+                                        sent.bps > 0.0
+                                            && current.bps >= sent.bps * 0.85
+                                            && self
+                                                .backlog_since_us
+                                                .is_some_and(|since| since <= sent.started_us)
+                                            && self
+                                                .demand_activity
+                                                .since_us
+                                                .is_some_and(|since| since <= sent.started_us)
+                                    })
+                            })
+                });
             if !monitor_withdrawn
                 && !waiting_for_drain_window
                 && fresh
@@ -1943,7 +1971,11 @@ impl PathController {
                 // observation before recovery explores further. The retained
                 // capacity shortcut otherwise bypasses receiver-keeps-up and
                 // can restart growth faster than loss can be corroborated.
-                && !(ordinary_loss && service_shortfall)
+                // A disjoint sample that crosses an older pace can lag a
+                // newer complete paired delivery interval. That newer evidence
+                // may release this growth guard, but grants no service memory
+                // or rate credit and never bypasses the independent brakes.
+                && !(ordinary_loss && service_shortfall && !current_recovery_service)
                 && observation.offered_backlog
                 && exercised
                 && now >= self.growth_not_before_us
@@ -2673,6 +2705,122 @@ mod tests {
         sample.admitted_symbols = Some(previous.admitted_symbols.unwrap_or(0) + symbols);
         sample.admitted_symbol_bytes = Some(previous.admitted_symbol_bytes.unwrap_or(0) + bytes);
         sample
+    }
+
+    fn recovery_service_072() -> (PathController, Observation) {
+        let mut controller = PathController::new(128_000, 20);
+        let mut sample = short_observation_022(200_000, 80.0);
+        sample.delivered_bytes = 0;
+        sample.delivered_bps = Some(0.0);
+        sample.admitted_symbols = Some(0);
+        sample.admitted_symbol_bytes = Some(0);
+        sample.finalized_expected = Some(0);
+        sample.finalized_lost = Some(0);
+        controller.observe(&sample);
+        controller.tokens = 0.0;
+        for now in (300_000..=5_000_000).step_by(100_000) {
+            controller.probe_admitted(now - 100_000);
+            sample = wire_admitted_report_060(&mut controller, &sample, now);
+            sample.probe_age_us = Some(20_000);
+            sample.finalized_expected = Some(0);
+            sample.finalized_lost = Some(0);
+            if (2_500_000..=2_800_000).contains(&now) {
+                sample.delivered_bytes -= 1025;
+                sample.delivered_bps = sample.delivered_bps.map(|bps| bps - 82_000.0);
+            }
+            controller.observe(&sample);
+        }
+        assert!(sample.admitted_symbols.unwrap() >= 64);
+        assert_eq!(controller.rate_bps, 128_000);
+        // Begin at an already restored pace; both old/new intervals below
+        // contain actual whole datagrams admitted at their respective rates.
+        controller.maximum_bps = 20_000_000;
+        controller.rate_bps = 256_000;
+        controller.congestion_seen = true;
+        controller.remembered_bps = 512_000.0;
+        controller.last_growth_us = 5_000_000;
+        controller.record_rate_change(5_000_000, 128_000, RateReason::KnownServiceRecovery);
+        controller.tokens = 0.0;
+        controller.last_control_us = 5_000_000;
+        controller.admitted_bytes = 0;
+        controller.admitted_symbol_bytes = 0;
+        controller.allowance_bytes = 0.0;
+        for now in [5_100_000, 5_200_000, 5_300_000, 5_400_000] {
+            controller.probe_admitted(now - 100_000);
+            sample = wire_admitted_report_060(&mut controller, &sample, now);
+            sample.probe_age_us = Some(20_000);
+            sample.finalized_expected = Some(if now == 5_100_000 { 32 } else { 64 });
+            sample.finalized_lost = Some(if now == 5_100_000 { 2 } else { 4 });
+            sample.loss_sample_rate = Some(0.0625);
+            sample.feedback_sample_symbols = if now <= 5_200_000 { 32 } else { 0 };
+            controller.observe(&sample);
+        }
+        assert_eq!(controller.rate_bps, 256_000);
+        (controller, sample)
+    }
+
+    fn recovery_report_072(controller: &mut PathController, previous: &Observation) -> Observation {
+        controller.probe_admitted(5_400_000);
+        let mut sample = wire_admitted_report_060(controller, previous, 5_500_000);
+        sample.probe_age_us = Some(20_000);
+        sample.finalized_expected = Some(64);
+        sample.finalized_lost = Some(4);
+        sample.feedback_sample_symbols = 0;
+        sample
+    }
+
+    #[test]
+    fn historical_loss_and_old_pace_cannot_hide_current_paired_delivery() {
+        let (mut controller, previous) = recovery_service_072();
+        let sample = recovery_report_072(&mut controller, &previous);
+        controller.observe(&sample);
+        let old = controller.service_window.latest(sample.now_us).unwrap();
+        let current = controller
+            .service_window
+            .discovery_with_counts(sample.now_us, 8, 1)
+            .unwrap();
+        assert!(controller.loss_evidence.ordinary());
+        assert!(old.bps * controller.wire_per_symbol < 256_000.0 * 0.85);
+        assert!(current.bps * controller.wire_per_symbol >= 256_000.0 * 0.85);
+        assert!(current.bps >= current.admission.unwrap().bps * 0.85);
+        assert!(
+            controller.rate_bps > 256_000,
+            "a newer complete paired interval supports the actual restored pace"
+        );
+        let grown = controller.rate_bps;
+        let count = controller.rate_changes_total;
+        controller.observe(&sample);
+        assert_eq!(controller.rate_bps, grown);
+        assert_eq!(controller.rate_changes_total, count);
+    }
+
+    #[test]
+    fn current_recovery_service_requires_complete_recent_busy_evidence() {
+        for guard in [
+            "blocked",
+            "idle",
+            "interrupted",
+            "missing_sender",
+            "old_positive",
+            "under_delivery",
+        ] {
+            let (mut controller, previous) = recovery_service_072();
+            let mut sample = recovery_report_072(&mut controller, &previous);
+            match guard {
+                "blocked" => sample.transport_blocked = true,
+                "idle" => sample.offered_backlog = false,
+                "interrupted" => controller.demand_activity.since_us = Some(5_300_000),
+                "missing_sender" => sample.admitted_symbols = None,
+                "old_positive" => sample.positive_delivery_age_us = Some(CONTROL_US + 1),
+                "under_delivery" => {
+                    sample.delivered_bytes = previous.delivered_bytes;
+                    sample.delivered_bps = Some(0.0);
+                }
+                _ => unreachable!(),
+            }
+            controller.observe(&sample);
+            assert!(controller.rate_bps <= 256_000, "{guard}");
+        }
     }
 
     fn quantized_admission_060() -> (PathController, Observation) {
