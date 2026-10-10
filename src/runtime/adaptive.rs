@@ -349,6 +349,7 @@ pub struct GrowthMonitorReply {
 pub struct GrowthMonitor {
     pub generation: u64,
     pub independent_service_credit: bool,
+    pub baseline_probe_rtt_ms: Option<f64>,
     pub armed_us: u64,
     pub latest_observed_us: u64,
     pub previous_bps: u64,
@@ -366,10 +367,12 @@ impl GrowthMonitor {
         previous_bps: u64,
         pacing_bps: u64,
         independent_service_credit: bool,
+        baseline_probe_rtt_ms: Option<f64>,
     ) -> Self {
         Self {
             generation: sample.generation,
             independent_service_credit,
+            baseline_probe_rtt_ms,
             armed_us: sample.now_us,
             latest_observed_us: sample.now_us,
             previous_bps,
@@ -1666,7 +1669,15 @@ impl PathController {
                 .first_reply
                 .as_ref()
                 .zip(monitor.second_reply.as_ref())
-                .is_some_and(|(first, second)| second.rtt_ms > first.rtt_ms + 0.25);
+                .is_some_and(|(first, second)| {
+                    // A rebound during drainage can remain below the RTT
+                    // that authorized growth. It does not establish that the
+                    // owned increment grew the queue above its starting point.
+                    second.rtt_ms > first.rtt_ms + 0.25
+                        && monitor
+                            .baseline_probe_rtt_ms
+                            .is_some_and(|baseline| second.rtt_ms > baseline + 0.25)
+                });
             if rising && self.queue_delay_ms > self.target_ms * 0.25 {
                 self.rate_bps = monitor.previous_bps;
                 rate_reason = RateReason::GrowthWithdrawalBrake;
@@ -2148,6 +2159,7 @@ impl PathController {
                 previous_rate,
                 self.rate_bps,
                 matches!(rate_reason, RateReason::ProbeServiceRecovery),
+                probe_rtt,
             ));
         }
         self.last_probe_sample_id = observation.probe_sample_id;
@@ -3270,6 +3282,67 @@ mod tests {
         assert!(monitor.second_reply.is_none());
         controller.probe_admitted(800_000);
         (controller, sample)
+    }
+
+    #[test]
+    fn monitored_growth_does_not_attribute_a_draining_queue_to_its_increment() {
+        // Observed shared-link sequence: the queue falls below the RTT at
+        // growth, then partially rebounds. Comparing only the last two replies
+        // would withdraw an increment while the overall queue is still lower.
+        for (first_rtt, second_rtt, withdraw) in [
+            (80.9, 86.0, false),
+            (86.6, 87.2, false),
+            (86.0, 88.25, false),
+            (86.0, 89.0, true),
+        ] {
+            let (mut controller, previous) = service_endpoint_032();
+            let mut sample = admitted_report_026(&mut controller, &previous, 800_000, u64::MAX);
+            sample.rtt_ms = 0.0;
+            sample.probe_rtt_ms = Some(88.0);
+            sample.probe_latest_rtt_ms = Some(88.0);
+            let baseline = controller.rate_bps;
+            controller.observe(&sample);
+            let grown = controller.rate_bps;
+            assert!(grown > baseline);
+            controller.probe_admitted(801_000);
+            let mut first = monitor_reply_034(
+                &mut controller,
+                &sample,
+                801_000 + (first_rtt * 1000.0) as u64,
+                first_rtt,
+                801_000,
+            );
+            first.probe_sample_id = sample.probe_sample_id + 1;
+            controller.observe(&first);
+            controller.probe_admitted(901_000);
+            let mut second = monitor_reply_034(
+                &mut controller,
+                &first,
+                901_000 + (second_rtt * 1000.0) as u64,
+                second_rtt,
+                901_000,
+            );
+            second.probe_sample_id = first.probe_sample_id + 1;
+            controller.observe(&second);
+            assert_eq!(
+                controller.rate_bps,
+                if withdraw { baseline } else { grown },
+                "88 -> {first_rtt} -> {second_rtt} must be compared with the actual growth baseline"
+            );
+            assert_eq!(
+                controller
+                    .last_control
+                    .growth_monitor
+                    .as_ref()
+                    .unwrap()
+                    .withdrawn,
+                withdraw
+            );
+            assert!(controller.growth_monitor.is_none());
+            let events = controller.rate_changes_total;
+            controller.observe(&second);
+            assert_eq!(controller.rate_changes_total, events);
+        }
     }
 
     #[test]
