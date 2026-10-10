@@ -492,7 +492,7 @@ async fn sender_actor_drains_multiple_flows_once_and_stops_cleanly() {
             .is_ok()
         );
     }
-    let task = tokio::spawn(sender(rx, paths, policy, stopped, scope));
+    let task = tokio::spawn(sender(rx, paths, policy, stopped, scope, None));
     let mut received = BTreeSet::new();
     let mut decoder = Receiver::default();
     timeout(Duration::from_secs(3), async {
@@ -524,4 +524,160 @@ async fn sender_actor_drains_multiple_flows_once_and_stops_cleanly() {
         assert_eq!(d.symbols.admitted_wait.count, 128);
     });
     pair.assert_quiet().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn event_observation_036_notifies_only_the_owner_on_accepted_wire_evidence() {
+    fn notified(notify: &Notify) -> bool {
+        let waker = Waker::from(Arc::new(Wakes::default()));
+        let mut future = Box::pin(notify.notified());
+        future
+            .as_mut()
+            .poll(&mut TaskContext::from_waker(&waker))
+            .is_ready()
+    }
+    let pair = Pair::connect().await;
+    let path0 = pair.path();
+    let mut path1 = pair.path();
+    path1.id = 1;
+    let paths = Arc::new(Mutex::new(vec![path0.clone(), path1.clone()]));
+    let scope = stats::Metrics::new("client").scope("event-observation", stats::FORWARD);
+    let owner = Notify::new();
+    let other_sender = Notify::new();
+    let mut peer0 = quality::State::new(7);
+    let mut peer1 = quality::State::new(7);
+    let reports = quality::control_v2(&[peer0.report(0, 1000), peer1.report(1, 1000)]);
+    assert!(
+        measured_payload(&paths, 0, &reports, true, &scope, Some(&owner))
+            .unwrap()
+            .is_none()
+    );
+    assert!(notified(&owner));
+    assert!(!notified(&owner), "one frame is one coalesced notification");
+    assert!(!notified(&other_sender));
+    assert!(paths.try_lock().is_ok());
+    assert!(path0.quality.try_lock().is_ok());
+    assert_eq!(path0.quality.lock().unwrap().snapshot.controls_received, 1);
+    assert_eq!(path1.quality.lock().unwrap().snapshot.controls_received, 1);
+    assert!(
+        measured_payload(&paths, 0, &reports, true, &scope, Some(&owner))
+            .unwrap()
+            .is_none()
+    );
+    assert!(!notified(&owner), "replayed reports are not new evidence");
+    assert!(measured_payload(&paths, 0, b"BQ2C", true, &scope, Some(&owner)).is_err());
+    assert!(!notified(&owner));
+
+    // Generate positive delivery feedback from actual admitted symbol bytes.
+    let data = wire::plain(&record(1)).unwrap();
+    let sent = {
+        let mut state = path0.quality.lock().unwrap();
+        let sent = state.wrap(&data, 0);
+        state.admitted(data.len());
+        sent
+    };
+    peer0.receive(&sent, 1500).unwrap();
+    let delivery = quality::control_v2(&[peer0.delivery_report(0, 2000)]);
+    measured_payload(&paths, 0, &delivery, true, &scope, Some(&owner)).unwrap();
+    assert!(notified(&owner));
+    assert!(!notified(&owner));
+    let mut stale = peer0.delivery_report(0, 3000);
+    stale.generation += 1;
+    measured_payload(
+        &paths,
+        0,
+        &quality::control_v2(&[stale]),
+        true,
+        &scope,
+        Some(&owner),
+    )
+    .unwrap();
+    assert!(
+        !notified(&owner),
+        "wrong-generation feedback does not notify"
+    );
+
+    let request = quality::Probe {
+        generation: 7,
+        nonce: 77,
+        response: false,
+    };
+    measured_payload(
+        &paths,
+        0,
+        &quality::probe(&request),
+        true,
+        &scope,
+        Some(&owner),
+    )
+    .unwrap();
+    assert!(!notified(&owner), "a peer request is not a measured reply");
+    assert_eq!(
+        path0.probe_reply.lock().unwrap().as_ref().unwrap().nonce,
+        77
+    );
+    let reply = quality::Probe {
+        response: true,
+        ..request
+    };
+    assert!(
+        measured_payload(
+            &paths,
+            0,
+            &quality::probe(&reply),
+            true,
+            &scope,
+            Some(&owner)
+        )
+        .is_err()
+    );
+    assert!(!notified(&owner), "an unsolicited reply is rejected");
+    path0
+        .quality
+        .lock()
+        .unwrap()
+        .probe_admitted(77, quality_time(&path0));
+    measured_payload(
+        &paths,
+        0,
+        &quality::probe(&reply),
+        true,
+        &scope,
+        Some(&owner),
+    )
+    .unwrap();
+    assert!(notified(&owner));
+    assert!(!notified(&owner));
+    assert_eq!(path0.quality.lock().unwrap().snapshot.replies_received, 1);
+    assert!(
+        measured_payload(
+            &paths,
+            0,
+            &quality::probe(&reply),
+            true,
+            &scope,
+            Some(&owner)
+        )
+        .is_err()
+    );
+    assert!(!notified(&owner), "the valid nonce can notify only once");
+
+    let incoming = peer1.wrap(&data, 0);
+    peer1.admitted(data.len());
+    assert!(
+        measured_payload(&paths, 1, &incoming, true, &scope, Some(&owner))
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        !notified(&owner),
+        "business reception does not notify this sender"
+    );
+    let fixed = quality::control_v2(&[peer1.report(1, 4000)]);
+    measured_payload(&paths, 1, &fixed, true, &scope, None).unwrap();
+    assert!(!notified(&owner));
+    assert!(
+        !notified(&other_sender),
+        "quality-only mode has no observation owner"
+    );
 }

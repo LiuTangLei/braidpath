@@ -157,6 +157,52 @@ impl RepairBudget {
     }
 }
 
+/// Coalesce accepted feedback without postponing the periodic observation.
+#[derive(Default)]
+pub struct ObservationSchedule {
+    next_periodic_us: u64,
+    last_observed_us: Option<u64>,
+    evidence_pending: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct ObservationCause {
+    pub periodic: bool,
+    pub evidence: bool,
+}
+
+impl ObservationSchedule {
+    pub fn evidence_received(&mut self) {
+        self.evidence_pending = true;
+    }
+
+    pub fn take_due(&mut self, now_us: u64) -> Option<ObservationCause> {
+        // The existing sender heartbeat is also the minimum coalescing span.
+        // A backward clock or an early caller retains both kinds of work.
+        if self.last_observed_us.is_some_and(|last| {
+            now_us
+                .checked_sub(last)
+                .is_none_or(|elapsed| elapsed < 1_000)
+        }) {
+            return None;
+        }
+        let periodic = now_us >= self.next_periodic_us;
+        if !periodic && !self.evidence_pending {
+            return None;
+        }
+        let cause = ObservationCause {
+            periodic,
+            evidence: self.evidence_pending,
+        };
+        if periodic {
+            self.next_periodic_us = now_us.saturating_add(100_000);
+        }
+        self.last_observed_us = Some(now_us);
+        self.evidence_pending = false;
+        Some(cause)
+    }
+}
+
 pub struct Pacer {
     tokens: f64,
     last_us: u64,
@@ -200,9 +246,14 @@ pub struct BusinessPacer {
 impl BusinessPacer {
     pub fn new(maximum_bps: u64, group_maximum_bps: [u64; MAX_PATHS], burst_bytes: usize) -> Self {
         let burst = burst_bytes.min(2400);
+        let startup_bucket = || {
+            let mut bucket = Pacer::new(0, burst);
+            bucket.tokens = burst as f64;
+            bucket
+        };
         Self {
-            aggregate: Pacer::new(0, burst),
-            groups: std::array::from_fn(|_| Pacer::new(0, burst)),
+            aggregate: startup_bucket(),
+            groups: std::array::from_fn(|_| startup_bucket()),
             maximum_bps,
             group_maximum_bps,
             last_us: 0,
@@ -259,11 +310,100 @@ mod tests {
     use super::*;
 
     #[test]
+    fn event_observation_036_coalesces_evidence_without_moving_periodic_deadlines() {
+        let periodic = Some(ObservationCause {
+            periodic: true,
+            evidence: false,
+        });
+        let evidence = Some(ObservationCause {
+            periodic: false,
+            evidence: true,
+        });
+        let both = Some(ObservationCause {
+            periodic: true,
+            evidence: true,
+        });
+        let mut schedule = ObservationSchedule::default();
+        assert_eq!(schedule.take_due(0), periodic);
+        schedule.evidence_received();
+        schedule.evidence_received();
+        assert_eq!(schedule.take_due(999), None);
+        assert_eq!(schedule.take_due(1000), evidence);
+        assert_eq!(schedule.take_due(1000), None);
+        assert_eq!(schedule.take_due(99_499), None);
+        schedule.evidence_received();
+        assert_eq!(schedule.take_due(99_500), evidence);
+        schedule.evidence_received();
+        // The event did not postpone the 100ms deadline. Both are retained
+        // until the 1ms minimum after the actual 99.5ms observation.
+        assert_eq!(schedule.take_due(100_000), None);
+        assert_eq!(schedule.take_due(100_499), None);
+        assert_eq!(schedule.take_due(100_500), both);
+        assert_eq!(schedule.take_due(200_499), None);
+        assert_eq!(schedule.take_due(200_500), periodic);
+        schedule.evidence_received();
+        assert_eq!(schedule.take_due(100_000), None);
+        assert_eq!(schedule.take_due(200_500), None);
+        assert_eq!(schedule.take_due(201_499), None);
+        assert_eq!(schedule.take_due(201_500), evidence);
+        for at in [250_000, 275_000, 300_000] {
+            schedule.evidence_received();
+            assert_eq!(schedule.take_due(at), evidence);
+        }
+        assert_eq!(schedule.take_due(300_500), None);
+        assert_eq!(schedule.take_due(301_000), periodic);
+        // A delayed actor skips missed periods instead of replaying them.
+        assert_eq!(schedule.take_due(1_000_000), periodic);
+        assert_eq!(schedule.take_due(1_001_000), None);
+        assert_eq!(schedule.take_due(1_100_000), periodic);
+    }
+
+    #[test]
+    fn event_observation_036_grants_startup_credit_once_across_groups() {
+        let mut business = BusinessPacer::new(10_000_000, [10_000_000; MAX_PATHS], 9600);
+        assert!(
+            !business.available(0, 1),
+            "credit cannot make a zero budget eligible"
+        );
+        let budgets = [(0, 80_000), (1, 80_000)];
+        business.update(0, budgets);
+        for _ in 0..3 {
+            assert!(business.available(0, 2400));
+            assert!(!business.available(0, 2401));
+        }
+        business.spend(0, 1200);
+        assert!(business.available(1, 1200));
+        assert!(!business.available(1, 1201));
+        business.spend(1, 1200);
+        assert!(!business.available(0, 1));
+        assert!(!business.available(1, 1));
+        business.update(0, [(0, 1_000_000)]);
+        business.update(0, []);
+        business.update(0, budgets);
+        assert!(
+            !business.available(0, 1),
+            "membership and rate changes do not renew credit"
+        );
+        business.update(1000, budgets);
+        assert!(business.available(0, 20));
+        assert!(!business.available(0, 21));
+        business.spend(0, 20);
+        business.update(1000, budgets);
+        assert!(!business.available(1, 1));
+        let configured = Pacer::new(10_000_000, 2400);
+        assert!(
+            !configured.available(1),
+            "the original all-datagram pacer is unchanged"
+        );
+    }
+
+    #[test]
     fn business_pacing_035_bounds_cross_path_bursts_and_both_caps() {
         let budgets = [(0, 365_000); 4];
         let mut business = BusinessPacer::new(350_000_000, [350_000_000; MAX_PATHS], 9600);
         business.update(0, budgets);
-        assert!(!business.available(0, 1), "no initial credit");
+        assert!(business.available(0, 2400));
+        assert!(!business.available(0, 2401), "one bounded initial credit");
         let mut accepted = 0u64;
         for offset in [0, 1300, 2200, 2400] {
             business.update(500_000 + offset, budgets);
@@ -285,6 +425,7 @@ mod tests {
         let mut grouped = BusinessPacer::new(400_000, caps, 2400);
         let budgets = [(0, 160_000), (0, 160_000), (1, u64::MAX), (1, u64::MAX)];
         grouped.update(0, budgets);
+        grouped.spend(0, 2400);
         grouped.update(40_000, budgets);
         assert!(grouped.available(0, 800));
         assert!(
@@ -315,10 +456,12 @@ mod tests {
     fn business_pacing_035_settles_old_rates_without_minting_or_replaying_credit() {
         let mut business = BusinessPacer::new(10_000_000, [10_000_000; MAX_PATHS], 2400);
         business.update(1_000_000, [(0, 80_000)]);
+        assert!(business.available(0, 2400));
         assert!(
-            !business.available(0, 1),
-            "first budget cannot backfill elapsed time"
+            !business.available(0, 2401),
+            "first budget exposes only the bounded initial credit"
         );
+        business.spend(0, 2400);
         business.update(1_100_000, [(0, 160_000)]);
         assert!(business.available(0, 1000));
         assert!(
@@ -389,6 +532,12 @@ mod tests {
         let mut control = Pacer::new(10_000_000, 2400);
         let mut control_group = Pacer::new(10_000_000, 2400);
         synchronize(&mut business, &controllers, 0);
+        for controller in &mut controllers {
+            assert!(controller.allow(0, 1200, 0.0));
+            assert!(business.available(0, 1200));
+            business.spend(0, 1200);
+            controller.admitted_symbol(0, 1200, 1090);
+        }
         synchronize(&mut business, &controllers, 100);
         assert!(
             controllers

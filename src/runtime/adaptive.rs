@@ -509,7 +509,7 @@ pub struct RateChange {
     pub control: ControlSample,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize)]
 pub struct Observation {
     pub now_us: u64,
     pub generation: u64,
@@ -2050,6 +2050,91 @@ mod tests {
             controller.observe(&sample);
         }
         (controller, sample)
+    }
+
+    #[test]
+    fn event_observation_036_keeps_controller_growth_and_pressure_time_gates() {
+        use super::super::outbound::ObservationSchedule;
+
+        let (mut controller, mut sample) = initial_credit_026(20_000_000);
+        assert_eq!(sample.now_us, 200_000);
+        assert_eq!(controller.last_growth_us, 200_000);
+        let mut schedule = ObservationSchedule::default();
+        for at in [0, 100_000, 200_000] {
+            assert!(schedule.take_due(at).is_some());
+        }
+        let grown_at_200 = controller.rate_bps;
+        sample = admitted_report_026(&mut controller, &sample, 300_000, u64::MAX);
+        schedule.evidence_received();
+        assert!(schedule.take_due(300_000).is_some());
+        controller.observe(&sample);
+        assert_eq!(controller.rate_bps, grown_at_200);
+
+        // Another path can wake this sender while this path's report remains
+        // unchanged. Its real admissions continue, and report/probe ages advance.
+        let admitted = exercise_budget(&mut controller, 300_000, 99_000);
+        sample.admitted_symbols = Some(sample.admitted_symbols.unwrap() + admitted / 1000);
+        sample.admitted_symbol_bytes = Some(sample.admitted_symbol_bytes.unwrap() + admitted);
+        sample.now_us = 399_000;
+        sample.feedback_age_us = Some(99_000);
+        sample.positive_delivery_age_us = Some(99_000);
+        sample.probe_age_us = Some(99_000);
+        schedule.evidence_received();
+        assert!(schedule.take_due(sample.now_us).is_some());
+        controller.observe(&sample);
+        assert_eq!(
+            controller.rate_bps, grown_at_200,
+            "199ms cannot authorize the next growth"
+        );
+        schedule.evidence_received();
+        assert!(schedule.take_due(399_999).is_none());
+        let admitted = exercise_budget(&mut controller, 399_000, 1000);
+        sample.admitted_symbols = Some(sample.admitted_symbols.unwrap() + admitted / 1000);
+        sample.admitted_symbol_bytes = Some(sample.admitted_symbol_bytes.unwrap() + admitted);
+        sample.now_us = 400_000;
+        sample.feedback_age_us = Some(100_000);
+        sample.positive_delivery_age_us = Some(100_000);
+        sample.probe_age_us = Some(100_000);
+        assert!(schedule.take_due(sample.now_us).is_some());
+        controller.observe(&sample);
+        assert!(controller.rate_bps > grown_at_200);
+        assert_eq!(controller.last_growth_us, 400_000);
+
+        let before_pressure = controller.rate_bps;
+        let pressure_probe = sample.probe_sample_id + 1;
+        let mut previous_at = 400_000;
+        for at in [401_000, 450_000, 500_000, 501_000] {
+            let admitted = exercise_budget(&mut controller, previous_at, at - previous_at);
+            sample.admitted_symbols = Some(sample.admitted_symbols.unwrap() + admitted / 1000);
+            sample.admitted_symbol_bytes = Some(sample.admitted_symbol_bytes.unwrap() + admitted);
+            sample.now_us = at;
+            sample.feedback_age_us = Some(at - 300_000);
+            sample.positive_delivery_age_us = Some(at - 300_000);
+            sample.rtt_ms = 95.0;
+            sample.probe_rtt_ms = Some(95.0);
+            sample.probe_latest_rtt_ms = Some(95.0);
+            sample.probe_sample_id = pressure_probe;
+            sample.probe_age_us = Some(at - 401_000);
+            schedule.evidence_received();
+            assert!(schedule.take_due(at).is_some());
+            controller.observe(&sample);
+            assert_eq!(controller.queue_delay_ms, 15.0);
+            if at < 501_000 {
+                assert_eq!(
+                    controller.rate_bps, before_pressure,
+                    "less than100ms pressure must hold, not brake"
+                );
+                assert!(controller.last_brake_us.is_none());
+            } else {
+                assert!(controller.rate_bps < before_pressure);
+                assert_eq!(controller.last_brake_us, Some(501_000));
+                assert!(matches!(
+                    controller.rate_changes.back().unwrap().reason,
+                    RateReason::QueueBrake
+                ));
+            }
+            previous_at = at;
+        }
     }
 
     fn cautious_probe_028() -> (PathController, Observation) {

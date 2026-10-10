@@ -24,7 +24,7 @@ use std::{
 use subtle::ConstantTimeEq;
 use tokio::{
     net::UdpSocket,
-    sync::{Semaphore, mpsc, watch},
+    sync::{Notify, Semaphore, mpsc, watch},
     task::JoinSet,
     time::{MissedTickBehavior, interval, timeout},
 };
@@ -185,22 +185,30 @@ fn measured_payload(
     payload: &[u8],
     enabled: bool,
     scope: &Scope,
+    observation_notify: Option<&Notify>,
 ) -> Result<Option<Bytes>> {
     if !enabled {
         return Ok(Some(Bytes::copy_from_slice(payload)));
     }
     let paths = paths.lock().expect("paths lock");
     if payload.starts_with(b"BQ1C") || payload.starts_with(b"BQ2C") {
+        let mut accepted = false;
         for report in quality::parse_control(payload)? {
             if let Some(path) = paths.iter().find(|p| p.id == report.id) {
                 let mut q = path.quality.lock().expect("quality lock");
                 if q.apply(&report, quality_time(path)).is_err() {
                     q.snapshot.invalid_controls += 1;
+                } else {
+                    accepted = true;
                 }
                 let feedback = q.snapshot_at(quality_time(path));
                 drop(q);
                 scope.path(path.id, |p| p.receiver_feedback = Some(feedback));
             }
+        }
+        drop(paths);
+        if accepted && let Some(notify) = observation_notify {
+            notify.notify_one();
         }
         return Ok(None);
     }
@@ -211,6 +219,7 @@ fn measured_payload(
     let mut q = path.quality.lock().expect("quality lock");
     if payload.starts_with(b"BQ2P") || payload.starts_with(b"BQ2R") {
         let probe = quality::parse_probe(payload)?;
+        let accepted_reply = probe.response;
         ensure!(
             probe.generation == q.snapshot.generation,
             "stale probe generation"
@@ -226,6 +235,10 @@ fn measured_payload(
         let feedback = q.snapshot_at(quality_time(path));
         drop(q);
         scope.path(pid, |p| p.receiver_feedback = Some(feedback));
+        drop(paths);
+        if accepted_reply && let Some(notify) = observation_notify {
+            notify.notify_one();
+        }
         return Ok(None);
     }
     let inner = q.receive(payload, quality_time(path))?;
@@ -426,6 +439,7 @@ impl WaitingSend {
 
 enum SenderEvent {
     Stop,
+    Evidence,
     Tick,
     Input(Option<QueuedRecord>),
     Ready(SendReadiness),
@@ -570,6 +584,7 @@ async fn sender(
     policy: Policy,
     mut stop: watch::Receiver<bool>,
     metrics: Scope,
+    observation_notify: Option<Arc<Notify>>,
 ) {
     let mut encoder = Encoder::new(policy.fec.max(1), Duration::from_millis(policy.block_ms))
         .expect("validated policy");
@@ -593,7 +608,7 @@ async fn sender(
     let mut reprobe_cursor = 0usize;
     let mut feedback_schedule = quality::FeedbackSchedule::default();
     let mut pending_feedback: Option<(Bytes, quality::ReportKind)> = None;
-    let mut observe_at = 0u64;
+    let mut observation_schedule = policy.adaptive.then(outbound::ObservationSchedule::default);
     let mut repair_turn = false;
     let mut tick = interval(Duration::from_millis(1));
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -606,6 +621,8 @@ async fn sender(
         let event = tokio::select! {
             biased;
             _=stop.changed()=>SenderEvent::Stop,
+            _=async { observation_notify.as_ref().expect("adaptive observation notify").notified().await },
+                if policy.adaptive && observation_notify.is_some()=>SenderEvent::Evidence,
             _=tick.tick()=>SenderEvent::Tick,
             ready=poll_fn(|cx| {
                 let Some(wait) = waiting.as_mut() else {
@@ -640,6 +657,12 @@ async fn sender(
         let prepared = waiting.take().map(WaitingSend::cancel);
         match event {
             SenderEvent::Stop => break,
+            SenderEvent::Evidence => {
+                observation_schedule
+                    .as_mut()
+                    .expect("adaptive observation schedule")
+                    .evidence_received();
+            }
             SenderEvent::Tick => {
                 if policy.fec > 0
                     && let Some(shard) = encoder.flush_due(Instant::now())
@@ -738,7 +761,11 @@ async fn sender(
             account_expired(&expired, now, &metrics);
         }
         let paths = shared_paths.lock().expect("paths lock");
-        if policy.adaptive && now_us >= observe_at {
+        if observation_schedule
+            .as_mut()
+            .and_then(|schedule| schedule.take_due(now_us))
+            .is_some()
+        {
             for path in paths.iter() {
                 let q = path.quality.lock().expect("quality lock");
                 let snapshot = &q.snapshot;
@@ -801,7 +828,6 @@ async fn sender(
                 let snapshot = controllers[usize::from(path.id)].snapshot(now_us);
                 metrics.path(path.id, |p| p.adaptive = Some(snapshot));
             }
-            observe_at = now_us.saturating_add(100_000);
         }
         update_business_pacer(&mut business, &paths, &controllers, now_us);
         if policy.receiver_feedback
@@ -1285,6 +1311,7 @@ struct Session {
     paths: Paths,
     stop: watch::Sender<bool>,
     policy: Policy,
+    observation_notify: Option<Arc<Notify>>,
     ingress_drops: Arc<AtomicU64>,
     forward: Scope,
     returning: Scope,
@@ -1306,6 +1333,7 @@ async fn session_loop(
         session.policy.clone(),
         session.stop.subscribe(),
         session.returning.clone(),
+        session.observation_notify.clone(),
     ));
     let mut stop = session.stop.subscribe();
     let mut decoder = Receiver::with_repair_wait(Duration::from_millis(session.policy.queue_ms));
@@ -1614,7 +1642,8 @@ async fn server_connection(
                             } else {
                                 ensure!(map.len()<16,"session limit");
                                 let (tx,rx)=mpsc::channel(QUEUE);let (stop,_)=watch::channel(false);
-                                let session=Arc::new(Session{generations:Mutex::new([None;MAX_PATHS]),empty_since:Mutex::new(Some(Instant::now())),events:tx,paths:Arc::new(Mutex::new(Vec::new())),stop,policy,ingress_drops:Arc::new(AtomicU64::new(0)),forward:metrics.scope(&sid,stats::FORWARD),returning:metrics.scope(&sid,stats::RETURN),finished:tokio::sync::Notify::new(),done:std::sync::atomic::AtomicBool::new(false)});
+                                let observation_notify=policy.adaptive.then(||Arc::new(Notify::new()));
+                                let session=Arc::new(Session{generations:Mutex::new([None;MAX_PATHS]),empty_since:Mutex::new(Some(Instant::now())),events:tx,paths:Arc::new(Mutex::new(Vec::new())),stop,policy,observation_notify,ingress_drops:Arc::new(AtomicU64::new(0)),forward:metrics.scope(&sid,stats::FORWARD),returning:metrics.scope(&sid,stats::RETURN),finished:tokio::sync::Notify::new(),done:std::sync::atomic::AtomicBool::new(false)});
                                 map.insert(sid.clone(),session.clone());
                                 tokio::spawn(session_loop(session.clone(),rx,target));
                                 session
@@ -1655,7 +1684,7 @@ async fn server_connection(
                     if let Some((_,session,pid,stream))=&joined {
                         session.forward.path(*pid,|p|p.http_datagrams_received+=1);
                         if let Ok(payload)=wire::http_payload(&data,*stream) && payload.len()<=(if session.policy.receiver_feedback{quality::MAX_FRAME}else{wire::MAX_WIRE}) {
-                            match measured_payload(&session.paths,*pid,payload,session.policy.receiver_feedback,&session.returning) {
+                            match measured_payload(&session.paths,*pid,payload,session.policy.receiver_feedback,&session.returning,session.observation_notify.as_deref()) {
                             Ok(Some(payload))=>{if let Err(error)=session.events.try_send(Event::Wire(*pid,payload)){session.ingress_drops.fetch_add(1,Ordering::Relaxed);queue_error(&session.forward,QueueLayer::Receiver,&error,Some(*pid));}},Ok(None)=>{},Err(_)=>session.forward.path(*pid,|p|p.invalid_http_datagrams_dropped+=1)}
                         } else {session.forward.path(*pid,|p|p.invalid_http_datagrams_dropped+=1);session.forward.update(|d|d.records.invalid_symbols_dropped+=1);}
                     }
@@ -1843,12 +1872,14 @@ async fn client_session(options: &ClientOptions, socket: Arc<UdpSocket>) -> Resu
     }
     let (tx, rx) = mpsc::channel(QUEUE);
     let (stop, stop_rx) = watch::channel(false);
+    let observation_notify = options.policy.adaptive.then(|| Arc::new(Notify::new()));
     tasks.spawn(sender(
         rx,
         paths.clone(),
         options.policy.clone(),
         stop_rx,
         forward.clone(),
+        observation_notify.clone(),
     ));
     let mut input = vec![0; 65536];
     let mut peers: HashMap<SocketAddr, (u32, Instant)> = HashMap::new();
@@ -1966,7 +1997,7 @@ async fn client_session(options: &ClientOptions, socket: Arc<UdpSocket>) -> Resu
                         }
                         if let Some(old)=endpoints[id].replace(value.endpoint) {old.close(0u32.into(),b"path replaced");}
                         tasks.spawn(drive_client_path(value.conn,value.stream,value.driver,value.request,value.send,diagnostic,pid,
-                            wire_tx.clone(),ingress_drops.clone(),returning.clone(),forward.clone(),paths.clone(),options.policy.receiver_feedback));
+                            wire_tx.clone(),ingress_drops.clone(),returning.clone(),forward.clone(),paths.clone(),options.policy.receiver_feedback,observation_notify.clone()));
                         has_session=true;
                         if options.policy.adaptive && !announced {
                             options.stats.readiness(true,configs.len());
@@ -2057,6 +2088,7 @@ async fn drive_client_path(
     measurement_scope: Scope,
     path_view: Paths,
     feedback: bool,
+    observation_notify: Option<Arc<Notify>>,
 ) {
     // Dropping the last SendRequest closes the HTTP/3 connection.
     let _send = send;
@@ -2067,7 +2099,7 @@ async fn drive_client_path(
                             Ok(d)=>{
                                 returning.path(pid,|p|p.http_datagrams_received+=1);
                                 if let Ok(p)=wire::http_payload(&d,stream) && p.len()<=(if feedback{quality::MAX_FRAME}else{wire::MAX_WIRE}) {
-                                    match measured_payload(&path_view,pid,p,feedback,&measurement_scope) {Ok(Some(p))=>{if let Err(error)=tx.try_send((pid,p)){ingress_drops.fetch_add(1,Ordering::Relaxed);queue_error(&returning,QueueLayer::Receiver,&error,Some(pid));}},Ok(None)=>{},Err(_)=>returning.path(pid,|p|p.invalid_http_datagrams_dropped+=1)}
+                                    match measured_payload(&path_view,pid,p,feedback,&measurement_scope,observation_notify.as_deref()) {Ok(Some(p))=>{if let Err(error)=tx.try_send((pid,p)){ingress_drops.fetch_add(1,Ordering::Relaxed);queue_error(&returning,QueueLayer::Receiver,&error,Some(pid));}},Ok(None)=>{},Err(_)=>returning.path(pid,|p|p.invalid_http_datagrams_dropped+=1)}
                                 }else{returning.path(pid,|p|p.invalid_http_datagrams_dropped+=1);returning.update(|d|d.records.invalid_symbols_dropped+=1);}
                             },
                             Err(e)=>return Err(e.into()),
