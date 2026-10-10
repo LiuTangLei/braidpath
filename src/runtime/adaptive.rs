@@ -239,6 +239,57 @@ pub enum RttSource {
     Probe,
 }
 
+/// A finalized interval's provable loss after the last actual congestion brake.
+/// Raw loss remains in the ordinary history, health hold and trial safety input.
+#[derive(Clone, Debug, Serialize)]
+pub struct BrakeLoss {
+    pub admitted_symbols: u64,
+    pub previous_brake_symbols: Option<u64>,
+    pub expected: u64,
+    pub lost: u64,
+    pub pressure_override: bool,
+    pub actionable: bool,
+}
+
+impl BrakeLoss {
+    fn from_batch(
+        sample: &Observation,
+        batch: (u64, u64),
+        previous_brake_symbols: Option<u64>,
+        pressure_override: bool,
+    ) -> Option<Self> {
+        let admitted_symbols = sample.admitted_symbols?;
+        let end = sample.finalized_expected?;
+        sample.finalized_lost?;
+        let (expected, lost) = batch;
+        let start = end.checked_sub(expected)?;
+        if end > admitted_symbols
+            || lost > expected
+            || previous_brake_symbols.is_some_and(|boundary| boundary > admitted_symbols)
+        {
+            return None;
+        }
+        let old = if pressure_override {
+            0
+        } else {
+            previous_brake_symbols
+                .map_or(0, |boundary| boundary.saturating_sub(start).min(expected))
+        };
+        // Every old symbol could explain one loss. Do not assign an ambiguous
+        // straddling batch's losses to its new part without that lower bound.
+        let expected = expected - old;
+        let lost = lost.saturating_sub(old);
+        Some(Self {
+            admitted_symbols,
+            previous_brake_symbols,
+            expected,
+            lost,
+            pressure_override,
+            actionable: expected >= 8 && u128::from(lost) * 2 >= u128::from(expected),
+        })
+    }
+}
+
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct ControlSample {
     pub at_us: u64,
@@ -281,6 +332,8 @@ pub struct ControlSample {
     pub startup_probe_excess_ms: Option<f64>,
     pub ordinary_loss_pressure: bool,
     pub fast_loss: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub brake_loss: Option<BrakeLoss>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -315,6 +368,9 @@ pub struct Observation {
     /// controller observations. They are distinct from current delivery bytes.
     pub finalized_expected: Option<u64>,
     pub finalized_lost: Option<u64>,
+    /// Successful sequence count from this generation's authoritative Quality
+    /// State. A controller-local mirror can miss admissions before first observe.
+    pub admitted_symbols: Option<u64>,
     /// Quality-share EWMA. Pacing brakes use bounded finalized-count evidence.
     pub loss_rate: f64,
     pub loss_sample_rate: Option<f64>,
@@ -360,6 +416,7 @@ pub struct PathController {
     startup_probe_pressure: Option<(f64, u64)>,
     growth_not_before_us: u64,
     last_brake_us: Option<u64>,
+    last_brake_admitted_symbols: Option<u64>,
     last_probe_sample_id: u64,
     last_rtt_ms: Option<f64>,
     last_local_rtt_ms: Option<f64>,
@@ -387,6 +444,7 @@ pub struct PathController {
     loss_evidence: LossEvidence,
     loss_pressure: bool,
     pressure_episode_exercised: Option<bool>,
+    pressure_episode_braked: bool,
     tokens: f64,
     token_us: u64,
     reprobe: reprobe::Controller,
@@ -423,6 +481,7 @@ impl PathController {
             startup_probe_pressure: None,
             growth_not_before_us: 0,
             last_brake_us: None,
+            last_brake_admitted_symbols: None,
             last_probe_sample_id: 0,
             last_rtt_ms: None,
             last_local_rtt_ms: None,
@@ -447,6 +506,7 @@ impl PathController {
             loss_evidence: LossEvidence::default(),
             loss_pressure: false,
             pressure_episode_exercised: None,
+            pressure_episode_braked: false,
             tokens: 2400.0,
             token_us: 0,
             reprobe: reprobe::Controller::default(),
@@ -521,6 +581,12 @@ impl PathController {
                 .is_some_and(|rate| rate.is_finite() && rate > 0.0);
         let mut new_service_report = false;
         if new_report {
+            if !self.fast_feedback_seen && short_delivery_interval && !self.pressure_episode_braked
+            {
+                // Do not import a legacy transient's provisional flag when
+                // short feedback starts. An actual prior brake keeps its flag.
+                self.pressure_episode_exercised = None;
+            }
             self.fast_feedback_seen |= short_delivery_interval;
             let accumulated = self.service_window.observe(
                 observation.report_number,
@@ -752,6 +818,33 @@ impl PathController {
         let settled_shortfall =
             service_shortfall && now.saturating_sub(last_change) >= PROBE_US + BRAKE_US;
         self.loss_pressure = ordinary_loss && settled_shortfall;
+        let brake_loss = self
+            .fast_feedback_seen
+            .then_some(loss_batch)
+            .flatten()
+            .and_then(|batch| {
+                BrakeLoss::from_batch(
+                    observation,
+                    batch,
+                    self.last_brake_admitted_symbols,
+                    self.queue_delay_ms >= self.target_ms * 4.0
+                        || blocked_pressure
+                        || settled_shortfall,
+                )
+            });
+        let fast_loss_actionable = brake_loss
+            .as_ref()
+            .map_or(fast_loss, |evidence| evidence.actionable);
+        let actionable_loss_fraction = brake_loss.as_ref().map_or_else(
+            || loss_batch.map_or(0.0, |(n, lost)| lost as f64 / n as f64),
+            |evidence| {
+                if evidence.expected == 0 {
+                    0.0
+                } else {
+                    evidence.lost as f64 / evidence.expected as f64
+                }
+            },
+        );
         let loss_counts = self.loss_evidence.counts();
         // Preserve the exact inputs and intermediate values at an action. These
         // observed minima are never substituted for the original mixed minimum.
@@ -803,6 +896,7 @@ impl PathController {
             startup_probe_excess_ms: startup_probe_excess,
             ordinary_loss_pressure: self.loss_pressure,
             fast_loss,
+            brake_loss,
         };
         let trial_action = self.reprobe.observe(reprobe::Input {
             sample: observation,
@@ -840,10 +934,10 @@ impl PathController {
             }
         }
         let protect_ordinary_loss = trial_action.protect_ordinary_loss;
-        let new_loss =
-            fast_loss || (loss_batch.is_some() && self.loss_pressure && !protect_ordinary_loss);
-        let loss_for_brake = if fast_loss {
-            loss_batch.map_or(0.0, |(n, lost)| lost as f64 / n as f64)
+        let new_loss = fast_loss_actionable
+            || (loss_batch.is_some() && self.loss_pressure && !protect_ordinary_loss);
+        let loss_for_brake = if fast_loss_actionable {
+            actionable_loss_fraction
         } else {
             self.loss_evidence.fraction()
         };
@@ -852,11 +946,14 @@ impl PathController {
             || fast_loss
             || blocked_pressure;
         if pressure {
-            self.pressure_episode_exercised.get_or_insert(exercised);
+            if !self.fast_feedback_seen {
+                self.pressure_episode_exercised.get_or_insert(exercised);
+            }
         } else if new_loss_report && observation.feedback_sample_symbols > 0 {
             // A clear RTT alone can precede the delayed loss report for this
             // episode. Require a genuinely new, finalized clear interval too.
             self.pressure_episode_exercised = None;
+            self.pressure_episode_braked = false;
         }
         let delivery_shortfall = new_service_report
             && delay_pressure
@@ -901,7 +998,28 @@ impl PathController {
             Health::Healthy
         };
 
+        let probe_began_us = probe_fresh
+            .then_some(observation.probe_age_us.zip(probe_rtt))
+            .flatten()
+            .and_then(|(age, rtt)| {
+                now.checked_sub(age)?
+                    .checked_sub((rtt * 1000.0).ceil() as u64)
+            });
+        let independent_local_pressure = (rtt == local_rtt && rtt_excess > self.target_ms * 0.5)
+            || local_rtt
+                .zip(self.last_local_rtt_ms)
+                .is_some_and(|(current, previous)| current > previous + 0.25)
+            || transport_wait > self.target_ms * 0.5;
+        let pre_brake_probe_pressure = self.fast_feedback_seen
+            && self.queue_delay_ms < self.target_ms * 4.0
+            && !independent_local_pressure
+            && ((rtt.is_some() && rtt != local_rtt && rtt_excess > self.target_ms * 0.5)
+                || startup_probe_excess.is_some_and(|excess| excess > self.target_ms * 0.5))
+            && probe_began_us
+                .zip(self.last_brake_us)
+                .is_some_and(|(began, brake)| began <= brake);
         let new_delay = persistent_delay
+            && !pre_brake_probe_pressure
             && self.braked_queue_ms.is_none_or(|last| {
                 new_queue && self.queue_delay_ms > last + (self.target_ms * 0.1).max(1.0)
             });
@@ -928,10 +1046,11 @@ impl PathController {
             let service_hint = wire_delivery_bps
                 .map(|rate| rate.max(recent_drain.unwrap_or(0.0)))
                 .or(recent_drain);
+            let episode_exercised = self.pressure_episode_exercised.unwrap_or(exercised);
             let mut desired = service_hint
                 .filter(|rate| {
                     *rate > 0.0
-                        && (self.pressure_episode_exercised == Some(true)
+                        && (episode_exercised
                             || delivery_shortfall
                             || *rate >= self.rate_bps as f64)
                 })
@@ -953,6 +1072,10 @@ impl PathController {
             let floor = MIN_BPS.min(self.maximum_bps) as f64;
             let reduced = desired.max(floor).min(self.rate_bps as f64) as u64;
             if reduced < self.rate_bps {
+                if self.fast_feedback_seen {
+                    self.pressure_episode_exercised.get_or_insert(exercised);
+                }
+                self.pressure_episode_braked = true;
                 // Safety always brakes. Persistent caution requires exercise
                 // captured before this episode's first reduction, not use of a
                 // later, smaller allowance while the old evidence drains.
@@ -967,7 +1090,7 @@ impl PathController {
                     self.drain_restore_pending = true;
                 }
                 self.rate_bps = reduced;
-                rate_reason = if fast_loss {
+                rate_reason = if fast_loss_actionable {
                     RateReason::FastLossBrake
                 } else if new_delay {
                     RateReason::QueueBrake
@@ -979,6 +1102,20 @@ impl PathController {
                     RateReason::LossBrake
                 };
                 self.last_brake_us = Some(now);
+                self.last_brake_admitted_symbols = self
+                    .fast_feedback_seen
+                    .then_some(observation.admitted_symbols)
+                    .flatten()
+                    .filter(|admitted| {
+                        self.last_brake_admitted_symbols
+                            .is_none_or(|boundary| *admitted >= boundary)
+                            && observation
+                                .finalized_expected
+                                .zip(observation.finalized_lost)
+                                .is_some_and(|(expected, lost)| {
+                                    lost <= expected && expected <= *admitted
+                                })
+                    });
                 self.growth_not_before_us = now.saturating_add(RETRY_GROWTH_US);
             }
         }
@@ -1374,6 +1511,224 @@ mod tests {
             }
         }
         admitted
+    }
+
+    fn short_observation_022(now: u64, probe_ms: f64) -> Observation {
+        Observation {
+            report_number: now / 100_000 + 1,
+            probe_sample_id: now / 100_000 + 1,
+            probe_latest_rtt_ms: Some(probe_ms),
+            delivery_sample_span_us: 100_000,
+            delivery_report_time_us: Some(100_000_000 + now),
+            delivered_bps: Some(START_BPS as f64),
+            delivered_bytes: now / 1000,
+            finalized_expected: Some(0),
+            finalized_lost: Some(0),
+            admitted_symbols: Some(0),
+            ..observation(now, 80.0)
+        }
+    }
+
+    #[test]
+    fn causal_braking_022_requires_post_brake_probe_but_keeps_independent_pressure() {
+        for safety in ["none", "severe", "quinn", "transport"] {
+            let mut controller = PathController::new(20_000_000, 20);
+            controller.observe(&short_observation_022(0, 80.0));
+            exercise_budget(&mut controller, 0, CONTROL_US);
+            controller.observe(&short_observation_022(200_000, 105.0));
+            assert_eq!(controller.last_brake_us, Some(200_000));
+            let first = controller.rate_bps;
+            let mut old_request = short_observation_022(300_000, 125.0);
+            match safety {
+                "severe" => old_request.probe_latest_rtt_ms = Some(170.0),
+                "quinn" => old_request.rtt_ms = 95.0,
+                "transport" => old_request.send_queue_bytes = 3000,
+                _ => {}
+            }
+            controller.observe(&old_request);
+            if safety == "none" {
+                // The reply is new, but 300-125=175 ms precedes the brake.
+                assert_eq!(controller.rate_bps, first);
+                assert_eq!(controller.last_brake_us, Some(200_000));
+                assert!(controller.queue_delay_ms > 10.0);
+                // This request began at 270 ms, after the actual brake.
+                controller.observe(&short_observation_022(400_000, 130.0));
+                assert!(controller.rate_bps < first);
+                assert_eq!(controller.last_brake_us, Some(400_000));
+            } else {
+                assert!(controller.rate_bps < first, "{safety}");
+                assert_eq!(controller.last_brake_us, Some(300_000));
+            }
+        }
+    }
+
+    #[test]
+    fn causal_braking_022_captures_exercise_at_actual_brake_and_migrates_transients() {
+        for legacy_pulse in [false, true] {
+            let mut controller = PathController::new(20_000_000, 20);
+            let mut initial = short_observation_022(0, 80.0);
+            if legacy_pulse {
+                initial.delivery_sample_span_us = 500_000;
+            }
+            controller.observe(&initial);
+            let mut pulse = short_observation_022(200_000, 95.0);
+            if legacy_pulse {
+                pulse.delivery_sample_span_us = 500_000;
+                pulse.rtt_ms = 95.0;
+            }
+            controller.observe(&pulse);
+            assert_eq!(controller.last_brake_us, None);
+            assert_eq!(
+                controller.pressure_episode_exercised,
+                legacy_pulse.then_some(false)
+            );
+            exercise_budget(&mut controller, 200_000, 100_000);
+            let mut brake = short_observation_022(300_000, 110.0);
+            if legacy_pulse {
+                brake.rtt_ms = 110.0;
+            }
+            controller.observe(&brake);
+            assert_eq!(controller.last_brake_us, Some(300_000));
+            assert_eq!(controller.pressure_episode_exercised, Some(true));
+            assert!(controller.congestion_seen);
+        }
+    }
+
+    #[test]
+    fn causal_braking_022_uses_only_provable_new_loss_and_falls_back_without_coordinates() {
+        let mut sample = short_observation_022(1_000_000, 80.0);
+        sample.finalized_expected = Some(130);
+        sample.finalized_lost = Some(30);
+        sample.admitted_symbols = Some(200);
+        for (boundary, lost, expected_new, lost_new, actionable) in [
+            (Some(130), 40, 0, 0, false),
+            (Some(90), 20, 40, 20, true),
+            (Some(110), 29, 20, 9, false),
+            (Some(110), 30, 20, 10, true),
+            (None, 20, 40, 20, true),
+        ] {
+            sample.finalized_lost = Some(lost);
+            let evidence = BrakeLoss::from_batch(&sample, (40, lost), boundary, false).unwrap();
+            assert_eq!((evidence.expected, evidence.lost), (expected_new, lost_new));
+            assert_eq!(evidence.actionable, actionable);
+        }
+        sample.finalized_lost = Some(40);
+        let override_old = BrakeLoss::from_batch(&sample, (40, 40), Some(130), true).unwrap();
+        assert_eq!((override_old.expected, override_old.lost), (40, 40));
+        assert!(override_old.actionable);
+        assert!(BrakeLoss::from_batch(&sample, (40, 40), Some(201), false).is_none());
+        sample.admitted_symbols = None;
+        assert!(BrakeLoss::from_batch(&sample, (40, 40), Some(130), false).is_none());
+        sample.admitted_symbols = Some(129);
+        assert!(BrakeLoss::from_batch(&sample, (40, 40), Some(130), false).is_none());
+    }
+
+    fn loss_after_first_brake_022() -> (PathController, Observation) {
+        // These symbols were admitted by the new Quality State before its first
+        // periodic controller observation; the controller has no matching mirror.
+        let mut quality = crate::runtime::quality::State::new(7);
+        for _ in 0..64 {
+            quality.admitted(1000);
+        }
+        let mut controller = PathController::new(20_000_000, 20);
+        let mut initial = short_observation_022(0, 80.0);
+        initial.admitted_symbols = Some(quality.snapshot.sent_symbols);
+        controller.observe(&initial);
+        assert_eq!(controller.last_brake_admitted_symbols, None);
+        let mut first_loss = short_observation_022(200_000, 80.0);
+        first_loss.admitted_symbols = Some(quality.snapshot.sent_symbols);
+        first_loss.finalized_expected = Some(16);
+        first_loss.finalized_lost = Some(16);
+        controller.observe(&first_loss);
+        assert_eq!(controller.rate_bps, 128_000);
+        assert_eq!(controller.last_brake_admitted_symbols, Some(64));
+        let mut old_loss = short_observation_022(800_000, 80.0);
+        old_loss.admitted_symbols = Some(64);
+        old_loss.finalized_expected = Some(32);
+        old_loss.finalized_lost = Some(32);
+        (controller, old_loss)
+    }
+
+    #[test]
+    fn causal_braking_022_preserves_raw_loss_and_resets_the_boundary_with_generation() {
+        let (mut controller, mut old_loss) = loss_after_first_brake_022();
+        controller.observe(&old_loss);
+        assert_eq!(controller.rate_bps, 128_000);
+        assert_eq!(controller.last_brake_us, Some(200_000));
+        assert!(controller.last_control.fast_loss);
+        assert!(
+            !controller
+                .last_control
+                .brake_loss
+                .as_ref()
+                .unwrap()
+                .actionable
+        );
+        assert_eq!(controller.loss_evidence.counts(), (32, 32));
+        old_loss.now_us = 900_000;
+        controller.observe(&old_loss);
+        assert_eq!(controller.loss_evidence.counts(), (32, 32));
+        assert!(!controller.last_control.fast_loss);
+        assert!(controller.last_control.brake_loss.is_none());
+
+        let mut new_loss = short_observation_022(1_200_000, 80.0);
+        new_loss.admitted_symbols = Some(128);
+        new_loss.finalized_expected = Some(80);
+        new_loss.finalized_lost = Some(80);
+        controller.observe(&new_loss);
+        assert_eq!(controller.rate_bps, 64_000);
+        assert_eq!(controller.last_brake_admitted_symbols, Some(128));
+
+        new_loss.now_us = 1_300_000;
+        new_loss.generation = 8;
+        new_loss.admitted_symbols = Some(64);
+        new_loss.finalized_expected = Some(16);
+        new_loss.finalized_lost = Some(16);
+        controller.observe(&new_loss);
+        assert_eq!(controller.rate_bps, 128_000);
+        assert_eq!(controller.last_brake_us, Some(1_300_000));
+        assert_eq!(controller.last_brake_admitted_symbols, Some(64));
+        assert_eq!(controller.loss_evidence.counts(), (16, 16));
+    }
+
+    #[test]
+    fn causal_braking_022_keeps_raw_fast_loss_for_missing_coordinates_and_current_pressure() {
+        for safety in ["missing", "regressed", "severe", "blocked", "shortfall"] {
+            let (mut controller, mut old_loss) = loss_after_first_brake_022();
+            match safety {
+                "missing" => old_loss.admitted_symbols = None,
+                "regressed" => old_loss.admitted_symbols = Some(50),
+                "severe" => old_loss.probe_latest_rtt_ms = Some(170.0),
+                "blocked" | "shortfall" => {
+                    exercise_budget(&mut controller, 200_000, 600_000);
+                    old_loss.delivered_bps = Some(0.0);
+                    if safety == "blocked" {
+                        controller.blocked_since_us = Some(300_000);
+                        old_loss.transport_blocked = true;
+                    }
+                }
+                _ => unreachable!(),
+            }
+            controller.observe(&old_loss);
+            assert!(controller.rate_bps < 128_000, "{safety}");
+            assert!(matches!(
+                controller.rate_changes.back().unwrap().reason,
+                RateReason::FastLossBrake
+            ));
+            if matches!(safety, "missing" | "regressed") {
+                assert!(controller.last_control.brake_loss.is_none());
+                assert_eq!(controller.last_brake_admitted_symbols, None);
+            } else {
+                assert!(
+                    controller
+                        .last_control
+                        .brake_loss
+                        .as_ref()
+                        .unwrap()
+                        .pressure_override
+                );
+            }
+        }
     }
 
     fn cautious_service_021(qualified_at_us: u64, positive_age_us: u64) -> PathController {
