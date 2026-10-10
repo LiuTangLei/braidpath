@@ -7,7 +7,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: python3 -m unittest bench.test_run bench.test_readiness
+      - run: python3 -m unittest bench.test_run bench.test_readiness bench.test_trace_replay
   rust:
     strategy:
       matrix:

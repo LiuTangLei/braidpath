@@ -1,5 +1,14 @@
 # Finite benchmark runner
 
+`python3 -m bench.trace_replay RAW DEST --paths PATH_A PATH_B PATH_C PATH_D`
+packs native sender/receiver samples for synchronized virtual-time replay.
+`Replay.events()` retains every source timestamp, gap and end-to-end missing
+packet on a common sender clock. It generates no traffic and refuses to
+overwrite evidence. Relay drop counters stay separate, with unknown packet
+attribution and uncalibrated relay clocks; they are neither subtracted from nor
+added to the recorded loss mask. Captured receiver timestamps do not establish
+absolute one-way delay. Keep input, bundles and results in ignored `local/`.
+
 `run.py` runs parameterized, paired comparisons with preinstalled binaries. It does
 not deploy binaries, change congestion defaults, alter the scheduler/FEC, or make
 performance acceptance claims. Python 3.9+, key-based SSH, remote Python 3,
