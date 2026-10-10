@@ -1711,6 +1711,10 @@ impl PathController {
                     self.last_control.drain_service_target_bps = Some(restored);
                 } else if let Some(drain) = recent_drain
                     && ordinary_growth_ready
+                    && (self
+                        .last_brake_us
+                        .is_none_or(|brake| self.last_growth_us <= brake)
+                        || (exercised && now >= self.growth_not_before_us))
                 {
                     let ceiling = if self.fast_feedback_seen {
                         self.rate_bps as f64 * growth_gain_limit
@@ -1727,7 +1731,25 @@ impl PathController {
                         rate_reason = RateReason::KnownServiceRecovery;
                         self.last_growth_us = now;
                     }
-                    self.drain_restore_pending = false;
+                    // A bounded exploratory step can be smaller than the
+                    // still-young drain hint. Keep the opportunity to validate
+                    // actual post-brake service; neither its age nor the retry
+                    // deadline is renewed by this partial step.
+                    self.drain_restore_pending = self.fast_feedback_seen
+                        && self.rate_bps < (drain * 0.9).min(self.maximum_bps as f64) as u64
+                        && self.last_brake_us.is_some()
+                        && service_sample.is_some_and(|sample| {
+                            now.checked_sub(sample.observed_us)
+                                .is_some_and(|age| age <= CONTROL_US)
+                                && sample.span_us >= PROBE_US
+                                && sample.admission.is_some_and(|sent| {
+                                    sent.span_us >= PROBE_US
+                                        && sent.symbols >= 8
+                                        && sent.bps > 0.0
+                                        && sample.bps > sent.bps * 1.1
+                                        && sent.started_us < last_pace_change
+                                })
+                        });
                 } else if recent_drain.is_none() {
                     self.drain_restore_pending = false;
                 }
@@ -3992,6 +4014,60 @@ mod tests {
             );
         }
         assert!(controller.decision(1_200_000).probe_due);
+    }
+
+    #[test]
+    fn partial_drain_exploration_does_not_finish_the_bounded_recovery_intent() {
+        let (mut controller, sample) = draining_service_029(0, 1_000_000);
+        let admission = controller
+            .service_window
+            .latest(sample.now_us)
+            .unwrap()
+            .admission
+            .unwrap();
+        let before = controller.rate_bps;
+        controller.rate_bps -= 1;
+        controller.record_rate_change(
+            admission.started_us + 1,
+            before,
+            RateReason::ReprobeRollback,
+        );
+        let before = controller.rate_bps;
+        let target = (controller.draining_bps.unwrap().0 * 0.9) as u64;
+        assert!(target > before);
+        controller.observe(&sample);
+        assert_eq!(controller.last_control.drain_service_target_bps, None);
+        assert!(controller.rate_bps > before && controller.rate_bps < target);
+        assert!(controller.rate_bps <= (before as f64 * (1.0 + 16.0 / 180.0)) as u64);
+        assert!(
+            controller.drain_restore_pending,
+            "a partial bounded step is not a completed restoration"
+        );
+        let pending_rate = controller.rate_bps;
+        controller.growth_not_before_us = sample.now_us + PROBE_US;
+        controller.probe_admitted(sample.now_us + 100_000);
+        let mut next = admitted_report_026(
+            &mut controller,
+            &sample,
+            sample.now_us + CONTROL_US,
+            u64::MAX,
+        );
+        next.probe_age_us = Some(20_000);
+        controller.observe(&next);
+        assert_eq!(
+            controller.rate_bps, pending_rate,
+            "pending intent cannot bypass retry time"
+        );
+        assert!(controller.drain_restore_pending);
+        let expired_at = controller.draining_bps.unwrap().1 + FRESH_US + 1;
+        controller.probe_admitted(expired_at - 100_000);
+        next = admitted_report_026(&mut controller, &next, expired_at, u64::MAX);
+        next.probe_age_us = Some(20_000);
+        controller.observe(&next);
+        assert!(
+            !controller.drain_restore_pending,
+            "partial recovery cannot renew a drain hint"
+        );
     }
 
     #[test]
