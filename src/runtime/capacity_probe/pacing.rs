@@ -37,6 +37,8 @@ pub struct Controller {
     last_rtt_used: u64,
     last_growth_bytes: u64,
     last_clock_us: u64,
+    last_rtt_request_us: Option<u64>,
+    rtt_request_interval_us: u64,
 }
 impl Controller {
     pub fn new(ceiling: u64) -> Self {
@@ -52,6 +54,8 @@ impl Controller {
             last_rtt_used: 0,
             last_growth_bytes: 0,
             last_clock_us: 0,
+            last_rtt_request_us: None,
+            rtt_request_interval_us: BRAKE_US,
         }
     }
     pub fn observe(&mut self, demand: &Demand, ceiling: u64) {
@@ -94,6 +98,8 @@ impl Controller {
         let previous = self.state.pacing_bps;
         let mut next = previous.min(ceiling);
         let rtt = demand.rtt_ms.filter(|rtt| rtt.is_finite() && *rtt > 0.0);
+        self.rtt_request_interval_us =
+            rtt.map_or(BRAKE_US, |rtt| ((rtt * 500.0).ceil() as u64).max(BRAKE_US));
         let request_us = demand
             .rtt_age_us
             .filter(|age| *age <= 200_000)
@@ -161,6 +167,27 @@ impl Controller {
     pub fn snapshot(&self) -> RateSnapshot {
         self.state.clone()
     }
+    pub fn rtt_request_due(&self, now: u64) -> bool {
+        // Measurement must not depend on the fresh reply it is trying to obtain.
+        // Keep the existing health cadence when business demand is absent.
+        now >= self.last_clock_us
+            && self.state.pacing_bps > 0
+            && self.state.generation.is_some()
+            && self.last_observed_us.is_some_and(|at| now - at <= 200_000)
+            && self
+                .state
+                .backlog_since_us
+                .is_some_and(|at| now - at >= GROWTH_US)
+            && self
+                .last_rtt_request_us
+                .is_none_or(|at| now.saturating_sub(at) >= self.rtt_request_interval_us)
+    }
+    pub fn rtt_request_admitted(&mut self, now: u64) {
+        if now >= self.last_clock_us {
+            self.last_clock_us = now;
+            self.last_rtt_request_us = Some(now);
+        }
+    }
 }
 #[cfg(test)]
 mod tests {
@@ -179,6 +206,48 @@ mod tests {
             positive_probe_age_us: Some(0),
             ..Default::default()
         }
+    }
+    #[test]
+    fn sustained_measurement_requests_rtt_even_without_recent_reply() {
+        let mut controller = Controller::new(4_375_000);
+        for now in (0..=500_000).step_by(100_000) {
+            let mut sample = demand(now, true);
+            sample.rtt_age_us = Some(500_000);
+            controller.observe(&sample, 4_375_000);
+        }
+        assert!(controller.rtt_request_due(500_000));
+        // A rejected send or repeated query spends neither the request nor data allowance.
+        assert!(controller.rtt_request_due(500_000));
+        controller.rtt_request_admitted(500_000);
+        assert!(!controller.rtt_request_due(599_999));
+        assert!(controller.rtt_request_due(600_000));
+        controller.rtt_request_admitted(600_000);
+        assert!(!controller.rtt_request_due(600_000));
+        assert_eq!(controller.snapshot().pacing_bps, LOW_BPS);
+    }
+    #[test]
+    fn independent_rtt_request_needs_current_continuous_demand_and_live_generation() {
+        let mut controller = Controller::new(4_375_000);
+        assert!(!controller.rtt_request_due(500_000));
+        for now in (0..=500_000).step_by(100_000) {
+            controller.observe(&demand(now, true), 4_375_000);
+        }
+        assert!(controller.rtt_request_due(500_000));
+        assert!(!controller.rtt_request_due(499_999));
+        assert!(!controller.rtt_request_due(700_001));
+        controller.observe(&demand(600_000, false), 4_375_000);
+        assert!(!controller.rtt_request_due(600_000));
+        let mut next = demand(700_000, true);
+        next.generation = 8;
+        controller.observe(&next, 4_375_000);
+        assert!(!controller.rtt_request_due(700_000));
+        for now in (800_000..=1_200_000).step_by(100_000) {
+            next.now_us = now;
+            controller.observe(&next, 4_375_000);
+        }
+        assert!(controller.rtt_request_due(1_200_000));
+        controller.observe(&next, 0);
+        assert!(!controller.rtt_request_due(1_200_000));
     }
     #[test]
     fn sparse_traffic_keeps_independent_probe_data_low_despite_configured_high_ceiling() {

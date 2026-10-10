@@ -1074,7 +1074,10 @@ async fn sender(
                 let reply = path.probe_reply.lock().expect("probe reply lock").clone();
                 let frame = if let Some(reply) = reply {
                     Some(reply)
-                } else if controllers[id].decision(now_us).probe_due {
+                } else if controllers[id].decision(now_us).probe_due
+                    || (policy.capacity_probe_bps > 0
+                        && capacity_pacing[id].rtt_request_due(now_us))
+                {
                     Some(quality::Probe {
                         generation: path
                             .quality
@@ -1117,6 +1120,9 @@ async fn sender(
                             .expect("quality lock")
                             .probe_admitted(probe.nonce, quality_time(path));
                         controllers[id].probe_admitted(now_us);
+                        if policy.capacity_probe_bps > 0 {
+                            capacity_pacing[id].rtt_request_admitted(now_us);
+                        }
                     }
                     metrics.update(|d| d.symbols.probes_admitted += 1);
                 }
