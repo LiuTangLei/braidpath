@@ -1696,6 +1696,14 @@ impl PathController {
                     increment_bps: monitor.pacing_bps - monitor.previous_bps,
                     observed_us: now,
                 });
+            } else if rising {
+                // Below the brake threshold, keep the current rate, but do
+                // not treat an increasing queue as a settled trial. Continue
+                // with one newer reply and the original ownership/expiry.
+                let mut pending = monitor.clone();
+                pending.first_reply = pending.second_reply.take();
+                pending.successful_request_us = [pending.successful_request_us[1], None];
+                self.growth_monitor = Some(pending);
             } else if let Some(rejected) = self
                 .growth_retry
                 .as_mut()
@@ -3733,7 +3741,48 @@ mod tests {
     }
 
     #[test]
-    fn growth_monitor_034_keeps_small_rises_and_releases_completed_samples() {
+    fn rising_below_brake_threshold_keeps_the_owned_growth_unsettled() {
+        for (next_rtt, withdrawn) in [(86.0, true), (84.1, false), (83.0, false)] {
+            let (mut controller, sample) = first_monitored_reply_034(83.3);
+            let grown = controller.rate_bps;
+            let count = controller.rate_changes_total;
+            let sample = monitor_reply_034(&mut controller, &sample, 900_000, 84.1, 800_000);
+            controller.observe(&sample);
+            assert_eq!(controller.rate_bps, grown);
+            assert_eq!(controller.rate_changes_total, count);
+            let monitor = controller
+                .growth_monitor
+                .as_ref()
+                .expect("rising below the brake threshold is not permission for another increase");
+            assert_eq!(monitor.armed_us, 600_000);
+            assert_eq!(monitor.previous_bps, 307_200);
+            assert_eq!(monitor.first_reply.as_ref().unwrap().rtt_ms, 84.1);
+            assert!(monitor.second_reply.is_none());
+            assert_eq!(monitor.successful_request_us, [Some(800_000), None]);
+            assert!(!monitor.live_at(600_000 + FRESH_US + 1));
+            controller.observe(&sample);
+            assert_eq!(controller.rate_changes_total, count);
+            assert!(controller.growth_monitor.is_some());
+            assert!(controller.decision(900_000).probe_due);
+            controller.probe_admitted(900_000);
+            let sample = monitor_reply_034(&mut controller, &sample, 1_000_000, next_rtt, 900_000);
+            controller.observe(&sample);
+            let settled = controller.last_control.growth_monitor.as_ref().unwrap();
+            assert_eq!(settled.withdrawn, withdrawn);
+            if withdrawn {
+                assert_eq!(controller.rate_bps, 307_200);
+                assert!(matches!(
+                    controller.rate_changes.back().unwrap().reason,
+                    RateReason::GrowthWithdrawalBrake
+                ));
+            } else {
+                assert!(controller.rate_bps >= grown);
+            }
+        }
+    }
+
+    #[test]
+    fn growth_monitor_034_keeps_small_rises_without_granting_unsettled_growth() {
         for (first, second) in [(80.2, 84.9), (85.5, 85.75), (86.0, 85.5)] {
             let (mut controller, sample) = first_monitored_reply_034(first);
             let count = controller.rate_changes_total;
@@ -3744,9 +3793,10 @@ mod tests {
             let evidence = controller.last_control.growth_monitor.as_ref().unwrap();
             assert!(evidence.second_reply.is_some());
             assert!(!evidence.withdrawn);
-            assert!(controller.growth_monitor.is_none());
+            let pending = first == 80.2;
+            assert_eq!(controller.growth_monitor.is_some(), pending);
             controller.observe(&sample);
-            assert!(controller.last_control.growth_monitor.is_none());
+            assert_eq!(controller.last_control.growth_monitor.is_some(), pending);
         }
     }
 
