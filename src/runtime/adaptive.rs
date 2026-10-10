@@ -14,6 +14,7 @@ const START_BPS: u64 = 256_000;
 const MIN_BPS: u64 = 64_000;
 const LOSS_WINDOW_US: u64 = 4_000_000;
 const LOSS_BATCHES: usize = 8;
+const WEIGHT_EVIDENCE_SYMBOLS: u64 = 16;
 
 #[derive(Default)]
 struct LossEvidence {
@@ -100,6 +101,71 @@ impl LossEvidence {
     }
 }
 
+#[derive(Clone, Copy)]
+struct WeightLoss {
+    rate: f64,
+    report: u64,
+    observed_us: u64,
+    age_us: u64,
+}
+
+#[derive(Clone, Copy)]
+struct WeightBatch {
+    expected: u64,
+    lost: u64,
+    observed_us: u64,
+    age_us: u64,
+}
+
+#[derive(Default)]
+struct WeightWindow {
+    batches: VecDeque<WeightBatch>,
+    expected: u64,
+    lost: u64,
+}
+
+impl WeightWindow {
+    fn observe(&mut self, now_us: u64, age_us: u64, expected: u64, lost: u64) {
+        if self.batches.back().is_some_and(|batch| {
+            batch
+                .age_us
+                .saturating_add(now_us.saturating_sub(batch.observed_us))
+                > FRESH_US
+        }) {
+            self.batches.clear();
+            self.expected = 0;
+            self.lost = 0;
+        }
+        self.batches.push_back(WeightBatch {
+            expected,
+            lost,
+            observed_us: now_us,
+            age_us,
+        });
+        // These are disjoint valid cumulative deltas in one generation, so
+        // their sum cannot exceed the latest u64 cumulative prefix.
+        self.expected += expected;
+        self.lost += lost;
+        // Keep whole report batches; never guess which symbols in a batch lost.
+        // Nonempty deltas leave at most 16 batches in this shortest suffix.
+        while let Some(batch) = self.batches.front().copied()
+            && self.expected - batch.expected >= WEIGHT_EVIDENCE_SYMBOLS
+        {
+            self.batches.pop_front();
+            self.expected -= batch.expected;
+            self.lost -= batch.lost;
+        }
+    }
+
+    fn effective_rate(&self, raw: f64) -> f64 {
+        if self.expected >= WEIGHT_EVIDENCE_SYMBOLS {
+            raw.max(self.lost as f64 / self.expected as f64)
+        } else {
+            raw
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Health {
@@ -114,6 +180,13 @@ pub struct Decision {
     pub pacing_bps: u64,
     pub eligible: bool,
     pub weight: i32,
+    pub weight_loss_rate: Option<f64>,
+    pub weight_loss_age_us: Option<u64>,
+    pub weight_loss_report: Option<u64>,
+    pub weight_loss_effective_rate: Option<f64>,
+    pub weight_loss_window_expected: Option<u64>,
+    pub weight_loss_window_lost: Option<u64>,
+    pub weight_loss_window_oldest_age_us: Option<u64>,
     pub state: Health,
     pub queue_delay_ms: f64,
     pub probe_due: bool,
@@ -231,7 +304,7 @@ pub struct Observation {
     /// controller observations. They are distinct from current delivery bytes.
     pub finalized_expected: Option<u64>,
     pub finalized_lost: Option<u64>,
-    /// Diagnostic EWMA. Control uses bounded finalized-count evidence below.
+    /// Quality-share EWMA. Pacing brakes use bounded finalized-count evidence.
     pub loss_rate: f64,
     pub loss_sample_rate: Option<f64>,
     pub rtt_ms: f64,
@@ -288,6 +361,8 @@ pub struct PathController {
     /// application-limited sample never decreases this exploration reference.
     remembered_bps: f64,
     congestion_seen: bool,
+    weight_loss: Option<WeightLoss>,
+    weight_window: WeightWindow,
     loss_evidence: LossEvidence,
     loss_pressure: bool,
     pressure_episode_exercised: Option<bool>,
@@ -340,6 +415,8 @@ impl PathController {
             drain_restore_pending: false,
             remembered_bps: 0.0,
             congestion_seen: false,
+            weight_loss: None,
+            weight_window: WeightWindow::default(),
             loss_evidence: LossEvidence::default(),
             loss_pressure: false,
             pressure_episode_exercised: None,
@@ -435,6 +512,28 @@ impl PathController {
             self.last_report = Some((observation.report_number, observation.delivered_bytes, now));
         }
         let loss_batch = self.loss_evidence.observe(observation, new_report);
+        if let Some((expected, lost)) = loss_batch
+            && let Some(cumulative_expected) = observation.finalized_expected
+            && observation.finalized_lost.is_some()
+            && observation.loss_rate.is_finite()
+            && (0.0..=1.0).contains(&observation.loss_rate)
+            && let Some(age_us) = observation.feedback_age_us.filter(|age| *age <= FRESH_US)
+        {
+            // Collect real symbols before maturity, with a separate age even
+            // while no raw sample qualifies. Legacy interval inputs cannot enter.
+            self.weight_window.observe(now, age_us, expected, lost);
+            // Sparse traffic can qualify over its cumulative finalized history
+            // without exercising a pacing budget. Only a new nonempty loss
+            // interval refreshes quality; probes and byte progress cannot.
+            if cumulative_expected >= WEIGHT_EVIDENCE_SYMBOLS {
+                self.weight_loss = Some(WeightLoss {
+                    rate: observation.loss_rate,
+                    report: observation.report_number,
+                    observed_us: now,
+                    age_us,
+                });
+            }
+        }
         let ordinary_loss = self.loss_evidence.ordinary();
 
         let local_rtt = (observation.rtt_ms.is_finite() && observation.rtt_ms > 0.0)
@@ -863,15 +962,40 @@ impl PathController {
             && self
                 .last_evidence_us
                 .is_none_or(|time| now_us.saturating_sub(time) > FRESH_US);
+        let weight_loss = self.weight_loss.and_then(|sample| {
+            let age = sample
+                .age_us
+                .saturating_add(now_us.saturating_sub(sample.observed_us));
+            (age <= FRESH_US).then_some((sample, age))
+        });
+        let effective_loss =
+            weight_loss.map(|(sample, _)| self.weight_window.effective_rate(sample.rate));
+        let reliability = effective_loss.map_or(1.0, |loss| (1.0 - loss).powi(4).clamp(0.25, 1.0));
+        let base_weight = ((self.rate_bps as f64 / 64_000.0)
+            / (1.0
+                + self.min_rtt_ms.unwrap_or(50.0) / 50.0
+                + self.queue_delay_ms / self.target_ms))
+            .round()
+            .clamp(1.0, 128.0);
         Decision {
             pacing_bps: self.rate_bps,
             eligible: self.eligible && !stale,
-            weight: ((self.rate_bps as f64 / 64_000.0)
-                / (1.0
-                    + self.min_rtt_ms.unwrap_or(50.0) / 50.0
-                    + self.queue_delay_ms / self.target_ms))
+            weight: (base_weight * 16.0 * reliability)
                 .round()
-                .clamp(1.0, 128.0) as i32,
+                .clamp(4.0, 2048.0) as i32,
+            weight_loss_rate: weight_loss.map(|(sample, _)| sample.rate),
+            weight_loss_age_us: weight_loss.map(|(_, age)| age),
+            weight_loss_report: weight_loss.map(|(sample, _)| sample.report),
+            weight_loss_effective_rate: effective_loss,
+            weight_loss_window_expected: weight_loss.map(|_| self.weight_window.expected),
+            weight_loss_window_lost: weight_loss.map(|_| self.weight_window.lost),
+            weight_loss_window_oldest_age_us: weight_loss.and_then(|_| {
+                self.weight_window.batches.front().map(|batch| {
+                    batch
+                        .age_us
+                        .saturating_add(now_us.saturating_sub(batch.observed_us))
+                })
+            }),
             state: if stale { Health::Probing } else { self.health },
             queue_delay_ms: self.queue_delay_ms,
             probe_due: self
@@ -1045,6 +1169,404 @@ mod tests {
             }
         }
         admitted
+    }
+
+    fn weight_observation_016(
+        now: u64,
+        report: u64,
+        expected: u64,
+        lost: u64,
+        loss_ewma: f64,
+        rtt: f64,
+    ) -> Observation {
+        let mut sample = observation(now, rtt);
+        sample.report_number = report;
+        sample.finalized_expected = Some(expected);
+        sample.finalized_lost = Some(lost);
+        sample.loss_rate = loss_ewma;
+        sample.offered_backlog = false;
+        sample
+    }
+
+    #[test]
+    fn weight_016_sparse_finalized_quality_changes_share_without_pacing_collapse() {
+        let mut controller = PathController::new(8_000_000, 20);
+        controller.observe(&weight_observation_016(0, 1, 32, 0, 0.0, 150.0));
+        let clean = controller.decision(0);
+        let mut sparse = weight_observation_016(5_000_000, 2, 36, 1, 0.25, 150.0);
+        sparse.offered_backlog = true;
+        controller.observe(&sparse);
+        let impaired = controller.decision(sparse.now_us);
+        assert_eq!(impaired.loss_evidence_expected, 4);
+        assert_eq!(impaired.loss_evidence_lost, 1);
+        assert!(impaired.weight < clean.weight);
+        assert!(impaired.weight >= clean.weight / 4);
+        assert_eq!(impaired.pacing_bps, clean.pacing_bps);
+        assert_eq!(impaired.pacing_bps, START_BPS);
+        assert!(impaired.eligible);
+        assert!(!impaired.loss_pressure);
+        assert!(!impaired.cautious);
+        assert_eq!(impaired.queue_delay_ms, 0.0);
+        assert_eq!(impaired.weight_loss_rate, Some(0.25));
+        assert_eq!(impaired.weight_loss_report, Some(2));
+        assert_eq!(impaired.weight_loss_age_us, Some(0));
+    }
+
+    #[test]
+    fn weight_016_uses_original_evidence_age_even_in_a_younger_sender_epoch() {
+        let mut controller = PathController::new(8_000_000, 20);
+        controller.observe(&weight_observation_016(0, 1, 0, 0, 0.0, 150.0));
+        let neutral = controller.decision(0).weight;
+        let mut report = weight_observation_016(100_000, 2, 16, 4, 0.25, 150.0);
+        report.feedback_age_us = Some(2_900_000);
+        controller.observe(&report);
+        let used = controller.decision(100_000);
+        assert!(used.weight < neutral);
+        assert_eq!(used.weight_loss_age_us, Some(2_900_000));
+        // Reusing the report with a younger claimed age cannot refresh it.
+        report.now_us = 150_000;
+        report.feedback_age_us = Some(0);
+        controller.observe(&report);
+        assert_eq!(
+            controller.decision(150_000).weight_loss_age_us,
+            Some(2_950_000)
+        );
+        assert_eq!(
+            controller.decision(200_000).weight_loss_age_us,
+            Some(FRESH_US)
+        );
+        let expired = controller.decision(200_001);
+        assert_eq!(expired.weight, neutral);
+        assert_eq!(expired.weight_loss_rate, None);
+        assert_eq!(expired.weight_loss_report, None);
+        assert_eq!(expired.weight_loss_age_us, None);
+        assert_eq!(expired.weight_loss_effective_rate, None);
+        assert_eq!(expired.weight_loss_window_expected, None);
+        assert_eq!(expired.weight_loss_window_lost, None);
+        assert_eq!(expired.weight_loss_window_oldest_age_us, None);
+    }
+
+    #[test]
+    fn weight_016_only_valid_nonempty_finalized_intervals_refresh_quality() {
+        for condition in [
+            "duplicate",
+            "reordered",
+            "empty",
+            "byte_only",
+            "probe_only",
+            "stale",
+            "nan",
+            "negative",
+            "above_one",
+            "regressed",
+            "lost_above_expected",
+            "lost_delta_above_expected",
+            "missing_expected",
+            "missing_lost",
+            "legacy",
+        ] {
+            let mut controller = PathController::new(8_000_000, 20);
+            controller.observe(&weight_observation_016(0, 1, 0, 0, 0.0, 150.0));
+            controller.observe(&weight_observation_016(100_000, 2, 16, 4, 0.25, 150.0));
+            let mut report = weight_observation_016(1_000_000, 3, 20, 5, 0.0, 150.0);
+            match condition {
+                "duplicate" => report.report_number = 2,
+                "reordered" => report.report_number = 1,
+                "empty" | "byte_only" => {
+                    report.finalized_expected = Some(16);
+                    report.finalized_lost = Some(4);
+                    report.feedback_sample_symbols = 0;
+                    if condition == "byte_only" {
+                        report.delivered_bytes = 100_000;
+                    }
+                }
+                "probe_only" => {
+                    report.feedback_age_us = None;
+                    report.positive_delivery_age_us = None;
+                }
+                "stale" => report.feedback_age_us = Some(FRESH_US + 1),
+                "nan" => report.loss_rate = f64::NAN,
+                "negative" => report.loss_rate = -0.1,
+                "above_one" => report.loss_rate = 1.1,
+                "regressed" => report.finalized_expected = Some(15),
+                "lost_above_expected" => report.finalized_lost = Some(21),
+                "lost_delta_above_expected" => {
+                    report.finalized_expected = Some(17);
+                    report.finalized_lost = Some(6);
+                }
+                "missing_expected" => report.finalized_expected = None,
+                "missing_lost" => report.finalized_lost = None,
+                "legacy" => {
+                    report.finalized_expected = None;
+                    report.finalized_lost = None;
+                    report.feedback_sample_symbols = 32;
+                    report.loss_sample_rate = Some(0.0);
+                }
+                _ => unreachable!(),
+            }
+            controller.observe(&report);
+            let decision = controller.decision(report.now_us);
+            assert_eq!(decision.weight_loss_report, Some(2), "{condition}");
+            assert_eq!(decision.weight_loss_rate, Some(0.25), "{condition}");
+            assert_eq!(decision.weight_loss_age_us, Some(900_000), "{condition}");
+            assert_eq!(
+                decision.weight_loss_effective_rate,
+                Some(0.25),
+                "{condition}"
+            );
+            assert_eq!(
+                decision.weight_loss_window_expected,
+                Some(16),
+                "{condition}"
+            );
+            assert_eq!(decision.weight_loss_window_lost, Some(4), "{condition}");
+            assert_eq!(
+                decision.weight_loss_window_oldest_age_us,
+                Some(900_000),
+                "{condition}"
+            );
+            assert_eq!(
+                controller.decision(3_100_001).weight_loss_rate,
+                None,
+                "{condition}"
+            );
+        }
+    }
+
+    #[test]
+    fn weight_016_requires_cumulative_maturity_and_resets_or_recovers_quality() {
+        for legacy in [false, true] {
+            let mut controller = PathController::new(8_000_000, 20);
+            controller.observe(&weight_observation_016(0, 1, 0, 0, 0.0, 150.0));
+            let clean = controller.decision(0).weight;
+            let mut report = weight_observation_016(100_000, 2, 15, 4, 0.25, 150.0);
+            if legacy {
+                report.finalized_expected = None;
+                report.finalized_lost = None;
+                report.feedback_sample_symbols = 32;
+                report.loss_sample_rate = Some(0.25);
+            }
+            controller.observe(&report);
+            assert_eq!(controller.decision(report.now_us).weight, clean);
+            assert_eq!(controller.decision(report.now_us).weight_loss_report, None);
+        }
+        let mut controller = PathController::new(8_000_000, 20);
+        controller.observe(&weight_observation_016(0, 1, 32, 8, 0.25, 150.0));
+        let bad = controller.decision(0).weight;
+        controller.observe(&weight_observation_016(500_000, 2, 36, 8, 0.0, 150.0));
+        let recovered = controller.decision(500_000);
+        assert!(recovered.weight > bad);
+        assert_eq!(recovered.weight_loss_rate, Some(0.0));
+        assert_eq!(recovered.weight_loss_report, Some(2));
+        let mut next = weight_observation_016(600_000, 0, 0, 0, 0.0, 150.0);
+        next.generation += 1;
+        controller.observe(&next);
+        let reset = controller.decision(next.now_us);
+        assert_eq!(reset.weight_loss_report, None);
+        assert_eq!(reset.weight_loss_effective_rate, None);
+        assert_eq!(reset.weight_loss_window_expected, None);
+        assert_eq!(reset.weight_loss_window_lost, None);
+        assert_eq!(reset.weight_loss_window_oldest_age_us, None);
+        // A new generation is neutral; four clean symbols in the old generation
+        // did not yet replace the impaired whole report batch.
+        assert_eq!(reset.weight, 16);
+        assert!(reset.weight > recovered.weight);
+        assert_eq!(reset.pacing_bps, START_BPS);
+        let mut worst = weight_observation_016(700_000, 1, 32, 32, 1.0, 150.0);
+        worst.generation = next.generation;
+        controller.observe(&worst);
+        assert_eq!(controller.decision(worst.now_us).weight, reset.weight / 4);
+        assert!(controller.decision(worst.now_us).weight > 0);
+    }
+
+    #[test]
+    fn weight_017_retains_whole_batches_until_enough_clean_symbols_replace_them() {
+        let mut controller = PathController::new(8_000_000, 20);
+        controller.observe(&weight_observation_016(0, 1, 0, 0, 0.0, 150.0));
+        let neutral = controller.decision(0).weight;
+        controller.observe(&weight_observation_016(100_000, 2, 32, 8, 0.25, 150.0));
+        for clean_batches in 1..=4 {
+            let now = 100_000 + clean_batches * 1_100_000;
+            controller.observe(&weight_observation_016(
+                now,
+                2 + clean_batches,
+                32 + clean_batches * 4,
+                8,
+                0.0,
+                150.0,
+            ));
+            let decision = controller.decision(now);
+            assert_eq!(decision.weight_loss_rate, Some(0.0));
+            assert_eq!(decision.weight_loss_age_us, Some(0));
+            assert_eq!(decision.pacing_bps, START_BPS);
+            if clean_batches < 4 {
+                let expected = 32 + clean_batches * 4;
+                assert_eq!(decision.weight_loss_window_expected, Some(expected));
+                assert_eq!(decision.weight_loss_window_lost, Some(8));
+                assert_eq!(
+                    decision.weight_loss_effective_rate,
+                    Some(8.0 / expected as f64)
+                );
+                assert_eq!(
+                    decision.weight_loss_window_oldest_age_us,
+                    Some(clean_batches * 1_100_000)
+                );
+                assert!(decision.weight < neutral);
+            } else {
+                assert_eq!(decision.weight_loss_window_expected, Some(16));
+                assert_eq!(decision.weight_loss_window_lost, Some(0));
+                assert_eq!(decision.weight_loss_effective_rate, Some(0.0));
+                assert_eq!(decision.weight, neutral);
+                assert_eq!(decision.weight_loss_window_oldest_age_us, Some(3_300_000));
+            }
+        }
+    }
+
+    #[test]
+    fn weight_017_collects_pre_maturity_symbols_with_bounded_history_and_fast_deterioration() {
+        let mut controller = PathController::new(8_000_000, 20);
+        controller.observe(&weight_observation_016(0, 1, 0, 0, 0.0, 150.0));
+        let neutral = controller.decision(0).weight;
+        for expected in 1..=64 {
+            let now = expected * 100_000;
+            controller.observe(&weight_observation_016(
+                now,
+                expected + 1,
+                expected,
+                1,
+                0.0,
+                150.0,
+            ));
+            let decision = controller.decision(now);
+            assert!(controller.weight_window.batches.len() <= 16);
+            if expected < 16 {
+                assert_eq!(decision.weight_loss_rate, None);
+                assert_eq!(decision.weight_loss_effective_rate, None);
+                assert_eq!(decision.weight_loss_window_expected, None);
+                assert_eq!(decision.weight, neutral);
+            } else {
+                assert_eq!(decision.weight_loss_window_expected, Some(16));
+                assert_eq!(
+                    decision.weight_loss_window_lost,
+                    Some(u64::from(expected == 16))
+                );
+                if expected == 16 {
+                    assert_eq!(decision.weight_loss_rate, Some(0.0));
+                    assert_eq!(decision.weight_loss_effective_rate, Some(1.0 / 16.0));
+                    assert!(decision.weight < neutral);
+                } else {
+                    assert_eq!(decision.weight_loss_effective_rate, Some(0.0));
+                    assert_eq!(decision.weight, neutral);
+                }
+            }
+            assert_eq!(decision.pacing_bps, START_BPS);
+        }
+        controller.observe(&weight_observation_016(6_500_000, 66, 65, 2, 1.0, 150.0));
+        let worse = controller.decision(6_500_000);
+        assert_eq!(worse.weight_loss_window_expected, Some(16));
+        assert_eq!(worse.weight_loss_window_lost, Some(1));
+        assert_eq!(worse.weight_loss_effective_rate, Some(1.0));
+        assert_eq!(worse.weight, neutral / 4);
+        assert_eq!(worse.pacing_bps, START_BPS);
+    }
+
+    #[test]
+    fn weight_017_expires_pre_maturity_history_by_original_age_before_accepting_a_new_batch() {
+        let mut controller = PathController::new(8_000_000, 20);
+        controller.observe(&weight_observation_016(0, 1, 0, 0, 0.0, 150.0));
+        let neutral = controller.decision(0).weight;
+        let mut early = weight_observation_016(100_000, 2, 15, 7, 7.0 / 15.0, 150.0);
+        early.feedback_age_us = Some(2_900_000);
+        controller.observe(&early);
+        assert_eq!(controller.decision(100_000).weight_loss_rate, None);
+        assert_eq!(controller.weight_window.expected, 15);
+        early.now_us = 150_000;
+        early.feedback_age_us = Some(0);
+        controller.observe(&early);
+        controller.observe(&weight_observation_016(200_001, 3, 16, 7, 0.0, 150.0));
+        let fresh = controller.decision(200_001);
+        assert_eq!(fresh.weight_loss_report, Some(3));
+        assert_eq!(fresh.weight_loss_window_expected, Some(1));
+        assert_eq!(fresh.weight_loss_window_lost, Some(0));
+        assert_eq!(fresh.weight_loss_window_oldest_age_us, Some(0));
+        assert_eq!(fresh.weight_loss_effective_rate, Some(0.0));
+        assert_eq!(fresh.weight, neutral);
+
+        let expired = controller.decision(3_200_002);
+        assert_eq!(expired.weight_loss_rate, None);
+        assert_eq!(expired.weight_loss_effective_rate, None);
+        assert_eq!(expired.weight_loss_window_expected, None);
+        controller.observe(&weight_observation_016(3_200_003, 4, 32, 15, 0.0, 150.0));
+        let resumed = controller.decision(3_200_003);
+        assert_eq!(resumed.weight_loss_window_expected, Some(16));
+        assert_eq!(resumed.weight_loss_window_lost, Some(8));
+        assert_eq!(resumed.weight_loss_window_oldest_age_us, Some(0));
+        assert_eq!(resumed.weight_loss_effective_rate, Some(0.5));
+        assert_eq!(resumed.weight, neutral / 4);
+        assert_eq!(resumed.pacing_bps, START_BPS);
+    }
+
+    #[test]
+    fn weight_016_sparse_multipath_schedule_reduces_and_restores_damaged_share() {
+        use crate::runtime::scheduler::Scheduler;
+        fn choose(scheduler: &mut Scheduler, weights: &[(u8, i32)]) -> [usize; 4] {
+            let mut counts = [0; 4];
+            for _ in 0..700 {
+                let accepted = scheduler.order(weights, 128)[0];
+                scheduler.commit(weights, accepted, 128);
+                counts[usize::from(accepted)] += 1;
+            }
+            assert_eq!(counts.iter().sum::<usize>(), 700);
+            counts
+        }
+        let mut paths: [PathController; 4] = std::array::from_fn(|id| {
+            let mut path = PathController::new(8_000_000, 20);
+            let rtt = if id == 1 { 150.0 } else { 50.0 };
+            path.observe(&weight_observation_016(0, 1, 32, 0, 0.0, rtt));
+            path
+        });
+        let weights = |paths: &[PathController; 4], now| {
+            paths
+                .iter()
+                .enumerate()
+                .map(|(id, p)| (id as u8, p.decision(now).weight))
+                .collect::<Vec<_>>()
+        };
+        let mut scheduler = Scheduler::default();
+        let initial_weights = weights(&paths, 0);
+        let initial = choose(&mut scheduler, &initial_weights);
+        for (id, path) in paths.iter_mut().enumerate() {
+            path.observe(&weight_observation_016(
+                5_000_000,
+                2,
+                36,
+                u64::from(id == 1),
+                if id == 1 { 0.25 } else { 0.0 },
+                if id == 1 { 150.0 } else { 50.0 },
+            ));
+            assert_eq!(path.decision(5_000_000).pacing_bps, START_BPS);
+            assert!(path.decision(5_000_000).eligible);
+        }
+        let impaired = choose(&mut scheduler, &weights(&paths, 5_000_000));
+        assert!(impaired[1] > 0);
+        assert!(impaired[1] < initial[1] / 2);
+        for (id, path) in paths.iter_mut().enumerate() {
+            path.observe(&weight_observation_016(
+                5_500_000,
+                3,
+                40,
+                u64::from(id == 1),
+                0.0,
+                if id == 1 { 150.0 } else { 50.0 },
+            ));
+        }
+        let restored_weights = weights(&paths, 5_500_000);
+        assert_eq!(restored_weights, initial_weights);
+        let restored = choose(&mut scheduler, &restored_weights);
+        assert!(restored[1].abs_diff(initial[1]) <= 1);
+        eprintln!(
+            "016 sparse fixed-quality selection populations: initial={initial:?}, impaired={impaired:?}, restored={restored:?}; 700 requests each"
+        );
     }
 
     fn rtt_evidence_observation(

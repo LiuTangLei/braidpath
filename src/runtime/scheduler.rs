@@ -31,7 +31,9 @@ impl Scheduler {
         if !candidates.iter().any(|(id, _)| *id == actual) {
             return;
         }
-        const LIMIT: i64 = 1 << 28;
+        // Adaptive weights use sixteen units per former unit. Preserve the
+        // same service-debt bound in those units, including max-size symbols.
+        const LIMIT: i64 = 1 << 32;
         let bytes = bytes.min(65_536) as i64;
         let sum: i64 = candidates.iter().map(|(_, w)| i64::from((*w).max(1))).sum();
         for &(id, weight) in candidates {
@@ -218,5 +220,49 @@ mod tests {
             bytes[path as usize] += size as i64;
         }
         assert!((bytes[0] - bytes[1]).abs() <= 1000);
+    }
+
+    #[test]
+    fn adaptive_016_scaled_clean_order_and_maximum_packet_debts_are_equivalent() {
+        let mut ordinary = Scheduler::default();
+        let mut scaled = Scheduler::default();
+        let mut exceeded_old_numerical_bound = false;
+        let mut ordinary_bytes = [0u64; MAX_PATHS];
+        let mut scaled_bytes = [0u64; MAX_PATHS];
+        for round in 0..2048 {
+            let candidates: Vec<_> = (0..MAX_PATHS)
+                .map(|id| {
+                    (
+                        id as u8,
+                        if round < 1024 {
+                            128
+                        } else {
+                            (id as i32 + 1) * 16
+                        },
+                    )
+                })
+                .collect();
+            let scaled_candidates: Vec<_> =
+                candidates.iter().map(|&(id, w)| (id, w * 16)).collect();
+            let bytes = [65_536, 1200, 64, 65_536][round % 4];
+            let order = ordinary.order(&candidates, bytes);
+            assert_eq!(scaled.order(&scaled_candidates, bytes), order);
+            let accepted = order[0];
+            ordinary.commit(&candidates, accepted, bytes);
+            scaled.commit(&scaled_candidates, accepted, bytes);
+            ordinary_bytes[usize::from(accepted)] += bytes as u64;
+            scaled_bytes[usize::from(accepted)] += bytes as u64;
+            for id in 0..MAX_PATHS {
+                // The reference remains below the former bound, so it also
+                // represents the original scheduler for this complete run.
+                assert!(ordinary.debt[id].abs() <= 1 << 28);
+                assert_eq!(scaled.debt[id], ordinary.debt[id] * 16);
+                assert!(scaled.debt[id].abs() <= 1 << 32);
+                exceeded_old_numerical_bound |= scaled.debt[id].abs() > 1 << 28;
+            }
+        }
+        assert!(exceeded_old_numerical_bound);
+        assert_eq!(scaled_bytes, ordinary_bytes);
+        assert!(scaled_bytes.iter().all(|bytes| *bytes > 0));
     }
 }
