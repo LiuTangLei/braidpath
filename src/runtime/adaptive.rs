@@ -346,6 +346,9 @@ pub struct ControlSample {
     pub service_sample_span_us: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub service_admission: Option<ServiceAdmission>,
+    /// Actual one-use restoration from the latest qualified post-brake service.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub drain_service_target_bps: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub startup_probe_excess_ms: Option<f64>,
     pub ordinary_loss_pressure: bool,
@@ -573,6 +576,7 @@ impl PathController {
             self.last_growth_us = now;
             self.token_us = now;
         }
+        let rate_before_refill = self.rate_bps;
         self.refill(now);
         let observation_contiguous = now
             .checked_sub(self.last_control.at_us)
@@ -986,6 +990,7 @@ impl PathController {
             service_symbol_delivery_bps: service_sample.map(|sample| sample.bps),
             service_sample_span_us: service_sample.map(|sample| sample.span_us),
             service_admission: None,
+            drain_service_target_bps: None,
             startup_probe_excess_ms: startup_probe_excess,
             ordinary_loss_pressure: self.loss_pressure,
             fast_loss,
@@ -1334,7 +1339,47 @@ impl PathController {
                 // RTT observations are more frequent than control ticks. Keep
                 // the drainage transition pending so an intervening clear RTT
                 // cannot erase restoration before the next control tick.
-                if let Some(drain) = recent_drain
+                let measured_restore = service_sample.and_then(|sample| {
+                    let braked_at = self.last_brake_us?;
+                    let admission = sample.admission?;
+                    let sent_us = now
+                        .checked_sub(observation.probe_age_us?)?
+                        .checked_sub((probe_rtt? * 1000.0).ceil() as u64)?;
+                    // These are two independent-clock intervals. The local
+                    // admission interval must follow every pace change; its
+                    // excess receiver delivery then corroborates old drainage.
+                    (self.fast_feedback_seen
+                        && positive_young
+                        && growth_probe_ready
+                        && sent_us > self.last_growth_us
+                        && sent_us > braked_at
+                        && self.rate_bps == rate_before_refill
+                        && self.rate_bps == previous_rate
+                        && now
+                            .checked_sub(sample.observed_us)
+                            .is_some_and(|age| age <= CONTROL_US)
+                        && sample.span_us >= PROBE_US
+                        && admission.span_us >= PROBE_US
+                        && admission.symbols >= 8
+                        && admission.bps > 0.0
+                        && admission.started_us >= braked_at
+                        && admission.started_us >= last_pace_change
+                        && self
+                            .backlog_since_us
+                            .is_some_and(|since| since <= admission.started_us)
+                        && sample.bps > admission.bps * 1.1)
+                        .then(|| {
+                            (sample.bps * self.wire_per_symbol * 0.9).min(self.maximum_bps as f64)
+                                as u64
+                        })
+                });
+                if let Some(restored) = measured_restore.filter(|target| *target > self.rate_bps) {
+                    self.rate_bps = restored;
+                    rate_reason = RateReason::KnownServiceRecovery;
+                    self.last_growth_us = now;
+                    self.drain_restore_pending = false;
+                    self.last_control.drain_service_target_bps = Some(restored);
+                } else if let Some(drain) = recent_drain
                     && growth_probe_ready
                 {
                     let ceiling = if self.fast_feedback_seen {
@@ -1541,11 +1586,7 @@ impl PathController {
             || self.queue_delay_ms > self.target_ms * 0.25
             || self.last_control.transport_blocked
             || self.reprobe.active()
-            || self.drain_restore_pending
-            || self.in_known_service_range()
-            // A necessary service-discovery condition keeps probes fast;
-            // it does not replace the actual delivery or growth gates.
-            || self.discovery_service_window(now_us).is_some();
+            || self.drain_restore_pending;
         let phase_repair = active
             && self.congestion_seen
             && now_us >= self.last_control.at_us
@@ -1844,7 +1885,15 @@ mod tests {
                 _ => unreachable!(),
             }
             assert!(!controller.decision(399_999).probe_due, "{opportunity}");
-            assert!(controller.decision(400_000).probe_due, "{opportunity}");
+            assert_eq!(
+                controller.decision(400_000).probe_due,
+                opportunity != "known",
+                "{opportunity}"
+            );
+            if opportunity == "known" {
+                assert!(!controller.decision(499_999).probe_due);
+                assert!(controller.decision(500_000).probe_due);
+            }
         }
 
         let (mut controller, _) = cautious_probe_028();
@@ -1863,7 +1912,9 @@ mod tests {
         controller.last_control.probe_age_us = Some(20_000);
         controller.probe_admitted(400_000);
         assert!(controller.discovery_service_window(500_000).is_some());
-        assert!(controller.decision(500_000).probe_due);
+        assert!(!controller.decision(500_000).probe_due);
+        assert!(!controller.decision(599_999).probe_due);
+        assert!(controller.decision(600_000).probe_due);
 
         let (mut controller, started, _) = granted_reprobe();
         assert!(controller.reprobe.active());
@@ -2002,6 +2053,391 @@ mod tests {
         assert!(controller.last_probe_us.is_none());
         assert!(controller.last_growth_probe.is_none());
         assert!(controller.decision(600_000).probe_due);
+    }
+
+    // One admitted-byte sequence supplies all restoration tests. A receiver
+    // initially withholds every tenth symbol, then drains those real bytes
+    // after a severe probe has actually reduced the established allowance.
+    fn draining_service_029(start_us: u64, start_bps: u64) -> (PathController, Observation) {
+        let mut controller = PathController::new(start_bps * 4, 20);
+        let mut quality = crate::runtime::quality::State::new(7);
+        let mut sample = short_observation_022(start_us, 80.0);
+        sample.report_number = 1;
+        sample.probe_sample_id = 1;
+        sample.delivered_bytes = 0;
+        sample.delivered_bps = Some(0.0);
+        sample.admitted_symbol_bytes = Some(0);
+        controller.observe(&sample);
+        controller.rate_bps = start_bps;
+        controller.tokens = 0.0;
+        controller.last_growth_probe = Some(1);
+        let mut received = 0;
+        let mut extra_drain = 0;
+        for step in 1..=16 {
+            let now = start_us + step * 100_000;
+            if step == 16 {
+                controller.probe_admitted(now - 100_000);
+            }
+            let before = quality.snapshot.sent_bytes;
+            for at in (now - 100_000..now).step_by(1000) {
+                while controller.allow(at, 500, 0.0) {
+                    controller.admitted_symbol(at, 500, 500);
+                    quality.admitted(500);
+                }
+            }
+            let admitted = quality.snapshot.sent_bytes - before;
+            let previous_received = received;
+            received = if step <= 5 {
+                (quality.snapshot.sent_symbols - quality.snapshot.sent_symbols / 10) * 500
+            } else if step == 6 {
+                received + admitted / 5 / 500 * 500
+            } else if (11..=15).contains(&step) {
+                received + admitted + extra_drain
+            } else {
+                received + admitted
+            };
+            assert!(received <= quality.snapshot.sent_bytes);
+            if step == 6 {
+                extra_drain = (quality.snapshot.sent_bytes - received) / 6 / 500 * 500;
+            }
+            sample = short_observation_022(now, if step < 6 || step == 16 { 80.0 } else { 280.0 });
+            sample.report_number = step + 1;
+            sample.rtt_ms = 0.0;
+            sample.probe_sample_id = if step < 6 {
+                1
+            } else if step == 16 {
+                3
+            } else {
+                2
+            };
+            sample.probe_age_us = Some(if step < 6 {
+                now - start_us
+            } else if step == 16 {
+                20_000
+            } else {
+                now - start_us - 600_000
+            });
+            sample.delivered_bytes = received;
+            sample.delivered_bps = Some((received - previous_received) as f64 * 80.0);
+            sample.admitted_symbols = Some(quality.snapshot.sent_symbols);
+            sample.admitted_symbol_bytes = Some(quality.snapshot.sent_bytes);
+            if step == 16 {
+                let latest = controller.service_window.latest(now).unwrap();
+                let admitted = latest.admission.unwrap();
+                assert_eq!(latest.observed_us, start_us + 1_500_000);
+                assert_eq!(admitted.started_us, start_us + 1_000_000);
+                assert!(admitted.symbols >= 8);
+                assert!(latest.bps > admitted.bps * 1.1);
+                assert!(controller.drain_restore_pending);
+                return (controller, sample);
+            }
+            controller.observe(&sample);
+            if step >= 6 {
+                assert_eq!(controller.last_brake_us, Some(start_us + 600_000));
+                assert!(controller.congestion_seen);
+            }
+            if step == 6 {
+                assert!(controller.rate_bps < start_bps);
+                assert!(matches!(
+                    controller.rate_changes.back().unwrap().reason,
+                    RateReason::QueueBrake
+                ));
+            }
+        }
+        unreachable!()
+    }
+
+    #[test]
+    fn probe_cadence_029_recovery_keeps_phase_and_control_cadence() {
+        let (mut controller, sample) = cautious_probe_028();
+        controller.probe_admitted(400_000);
+        let mut next = admitted_report_026(&mut controller, &sample, 500_000, u64::MAX);
+        next.probe_age_us = Some(20_000);
+        controller.observe(&next);
+        assert!(controller.discovery_service_window(500_000).is_some());
+        controller.remembered_bps = controller.rate_bps as f64 * 2.0;
+        assert!(!controller.decision(500_000).probe_due);
+        assert!(!controller.decision(599_999).probe_due);
+        assert!(controller.decision(600_000).probe_due);
+        let before = controller.rate_bps;
+        next = admitted_report_026(&mut controller, &next, 600_000, u64::MAX);
+        controller.observe(&next);
+        assert!(controller.rate_bps > before);
+        assert_eq!(controller.last_growth_us, 600_000);
+        controller.probe_admitted(600_000);
+        assert!(!controller.decision(699_999).probe_due);
+        assert!(controller.decision(700_000).probe_due);
+        assert!(
+            controller.decision(700_000).probe_due,
+            "rejected request keeps its opportunity"
+        );
+        controller.probe_admitted(700_000);
+        for now in [800_000, 900_000, 1_199_999] {
+            assert!(
+                !controller.decision(now).probe_due,
+                "missing reply at {now}"
+            );
+        }
+        assert!(controller.decision(1_200_000).probe_due);
+    }
+
+    #[test]
+    fn drain_service_029_restores_latest_post_brake_service_once() {
+        for cap in ["latest", "maximum", "no_increase"] {
+            let (mut controller, sample) = draining_service_029(0, 1_000_000);
+            let latest = controller.service_window.latest(sample.now_us).unwrap();
+            let before = controller.rate_bps;
+            let measured = (latest.bps * controller.wire_per_symbol * 0.9) as u64;
+            assert!(measured > (before as f64 * 1.2) as u64);
+            // Neither this older high hint nor memory may replace latest D.
+            controller.draining_bps = Some((3_000_000.0, sample.now_us - 200_000));
+            controller.remembered_bps = 4_000_000.0;
+            if cap == "maximum" {
+                controller.maximum_bps = (before + measured) / 2;
+            } else if cap == "no_increase" {
+                controller.maximum_bps = before;
+            }
+            let target = measured.min(controller.maximum_bps);
+            let changes = controller.rate_changes_total;
+            controller.observe(&sample);
+            assert_eq!(controller.rate_bps, target, "{cap}");
+            assert_eq!(
+                controller.last_control.drain_service_target_bps,
+                (target > before).then_some(target),
+                "{cap}"
+            );
+            assert!(!controller.drain_restore_pending);
+            assert_eq!(
+                controller.rate_changes_total,
+                changes + u64::from(target > before)
+            );
+            if target > before {
+                assert_eq!(controller.last_growth_probe, Some(sample.probe_sample_id));
+                assert_eq!(controller.last_growth_us, sample.now_us);
+                assert!(matches!(
+                    controller.rate_changes.back().unwrap().reason,
+                    RateReason::KnownServiceRecovery
+                ));
+                assert_eq!(
+                    controller
+                        .rate_changes
+                        .back()
+                        .unwrap()
+                        .control
+                        .drain_service_target_bps,
+                    Some(target)
+                );
+            }
+            let mut repeated = sample.clone();
+            repeated.now_us += 100_000;
+            repeated.probe_age_us = Some(120_000);
+            controller.observe(&repeated);
+            assert_eq!(controller.rate_bps, target);
+            assert_eq!(controller.last_control.drain_service_target_bps, None);
+            assert!(
+                serde_json::to_value(&controller.last_control)
+                    .unwrap()
+                    .get("drain_service_target_bps")
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn drain_service_029_rejects_unqualified_service_windows() {
+        for invalid in [
+            "old",
+            "missing",
+            "regressed",
+            "sparse",
+            "local_span",
+            "receiver_span",
+            "not_draining",
+            "before_brake",
+            "pace_change",
+        ] {
+            let (mut controller, mut sample) = draining_service_029(0, 1_000_000);
+            let latest = controller.service_window.latest(sample.now_us).unwrap();
+            let admission = latest.admission.unwrap();
+            let mut observed = latest.observed_us;
+            let mut local_span = admission.span_us;
+            let mut receiver_span = latest.span_us;
+            let mut symbols = admission.symbols;
+            let mut delivered = (latest.bps * latest.span_us as f64 / 8_000_000.0).round() as u64;
+            match invalid {
+                "old" => observed = sample.now_us - CONTROL_US - 1,
+                "sparse" => symbols = 7,
+                "local_span" => local_span = PROBE_US - 1,
+                "receiver_span" => receiver_span = PROBE_US - 1,
+                "not_draining" => delivered = admission.symbol_bytes,
+                "before_brake" => local_span = observed - controller.last_brake_us.unwrap() + 1,
+                "pace_change" => {
+                    let before = controller.rate_bps;
+                    controller.rate_bps -= 1;
+                    controller.record_rate_change(
+                        admission.started_us + 1,
+                        before,
+                        RateReason::ReprobeRollback,
+                    );
+                }
+                "missing" | "regressed" => {}
+                _ => unreachable!(),
+            }
+            let received_end = controller.last_report.unwrap().1;
+            let sent_end = (
+                sample.admitted_symbol_bytes.unwrap(),
+                sample.admitted_symbols.unwrap(),
+            );
+            let sent_start = (sent_end.0 - admission.symbol_bytes, sent_end.1 - symbols);
+            let receiver_end = 100_000_000 + observed;
+            controller.service_window = service::Window::default();
+            assert!(!controller.service_window.observe(
+                1,
+                Some(receiver_end - receiver_span),
+                received_end - delivered,
+                observed - local_span,
+                (invalid != "missing").then_some(sent_start)
+            ));
+            if invalid == "regressed" {
+                assert!(!controller.service_window.observe(
+                    2,
+                    Some(receiver_end - receiver_span + 100_000),
+                    received_end - delivered,
+                    observed - local_span + 100_000,
+                    Some((sent_start.0 - 1, sent_start.1))
+                ));
+            }
+            let complete = controller.service_window.observe(
+                3,
+                Some(receiver_end),
+                received_end,
+                observed,
+                (invalid != "missing").then_some(sent_end),
+            );
+            assert_eq!(complete, invalid != "receiver_span", "{invalid}");
+            // The clear probe arrives between reports. Retain the actual last
+            // accepted report instead of completing a new, now-long-enough
+            // receiver interval while testing the existing sample's validity.
+            sample.report_number = controller.last_report.unwrap().0;
+            sample.delivered_bytes = received_end;
+            sample.delivery_report_time_us = controller.last_control.delivery_report_time_us;
+            sample.positive_delivery_age_us = Some(100_000);
+            let before = controller.rate_bps;
+            controller.observe(&sample);
+            assert_eq!(
+                controller.last_control.drain_service_target_bps, None,
+                "{invalid}"
+            );
+            assert_eq!(
+                controller.rate_bps,
+                (before as f64 * 1.2) as u64,
+                "old fallback: {invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn drain_service_029_preserves_probe_pressure_and_legacy_fallback() {
+        for guard in [
+            "used_probe",
+            "old_probe",
+            "pre_brake_probe",
+            "pressure",
+            "positive_age",
+            "idle",
+            "interrupted",
+            "generation",
+            "gap",
+            "clock",
+            "not_pending",
+            "legacy",
+        ] {
+            let (mut controller, mut sample) = draining_service_029(0, 1_000_000);
+            let before = controller.rate_bps;
+            let legacy_target = (controller.draining_bps.unwrap().0 * 0.9) as u64;
+            match guard {
+                "used_probe" => controller.last_growth_probe = Some(sample.probe_sample_id),
+                "old_probe" => sample.probe_age_us = Some(CONTROL_US + 1),
+                "pre_brake_probe" => {
+                    // Long propagation can produce a young clear reply whose
+                    // request still predates/equaled the actual brake.
+                    let rtt = (sample.now_us - controller.last_brake_us.unwrap()) as f64 / 1000.0;
+                    controller.min_rtt_ms = Some(rtt);
+                    controller.fast_probe_min_rtt_ms = Some(rtt);
+                    controller.startup_probe_pressure = None;
+                    sample.probe_latest_rtt_ms = Some(rtt);
+                    sample.probe_rtt_ms = Some(rtt);
+                    sample.probe_age_us = Some(0);
+                }
+                "pressure" => sample.send_queue_bytes = 5000,
+                "positive_age" => sample.positive_delivery_age_us = Some(CONTROL_US + 1),
+                "idle" => sample.offered_backlog = false,
+                "interrupted" => controller.backlog_since_us = Some(1_100_000),
+                "generation" => {
+                    sample.generation += 1;
+                    sample.report_number = 1;
+                    sample.delivered_bytes = 0;
+                    sample.delivered_bps = Some(0.0);
+                    sample.admitted_symbols = Some(0);
+                    sample.admitted_symbol_bytes = Some(0);
+                }
+                "gap" => sample.now_us += FRESH_US + 1,
+                "clock" => sample.now_us = controller.last_control.at_us - 1,
+                "not_pending" => controller.drain_restore_pending = false,
+                "legacy" => {
+                    controller.fast_feedback_seen = false;
+                    sample.delivery_sample_span_us = PROBE_US;
+                }
+                _ => unreachable!(),
+            }
+            controller.observe(&sample);
+            assert_eq!(
+                controller.last_control.drain_service_target_bps, None,
+                "{guard}"
+            );
+            if guard == "legacy" {
+                assert_eq!(controller.rate_bps, legacy_target);
+                assert!(!controller.fast_feedback_seen);
+            } else {
+                assert!(
+                    controller.rate_bps <= ((before as f64 * 1.2) as u64).max(START_BPS),
+                    "{guard}"
+                );
+            }
+            if guard == "generation" {
+                assert!(controller.last_brake_us.is_none());
+                assert!(!controller.drain_restore_pending);
+                assert!(controller.service_window.latest(sample.now_us).is_none());
+            }
+        }
+
+        // Reuse a genuinely granted finite trial. Its expiry in refill and
+        // its explicit disable in observe must both reject the new exception,
+        // while leaving the existing bounded fallback semantics intact.
+        for expiry in [false, true] {
+            let (trial, started, baseline) = granted_reprobe();
+            let now = started + if expiry { 4_000_000 } else { 3_800_000 };
+            let (mut controller, mut sample) =
+                draining_service_029(now - 1_600_000, trial.rate_bps * 8);
+            assert!(controller.rate_bps > baseline);
+            controller.reprobe = trial.reprobe;
+            sample.reprobe_enabled = expiry;
+            assert!(controller.reprobe.active());
+            controller.observe(&sample);
+            assert!(!controller.reprobe.active());
+            assert_eq!(controller.last_control.drain_service_target_bps, None);
+            assert!(controller.rate_bps <= (baseline as f64 * 1.2) as u64);
+            if expiry {
+                assert!(
+                    controller
+                        .rate_changes
+                        .iter()
+                        .any(|change| change.at_us == now
+                            && matches!(change.reason, RateReason::ReprobeRollback)
+                            && change.pacing_bps == baseline)
+                );
+            }
+        }
     }
 
     #[test]
