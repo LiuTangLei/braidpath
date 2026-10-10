@@ -110,7 +110,7 @@ fn block_and_poll(
             &mut TaskContext::from_waker(&waker),
             paths,
             lifetime,
-            |_, _| true,
+            |_, _, _| true,
         )
         .is_pending()
     );
@@ -155,6 +155,7 @@ struct Accounting {
     controllers: [adaptive::PathController; MAX_PATHS],
     pacer: outbound::Pacer,
     groups: [outbound::Pacer; MAX_PATHS],
+    business: Option<outbound::BusinessPacer>,
     cursor: usize,
     repair_turn: bool,
     epoch: Instant,
@@ -181,6 +182,7 @@ impl Accounting {
             }),
             pacer,
             groups,
+            business: None,
             cursor: 0,
             repair_turn: false,
             epoch: Instant::now(),
@@ -226,6 +228,8 @@ impl Accounting {
             controllers: &mut self.controllers,
             pacer: &mut self.pacer,
             groups: &mut self.groups,
+            business: &mut self.business,
+            paths: std::slice::from_ref(&prepared.path),
             cursor: &mut self.cursor,
             repair_turn: &mut self.repair_turn,
             epoch: self.epoch,
@@ -294,7 +298,7 @@ async fn quinn_readiness_wakes_without_input_or_timer_and_commits_each_symbol_on
         let ready = timeout(
             Duration::from_secs(1),
             poll_fn(|cx| {
-                wait.poll(cx, &paths, Duration::from_secs(1), |attempt, _| {
+                wait.poll(cx, &paths, Duration::from_secs(1), |attempt, _, _| {
                     let cost = attempt.data.len() + 80;
                     accounting.pacer.available(cost)
                         && accounting.groups[usize::from(path.group)].available(cost)
@@ -370,7 +374,7 @@ async fn cancelling_a_pending_wait_does_not_send_or_mint_credit_and_can_be_resel
     accounting.assert_no_admission(&path, 1);
     // A later actor turn can reselect the same still-queued original exactly once.
     let mut wait = WaitingSend::new(prepared);
-    let ready = poll_fn(|cx| wait.poll(cx, &paths, Duration::from_secs(1), |_, _| true)).await;
+    let ready = poll_fn(|cx| wait.poll(cx, &paths, Duration::from_secs(1), |_, _, _| true)).await;
     let SendReadiness::Admitted { at, next_cursor } = ready else {
         panic!("{ready:?}")
     };
@@ -399,7 +403,7 @@ async fn a_ready_buffer_cannot_send_past_the_adaptive_20ms_limit_with_a_100ms_qu
     assert_eq!(pair.receive().await.as_ref(), FILLER);
     tokio::time::sleep_until((created + Duration::from_millis(25)).into()).await;
     assert!(pair.outgoing.datagram_send_buffer_space() >= wait.prepared.data.len());
-    let ready = poll_fn(|cx| wait.poll(cx, &paths, lifetime, |_, _| true)).await;
+    let ready = poll_fn(|cx| wait.poll(cx, &paths, lifetime, |_, _, _| true)).await;
     assert!(matches!(ready, SendReadiness::Expired));
     wait.cancel();
     accounting.assert_no_admission(&path, 1);
@@ -432,7 +436,8 @@ async fn removal_or_generation_change_invalidates_a_pending_wait_before_ready_se
         }
         assert_eq!(pair.receive().await.as_ref(), FILLER);
         assert!(pair.outgoing.datagram_send_buffer_space() >= wait.prepared.data.len());
-        let ready = poll_fn(|cx| wait.poll(cx, &paths, Duration::from_secs(1), |_, _| true)).await;
+        let ready =
+            poll_fn(|cx| wait.poll(cx, &paths, Duration::from_secs(1), |_, _, _| true)).await;
         assert!(matches!(ready, SendReadiness::PathChanged));
         wait.cancel();
         accounting.assert_no_admission(&path, 1);
@@ -452,7 +457,7 @@ async fn ready_poll_rechecks_current_group_budget_before_entering_quinn() {
     assert_eq!(pair.receive().await.as_ref(), FILLER);
     let exhausted_group = outbound::Pacer::new(64_000, 2400);
     let ready = poll_fn(|cx| {
-        wait.poll(cx, &paths, Duration::from_secs(1), |attempt, _| {
+        wait.poll(cx, &paths, Duration::from_secs(1), |attempt, _, _| {
             exhausted_group.available(attempt.data.len() + 80)
         })
     })

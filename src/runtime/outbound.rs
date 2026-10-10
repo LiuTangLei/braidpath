@@ -1,5 +1,5 @@
 //! Bounded per-flow service, one ingress clock, and admission-based repair credit.
-use super::QUEUE;
+use super::{MAX_PATHS, QUEUE};
 use bytes::Bytes;
 use std::{
     collections::{BTreeMap, VecDeque},
@@ -187,9 +187,262 @@ impl Pacer {
     }
 }
 
+/// Additional adaptive business credit, shared across paths and bottleneck groups.
+/// Protocol feedback and probes keep their separate, configured all-datagram caps.
+pub struct BusinessPacer {
+    aggregate: Pacer,
+    groups: [Pacer; MAX_PATHS],
+    maximum_bps: u64,
+    group_maximum_bps: [u64; MAX_PATHS],
+    last_us: u64,
+}
+
+impl BusinessPacer {
+    pub fn new(maximum_bps: u64, group_maximum_bps: [u64; MAX_PATHS], burst_bytes: usize) -> Self {
+        let burst = burst_bytes.min(2400);
+        Self {
+            aggregate: Pacer::new(0, burst),
+            groups: std::array::from_fn(|_| Pacer::new(0, burst)),
+            maximum_bps,
+            group_maximum_bps,
+            last_us: 0,
+        }
+    }
+
+    /// Supply current live, eligible path allowances, including paths whose
+    /// individual tokens cannot yet afford this packet. Settle the old rates
+    /// first; a changed rate or membership never refills the bucket for free.
+    pub fn update(&mut self, now_us: u64, budgets: impl IntoIterator<Item = (u8, u64)>) {
+        if now_us < self.last_us {
+            return;
+        }
+        self.aggregate.refill(now_us);
+        for group in &mut self.groups {
+            group.refill(now_us);
+        }
+        self.last_us = now_us;
+        let mut rates = [0u64; MAX_PATHS];
+        for (group, rate) in budgets {
+            let total = &mut rates[usize::from(group)];
+            *total = total.saturating_add(rate);
+        }
+        let mut total = 0u64;
+        for (id, rate) in rates.into_iter().enumerate() {
+            let rate = rate.min(self.group_maximum_bps[id]);
+            self.groups[id].rate = rate;
+            self.groups[id].tokens = self.groups[id].tokens.min(self.groups[id].burst);
+            total = total.saturating_add(rate);
+        }
+        self.aggregate.rate = total.min(self.maximum_bps);
+        self.aggregate.tokens = self.aggregate.tokens.min(self.aggregate.burst);
+    }
+
+    pub fn available(&self, group: u8, wire_bytes: usize) -> bool {
+        let group = &self.groups[usize::from(group)];
+        self.aggregate.rate > 0
+            && group.rate > 0
+            && self.aggregate.available(wire_bytes)
+            && group.available(wire_bytes)
+    }
+
+    /// Call only after authoritative successful admission. Preview, rejection,
+    /// expiry and transport waiting must not debit either level.
+    pub fn spend(&mut self, group: u8, wire_bytes: usize) {
+        assert!(self.available(group, wire_bytes));
+        self.aggregate.spend(wire_bytes);
+        self.groups[usize::from(group)].spend(wire_bytes);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn business_pacing_035_bounds_cross_path_bursts_and_both_caps() {
+        let budgets = [(0, 365_000); 4];
+        let mut business = BusinessPacer::new(350_000_000, [350_000_000; MAX_PATHS], 9600);
+        business.update(0, budgets);
+        assert!(!business.available(0, 1), "no initial credit");
+        let mut accepted = 0u64;
+        for offset in [0, 1300, 2200, 2400] {
+            business.update(500_000 + offset, budgets);
+            if business.available(0, 1135) {
+                business.spend(0, 1135);
+                accepted += 1;
+            }
+        }
+        assert_eq!(
+            accepted, 2,
+            "four path bursts cannot share four full buckets"
+        );
+        assert!(accepted * 1135 <= 2400 + 1_460_000 * 2400 / 8_000_000);
+        assert!(!business.available(0, 1135));
+
+        let mut caps = [0; MAX_PATHS];
+        caps[0] = 160_000;
+        caps[1] = 320_000;
+        let mut grouped = BusinessPacer::new(400_000, caps, 2400);
+        let budgets = [(0, 160_000), (0, 160_000), (1, u64::MAX), (1, u64::MAX)];
+        grouped.update(0, budgets);
+        grouped.update(40_000, budgets);
+        assert!(grouped.available(0, 800));
+        assert!(
+            !grouped.available(0, 801),
+            "group cap applies to its summed paths"
+        );
+        grouped.spend(0, 800);
+        assert!(!grouped.available(0, 1));
+        assert!(grouped.available(1, 1200));
+        assert!(
+            !grouped.available(1, 1201),
+            "aggregate cap is smaller than the group sum"
+        );
+        grouped.spend(1, 1200);
+        assert!(
+            !grouped.available(1, 1),
+            "another group cannot reuse global credit"
+        );
+
+        let mut smaller = BusinessPacer::new(8_000_000, [8_000_000; MAX_PATHS], 1200);
+        smaller.update(0, [(0, 8_000_000)]);
+        smaller.update(1_000_000, [(0, 8_000_000)]);
+        assert!(smaller.available(0, 1200));
+        assert!(!smaller.available(0, 1201));
+    }
+
+    #[test]
+    fn business_pacing_035_settles_old_rates_without_minting_or_replaying_credit() {
+        let mut business = BusinessPacer::new(10_000_000, [10_000_000; MAX_PATHS], 2400);
+        business.update(1_000_000, [(0, 80_000)]);
+        assert!(
+            !business.available(0, 1),
+            "first budget cannot backfill elapsed time"
+        );
+        business.update(1_100_000, [(0, 160_000)]);
+        assert!(business.available(0, 1000));
+        assert!(
+            !business.available(0, 1001),
+            "the earlier interval used 80 kbit/s"
+        );
+        for _ in 0..3 {
+            assert!(!business.available(0, 1200));
+            assert!(
+                business.available(0, 1000),
+                "preview/rejection spends nothing"
+            );
+        }
+        business.update(1_050_000, [(0, 8_000_000)]);
+        business.update(1_150_000, [(0, 160_000)]);
+        assert!(business.available(0, 2000));
+        assert!(
+            !business.available(0, 2001),
+            "a regressed clock changes neither time nor rate"
+        );
+        business.update(1_200_000, [(0, 40_000)]);
+        assert!(business.available(0, 2400));
+        assert!(!business.available(0, 2401));
+        business.spend(0, 2300);
+        business.update(1_200_000, [(0, 8_000_000)]);
+        business.update(1_200_000, [(0, 40_000)]);
+        assert!(business.available(0, 100));
+        assert!(
+            !business.available(0, 101),
+            "same-time rate changes cannot refill credit"
+        );
+        business.update(1_300_000, [(0, 40_000)]);
+        assert!(business.available(0, 600));
+        assert!(
+            !business.available(0, 601),
+            "only the new lower rate earns future credit"
+        );
+        business.spend(0, 600);
+        business.update(1_400_000, []);
+        assert!(
+            !business.available(0, 1),
+            "zero budget blocks business despite earned credit"
+        );
+        business.update(1_500_000, []);
+        business.update(1_500_000, [(0, 80_000)]);
+        assert!(business.available(0, 500));
+        assert!(
+            !business.available(0, 501),
+            "rejoining retains only previously earned credit"
+        );
+    }
+
+    #[test]
+    fn business_pacing_035_preserves_path_gates_and_control_when_business_is_zero() {
+        use super::super::adaptive::PathController;
+        let mut controllers: [PathController; 2] =
+            std::array::from_fn(|_| PathController::new(10_000_000, 20));
+        let mut business = BusinessPacer::new(10_000_000, [10_000_000; MAX_PATHS], 2400);
+        let synchronize = |business: &mut BusinessPacer, controllers: &[PathController; 2], now| {
+            business.update(
+                now,
+                controllers.iter().filter_map(|controller| {
+                    let decision = controller.decision(now);
+                    decision.eligible.then_some((0, decision.pacing_bps))
+                }),
+            );
+        };
+        let mut control = Pacer::new(10_000_000, 2400);
+        let mut control_group = Pacer::new(10_000_000, 2400);
+        synchronize(&mut business, &controllers, 0);
+        synchronize(&mut business, &controllers, 100);
+        assert!(
+            controllers
+                .iter_mut()
+                .all(|controller| controller.allow(100, 1135, 0.0))
+        );
+        assert!(
+            !business.available(0, 1135),
+            "individual bursts do not bypass shared credit"
+        );
+        control.refill(100);
+        control_group.refill(100);
+        assert!(control.available(102) && control_group.available(102));
+        control.spend(102);
+        control_group.spend(102);
+        assert!(!business.available(0, 1135));
+
+        let allowed = controllers[0].allow(20_000, 1135, 0.0);
+        synchronize(&mut business, &controllers, 20_000);
+        assert!(allowed && business.available(0, 1135));
+        business.spend(0, 1135);
+        controllers[0].admitted_symbol(20_000, 1135, 1025);
+        synchronize(&mut business, &controllers, 20_000);
+        assert!(
+            !business.available(0, 1135),
+            "success debits global and group exactly once"
+        );
+
+        let stale = 3_000_001;
+        assert!(
+            controllers
+                .iter()
+                .all(|controller| !controller.decision(stale).eligible)
+        );
+        synchronize(&mut business, &controllers, stale);
+        assert!(!business.available(0, 1));
+        assert!(
+            controllers
+                .iter()
+                .all(|controller| controller.decision(stale).probe_due)
+        );
+        control.refill(stale);
+        control_group.refill(stale);
+        for wire_bytes in [347, 102] {
+            assert!(control.available(wire_bytes) && control_group.available(wire_bytes));
+            control.spend(wire_bytes);
+            control_group.spend(wire_bytes);
+            assert!(
+                !business.available(0, 1),
+                "health/control does not require business eligibility"
+            );
+        }
+    }
+
     fn item(flow: u32, id: u64, at: Instant) -> Pending {
         Pending {
             data: Bytes::from_static(b"payload"),

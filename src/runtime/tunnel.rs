@@ -375,7 +375,7 @@ impl WaitingSend {
         cx: &mut TaskContext<'_>,
         shared_paths: &Paths,
         lifetime: Duration,
-        mut allowed: impl FnMut(&PreparedSend, Instant) -> bool,
+        mut allowed: impl FnMut(&PreparedSend, Instant, &[OutPath]) -> bool,
     ) -> Poll<SendReadiness> {
         let paths = shared_paths.lock().expect("paths lock");
         let Some(index) = paths.iter().position(|path| {
@@ -402,7 +402,7 @@ impl WaitingSend {
         if now.saturating_duration_since(self.prepared.front.created) >= lifetime {
             return Poll::Ready(SendReadiness::Expired);
         }
-        if !allowed(&self.prepared, now) {
+        if !allowed(&self.prepared, now, &paths) {
             return Poll::Ready(SendReadiness::GateChanged);
         }
         match self.send.as_mut().poll(cx) {
@@ -442,6 +442,28 @@ struct Admission<'a> {
     at: Instant,
 }
 
+fn update_business_pacer(
+    business: &mut Option<outbound::BusinessPacer>,
+    paths: &[OutPath],
+    controllers: &[adaptive::PathController; MAX_PATHS],
+    now_us: u64,
+) {
+    if let Some(business) = business {
+        business.update(
+            now_us,
+            paths.iter().filter_map(|path| {
+                if path.conn.close_reason().is_some() {
+                    return None;
+                }
+                let decision = controllers[usize::from(path.id)].decision(now_us);
+                decision
+                    .eligible
+                    .then_some((path.group, decision.pacing_bps))
+            }),
+        );
+    }
+}
+
 /// The immediate path and the readiness path share the exact same successful
 /// admission transaction. Pending, cancellation and expiry never call this.
 struct SendAccounting<'a> {
@@ -454,6 +476,8 @@ struct SendAccounting<'a> {
     controllers: &'a mut [adaptive::PathController; MAX_PATHS],
     pacer: &'a mut outbound::Pacer,
     groups: &'a mut [outbound::Pacer; MAX_PATHS],
+    business: &'a mut Option<outbound::BusinessPacer>,
+    paths: &'a [OutPath],
     cursor: &'a mut usize,
     repair_turn: &'a mut bool,
     epoch: Instant,
@@ -479,6 +503,9 @@ impl SendAccounting<'_> {
         let cost = frame_bytes + 80;
         self.pacer.spend(cost);
         self.groups[usize::from(path.group)].spend(cost);
+        if let Some(business) = self.business.as_mut() {
+            business.spend(path.group, cost);
+        }
         if self.policy.quality_schedule {
             self.scheduler.commit(candidates, path.id, frame_bytes);
         }
@@ -488,6 +515,7 @@ impl SendAccounting<'_> {
                 .as_micros()
                 .min(u128::from(u64::MAX)) as u64;
             self.controllers[usize::from(path.id)].admitted_symbol(now_us, cost, sent.data.len());
+            update_business_pacer(self.business, self.paths, self.controllers, now_us);
         }
         if self.policy.receiver_feedback {
             path.quality
@@ -556,6 +584,9 @@ async fn sender(
     let mut pacer = outbound::Pacer::new(policy.rate, burst);
     let mut groups: [outbound::Pacer; MAX_PATHS] =
         std::array::from_fn(|i| outbound::Pacer::new(policy.group_rates[i], burst));
+    let mut business = policy
+        .adaptive
+        .then(|| outbound::BusinessPacer::new(policy.rate, policy.group_rates, burst));
     let epoch = Instant::now();
     let mut cursor = 0usize;
     let mut control_cursor = 0usize;
@@ -580,18 +611,26 @@ async fn sender(
                 let Some(wait) = waiting.as_mut() else {
                     return Poll::Pending;
                 };
-                wait.poll(cx, &shared_paths, lifetime, |attempt, now| {
+                wait.poll(cx, &shared_paths, lifetime, |attempt, now, paths| {
                     let cost = attempt.data.len() + 80;
                     let now_us = now.saturating_duration_since(epoch).as_micros()
                         .min(u128::from(u64::MAX)) as u64;
                     let age = now.saturating_duration_since(attempt.front.created);
-                    pacer.available(cost + attempt.feedback_reserve)
-                        && groups[usize::from(attempt.path.group)]
+                    if !pacer.available(cost + attempt.feedback_reserve)
+                        || !groups[usize::from(attempt.path.group)]
                             .available(cost + attempt.group_reserve)
-                        && (!attempt.repair || budget.can_repair(attempt.data.len()))
-                        && (!policy.adaptive
-                            || controllers[usize::from(attempt.path.id)]
-                                .allow(now_us, cost, age.as_secs_f64() * 1000.0))
+                        || (attempt.repair && !budget.can_repair(attempt.data.len()))
+                    {
+                        return false;
+                    }
+                    if !policy.adaptive {
+                        return true;
+                    }
+                    let allowed = controllers[usize::from(attempt.path.id)]
+                        .allow(now_us, cost, age.as_secs_f64() * 1000.0);
+                    update_business_pacer(&mut business, paths, &controllers, now_us);
+                    allowed && business.as_ref().expect("adaptive business pacer")
+                        .available(attempt.path.group, cost)
                 })
             }), if waiting.is_some()=>SenderEvent::Ready(ready),
             item=input.recv()=>SenderEvent::Input(item),
@@ -616,6 +655,7 @@ async fn sender(
             }
             SenderEvent::Ready(SendReadiness::Admitted { at, next_cursor }) => {
                 let attempt = prepared.expect("selected readiness attempt");
+                let paths = shared_paths.lock().expect("paths lock");
                 SendAccounting {
                     policy: &policy,
                     metrics: &metrics,
@@ -626,6 +666,8 @@ async fn sender(
                     controllers: &mut controllers,
                     pacer: &mut pacer,
                     groups: &mut groups,
+                    business: &mut business,
+                    paths: &paths,
                     cursor: &mut cursor,
                     repair_turn: &mut repair_turn,
                     epoch,
@@ -761,6 +803,7 @@ async fn sender(
             }
             observe_at = now_us.saturating_add(100_000);
         }
+        update_business_pacer(&mut business, &paths, &controllers, now_us);
         if policy.receiver_feedback
             && pending_feedback.is_none()
             && feedback_schedule.should_check(now_us, policy.adaptive)
@@ -1031,10 +1074,17 @@ async fn sender(
                 if repair && !budget.can_repair(frame_bytes) {
                     continue;
                 }
-                if policy.adaptive
-                    && !controllers[id].allow(now_us, cost, age.as_secs_f64() * 1000.0)
-                {
-                    continue;
+                if policy.adaptive {
+                    let allowed = controllers[id].allow(now_us, cost, age.as_secs_f64() * 1000.0);
+                    update_business_pacer(&mut business, &paths, &controllers, now_us);
+                    if !allowed
+                        || !business
+                            .as_ref()
+                            .expect("adaptive business pacer")
+                            .available(path.group, cost)
+                    {
+                        continue;
+                    }
                 }
                 if path.conn.max_datagram_size().is_none_or(|m| data.len() > m) {
                     continue;
@@ -1101,6 +1151,8 @@ async fn sender(
                 controllers: &mut controllers,
                 pacer: &mut pacer,
                 groups: &mut groups,
+                business: &mut business,
+                paths: &paths,
                 cursor: &mut cursor,
                 repair_turn: &mut repair_turn,
                 epoch,
