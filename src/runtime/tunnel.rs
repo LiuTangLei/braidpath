@@ -540,6 +540,35 @@ fn update_business_pacer(
     }
 }
 
+fn business_ready_candidates(
+    candidates: &[(u8, i32)],
+    paths: &[OutPath],
+    controllers: &mut [adaptive::PathController; MAX_PATHS],
+    now_us: u64,
+    measured_payload_bytes: usize,
+    queue_age_ms: f64,
+    admitted: Option<u8>,
+) -> Vec<(u8, i32)> {
+    scheduler::ready_candidates(candidates, |id| {
+        // The accepted path is charged even if a gate changes after admission.
+        if admitted == Some(id) {
+            return true;
+        }
+        let Some(path) = paths.iter().find(|path| path.id == id) else {
+            return false;
+        };
+        // Mapping size depends on the actual stream ID, not on the payload.
+        let Ok(mapping) = wire::http_datagram(path.stream, &[]) else {
+            return false;
+        };
+        controllers[usize::from(id)].allow(
+            now_us,
+            measured_payload_bytes + mapping.len() + 80,
+            queue_age_ms,
+        )
+    })
+}
+
 /// The immediate path and the readiness path share the exact same successful
 /// admission transaction. Pending, cancellation and expiry never call this.
 struct SendAccounting<'a> {
@@ -577,19 +606,40 @@ impl SendAccounting<'_> {
         debug_assert_eq!(sent.block, front.block);
         debug_assert_eq!(sent.data, front.data);
         let cost = frame_bytes + 80;
+        let now_us = at
+            .saturating_duration_since(self.epoch)
+            .as_micros()
+            .min(u128::from(u64::MAX)) as u64;
+        // Recheck at actual admission, including Quinn's readiness-wait path.
+        let ready_candidates = self.policy.adaptive.then(|| {
+            business_ready_candidates(
+                candidates,
+                self.paths,
+                self.controllers,
+                now_us,
+                front.data.len()
+                    + if self.policy.receiver_feedback {
+                        quality::HEADER
+                    } else {
+                        0
+                    },
+                at.saturating_duration_since(front.created).as_secs_f64() * 1000.0,
+                Some(path.id),
+            )
+        });
         self.pacer.spend(cost);
         self.groups[usize::from(path.group)].spend(cost);
         if let Some(business) = self.business.as_mut() {
             business.spend(path.group, cost);
         }
         if self.policy.quality_schedule {
-            self.scheduler.commit(candidates, path.id, frame_bytes);
+            self.scheduler.commit(
+                ready_candidates.as_deref().unwrap_or(candidates),
+                path.id,
+                frame_bytes,
+            );
         }
         if self.policy.adaptive {
-            let now_us = at
-                .saturating_duration_since(self.epoch)
-                .as_micros()
-                .min(u128::from(u64::MAX)) as u64;
             self.controllers[usize::from(path.id)].admitted_symbol(now_us, cost, sent.data.len());
             update_business_pacer(self.business, self.paths, self.controllers, now_us);
         }
@@ -1246,6 +1296,27 @@ async fn sender(
                     (path.id, weight)
                 })
                 .collect();
+            let candidates = if policy.adaptive {
+                business_ready_candidates(
+                    &candidates,
+                    &paths,
+                    &mut controllers,
+                    now_us,
+                    front.data.len()
+                        + if policy.receiver_feedback {
+                            quality::HEADER
+                        } else {
+                            0
+                        },
+                    age.as_secs_f64() * 1000.0,
+                    None,
+                )
+            } else {
+                candidates
+            };
+            if policy.adaptive {
+                update_business_pacer(&mut business, &paths, &controllers, now_us);
+            }
             let mut order: Vec<usize> = if policy.quality_schedule {
                 scheduler
                     .order(

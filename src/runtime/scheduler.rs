@@ -12,6 +12,17 @@ pub fn weight(estimate: &Estimate, now_us: u64, rtt_ms: f64) -> i32 {
         / (1.0 + (estimate.delay_variation_ms + rtt_ms) / 50.0);
     (score * 32.0).round().clamp(1.0, 32.0) as i32
 }
+/// A path without this symbol's business allowance is not owed its service share.
+pub fn ready_candidates(
+    candidates: &[(u8, i32)],
+    mut ready: impl FnMut(u8) -> bool,
+) -> Vec<(u8, i32)> {
+    candidates
+        .iter()
+        .copied()
+        .filter(|&(id, _)| ready(id))
+        .collect()
+}
 #[derive(Default)]
 pub struct Scheduler {
     debt: [i64; MAX_PATHS],
@@ -115,6 +126,34 @@ pub fn admit_generation(highest: &mut Option<u64>, generation: u64) -> anyhow::R
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn unavailable_bulk_allowance_cannot_accumulate_debt_against_later_small_packets() {
+        let candidates = [(0, 16), (1, 16)];
+        let mut scheduler = Scheduler::default();
+        // Path 1 can hold a small packet, but cannot admit the bulk symbol.
+        let mut small_budget = crate::runtime::outbound::Pacer::new(0, 200);
+        small_budget.set_rate(0, 64_000);
+        small_budget.refill(100_000);
+        assert!(small_budget.available(183));
+        assert!(!small_budget.available(1055));
+        for _ in 0..10_000 {
+            let ready = ready_candidates(&candidates, |id| id == 0 || small_budget.available(1055));
+            scheduler.commit(&ready, 0, 1055);
+        }
+        let mut small = [0; 2];
+        for _ in 0..200 {
+            let ready = ready_candidates(&candidates, |_| true);
+            let selected = scheduler.order(&ready, 183)[0];
+            scheduler.commit(&ready, selected, 183);
+            small[usize::from(selected)] += 1;
+        }
+        assert_eq!(
+            small,
+            [100, 100],
+            "bulk allowance must not pin small packets: {small:?}"
+        );
+        assert_eq!(scheduler.debt, [0; MAX_PATHS]);
+    }
     #[test]
     fn recovery_remains_bounded_and_available_after_many_outages() {
         let q = Estimate {
