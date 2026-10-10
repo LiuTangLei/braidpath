@@ -1766,26 +1766,13 @@ impl PathController {
                 // Wait only for a fresh actual drainage pair crossing this
                 // brake, until the original time and symbol floors both
                 // exist after it, bounded by the existing freshness limit.
-                let drain_horizon_us = self
-                    .service_window
-                    .discovery_with_counts(now, 8, 1)
-                    .or(service_sample)
-                    .and_then(|sample| sample.admission)
-                    .filter(|admission| admission.symbols > 0)
-                    .map_or(PROBE_US, |admission| {
-                        ((admission.symbol_bytes as f64 / admission.symbols as f64)
-                            * self.wire_per_symbol
-                            * 8.0
-                            * 8_000_000.0
-                            / self.rate_bps as f64)
-                            .ceil() as u64
-                    })
-                    .clamp(PROBE_US, FRESH_US);
+                // Older average packet sizes cannot predict when the actual
+                // post-brake symbols will meet that floor.
                 waiting_for_drain_window = self.last_brake_us.is_some_and(|brake| {
                     self.fast_feedback_seen
                         && recent_drain.is_some()
                         && self.last_growth_us <= brake
-                        && now.saturating_sub(brake) < drain_horizon_us
+                        && now.saturating_sub(brake) < FRESH_US
                         && !self
                             .service_window
                             .discovery_with_counts(now, 8, 1)
@@ -4461,7 +4448,7 @@ mod tests {
             drain_start,
             drain_slices,
             warmup_us,
-            500,
+            (500, 500),
         )
     }
 
@@ -4472,7 +4459,7 @@ mod tests {
         drain_start: u64,
         drain_slices: u64,
         warmup_us: u64,
-        packet_bytes: u64,
+        packet_sizes: (u64, u64),
     ) -> (PathController, Observation) {
         let mut controller = PathController::new(start_bps * 4, 20);
         let mut quality = crate::runtime::quality::State::new(7);
@@ -4500,6 +4487,11 @@ mod tests {
         let mut received = 0;
         let mut extra_drain = 0;
         for step in 1..=clear_step {
+            let packet_bytes = if step <= 6 {
+                packet_sizes.0
+            } else {
+                packet_sizes.1
+            };
             let now = start_us + step * 100_000;
             if step == clear_step {
                 controller.probe_admitted(now - 100_000);
@@ -4577,6 +4569,11 @@ mod tests {
             }
             if step == 6 {
                 assert!(controller.rate_bps < start_bps);
+                if packet_sizes.0 != packet_sizes.1 {
+                    // The larger post-brake symbols must earn their entire
+                    // allowance, independent of the old small-packet phase.
+                    controller.tokens = 0.0;
+                }
                 assert!(matches!(
                     controller.rate_changes.back().unwrap().reason,
                     RateReason::QueueBrake
@@ -4927,8 +4924,47 @@ mod tests {
     }
 
     #[test]
+    fn changing_packet_sizes_cannot_end_the_wait_before_real_symbols_mature() {
+        let (mut controller, sample) =
+            draining_service_packets_064(0, 400_000, 12, 8, 3, 0, (500, 1000));
+        let before = controller.rate_bps;
+        controller.observe(&sample);
+        let current = controller
+            .service_window
+            .discovery_with_counts(sample.now_us, 8, 1)
+            .unwrap();
+        assert!(
+            current.admission.unwrap().started_us < controller.last_brake_us.unwrap(),
+            "eight symbols still include the smaller pre-brake packets"
+        );
+        assert_eq!(
+            controller.rate_bps, before,
+            "an average packet size cannot substitute for eight real post-brake symbols"
+        );
+        assert!(controller.drain_restore_pending);
+        controller.probe_admitted(1_500_000);
+        let mut next = admitted_report_026(&mut controller, &sample, 1_600_000, u64::MAX);
+        next.probe_age_us = Some(20_000);
+        controller.observe(&next);
+        let current = controller
+            .service_window
+            .discovery_with_counts(next.now_us, 8, 1)
+            .unwrap();
+        assert!(current.admission.unwrap().started_us >= 600_000);
+        assert!(current.bps > current.admission.unwrap().bps * 1.1);
+        let target = (current.bps * controller.wire_per_symbol * 0.9) as u64;
+        assert!(target > before);
+        assert_eq!(controller.rate_bps, target);
+        assert_eq!(
+            controller.last_control.drain_service_target_bps,
+            Some(target)
+        );
+    }
+
+    #[test]
     fn post_brake_wait_preserves_the_original_symbol_floor_at_low_rates() {
-        let (mut controller, sample) = draining_service_packets_064(0, 400_000, 12, 8, 3, 0, 1000);
+        let (mut controller, sample) =
+            draining_service_packets_064(0, 400_000, 12, 8, 3, 0, (1000, 1000));
         let before = controller.rate_bps;
         assert_eq!(controller.last_brake_us, Some(600_000));
         controller.observe(&sample);
@@ -5415,15 +5451,23 @@ mod tests {
             );
             assert_eq!(
                 controller.rate_bps,
-                if matches!(invalid, "old" | "receiver_span") {
+                if matches!(invalid, "old" | "receiver_span" | "before_brake") {
                     before
                 } else {
                     (before as f64 * (1.0 + 16.0 / 180.0)) as u64
                 },
-                "old fallback: {invalid}"
+                "unqualified service: {invalid}"
             );
-            if matches!(invalid, "old" | "receiver_span") {
+            if matches!(invalid, "old" | "receiver_span" | "before_brake") {
                 assert!(controller.drain_restore_pending, "{invalid}");
+            }
+            if invalid == "before_brake" {
+                // This is precisely the interval still awaiting post-brake
+                // symbols. Reject full credit and do not interrupt it with the
+                // speculative increment that the old fallback expected.
+                controller.observe(&sample);
+                assert_eq!(controller.rate_bps, before);
+                assert_eq!(controller.last_control.drain_service_target_bps, None);
             }
         }
     }
