@@ -342,6 +342,7 @@ pub struct GrowthMonitorReply {
     pub age_us: u64,
     pub inferred_request_us: u64,
     pub rtt_ms: f64,
+    pub queue_delay_ms: f64,
 }
 
 /// Two observations of one actual ordinary increase, not a capacity estimate.
@@ -412,7 +413,7 @@ impl GrowthMonitor {
         }
     }
 
-    fn observe(&mut self, sample: &Observation, probe_rtt_ms: f64) -> bool {
+    fn observe(&mut self, sample: &Observation, probe_rtt_ms: f64, queue_delay_ms: f64) -> bool {
         if sample.generation != self.generation
             || !self.live_at(sample.now_us)
             || sample
@@ -445,6 +446,7 @@ impl GrowthMonitor {
                     age_us,
                     inferred_request_us: request_us,
                     rtt_ms: probe_rtt_ms,
+                    queue_delay_ms,
                 };
                 if self.first_reply.is_none() {
                     self.first_reply = Some(reply);
@@ -1661,7 +1663,11 @@ impl PathController {
             || self.rate_bps != rate_before_refill
             || self.growth_monitor.as_mut().is_some_and(|monitor| {
                 monitor.pacing_bps != self.rate_bps
-                    || !monitor.observe(observation, probe_rtt.unwrap_or(f64::INFINITY))
+                    || !monitor.observe(
+                        observation,
+                        probe_rtt.unwrap_or(f64::INFINITY),
+                        self.queue_delay_ms,
+                    )
             })
         {
             self.growth_monitor = None;
@@ -1685,7 +1691,17 @@ impl PathController {
                             .baseline_probe_rtt_ms
                             .is_some_and(|baseline| second.rtt_ms > baseline + 0.25)
                 });
-            if rising && self.queue_delay_ms > self.target_ms * 0.25 {
+            let sustained_small_queue = monitor
+                .first_reply
+                .as_ref()
+                .is_some_and(|reply| reply.queue_delay_ms > self.target_ms * 0.25);
+            // A single small crossing can be one packet burst, even if the
+            // two RTTs rise. Keep observing at the current rate until it is
+            // sustained; the existing larger queue threshold acts immediately.
+            if rising
+                && self.queue_delay_ms > self.target_ms * 0.25
+                && (sustained_small_queue || self.queue_delay_ms > self.target_ms * 0.5)
+            {
                 self.rate_bps = monitor.previous_bps;
                 rate_reason = RateReason::GrowthWithdrawalBrake;
                 monitor.withdrawn = true;
@@ -3125,7 +3141,7 @@ mod tests {
         assert!(controller.decision(601_000).probe_due);
         controller.probe_admitted(601_000);
         assert!(!controller.decision(700_999).probe_due);
-        let mut first = monitor_reply_034(&mut controller, &sample, 685_000, 84.0, 601_000);
+        let mut first = monitor_reply_034(&mut controller, &sample, 686_500, 85.5, 601_000);
         first.probe_sample_id = sample.probe_sample_id + 1;
         controller.observe(&first);
         assert_eq!(controller.rate_bps, 334_506);
@@ -3609,10 +3625,10 @@ mod tests {
 
     #[test]
     fn growth_monitor_034_withdraws_only_its_increment_after_original_brakes() {
-        let (mut controller, sample) = first_monitored_reply_034(84.0);
+        let (mut controller, sample) = first_monitored_reply_034(85.5);
         assert_eq!(
-            controller.queue_delay_ms, 4.0,
-            "first rise retains monitoring"
+            controller.queue_delay_ms, 5.5,
+            "one elevated sample retains monitoring"
         );
         let remembered = controller.remembered_bps;
         let draining = controller.draining_bps;
@@ -3680,7 +3696,7 @@ mod tests {
 
     #[test]
     fn growth_withdrawal_retries_a_smaller_increment_at_the_same_rate() {
-        let (mut controller, sample) = first_monitored_reply_034(84.0);
+        let (mut controller, sample) = first_monitored_reply_034(85.5);
         let rejected_rate = controller.rate_bps;
         let sample = monitor_reply_034(&mut controller, &sample, 900_000, 86.0, 800_000);
         controller.observe(&sample);
@@ -3747,7 +3763,7 @@ mod tests {
 
     #[test]
     fn successful_smaller_retry_recovers_its_step_without_jumping_to_the_rejected_gain() {
-        let (mut controller, sample) = first_monitored_reply_034(84.0);
+        let (mut controller, sample) = first_monitored_reply_034(85.5);
         let mut sample = monitor_reply_034(&mut controller, &sample, 900_000, 86.0, 800_000);
         controller.observe(&sample);
         let baseline = controller.rate_bps;
@@ -3800,7 +3816,7 @@ mod tests {
 
     #[test]
     fn another_retry_withdrawal_halves_only_the_new_failed_increment() {
-        let (mut controller, sample) = first_monitored_reply_034(84.0);
+        let (mut controller, sample) = first_monitored_reply_034(85.5);
         let mut sample = monitor_reply_034(&mut controller, &sample, 900_000, 86.0, 800_000);
         controller.observe(&sample);
         let baseline = controller.rate_bps;
@@ -3816,7 +3832,7 @@ mod tests {
         }
         let at = retry_at.unwrap();
         let increment = controller.rate_bps - baseline;
-        for (now, rtt) in [(at + 100_000, 84.0), (at + 200_000, 86.0)] {
+        for (now, rtt) in [(at + 100_000, 85.5), (at + 200_000, 86.0)] {
             controller.probe_admitted(now - 99_000);
             sample = monitor_reply_034(&mut controller, &sample, now, rtt, now - 99_000);
             controller.observe(&sample);
@@ -3848,7 +3864,7 @@ mod tests {
             "generation",
             "queue_brake",
         ] {
-            let (mut controller, sample) = first_monitored_reply_034(84.0);
+            let (mut controller, sample) = first_monitored_reply_034(85.5);
             let mut sample = monitor_reply_034(&mut controller, &sample, 900_000, 86.0, 800_000);
             controller.observe(&sample);
             assert!(controller.growth_retry.is_some());
@@ -3889,8 +3905,57 @@ mod tests {
     }
 
     #[test]
+    fn isolated_small_queue_crossing_does_not_withdraw_a_growth_trial() {
+        for (third, withdraw) in [(80.9, false), (88.0, true)] {
+            let (mut controller, sample) = first_monitored_reply_034(84.2);
+            let grown = controller.rate_bps;
+            let sample = monitor_reply_034(&mut controller, &sample, 900_000, 87.4, 800_000);
+            controller.observe(&sample);
+            assert_eq!(
+                controller.rate_bps, grown,
+                "one small threshold crossing is not a sustained queue increase"
+            );
+            assert!(controller.growth_monitor.is_some());
+            controller.probe_admitted(900_000);
+            let sample = monitor_reply_034(&mut controller, &sample, 1_000_000, third, 900_000);
+            controller.observe(&sample);
+            assert_eq!(
+                controller
+                    .last_control
+                    .growth_monitor
+                    .as_ref()
+                    .unwrap()
+                    .withdrawn,
+                withdraw
+            );
+            if withdraw {
+                assert_eq!(controller.rate_bps, 307_200);
+            } else {
+                assert!(controller.rate_bps >= grown);
+            }
+        }
+
+        // Sustained small queues and larger crossings still withdraw the
+        // owned increment, without waiting for another sample or a timer.
+        for (first, second) in [(86.0, 87.4), (84.2, 92.0)] {
+            let (mut controller, sample) = first_monitored_reply_034(first);
+            let sample = monitor_reply_034(&mut controller, &sample, 900_000, second, 800_000);
+            controller.observe(&sample);
+            assert_eq!(controller.rate_bps, 307_200, "{first} -> {second}");
+            assert!(
+                controller
+                    .last_control
+                    .growth_monitor
+                    .as_ref()
+                    .unwrap()
+                    .withdrawn
+            );
+        }
+    }
+
+    #[test]
     fn rising_below_brake_threshold_keeps_the_owned_growth_unsettled() {
-        for (next_rtt, withdrawn) in [(86.0, true), (84.1, false), (83.0, false)] {
+        for (next_rtt, withdrawn) in [(92.0, true), (84.1, false), (83.0, false)] {
             let (mut controller, sample) = first_monitored_reply_034(83.3);
             let grown = controller.rate_bps;
             let count = controller.rate_changes_total;
@@ -4003,7 +4068,7 @@ mod tests {
         reply.now_us = 800_000;
         reply.probe_sample_id += 2;
         reply.probe_age_us = Some(16_000);
-        assert!(monitor.observe(&reply, 84.0));
+        assert!(monitor.observe(&reply, 84.0, 4.0));
         assert_eq!(
             monitor.first_reply.as_ref().unwrap().sample_id,
             reply.probe_sample_id
@@ -4012,12 +4077,12 @@ mod tests {
             monitor.second_reply.is_none(),
             "a skipped id is only one visible reply"
         );
-        assert!(monitor.observe(&reply, 84.0));
+        assert!(monitor.observe(&reply, 84.0, 4.0));
         assert!(monitor.second_reply.is_none(), "duplicate id");
         reply.now_us = 900_000;
         reply.probe_sample_id += 1;
         reply.probe_age_us = Some(116_000);
-        assert!(monitor.observe(&reply, 84.0));
+        assert!(monitor.observe(&reply, 84.0, 4.0));
         assert!(
             monitor.second_reply.is_none(),
             "same inferred request origin"
@@ -4025,7 +4090,7 @@ mod tests {
         reply.now_us = 1_000_000;
         reply.probe_sample_id += 1;
         reply.probe_age_us = Some(114_000);
-        assert!(monitor.observe(&reply, 86.0));
+        assert!(monitor.observe(&reply, 86.0, 6.0));
         let first = monitor.first_reply.as_ref().unwrap();
         assert!(first.age_us + reply.now_us - first.observed_us > CONTROL_US);
         assert_eq!(first.inferred_request_us, 700_000);
@@ -4037,10 +4102,10 @@ mod tests {
         let mut unrenewed = controller.growth_monitor.clone().unwrap();
         let mut held = sample;
         held.now_us = unrenewed.armed_us + FRESH_US;
-        assert!(unrenewed.observe(&held, 80.0));
+        assert!(unrenewed.observe(&held, 80.0, 0.0));
         held.now_us += 1;
         assert!(
-            !unrenewed.observe(&held, 80.0),
+            !unrenewed.observe(&held, 80.0, 0.0),
             "observation cannot renew the fixed lifetime"
         );
     }
