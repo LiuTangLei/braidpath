@@ -183,6 +183,7 @@ pub struct Decision {
     pub pacing_bps: u64,
     pub eligible: bool,
     pub weight: i32,
+    pub weight_erasure_corroborated: bool,
     pub weight_loss_rate: Option<f64>,
     pub weight_loss_age_us: Option<u64>,
     pub weight_loss_report: Option<u64>,
@@ -2369,7 +2370,37 @@ impl PathController {
         });
         let effective_loss =
             weight_loss.map(|(sample, _)| self.weight_window.effective_rate(sample.rate));
-        let reliability = effective_loss.map_or(1.0, |loss| (1.0 - loss).powi(4).clamp(0.25, 1.0));
+        // The original penalty remains for unexplained loss. Independent
+        // covered erasure is already classified separately by pacing; give
+        // its expected retained service a distinct share rather than flatten
+        // every loss above ~29% to the same floor. Evidence cannot be renewed
+        // by asking for a decision, and this grants no pacing credit.
+        let weight_erasure_corroborated = effective_loss.is_some()
+            && self.last_control.probe_covered_loss
+            && now_us
+                .checked_sub(self.last_control.at_us)
+                .is_some_and(|age| {
+                    age <= CONTROL_US
+                        && self
+                            .last_control
+                            .probe_age_us
+                            .is_some_and(|probe_age| probe_age.saturating_add(age) <= CONTROL_US)
+                })
+            && self
+                .last_positive_report_us
+                .is_some_and(|at| now_us.checked_sub(at).is_some_and(|age| age <= CONTROL_US))
+            && self
+                .probe_service
+                .reference(now_us)
+                .is_some_and(|reference| self.rate_bps <= reference.budget_bps);
+        let reliability = effective_loss.map_or(1.0, |loss| {
+            let retained = 1.0 - loss;
+            if weight_erasure_corroborated {
+                retained.clamp(0.25, 1.0)
+            } else {
+                retained.powi(4).clamp(0.25, 1.0)
+            }
+        });
         let base_weight = ((self.rate_bps as f64 / 64_000.0)
             / (1.0
                 + self.min_rtt_ms.unwrap_or(50.0) / 50.0
@@ -2382,6 +2413,7 @@ impl PathController {
             weight: (base_weight * 16.0 * reliability)
                 .round()
                 .clamp(4.0, 2048.0) as i32,
+            weight_erasure_corroborated,
             weight_loss_rate: weight_loss.map(|(sample, _)| sample.rate),
             weight_loss_age_us: weight_loss.map(|(_, age)| age),
             weight_loss_report: weight_loss.map(|(sample, _)| sample.report),
@@ -8717,6 +8749,50 @@ mod tests {
             assert!(!controller.last_control.probe_covered_loss);
             assert!(controller.rate_bps < old);
         }
+    }
+
+    #[test]
+    fn independently_corroborated_erasure_keeps_expected_delivery_weight() {
+        let (mut controller, _, sample) = guided_erasure_session(true);
+        let now = sample.now_us;
+        assert!(controller.last_control.probe_covered_loss);
+        assert!(controller.probe_service.reference(now).is_some());
+        let before = controller.rate_bps;
+        let base = ((before as f64 / 64_000.0)
+            / (1.0
+                + controller.min_rtt_ms.unwrap_or(50.0) / 50.0
+                + controller.queue_delay_ms / controller.target_ms))
+            .round()
+            .clamp(1.0, 128.0);
+        let quality = controller.decision(now);
+        assert!(quality.weight_erasure_corroborated);
+        let retained = (1.0 - quality.weight_loss_effective_rate.unwrap()).clamp(0.25, 1.0);
+        assert_eq!(
+            quality.weight,
+            (base * 16.0 * retained).round() as i32,
+            "corroborated erasure should retain its delivery distinction"
+        );
+        // Expired independent evidence falls back to the original policy; it
+        // cannot renew quality or approve pacing. No old fixture is changed.
+        let old_policy = (base
+            * 16.0
+            * (1.0 - quality.weight_loss_effective_rate.unwrap())
+                .powi(4)
+                .clamp(0.25, 1.0))
+        .round() as i32;
+        assert_eq!(controller.decision(now + CONTROL_US + 1).weight, old_policy);
+        assert!(
+            !controller
+                .decision(now + CONTROL_US + 1)
+                .weight_erasure_corroborated
+        );
+        controller.last_control.probe_covered_loss = false;
+        assert!(!controller.decision(now).weight_erasure_corroborated);
+        assert_eq!(controller.decision(now).weight, old_policy);
+        controller.observe(&sample);
+        assert_eq!(controller.decision(now).weight, old_policy);
+        assert!(!controller.decision(now).weight_erasure_corroborated);
+        assert_eq!(controller.rate_bps, before);
     }
 
     #[test]
