@@ -332,6 +332,8 @@ pub struct ServiceAdmission {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub activity_since_us: Option<u64>,
     pub last_pace_change_us: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub positive_settlement_since_us: Option<u64>,
     pub deficit: bool,
 }
 
@@ -1382,6 +1384,25 @@ impl PathController {
         } else {
             None
         };
+        // Receiver feedback trails the actual sender admissions.
+        // A positive first window after activity or a pace change may therefore
+        // omit in-flight symbols. Let a full RTT pass before its local anchor;
+        // this is bounded settlement, not an upper bound on feedback delay.
+        // Reports do not renew the activity/pace anchor. A later qualified
+        // window can still expose a persistent deficit. Missing RTT waits
+        // 500 ms; the settlement period is capped at the freshness horizon.
+        let service_settle_us = rtt.map_or(PROBE_US, |ms| {
+            (ms.min(FRESH_US as f64 / 1000.0) * 1000.0).ceil() as u64
+        });
+        // Recovery timing can advance on a capped no-op. It retains its old
+        // qualification below, but cannot renew this additional settlement.
+        let positive_settlement_since_us = activity_since_us.map(|since| {
+            since.max(
+                self.rate_changes
+                    .back()
+                    .map_or(self.born_us, |change| change.at_us),
+            )
+        });
         let service_admission = service_sample.and_then(|sample| {
             sample.admission.map(|admission| ServiceAdmission {
                 symbol_bytes: admission.symbol_bytes,
@@ -1392,12 +1413,17 @@ impl PathController {
                 backlog_since_us: self.backlog_since_us,
                 activity_since_us,
                 last_pace_change_us: last_pace_change,
+                positive_settlement_since_us,
                 deficit: new_service_report
                     && admission.span_us >= PROBE_US
                     && admission.symbols >= 8
                     && admission.bps > 0.0
                     && admission.started_us >= last_pace_change
                     && activity_since_us.is_some_and(|since| since <= admission.started_us)
+                    && (sample.bps == 0.0
+                        || positive_settlement_since_us.is_some_and(|since| {
+                            admission.started_us.saturating_sub(since) >= service_settle_us
+                        }))
                     && sample.bps < admission.bps * 0.85
                     && wire_delivery_bps
                         .is_some_and(|rate| rate < self.rate_bps as f64 * 0.85)
@@ -2771,6 +2797,427 @@ impl PathController {
 mod tests {
     use super::*;
     use std::collections::VecDeque;
+
+    #[derive(serde::Serialize)]
+    struct DeficitDelayReplay {
+        forward_us: u64,
+        report_return_us: u64,
+        drop_every: u64,
+        rate_step_bps: Option<u64>,
+        measured_rtt_ms: Option<f64>,
+        cautious_at_cap: bool,
+        capped_growth_clock_us: Vec<u64>,
+        sent_symbols: u64,
+        sent_bytes: u64,
+        received_bytes: u64,
+        finalized_expected: u64,
+        finalized_lost: u64,
+        first_deficit: Option<RateChange>,
+        cautious_at_first_deficit: bool,
+        remembered_bps_at_first_deficit: f64,
+        final_pacing_bps: u64,
+        final_remembered_bps: f64,
+        final_cautious: bool,
+    }
+
+    fn deficit_delay_replay(
+        forward_us: u64,
+        report_return_us: u64,
+        drop_every: u64,
+    ) -> DeficitDelayReplay {
+        deficit_delay_replay_case(forward_us, report_return_us, drop_every, None, None, false)
+    }
+
+    fn deficit_delay_replay_case(
+        forward_us: u64,
+        report_return_us: u64,
+        drop_every: u64,
+        rate_step_bps: Option<u64>,
+        measured_rtt_override: Option<f64>,
+        cautious_at_cap: bool,
+    ) -> DeficitDelayReplay {
+        // Receiver and sender have different clock origins. Both directions
+        // advance through actual event times, never by subtracting the origins.
+        const RECEIVER_EPOCH_US: u64 = 100_000_000;
+        const STEP_AT: u64 = 720_000;
+        let started_at = if cautious_at_cap { 100_000 } else { 0 };
+        let busy_at = if cautious_at_cap {
+            started_at
+        } else if rate_step_bps.is_some() {
+            0
+        } else {
+            STEP_AT
+        };
+        let stop_at = if measured_rtt_override.is_some() {
+            6_750_000
+        } else {
+            2_750_000
+        };
+        let end_at = if measured_rtt_override.is_some() {
+            11_000_000
+        } else {
+            4_000_000
+        };
+        // Delay finalization in the RTT-bound and capped-caution cases so an
+        // ordinary-loss brake cannot mask the paired deficit's finite bound.
+        let finalization_lag = if measured_rtt_override.is_some() {
+            FRESH_US
+        } else {
+            PROBE_US
+        };
+        let rtt_us = (forward_us + report_return_us).max(1_000);
+        let rtt_ms = measured_rtt_override.unwrap_or(rtt_us as f64 / 1000.0);
+        let mut controller = PathController::new(START_BPS, 100);
+        let mut initial = observation(started_at, rtt_ms);
+        initial.report_number = 0;
+        initial.delivered_bytes = 0;
+        initial.delivered_bps = Some(0.0);
+        initial.delivery_report_time_us = None;
+        initial.delivery_sample_span_us = 100_000;
+        initial.finalized_expected = Some(0);
+        initial.finalized_lost = Some(0);
+        initial.admitted_symbols = Some(0);
+        initial.admitted_symbol_bytes = Some(0);
+        initial.feedback_sample_symbols = 0;
+        initial.feedback_age_us = None;
+        initial.positive_delivery_age_us = None;
+        initial.offered_backlog = false;
+        initial.probe_age_us = None;
+        initial.probe_rtt_ms = None;
+        initial.probe_latest_rtt_ms = None;
+        controller.observe(&initial);
+        controller.congestion_seen = cautious_at_cap;
+
+        // (actual admission time, measured symbol bytes, deliberately lost).
+        let mut packets: Vec<(u64, u64, bool)> = Vec::new();
+        // (feedback arrival, receiver report time, bytes, finalized N/lost).
+        let mut reports: VecDeque<(u64, u64, u64, u64, u64)> = VecDeque::new();
+        // All cases observe report endpoints at 250, 350, ... ms. When bulk
+        // starts at 720 ms, the second disjoint window starts 30 ms after that
+        // onset; recent warmup admissions belong to the older activity segment.
+        let mut next_receiver_report = 250_000 - report_return_us;
+        let mut report_number = 0;
+        let mut business_symbols = 0;
+        let mut previous_received = 0;
+        let mut previous_expected = 0;
+        let mut previous_lost = 0;
+        let mut previous_receiver_report = 0;
+        let mut last_positive_report = None;
+        let mut last_finalized_report = None;
+        let mut first_deficit = None;
+        let mut cautious_at_first_deficit = false;
+        let mut remembered_at_first_deficit = 0.0;
+        let mut capped_growth_clock_us = Vec::new();
+        for now in (started_at..=end_at).step_by(1_000) {
+            if now % 100_000 == 0 {
+                controller.probe_admitted(now);
+            }
+            if now == STEP_AT
+                && let Some(next_rate) = rate_step_bps
+            {
+                // Isolate a pace transition from activity startup. Settle the
+                // real pacer's old-rate integral first, and mint no credit.
+                controller.refill(now);
+                let previous = controller.rate_bps;
+                controller.maximum_bps = next_rate;
+                controller.rate_bps = next_rate;
+                controller.last_growth_us = now;
+                controller.record_rate_change(now, previous, RateReason::InitialGrowth);
+            }
+            if now < busy_at && now % 200_000 == 0 {
+                // Sparse, already established interactive traffic before bulk.
+                assert!(controller.allow(now, 263, 0.0));
+                controller.admitted_symbol(now, 263, 153);
+                packets.push((now, 153, false));
+            }
+            if (busy_at..stop_at).contains(&now) {
+                loop {
+                    let body = if business_symbols % 14 == 13 {
+                        153
+                    } else {
+                        1025
+                    };
+                    if !controller.allow(now, (body + 110) as usize, 0.0) {
+                        break;
+                    }
+                    controller.admitted_symbol(now, (body + 110) as usize, body as usize);
+                    business_symbols += 1;
+                    let lost = drop_every > 0
+                        && (!cautious_at_cap || now >= PROBE_US)
+                        && business_symbols % drop_every == 0;
+                    packets.push((now, body, lost));
+                }
+            }
+            if now == next_receiver_report {
+                let received = packets
+                    .iter()
+                    .filter(|(at, _, lost)| !lost && at + forward_us <= now)
+                    .map(|(_, bytes, _)| bytes)
+                    .sum();
+                // A finite finalization lag keeps in-flight packets out of
+                // finalized loss. Every no-loss packet is eventually received.
+                let finalized: Vec<_> = packets
+                    .iter()
+                    .filter(|(at, _, _)| at + forward_us + finalization_lag <= now)
+                    .collect();
+                let expected = finalized.len() as u64;
+                let lost = finalized.iter().filter(|(_, _, lost)| *lost).count() as u64;
+                reports.push_back((now + report_return_us, now, received, expected, lost));
+                next_receiver_report += 100_000;
+            }
+            while reports.front().is_some_and(|(arrival, ..)| *arrival == now) {
+                let (_, receiver_at, received, expected, lost) = reports.pop_front().unwrap();
+                report_number += 1;
+                if received > previous_received {
+                    last_positive_report = Some(now);
+                }
+                if expected > previous_expected {
+                    last_finalized_report = Some(now);
+                }
+                let span = receiver_at - previous_receiver_report;
+                let mut sample = observation(now, rtt_ms);
+                sample.report_number = report_number;
+                sample.delivered_bytes = received;
+                sample.delivered_bps =
+                    Some((received - previous_received) as f64 * 8_000_000.0 / span as f64);
+                sample.delivery_report_time_us = Some(RECEIVER_EPOCH_US + receiver_at);
+                sample.delivery_sample_span_us = span;
+                sample.finalized_expected = Some(expected);
+                sample.finalized_lost = Some(lost);
+                sample.feedback_sample_symbols = expected - previous_expected;
+                sample.loss_sample_rate = (expected > previous_expected)
+                    .then(|| (lost - previous_lost) as f64 / (expected - previous_expected) as f64);
+                sample.loss_rate = if expected == 0 {
+                    0.0
+                } else {
+                    lost as f64 / expected as f64
+                };
+                sample.admitted_symbols = Some(packets.len() as u64);
+                sample.admitted_symbol_bytes =
+                    Some(packets.iter().map(|(_, bytes, _)| bytes).sum());
+                sample.offered_backlog = (busy_at..stop_at).contains(&now);
+                sample.feedback_age_us = last_finalized_report.map(|at| now - at);
+                sample.positive_delivery_age_us = last_positive_report.map(|at| now - at);
+                if now >= rtt_us {
+                    let request = (now - rtt_us) / 100_000 * 100_000;
+                    sample.probe_sample_id = request / 100_000 + 1;
+                    sample.probe_age_us = Some(now - request - rtt_us);
+                } else {
+                    sample.probe_age_us = None;
+                    sample.probe_rtt_ms = None;
+                    sample.probe_latest_rtt_ms = None;
+                }
+                let previous_rate = controller.rate_bps;
+                let previous_growth = controller.last_growth_us;
+                controller.observe(&sample);
+                if controller.rate_bps == previous_rate
+                    && controller.last_growth_us > previous_growth
+                {
+                    capped_growth_clock_us.push(now);
+                }
+                if first_deficit.is_none()
+                    && let Some(change) = controller.rate_changes.back()
+                    && matches!(change.reason, RateReason::DeliveryShortfallBrake)
+                {
+                    first_deficit = Some(change.clone());
+                    cautious_at_first_deficit = controller.congestion_seen;
+                    remembered_at_first_deficit = controller.remembered_bps;
+                }
+                previous_received = received;
+                previous_expected = expected;
+                previous_lost = lost;
+                previous_receiver_report = receiver_at;
+            }
+        }
+        let sent_bytes = packets.iter().map(|(_, bytes, _)| bytes).sum();
+        let received_bytes = packets
+            .iter()
+            .filter(|(_, _, lost)| !lost)
+            .map(|(_, bytes, _)| bytes)
+            .sum();
+        assert_eq!(
+            previous_received, received_bytes,
+            "all surviving packets and feedback drained"
+        );
+        assert_eq!(
+            previous_expected,
+            packets.len() as u64,
+            "all sent packets finalized"
+        );
+        DeficitDelayReplay {
+            forward_us,
+            report_return_us,
+            drop_every,
+            rate_step_bps,
+            measured_rtt_ms: rtt_ms.is_finite().then_some(rtt_ms),
+            cautious_at_cap,
+            capped_growth_clock_us,
+            sent_symbols: packets.len() as u64,
+            sent_bytes,
+            received_bytes,
+            finalized_expected: previous_expected,
+            finalized_lost: previous_lost,
+            first_deficit,
+            cautious_at_first_deficit,
+            remembered_bps_at_first_deficit: remembered_at_first_deficit,
+            final_pacing_bps: controller.rate_bps,
+            final_remembered_bps: controller.remembered_bps,
+            final_cautious: controller.congestion_seen,
+        }
+    }
+
+    #[test]
+    fn loss_free_report_phase_cannot_establish_capacity_deficit() {
+        let mut false_deficits = Vec::new();
+        for forward in [0, 50_000, 80_000, 120_000] {
+            for report_return in [0, 50_000, 80_000, 120_000] {
+                let result = deficit_delay_replay(forward, report_return, 0);
+                assert_eq!(result.sent_bytes, result.received_bytes);
+                assert_eq!(result.finalized_lost, 0);
+                eprintln!("delay_fixture {}", serde_json::to_string(&result).unwrap());
+                if result.first_deficit.is_some() {
+                    false_deficits.push((forward, report_return));
+                }
+            }
+        }
+        assert!(
+            false_deficits.is_empty(),
+            "all business datagrams were delivered; false deficits at {false_deficits:?}"
+        );
+    }
+
+    #[test]
+    fn delayed_report_phase_still_brakes_sustained_actual_missing_data() {
+        for (forward, report_return) in [(0, 0), (50_000, 50_000), (120_000, 120_000)] {
+            let result = deficit_delay_replay(forward, report_return, 3);
+            assert!(result.finalized_lost > 0);
+            assert!(result.received_bytes < result.sent_bytes);
+            assert!(
+                result.first_deficit.is_some(),
+                "sustained one-third loss must retain the deficit brake"
+            );
+            assert!(result.first_deficit.as_ref().unwrap().at_us <= 2_250_000);
+            eprintln!(
+                "actual_missing_fixture {}",
+                serde_json::to_string(&result).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn loss_free_report_phase_after_rate_step_cannot_establish_capacity_deficit() {
+        let mut false_deficits = Vec::new();
+        for (forward, report_return) in [
+            (0, 0),
+            (50_000, 50_000),
+            (80_000, 120_000),
+            (120_000, 120_000),
+        ] {
+            let result = deficit_delay_replay_case(
+                forward,
+                report_return,
+                0,
+                Some(START_BPS * 2),
+                None,
+                false,
+            );
+            assert_eq!(result.sent_bytes, result.received_bytes);
+            assert_eq!(result.finalized_lost, 0);
+            eprintln!(
+                "rate_step_fixture {}",
+                serde_json::to_string(&result).unwrap()
+            );
+            if result.first_deficit.is_some() {
+                false_deficits.push((forward, report_return));
+            }
+        }
+        assert!(
+            false_deficits.is_empty(),
+            "a real rate step with all datagrams delivered caused deficits at {false_deficits:?}"
+        );
+    }
+
+    #[test]
+    fn deficit_settlement_with_missing_or_extreme_rtt_is_bounded() {
+        for (rtt, expected_at) in [
+            (0.0, 1_750_000),
+            (-1.0, 1_750_000),
+            (f64::NAN, 1_750_000),
+            (f64::INFINITY, 1_750_000),
+            (3_001.0, 4_250_000),
+            (f64::MAX, 4_250_000),
+        ] {
+            let result = deficit_delay_replay_case(50_000, 50_000, 3, None, Some(rtt), false);
+            eprintln!(
+                "bounded_rtt_fixture rtt={rtt:?} {}",
+                serde_json::to_string(&result).unwrap()
+            );
+            assert!(result.finalized_lost > 0);
+            assert!(result.received_bytes < result.sent_bytes);
+            let first = result
+                .first_deficit
+                .as_ref()
+                .expect("sustained actual missing data must reach the paired deficit brake");
+            assert_eq!(
+                first.at_us, expected_at,
+                "a finite settlement must not defer true deficit indefinitely: {rtt:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn zero_service_does_not_wait_for_positive_deficit_settlement() {
+        let result = deficit_delay_replay_case(50_000, 50_000, 1, None, Some(f64::MAX), false);
+        eprintln!(
+            "zero_service_fixture {}",
+            serde_json::to_string(&result).unwrap()
+        );
+        assert!(result.finalized_lost > 0);
+        let first = result
+            .first_deficit
+            .as_ref()
+            .expect("zero service must brake");
+        assert_eq!(first.control.service_symbol_delivery_bps, Some(0.0));
+        assert!(
+            first.at_us <= 1_750_000,
+            "zero service must not wait for the three-second positive-service cap"
+        );
+        assert!(first.control.service_admission.as_ref().unwrap().deficit);
+    }
+
+    #[test]
+    fn capped_cautious_noop_cannot_renew_positive_deficit_settlement() {
+        // Start with healthy busy service, then lose each third symbol from
+        // 500 ms onward. Finalization lags three seconds; the paired service
+        // check must work while loss counts are still immature.
+        let result = deficit_delay_replay_case(50_000, 50_000, 3, None, Some(100.0), true);
+        eprintln!(
+            "capped_caution_fixture {}",
+            serde_json::to_string(&result).unwrap()
+        );
+        assert!(result.finalized_lost > 0);
+        assert!(
+            result
+                .capped_growth_clock_us
+                .iter()
+                .any(|at| *at <= 750_000)
+        );
+        let first = result
+            .first_deficit
+            .as_ref()
+            .expect("continuous positive deficit must brake");
+        assert!(
+            first.at_us <= 1_750_000,
+            "capped growth attempts must not renew settlement at an unchanged pace"
+        );
+        assert!(!first.control.ordinary_loss_pressure);
+        assert!(!first.control.fast_loss);
+        let paired = first.control.service_admission.as_ref().unwrap();
+        assert!(paired.deficit);
+        assert_eq!(paired.started_us, 750_000);
+        assert_eq!(paired.last_pace_change_us, 750_000);
+        assert_eq!(paired.positive_settlement_since_us, Some(100_000));
+    }
 
     fn paired_loss_service_fixture() -> (PathController, Observation) {
         let now = 18_600_711;
