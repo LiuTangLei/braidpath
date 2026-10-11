@@ -2166,10 +2166,14 @@ impl PathController {
                     || (!growth_probe_ready && self.discovery_service_window(now).is_some())
                     || (probe_covered_loss && elapsed < PROBE_US)
                     || (waiting_for_drain_window && elapsed < PROBE_US)
-                    // Meeting the exercise floor cannot restart this same
-                    // pacing interval while its owned monitor still gates
-                    // growth. Retain actual use, not permission to increase.
-                    || (self.growth_monitor.is_some() && elapsed < PROBE_US)
+                    // Independent measurement may keep the actual same-pace
+                    // interval while its monitor gates growth, even after use
+                    // reaches 90%. Without a qualified reference, ordinary
+                    // monitoring retains its original settlement behavior.
+                    // This retains actual use, not permission to increase.
+                    || (self.growth_monitor.is_some()
+                        && probe_reference.is_some()
+                        && elapsed < PROBE_US)
                     // Whole datagrams can underfill one short tick despite
                     // continuous demand. Keep actual admissions at the same
                     // pace for at most one service horizon; the original 90%
@@ -2850,19 +2854,38 @@ mod tests {
     }
 
     fn quantized_admission_at_rate(rate: u64) -> (PathController, Observation) {
+        quantized_admission_with_probe(rate, false)
+    }
+
+    fn observe_monitor_fixture(
+        controller: &mut PathController,
+        sample: &Observation,
+        guided: bool,
+    ) {
+        if guided {
+            controller.observe_with_delivery_probe(
+                sample,
+                &probe_service::tests::probe(sample.now_us / 100_000),
+            );
+        } else {
+            controller.observe(sample);
+        }
+    }
+
+    fn quantized_admission_with_probe(rate: u64, guided: bool) -> (PathController, Observation) {
         let mut controller = PathController::new(rate, 20);
         let mut sample = short_observation_022(0, 80.0);
         sample.delivered_bytes = 0;
         sample.delivered_bps = Some(0.0);
         sample.admitted_symbols = Some(0);
         sample.admitted_symbol_bytes = Some(0);
-        controller.observe(&sample);
+        observe_monitor_fixture(&mut controller, &sample, guided);
         controller.tokens = 0.0;
         for now in (100_000..=1_000_000).step_by(100_000) {
             controller.probe_admitted(now - 100_000);
             sample = wire_admitted_report_060(&mut controller, &sample, now);
             sample.probe_age_us = Some(20_000);
-            controller.observe(&sample);
+            observe_monitor_fixture(&mut controller, &sample, guided);
         }
         assert_eq!(controller.rate_bps, rate);
         controller.maximum_bps = 20_000_000;
@@ -2877,13 +2900,13 @@ mod tests {
         (controller, sample)
     }
 
-    fn exercised_pending_monitor_077() -> (PathController, Observation, u64) {
-        let (mut controller, mut sample) = quantized_admission_at_rate(138_000);
+    fn exercised_pending_monitor_077(guided: bool) -> (PathController, Observation, u64) {
+        let (mut controller, mut sample) = quantized_admission_with_probe(138_000, guided);
         for now in [1_100_000, 1_200_000] {
             controller.probe_admitted(now - 100_000);
             sample = wire_admitted_report_060(&mut controller, &sample, now);
             sample.probe_age_us = Some(20_000);
-            controller.observe(&sample);
+            observe_monitor_fixture(&mut controller, &sample, guided);
         }
         let grown = controller.rate_bps;
         assert!(grown > 138_000);
@@ -2897,12 +2920,12 @@ mod tests {
         sample = wire_admitted_report_060(&mut controller, &sample, 1_300_000);
         sample.probe_sample_id = before_reply;
         sample.probe_age_us = Some(120_000);
-        controller.observe(&sample);
+        observe_monitor_fixture(&mut controller, &sample, guided);
         controller.probe_admitted(1_350_000);
         sample = wire_admitted_report_060(&mut controller, &sample, 1_400_000);
         sample.probe_sample_id = before_reply + 1;
         sample.probe_age_us = Some(70_000);
-        controller.observe(&sample);
+        observe_monitor_fixture(&mut controller, &sample, guided);
         assert_eq!(
             controller.rate_bps, grown,
             "second owned reply is still owed"
@@ -2916,7 +2939,7 @@ mod tests {
 
     #[test]
     fn a_pending_growth_monitor_keeps_exercised_actual_admissions() {
-        let (mut controller, mut sample, before_reply) = exercised_pending_monitor_077();
+        let (mut controller, mut sample, before_reply) = exercised_pending_monitor_077(true);
         let grown = controller.rate_bps;
         assert_eq!(
             controller.last_control_us, 1_200_000,
@@ -2929,7 +2952,7 @@ mod tests {
         sample = wire_admitted_report_060(&mut controller, &sample, 1_500_000);
         sample.probe_sample_id = before_reply + 2;
         sample.probe_age_us = Some(70_000);
-        controller.observe(&sample);
+        observe_monitor_fixture(&mut controller, &sample, true);
         // The next whole packet has not earned enough credit at 300ms.
         // Settling the monitor cannot bypass the unchanged 90% floor.
         assert_eq!(controller.rate_bps, grown);
@@ -2941,7 +2964,7 @@ mod tests {
         sample = wire_admitted_report_060(&mut controller, &sample, 1_600_000);
         sample.probe_sample_id = before_reply + 2;
         sample.probe_age_us = Some(170_000);
-        controller.observe(&sample);
+        observe_monitor_fixture(&mut controller, &sample, true);
         assert!(controller.rate_bps > grown);
         assert_eq!(controller.last_control.admission_span_us, 400_000);
         assert!(
@@ -2953,7 +2976,7 @@ mod tests {
     #[test]
     fn pending_monitor_admissions_still_settle_on_expiry_idle_pressure_or_generation() {
         for guard in ["horizon", "idle", "blocked", "queue", "stale", "generation"] {
-            let (mut controller, previous, _) = exercised_pending_monitor_077();
+            let (mut controller, previous, _) = exercised_pending_monitor_077(true);
             let epoch = 1_200_000;
             let now = if guard == "horizon" {
                 epoch + PROBE_US
@@ -2992,6 +3015,18 @@ mod tests {
             assert_eq!(controller.admitted_bytes, 0, "{guard}");
             assert_eq!(controller.allowance_bytes, 0.0, "{guard}");
         }
+    }
+
+    #[test]
+    fn unqualified_monitor_cannot_hold_an_exercised_business_window() {
+        let (controller, _, _) = exercised_pending_monitor_077(false);
+        assert!(controller.probe_service.reference(1_400_000).is_none());
+        assert_eq!(
+            controller.last_control_us, 1_400_000,
+            "an ordinary monitor without independent measurement retains its original settlement"
+        );
+        assert_eq!(controller.admitted_bytes, 0);
+        assert_eq!(controller.allowance_bytes, 0.0);
     }
 
     #[test]
