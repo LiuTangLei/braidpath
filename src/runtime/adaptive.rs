@@ -2341,7 +2341,10 @@ impl PathController {
         });
         let effective_loss =
             weight_loss.map(|(sample, _)| self.weight_window.effective_rate(sample.rate));
-        let reliability = effective_loss.map_or(1.0, |loss| (1.0 - loss).powi(4).clamp(0.25, 1.0));
+        // Weight expected delivered service. Applying the fourth power before
+        // the retained-share floor made every loss above ~29% indistinguishable.
+        // Admission and independent probes still enforce their existing bounds.
+        let reliability = effective_loss.map_or(1.0, |loss| (1.0 - loss).clamp(0.25, 1.0));
         let base_weight = ((self.rate_bps as f64 / 64_000.0)
             / (1.0
                 + self.min_rtt_ms.unwrap_or(50.0) / 50.0
@@ -7543,6 +7546,47 @@ mod tests {
     }
 
     #[test]
+    fn heavily_impaired_paths_keep_distinct_expected_delivery_shares() {
+        use crate::runtime::scheduler::Scheduler;
+        // All paths have the same low admission allowance and RTT. Independent
+        // readiness cannot explain away a loss of quality ordering here.
+        let paths: [PathController; 4] = std::array::from_fn(|id| {
+            let mut path = PathController::new(MIN_BPS, 20);
+            let lost = if id == 1 { 12 } else { 15 };
+            path.observe(&weight_observation_016(
+                0,
+                1,
+                20,
+                lost,
+                lost as f64 / 20.0,
+                80.0,
+            ));
+            assert_eq!(path.decision(0).pacing_bps, MIN_BPS);
+            assert!(path.decision(0).eligible);
+            path
+        });
+        let weights: Vec<_> = paths
+            .iter()
+            .enumerate()
+            .map(|(id, path)| (id as u8, path.decision(0).weight))
+            .collect();
+        assert!(
+            weights[1].1 > weights[0].1,
+            "distinct retained fractions: {weights:?}"
+        );
+        let mut scheduler = Scheduler::default();
+        let mut admitted = [0; 4];
+        for _ in 0..1800 {
+            let actual = scheduler.order(&weights, 183)[0];
+            scheduler.commit(&weights, actual, 183);
+            admitted[usize::from(actual)] += 1;
+        }
+        assert_eq!(admitted, [400, 600, 400, 400]);
+        // Unknown and expired evidence retain the original neutral weight.
+        assert_eq!(paths[1].decision(FRESH_US + 1).weight, 16);
+    }
+
+    #[test]
     fn weight_016_sparse_finalized_quality_changes_share_without_pacing_collapse() {
         let mut controller = PathController::new(8_000_000, 20);
         controller.observe(&weight_observation_016(0, 1, 32, 0, 0.0, 150.0));
@@ -7708,10 +7752,18 @@ mod tests {
         controller.observe(&weight_observation_016(0, 1, 32, 8, 0.25, 150.0));
         let bad = controller.decision(0).weight;
         controller.observe(&weight_observation_016(500_000, 2, 36, 8, 0.0, 150.0));
-        let recovered = controller.decision(500_000);
+        let sparse_recovery = controller.decision(500_000);
+        assert!(sparse_recovery.weight >= bad);
+        assert_eq!(sparse_recovery.weight_loss_rate, Some(0.0));
+        assert_eq!(sparse_recovery.weight_loss_report, Some(2));
+        assert_eq!(sparse_recovery.weight_loss_effective_rate, Some(8.0 / 36.0));
+        // Four symbols improve the retained fraction but round to the same
+        // integer under the linear policy. Further actual evidence must cross
+        // the next weight unit; an empty/raw-only report cannot do so.
+        controller.observe(&weight_observation_016(550_000, 3, 40, 8, 0.0, 150.0));
+        let recovered = controller.decision(550_000);
         assert!(recovered.weight > bad);
-        assert_eq!(recovered.weight_loss_rate, Some(0.0));
-        assert_eq!(recovered.weight_loss_report, Some(2));
+        assert_eq!(recovered.weight, 13);
         let mut next = weight_observation_016(600_000, 0, 0, 0, 0.0, 150.0);
         next.generation += 1;
         controller.observe(&next);
@@ -7856,7 +7908,7 @@ mod tests {
         assert_eq!(resumed.weight_loss_window_lost, Some(8));
         assert_eq!(resumed.weight_loss_window_oldest_age_us, Some(0));
         assert_eq!(resumed.weight_loss_effective_rate, Some(0.5));
-        assert_eq!(resumed.weight, neutral / 4);
+        assert_eq!(resumed.weight, neutral / 2);
         assert_eq!(resumed.pacing_bps, START_BPS);
     }
 
@@ -7901,9 +7953,19 @@ mod tests {
             assert_eq!(path.decision(5_000_000).pacing_bps, START_BPS);
             assert!(path.decision(5_000_000).eligible);
         }
-        let impaired = choose(&mut scheduler, &weights(&paths, 5_000_000));
+        let impaired_weights = weights(&paths, 5_000_000);
+        let impaired = choose(&mut scheduler, &impaired_weights);
         assert!(impaired[1] > 0);
-        assert!(impaired[1] < initial[1] / 2);
+        assert!(impaired[1] < initial[1]);
+        // Retained delivery now scales the impaired path by 3/4, rather
+        // than a fourth-power penalty. Verify that exact service entitlement.
+        assert_eq!(impaired_weights[1].1 * 4, initial_weights[1].1 * 3);
+        let expected = 700 * impaired_weights[1].1 as usize
+            / impaired_weights
+                .iter()
+                .map(|(_, w)| *w as usize)
+                .sum::<usize>();
+        assert!(impaired[1].abs_diff(expected) <= 1);
         for (id, path) in paths.iter_mut().enumerate() {
             path.observe(&weight_observation_016(
                 5_500_000,
