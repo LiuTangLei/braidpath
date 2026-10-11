@@ -2166,6 +2166,10 @@ impl PathController {
                     || (!growth_probe_ready && self.discovery_service_window(now).is_some())
                     || (probe_covered_loss && elapsed < PROBE_US)
                     || (waiting_for_drain_window && elapsed < PROBE_US)
+                    // Meeting the exercise floor cannot restart this same
+                    // pacing interval while its owned monitor still gates
+                    // growth. Retain actual use, not permission to increase.
+                    || (self.growth_monitor.is_some() && elapsed < PROBE_US)
                     // Whole datagrams can underfill one short tick despite
                     // continuous demand. Keep actual admissions at the same
                     // pace for at most one service horizon; the original 90%
@@ -2871,6 +2875,123 @@ mod tests {
         controller.admitted_symbol_bytes = 0;
         controller.allowance_bytes = 0.0;
         (controller, sample)
+    }
+
+    fn exercised_pending_monitor_077() -> (PathController, Observation, u64) {
+        let (mut controller, mut sample) = quantized_admission_at_rate(138_000);
+        for now in [1_100_000, 1_200_000] {
+            controller.probe_admitted(now - 100_000);
+            sample = wire_admitted_report_060(&mut controller, &sample, now);
+            sample.probe_age_us = Some(20_000);
+            controller.observe(&sample);
+        }
+        let grown = controller.rate_bps;
+        assert!(grown > 138_000);
+        assert_eq!(
+            controller.growth_monitor.as_ref().unwrap().armed_us,
+            1_200_000
+        );
+        controller.tokens = 0.0;
+        let before_reply = sample.probe_sample_id;
+        controller.probe_admitted(1_250_000);
+        sample = wire_admitted_report_060(&mut controller, &sample, 1_300_000);
+        sample.probe_sample_id = before_reply;
+        sample.probe_age_us = Some(120_000);
+        controller.observe(&sample);
+        controller.probe_admitted(1_350_000);
+        sample = wire_admitted_report_060(&mut controller, &sample, 1_400_000);
+        sample.probe_sample_id = before_reply + 1;
+        sample.probe_age_us = Some(70_000);
+        controller.observe(&sample);
+        assert_eq!(
+            controller.rate_bps, grown,
+            "second owned reply is still owed"
+        );
+        assert!(
+            controller.last_control.admitted_bytes as f64
+                >= controller.last_control.integrated_allowance_bytes * 0.9
+        );
+        (controller, sample, before_reply)
+    }
+
+    #[test]
+    fn a_pending_growth_monitor_keeps_exercised_actual_admissions() {
+        let (mut controller, mut sample, before_reply) = exercised_pending_monitor_077();
+        let grown = controller.rate_bps;
+        assert_eq!(
+            controller.last_control_us, 1_200_000,
+            "meeting the exercise floor while waiting is not a pacing change"
+        );
+        assert_eq!(
+            controller.admitted_bytes,
+            controller.last_control.admitted_bytes
+        );
+        sample = wire_admitted_report_060(&mut controller, &sample, 1_500_000);
+        sample.probe_sample_id = before_reply + 2;
+        sample.probe_age_us = Some(70_000);
+        controller.observe(&sample);
+        // The next whole packet has not earned enough credit at 300ms.
+        // Settling the monitor cannot bypass the unchanged 90% floor.
+        assert_eq!(controller.rate_bps, grown);
+        assert_eq!(controller.last_control.admission_span_us, 300_000);
+        assert!(
+            (controller.last_control.admitted_bytes as f64)
+                < controller.last_control.integrated_allowance_bytes * 0.9
+        );
+        sample = wire_admitted_report_060(&mut controller, &sample, 1_600_000);
+        sample.probe_sample_id = before_reply + 2;
+        sample.probe_age_us = Some(170_000);
+        controller.observe(&sample);
+        assert!(controller.rate_bps > grown);
+        assert_eq!(controller.last_control.admission_span_us, 400_000);
+        assert!(
+            controller.last_control.admitted_bytes as f64
+                >= controller.last_control.integrated_allowance_bytes * 0.9
+        );
+    }
+
+    #[test]
+    fn pending_monitor_admissions_still_settle_on_expiry_idle_pressure_or_generation() {
+        for guard in ["horizon", "idle", "blocked", "queue", "stale", "generation"] {
+            let (mut controller, previous, _) = exercised_pending_monitor_077();
+            let epoch = 1_200_000;
+            let now = if guard == "horizon" {
+                epoch + PROBE_US
+            } else {
+                previous.now_us + 100_000
+            };
+            let mut sample = wire_admitted_report_060(&mut controller, &previous, now);
+            // No second reply arrived. Its genuine age increases normally.
+            sample.probe_sample_id = previous.probe_sample_id;
+            sample.probe_age_us = Some(previous.probe_age_us.unwrap() + now - previous.now_us);
+            match guard {
+                "horizon" => {
+                    // Isolate this bounded monitor hold from independently
+                    // qualified service/probe-credit holds.
+                    controller.service_window = service::Window::default();
+                }
+                "idle" => sample.offered_backlog = false,
+                "blocked" => {
+                    sample.transport_blocked = true;
+                    sample.send_queue_bytes = 20_000;
+                }
+                "queue" => {
+                    sample.rtt_ms = 200.0;
+                    sample.probe_latest_rtt_ms = Some(200.0);
+                }
+                "stale" => {
+                    sample.positive_delivery_age_us = Some(FRESH_US + 1);
+                    sample.feedback_age_us = Some(FRESH_US + 1);
+                    sample.probe_age_us = Some(FRESH_US + 1);
+                }
+                "generation" => sample.generation += 1,
+                _ => unreachable!(),
+            }
+            controller.observe(&sample);
+            assert_eq!(controller.last_control_us, now, "{guard}");
+            assert_eq!(controller.admitted_bytes, 0, "{guard}");
+            assert_eq!(controller.allowance_bytes, 0.0, "{guard}");
+        }
     }
 
     #[test]
