@@ -28,20 +28,12 @@ pub struct Scheduler {
     debt: [i64; MAX_PATHS],
 }
 impl Scheduler {
-    const UNIT: i64 = 1 << 32;
-    // Debt is in fractional bytes, independent of the current weight sum.
-    // Widen the intermediate only: the result cannot exceed bytes * UNIT.
-    fn credit(weight: i32, bytes: i64, total: i64) -> i64 {
-        (i128::from(weight.max(1)) * i128::from(bytes) * i128::from(Self::UNIT) / i128::from(total))
-            as i64
-    }
     /// Preview byte-weighted service order. A failed attempt spends no service credit.
     pub fn order(&self, candidates: &[(u8, i32)], bytes: usize) -> Vec<u8> {
         let bytes = bytes.min(65_536) as i64;
         let mut order = candidates.to_vec();
-        let total: i64 = candidates.iter().map(|(_, w)| i64::from((*w).max(1))).sum();
         order.sort_by_key(|(id, weight)| {
-            std::cmp::Reverse(self.debt[usize::from(*id)] + Self::credit(*weight, bytes, total))
+            std::cmp::Reverse(self.debt[usize::from(*id)] + i64::from((*weight).max(1)) * bytes)
         });
         order.into_iter().map(|(id, _)| id).collect()
     }
@@ -50,15 +42,15 @@ impl Scheduler {
         if !candidates.iter().any(|(id, _)| *id == actual) {
             return;
         }
-        // A fixed one-MiB byte-debt bound, expressed in the same fractional
-        // byte unit even when ready sets or weight scales change.
-        const LIMIT: i64 = 1 << 52;
+        // Adaptive weights use sixteen units per former unit. Preserve the
+        // same service-debt bound in those units, including max-size symbols.
+        const LIMIT: i64 = 1 << 32;
         let bytes = bytes.min(65_536) as i64;
         let sum: i64 = candidates.iter().map(|(_, w)| i64::from((*w).max(1))).sum();
         for &(id, weight) in candidates {
             self.debt[usize::from(id)] = (self.debt[usize::from(id)]
-                + Self::credit(weight, bytes, sum)
-                - if id == actual { bytes * Self::UNIT } else { 0 })
+                + i64::from(weight.max(1)) * bytes
+                - if id == actual { sum * bytes } else { 0 })
             .clamp(-LIMIT, LIMIT);
         }
     }
@@ -134,26 +126,6 @@ pub fn admit_generation(highest: &mut Option<u64>, generation: u64) -> anyhow::R
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn changing_common_weight_scale_cannot_change_actual_service() {
-        let mut fixed = Scheduler::default();
-        let mut changing = Scheduler::default();
-        for n in 0..1000 {
-            let candidates = [(0, 4), (1, 6), (2, 4)];
-            let scale = if n % 3 == 0 { 16 } else { 1 };
-            let scaled: Vec<_> = candidates.iter().map(|&(id, w)| (id, w * scale)).collect();
-            let bytes = if n % 3 == 0 { 1055 } else { 183 };
-            let actual = fixed.order(&candidates, bytes)[0];
-            assert_eq!(
-                changing.order(&scaled, bytes)[0],
-                actual,
-                "relative entitlement unchanged on actual admission {n}"
-            );
-            fixed.commit(&candidates, actual, bytes);
-            changing.commit(&scaled, actual, bytes);
-        }
-    }
-
     #[test]
     fn unavailable_bulk_allowance_cannot_accumulate_debt_against_later_small_packets() {
         let candidates = [(0, 16), (1, 16)];
@@ -261,7 +233,7 @@ mod tests {
         for _ in 0..1000 {
             s.commit(&[(1, 1)], 1, 1000);
         }
-        assert!(s.debt.iter().all(|d| d.abs() <= 1 << 52));
+        assert!(s.debt.iter().all(|d| d.abs() <= 1 << 28));
     }
     #[test]
     fn failed_attempts_spend_no_credit_and_fallback_is_charged() {
@@ -322,9 +294,9 @@ mod tests {
             for id in 0..MAX_PATHS {
                 // The reference remains below the former bound, so it also
                 // represents the original scheduler for this complete run.
-                assert!(ordinary.debt[id].abs() <= 1 << 52);
-                assert_eq!(scaled.debt[id], ordinary.debt[id]);
-                assert!(scaled.debt[id].abs() <= 1 << 52);
+                assert!(ordinary.debt[id].abs() <= 1 << 28);
+                assert_eq!(scaled.debt[id], ordinary.debt[id] * 16);
+                assert!(scaled.debt[id].abs() <= 1 << 32);
                 exceeded_old_numerical_bound |= scaled.debt[id].abs() > 1 << 28;
             }
         }

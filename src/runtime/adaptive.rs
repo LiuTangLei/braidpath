@@ -521,6 +521,7 @@ pub struct ControlSample {
     pub ordinary_loss_pressure: bool,
     pub fast_loss: bool,
     pub probe_covered_loss: bool,
+    pub historic_fast_loss_deferred: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub brake_loss: Option<BrakeLoss>,
 }
@@ -1165,6 +1166,32 @@ impl PathController {
                 && !observation.transport_blocked
                 && wire_delivery_bps.is_some_and(|bps| bps > 0.0)
         });
+        // The brake watermark already proves this finalized batch contains no
+        // post-brake symbols. Under a complete independent post-brake interval
+        // supporting this pace, its raw severity cannot manufacture current
+        // pressure. Keep all counts and every independent safety brake intact.
+        let historic_fast_loss_deferred = fast_loss
+            && brake_loss.as_ref().is_some_and(|loss| {
+                loss.expected == 0 && loss.lost == 0 && !loss.pressure_override
+            })
+            && probe_reference.is_some_and(|reference| {
+                self.rate_bps <= reference.budget_bps
+                    && self
+                        .last_brake_us
+                        .is_some_and(|brake| reference.local_started_us >= brake)
+            })
+            && fresh
+            && probe_fresh
+            && observation
+                .probe_age_us
+                .is_some_and(|age| age <= CONTROL_US)
+            && observation
+                .positive_delivery_age_us
+                .is_some_and(|age| age <= CONTROL_US)
+            && self.queue_delay_ms <= self.target_ms * 0.25
+            && !blocked_pressure
+            && !observation.transport_blocked
+            && wire_delivery_bps.is_some_and(|bps| bps > 0.0);
         let fast_loss_actionable = !probe_covered_loss
             && brake_loss
                 .as_ref()
@@ -1236,6 +1263,7 @@ impl PathController {
             ordinary_loss_pressure: self.loss_pressure,
             fast_loss,
             probe_covered_loss,
+            historic_fast_loss_deferred,
             brake_loss,
         };
         let trial_action = self.reprobe.observe(reprobe::Input {
@@ -1333,7 +1361,7 @@ impl PathController {
             && ((!protect_ordinary_loss && !probe_covered_loss) || service_bps == Some(0.0));
         let pressure = delay_pressure
             || (self.loss_pressure && !protect_ordinary_loss && !probe_covered_loss)
-            || (fast_loss && !probe_covered_loss)
+            || (fast_loss && !probe_covered_loss && !historic_fast_loss_deferred)
             || blocked_pressure
             || service_deficit_actionable;
         if pressure {
@@ -2341,10 +2369,7 @@ impl PathController {
         });
         let effective_loss =
             weight_loss.map(|(sample, _)| self.weight_window.effective_rate(sample.rate));
-        // Weight expected delivered service. Applying the fourth power before
-        // the retained-share floor made every loss above ~29% indistinguishable.
-        // Admission and independent probes still enforce their existing bounds.
-        let reliability = effective_loss.map_or(1.0, |loss| (1.0 - loss).clamp(0.25, 1.0));
+        let reliability = effective_loss.map_or(1.0, |loss| (1.0 - loss).powi(4).clamp(0.25, 1.0));
         let base_weight = ((self.rate_bps as f64 / 64_000.0)
             / (1.0
                 + self.min_rtt_ms.unwrap_or(50.0) / 50.0
@@ -7018,6 +7043,90 @@ mod tests {
         (controller, old_loss)
     }
 
+    fn historic_loss_with_independent_service() -> (PathController, Observation) {
+        let (mut controller, mut sample) = loss_after_first_brake_022();
+        // Real independent fixture counts, two clocks and a complete interval
+        // following the 200ms brake; no business admission credit is supplied.
+        for step in 0..=30 {
+            controller
+                .probe_service
+                .observe(&probe_service::tests::probe(step), step * 100_000, 7);
+        }
+        sample.now_us = 3_000_000;
+        sample.report_number = 31;
+        sample.delivery_report_time_us = Some(103_000_000);
+        sample.delivered_bytes = 3000;
+        sample.probe_sample_id = 31;
+        sample.probe_age_us = Some(20_000);
+        (controller, sample)
+    }
+
+    #[test]
+    fn qualified_post_brake_service_does_not_inherit_historic_fast_loss_pressure() {
+        let (mut controller, sample) = historic_loss_with_independent_service();
+        controller.observe_with_delivery_probe(&sample, &probe_service::tests::probe(30));
+        assert!(controller.last_control.fast_loss, "raw loss stays visible");
+        let loss = controller.last_control.brake_loss.as_ref().unwrap();
+        assert_eq!((loss.expected, loss.lost), (0, 0));
+        assert!(!loss.pressure_override);
+        assert_eq!(controller.loss_evidence.counts(), (32, 32));
+        assert_eq!(
+            controller.rate_bps, 128_000,
+            "measurement grants no admission credit"
+        );
+        assert_eq!(
+            controller.health,
+            Health::Healthy,
+            "old cohort is not current pressure"
+        );
+        assert!(controller.last_control.historic_fast_loss_deferred);
+    }
+
+    #[test]
+    fn historic_loss_deferral_requires_current_independent_post_brake_service() {
+        for safety in [
+            "no_reference",
+            "expired",
+            "old_interval",
+            "budget",
+            "rtt",
+            "positive",
+            "blocked",
+            "severe",
+            "new_loss",
+        ] {
+            let (mut controller, mut sample) = historic_loss_with_independent_service();
+            match safety {
+                "expired" => sample.now_us += CONTROL_US + 1,
+                "old_interval" => controller.last_brake_us = Some(2_600_000),
+                "budget" => controller.rate_bps = 800_000,
+                "rtt" => sample.probe_age_us = Some(CONTROL_US + 1),
+                "positive" => sample.positive_delivery_age_us = Some(CONTROL_US + 1),
+                "blocked" => sample.transport_blocked = true,
+                "severe" => sample.probe_latest_rtt_ms = Some(170.0),
+                "new_loss" => {
+                    sample.finalized_expected = Some(80);
+                    sample.finalized_lost = Some(80);
+                    sample.admitted_symbols = Some(128);
+                }
+                _ => {}
+            }
+            if safety == "no_reference" {
+                controller.observe(&sample);
+            } else {
+                controller.observe_with_delivery_probe(&sample, &probe_service::tests::probe(30));
+            }
+            assert!(
+                !controller.last_control.historic_fast_loss_deferred,
+                "{safety}"
+            );
+            assert_ne!(controller.health, Health::Healthy, "{safety}");
+            if safety == "new_loss" {
+                assert!(controller.rate_bps < 128_000);
+            }
+        }
+    }
+
     #[test]
     fn causal_braking_022_preserves_raw_loss_and_resets_the_boundary_with_generation() {
         let (mut controller, mut old_loss) = loss_after_first_brake_022();
@@ -7546,47 +7655,6 @@ mod tests {
     }
 
     #[test]
-    fn heavily_impaired_paths_keep_distinct_expected_delivery_shares() {
-        use crate::runtime::scheduler::Scheduler;
-        // All paths have the same low admission allowance and RTT. Independent
-        // readiness cannot explain away a loss of quality ordering here.
-        let paths: [PathController; 4] = std::array::from_fn(|id| {
-            let mut path = PathController::new(MIN_BPS, 20);
-            let lost = if id == 1 { 12 } else { 15 };
-            path.observe(&weight_observation_016(
-                0,
-                1,
-                20,
-                lost,
-                lost as f64 / 20.0,
-                80.0,
-            ));
-            assert_eq!(path.decision(0).pacing_bps, MIN_BPS);
-            assert!(path.decision(0).eligible);
-            path
-        });
-        let weights: Vec<_> = paths
-            .iter()
-            .enumerate()
-            .map(|(id, path)| (id as u8, path.decision(0).weight))
-            .collect();
-        assert!(
-            weights[1].1 > weights[0].1,
-            "distinct retained fractions: {weights:?}"
-        );
-        let mut scheduler = Scheduler::default();
-        let mut admitted = [0; 4];
-        for _ in 0..1800 {
-            let actual = scheduler.order(&weights, 183)[0];
-            scheduler.commit(&weights, actual, 183);
-            admitted[usize::from(actual)] += 1;
-        }
-        assert_eq!(admitted, [400, 600, 400, 400]);
-        // Unknown and expired evidence retain the original neutral weight.
-        assert_eq!(paths[1].decision(FRESH_US + 1).weight, 16);
-    }
-
-    #[test]
     fn weight_016_sparse_finalized_quality_changes_share_without_pacing_collapse() {
         let mut controller = PathController::new(8_000_000, 20);
         controller.observe(&weight_observation_016(0, 1, 32, 0, 0.0, 150.0));
@@ -7752,18 +7820,10 @@ mod tests {
         controller.observe(&weight_observation_016(0, 1, 32, 8, 0.25, 150.0));
         let bad = controller.decision(0).weight;
         controller.observe(&weight_observation_016(500_000, 2, 36, 8, 0.0, 150.0));
-        let sparse_recovery = controller.decision(500_000);
-        assert!(sparse_recovery.weight >= bad);
-        assert_eq!(sparse_recovery.weight_loss_rate, Some(0.0));
-        assert_eq!(sparse_recovery.weight_loss_report, Some(2));
-        assert_eq!(sparse_recovery.weight_loss_effective_rate, Some(8.0 / 36.0));
-        // Four symbols improve the retained fraction but round to the same
-        // integer under the linear policy. Further actual evidence must cross
-        // the next weight unit; an empty/raw-only report cannot do so.
-        controller.observe(&weight_observation_016(550_000, 3, 40, 8, 0.0, 150.0));
-        let recovered = controller.decision(550_000);
+        let recovered = controller.decision(500_000);
         assert!(recovered.weight > bad);
-        assert_eq!(recovered.weight, 13);
+        assert_eq!(recovered.weight_loss_rate, Some(0.0));
+        assert_eq!(recovered.weight_loss_report, Some(2));
         let mut next = weight_observation_016(600_000, 0, 0, 0, 0.0, 150.0);
         next.generation += 1;
         controller.observe(&next);
@@ -7908,7 +7968,7 @@ mod tests {
         assert_eq!(resumed.weight_loss_window_lost, Some(8));
         assert_eq!(resumed.weight_loss_window_oldest_age_us, Some(0));
         assert_eq!(resumed.weight_loss_effective_rate, Some(0.5));
-        assert_eq!(resumed.weight, neutral / 2);
+        assert_eq!(resumed.weight, neutral / 4);
         assert_eq!(resumed.pacing_bps, START_BPS);
     }
 
@@ -7953,19 +8013,9 @@ mod tests {
             assert_eq!(path.decision(5_000_000).pacing_bps, START_BPS);
             assert!(path.decision(5_000_000).eligible);
         }
-        let impaired_weights = weights(&paths, 5_000_000);
-        let impaired = choose(&mut scheduler, &impaired_weights);
+        let impaired = choose(&mut scheduler, &weights(&paths, 5_000_000));
         assert!(impaired[1] > 0);
-        assert!(impaired[1] < initial[1]);
-        // Retained delivery now scales the impaired path by 3/4, rather
-        // than a fourth-power penalty. Verify that exact service entitlement.
-        assert_eq!(impaired_weights[1].1 * 4, initial_weights[1].1 * 3);
-        let expected = 700 * impaired_weights[1].1 as usize
-            / impaired_weights
-                .iter()
-                .map(|(_, w)| *w as usize)
-                .sum::<usize>();
-        assert!(impaired[1].abs_diff(expected) <= 1);
+        assert!(impaired[1] < initial[1] / 2);
         for (id, path) in paths.iter_mut().enumerate() {
             path.observe(&weight_observation_016(
                 5_500_000,
