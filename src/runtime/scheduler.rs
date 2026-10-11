@@ -23,30 +23,25 @@ pub fn ready_candidates(
         .filter(|&(id, _)| ready(id))
         .collect()
 }
+#[derive(Default)]
 pub struct Scheduler {
-    // A ready set is an independent service opportunity. Its byte debt cannot
-    // be collected from a different set (e.g. small-only allowance after bulk).
-    // MAX_PATHS is eight, so all possible sets occupy a fixed 16 KiB.
-    debt: [[i64; MAX_PATHS]; 1 << MAX_PATHS],
-}
-impl Default for Scheduler {
-    fn default() -> Self {
-        Self {
-            debt: [[0; MAX_PATHS]; 1 << MAX_PATHS],
-        }
-    }
+    debt: [i64; MAX_PATHS],
 }
 impl Scheduler {
-    fn ready_set(candidates: &[(u8, i32)]) -> usize {
-        candidates.iter().fold(0, |mask, &(id, _)| mask | (1 << id))
+    const UNIT: i64 = 1 << 32;
+    // Debt is in fractional bytes, independent of the current weight sum.
+    // Widen the intermediate only: the result cannot exceed bytes * UNIT.
+    fn credit(weight: i32, bytes: i64, total: i64) -> i64 {
+        (i128::from(weight.max(1)) * i128::from(bytes) * i128::from(Self::UNIT) / i128::from(total))
+            as i64
     }
     /// Preview byte-weighted service order. A failed attempt spends no service credit.
     pub fn order(&self, candidates: &[(u8, i32)], bytes: usize) -> Vec<u8> {
         let bytes = bytes.min(65_536) as i64;
         let mut order = candidates.to_vec();
-        let debt = &self.debt[Self::ready_set(candidates)];
+        let total: i64 = candidates.iter().map(|(_, w)| i64::from((*w).max(1))).sum();
         order.sort_by_key(|(id, weight)| {
-            std::cmp::Reverse(debt[usize::from(*id)] + i64::from((*weight).max(1)) * bytes)
+            std::cmp::Reverse(self.debt[usize::from(*id)] + Self::credit(*weight, bytes, total))
         });
         order.into_iter().map(|(id, _)| id).collect()
     }
@@ -55,15 +50,15 @@ impl Scheduler {
         if !candidates.iter().any(|(id, _)| *id == actual) {
             return;
         }
-        // Adaptive weights use sixteen units per former unit. Preserve the
-        // same service-debt bound in those units, including max-size symbols.
-        const LIMIT: i64 = 1 << 32;
+        // A fixed one-MiB byte-debt bound, expressed in the same fractional
+        // byte unit even when ready sets or weight scales change.
+        const LIMIT: i64 = 1 << 52;
         let bytes = bytes.min(65_536) as i64;
         let sum: i64 = candidates.iter().map(|(_, w)| i64::from((*w).max(1))).sum();
-        let debt = &mut self.debt[Self::ready_set(candidates)];
         for &(id, weight) in candidates {
-            debt[usize::from(id)] = (debt[usize::from(id)] + i64::from(weight.max(1)) * bytes
-                - if id == actual { sum * bytes } else { 0 })
+            self.debt[usize::from(id)] = (self.debt[usize::from(id)]
+                + Self::credit(weight, bytes, sum)
+                - if id == actual { bytes * Self::UNIT } else { 0 })
             .clamp(-LIMIT, LIMIT);
         }
     }
@@ -140,26 +135,23 @@ pub fn admit_generation(highest: &mut Option<u64>, generation: u64) -> anyhow::R
 mod tests {
     use super::*;
     #[test]
-    fn changing_ready_sets_cannot_transfer_bulk_debt_to_small_service() {
-        let mut scheduler = Scheduler::default();
-        let both = [(0, 4), (1, 6)];
-        // The better path accepts a bulk symbol while both are ready. During
-        // the subsequent bulk service it has only enough budget for small
-        // traffic, so those admissions use a different ready set.
-        let selected = scheduler.order(&both, 1055)[0];
-        assert_eq!(selected, 1);
-        scheduler.commit(&both, selected, 1055);
-        for _ in 0..100 {
-            scheduler.commit(&[(0, 4)], 0, 1055);
+    fn changing_common_weight_scale_cannot_change_actual_service() {
+        let mut fixed = Scheduler::default();
+        let mut changing = Scheduler::default();
+        for n in 0..1000 {
+            let candidates = [(0, 4), (1, 6), (2, 4)];
+            let scale = if n % 3 == 0 { 16 } else { 1 };
+            let scaled: Vec<_> = candidates.iter().map(|&(id, w)| (id, w * scale)).collect();
+            let bytes = if n % 3 == 0 { 1055 } else { 183 };
+            let actual = fixed.order(&candidates, bytes)[0];
+            assert_eq!(
+                changing.order(&scaled, bytes)[0],
+                actual,
+                "relative entitlement unchanged on actual admission {n}"
+            );
+            fixed.commit(&candidates, actual, bytes);
+            changing.commit(&scaled, actual, bytes);
         }
-        let small = [(0, 4), (1, 6), (2, 4)];
-        let mut accepted = [0; 3];
-        for _ in 0..140 {
-            let actual = scheduler.order(&small, 183)[0];
-            scheduler.commit(&small, actual, 183);
-            accepted[usize::from(actual)] += 1;
-        }
-        assert_eq!(accepted, [40, 60, 40], "only this ready set owes service");
     }
 
     #[test]
@@ -188,7 +180,7 @@ mod tests {
             [100, 100],
             "bulk allowance must not pin small packets: {small:?}"
         );
-        assert_eq!(scheduler.debt, [[0; MAX_PATHS]; 1 << MAX_PATHS]);
+        assert_eq!(scheduler.debt, [0; MAX_PATHS]);
     }
     #[test]
     fn recovery_remains_bounded_and_available_after_many_outages() {
@@ -269,7 +261,7 @@ mod tests {
         for _ in 0..1000 {
             s.commit(&[(1, 1)], 1, 1000);
         }
-        assert!(s.debt.iter().flatten().all(|d| d.abs() <= 1 << 28));
+        assert!(s.debt.iter().all(|d| d.abs() <= 1 << 52));
     }
     #[test]
     fn failed_attempts_spend_no_credit_and_fallback_is_charged() {
@@ -281,7 +273,7 @@ mod tests {
         s.commit(&candidates, 1, 1000);
         assert_eq!(s.order(&candidates, 1000), vec![0, 1]);
         s.commit(&candidates, 0, 1000);
-        assert_eq!(s.debt, [[0; MAX_PATHS]; 1 << MAX_PATHS]);
+        assert_eq!(s.debt, [0; MAX_PATHS]);
     }
     #[test]
     fn mixed_packet_sizes_balance_bytes_instead_of_packet_counts() {
@@ -330,14 +322,10 @@ mod tests {
             for id in 0..MAX_PATHS {
                 // The reference remains below the former bound, so it also
                 // represents the original scheduler for this complete run.
-                assert!(ordinary.debt[(1 << MAX_PATHS) - 1][id].abs() <= 1 << 28);
-                assert_eq!(
-                    scaled.debt[(1 << MAX_PATHS) - 1][id],
-                    ordinary.debt[(1 << MAX_PATHS) - 1][id] * 16
-                );
-                assert!(scaled.debt[(1 << MAX_PATHS) - 1][id].abs() <= 1 << 32);
-                exceeded_old_numerical_bound |=
-                    scaled.debt[(1 << MAX_PATHS) - 1][id].abs() > 1 << 28;
+                assert!(ordinary.debt[id].abs() <= 1 << 52);
+                assert_eq!(scaled.debt[id], ordinary.debt[id]);
+                assert!(scaled.debt[id].abs() <= 1 << 52);
+                exceeded_old_numerical_bound |= scaled.debt[id].abs() > 1 << 28;
             }
         }
         assert!(exceeded_old_numerical_bound);
