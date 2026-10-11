@@ -213,6 +213,9 @@ impl State {
         } else if !self.seen.insert(seq) {
             self.snapshot.duplicates += 1;
         } else {
+            // An authenticated original proves that this prefix was sent,
+            // independently of whether the peer's control watermark arrived.
+            self.defer_prefix(seq + 1, now_us);
             self.snapshot.received.delivered_updated_us = Some(now_us);
             self.snapshot.received.received_bytes = self
                 .snapshot
@@ -227,6 +230,24 @@ impl State {
                 self.snapshot.received.delay_variation_ms * 0.8 + variation * 0.2;
         }
         Ok(&b[HEADER..])
+    }
+    fn defer_prefix(&mut self, end: u64, now_us: u64) {
+        if end <= self.snapshot.received.expected
+            || self.pending.back().is_some_and(|(_, known)| end <= *known)
+        {
+            return;
+        }
+        let due = now_us.saturating_add(INTERVAL_US);
+        if self.pending.len() == 4 {
+            // Keep the oldest grace periods intact. Merge only the newest
+            // pending prefix and wait a full grace for its new high sequence.
+            // A busy receiver must not classify gaps early to free a slot.
+            let last = self.pending.back_mut().expect("bounded pending prefix");
+            *last = (last.0.max(due), end);
+        } else {
+            let due = self.pending.back().map_or(due, |(last, _)| due.max(*last));
+            self.pending.push_back((due, end));
+        }
     }
     fn finalize(&mut self, end: u64) {
         if end <= self.snapshot.received.expected {
@@ -316,13 +337,7 @@ impl State {
             );
         }
         if r.sent > self.watermark {
-            // Reports arrive at a bounded cadence. Keep at most four watermarks.
-            if self.pending.len() == 4 {
-                let (_, end) = self.pending.pop_front().expect("bounded pending");
-                self.finalize(end);
-            }
-            self.pending
-                .push_back((now_us.saturating_add(INTERVAL_US), r.sent));
+            self.defer_prefix(r.sent, now_us);
             self.watermark = r.sent;
         }
         self.peer_report = r.number;
@@ -577,8 +592,11 @@ mod tests {
                 (full.sent, full.expected, full.received, full.delay_us)
             );
             assert!(extra.received_bytes > full.received_bytes);
+            let pending_before_extra = right.pending.clone();
             apply_wire_report(&mut right, extra, at + 20);
-            assert_eq!(right.pending.len(), 1);
+            assert_eq!(right.pending, pending_before_extra);
+            assert!(right.pending.len() <= 4);
+            assert_eq!(right.pending.front(), Some(&(500_020, 2)));
             assert_eq!(right.snapshot.received.expected, 0);
             assert_eq!(right.snapshot.sender_estimate.sample_symbols, 0);
             assert_eq!(right.snapshot.sender_estimate.updated_us, None);
@@ -767,6 +785,87 @@ mod tests {
         assert_eq!(state.snapshot.sampled_us, 0);
     }
     #[test]
+    fn received_sequence_proves_a_prefix_even_when_sent_watermarks_are_lost() {
+        let mut sender = State::new(7);
+        let mut receiver = State::new(7);
+        let packets: Vec<_> = (0..12)
+            .map(|n| {
+                let packet = sender.wrap(&payload(), n * 1000);
+                sender.admitted(packet.len() - HEADER);
+                packet
+            })
+            .collect();
+        receiver.receive(&packets[10], 10_000).unwrap();
+        receiver.receive(&packets[2], 20_000).unwrap();
+        receiver.receive(&packets[4], 30_000).unwrap();
+        receiver.receive(&packets[6], 40_000).unwrap();
+        receiver.receive(&packets[8], 50_000).unwrap();
+        receiver.receive(&packets[10], 60_000).unwrap();
+        receiver.mature(509_999);
+        assert_eq!(receiver.snapshot.received.expected, 0);
+        // A reordered original just inside the existing grace is counted.
+        receiver.receive(&packets[0], 509_999).unwrap();
+        let prefix = receiver.report(0, 510_000);
+        assert_eq!((prefix.expected, prefix.received), (11, 6));
+        assert_eq!(receiver.snapshot.received.lost, 5);
+        assert_eq!(receiver.snapshot.duplicates, 1);
+        // An unseen lost tail is still unproven until an actual sent watermark.
+        receiver.apply(&sender.report(0, 600_000), 600_000).unwrap();
+        receiver.mature(1_099_999);
+        assert_eq!(receiver.snapshot.received.expected, 11);
+        receiver.mature(1_100_000);
+        assert_eq!(
+            (
+                receiver.snapshot.received.expected,
+                receiver.snapshot.received.lost
+            ),
+            (12, 6)
+        );
+    }
+
+    #[test]
+    fn busy_observed_prefixes_coalesce_without_shortening_reordering_grace() {
+        let mut sender = State::new(7);
+        let mut receiver = State::new(7);
+        let packets: Vec<_> = (0..100)
+            .map(|n| {
+                let packet = sender.wrap(&payload(), n * 1000);
+                sender.admitted(packet.len() - HEADER);
+                packet
+            })
+            .collect();
+        for (n, packet) in packets.iter().enumerate() {
+            if n != 8 {
+                receiver.receive(packet, n as u64 * 1000).unwrap();
+            }
+            assert!(receiver.pending.len() <= 4);
+            assert_eq!(receiver.snapshot.received.expected, 0);
+        }
+        assert_eq!(receiver.pending.front(), Some(&(500_000, 1)));
+        assert_eq!(receiver.pending.back(), Some(&(599_000, 100)));
+        let pending = receiver.pending.clone();
+        receiver.receive(&packets[99], 400_000).unwrap();
+        assert_eq!(receiver.pending, pending, "duplicate cannot renew grace");
+        receiver.mature(499_999);
+        assert_eq!(receiver.snapshot.received.expected, 0);
+        receiver.mature(500_000);
+        assert_eq!(receiver.snapshot.received.expected, 1);
+        receiver.mature(502_000);
+        assert_eq!(receiver.snapshot.received.expected, 3);
+        receiver.receive(&packets[8], 598_999).unwrap();
+        assert_eq!(receiver.snapshot.received.lost, 0);
+        receiver.mature(599_000);
+        assert_eq!(
+            (
+                receiver.snapshot.received.expected,
+                receiver.snapshot.received.received
+            ),
+            (100, 100)
+        );
+        assert!(receiver.pending.is_empty());
+    }
+
+    #[test]
     fn loss_reordering_duplicates_and_tail_are_finalized_without_fec_credit() {
         let mut tx = State::new(7);
         let mut rx = State::new(7);
@@ -783,8 +882,12 @@ mod tests {
         assert_eq!(rx.snapshot.received.delivered_updated_us, Some(11_000));
         let r = tx.report(0, 20_000);
         rx.apply(&r, 20_000).unwrap();
-        rx.mature(519_999);
+        rx.mature(509_999);
         assert_eq!(rx.snapshot.received.expected, 0);
+        rx.mature(510_000);
+        assert_eq!(rx.snapshot.received.expected, 3);
+        rx.mature(519_999);
+        assert_eq!(rx.snapshot.received.expected, 3);
         rx.mature(520_000);
         assert_eq!(
             (
