@@ -2169,10 +2169,11 @@ impl PathController {
                     // continuous demand. Keep actual admissions at the same
                     // pace for at most one service horizon; the original 90%
                     // floor and evidence ages still apply to any increase.
+                    // An unsettled growth monitor gates the next increase,
+                    // not preservation of this actual pacing interval.
                     || (!exercised
                         && self.admitted_symbol_bytes > 0
                         && growth_probe_ready
-                        && self.growth_monitor.is_none()
                         && self.rate_bps == rate_before_refill
                         && elapsed < PROBE_US
                         && ((self.congestion_seen
@@ -2840,7 +2841,11 @@ mod tests {
     }
 
     fn quantized_admission_060() -> (PathController, Observation) {
-        let mut controller = PathController::new(123_695, 20);
+        quantized_admission_at_rate(123_695)
+    }
+
+    fn quantized_admission_at_rate(rate: u64) -> (PathController, Observation) {
+        let mut controller = PathController::new(rate, 20);
         let mut sample = short_observation_022(0, 80.0);
         sample.delivered_bytes = 0;
         sample.delivered_bps = Some(0.0);
@@ -2854,7 +2859,7 @@ mod tests {
             sample.probe_age_us = Some(20_000);
             controller.observe(&sample);
         }
-        assert_eq!(controller.rate_bps, 123_695);
+        assert_eq!(controller.rate_bps, rate);
         controller.maximum_bps = 20_000_000;
         controller.congestion_seen = true;
         // Discard remaining burst credit; all following admissions must be
@@ -2865,6 +2870,61 @@ mod tests {
         controller.admitted_symbol_bytes = 0;
         controller.allowance_bytes = 0.0;
         (controller, sample)
+    }
+
+    #[test]
+    fn a_pending_growth_monitor_keeps_underfilled_actual_admissions() {
+        let (mut controller, mut sample) = quantized_admission_at_rate(146_640);
+        for now in [1_100_000, 1_200_000] {
+            controller.probe_admitted(now - 100_000);
+            sample = wire_admitted_report_060(&mut controller, &sample, now);
+            sample.probe_age_us = Some(20_000);
+            controller.observe(&sample);
+        }
+        let grown = controller.rate_bps;
+        assert!(grown > 146_640);
+        assert_eq!(
+            controller.growth_monitor.as_ref().unwrap().armed_us,
+            1_200_000
+        );
+        // Use a whole-packet phase with no residual credit after actual growth.
+        controller.tokens = 0.0;
+        let before_reply = sample.probe_sample_id;
+        controller.probe_admitted(1_250_000);
+        sample = wire_admitted_report_060(&mut controller, &sample, 1_300_000);
+        sample.probe_sample_id = before_reply;
+        sample.probe_age_us = Some(120_000);
+        controller.observe(&sample);
+        controller.probe_admitted(1_350_000);
+        sample = wire_admitted_report_060(&mut controller, &sample, 1_400_000);
+        sample.probe_sample_id = before_reply + 1;
+        sample.probe_age_us = Some(70_000);
+        controller.observe(&sample);
+        assert_eq!(
+            controller.rate_bps, grown,
+            "the second actual reply is still owed"
+        );
+        assert!(
+            (controller.last_control.admitted_bytes as f64)
+                < controller.last_control.integrated_allowance_bytes * 0.9
+        );
+        assert_eq!(
+            controller.last_control_us, 1_200_000,
+            "waiting for the monitor cannot discard this underfilled pacing interval"
+        );
+        sample = wire_admitted_report_060(&mut controller, &sample, 1_500_000);
+        sample.probe_sample_id = before_reply + 2;
+        sample.probe_age_us = Some(70_000);
+        controller.observe(&sample);
+        assert!(controller.rate_bps > grown);
+        assert_eq!(controller.last_control.admission_span_us, 300_000);
+        assert!(
+            controller.last_control.admitted_bytes as f64
+                >= controller.last_control.integrated_allowance_bytes * 0.9
+        );
+        let settled = controller.last_control.growth_monitor.as_ref().unwrap();
+        assert_eq!(settled.armed_us, 1_200_000);
+        assert!(settled.second_reply.is_some() && !settled.withdrawn);
     }
 
     #[test]
