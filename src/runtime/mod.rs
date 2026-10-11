@@ -7,6 +7,7 @@ pub mod probe;
 pub mod quality;
 pub mod relay;
 pub mod scheduler;
+mod shutdown;
 pub mod stats;
 pub mod transport;
 pub mod tunnel;

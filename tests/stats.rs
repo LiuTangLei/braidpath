@@ -171,6 +171,107 @@ fn check_symbols(v: &Value) {
     );
 }
 #[test]
+fn relay_single_interrupt_during_bidirectional_traffic_writes_final_stats() {
+    let dir = tempfile::tempdir().unwrap();
+    let sink = UdpSocket::bind("127.0.0.1:0").unwrap();
+    sink.set_nonblocking(true).unwrap();
+    let addr = port();
+    let mut relay = launch(
+        &[
+            "relay",
+            "--listen",
+            &addr,
+            "--target",
+            &sink.local_addr().unwrap().to_string(),
+            "--allow-source",
+            "127.0.0.1",
+            "--rate-bps",
+            "400000000",
+        ],
+        dir.path(),
+        "busy-relay",
+    );
+    ready(&mut relay);
+    let client = UdpSocket::bind("127.0.0.1:0").unwrap();
+    client.connect(&addr).unwrap();
+    client.set_nonblocking(true).unwrap();
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    thread::scope(|scope| {
+        let traffic = scope.spawn(|| {
+            let start = Instant::now();
+            let payload = [0x5au8; 1000];
+            let mut buffer = [0u8; 2048];
+            let mut echoed = 0;
+            // Nonblocking sockets and a finite independent deadline guarantee
+            // this test worker finishes even if the parent assertion fails.
+            while !stop.load(std::sync::atomic::Ordering::Relaxed)
+                && start.elapsed() < Duration::from_secs(3)
+            {
+                for _ in 0..16 {
+                    let _ = client.send(&payload);
+                }
+                for _ in 0..32 {
+                    match sink.recv_from(&mut buffer) {
+                        Ok((n, peer)) => {
+                            let _ = sink.send_to(&buffer[..n], peer);
+                        }
+                        Err(_) => break,
+                    }
+                }
+                for _ in 0..32 {
+                    match client.recv(&mut buffer) {
+                        Ok(n) => {
+                            assert_eq!(&buffer[..n], &payload);
+                            echoed += 1;
+                        }
+                        Err(_) => break,
+                    }
+                }
+                thread::sleep(Duration::from_micros(200));
+            }
+            echoed
+        });
+        let start = Instant::now();
+        loop {
+            let active = fs::read_to_string(&relay.jsonl)
+                .unwrap()
+                .lines()
+                .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                .any(|v| {
+                    v["stats"]["relay"]["client_to_server"]["forwarded"]
+                        .as_u64()
+                        .unwrap_or(0)
+                        >= 128
+                        && v["stats"]["relay"]["server_to_client"]["forwarded"]
+                            .as_u64()
+                            .unwrap_or(0)
+                            >= 128
+                });
+            if active {
+                break;
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(2),
+                "bidirectional traffic did not start"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        // finish sends exactly one SIGINT and requires a normal exit plus both
+        // final JSON outputs; it neither retries SIGINT nor manufactures exits.
+        let result = finish(&mut relay);
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(traffic.join().unwrap() > 0);
+        for direction in ["client_to_server", "server_to_client"] {
+            let counters = &result["stats"]["relay"][direction];
+            assert_eq!(
+                num(counters, "received"),
+                num(counters, "forwarded") + drops(counters)
+            );
+        }
+    });
+}
+
+#[test]
 fn raw_udp_relay_injected_loss_has_exact_conservation() {
     let dir = tempfile::tempdir().unwrap();
     let sink = UdpSocket::bind("127.0.0.1:0").unwrap();

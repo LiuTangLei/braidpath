@@ -1,3 +1,4 @@
+use super::shutdown::Shutdown;
 use super::stats::{self, Metrics};
 use anyhow::{Result, ensure};
 use std::{
@@ -111,10 +112,11 @@ pub async fn run(options: Options) -> Result<()> {
     let mut b = vec![0; 65536];
     let mut packets = 0u64;
     let mut tick = tokio::time::interval(Duration::from_secs(5));
+    let mut shutdown = Shutdown::new();
     options.stats.readiness(true, 0);
     info!(listen=%front.local_addr()?,target=%options.target,drop_every=options.drop_every,"fixed-target relay ready");
     let result:Result<()>=async {loop {tokio::select!{
-        _=tokio::signal::ctrl_c()=>break,
+        _=shutdown.wait()=>break,
         _=tick.tick()=>{peers.retain(|_,tx|!tx.is_closed());info!(mappings=peers.len(),packets,"relay statistics");},
         received=front.recv_from(&mut b)=>{
             let (n,peer)=received?;count(&options.stats,stats::FORWARD,|d|d.received+=1);

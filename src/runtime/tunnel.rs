@@ -1,5 +1,6 @@
 use super::{
     MAX_PATHS, MAX_PAYLOAD, QUEUE, adaptive, capacity_probe, outbound, quality, scheduler,
+    shutdown::Shutdown,
     stats::{self, Scope},
     transport,
     wire::{self, Receiver, Record},
@@ -34,18 +35,6 @@ const MAX_FLOWS: usize = 64;
 const SESSION_IDLE_GRACE: Duration = Duration::from_secs(120);
 const SESSION_PATH: &str = "/session";
 
-/// Keep one interrupt subscription across control branches and session epochs.
-struct Shutdown(Pin<Box<dyn Future<Output = std::io::Result<()>> + Send>>);
-
-impl Shutdown {
-    fn new() -> Self {
-        Self(Box::pin(tokio::signal::ctrl_c()))
-    }
-
-    async fn wait(&mut self) {
-        let _ = self.0.as_mut().await;
-    }
-}
 const WEBSITE: &str = "<!doctype html><html lang=\"en\"><meta charset=\"utf-8\"><title>Welcome</title><h1>Welcome</h1><p>This service is online.</p></html>\n";
 
 #[derive(Clone, Debug, PartialEq, Eq)]

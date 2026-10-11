@@ -1,5 +1,5 @@
 //! Finite UDP workloads. One-way delay is relative to the minimum signed transit delta.
-use super::MAX_PAYLOAD;
+use super::{MAX_PAYLOAD, shutdown::Shutdown};
 use anyhow::{Context, Result, bail, ensure};
 use clap::{Args, ValueEnum};
 use serde::Serialize;
@@ -180,6 +180,7 @@ struct Sample {
     rtt_ms: Option<f64>,
 }
 struct State {
+    shutdown: Shutdown,
     samples: Vec<Option<Sample>>,
     sent_times: Vec<Option<Instant>>,
     sent: u32,
@@ -197,6 +198,7 @@ struct State {
 impl State {
     fn new(count: u32) -> Self {
         Self {
+            shutdown: Shutdown::new(),
             samples: vec![None; count as usize],
             sent_times: vec![None; count as usize],
             sent: 0,
@@ -232,7 +234,7 @@ async fn accept(socket: &UdpSocket, id: &[u8; 16], w: &Workload, state: &mut Sta
     loop {
         tokio::select! {
             _=tokio::time::sleep_until(until)=>bail!("startup timeout waiting for authorized registration"),
-            _=tokio::signal::ctrl_c()=>bail!("interrupted during startup"),
+            _=state.shutdown.wait()=>bail!("interrupted during startup"),
             r=socket.recv_from(&mut b)=>{
                 let(n,peer)=r?;
                 if n==HEADER && decode(&b[..n],id)==Some((REGISTER,0,0)) {
@@ -262,7 +264,7 @@ async fn register(
         loop {
             tokio::select! {
                 _=tokio::time::sleep_until(until)=>break,
-                _=tokio::signal::ctrl_c()=>bail!("interrupted during startup"),
+                _=state.shutdown.wait()=>bail!("interrupted during startup"),
                 r=socket.recv(&mut b)=>{
                     let n=r?;
                     if n==HEADER && decode(&b[..n],id)==Some((ACK,0,0)) { state.control_received+=1;return Ok(()); }
@@ -402,7 +404,7 @@ async fn receive_stream(
     loop {
         tokio::select! {
             _=tokio::time::sleep_until(window.until)=>break,
-            _=tokio::signal::ctrl_c()=>{state.interrupted=true;break;},
+            _=state.shutdown.wait()=>{state.interrupted=true;break;},
             r=socket.recv(&mut b)=>{
                 let n=r?;
                 match decode(&b[..n],id) {
@@ -438,7 +440,7 @@ async fn send_stream(
     let mut first = None;
     loop {
         tokio::select! {
-            _=tokio::signal::ctrl_c()=>{state.interrupted=true;break;},
+            _=state.shutdown.wait()=>{state.interrupted=true;break;},
             _=tick.tick(),if state.sent<w.count=>{
                 let seq=state.sent;
                 let stamp=unix_us()?;
@@ -791,12 +793,13 @@ pub async fn run_sink(options: SinkOptions) -> Result<()> {
     finish(w, &state, result, "sink")
 }
 pub async fn echo(listen: SocketAddr, ready_file: Option<PathBuf>) -> Result<()> {
+    let mut shutdown = Shutdown::new();
     let result=async {
         let socket=UdpSocket::bind(listen).await?;ready(ready_file.as_deref(),"echo",&socket,None)?;
         tracing::info!(%listen,"test echo ready");
         let mut b=[0u8;MAX_PAYLOAD+1];let mut received=0u64;let mut sent=0u64;
         loop {tokio::select! {
-            _=tokio::signal::ctrl_c()=>break,
+            _=shutdown.wait()=>break,
             r=socket.recv_from(&mut b)=>{let(n,peer)=r?;received+=1;if n<=MAX_PAYLOAD {socket.send_to(&b[..n],peer).await?;sent+=1;}}
         }}
         Ok(json!({"command":"echo","final":true,"outcome":"ok","received":received,"sent":sent}))
