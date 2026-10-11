@@ -1875,7 +1875,7 @@ impl PathController {
                         })
                 };
                 // A disjoint capacity sample can age out or still straddle
-                // the actual brake, or lack the original symbol floor, while
+                // the actual brake, or lack either original admission floor, while
                 // current paired endpoints already prove post-brake drainage.
                 // Prefer other fresh samples; later pace changes and interrupted
                 // backlog retain their original guards. Capacity memory and
@@ -1888,6 +1888,7 @@ impl PathController {
                                 self.last_brake_us
                                     .is_some_and(|brake| admission.started_us < brake)
                                     || admission.symbols < 8
+                                    || admission.span_us < PROBE_US
                             })
                     }) {
                         return None;
@@ -4803,7 +4804,7 @@ mod tests {
             clear_step,
             drain_start,
             drain_slices,
-            warmup_us,
+            (warmup_us, 0),
             (500, 500),
         )
     }
@@ -4814,9 +4815,10 @@ mod tests {
         clear_step: u64,
         drain_start: u64,
         drain_slices: u64,
-        warmup_us: u64,
+        timing: (u64, u64),
         packet_sizes: (u64, u64),
     ) -> (PathController, Observation) {
+        let (warmup_us, report_delay_us) = timing;
         let mut controller = PathController::new(start_bps * 4, 20);
         let mut quality = crate::runtime::quality::State::new(7);
         let mut sample = short_observation_022(start_us - warmup_us, 80.0);
@@ -4842,23 +4844,26 @@ mod tests {
         }
         let mut received = 0;
         let mut extra_drain = 0;
+        let mut previous_local_us = start_us;
         for step in 1..=clear_step {
             let packet_bytes = if step <= 6 {
                 packet_sizes.0
             } else {
                 packet_sizes.1
             };
-            let now = start_us + step * 100_000;
+            let receiver_elapsed = start_us + step * 100_000;
+            let now = receiver_elapsed + if step == 10 { report_delay_us } else { 0 };
             if step == clear_step {
                 controller.probe_admitted(now - 100_000);
             }
             let before = quality.snapshot.sent_bytes;
-            for at in (now - 100_000..now).step_by(1000) {
+            for at in (previous_local_us..now).step_by(1000) {
                 while controller.allow(at, packet_bytes as usize, 0.0) {
                     controller.admitted_symbol(at, packet_bytes as usize, packet_bytes as usize);
                     quality.admitted(packet_bytes as usize);
                 }
             }
+            previous_local_us = now;
             let admitted = quality.snapshot.sent_bytes - before;
             let previous_received = received;
             received = if step <= 5 {
@@ -4884,6 +4889,7 @@ mod tests {
                     280.0
                 },
             );
+            sample.delivery_report_time_us = Some(100_000_000 + receiver_elapsed);
             sample.report_number = step + 1;
             sample.rtt_ms = 0.0;
             sample.probe_sample_id = if step < 6 {
@@ -4909,7 +4915,7 @@ mod tests {
                 let admitted = latest.admission.unwrap();
                 if clear_step == 16 {
                     assert_eq!(latest.observed_us, start_us + 1_500_000);
-                    assert_eq!(admitted.started_us, start_us + 1_000_000);
+                    assert_eq!(admitted.started_us, start_us + 1_000_000 + report_delay_us);
                 }
                 assert!(admitted.symbols >= 8);
                 if drain_start == 11 && drain_slices == 6 {
@@ -5282,7 +5288,7 @@ mod tests {
     #[test]
     fn changing_packet_sizes_cannot_end_the_wait_before_real_symbols_mature() {
         let (mut controller, sample) =
-            draining_service_packets_064(0, 400_000, 12, 8, 3, 0, (500, 1000));
+            draining_service_packets_064(0, 400_000, 12, 8, 3, (0, 0), (500, 1000));
         let before = controller.rate_bps;
         controller.observe(&sample);
         let current = controller
@@ -5320,7 +5326,7 @@ mod tests {
     #[test]
     fn post_brake_wait_preserves_the_original_symbol_floor_at_low_rates() {
         let (mut controller, sample) =
-            draining_service_packets_064(0, 400_000, 12, 8, 3, 0, (1000, 1000));
+            draining_service_packets_064(0, 400_000, 12, 8, 3, (0, 0), (1000, 1000));
         let before = controller.rate_bps;
         assert_eq!(controller.last_brake_us, Some(600_000));
         controller.observe(&sample);
@@ -5519,6 +5525,78 @@ mod tests {
                 "old_probe" => sample.probe_age_us = Some(CONTROL_US + 1),
                 "positive_age" => sample.positive_delivery_age_us = Some(CONTROL_US + 1),
                 "pressure" => sample.send_queue_bytes = 5000,
+                _ => unreachable!(),
+            }
+            let before = controller.rate_bps;
+            controller.observe(&sample);
+            assert_eq!(
+                controller.last_control.drain_service_target_bps, None,
+                "{guard}"
+            );
+            assert!(
+                controller.rate_bps <= (before as f64 * 1.2) as u64,
+                "{guard}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_short_local_disjoint_interval_does_not_hide_complete_paired_drainage() {
+        let (mut controller, sample) =
+            draining_service_packets_064(0, 1_000_000, 17, 11, 6, (0, 1600), (500, 500));
+        let old = controller.service_window.latest(sample.now_us).unwrap();
+        assert_eq!(old.span_us, PROBE_US);
+        assert_eq!(old.admission.unwrap().span_us, PROBE_US - 1600);
+        assert!(old.admission.unwrap().started_us > controller.last_brake_us.unwrap());
+        assert!(old.admission.unwrap().symbols >= 8);
+        let before = controller.rate_bps;
+        controller.observe(&sample);
+        let paired = controller
+            .service_window
+            .discovery_with_counts(sample.now_us, 8, 1)
+            .unwrap();
+        let admission = paired.admission.unwrap();
+        assert!(paired.span_us >= PROBE_US && admission.span_us >= PROBE_US);
+        assert!(admission.started_us >= controller.last_brake_us.unwrap());
+        assert!(paired.bps > admission.bps * 1.1);
+        let target = (paired.bps * controller.wire_per_symbol * 0.9) as u64;
+        assert!(target > before);
+        assert_eq!(
+            controller.last_control.drain_service_target_bps,
+            Some(target)
+        );
+        assert_eq!(controller.rate_bps, target);
+    }
+
+    #[test]
+    fn short_disjoint_fallback_keeps_actual_evidence_guards() {
+        for guard in [
+            "used_probe",
+            "old_probe",
+            "positive_age",
+            "pace",
+            "interrupted",
+            "pressure",
+            "missing_sender",
+        ] {
+            let (mut controller, mut sample) =
+                draining_service_packets_064(0, 1_000_000, 17, 11, 6, (0, 1600), (500, 500));
+            match guard {
+                "used_probe" => controller.last_growth_probe = Some(sample.probe_sample_id),
+                "old_probe" => sample.probe_age_us = Some(CONTROL_US + 1),
+                "positive_age" => sample.positive_delivery_age_us = Some(CONTROL_US + 1),
+                "pace" => {
+                    let before = controller.rate_bps;
+                    controller.rate_bps -= 1;
+                    controller.record_rate_change(
+                        sample.now_us - PROBE_US + 1,
+                        before,
+                        RateReason::ReprobeRollback,
+                    );
+                }
+                "interrupted" => controller.backlog_since_us = Some(sample.now_us - PROBE_US + 1),
+                "pressure" => sample.send_queue_bytes = 5000,
+                "missing_sender" => sample.admitted_symbols = None,
                 _ => unreachable!(),
             }
             let before = controller.rate_bps;
