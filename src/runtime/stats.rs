@@ -113,12 +113,23 @@ pub struct Ids {
     pub highest_id: u64,
     pub floor_id: u64,
     pub recent: BTreeSet<u64>,
+    #[serde(skip)]
+    suppressed: bool,
 }
 impl Ids {
+    fn suppressed() -> Self {
+        Self {
+            suppressed: true,
+            ..Self::default()
+        }
+    }
     fn is_empty(&self) -> bool {
         self.recent.is_empty()
     }
     pub fn add(&mut self, id: u64) {
+        if self.suppressed {
+            return;
+        }
         self.highest_id = self.highest_id.max(id);
         self.floor_id = self.highest_id.saturating_sub(ID_WINDOW - 1);
         while self.recent.first().is_some_and(|v| *v < self.floor_id) {
@@ -141,6 +152,17 @@ pub struct Direction {
     pub locally_dropped_original_ids: Ids,
     #[serde(skip_serializing_if = "Ids::is_empty")]
     pub udp_delivered_record_ids: Ids,
+}
+impl Direction {
+    fn aggregate() -> Self {
+        Self {
+            quinn_admitted_record_ids: Ids::suppressed(),
+            generated_record_ids: Ids::suppressed(),
+            locally_dropped_original_ids: Ids::suppressed(),
+            udp_delivered_record_ids: Ids::suppressed(),
+            ..Self::default()
+        }
+    }
 }
 #[derive(Clone, Default, Serialize)]
 pub struct Quinn {
@@ -720,15 +742,31 @@ impl Metrics {
 impl Scope {
     pub fn update(&self, mut f: impl FnMut(&mut Direction)) {
         self.metrics.state(|s| {
-            let aggregate = s.directions.entry(self.direction.to_owned()).or_default();
+            // Borrow existing keys: constructing an occupied entry used to
+            // allocate and discard the same direction String for every packet.
+            let aggregate = if s.directions.contains_key(self.direction) {
+                s.directions
+                    .get_mut(self.direction)
+                    .expect("existing direction")
+            } else {
+                s.directions
+                    .entry(self.direction.to_owned())
+                    .or_insert_with(Direction::aggregate)
+            };
             f(aggregate);
             // IDs restart at each session; global totals must not merge these namespaces.
-            aggregate.quinn_admitted_record_ids = Ids::default();
-            aggregate.generated_record_ids = Ids::default();
-            aggregate.locally_dropped_original_ids = Ids::default();
-            aggregate.udp_delivered_record_ids = Ids::default();
+            // Suppress their insertion, rather than allocate a tree node only
+            // to clear it immediately. Session windows below remain enabled.
+            aggregate.quinn_admitted_record_ids = Ids::suppressed();
+            aggregate.generated_record_ids = Ids::suppressed();
+            aggregate.locally_dropped_original_ids = Ids::suppressed();
+            aggregate.udp_delivered_record_ids = Ids::suppressed();
             if let Some(session) = s.sessions.get_mut(&self.session) {
-                f(session.entry(self.direction.to_owned()).or_default());
+                if let Some(direction) = session.get_mut(self.direction) {
+                    f(direction);
+                } else {
+                    f(session.entry(self.direction.to_owned()).or_default());
+                }
             }
         });
     }
@@ -836,6 +874,84 @@ mod tests {
     use crate::runtime::transport::{self, Congestion};
     use bytes::Bytes;
     use tokio::time::timeout;
+
+    #[test]
+    fn suppressed_global_ids_stay_empty_and_keep_the_serialized_schema() {
+        let mut ids = Ids::suppressed();
+        for id in [0, 1, 8192, 1_000_000, u64::MAX] {
+            ids.add(id);
+        }
+        assert!(ids.recent.is_empty());
+        assert_eq!(ids.highest_id, 0);
+        assert_eq!(ids.floor_id, 0);
+        assert_eq!(
+            serde_json::to_value(&ids).unwrap(),
+            serde_json::to_value(Ids::default()).unwrap()
+        );
+    }
+
+    #[test]
+    fn aggregate_suppression_preserves_each_session_window_and_all_counters() {
+        let metrics = Metrics::new("test");
+        for (session, count) in [("first", 10_000u64), ("second", 16)] {
+            let scope = metrics.scope(session, RETURN);
+            for id in 0..count {
+                scope.update(|d| {
+                    d.records.application_received += 1;
+                    d.symbols.originals_generated += 1;
+                    d.generated_record_ids.add(id);
+                    if id.is_multiple_of(2) {
+                        d.symbols.originals_quinn_admitted += 1;
+                        d.records.udp_target_delivered += 1;
+                        d.quinn_admitted_record_ids.add(id);
+                        d.udp_delivered_record_ids.add(id);
+                    } else {
+                        d.symbols.originals_queue_full_dropped += 1;
+                        d.locally_dropped_original_ids.add(id);
+                    }
+                });
+            }
+        }
+        metrics.state(|s| {
+            let aggregate = &s.directions[RETURN];
+            assert_eq!(aggregate.records.application_received, 10_016);
+            assert_eq!(aggregate.symbols.originals_generated, 10_016);
+            assert_eq!(aggregate.symbols.originals_quinn_admitted, 5008);
+            assert_eq!(aggregate.symbols.originals_queue_full_dropped, 5008);
+            assert_eq!(aggregate.records.udp_target_delivered, 5008);
+            let serialized = serde_json::to_value(aggregate).unwrap();
+            for key in [
+                "generated_record_ids",
+                "quinn_admitted_record_ids",
+                "locally_dropped_original_ids",
+                "udp_delivered_record_ids",
+            ] {
+                assert!(serialized.get(key).is_none());
+            }
+            for (session, count) in [("first", 10_000u64), ("second", 16)] {
+                let d = &s.sessions[session][RETURN];
+                assert_eq!(d.records.application_received, count);
+                assert_eq!(d.symbols.originals_generated, count);
+                assert_eq!(d.generated_record_ids.highest_id, count - 1);
+                assert_eq!(
+                    d.generated_record_ids.recent.len() as u64,
+                    count.min(ID_WINDOW)
+                );
+                assert_eq!(
+                    d.quinn_admitted_record_ids.recent.len() as u64,
+                    (count / 2).min(ID_WINDOW / 2)
+                );
+                assert_eq!(
+                    d.udp_delivered_record_ids.recent,
+                    d.quinn_admitted_record_ids.recent
+                );
+                assert_eq!(
+                    d.locally_dropped_original_ids.recent.len() as u64,
+                    (count / 2).min(ID_WINDOW / 2)
+                );
+            }
+        });
+    }
 
     #[test]
     fn explicit_pre_admission_cancellation_is_normal_and_counted_once() {

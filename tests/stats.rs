@@ -11,6 +11,11 @@ use std::{
     time::{Duration, Instant},
 };
 const BIN: &str = env!("CARGO_BIN_EXE_braidpath");
+// These subprocess fixtures select a loopback port before the child binds it.
+// Serialize sibling fixtures so their ephemeral sockets cannot claim a port
+// in that select-to-bind interval. Traffic/tasks within each fixture remain
+// concurrent; no transport assertion, rate, deadline or exit gate is relaxed.
+static LOCAL_SOCKET_FIXTURES: std::sync::Mutex<()> = std::sync::Mutex::new(());
 struct Process {
     child: Child,
     json: PathBuf,
@@ -172,6 +177,7 @@ fn check_symbols(v: &Value) {
 }
 #[test]
 fn relay_single_interrupt_during_bidirectional_traffic_writes_final_stats() {
+    let _fixture = LOCAL_SOCKET_FIXTURES.lock().unwrap();
     let dir = tempfile::tempdir().unwrap();
     let sink = UdpSocket::bind("127.0.0.1:0").unwrap();
     sink.set_nonblocking(true).unwrap();
@@ -273,6 +279,7 @@ fn relay_single_interrupt_during_bidirectional_traffic_writes_final_stats() {
 
 #[test]
 fn raw_udp_relay_injected_loss_has_exact_conservation() {
+    let _fixture = LOCAL_SOCKET_FIXTURES.lock().unwrap();
     let dir = tempfile::tempdir().unwrap();
     let sink = UdpSocket::bind("127.0.0.1:0").unwrap();
     let addr = port();
@@ -331,6 +338,7 @@ fn raw_udp_relay_injected_loss_has_exact_conservation() {
 }
 #[test]
 fn http3_impairment_reconciles_queues_symbols_and_observed_logical_ids() {
+    let _fixture = LOCAL_SOCKET_FIXTURES.lock().unwrap();
     let dir = tempfile::tempdir().unwrap();
     let identity = dir.path().join("identity");
     assert!(
@@ -548,6 +556,7 @@ fn http3_impairment_reconciles_queues_symbols_and_observed_logical_ids() {
 }
 #[test]
 fn error_returns_final_json_without_log_parsing() {
+    let _fixture = LOCAL_SOCKET_FIXTURES.lock().unwrap();
     let dir = tempfile::tempdir().unwrap();
     let stats = dir.path().join("error.json");
     let stream = dir.path().join("error.jsonl");
