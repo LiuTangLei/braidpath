@@ -329,7 +329,7 @@ fn enqueue_symbol(
     metrics: &Scope,
 ) {
     let record = if data[3] != 1 {
-        Record::decode(&data[wire::HEADER..]).ok()
+        Record::decode_identity(&data[wire::HEADER..]).ok()
     } else {
         None
     };
@@ -352,7 +352,7 @@ fn enqueue_symbol(
     if let Some(block) = block {
         blocks.get_mut(&block).expect("block inserted").created = block_created;
     }
-    let record_id = record.as_ref().map(|r| r.id);
+    let record_id = record.map(|(_, id)| id);
     // An original keeps its own ingress clock; a repair expires with the oldest
     // original it could help, so encoder waiting never grants extra repair time.
     let created = if record_id.is_some() {
@@ -360,7 +360,7 @@ fn enqueue_symbol(
     } else {
         block_created
     };
-    let flow = record.map(|r| r.flow);
+    let flow = record.map(|(flow, _)| flow);
     metrics.update(|d| {
         if let Some(id) = record_id {
             d.symbols.originals_generated += 1;
@@ -558,12 +558,12 @@ fn business_ready_candidates(
             return false;
         };
         // Mapping size depends on the actual stream ID, not on the payload.
-        let Ok(mapping) = wire::http_datagram(path.stream, &[]) else {
+        let Ok(mapping_bytes) = wire::http_datagram_overhead(path.stream) else {
             return false;
         };
         controllers[usize::from(id)].allow(
             now_us,
-            measured_payload_bytes + mapping.len() + 80,
+            measured_payload_bytes + mapping_bytes + 80,
             queue_age_ms,
         )
     })
@@ -708,9 +708,9 @@ async fn sender(
         adaptive::PathController::new(policy.rate, policy.latency_target_ms)
     });
     let burst = if policy.adaptive { 2400 } else { 9600 };
-    let mut pacer = outbound::Pacer::new(policy.rate, burst);
+    let mut pacer = outbound::Pacer::for_sender(policy.rate, burst);
     let mut groups: [outbound::Pacer; MAX_PATHS] =
-        std::array::from_fn(|i| outbound::Pacer::new(policy.group_rates[i], burst));
+        std::array::from_fn(|i| outbound::Pacer::for_sender(policy.group_rates[i], burst));
     let mut business = policy
         .adaptive
         .then(|| outbound::BusinessPacer::new(policy.rate, policy.group_rates, burst));
@@ -1308,31 +1308,35 @@ async fn sender(
                 stalled_originals = 0;
                 continue;
             }
-            let candidates: Vec<_> = paths
-                .iter()
-                .filter(|p| {
-                    p.conn.close_reason().is_none()
-                        && (!policy.adaptive
-                            || controllers[usize::from(p.id)].decision(now_us).eligible)
-                })
-                .map(|path| {
-                    let weight = if policy.adaptive {
-                        controllers[usize::from(path.id)].decision(now_us).weight
-                    } else {
-                        scheduler::weight(
-                            &path
-                                .quality
-                                .lock()
-                                .expect("quality lock")
-                                .snapshot
-                                .sender_estimate,
-                            quality_time(path),
-                            path.conn.rtt().as_secs_f64() * 1000.0,
-                        )
-                    };
-                    (path.id, weight)
-                })
-                .collect();
+            let candidates: Vec<_> = if policy.quality_schedule || policy.adaptive {
+                paths
+                    .iter()
+                    .filter(|p| {
+                        p.conn.close_reason().is_none()
+                            && (!policy.adaptive
+                                || controllers[usize::from(p.id)].decision(now_us).eligible)
+                    })
+                    .map(|path| {
+                        let weight = if policy.adaptive {
+                            controllers[usize::from(path.id)].decision(now_us).weight
+                        } else {
+                            scheduler::weight(
+                                &path
+                                    .quality
+                                    .lock()
+                                    .expect("quality lock")
+                                    .snapshot
+                                    .sender_estimate,
+                                quality_time(path),
+                                path.conn.rtt().as_secs_f64() * 1000.0,
+                            )
+                        };
+                        (path.id, weight)
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
             let candidates = if policy.adaptive {
                 business_ready_candidates(
                     &candidates,
@@ -1388,18 +1392,16 @@ async fn sender(
                 if path.conn.close_reason().is_some() {
                     continue;
                 }
-                let payload = if policy.receiver_feedback {
-                    path.quality
-                        .lock()
-                        .expect("quality lock")
-                        .wrap(&front.data, quality_time(path))
-                } else {
-                    front.data.clone()
-                };
-                let Ok(data) = wire::http_datagram(path.stream, &payload) else {
+                let Ok(mapping_bytes) = wire::http_datagram_overhead(path.stream) else {
                     continue;
                 };
-                let frame_bytes = data.len();
+                let frame_bytes = mapping_bytes
+                    + front.data.len()
+                    + if policy.receiver_feedback {
+                        quality::HEADER
+                    } else {
+                        0
+                    };
                 let cost = frame_bytes + 80;
                 let group_reserve = if Some(path.group) == reserved_group {
                     feedback_reserve
@@ -1426,29 +1428,51 @@ async fn sender(
                         continue;
                     }
                 }
-                if path.conn.max_datagram_size().is_none_or(|m| data.len() > m) {
+                if path
+                    .conn
+                    .max_datagram_size()
+                    .is_none_or(|m| frame_bytes > m)
+                {
                     continue;
                 }
-                if path.conn.datagram_send_buffer_space() < data.len() {
+                let blocked = path.conn.datagram_send_buffer_space() < frame_bytes;
+                if blocked {
                     metrics.path(path.id, |p| p.send_buffer_full_attempts += 1);
-                    if wait_candidate.is_none() {
-                        wait_candidate = Some(PreparedSend {
-                            path: path.clone(),
-                            generation: path
-                                .quality
-                                .lock()
-                                .expect("quality lock")
-                                .snapshot
-                                .generation,
-                            front: front.clone(),
-                            candidates: candidates.clone(),
-                            repair,
-                            used,
-                            data,
-                            feedback_reserve,
-                            group_reserve,
-                        });
+                    if wait_candidate.is_some() {
+                        continue;
                     }
+                }
+                // Only a viable immediate send or the first readiness candidate
+                // needs an owned frame. Failed previews consume no quality sequence.
+                let payload = if policy.receiver_feedback {
+                    path.quality
+                        .lock()
+                        .expect("quality lock")
+                        .wrap(&front.data, quality_time(path))
+                } else {
+                    front.data.clone()
+                };
+                let Ok(data) = wire::http_datagram(path.stream, &payload) else {
+                    continue;
+                };
+                debug_assert_eq!(data.len(), frame_bytes);
+                if blocked {
+                    wait_candidate = Some(PreparedSend {
+                        path: path.clone(),
+                        generation: path
+                            .quality
+                            .lock()
+                            .expect("quality lock")
+                            .snapshot
+                            .generation,
+                        front: front.clone(),
+                        candidates: candidates.clone(),
+                        repair,
+                        used,
+                        data,
+                        feedback_reserve,
+                        group_reserve,
+                    });
                     continue;
                 }
                 match path.conn.send_datagram(data) {

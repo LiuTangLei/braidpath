@@ -30,14 +30,22 @@ impl Record {
         out.extend(&self.payload);
         Ok(out)
     }
-    pub fn decode(b: &[u8]) -> Result<Self> {
+    /// Validate a record and read routing/accounting fields without copying its payload.
+    pub fn decode_identity(b: &[u8]) -> Result<(u32, u64)> {
         ensure!(
             (12..=12 + MAX_PAYLOAD).contains(&b.len()),
             "invalid record length"
         );
+        Ok((
+            u32::from_be_bytes(b[..4].try_into()?),
+            u64::from_be_bytes(b[4..12].try_into()?),
+        ))
+    }
+    pub fn decode(b: &[u8]) -> Result<Self> {
+        let (flow, id) = Self::decode_identity(b)?;
         Ok(Self {
-            flow: u32::from_be_bytes(b[..4].try_into()?),
-            id: u64::from_be_bytes(b[4..12].try_into()?),
+            flow,
+            id,
             payload: b[12..].to_vec(),
         })
     }
@@ -104,9 +112,8 @@ fn decode(b: &[u8]) -> Result<Option<Shard>> {
     }
 }
 
-/// RFC 9297 Quarter Stream ID followed by BraidPath context 0.
-/// Implemented here to validate mapping explicitly, including nonzero stream IDs.
-pub fn http_datagram(stream: u64, payload: &[u8]) -> Result<Bytes> {
+/// Exact mapping bytes, including context 0, for allocation-free admission checks.
+pub fn http_datagram_overhead(stream: u64) -> Result<usize> {
     ensure!(
         stream < (1u64 << 62) && stream.is_multiple_of(4),
         "invalid request stream"
@@ -121,6 +128,14 @@ pub fn http_datagram(stream: u64, payload: &[u8]) -> Result<Bytes> {
     } else {
         8
     };
+    Ok(n + 1)
+}
+
+/// RFC 9297 Quarter Stream ID followed by BraidPath context 0.
+/// Implemented here to validate mapping explicitly, including nonzero stream IDs.
+pub fn http_datagram(stream: u64, payload: &[u8]) -> Result<Bytes> {
+    let n = http_datagram_overhead(stream)? - 1;
+    let q = stream / 4;
     let mut b = Vec::with_capacity(n + 1 + payload.len());
     let full = q.to_be_bytes();
     b.extend_from_slice(&full[8 - n..]);
@@ -534,6 +549,72 @@ mod tests {
             receiver.receive(&symbols[1], now).unwrap(),
             vec![records[1].clone()]
         );
+    }
+
+    #[test]
+    fn sender_preflight_lengths_and_record_identity_match_wire_frames() {
+        let streams = [
+            (0, 2),
+            (4, 2),
+            (252, 2),
+            (256, 3),
+            (65_532, 3),
+            (65_536, 5),
+            ((1u64 << 32) - 4, 5),
+            (1u64 << 32, 9),
+            ((1u64 << 62) - 4, 9),
+        ];
+        for (flow, id) in [
+            (0, 0),
+            (0x0123_4567, 0x89ab_cdef_0123_4567),
+            (u32::MAX, u64::MAX),
+        ] {
+            for payload_len in [0, 1, 128, 1000, MAX_PAYLOAD] {
+                let record = Record {
+                    flow,
+                    id,
+                    payload: vec![0xa5; payload_len],
+                };
+                let encoded = record.encode().unwrap();
+                assert_eq!(Record::decode_identity(&encoded).unwrap(), (flow, id));
+                assert_eq!(Record::decode(&encoded).unwrap(), record);
+                let symbol = plain(&record).unwrap();
+                let quality = super::super::quality::State::new(7);
+                for (stream, overhead) in streams {
+                    assert_eq!(http_datagram_overhead(stream).unwrap(), overhead);
+                    for feedback in [false, true] {
+                        let payload = if feedback {
+                            quality.wrap(&symbol, 1234)
+                        } else {
+                            symbol.clone()
+                        };
+                        let predicted = overhead
+                            + symbol.len()
+                            + if feedback {
+                                super::super::quality::HEADER
+                            } else {
+                                0
+                            };
+                        let frame = http_datagram(stream, &payload).unwrap();
+                        assert_eq!(frame.len(), predicted);
+                        assert_eq!(http_payload(&frame, stream).unwrap(), payload.as_ref());
+                    }
+                }
+                assert_eq!(
+                    quality.snapshot.sent_symbols, 0,
+                    "previews spend no sequence"
+                );
+            }
+        }
+        for len in (0..12).chain([13 + MAX_PAYLOAD]) {
+            let invalid = vec![0; len];
+            assert!(Record::decode_identity(&invalid).is_err());
+            assert!(Record::decode(&invalid).is_err());
+        }
+        for stream in [1, 2, 3, 257, 1u64 << 62, u64::MAX - 3] {
+            assert!(http_datagram_overhead(stream).is_err());
+            assert!(http_datagram(stream, &[]).is_err());
+        }
     }
 
     #[test]

@@ -1101,16 +1101,75 @@ impl PathController {
         } else {
             self.allowance_bytes * 8_000_000.0 / admission_span as f64
         };
-        // Finalized loss can describe an older packet cohort. Corroborate it
-        // independently with current service under an exercised, settled pace;
-        // do not interpret a delayed warmup loss as today's capacity ceiling.
-        let service_shortfall = feedback_fresh
+        let allowance_shortfall = feedback_fresh
             && exercised
             && allowance_rate > 0.0
             && wire_delivery_bps.is_some_and(|rate| rate < allowance_rate * 0.85);
         let last_change = self.last_growth_us.max(self.last_brake_us.unwrap_or(0));
+        let last_pace_change = self
+            .rate_changes
+            .back()
+            .map_or(last_change, |change| last_change.max(change.at_us));
+        // A short allowance interval can be well exercised while shared sender
+        // admission underfills a longer receiver interval. Compare actual symbol
+        // service on matching, complete endpoints at a stable pace instead of
+        // attributing unsent allowance to this path's delivery capacity.
+        let qualified_loss_service = |sample: &service::Sample| {
+            self.fast_feedback_seen
+                && !observation.transport_blocked
+                && (sample.bps == 0.0
+                    || self
+                        .last_positive_report_us
+                        .is_some_and(|at| now.checked_sub(at).is_some_and(|age| age <= CONTROL_US)))
+                && now
+                    .checked_sub(sample.observed_us)
+                    .is_some_and(|age| age <= CONTROL_US)
+                && (PROBE_US..=FRESH_US).contains(&sample.span_us)
+                && sample.bps.is_finite()
+                && sample.bps >= 0.0
+                && sample.admission.is_some_and(|admission| {
+                    (PROBE_US..=FRESH_US).contains(&admission.span_us)
+                        && admission.symbols >= 8
+                        && admission.bps.is_finite()
+                        && admission.bps > 0.0
+                        && admission.started_us >= last_pace_change
+                        && self
+                            .backlog_since_us
+                            .is_some_and(|since| since <= admission.started_us)
+                        && self
+                            .demand_activity
+                            .since_us
+                            .is_some_and(|since| since <= admission.started_us)
+                })
+        };
+        let loss_service = service_sample.filter(qualified_loss_service).or_else(|| {
+            self.service_window
+                .discovery_with_counts(now, 8, 0)
+                .filter(qualified_loss_service)
+        });
+        let service_shortfall = feedback_fresh
+            && if self.fast_feedback_seen {
+                loss_service.is_some_and(|sample| {
+                    // A legal finite token burst is not sustained path demand.
+                    let admitted = sample
+                        .admission
+                        .unwrap()
+                        .bps
+                        .min(self.rate_bps as f64 / self.wire_per_symbol);
+                    sample.bps < admitted * 0.85
+                })
+            } else {
+                // Legacy callers have no paired symbol coordinates.
+                allowance_shortfall
+            };
+        let unqualified_loss_service = self.fast_feedback_seen && loss_service.is_none();
         let settled_shortfall =
             service_shortfall && now.saturating_sub(last_change) >= PROBE_US + BRAKE_US;
+        // Preserve the separate severe-loss safety override, including older
+        // callers without cumulative sender-byte coordinates. It grants no
+        // ordinary-loss capacity evidence or positive growth permission.
+        let fast_loss_service_pressure =
+            allowance_shortfall && now.saturating_sub(last_change) >= PROBE_US + BRAKE_US;
         self.loss_pressure = ordinary_loss && settled_shortfall;
         let probe_began_us = probe_fresh
             .then_some(observation.probe_age_us.zip(probe_rtt))
@@ -1143,7 +1202,7 @@ impl PathController {
                     observation,
                     batch,
                     self.last_brake_admitted_symbols,
-                    severe_pressure || blocked_pressure || settled_shortfall,
+                    severe_pressure || blocked_pressure || fast_loss_service_pressure,
                 )
             });
         let loss_counts = self.loss_evidence.counts();
@@ -1318,10 +1377,6 @@ impl PathController {
         // Compare actual symbol rates over each clock's own paired interval.
         // A full stable local interval and recent actual business activity avoid
         // treating idle traffic or an earlier pace as current capacity evidence.
-        let last_pace_change = self
-            .rate_changes
-            .back()
-            .map_or(last_change, |change| last_change.max(change.at_us));
         let activity_since_us = if self.fast_feedback_seen {
             self.demand_activity.since_us
         } else {
@@ -2021,7 +2076,9 @@ impl PathController {
                 // newer complete paired delivery interval. That newer evidence
                 // may release this growth guard, but grants no service memory
                 // or rate credit and never bypasses the independent brakes.
-                && !(ordinary_loss && service_shortfall && !current_recovery_service)
+                && !(ordinary_loss
+                    && (service_shortfall || unqualified_loss_service)
+                    && !current_recovery_service)
                 && observation.offered_backlog
                 && exercised
                 && now >= self.growth_not_before_us
@@ -2260,7 +2317,9 @@ impl PathController {
         self.last_rtt_ms = rtt;
         self.last_local_rtt_ms = local_rtt;
         self.last_transport_wait_ms = transport_wait;
-        self.tokens = self.tokens.min(2400.0);
+        self.tokens = self
+            .tokens
+            .min(super::outbound::pacing_burst_bytes(self.rate_bps, 2400));
     }
 
     fn in_known_service_range(&self) -> bool {
@@ -2643,6 +2702,9 @@ impl PathController {
         if previous_bps == self.rate_bps {
             return;
         }
+        self.tokens = self
+            .tokens
+            .min(super::outbound::pacing_burst_bytes(self.rate_bps, 2400));
         self.initial_delivery_credit = None;
         self.growth_monitor = None;
         let owned_retry = self.last_control.growth_retry_ceiling_bps.is_some()
@@ -2685,7 +2747,8 @@ impl PathController {
             let before =
                 deadline.saturating_sub(self.token_us) as f64 * old_rate as f64 / 8_000_000.0;
             self.allowance_bytes += before;
-            self.tokens = (self.tokens + before).min(2400.0);
+            self.tokens =
+                (self.tokens + before).min(super::outbound::pacing_burst_bytes(old_rate, 2400));
             self.token_us = self.token_us.max(deadline);
             if let Some(maximum) = self.reprobe.expire(now_us) {
                 self.rate_bps = self.rate_bps.min(maximum);
@@ -2696,7 +2759,8 @@ impl PathController {
         let allowance =
             now_us.saturating_sub(self.token_us) as f64 * self.rate_bps as f64 / 8_000_000.0;
         self.allowance_bytes += allowance;
-        self.tokens = (self.tokens + allowance).min(2400.0);
+        self.tokens =
+            (self.tokens + allowance).min(super::outbound::pacing_burst_bytes(self.rate_bps, 2400));
         self.token_us = self.token_us.max(now_us);
     }
 }
@@ -2705,6 +2769,176 @@ impl PathController {
 mod tests {
     use super::*;
     use std::collections::VecDeque;
+
+    fn paired_loss_service_fixture() -> (PathController, Observation) {
+        let now = 18_600_711;
+        let mut controller = PathController::new(100_000_000, 100);
+        controller.observe(&observation(now - 1_000_000, 82.539969));
+        controller.rate_bps = 14_762_250;
+        controller.fast_feedback_seen = true;
+        controller.last_growth_us = 17_778_445;
+        controller.last_control_us = now - 21_299;
+        controller.last_control.at_us = now - 1_000;
+        controller.token_us = now;
+        controller.admitted_bytes = 35_448;
+        controller.admitted_symbol_bytes = 31_928;
+        controller.allowance_bytes = 39_302.645_343_75;
+        controller.backlog_since_us = Some(now - 2_000_000);
+        controller.demand_activity = DemandActivity {
+            since_us: controller.backlog_since_us,
+            last_activity_us: Some(now - 1_000),
+        };
+        controller.last_report = Some((83, 3_424_806, now - 197_867));
+        controller.loss_evidence = LossEvidence {
+            previous: Some((3_000, 240)),
+            batches: VecDeque::from([(now - 500_000, 128, 10)]),
+        };
+        controller.service_window = service::Window::default();
+        controller.service_window.observe(
+            80,
+            Some(1),
+            3_000_000,
+            now - 500_039,
+            Some((3_000_000, 3_291)),
+        );
+        let mut sample = observation(now, 82.539969);
+        sample.report_number = 84;
+        sample.delivered_bytes = 3_700_840;
+        sample.delivered_bps = Some(11_160_264.217_883_73);
+        sample.delivery_report_time_us = Some(500_117);
+        sample.delivery_sample_span_us = 197_867;
+        sample.admitted_symbol_bytes = Some(3_764_390);
+        sample.admitted_symbols = Some(4_041);
+        sample.finalized_expected = Some(3_753);
+        sample.finalized_lost = Some(299);
+        sample.feedback_sample_symbols = 753;
+        sample.loss_rate = 0.08;
+        sample.loss_sample_rate = Some(59.0 / 753.0);
+        (controller, sample)
+    }
+
+    #[test]
+    fn paired_service_prevents_short_allowance_loss_brake() {
+        let (mut controller, sample) = paired_loss_service_fixture();
+        let before = controller.rate_bps;
+        controller.observe(&sample);
+        let service = controller.service_window.latest(sample.now_us).unwrap();
+        let admitted = service.admission.unwrap();
+        assert_eq!(admitted.span_us, 500_039);
+        assert_eq!(service.span_us, 500_116);
+        assert!(service.bps >= admitted.bps * 0.91);
+        assert!(controller.loss_evidence.ordinary());
+        assert!(!controller.last_control.service_admission.unwrap().deficit);
+        // The 21 ms control interval used 90.2% of its allowance. Its different
+        // time span cannot turn 91.7% delivery of actual admitted symbols into
+        // a path-capacity shortfall against the larger configured allowance.
+        assert!(!controller.loss_pressure);
+        assert_eq!(controller.rate_bps, before);
+        assert!(!controller.congestion_seen);
+    }
+
+    #[test]
+    fn paired_loss_service_still_brakes_actual_delivery_deficit() {
+        let (mut controller, mut sample) = paired_loss_service_fixture();
+        let before = controller.rate_bps;
+        sample.delivered_bytes = 3_500_000;
+        sample.delivered_bps = Some(7_800_000.0);
+        controller.observe(&sample);
+        assert!(controller.loss_pressure);
+        assert!(controller.last_control.service_admission.unwrap().deficit);
+        assert!(controller.rate_bps < before);
+        assert!(controller.congestion_seen);
+    }
+
+    #[test]
+    fn ordinary_loss_without_qualified_service_cannot_authorize_growth() {
+        for guard in [
+            "missing_sender",
+            "missing_clock",
+            "pace_crossing",
+            "short_local_span",
+        ] {
+            let (mut controller, mut sample) = paired_loss_service_fixture();
+            let before = controller.rate_bps;
+            controller.last_control_us = sample.now_us - CONTROL_US;
+            controller.admitted_bytes = 350_000;
+            controller.admitted_symbol_bytes = 315_255;
+            controller.allowance_bytes = before as f64 * CONTROL_US as f64 / 8_000_000.0;
+            // A young individual report can exceed the startup threshold while
+            // the complete same-pace admission evidence remains unqualified.
+            sample.delivered_bps = Some(13_800_000.0);
+            match guard {
+                "missing_sender" => {
+                    sample.admitted_symbol_bytes = None;
+                    sample.admitted_symbols = None;
+                }
+                "missing_clock" => sample.delivery_report_time_us = None,
+                "pace_crossing" => controller.last_growth_us = sample.now_us - 300_000,
+                "short_local_span" => {
+                    controller.service_window = service::Window::default();
+                    controller.service_window.observe(
+                        80,
+                        Some(1),
+                        3_000_000,
+                        sample.now_us - 100_000,
+                        Some((3_000_000, 3_291)),
+                    );
+                }
+                _ => unreachable!(),
+            }
+            controller.observe(&sample);
+            assert!(controller.loss_evidence.ordinary(), "{guard}");
+            assert!(!controller.loss_pressure, "{guard}");
+            assert_eq!(controller.rate_bps, before, "{guard}");
+        }
+    }
+
+    #[test]
+    fn adaptive_pacing_realizes_high_rates_with_millisecond_wakes() {
+        for rate in [32_000_000, 64_000_000, 80_000_000, 100_000_000, 400_000_000] {
+            for packet_bytes in [1_135, 1_200] {
+                let mut controller = PathController::new(rate, 100);
+                controller.rate_bps = rate;
+                controller.tokens = 0.0;
+                let mut admitted = 0u64;
+                for now in (1_000..=1_000_000).step_by(1_000) {
+                    while controller.allow(now, packet_bytes, 0.0) {
+                        controller.admitted(now, packet_bytes);
+                        admitted += packet_bytes as u64;
+                    }
+                }
+                let budget = rate / 8;
+                assert!(admitted <= budget, "new time is the only source of credit");
+                assert!(
+                    admitted * 100 >= budget * 95,
+                    "rate={rate}, packet={packet_bytes}, admitted={admitted}, budget={budget}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn adaptive_rate_changes_preserve_startup_and_clamp_without_new_credit() {
+        let mut controller = PathController::new(400_000_000, 100);
+        assert_eq!(controller.rate_bps, START_BPS);
+        assert_eq!(controller.tokens, 2_400.0);
+        controller.rate_bps = 400_000_000;
+        controller.record_rate_change(0, START_BPS, RateReason::InitialGrowth);
+        assert_eq!(controller.tokens, 2_400.0);
+        controller.admitted(0, 2_400);
+        assert!(!controller.allow(0, 1, 0.0));
+        controller.refill(1_000);
+        assert_eq!(controller.tokens, 50_000.0);
+        controller.rate_bps = MIN_BPS;
+        controller.record_rate_change(1_000, 400_000_000, RateReason::LossBrake);
+        assert_eq!(controller.tokens, 2_400.0);
+        controller.admitted(1_000, 2_400);
+        controller.rate_bps = 400_000_000;
+        controller.record_rate_change(1_000, MIN_BPS, RateReason::KnownServiceRecovery);
+        assert!(!controller.allow(1_000, 1, 0.0));
+        assert!(controller.allow(1_001, 50, 0.0));
+        assert!(!controller.allow(1_001, 51, 0.0));
+    }
 
     fn observation(now_us: u64, rtt_ms: f64) -> Observation {
         Observation {

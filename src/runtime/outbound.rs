@@ -203,11 +203,26 @@ impl ObservationSchedule {
     }
 }
 
+/// Retain one sender timer quantum plus at most one frame's fractional credit.
+/// A fixed two-
+/// datagram bucket otherwise caps a 1 ms wakeup cadence near 19 Mbit/s, even
+/// when the admitted rate is hundreds of Mbit/s. Low-rate/startup credit keeps
+/// its existing byte bound; a rate change never grants tokens by itself.
+pub(super) fn pacing_burst_bytes(rate_bps: u64, minimum_bytes: usize) -> f64 {
+    // Maximum repair symbol, feedback header, HTTP mapping and admission cost.
+    // The remainder lets a packet that did not fit the previous quantum carry
+    // its earned bytes forward instead of rounding every wakeup down to packets.
+    let frame_remainder = super::wire::MAX_WIRE + super::quality::HEADER + 9 + 80;
+    (minimum_bytes as f64).max(rate_bps.div_ceil(8000) as f64 + frame_remainder as f64)
+}
+
 pub struct Pacer {
     tokens: f64,
     last_us: u64,
     rate: u64,
     burst: f64,
+    minimum_burst: usize,
+    rate_aware: bool,
 }
 impl Pacer {
     pub fn new(rate: u64, burst: usize) -> Self {
@@ -216,6 +231,15 @@ impl Pacer {
             last_us: 0,
             rate,
             burst: burst as f64,
+            minimum_burst: burst,
+            rate_aware: false,
+        }
+    }
+    pub fn for_sender(rate: u64, minimum_burst: usize) -> Self {
+        Self {
+            burst: pacing_burst_bytes(rate, minimum_burst),
+            rate_aware: true,
+            ..Self::new(rate, minimum_burst)
         }
     }
     pub fn refill(&mut self, now_us: u64) {
@@ -228,6 +252,10 @@ impl Pacer {
     pub fn set_rate(&mut self, now_us: u64, rate: u64) {
         self.refill(now_us.max(self.last_us));
         self.rate = rate;
+        if self.rate_aware {
+            self.burst = pacing_burst_bytes(rate, self.minimum_burst);
+        }
+        self.tokens = self.tokens.min(self.burst);
     }
     pub fn available(&self, bytes: usize) -> bool {
         self.tokens >= bytes as f64
@@ -252,7 +280,12 @@ impl BusinessPacer {
     pub fn new(maximum_bps: u64, group_maximum_bps: [u64; MAX_PATHS], burst_bytes: usize) -> Self {
         let burst = burst_bytes.min(2400);
         let startup_bucket = || {
-            let mut bucket = Pacer::new(0, burst);
+            let mut bucket = if burst == 2400 {
+                Pacer::for_sender(0, burst)
+            } else {
+                // An explicitly smaller caller limit remains a byte cap.
+                Pacer::new(0, burst)
+            };
             bucket.tokens = burst as f64;
             bucket
         };
@@ -285,12 +318,10 @@ impl BusinessPacer {
         let mut total = 0u64;
         for (id, rate) in rates.into_iter().enumerate() {
             let rate = rate.min(self.group_maximum_bps[id]);
-            self.groups[id].rate = rate;
-            self.groups[id].tokens = self.groups[id].tokens.min(self.groups[id].burst);
+            self.groups[id].set_rate(now_us, rate);
             total = total.saturating_add(rate);
         }
-        self.aggregate.rate = total.min(self.maximum_bps);
-        self.aggregate.tokens = self.aggregate.tokens.min(self.aggregate.burst);
+        self.aggregate.set_rate(now_us, total.min(self.maximum_bps));
     }
 
     pub fn available(&self, group: u8, wire_bytes: usize) -> bool {
@@ -313,6 +344,73 @@ impl BusinessPacer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn high_rate_pacers_service_the_budget_at_a_millisecond_wakeup_cadence() {
+        const COST: usize = 1135;
+        // Exercise the same aggregate/group/business gates with a continuously
+        // backlogged sender, after startup credit has been consumed.
+        for (rate, minimum_burst) in [10_000_000, 32_000_000, 80_000_000, 100_000_000, 400_000_000]
+            .into_iter()
+            .flat_map(|rate| [2400, 9600].map(|minimum| (rate, minimum)))
+        {
+            let mut aggregate = Pacer::for_sender(rate, minimum_burst);
+            let mut group = Pacer::for_sender(rate, minimum_burst);
+            let mut business = BusinessPacer::new(rate, [rate; MAX_PATHS], 2400);
+            let budgets = [(0, rate / 4); 4];
+            business.update(0, budgets);
+            business.spend(0, 2400);
+            let mut admitted = 0u64;
+            for now_us in (1000..=100_000).step_by(1000) {
+                aggregate.refill(now_us);
+                group.refill(now_us);
+                business.update(now_us, budgets);
+                while aggregate.available(COST)
+                    && group.available(COST)
+                    && business.available(0, COST)
+                {
+                    aggregate.spend(COST);
+                    group.spend(COST);
+                    business.spend(0, COST);
+                    admitted += COST as u64;
+                }
+            }
+            let allowance = rate * 100_000 / 8_000_000;
+            assert!(admitted >= allowance * 95 / 100, "{admitted}/{allowance}");
+            assert!(admitted <= allowance, "no timer catch-up credit");
+        }
+    }
+
+    #[test]
+    fn high_rate_credit_remains_bounded_and_rate_changes_grant_no_tokens() {
+        let mut pacer = Pacer::for_sender(400_000_000, 2400);
+        pacer.refill(1_000_000);
+        assert!(pacer.available(51_144));
+        assert!(
+            !pacer.available(51_145),
+            "one millisecond plus one frame survives idle"
+        );
+        pacer.set_rate(1_000_000, 8_000_000);
+        assert!(pacer.available(2400));
+        assert!(
+            !pacer.available(2401),
+            "lower rate restores the small bound"
+        );
+        pacer.spend(2400);
+        pacer.set_rate(1_000_000, 400_000_000);
+        assert!(!pacer.available(1), "raising a rate creates no credit");
+        pacer.refill(1_001_000);
+        assert!(pacer.available(50_000));
+        assert!(!pacer.available(50_001));
+
+        // Independent measurement probes retain their explicitly fixed burst.
+        let mut probe = Pacer::new(20_000_000, 2178);
+        probe.refill(1_000_000);
+        probe.set_rate(1_000_000, 400_000_000);
+        probe.refill(2_000_000);
+        assert!(probe.available(2178));
+        assert!(!probe.available(2179));
+    }
 
     #[test]
     fn event_observation_036_coalesces_evidence_without_moving_periodic_deadlines() {
