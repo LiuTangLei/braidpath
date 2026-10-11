@@ -2050,6 +2050,7 @@ impl PathController {
                                     && current.bps * self.wire_per_symbol >= allowance_rate * 0.85
                                     && current.admission.is_some_and(|sent| {
                                         sent.bps > 0.0
+                                            && sent.started_us >= last_pace_change
                                             && current.bps >= sent.bps * 0.85
                                             && self
                                                 .backlog_since_us
@@ -2073,12 +2074,13 @@ impl PathController {
                 // capacity shortcut otherwise bypasses receiver-keeps-up and
                 // can restart growth faster than loss can be corroborated.
                 // A disjoint sample that crosses an older pace can lag a
-                // newer complete paired delivery interval. That newer evidence
-                // may release this growth guard, but grants no service memory
-                // or rate credit and never bypasses the independent brakes.
+                // newer complete paired delivery interval at the current pace.
+                // Qualified newer evidence may release the shortfall guard,
+                // but grants no service memory or rate credit and never
+                // bypasses missing qualifications or the independent brakes.
                 && !(ordinary_loss
-                    && (service_shortfall || unqualified_loss_service)
-                    && !current_recovery_service)
+                    && (unqualified_loss_service
+                        || (service_shortfall && !current_recovery_service)))
                 && observation.offered_backlog
                 && exercised
                 && now >= self.growth_not_before_us
@@ -3087,6 +3089,114 @@ mod tests {
         sample.finalized_lost = Some(4);
         sample.feedback_sample_symbols = 0;
         sample
+    }
+
+    fn ordinary_loss_recovery_report(
+        controller: &mut PathController,
+        previous: &Observation,
+        now: u64,
+    ) -> Observation {
+        controller.probe_admitted(now - 100_000);
+        let mut sample = wire_admitted_report_060(controller, previous, now);
+        // Every sixteenth actually admitted datagram is absent at the receiver.
+        // Finalized loss and delivered bytes describe those same datagrams.
+        let expected = sample.admitted_symbols.unwrap();
+        let lost = expected / 16;
+        let previous_expected = previous.admitted_symbols.unwrap();
+        sample.delivered_bytes = sample.admitted_symbol_bytes.unwrap() - lost * 1025;
+        sample.delivered_bps = Some(
+            (sample.delivered_bytes - previous.delivered_bytes) as f64 * 8_000_000.0
+                / (now - previous.now_us) as f64,
+        );
+        sample.finalized_expected = Some(expected);
+        sample.finalized_lost = Some(lost);
+        sample.feedback_sample_symbols = expected - previous_expected;
+        sample.loss_sample_rate = Some(
+            (lost - previous.finalized_lost.unwrap()) as f64
+                / (expected - previous_expected) as f64,
+        );
+        sample.probe_age_us = Some(20_000);
+        sample
+    }
+
+    fn ordinary_loss_recovery_fixture() -> (PathController, Observation) {
+        let mut controller = PathController::new(3_000_000, 100);
+        let mut sample = short_observation_022(0, 80.0);
+        sample.delivered_bytes = 0;
+        sample.delivered_bps = Some(0.0);
+        sample.admitted_symbol_bytes = Some(0);
+        // Seed the receiver window at 100 ms, so its disjoint endpoints are
+        // [100, 600] and [600, 1100], followed by rolling [700, 1200].
+        sample.delivery_report_time_us = None;
+        controller.observe(&sample);
+        controller.rate_bps = 900_000;
+        controller.tokens = 0.0;
+        controller.growth_not_before_us = 1_200_000;
+        for now in (100_000..=1_000_000).step_by(100_000) {
+            sample = ordinary_loss_recovery_report(&mut controller, &sample, now);
+            controller.observe(&sample);
+            assert_eq!(controller.rate_bps, 900_000, "before pace change at {now}");
+        }
+        controller.rate_bps = 1_000_000;
+        controller.congestion_seen = true;
+        controller.remembered_bps = 2_000_000.0;
+        controller.last_growth_us = 1_000_000;
+        controller.record_rate_change(1_000_000, 900_000, RateReason::KnownServiceRecovery);
+        controller.last_control_us = 1_000_000;
+        controller.admitted_bytes = 0;
+        controller.admitted_symbol_bytes = 0;
+        controller.allowance_bytes = 0.0;
+        sample = ordinary_loss_recovery_report(&mut controller, &sample, 1_100_000);
+        controller.observe(&sample);
+        assert_eq!(controller.rate_bps, 1_000_000);
+        let old = controller.service_window.latest(sample.now_us).unwrap();
+        assert_eq!(old.admission.unwrap().started_us, 600_000);
+        assert_eq!(old.observed_us, 1_100_000);
+        (controller, sample)
+    }
+
+    #[test]
+    fn ordinary_loss_recovery_rejects_newer_cross_pace_window() {
+        let (mut controller, previous) = ordinary_loss_recovery_fixture();
+        let sample = ordinary_loss_recovery_report(&mut controller, &previous, 1_200_000);
+        controller.observe(&sample);
+        let old = controller.service_window.latest(sample.now_us).unwrap();
+        let current = controller
+            .service_window
+            .discovery_with_counts(sample.now_us, 8, 1)
+            .unwrap();
+        assert!(controller.loss_evidence.ordinary());
+        assert_eq!(old.admission.unwrap().started_us, 600_000);
+        assert_eq!(current.admission.unwrap().started_us, 700_000);
+        assert!(current.observed_us > old.observed_us);
+        assert!(current.bps * controller.wire_per_symbol >= 1_000_000.0 * 0.85);
+        assert!(current.bps >= current.admission.unwrap().bps * 0.85);
+        assert!(!controller.loss_pressure);
+        assert_eq!(
+            controller.rate_bps, 1_000_000,
+            "a newer endpoint still crosses the latest pace and cannot release the growth guard"
+        );
+    }
+
+    #[test]
+    fn ordinary_loss_recovery_accepts_complete_post_pace_window() {
+        let (mut controller, mut sample) = ordinary_loss_recovery_fixture();
+        for now in (1_200_000..=1_700_000).step_by(100_000) {
+            sample = ordinary_loss_recovery_report(&mut controller, &sample, now);
+            controller.observe(&sample);
+            assert!(controller.loss_evidence.ordinary());
+            if controller.rate_bps > 1_000_000 {
+                let current = controller
+                    .service_window
+                    .discovery_with_counts(now, 8, 1)
+                    .unwrap();
+                assert!(current.admission.unwrap().started_us >= 1_000_000);
+                assert!(current.admission.unwrap().span_us >= PROBE_US);
+                assert!(current.bps >= current.admission.unwrap().bps * 0.85);
+                return;
+            }
+        }
+        panic!("a complete fresh post-pace service window must still permit bounded recovery");
     }
 
     #[test]
