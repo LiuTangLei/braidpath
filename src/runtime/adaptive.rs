@@ -1933,6 +1933,22 @@ impl PathController {
         } else {
             1.5
         };
+        // A queue safety brake can be valid without having exercised the
+        // budget enough to establish capacity. Keep that distinction, but
+        // do not restart the initial search through its unfinished queue.
+        // Existing paired-service qualification releases this bounded hold;
+        // a short byte report alone cannot prove post-brake drainage.
+        let unfinished_startup_drain = !self.congestion_seen
+            && self.drain_restore_pending
+            && self.queue_delay_ms > self.target_ms * 0.25
+            && self.last_brake_us.is_some_and(|brake| {
+                now.checked_sub(brake).is_some_and(|age| age < FRESH_US)
+                    && !loss_service.is_some_and(|sample| {
+                        sample
+                            .admission
+                            .is_some_and(|admission| admission.started_us >= brake)
+                    })
+            });
         let elapsed = now.saturating_sub(self.last_control_us);
         let mut waiting_for_drain_window = false;
         if elapsed >= CONTROL_US {
@@ -2111,7 +2127,7 @@ impl PathController {
                                         && sent.started_us < last_pace_change
                                 })
                         });
-                } else if recent_drain.is_none() {
+                } else if recent_drain.is_none() && !unfinished_startup_drain {
                     self.drain_restore_pending = false;
                 }
             }
@@ -2146,6 +2162,7 @@ impl PathController {
                 });
             if !monitor_withdrawn
                 && !waiting_for_drain_window
+                && !unfinished_startup_drain
                 && fresh
                 && self.eligible
                 && !pressure
@@ -11157,6 +11174,165 @@ mod tests {
             controller.observe(&sample);
             assert!(controller.decision(now).eligible);
             assert_eq!(controller.decision(now).queue_delay_ms, 0.0);
+        }
+    }
+
+    fn lingering_queue_startup_fixture() -> (PathController, Observation) {
+        let mut controller = PathController::new(400_000_000, 100);
+        let mut sample = short_observation_022(16_770_477, 0.0);
+        sample.report_number = 131;
+        sample.delivered_bytes = 155_969_186;
+        sample.delivered_bps = Some(90_804_241.58229809);
+        sample.delivery_report_time_us = Some(16_629_103);
+        sample.delivery_sample_span_us = 100_057;
+        sample.probe_latest_rtt_ms = Some(65.128);
+        sample.probe_rtt_ms = Some(65.128);
+        sample.probe_sample_id = 104;
+        sample.probe_age_us = Some(64_268);
+        sample.rtt_ms = 70.724777;
+        controller.generation = Some(sample.generation);
+        controller.rate_bps = 110_822_666;
+        controller.min_rtt_ms = Some(30.271);
+        controller.fast_probe_min_rtt_ms = Some(30.271);
+        controller.startup_probe_pressure = Some((34.857, sample.now_us));
+        controller.fast_feedback_seen = true;
+        controller.last_brake_us = Some(16_169_482);
+        controller.last_growth_us = 2_110_462;
+        controller.last_growth_probe = Some(100);
+        controller.drain_restore_pending = true;
+        controller.pressure_episode_exercised = Some(false);
+        controller.last_report = Some((131, sample.delivered_bytes, 16_736_758));
+        controller.last_control.at_us = 16_736_758;
+        controller.record_rate_change(16_169_482, 138_528_333, RateReason::QueueBrake);
+        // record_rate_change clears consumed credits; this is the newer actual
+        // receiver endpoint accepted after the already recorded safety brake.
+        controller.initial_delivery_credit = Some(InitialDeliveryCredit {
+            report_number: 131,
+            delivered_bytes: sample.delivered_bytes,
+            observed_us: 16_736_758,
+            positive_age_at_observation_us: 11,
+            wire_delivery_bps: 100_549_087.02039838,
+            used: false,
+        });
+        let received = sample.delivered_bytes;
+        controller.service_window.observe(
+            126,
+            Some(16_128_679),
+            received - 4_169_700,
+            16_175_642,
+            Some((200_000_000, 200_000)),
+        );
+        controller.service_window.observe(
+            131,
+            sample.delivery_report_time_us,
+            received,
+            16_636_930,
+            Some((204_893_350, 204_774)),
+        );
+        controller.token_us = 16_570_327;
+        controller.last_control_us = 16_570_327;
+        controller.last_evidence_us = Some(16_570_327);
+        controller.tokens = crate::runtime::outbound::pacing_burst_bytes(controller.rate_bps, 2400);
+        controller.demand_activity.since_us = Some(650_942);
+        controller.demand_activity.last_activity_us = Some(controller.token_us);
+        controller.backlog_since_us = Some(16_336_735);
+        for packet in 1..=2448 {
+            let at = 16_570_327 + packet * 200_150 / 2448;
+            assert!(controller.allow(at, 1135, 0.0));
+            controller.admitted_symbol(at, 1135, 1025);
+        }
+        (controller, sample)
+    }
+
+    #[test]
+    fn a_lingering_queue_brake_does_not_restart_initial_growth_before_post_brake_service() {
+        let (mut controller, sample) = lingering_queue_startup_fixture();
+        assert!(!controller.congestion_seen);
+        let service = controller.service_window.latest(sample.now_us).unwrap();
+        assert_eq!(service.admission.unwrap().span_us, 461_288);
+        assert_eq!(service.span_us, 500_424);
+        let before = controller.rate_bps;
+        let memory = controller.remembered_bps;
+        controller.observe(&sample);
+        assert!((controller.queue_delay_ms - 34.857).abs() < 0.001);
+        assert_eq!(
+            controller.rate_bps, before,
+            "unfinished drainage is not a fresh cold start"
+        );
+        assert_eq!(controller.remembered_bps, memory);
+        assert!(
+            !controller.congestion_seen,
+            "a safety hold must not invent capacity evidence"
+        );
+        assert!(controller.drain_restore_pending);
+    }
+
+    #[test]
+    fn initial_growth_is_not_held_without_a_fresh_unfinished_queue_brake() {
+        for released in ["no_brake", "not_pending", "clear_queue", "aged_brake"] {
+            let (mut controller, mut sample) = lingering_queue_startup_fixture();
+            match released {
+                "no_brake" => controller.last_brake_us = None,
+                "not_pending" => controller.drain_restore_pending = false,
+                "clear_queue" => {
+                    controller.startup_probe_pressure = None;
+                    sample.rtt_ms = 31.0;
+                    sample.probe_latest_rtt_ms = Some(31.0);
+                    sample.probe_rtt_ms = Some(31.0);
+                }
+                "aged_brake" => controller.last_brake_us = Some(sample.now_us - FRESH_US),
+                _ => unreachable!(),
+            }
+            let before = controller.rate_bps;
+            controller.observe(&sample);
+            assert!(controller.rate_bps > before, "{released}");
+            assert!(!controller.congestion_seen, "{released}");
+        }
+    }
+
+    #[test]
+    fn initial_queue_hold_releases_only_on_qualified_post_brake_actual_service() {
+        for evidence in ["qualified", "sparse", "short_local", "interrupted", "stale"] {
+            let (mut controller, sample) = lingering_queue_startup_fixture();
+            // Counterfactual continuous post-brake service, distinct from the
+            // captured 461,288-us pair: both original clock floors must hold.
+            let completed = 16_736_758;
+            let mut started = controller.last_brake_us.unwrap() + 1;
+            if evidence == "short_local" {
+                started = completed - PROBE_US + 1;
+            }
+            controller.service_window = service::Window::default();
+            let symbols = if evidence == "sparse" { 7 } else { 4774 };
+            let symbol_bytes = symbols * 1025;
+            controller.service_window.observe(
+                126,
+                Some(16_128_679),
+                sample.delivered_bytes - symbol_bytes,
+                started,
+                Some((200_000_000, 200_000)),
+            );
+            controller.service_window.observe(
+                131,
+                sample.delivery_report_time_us,
+                sample.delivered_bytes,
+                completed,
+                Some((200_000_000 + symbol_bytes, 200_000 + symbols)),
+            );
+            controller.backlog_since_us = Some(started);
+            controller.last_positive_report_us = Some(completed);
+            if evidence == "interrupted" {
+                controller.backlog_since_us = Some(started + 1);
+            } else if evidence == "stale" {
+                controller.last_positive_report_us = Some(sample.now_us - CONTROL_US - 1);
+            }
+            let before = controller.rate_bps;
+            controller.observe(&sample);
+            if evidence == "qualified" {
+                assert!(controller.rate_bps > before);
+            } else {
+                assert_eq!(controller.rate_bps, before, "{evidence}");
+            }
+            assert!(!controller.congestion_seen, "{evidence}");
         }
     }
 
