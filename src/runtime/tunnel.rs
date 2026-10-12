@@ -34,6 +34,7 @@ use tracing::{info, warn};
 const MAX_FLOWS: usize = 64;
 const SESSION_IDLE_GRACE: Duration = Duration::from_secs(120);
 const SESSION_PATH: &str = "/session";
+mod local_delivery;
 mod small_delivery;
 
 const WEBSITE: &str = "<!doctype html><html lang=\"en\"><meta charset=\"utf-8\"><title>Welcome</title><h1>Welcome</h1><p>This service is online.</p></html>\n";
@@ -1888,6 +1889,15 @@ async fn session_loop(
     ));
     let mut stop = session.stop.subscribe();
     let mut decoder = Receiver::with_repair_wait(Duration::from_millis(session.policy.queue_ms));
+    let mut delivery = local_delivery::Queue::new(
+        session.forward.clone(),
+        Duration::from_millis(
+            session
+                .policy
+                .queue_ms
+                .min(session.policy.latency_target_ms),
+        ),
+    );
     let mut flows: HashMap<u32, (Arc<UdpSocket>, Instant)> = HashMap::new();
     let mut next_id = 0u64;
     let mut tick = interval(Duration::from_secs(5));
@@ -1905,15 +1915,17 @@ async fn session_loop(
                 for path in p.iter(){let stats=path.conn.stats();info!(path=path.id,rtt_ms=path.conn.rtt().as_secs_f64()*1000.0,tx_packets=stats.udp_tx.datagrams,rx_packets=stats.udp_rx.datagrams,tx_bytes=stats.udp_tx.bytes,rx_bytes=stats.udp_rx.bytes,lost=stats.path.lost_packets,cwnd=stats.path.cwnd,"server path statistics");}
                 info!(paths=p.len(),flows=flows.len(),originals=decoder.originals,recovered=decoder.recovered,duplicates=decoder.duplicates,invalid=decoder.invalid,dropped,ingress_drops=session.ingress_drops.load(Ordering::Relaxed),"server session");
             },
+            completed=delivery.ready()=>dropped+=completed,
             e=events.recv()=>match e {
                 Some(Event::Wire(pid,data))=>{
                     let records=receive_records(&mut decoder,&session.forward,pid,&data);
+                    let decoded=Instant::now();
                     for r in records {
                         if !flows.contains_key(&r.flow) {
                             if flows.len()>=MAX_FLOWS{dropped+=1;session.forward.update(|d|d.records.udp_target_flow_dropped+=1);session.forward.path(pid,|p|p.udp_target_flow_dropped+=1);continue}
                             let bind=if target.is_ipv4(){"0.0.0.0:0"}else{"[::]:0"};
-                            let Ok(socket)=UdpSocket::bind(bind).await else{dropped+=1;session.forward.update(|d|d.records.udp_target_send_dropped+=1);session.forward.path(pid,|p|p.udp_target_send_dropped+=1);continue};
-                            if socket.connect(target).await.is_err() || socket.writable().await.is_err(){dropped+=1;session.forward.update(|d|d.records.udp_target_send_dropped+=1);session.forward.path(pid,|p|p.udp_target_send_dropped+=1);continue}
+                            let Ok(socket)=UdpSocket::bind(bind).await else{dropped+=delivery.socket_error(pid);continue};
+                            if socket.connect(target).await.is_err(){dropped+=delivery.socket_error(pid);continue}
                             let socket=Arc::new(socket); let weak=Arc::downgrade(&socket); let events=session.events.clone(); let flow=r.flow; let mut quit=session.stop.subscribe(); let ingress_drops=session.ingress_drops.clone();let returning=session.returning.clone();
                             tasks.spawn(async move {
                                 let mut b=vec![0;65536];
@@ -1937,7 +1949,8 @@ async fn session_loop(
                             flows.insert(r.flow,(socket,Instant::now()));
                         }
                         if let Some((socket,last))=flows.get_mut(&r.flow) {
-                            *last=Instant::now(); if socket.try_send(&r.payload).is_err(){dropped+=1;session.forward.update(|d|d.records.udp_target_send_dropped+=1);session.forward.path(pid,|p|p.udp_target_send_dropped+=1);}else{session.forward.path(pid,|p|p.udp_target_delivered+=1);session.forward.update(|d|{d.records.udp_target_delivered+=1;d.records.udp_target_bytes+=r.payload.len() as u64;d.udp_delivered_record_ids.add(r.id);});}
+                            *last=Instant::now();
+                            dropped+=delivery.send(socket,None,r,pid,decoded);
                         }
                     }
                 },
@@ -1951,6 +1964,7 @@ async fn session_loop(
         }
         while tasks.try_join_next().is_some() {}
     }
+    dropped += delivery.close();
     let _ = session.stop.send(true);
     events.close();
     while let Ok(event) = events.try_recv() {
@@ -2456,6 +2470,15 @@ async fn client_session(
     let mut next_flow = 0u32;
     let mut next_id = 0u64;
     let mut decoder = Receiver::with_repair_wait(Duration::from_millis(options.policy.queue_ms));
+    let mut delivery = local_delivery::Queue::new(
+        returning.clone(),
+        Duration::from_millis(
+            options
+                .policy
+                .queue_ms
+                .min(options.policy.latency_target_ms),
+        ),
+    );
     let mut tick = interval(Duration::from_millis(200));
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut drops = 0u64;
@@ -2465,6 +2488,7 @@ async fn client_session(
     let result:Result<()>=async {loop {
         tokio::select! {
             _=shutdown.wait()=>break,
+            completed=delivery.ready()=>drops+=completed,
             _=tick.tick()=>{
                 let now_us=epoch.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
                 peers.retain(|_,(id,last)|{if last.elapsed()<Duration::from_secs(60){true}else{reverse.remove(id);false}});
@@ -2606,22 +2630,19 @@ async fn client_session(
             },
             data=wire_rx.recv()=>{
                 let Some((pid,data))=data else {bail!("all receivers ended")};
-                for record in receive_records(&mut decoder,&returning,pid,&data) {
+                let records=receive_records(&mut decoder,&returning,pid,&data);
+                let decoded=Instant::now();
+                for record in records {
                     if let Some(peer)=reverse.get(&record.flow) {
                         if let Some((_,last))=peers.get_mut(peer) {*last=Instant::now();}
-                        if socket.try_send_to(&record.payload,*peer).is_err() {
-                            drops+=1;returning.update(|d|d.records.udp_target_send_dropped+=1);
-                            returning.path(pid,|p|p.udp_target_send_dropped+=1);
-                        } else {
-                            returning.path(pid,|p|p.udp_target_delivered+=1);
-                            returning.update(|d|{d.records.udp_target_delivered+=1;d.records.udp_target_bytes+=record.payload.len() as u64;d.udp_delivered_record_ids.add(record.id);});
-                        }
+                        drops+=delivery.send(&socket,Some(*peer),record,pid,decoded);
                     } else {returning.update(|d|d.records.udp_target_flow_dropped+=1);returning.path(pid,|p|p.udp_target_flow_dropped+=1);}
                 }
             }
         }
         while let Some(completion)=tasks.try_join_next() {completion.context("path task failed")?;}
     }Ok(())}.await;
+    delivery.close();
     let _ = stop.send(true);
     options.stats.readiness(false, configs.len());
     for endpoint in endpoints.iter().flatten() {

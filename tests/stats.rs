@@ -4,20 +4,20 @@ use serde_json::Value;
 use std::{
     collections::BTreeSet,
     fs,
-    net::UdpSocket,
+    net::{SocketAddr, UdpSocket},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     thread,
     time::{Duration, Instant},
 };
 const BIN: &str = env!("CARGO_BIN_EXE_braidpath");
-// These subprocess fixtures select a loopback port before the child binds it.
-// Serialize sibling fixtures so their ephemeral sockets cannot claim a port
-// in that select-to-bind interval. Traffic/tasks within each fixture remain
-// concurrent; no transport assertion, rate, deadline or exit gate is relaxed.
+// Keep sibling traffic fixtures serialized. Each native listener now binds :0
+// itself and reports its actual address before downstream sockets are connected;
+// this mutex does not reserve ports or close a select-to-bind race.
 static LOCAL_SOCKET_FIXTURES: std::sync::Mutex<()> = std::sync::Mutex::new(());
 struct Process {
     child: Child,
+    role: String,
     json: PathBuf,
     jsonl: PathBuf,
     log: PathBuf,
@@ -51,32 +51,75 @@ fn launch(args: &[&str], dir: &Path, name: &str) -> Process {
         .unwrap();
     Process {
         child,
+        role: args[0].to_owned(),
         json,
         jsonl,
         log,
     }
 }
-fn ready(process: &mut Process) {
+fn ready(process: &mut Process) -> String {
+    let (message, address_key) = match process.role.as_str() {
+        "server" => ("HTTP/3 server ready", "address="),
+        "relay" => ("fixed-target relay ready", "listen="),
+        "client" => ("UDP client ready", "listen="),
+        role => panic!("unsupported readiness role: {role}"),
+    };
     let start = Instant::now();
     loop {
-        if process.jsonl.exists()
-            && fs::read_to_string(&process.jsonl)
-                .unwrap()
-                .lines()
-                .filter_map(|s| serde_json::from_str::<Value>(s).ok())
-                .any(|v| v["stats"]["ready"] == true)
-        {
-            return;
-        }
+        let log = fs::read_to_string(&process.log).unwrap();
         assert!(
             process.child.try_wait().unwrap().is_none(),
-            "{}",
-            fs::read_to_string(&process.log).unwrap()
+            "child {} ({}) exited before readiness: {log}",
+            process.child.id(),
+            process.role
         );
+        let snapshot = if process.jsonl.exists() {
+            fs::read_to_string(&process.jsonl)
+                .unwrap()
+                .lines()
+                .rev()
+                .find_map(|line| serde_json::from_str::<Value>(line).ok())
+        } else {
+            None
+        };
+        if let Some(snapshot) = snapshot {
+            assert_eq!(
+                snapshot["process_id"].as_u64(),
+                Some(u64::from(process.child.id())),
+                "readiness JSON must belong to the launched child"
+            );
+            assert_eq!(snapshot["role"].as_str(), Some(process.role.as_str()));
+            if snapshot["stats"]["ready"] == true
+                && snapshot["stats"]["listener_bound"] == true
+                && snapshot["final"] == false
+                && let Some(line) = log
+                    .split_inclusive('\n')
+                    .filter(|line| line.ends_with('\n'))
+                    .find(|line| line.contains(message))
+            {
+                // stderr is the dedicated file handle passed directly to this
+                // child. The ready event prints that child's local_addr(), and
+                // the JSON above independently identifies its PID and readiness.
+                let address: SocketAddr = line
+                    .split_whitespace()
+                    .find_map(|field| field.strip_prefix(address_key))
+                    .expect("ready event is missing its bound address")
+                    .parse()
+                    .expect("ready event has an invalid bound address");
+                assert!(address.is_ipv4() && address.ip().is_loopback());
+                assert_ne!(address.port(), 0, "child did not report an assigned port");
+                assert!(
+                    process.child.try_wait().unwrap().is_none(),
+                    "child exited while its ready address was being read: {log}"
+                );
+                return address.to_string();
+            }
+        }
         assert!(
             start.elapsed() < Duration::from_secs(12),
-            "readiness timeout: {}",
-            fs::read_to_string(&process.log).unwrap()
+            "readiness timeout for child {} ({}): {log}",
+            process.child.id(),
+            process.role
         );
         thread::sleep(Duration::from_millis(10));
     }
@@ -116,13 +159,6 @@ fn finish(process: &mut Process) -> Value {
     .unwrap();
     assert_eq!(last, result);
     result
-}
-fn port() -> String {
-    UdpSocket::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .to_string()
 }
 fn num(v: &Value, key: &str) -> u64 {
     v[key].as_u64().unwrap()
@@ -181,12 +217,11 @@ fn relay_single_interrupt_during_bidirectional_traffic_writes_final_stats() {
     let dir = tempfile::tempdir().unwrap();
     let sink = UdpSocket::bind("127.0.0.1:0").unwrap();
     sink.set_nonblocking(true).unwrap();
-    let addr = port();
     let mut relay = launch(
         &[
             "relay",
             "--listen",
-            &addr,
+            "127.0.0.1:0",
             "--target",
             &sink.local_addr().unwrap().to_string(),
             "--allow-source",
@@ -197,7 +232,7 @@ fn relay_single_interrupt_during_bidirectional_traffic_writes_final_stats() {
         dir.path(),
         "busy-relay",
     );
-    ready(&mut relay);
+    let addr = ready(&mut relay);
     let client = UdpSocket::bind("127.0.0.1:0").unwrap();
     client.connect(&addr).unwrap();
     client.set_nonblocking(true).unwrap();
@@ -282,14 +317,13 @@ fn raw_udp_relay_injected_loss_has_exact_conservation() {
     let _fixture = LOCAL_SOCKET_FIXTURES.lock().unwrap();
     let dir = tempfile::tempdir().unwrap();
     let sink = UdpSocket::bind("127.0.0.1:0").unwrap();
-    let addr = port();
     sink.set_read_timeout(Some(Duration::from_millis(100)))
         .unwrap();
     let mut relay = launch(
         &[
             "relay",
             "--listen",
-            &addr,
+            "127.0.0.1:0",
             "--target",
             &sink.local_addr().unwrap().to_string(),
             "--allow-source",
@@ -300,7 +334,7 @@ fn raw_udp_relay_injected_loss_has_exact_conservation() {
         dir.path(),
         "relay",
     );
-    ready(&mut relay);
+    let addr = ready(&mut relay);
     let client = UdpSocket::bind("127.0.0.1:0").unwrap();
     client.connect(&addr).unwrap();
     let mut received = BTreeSet::new();
@@ -352,9 +386,6 @@ fn http3_impairment_reconciles_queues_symbols_and_observed_logical_ids() {
     let cert = identity.join("cert.pem");
     let key = identity.join("key.pem");
     let token = identity.join("token");
-    let main = port();
-    let relayaddr = port();
-    let clientaddr = port();
     let sink = UdpSocket::bind("127.0.0.1:0").unwrap();
     sink.set_read_timeout(Some(Duration::from_millis(100)))
         .unwrap();
@@ -362,7 +393,7 @@ fn http3_impairment_reconciles_queues_symbols_and_observed_logical_ids() {
         &[
             "server",
             "--listen",
-            &main,
+            "127.0.0.1:0",
             "--cert",
             cert.to_str().unwrap(),
             "--key",
@@ -375,12 +406,12 @@ fn http3_impairment_reconciles_queues_symbols_and_observed_logical_ids() {
         dir.path(),
         "server",
     );
-    ready(&mut server);
+    let main = ready(&mut server);
     let mut relay = launch(
         &[
             "relay",
             "--listen",
-            &relayaddr,
+            "127.0.0.1:0",
             "--target",
             &main,
             "--allow-source",
@@ -391,12 +422,12 @@ fn http3_impairment_reconciles_queues_symbols_and_observed_logical_ids() {
         dir.path(),
         "relay",
     );
-    ready(&mut relay);
+    let relayaddr = ready(&mut relay);
     let mut client = launch(
         &[
             "client",
             "--listen",
-            &clientaddr,
+            "127.0.0.1:0",
             "--entrance",
             &relayaddr,
             "--server-name",
@@ -413,7 +444,7 @@ fn http3_impairment_reconciles_queues_symbols_and_observed_logical_ids() {
         dir.path(),
         "client",
     );
-    ready(&mut client);
+    let clientaddr = ready(&mut client);
     let app = UdpSocket::bind("127.0.0.1:0").unwrap();
     app.connect(&clientaddr).unwrap();
     for id in 1u64..=160 {

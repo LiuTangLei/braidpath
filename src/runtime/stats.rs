@@ -84,6 +84,30 @@ pub struct Records {
     pub udp_target_flow_dropped: u64,
 }
 #[derive(Clone, Default, Serialize)]
+pub struct UdpDelivery {
+    /// Live decoded records waiting at the local UDP boundary, not sender symbols.
+    pub pending_records: u64,
+    /// Queued UDP payload bytes; bounded queue bookkeeping is separate.
+    pub pending_bytes: u64,
+    pub peak_pending_records: u64,
+    pub peak_pending_bytes: u64,
+    /// Includes records retained behind an already blocked local socket/peer flow.
+    pub queued_records: u64,
+    /// Initial nonblocking send attempts reporting WouldBlock; not terminal drops.
+    pub would_block_events: u64,
+    pub delayed_delivered: u64,
+    /// Local decode-to-completion time for queued records, including terminal drops.
+    pub queued_wait: Wait,
+    pub expired_dropped: u64,
+    pub queue_full_dropped: u64,
+    /// Per-socket/peer pending limit, separate from the runtime flow-table limit.
+    pub flow_full_dropped: u64,
+    /// Pending UDP payload bytes; queue bookkeeping is outside this byte count.
+    pub byte_limit_dropped: u64,
+    pub socket_error_dropped: u64,
+    pub shutdown_dropped: u64,
+}
+#[derive(Clone, Default, Serialize)]
 pub struct Symbols {
     pub originals_generated: u64,
     pub repairs_generated: u64,
@@ -144,6 +168,7 @@ impl Ids {
 pub struct Direction {
     pub records: Records,
     pub symbols: Symbols,
+    pub udp_delivery: UdpDelivery,
     #[serde(skip_serializing_if = "Ids::is_empty")]
     pub quinn_admitted_record_ids: Ids,
     #[serde(skip_serializing_if = "Ids::is_empty")]
