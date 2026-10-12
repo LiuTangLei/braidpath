@@ -81,7 +81,7 @@ def calibrate_shared(bed, plan, leaf_rate_mbps):
     access = plan["access_calibration"]
     cases = [(f"leaf-{i}", bed.server, path["entrance"].split(":")[0],
               9300 + i, leaf_rate_mbps) for i, path in enumerate(plan["paths"])]
-    cases.append(("access", access["namespace"], access["target"],
+    cases.append(("access", access["server_namespace"], access["target"],
                   9310, plan["shared_access_mbps"]))
     result = {"passed": False, "method": "four individual leaf links, then isolated common access link",
               "duration_seconds_each": 3, "range": "85..105 percent of each configured rate",

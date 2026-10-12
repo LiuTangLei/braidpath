@@ -5,6 +5,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from bench.netem_calibration import receiver_rate, calibrate_shared
+from bench.netem_shared import shared_plan
 
 
 class ReceiverRate(unittest.TestCase):
@@ -45,9 +46,7 @@ class SharedCalibration(unittest.TestCase):
                         (self.output / f"{role}.log").write_text(json.dumps({
                             "end": {"sum_received": {"bits_per_second": rate, "sender": False}}}))
                     return Process(), 0
-            plan = {"paths": [{"entrance": f"10.203.{i + 1}.2:9443"} for i in range(4)],
-                    "shared_access_mbps": 400,
-                    "access_calibration": {"namespace": "bridge", "target": "10.204.0.2"}}
+            plan = shared_plan("client", "server", "bridge", [30, 45, 60, 80], 100, 400, 1024)
             calibrate_shared(Bed(), plan, 100)
             self.assertEqual(len(jobs), 10)
             self.assertEqual(jobs[-2][0:2], ("bridge", "calibration-access-server"))
