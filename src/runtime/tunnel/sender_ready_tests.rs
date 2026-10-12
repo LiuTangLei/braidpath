@@ -55,6 +55,7 @@ impl Pair {
             id: 0,
             group: 2,
             conn: self.outgoing.clone(),
+            empty_datagram_space: self.outgoing.datagram_send_buffer_space(),
             stream: 0,
             quality: Arc::new(Mutex::new(quality::State::new(7))),
             capacity_probe: Arc::new(Mutex::new(capacity_probe::State::new(7))),
@@ -286,6 +287,137 @@ impl Accounting {
         assert!(self.groups[usize::from(path.group)].available(9600));
         assert_eq!(path.quality.lock().unwrap().snapshot.sent_symbols, 0);
     }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn small_sender_avoids_measured_late_path_for_both_symbols() {
+    let fast = Pair::connect().await;
+    let slow = Pair::connect().await;
+    let path0 = fast.path();
+    let mut path1 = slow.path();
+    path1.id = 1;
+    for (path, delay) in [(&path0, 0.0), (&path1, 500.0)] {
+        path.quality.lock().unwrap().snapshot.sender_estimate = quality::Estimate {
+            expected: 100,
+            received: 100,
+            updated_us: Some(0),
+            delivered_updated_us: Some(0),
+            delay_variation_ms: delay,
+            ..Default::default()
+        };
+    }
+    let paths = Arc::new(Mutex::new(vec![path0, path1]));
+    let mut policy = policy();
+    policy.fec = 0;
+    policy.redundancy = 0;
+    policy.small_fec_bytes = 128;
+    policy.queue_ms = 100;
+    let metrics = stats::Metrics::new("client");
+    metrics.register("small-delivery", 0, 0, stats::FORWARD, &fast.outgoing);
+    metrics.register("small-delivery", 1, 0, stats::FORWARD, &slow.outgoing);
+    let scope = metrics.scope("small-delivery", stats::FORWARD);
+    let (tx, rx) = mpsc::channel(4);
+    let (stop, stopped) = watch::channel(false);
+    let task = tokio::spawn(sender(rx, paths, policy, stopped, scope, None));
+    tx.send(QueuedRecord {
+        record: Record {
+            flow: 2,
+            id: 1,
+            payload: vec![7; 128],
+        },
+        created: Instant::now(),
+    })
+    .await
+    .unwrap();
+    let complete = timeout(Duration::from_millis(200), async {
+        loop {
+            let mut done = false;
+            metrics.state(|s| {
+                done = s
+                    .sessions
+                    .get("small-delivery")
+                    .and_then(|directions| directions.get(stats::FORWARD))
+                    .is_some_and(|d| d.symbols.repairs_quinn_admitted == 1);
+            });
+            if done {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await;
+    stop.send(true).unwrap();
+    task.await.unwrap();
+    assert!(complete.is_ok(), "a timely same-path copy must remain live");
+    metrics.state(|s| {
+        assert_eq!(s.paths["small-delivery/0"].quinn_admitted_originals, 1);
+        assert_eq!(
+            s.paths["small-delivery/0"].quinn_admitted_repairs, 1,
+            "measured late diversity must not override timely delivery"
+        );
+        assert_eq!(
+            s.paths["small-delivery/1"].quinn_admitted_originals
+                + s.paths["small-delivery/1"].quinn_admitted_repairs,
+            0
+        );
+    });
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn same_path_small_copy_waits_for_quinn_packetization() {
+    let pair = Pair::connect().await;
+    let path = pair.path();
+    let before = pair.outgoing.stats();
+    let original = Bytes::from_static(b"small-original");
+    let copy = Bytes::from_static(b"small-copy");
+    pair.outgoing.send_datagram(original.clone()).unwrap();
+    // Without a yield, both frames would still fit the same QUIC/UDP packet.
+    assert!(!small_delivery::copy_ready(&path, 1));
+    assert!(
+        small_delivery::copy_ready(&path, 2),
+        "another path does not wait"
+    );
+    assert_eq!(
+        pair.outgoing.stats().frame_tx.datagram,
+        before.frame_tx.datagram
+    );
+    assert_eq!(pair.receive().await, original);
+    assert!(small_delivery::copy_ready(&path, 1));
+    pair.outgoing.send_datagram(copy.clone()).unwrap();
+    assert_eq!(pair.receive().await, copy);
+    let after = pair.outgoing.stats();
+    assert_eq!(after.frame_tx.datagram - before.frame_tx.datagram, 2);
+    assert!(after.udp_tx.datagrams - before.udp_tx.datagrams >= 2);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn small_timing_recovers_from_stale_feedback_and_keeps_cold_paths_live() {
+    let fast = Pair::connect().await;
+    let slow = Pair::connect().await;
+    let path0 = fast.path();
+    let mut path1 = slow.path();
+    path1.id = 1;
+    let remaining = Duration::from_millis(100);
+    assert_eq!(
+        small_delivery::mask(&[path0.clone(), path1.clone()], 3, remaining, 100),
+        3
+    );
+    path1.quality.lock().unwrap().snapshot.sender_estimate = quality::Estimate {
+        updated_us: Some(0),
+        delay_variation_ms: 500.0,
+        ..Default::default()
+    };
+    assert_eq!(
+        small_delivery::mask(&[path0.clone(), path1.clone()], 3, remaining, 100),
+        1
+    );
+    path1.epoch = Instant::now() - Duration::from_secs(4);
+    assert_eq!(
+        small_delivery::mask(&[path0.clone(), path1.clone()], 3, remaining, 100),
+        3
+    );
+    // An unavailable best path cannot prevent the remaining live path serving.
+    assert_eq!(small_delivery::mask(&[path0, path1], 2, remaining, 100), 2);
 }
 
 #[tokio::test(flavor = "current_thread")]

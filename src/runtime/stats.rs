@@ -261,6 +261,9 @@ pub struct Path {
     pub authenticated: bool,
     pub quinn_admitted_originals: u64,
     pub quinn_admitted_repairs: u64,
+    /// The explicitly protected small-record subset of the admission counters.
+    pub quinn_admitted_small_originals: u64,
+    pub quinn_admitted_small_repairs: u64,
     /// Attempt count, retried frames can increment this multiple times. Not a drop count.
     pub send_buffer_full_attempts: u64,
     pub quinn_send_error_attempts: u64,

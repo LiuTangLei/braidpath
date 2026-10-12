@@ -94,7 +94,13 @@ XOR cannot generally recover an entire failed path. Sparse traffic may exhaust t
 
 An experimental `--fec 0 --redundancy-percent 0 --small-fec-bytes 128` gives each
 successfully admitted record with at most 128 application bytes one immediate
-XOR repair, preferring another path. Bulk remains uncoded. The copy retains the
+XOR repair. Both symbols favor paths with lower estimated delivery delay; the
+repair prefers another path among similarly timely candidates. A same-path copy
+waits for the original to leave Quinn's outgoing queue, preventing both from
+being packed into the same QUIC packet without waiting for an acknowledgement.
+Estimates combine minimum RTT, excess RTT, fresh sender-direction transit
+variation and local transport queue occupancy; they are not synchronized one-way
+measurements. Bulk remains uncoded. The copy retains the
 original ingress deadline and consumes the aggregate and group budgets; loss of
 both transmissions remains unrecoverable. The threshold defaults to zero and
 must be acknowledged by both endpoints. This does not establish a performance

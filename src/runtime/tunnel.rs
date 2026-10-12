@@ -34,6 +34,7 @@ use tracing::{info, warn};
 const MAX_FLOWS: usize = 64;
 const SESSION_IDLE_GRACE: Duration = Duration::from_secs(120);
 const SESSION_PATH: &str = "/session";
+mod small_delivery;
 
 const WEBSITE: &str = "<!doctype html><html lang=\"en\"><meta charset=\"utf-8\"><title>Welcome</title><h1>Welcome</h1><p>This service is online.</p></html>\n";
 
@@ -120,6 +121,8 @@ struct OutPath {
     id: u8,
     group: u8,
     conn: quinn::Connection,
+    /// Exact empty-buffer payload allowance, captured before this sender owns it.
+    empty_datagram_space: usize,
     stream: u64,
     quality: Arc<Mutex<quality::State>>,
     capacity_probe: Arc<Mutex<capacity_probe::State>>,
@@ -751,8 +754,12 @@ impl SendAccounting<'_> {
             if self.policy.small_fec_bytes == 0 {
                 self.budget.repair_admitted(frame_bytes);
             }
-            self.metrics
-                .path(path.id, |p| p.quinn_admitted_repairs += 1);
+            self.metrics.path(path.id, |p| {
+                p.quinn_admitted_repairs += 1;
+                if small_delivery::applies(self.policy, front) {
+                    p.quinn_admitted_small_repairs += 1;
+                }
+            });
             if used & (1 << path.id) != 0 {
                 self.metrics
                     .update(|d| d.symbols.repair_no_diverse_path += 1);
@@ -762,8 +769,12 @@ impl SendAccounting<'_> {
             }
         } else {
             self.budget.original_admitted(frame_bytes);
-            self.metrics
-                .path(path.id, |p| p.quinn_admitted_originals += 1);
+            self.metrics.path(path.id, |p| {
+                p.quinn_admitted_originals += 1;
+                if small_delivery::applies(self.policy, front) {
+                    p.quinn_admitted_small_originals += 1;
+                }
+            });
             if let Some(block) = sent.block
                 && let Some(meta) = self.blocks.get_mut(&block)
             {
@@ -875,6 +886,17 @@ async fn sender(
                         || (attempt.repair && !repair_allowed(&policy, &budget, &blocks, &attempt.front, attempt.data.len()))
                     {
                         return false;
+                    }
+                    if small_delivery::applies(&policy, &attempt.front) {
+                        let eligible = paths.iter()
+                            .filter(|path| !policy.adaptive || controllers[usize::from(path.id)].decision(now_us).eligible)
+                            .fold(0, |mask, path| mask | (1 << path.id));
+                        let timely = small_delivery::mask(paths, eligible, lifetime.saturating_sub(age), policy.latency_target_ms);
+                        if timely & (1 << attempt.path.id) == 0
+                            || (attempt.repair && !small_delivery::copy_ready(&attempt.path, attempt.used))
+                        {
+                            return false;
+                        }
                     }
                     if !policy.adaptive {
                         return true;
@@ -1447,7 +1469,7 @@ async fn sender(
             } else {
                 Vec::new()
             };
-            let candidates = if policy.adaptive {
+            let mut candidates = if policy.adaptive {
                 business_ready_candidates(
                     &candidates,
                     &paths,
@@ -1465,6 +1487,25 @@ async fn sender(
             } else {
                 candidates
             };
+            let is_small = small_delivery::applies(&policy, &front);
+            let small_mask = if is_small {
+                let eligible = if policy.quality_schedule {
+                    candidates.iter().fold(0, |mask, (id, _)| mask | (1 << id))
+                } else {
+                    paths.iter().fold(0, |mask, path| mask | (1 << path.id))
+                };
+                small_delivery::mask(
+                    &paths,
+                    eligible,
+                    lifetime.saturating_sub(age),
+                    policy.latency_target_ms,
+                )
+            } else {
+                u8::MAX
+            };
+            if is_small {
+                candidates.retain(|(id, _)| small_mask & (1 << id) != 0);
+            }
             if policy.adaptive {
                 update_business_pacer(&mut business, &paths, &controllers, now_us);
             }
@@ -1491,6 +1532,9 @@ async fn sender(
                 .block
                 .and_then(|b| blocks.get(&b))
                 .map_or(0, |b| b.paths);
+            if is_small {
+                order.retain(|i| small_mask & (1 << paths[*i].id) != 0);
+            }
             if repair {
                 order.sort_by_key(|i| u8::from(used & (1 << paths[*i].id) != 0));
             }
@@ -1500,6 +1544,9 @@ async fn sender(
                 let path = &paths[i];
                 let id = usize::from(path.id);
                 if path.conn.close_reason().is_some() {
+                    continue;
+                }
+                if is_small && repair && !small_delivery::copy_ready(path, used) {
                     continue;
                 }
                 let Ok(mapping_bytes) = wire::http_datagram_overhead(path.stream) else {
@@ -2115,7 +2162,7 @@ async fn server_connection(
                                 let mut generations=session.generations.lock().expect("generation lock");
                                 scheduler::admit_generation(&mut generations[usize::from(pid)],generation)?;
                                 if let Some(i)=existing {paths.remove(i).conn.close(0u32.into(),b"path rejoined");}
-                                paths.push(OutPath{id:pid,group,conn:conn.clone(),stream:stream_id,quality:Arc::new(Mutex::new(quality::State::new(generation))),capacity_probe:Arc::new(Mutex::new(capacity_probe::State::new(generation))),capacity_probe_enabled:capacity_probe_bps>0,epoch:Instant::now(),probe_reply:Arc::new(Mutex::new(None))});
+                                paths.push(OutPath{id:pid,group,conn:conn.clone(),empty_datagram_space:conn.datagram_send_buffer_space(),stream:stream_id,quality:Arc::new(Mutex::new(quality::State::new(generation))),capacity_probe:Arc::new(Mutex::new(capacity_probe::State::new(generation))),capacity_probe_enabled:capacity_probe_bps>0,epoch:Instant::now(),probe_reply:Arc::new(Mutex::new(None))});
                                 *session.empty_since.lock().expect("empty time lock")=None;
                             }
                             Some(session)
@@ -2465,6 +2512,7 @@ async fn client_session(
                             for old in active.iter().filter(|p|p.id==pid) {old.conn.close(0u32.into(),b"path replaced");}
                             active.retain(|p|p.id!=pid);
                             active.push(OutPath{id:pid,group:configs[id].group,conn:value.conn.clone(),stream:value.stream,
+                                empty_datagram_space:value.conn.datagram_send_buffer_space(),
                                 quality:Arc::new(Mutex::new(quality::State::new(generation))),capacity_probe:Arc::new(Mutex::new(capacity_probe::State::new(generation))),capacity_probe_enabled:options.policy.capacity_probe_bps>0,epoch:Instant::now(),
                                 probe_reply:Arc::new(Mutex::new(None))});
                         }
