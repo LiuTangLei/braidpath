@@ -20,7 +20,7 @@ class SharedPhysicalTopology(unittest.TestCase):
         self.assertEqual(len(access), 2)  # Two directions of one physical veth link.
         routes = [argv for argv in self.plan["commands"] if argv[:4] == ["ip", "-n", "client", "route"]]
         self.assertEqual(len(routes), 4)
-        self.assertTrue(all(argv[argv.index("via") + 1] == "10.204.0.2" for argv in routes))
+        self.assertTrue(all("via" not in argv for argv in routes))
         self.assertTrue(all(argv[argv.index("dev") + 1] == "u0c" for argv in routes))
         self.assertEqual({p["bottleneck_group"] for p in paths}, {0})
         self.assertEqual(self.plan["group_rate_bps"], {"0": 400000000})
@@ -38,19 +38,28 @@ class SharedPhysicalTopology(unittest.TestCase):
             self.assertEqual([shared[i + 1] for i, value in enumerate(shared) if value == flag],
                              [independent[i + 1] for i, value in enumerate(independent) if value == flag])
 
-    def test_return_host_routes_prevent_direct_arp_for_virtual_client_addresses(self):
-        routes = [argv for argv in self.plan["commands"] if "route" in argv]
+    def test_static_neighbors_and_bridge_fdb_preserve_each_paths_leaf_affinity(self):
+        self.assertFalse(any("sysctl" in command for command in self.plan["commands"]))
+        bridge_ports = [command for command in self.plan["commands"] if "master" in command and "bridge" not in command]
+        self.assertEqual({command[5] for command in bridge_ports}, {"u0r", "p0c", "p1c", "p2c", "p3c"})
+        self.assertTrue(all(command[command.index("master") + 1] == "br0" for command in bridge_ports))
+        neighbors = [command for command in self.plan["commands"] if "neigh" in command]
+        forwarding = [command for command in self.plan["commands"] if "fdb" in command]
         for path in self.plan["paths"]:
-            source = path["client_bind"].split(":")[0] + "/32"
-            router_routes = [r for r in routes if r[2] == "router" and r[5] == source]
-            server_routes = [r for r in routes if r[2] == "server" and r[5] == source]
-            self.assertEqual(len(router_routes), 1)
-            self.assertEqual(len(server_routes), 1)
-            self.assertEqual(router_routes[0][router_routes[0].index("dev") + 1], "u0r")
-            self.assertEqual(server_routes[0][server_routes[0].index("dev") + 1], path["server_entry_device"])
-        changes = [argv for argv in self.plan["commands"] if "sysctl" in argv]
-        self.assertTrue(all(argv[:3] == ["ip", "netns", "exec"] for argv in changes))
-        self.assertEqual([argv[3] for argv in changes if argv[-1] == "net.ipv4.ip_forward=1"], ["router"])
+            target = path["entrance"].split(":")[0]
+            source = path["client_bind"].split(":")[0]
+            client_neighbor = [command for command in neighbors if command[2] == "client" and command[5] == target]
+            server_neighbor = [command for command in neighbors if command[2] == "server" and command[5] == source]
+            self.assertEqual(len(client_neighbor), 1)
+            self.assertEqual(len(server_neighbor), 1)
+            self.assertEqual(client_neighbor[0][client_neighbor[0].index("lladdr") + 1], path["server_mac"])
+            self.assertEqual(client_neighbor[0][client_neighbor[0].index("dev") + 1], "u0c")
+            self.assertEqual(server_neighbor[0][server_neighbor[0].index("lladdr") + 1], path["client_mac"])
+            self.assertEqual(server_neighbor[0][server_neighbor[0].index("dev") + 1], path["server_entry_device"])
+            entry = [command for command in forwarding if command[7] == path["server_mac"]]
+            self.assertEqual(len(entry), 1)
+            self.assertEqual(entry[0][entry[0].index("dev") + 1], path["router_entry_device"])
+            self.assertIn("static", entry[0])
 
     def test_shared_rate_and_leaf_delay_are_verified_separately(self):
         qdiscs = {name: [] for name in ("client", "server", "router")}

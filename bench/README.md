@@ -30,11 +30,14 @@ the attempt invalid even when cleanup is confirmed. Complete-line CSV from an
 incomplete stream remains diagnostic and is explicitly marked in its status file;
 the original raw evidence is preserved.
 `--topology shared --shared-rate-mbps 400` routes the same four distinct client
-source addresses through one physical access link and an owned router namespace,
+source addresses through one physical access link and an owned bridge namespace,
 then four entry links with the registered half-RTT delays. All four runtime paths
 use group zero with an explicit group budget capped by the 400 Mbps aggregate
 budget. Shared qdiscs and namespace network counters are included in the same
 evidence; configuration validation checks the common link and every entry link.
+Static neighbors and bridge forwarding entries bind each entrance to its own
+delayed leaf link. Setup uses namespace-scoped link administration and requires
+no writable sysctl mount or host network settings.
 Independent topology remains the default. The initial shared calibration uses
 the clean 400 Mbps access scenario; reduced shared capacities need an aggregate
 rate calibration rather than expecting each path to receive its full leaf rate.

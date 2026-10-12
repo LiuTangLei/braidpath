@@ -18,21 +18,22 @@ def shared_plan(client, server, router, rtt_ms, rate_mbps, shared_rate_mbps, que
     for namespace in (client, router, server):
         commands += [["ip", "netns", "add", namespace],
                      ["ip", "-n", namespace, "link", "set", "lo", "up"]]
-        if namespace == router:
-            commands.append(["ip", "netns", "exec", namespace, "sysctl", "-w", "net.ipv4.ip_forward=1"])
-        for key in ("all", "default"):
-            commands.append(["ip", "netns", "exec", namespace, "sysctl", "-w",
-                             f"net.ipv4.conf.{key}.rp_filter=0"])
+    commands += [["ip", "-n", router, "link", "add", "br0", "type", "bridge"],
+                 ["ip", "-n", router, "link", "set", "br0", "up"]]
 
-    def link(left_ns, left_device, left_ip, right_ns, right_device, right_ip, rate, delay, purpose):
+    def link(left_ns, left_device, left_ip, left_mac, right_ns, right_device, right_ip, right_mac,
+             rate, delay, purpose):
         commands.extend([
             ["ip", "link", "add", left_device, "type", "veth", "peer", "name", right_device],
             ["ip", "link", "set", left_device, "netns", left_ns],
             ["ip", "link", "set", right_device, "netns", right_ns],
         ])
-        for namespace, device, address in ((left_ns, left_device, left_ip), (right_ns, right_device, right_ip)):
+        for namespace, device, address, mac in ((left_ns, left_device, left_ip, left_mac),
+                                               (right_ns, right_device, right_ip, right_mac)):
+            commands.append(["ip", "-n", namespace, "link", "set", device, "address", mac])
+            if address:
+                commands.append(["ip", "-n", namespace, "addr", "add", address, "dev", device])
             commands.extend([
-                ["ip", "-n", namespace, "addr", "add", address, "dev", device],
                 ["ip", "-n", namespace, "link", "set", device, "up"],
                 ["ip", "netns", "exec", namespace, "tc", "qdisc", "add", "dev", device,
                  "root", "netem", "limit", str(queue_packets), "delay", f"{delay:g}ms", "rate", f"{rate:g}mbit"],
@@ -41,26 +42,38 @@ def shared_plan(client, server, router, rtt_ms, rate_mbps, shared_rate_mbps, que
                            "rate_bytes_per_second": rate * 1000000 / 8, "queue_packets": queue_packets,
                            "purpose": purpose})
 
-    link(client, "u0c", "10.204.0.1/30", router, "u0r", "10.204.0.2/30",
+    client_mac = "02:42:00:00:00:01"
+    link(client, "u0c", None, client_mac, router, "u0r", None, "02:42:00:00:00:02",
          shared_rate_mbps, 0, "shared_access")
+    commands += [["ip", "-n", router, "link", "set", "u0r", "master", "br0"],
+                 ["ip", "netns", "exec", router, "bridge", "fdb", "replace", client_mac,
+                  "dev", "u0r", "master", "static"]]
     for index, rtt in enumerate(rtt_ms):
-        source, target, gateway = (f"10.203.{index + 1}.{suffix}" for suffix in (1, 2, 254))
+        source, target = (f"10.203.{index + 1}.{suffix}" for suffix in (1, 2))
         router_device, server_device = f"p{index}c", f"p{index}s"
-        link(router, router_device, f"{gateway}/24", server, server_device, f"{target}/24",
+        router_mac, server_mac = (f"02:42:00:01:{index + 1:02x}:{suffix:02x}" for suffix in (1, 2))
+        link(router, router_device, None, router_mac, server, server_device, f"{target}/24", server_mac,
              rate_mbps, rtt / 2, "entry_link")
         commands.extend([
-            ["ip", "-n", client, "addr", "add", f"{source}/32", "dev", "lo"],
-            ["ip", "-n", client, "route", "add", f"{target}/32", "via", "10.204.0.2", "dev", "u0c", "src", source],
-            ["ip", "-n", router, "route", "add", f"{source}/32", "via", "10.204.0.1", "dev", "u0r"],
-            ["ip", "-n", server, "route", "add", f"{source}/32", "via", gateway, "dev", server_device],
+            ["ip", "-n", router, "link", "set", router_device, "master", "br0"],
+            ["ip", "-n", client, "addr", "add", f"{source}/24", "dev", "u0c"],
+            ["ip", "-n", client, "route", "add", f"{target}/32", "dev", "u0c", "src", source],
+            ["ip", "-n", client, "neigh", "replace", target, "lladdr", server_mac,
+             "nud", "permanent", "dev", "u0c"],
+            ["ip", "-n", server, "neigh", "replace", source, "lladdr", client_mac,
+             "nud", "permanent", "dev", server_device],
+            ["ip", "netns", "exec", router, "bridge", "fdb", "replace", server_mac,
+             "dev", router_device, "master", "static"],
         ])
         paths.append({"path_id": index, "client_bind": f"{source}:{9500 + index}",
                       "entrance": f"{target}:9443", "bottleneck_group": 0,
                       "client_access_device": "u0c", "router_access_device": "u0r",
-                      "router_entry_device": router_device, "server_entry_device": server_device})
+                      "router_entry_device": router_device, "server_entry_device": server_device,
+                      "client_mac": client_mac, "server_mac": server_mac})
     return {
         "topology": "four entrances behind one shared bidirectional access link",
         "client_namespace": client, "server_namespace": server, "router_namespace": router,
+        "forwarding": "owned layer-2 bridge with static neighbors and per-entry static FDB",
         "shared_access_mbps": shared_rate_mbps, "entry_link_mbps": rate_mbps,
         "rtt_ms": list(rtt_ms), "random_loss_percent": 0,
         "group_rate_bps": {"0": int(shared_rate_mbps * 1000000)},
