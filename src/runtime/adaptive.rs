@@ -655,6 +655,8 @@ pub struct PathController {
     last_transport_wait_ms: f64,
     admitted_bytes: u64,
     admitted_symbol_bytes: u64,
+    /// Actual business measurement start, separate from the control owner clock.
+    admission_started_us: Option<u64>,
     allowance_bytes: f64,
     wire_per_symbol: f64,
     blocked_since_us: Option<u64>,
@@ -727,6 +729,7 @@ impl PathController {
             last_transport_wait_ms: 0.0,
             admitted_bytes: 0,
             admitted_symbol_bytes: 0,
+            admission_started_us: None,
             allowance_bytes: 0.0,
             wire_per_symbol: 1.0,
             blocked_since_us: None,
@@ -1132,7 +1135,9 @@ impl PathController {
             self.braked_queue_ms = None;
             false
         };
-        let admission_span = now.saturating_sub(self.last_control_us);
+        let control_span = now.saturating_sub(self.last_control_us);
+        let admission_span =
+            now.saturating_sub(self.admission_started_us.unwrap_or(self.last_control_us));
         // Integrate the allowance at the rates that actually applied. Comparing
         // old admissions with a later reduced rate can manufacture utilization.
         let exercised =
@@ -1384,7 +1389,7 @@ impl PathController {
             stalled: self.congestion_seen
                 && now.saturating_sub(self.last_growth_us) >= LOSS_WINDOW_US,
             new_report,
-            control_sample: admission_span >= CONTROL_US,
+            control_sample: control_span >= CONTROL_US,
             admission_span_us: admission_span,
             admitted: self.admitted_bytes,
             admitted_symbol_bytes: self.admitted_symbol_bytes,
@@ -2383,6 +2388,7 @@ impl PathController {
                 self.last_control_us = now;
                 self.admitted_bytes = 0;
                 self.admitted_symbol_bytes = 0;
+                self.admission_started_us = None;
                 self.allowance_bytes = 0.0;
             }
         }
@@ -2740,6 +2746,38 @@ impl PathController {
         }
         self.demand_activity
             .update(now_us, wire_bytes > 0 && measured_symbol_bytes > 0);
+        let last_pace_change = self.rate_changes.back().map_or(
+            self.last_growth_us.max(self.last_brake_us.unwrap_or(0)),
+            |change| {
+                change
+                    .at_us
+                    .max(self.last_growth_us)
+                    .max(self.last_brake_us.unwrap_or(0))
+            },
+        );
+        if wire_bytes > 0
+            && measured_symbol_bytes > 0
+            && self.admitted_bytes == 0
+            && self.admitted_symbol_bytes == 0
+            && self.admission_started_us.is_none()
+            && last_pace_change <= self.last_control_us
+            && let Some(since) = self.demand_activity.since_us
+            && since > self.last_control_us
+            && since <= now_us
+        {
+            // A stable-rate idle prefix is not business demand. Keep the busy
+            // interval, including any wait for Quinn after activity began.
+            let unused_idle =
+                (since - self.last_control_us) as f64 * self.rate_bps as f64 / 8_000_000.0;
+            let allowance = (self.allowance_bytes - unused_idle).max(wire_bytes as f64);
+            if allowance < self.allowance_bytes {
+                // Never add denominator credit, mint tokens, or retime control.
+                // Retain the first packet's consumed pre-earned credit in both
+                // numerator and denominator instead of claiming free use.
+                self.admission_started_us = Some(since);
+                self.allowance_bytes = allowance;
+            }
+        }
         self.tokens = (self.tokens - wire_bytes as f64).max(0.0);
         self.admitted_bytes = self.admitted_bytes.saturating_add(wire_bytes as u64);
         self.admitted_symbol_bytes = self
@@ -2878,6 +2916,179 @@ impl PathController {
 mod tests {
     use super::*;
     use std::collections::VecDeque;
+
+    #[test]
+    fn idle_allowance_is_excluded_from_business_measurement_without_retiming_control() {
+        let control_owner = 605_648;
+        let first_business = 650_942;
+        let mut controller = PathController::new(400_000_000, 100);
+        let mut idle = observation(control_owner, 30.0);
+        idle.offered_backlog = false;
+        idle.delivered_bytes = 0;
+        idle.feedback_sample_symbols = 0;
+        idle.positive_delivery_age_us = None;
+        controller.observe_native(&idle, None, 240_000, 30_000);
+        assert_eq!(controller.last_control_us, control_owner);
+        assert_eq!(controller.admitted_bytes, 0);
+        assert_eq!(controller.admitted_symbol_bytes, 0);
+        assert!(controller.allow(first_business, 1135, 0.0));
+        let tokens = controller.tokens;
+        let token_phase = controller.token_us;
+        let initial_rate = controller.rate_bps;
+        let born = controller.born_us;
+        let growth_clock = controller.last_growth_us;
+        let evidence_clock = controller.last_evidence_us;
+        let probe_sample = controller.last_probe_sample_id;
+        let remembered = controller.remembered_bps;
+        controller.admitted_symbol(first_business, 1135, 1025);
+        assert_eq!(controller.admission_started_us, Some(first_business));
+        assert_eq!(controller.allowance_bytes, 1135.0);
+        assert_eq!(controller.admitted_bytes, 1135);
+        assert_eq!(controller.admitted_symbol_bytes, 1025);
+        assert_eq!(controller.tokens, tokens - 1135.0);
+        assert_eq!(controller.token_us, token_phase);
+        assert_eq!(controller.last_control_us, control_owner);
+        assert_eq!(controller.rate_bps, initial_rate);
+        assert_eq!(controller.born_us, born);
+        assert_eq!(controller.last_growth_us, growth_clock);
+        assert_eq!(controller.last_evidence_us, evidence_clock);
+        assert_eq!(controller.last_probe_sample_id, probe_sample);
+        assert_eq!(controller.remembered_bps, remembered);
+
+        controller.refill(first_business + 1000);
+        controller.rate_bps = initial_rate / 2;
+        let expected_allowance = 1135.0
+            + 1000.0 * initial_rate as f64 / 8_000_000.0
+            + 1000.0 * controller.rate_bps as f64 / 8_000_000.0;
+        assert!(controller.allow(first_business + 2000, 1135, 0.0));
+        let tokens = controller.tokens;
+        controller.admitted_symbol(first_business + 2000, 1135, 1025);
+        assert_eq!(controller.admission_started_us, Some(first_business));
+        assert_eq!(controller.allowance_bytes, expected_allowance);
+        assert_eq!(controller.admitted_bytes, 2270);
+        assert_eq!(controller.tokens, tokens - 1135.0);
+        assert_eq!(controller.last_control_us, control_owner);
+
+        // The old 200 ms owner tick still settles the counters at the same instant.
+        let mut settled = idle;
+        settled.now_us = control_owner + CONTROL_US;
+        controller.observe(&settled);
+        assert_eq!(controller.last_control_us, control_owner + CONTROL_US);
+        assert_eq!(
+            controller.last_control.admission_span_us,
+            control_owner + CONTROL_US - first_business
+        );
+        assert_eq!(
+            controller.last_control.integrated_allowance_bytes,
+            expected_allowance
+                + (control_owner + CONTROL_US - first_business - 2000) as f64
+                    * controller.rate_bps as f64
+                    / 8_000_000.0
+        );
+        assert_eq!(controller.admission_started_us, None);
+        assert_eq!(controller.admitted_bytes, 0);
+        assert_eq!(controller.allowance_bytes, 0.0);
+    }
+
+    #[test]
+    fn business_measurement_keeps_existing_use_and_ignores_control_only_admissions() {
+        for (old_wire, old_symbols, wire, symbols) in
+            [(0, 0, 0, 0), (0, 0, 263, 0), (1135, 1025, 1135, 1025)]
+        {
+            let mut controller = PathController::new(400_000_000, 100);
+            controller.observe(&observation(605_648, 30.0));
+            controller.admitted_bytes = old_wire;
+            controller.admitted_symbol_bytes = old_symbols;
+            controller.refill(650_942);
+            let allowance = controller.allowance_bytes;
+            let tokens = controller.tokens;
+            let control_owner = controller.last_control_us;
+            controller.admitted_symbol(650_942, wire, symbols);
+            assert_eq!(controller.admission_started_us, None);
+            assert_eq!(controller.allowance_bytes, allowance);
+            assert_eq!(controller.tokens, (tokens - wire as f64).max(0.0));
+            assert_eq!(controller.admitted_bytes, old_wire + wire as u64);
+            assert_eq!(
+                controller.admitted_symbol_bytes,
+                old_symbols + symbols as u64
+            );
+            assert_eq!(controller.last_control_us, control_owner);
+        }
+    }
+
+    #[test]
+    fn idle_measurement_trim_keeps_queued_business_and_skips_continuous_or_mixed_pace() {
+        let owner = 605_648;
+        let active = 650_942;
+        let first_send = active + 50_000;
+        for case in ["queued", "continuous", "changed"] {
+            let mut controller = PathController::new(400_000_000, 100);
+            let mut sample = observation(owner, 30.0);
+            sample.offered_backlog = false;
+            sample.delivered_bytes = 0;
+            sample.feedback_sample_symbols = 0;
+            sample.positive_delivery_age_us = None;
+            controller.observe_native(&sample, None, 240_000, 30_000);
+            let rate = controller.rate_bps;
+            controller
+                .demand_activity
+                .update(if case == "continuous" { owner } else { active }, true);
+            if case == "changed" {
+                controller.refill(active);
+                controller.rate_bps /= 2;
+                controller.record_rate_change(active, rate, RateReason::QueueBrake);
+            }
+            assert!(controller.allow(first_send, 1135, 0.0));
+            let allowance = controller.allowance_bytes;
+            let tokens = controller.tokens;
+            controller.admitted_symbol(first_send, 1135, 1025);
+            assert_eq!(controller.last_control_us, owner);
+            assert_eq!(controller.token_us, first_send);
+            assert_eq!(controller.tokens, tokens - 1135.0);
+            if case == "queued" {
+                assert_eq!(controller.admission_started_us, Some(active));
+                assert_eq!(
+                    controller.allowance_bytes,
+                    50_000.0 * rate as f64 / 8_000_000.0
+                );
+                assert!(controller.allowance_bytes > 1135.0);
+            } else {
+                assert_eq!(controller.admission_started_us, None, "{case}");
+                assert_eq!(controller.allowance_bytes, allowance, "{case}");
+            }
+        }
+    }
+
+    #[test]
+    fn idle_credit_cannot_make_one_sparse_burst_exercise_a_high_business_rate() {
+        let mut controller = PathController::new(400_000_000, 100);
+        let mut sample = observation(605_648, 30.0);
+        sample.offered_backlog = false;
+        sample.delivered_bytes = 0;
+        sample.feedback_sample_symbols = 0;
+        sample.positive_delivery_age_us = None;
+        controller.observe_native(&sample, None, 240_000, 30_000);
+        let rate = controller.rate_bps;
+        for _ in 0..8 {
+            assert!(controller.allow(650_942, 263, 0.0));
+            controller.admitted_symbol(650_942, 263, 153);
+        }
+        sample.now_us = 650_942 + CONTROL_US;
+        sample.offered_backlog = true;
+        sample.report_number += 1;
+        sample.delivered_bytes = 8 * 153;
+        sample.delivered_bps =
+            Some(sample.delivered_bytes as f64 * 8_000_000.0 / CONTROL_US as f64);
+        sample.feedback_sample_symbols = 8;
+        sample.positive_delivery_age_us = Some(0);
+        controller.observe(&sample);
+        assert_eq!(controller.rate_bps, rate);
+        assert_eq!(controller.last_growth_probe, None);
+        assert!(
+            (controller.last_control.admitted_bytes as f64)
+                < controller.last_control.integrated_allowance_bytes * 0.9
+        );
+    }
 
     #[test]
     fn native_startup_uses_current_bbr_allowance_without_granting_tokens() {
