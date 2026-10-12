@@ -171,11 +171,20 @@ pub struct Quinn {
     pub min_rtt_ms: f64,
     pub smoothed_rtt_ms: f64,
     pub congestion_window_bytes: u64,
+    /// Payload bytes currently available for another outgoing QUIC datagram.
+    /// Quinn reserves its datagram metadata; this is not the configured buffer size.
+    pub datagram_send_buffer_space_bytes: u64,
     pub sent_packets: u64,
     pub udp_datagrams_tx: u64,
     pub udp_datagrams_rx: u64,
     pub udp_bytes_tx: u64,
     pub udp_bytes_rx: u64,
+    /// Quinn's native `ios` counters, not measured kernel syscall counts.
+    /// The pinned implementation counts TX transmit batches and RX QUIC packet handling.
+    /// A TX datagram/operation ratio indicates batching offered to the UDP layer;
+    /// it does not prove that the kernel performed GSO.
+    pub udp_io_operations_tx: u64,
+    pub udp_io_operations_rx: u64,
     pub http_datagram_frames_tx: u64,
     pub http_datagram_frames_rx: u64,
     /// Frame counts, not ACK bytes or physical egress bandwidth.
@@ -196,11 +205,14 @@ impl Quinn {
             min_rtt_ms: q.path.min_rtt.as_secs_f64() * 1000.,
             smoothed_rtt_ms: conn.rtt().as_secs_f64() * 1000.,
             congestion_window_bytes: q.path.cwnd,
+            datagram_send_buffer_space_bytes: conn.datagram_send_buffer_space() as u64,
             sent_packets: q.path.sent_packets,
             udp_datagrams_tx: q.udp_tx.datagrams,
             udp_datagrams_rx: q.udp_rx.datagrams,
             udp_bytes_tx: q.udp_tx.bytes,
             udp_bytes_rx: q.udp_rx.bytes,
+            udp_io_operations_tx: q.udp_tx.ios,
+            udp_io_operations_rx: q.udp_rx.ios,
             http_datagram_frames_tx: q.frame_tx.datagram,
             http_datagram_frames_rx: q.frame_rx.datagram,
             ack_frames_tx: q.frame_tx.acks,
@@ -874,6 +886,74 @@ mod tests {
     use crate::runtime::transport::{self, Congestion};
     use bytes::Bytes;
     use tokio::time::timeout;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn quinn_snapshot_reports_real_datagram_space_and_udp_io_operations() {
+        let temp = tempfile::tempdir().unwrap();
+        let identity = temp.path().join("identity");
+        transport::initialize(&identity, "localhost").unwrap();
+        let server = transport::server(
+            "127.0.0.1:0".parse().unwrap(),
+            &identity.join("cert.pem"),
+            &identity.join("key.pem"),
+            Congestion::Bbr,
+        )
+        .unwrap();
+        let address = server.local_addr().unwrap();
+        let client =
+            transport::client(address, &identity.join("cert.pem"), None, Congestion::Bbr).unwrap();
+        let (outgoing, incoming) = timeout(Duration::from_secs(3), async {
+            tokio::join!(client.connect(address, "localhost").unwrap(), async {
+                server.accept().await.unwrap().await
+            })
+        })
+        .await
+        .unwrap();
+        let outgoing = outgoing.unwrap();
+        let incoming = incoming.unwrap();
+        let before = Quinn::sample(&outgoing);
+        let payload = Bytes::from_static(b"buffer space sample");
+        outgoing.send_datagram(payload.clone()).unwrap();
+        // No task can drive this current-thread connection between send and sample.
+        let queued = Quinn::sample(&outgoing);
+        assert!(
+            queued.datagram_send_buffer_space_bytes + payload.len() as u64
+                <= before.datagram_send_buffer_space_bytes
+        );
+        assert_eq!(
+            queued.datagram_send_buffer_space_bytes,
+            outgoing.datagram_send_buffer_space() as u64
+        );
+        assert_eq!(
+            timeout(Duration::from_secs(3), incoming.read_datagram())
+                .await
+                .unwrap()
+                .unwrap(),
+            payload
+        );
+        for conn in [&outgoing, &incoming] {
+            let sampled = Quinn::sample(conn);
+            let native = conn.stats();
+            let serialized = serde_json::to_value(&sampled).unwrap();
+            assert_eq!(serialized["udp_io_operations_tx"], native.udp_tx.ios);
+            assert_eq!(serialized["udp_io_operations_rx"], native.udp_rx.ios);
+            assert_eq!(serialized["udp_datagrams_tx"], native.udp_tx.datagrams);
+            assert_eq!(serialized["udp_datagrams_rx"], native.udp_rx.datagrams);
+            assert!(native.udp_tx.ios > 0);
+            assert!(native.udp_rx.ios > 0);
+            assert_eq!(
+                serialized["datagram_send_buffer_space_bytes"],
+                conn.datagram_send_buffer_space() as u64
+            );
+        }
+        client.close(0u32.into(), b"test complete");
+        server.close(0u32.into(), b"test complete");
+        timeout(Duration::from_secs(3), async {
+            tokio::join!(client.wait_idle(), server.wait_idle());
+        })
+        .await
+        .unwrap();
+    }
 
     #[test]
     fn suppressed_global_ids_stay_empty_and_keep_the_serialized_schema() {
