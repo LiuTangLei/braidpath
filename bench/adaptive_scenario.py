@@ -429,7 +429,17 @@ def phases_for(args):
                    {"name": "window_e", "seconds": 8.0, "condition": "clean"},
                    {"name": "window_f", "seconds": 18.0, "condition": "all_outage"},
                    {"name": "window_g", "seconds": 15.0, "condition": "clean"}]
+    for phase in phases:
+        phase["loss"] = getattr(args, "loss", 0.0)
     return phases
+
+
+def phase_shape(args, condition, link_index):
+    rate = args.link_mbps
+    if condition == "congested" and (args.topology == "shared" or link_index < 2):
+        rate = args.congested_mbps
+    return Shape(round(rate * 1e6), args.delay_ms, args.queue_bytes,
+                 args.network_queue_ms, args.loss)
 
 
 def free_address():
@@ -519,6 +529,12 @@ def summarize(streams, phases, deadline_ms, start_ns):
                       if s["echo_ns"] is not None and s["send_ns"] is not None else math.inf
                       for s in samples]
             values += [math.inf] * (planned - len(samples))
+            one_way = [(s["target_ns"] - s["send_ns"]) / 1e6
+                       if s["status"] == "kernel_accepted" and s["target_ns"] is not None
+                       and s["send_ns"] is not None else math.inf for s in samples]
+            one_way += [math.inf] * (planned - len(samples))
+            target_on_time = sum(v <= deadline_ms for v in one_way)
+            payload_bytes = stream.size - HEADER.size
             target = sum(s["target_ns"] is not None for s in samples)
             received = sum(s["echo_ns"] is not None for s in samples)
             on_time = sum(v <= deadline_ms for v in values)
@@ -538,6 +554,21 @@ def summarize(streams, phases, deadline_ms, start_ns):
                 "missing_echoes": planned - received,
                 "rtt_p50_ms": quantile(values, .50), "rtt_p95_ms": quantile(values, .95),
                 "rtt_p99_ms": quantile(values, .99),
+                "target_one_way_deadline_ms": deadline_ms,
+                "target_one_way_p50_ms": quantile(one_way, .50),
+                "target_one_way_p95_ms": quantile(one_way, .95),
+                "target_one_way_p99_ms": quantile(one_way, .99),
+                "target_one_way_on_time_operations": target_on_time,
+                "target_one_way_on_time_fraction": target_on_time / max(1, planned),
+                "target_one_way_deadline_miss_fraction": (planned - target_on_time) / max(1, planned),
+                "missing_target_operations": sum(math.isinf(v) for v in one_way),
+                "measurement_header_bytes_excluded_per_record": HEADER.size,
+                "payload_bytes_per_record": payload_bytes,
+                "target_unique_payload_bytes": target * payload_bytes,
+                "target_payload_goodput_bps": target * payload_bytes * 8 / phase["seconds"],
+                "target_one_way_on_time_payload_bytes": target_on_time * payload_bytes,
+                "target_one_way_on_time_payload_goodput_bps":
+                    target_on_time * payload_bytes * 8 / phase["seconds"],
                 "quantile_population": "all planned operations; missing/not-sent = infinity",
             }
         result.append(row)
@@ -559,6 +590,7 @@ async def experiment(args):
                 "harness_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
                 "profile": args.profile, "topology": args.topology, "paths": args.paths,
                 "rate_bps": args.rate_bps, "queue_ms": args.queue_ms, "fec": args.fec,
+                "latency_target_ms": args.latency_target_ms, "loss": args.loss,
                 "link_mbps": args.link_mbps, "congested_mbps": args.congested_mbps,
                 "queue_bytes": args.queue_bytes, "network_queue_ms": args.network_queue_ms,
                 "delay_ms": args.delay_ms, "seed": args.seed, "deadline_ms": args.deadline_ms,
@@ -581,6 +613,9 @@ async def experiment(args):
                     "Actual UDP ciphertext packets are shaped, including QUIC ACKs/handshakes.",
                     "Rate accounting boundary is IPv4+UDP bytes; no Ethernet overhead.",
                     "RTT uses this harness process's monotonic clock; no per-run minimum subtraction.",
+                    "Target one-way delay uses this same monotonic clock without minimum subtraction; missing/not-sent=infinity.",
+                    "New payload metrics exclude HEADER.size measurement bytes; legacy application-byte/goodput fields remain unchanged.",
+                    "Configured loss is independently seeded packet erasure on both shaped directions in every phase, including handshakes and ACKs.",
                     "Payload goodput uses the fixed active source window; drain is only for censoring.",
                     "Kernel acceptance, runtime admissions, target receipt and echo receipt are distinct.",
                     "Independent entrances have distinct serializers; shared entrances use one per direction.",
@@ -609,7 +644,7 @@ async def experiment(args):
         echo_transport, echo = await loop.create_datagram_endpoint(lambda: EchoTarget(streams),
                                                                    local_addr=("127.0.0.1", 0))
         target_addr = echo_transport.get_extra_info("sockname")
-        clean = Shape(round(args.link_mbps * 1e6), args.delay_ms, args.queue_bytes, args.network_queue_ms)
+        clean = phase_shape(args, "clean", 0)
         lane_count = args.paths if args.topology == "independent" else 1
         for lane in range(lane_count):
             links += [SerializedLink.create(f"lane_{lane}_forward", clean, args.seed + lane * 2),
@@ -629,12 +664,13 @@ async def experiment(args):
         client_args = [binary, "client", "--listen", address(client_addr), "--server-name", "localhost",
                        "--ca", cert, "--token-file", token, "--rate-bps", args.rate_bps,
                        "--fec", args.fec, "--queue-ms", args.queue_ms,
+                       "--latency-target-ms", args.latency_target_ms,
                        "--stats-file", output / "client.final.json",
                        "--stats-jsonl", output / "client.stats.jsonl", "--stats-interval-ms", "200"]
         for proxy in entrances:
             client_args += ["--entrance", address(proxy.transport.get_extra_info("sockname"))]
         if args.profile == "adaptive":
-            client_args += ["--adaptive", "--latency-target-ms", "20"]
+            client_args += ["--adaptive"]
             for group in (range(args.paths) if args.topology == "independent" else [0] * args.paths):
                 client_args += ["--path-group", str(group)]
         elif args.profile == "quality":
@@ -656,10 +692,7 @@ async def experiment(args):
                     proxy.enabled = not (condition == "all_outage"
                                          or condition == "one_outage" and proxy_index == 0)
                 for index, link in enumerate(links):
-                    rate = clean.rate_bps
-                    if condition == "congested" and (args.topology == "shared" or index < 2):
-                        rate = round(args.congested_mbps * 1e6)
-                    link.configure(Shape(rate, args.delay_ms, args.queue_bytes, args.network_queue_ms))
+                    link.configure(phase_shape(args, condition, index))
                 snapshots.append({"window": phase["name"], "elapsed_seconds": time.monotonic() - start,
                                   "utc": utc(), "links": [l.snapshot() for l in links],
                                   "client_alive": client.returncode is None,
@@ -737,8 +770,10 @@ def parse_args(argv=None):
     parser.add_argument("--congested-mbps", type=float, default=.35)
     parser.add_argument("--rate-bps", type=int, default=8_000_000)
     parser.add_argument("--queue-ms", type=int, default=40)
+    parser.add_argument("--latency-target-ms", type=int, default=20)
     parser.add_argument("--fec", type=int, default=0)
     parser.add_argument("--delay-ms", type=float, default=8)
+    parser.add_argument("--loss", type=float, default=0)
     parser.add_argument("--queue-bytes", type=int, default=65536)
     parser.add_argument("--network-queue-ms", type=float, default=250)
     parser.add_argument("--phase-seconds", type=float, default=12)
@@ -751,10 +786,11 @@ def parse_args(argv=None):
     if not (1 <= args.bulk_pps <= 3000 and 1 <= args.interactive_pps <= 200
             and 3 <= args.phase_seconds <= 60 and 1 <= args.rate_bps <= 100_000_000
             and 1 <= args.queue_ms <= 1000 and args.fec in (0, 2, 3, 4, 8)
+            and 0 <= args.loss <= 1 and 1 <= args.latency_target_ms <= 1000
             and 1 <= args.deadline_ms <= 2000):
         parser.error("workload is outside bounded local-test limits")
-    Shape(round(args.link_mbps * 1e6), args.delay_ms, args.queue_bytes, args.network_queue_ms).validate()
-    Shape(round(args.congested_mbps * 1e6), args.delay_ms, args.queue_bytes, args.network_queue_ms).validate()
+    phase_shape(args, "clean", 0).validate()
+    phase_shape(args, "congested", 0).validate()
     if sum(p["seconds"] for p in phases_for(args)) * (args.bulk_pps + args.interactive_pps) > 100000:
         parser.error("at most 100000 planned application operations per run")
     return args

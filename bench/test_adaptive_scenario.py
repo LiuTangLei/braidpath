@@ -6,7 +6,10 @@ import time
 import unittest
 import socket
 import heapq
+from pathlib import Path
+import tempfile
 from unittest.mock import patch
+from bench import adaptive_scenario
 
 from bench.adaptive_scenario import (SerializedLink, Shape, phases_for, quantile, summarize,
                                      window_at, udp_send, udp_receive, Traffic,
@@ -228,6 +231,78 @@ class SourceSchedulingTests(unittest.TestCase):
 
 
 class MeasurementTests(unittest.TestCase):
+    def test_loss_is_registered_and_kept_on_every_phase_and_direction(self):
+        args = adaptive_scenario.parse_args([
+            "--binary", "unused", "--output", "unused", "--loss", ".20",
+            "--phase-seconds", "3", "--outages"])
+        for topology in ["independent", "shared"]:
+            args.topology = topology
+            for phase in phases_for(args):
+                self.assertEqual(phase["loss"], .20)
+                for index in range(4 if topology == "independent" else 2):
+                    shape = adaptive_scenario.phase_shape(args, phase["condition"], index)
+                    self.assertEqual(shape.loss, .20)
+                    expected = args.congested_mbps if phase["condition"] == "congested" \
+                        and (topology == "shared" or index < 2) else args.link_mbps
+                    self.assertEqual(shape.rate_bps, round(expected * 1e6))
+
+    def test_loss_and_latency_parser_bounds_preserve_defaults(self):
+        base = ["--binary", "unused", "--output", "unused"]
+        default = adaptive_scenario.parse_args(base)
+        self.assertEqual(default.loss, 0)
+        self.assertEqual(default.latency_target_ms, 20)
+        configured = adaptive_scenario.parse_args(base + ["--loss", ".2", "--latency-target-ms", "100"])
+        self.assertEqual(configured.latency_target_ms, 100)
+        for boundary in ["0", "1"]:
+            self.assertEqual(adaptive_scenario.parse_args(base + ["--loss", boundary]).loss,
+                             float(boundary))
+        for option, value in [("--loss", "-.01"), ("--loss", "1.01"), ("--loss", "nan"),
+                              ("--latency-target-ms", "0"), ("--latency-target-ms", "1001")]:
+            with self.subTest(option=option, value=value), self.assertRaises(SystemExit):
+                adaptive_scenario.parse_args(base + [option, value])
+
+    def test_loss_and_latency_are_registered_without_running_a_workload(self):
+        (adaptive_scenario.ROOT / "local").mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=adaptive_scenario.ROOT / "local") as directory:
+            binary = Path(directory) / "unused-binary"
+            binary.write_bytes(b"manifest-only test")
+            output = Path(directory) / "registered"
+            args = adaptive_scenario.parse_args([
+                "--binary", str(binary), "--output", str(output), "--dry-run",
+                "--loss", ".20", "--latency-target-ms", "100"])
+            asyncio.run(adaptive_scenario.experiment(args))
+            import json
+            manifest = json.loads((output / "manifest.json").read_text())
+            self.assertEqual(manifest["loss"], .20)
+            self.assertEqual(manifest["latency_target_ms"], 100)
+            self.assertTrue(all(p["loss"] == .20 for p in manifest["phases"]))
+            self.assertEqual(manifest["profile"], "rr")
+            self.assertEqual([p["seconds"] for p in manifest["phases"]], [4, 12, 12, 12])
+            self.assertFalse((output / "commands.json").exists())
+
+    def test_target_one_way_uses_absolute_local_clock_and_all_planned_operations(self):
+        phases = [{"name": "window_a", "seconds": 1, "condition": "clean"}]
+        stream = SimpleNamespace(pps=4, size=1000, samples=[
+            {"window": "window_a", "status": "kernel_accepted", "send_ns": 1_000_000_000,
+             "target_ns": 1_200_000_000, "echo_ns": 1_300_000_000},
+            {"window": "window_a", "status": "kernel_accepted", "send_ns": 2_000_000_000,
+             "target_ns": 2_250_000_000, "echo_ns": 2_350_000_000},
+            {"window": "window_a", "status": "generator_late", "send_ns": None,
+             "target_ns": None, "echo_ns": None}])
+        result = summarize({1: stream}, phases, 200, 0)[0]["streams"]["bulk"]
+        self.assertEqual(result["target_one_way_p50_ms"], 250)
+        self.assertEqual(result["target_one_way_p95_ms"], "infinity")
+        self.assertEqual(result["target_one_way_p99_ms"], "infinity")
+        self.assertEqual(result["target_one_way_on_time_operations"], 1)
+        self.assertEqual(result["target_one_way_deadline_miss_fraction"], .75)
+        self.assertEqual(result["missing_target_operations"], 2)
+        self.assertEqual(result["target_one_way_on_time_payload_bytes"], 1000 - HEADER.size)
+        self.assertEqual(result["target_one_way_on_time_payload_goodput_bps"], (1000 - HEADER.size) * 8)
+        self.assertEqual(result["target_payload_goodput_bps"], 2 * (1000 - HEADER.size) * 8)
+        self.assertEqual(result["measurement_header_bytes_excluded_per_record"], HEADER.size)
+        self.assertEqual(result["rtt_p50_ms"], 350)
+        self.assertEqual(result["target_goodput_bps"], 16000)
+
     def comparison_window(self, target, on_time, miss):
         return {"name": "window_a", "condition": "clean",
                 "streams": {"bulk": {"target_goodput_bps": target,

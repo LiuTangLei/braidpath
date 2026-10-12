@@ -8,7 +8,7 @@ ROOT = Path(__file__).resolve().parents[1]
 MATCH_FIELDS = ("topology", "paths", "rate_bps", "queue_ms", "fec", "link_mbps",
                 "congested_mbps", "queue_bytes", "network_queue_ms", "delay_ms", "seed",
                 "deadline_ms", "bulk_pps", "bulk_bytes", "interactive_pps",
-                "interactive_bytes", "phases", "drain_seconds")
+                "interactive_bytes", "phases", "drain_seconds", "loss", "latency_target_ms")
 
 
 def evaluate_window(baseline, candidate):
