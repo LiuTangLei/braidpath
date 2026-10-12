@@ -135,6 +135,7 @@ def shaping_errors(qdiscs, client, server, rtts, rate_mbps, queue_packets):
 
 def timeseries(raw_path, csv_path):
     previous = {}
+    complete_lines, incomplete_tail_bytes = 0, 0
     with raw_path.open() as source, csv_path.open("w") as target:
         fields = ["sample_unix_ms", "path_id", "cwnd_bytes", "rtt_ms", "pacing_rate_bps",
                   "datagram_send_buffer_space_bytes", "udp_tx_mbps", "udp_io_operations_tx_delta",
@@ -143,7 +144,11 @@ def timeseries(raw_path, csv_path):
         writer = csv.DictWriter(target, fieldnames=fields)
         writer.writeheader()
         for line in source:
+            if not line.endswith("\n"):
+                incomplete_tail_bytes = len(line.encode())
+                continue
             snapshot = json.loads(line)
+            complete_lines += 1
             now = snapshot["sample_unix_ms"]
             direction = snapshot["stats"]["directions"].get("client_to_server", {})
             records, symbols = direction.get("records", {}), direction.get("symbols", {})
@@ -167,6 +172,9 @@ def timeseries(raw_path, csv_path):
                     q["congestion_window_bytes"], q["smoothed_rtt_ms"], q.get("pacing_rate_bps"),
                     q.get("datagram_send_buffer_space_bytes"), rate, *delta[1:]])))
                 previous[identity] = (now, current)
+    return {"complete": incomplete_tail_bytes == 0, "complete_snapshots": complete_lines,
+            "incomplete_tail_bytes": incomplete_tail_bytes,
+            "scope": "complete-line diagnostic; incomplete raw evidence invalidates the attempt"}
 
 
 class Testbed:
@@ -181,6 +189,8 @@ class Testbed:
         self.sampler = None
         self.sample_errors = []
         self.business_started = False
+        self.orderly_shutdown = False
+        self.cleanup_confirmed = False
 
     def command(self, argv, *, timeout=10, check=True):
         result = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
@@ -368,6 +378,7 @@ class Testbed:
 
     def cleanup(self):
         errors, exits = [], {}
+        self.orderly_shutdown = True
         self.stop.set()
         if self.sampler:
             self.sampler.join(timeout=25)
@@ -375,16 +386,27 @@ class Testbed:
                 errors.append("qdisc sampler did not stop")
         for role, process in reversed(self.jobs):
             if process.poll() is None:
-                os.killpg(process.pid, signal.SIGINT)
+                try:
+                    os.killpg(process.pid, signal.SIGINT)
+                except ProcessLookupError:
+                    pass
         for role, process in reversed(self.jobs):
             try:
                 process.wait(timeout=8)
             except subprocess.TimeoutExpired:
-                os.killpg(process.pid, signal.SIGKILL)
-                process.wait(timeout=5)
+                self.orderly_shutdown = False
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    errors.append(f"process still alive after forced stop: {role}")
                 errors.append(f"forced stop: {role}")
             exits[role] = process.returncode
             if process.returncode:
+                self.orderly_shutdown = False
                 errors.append(f"nonzero exit: {role}: {process.returncode}")
         if self.business_started:
             try:
@@ -406,6 +428,20 @@ class Testbed:
                         errors.append(f"interface cleanup failed: {interface}")
             except Exception as error:
                 errors.append(f"interface cleanup failed: {interface}: {error}")
+        try:
+            namespace_names = {line.split()[0] for line in self.command(["ip", "netns", "list"]).stdout.splitlines() if line.strip()}
+            interface_names = {link["ifname"] for link in json.loads(self.command(["ip", "-j", "link", "show"]).stdout)}
+            remaining_namespaces = set(self.owned_namespaces) & namespace_names
+            remaining_interfaces = set(self.owned_links) & interface_names
+            live_processes = [role for role, process in self.jobs if process.poll() is None]
+            for name in sorted(remaining_namespaces | remaining_interfaces):
+                errors.append(f"owned resource still present: {name}")
+            if live_processes:
+                errors.append(f"owned processes still alive: {live_processes}")
+            self.cleanup_confirmed = (not remaining_namespaces and not remaining_interfaces
+                and not live_processes and not (self.sampler and self.sampler.is_alive()))
+        except Exception as error:
+            errors.append(f"cleanup verification failed: {error}")
         return errors, exits
 
 
@@ -469,18 +505,29 @@ def main():
         cleanup_errors, exits = bed.cleanup()
         if args.action == "run" and (args.output / "client.jsonl").exists():
             try:
+                status = timeseries(args.output / "client.jsonl", args.output / "path-series.csv")
+                save(args.output / "path-series-status.json", status)
+                if not status["complete"]:
+                    raise ValueError("partial final JSONL line; complete-line CSV is diagnostic only")
                 for role in ("client", "server"):
                     snapshot = json.loads((args.output / f"{role}.json").read_text())
                     if (snapshot.get("final") is not True or snapshot.get("outcome") != "stopped"
                         or snapshot.get("stats", {}).get("shutdown_complete") is not True):
                         raise ValueError(f"{role} final shutdown not confirmed")
-                timeseries(args.output / "client.jsonl", args.output / "path-series.csv")
             except Exception as error:
+                bed.orderly_shutdown = False
                 failure = failure or f"time series invalid: {error}"
+        valid = (not failure and not cleanup_errors and not bed.sample_errors
+                 and bed.cleanup_confirmed and bed.orderly_shutdown)
+        if (args.output / "summary.json").exists():
+            summary = json.loads((args.output / "summary.json").read_text())
+            summary["attempt_valid"] = valid
+            save(args.output / "summary.json", summary)
         save(args.output / "commands.json", bed.commands)
         save(args.output / "completion.json", {"failure": failure, "cleanup_errors": cleanup_errors,
             "exit_codes": exits, "sample_errors": bed.sample_errors,
-            "cleanup_confirmed": not cleanup_errors, "valid": not failure and not cleanup_errors and not bed.sample_errors})
+            "orderly_shutdown": bed.orderly_shutdown,
+            "cleanup_confirmed": bed.cleanup_confirmed, "valid": valid})
     if failure or cleanup_errors or bed.sample_errors:
         raise SystemExit(f"diagnostic invalid: {failure}; cleanup={cleanup_errors}; samples={bed.sample_errors}")
 

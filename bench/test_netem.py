@@ -2,6 +2,8 @@ import csv
 import json
 from pathlib import Path
 import tempfile
+import signal
+import subprocess
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
@@ -41,6 +43,60 @@ class DeliveryAccounting(unittest.TestCase):
 
 
 class NetworkAndCounters(unittest.TestCase):
+    def test_partial_tail_is_preserved_and_marks_diagnostic_csv_incomplete(self):
+        with tempfile.TemporaryDirectory() as directory:
+            raw, csv_path = Path(directory) / "raw.jsonl", Path(directory) / "path.csv"
+            snapshot = {"sample_unix_ms": 1000, "stats": {"directions": {}, "paths": {
+                "0": {"path_id": 0, "connection_id": 1, "send_buffer_full_attempts": 4,
+                    "quinn": {"udp_bytes_tx": 1000, "congestion_window_bytes": 12000,
+                              "smoothed_rtt_ms": 80}}}}}
+            evidence = json.dumps(snapshot) + '\n{"sample_unix_ms":2'
+            raw.write_text(evidence)
+            status = timeseries(raw, csv_path)
+            self.assertFalse(status["complete"])
+            self.assertEqual(status["complete_snapshots"], 1)
+            self.assertGreater(status["incomplete_tail_bytes"], 0)
+            with csv_path.open() as source:
+                self.assertEqual(len(list(csv.DictReader(source))), 1)
+            self.assertEqual(raw.read_text(), evidence)
+
+    def test_forced_stop_invalidates_orderly_shutdown_but_can_confirm_cleanup(self):
+        with tempfile.TemporaryDirectory() as directory:
+            bed = Testbed(Path(directory))
+            process = SimpleNamespace(pid=123, returncode=None)
+            process.poll = lambda: process.returncode
+            def wait(timeout):
+                if process.returncode is None:
+                    raise subprocess.TimeoutExpired("test-client", timeout)
+                return process.returncode
+            process.wait = wait
+            bed.jobs = [("client", process)]
+            bed.owned_namespaces = ["owned-namespace"]
+            bed.owned_links = ["owned-link"]
+            bed.command = lambda argv, **kwargs: SimpleNamespace(
+                returncode=1 if argv[:3] == ["ip", "link", "show"] else 0,
+                stdout="[]" if "-j" in argv else "")
+            def signal_group(pid, signum):
+                if signum == signal.SIGKILL:
+                    process.returncode = -signal.SIGKILL
+            with patch("bench.netem.os.killpg", side_effect=signal_group):
+                errors, exits = bed.cleanup()
+            self.assertIn("forced stop: client", errors)
+            self.assertEqual(exits["client"], -signal.SIGKILL)
+            self.assertFalse(bed.orderly_shutdown)
+            self.assertTrue(bed.cleanup_confirmed)
+
+    def test_successful_remove_command_is_insufficient_if_namespace_still_exists(self):
+        with tempfile.TemporaryDirectory() as directory:
+            bed = Testbed(Path(directory))
+            bed.owned_namespaces = ["owned-namespace"]
+            bed.command = lambda argv, **kwargs: SimpleNamespace(returncode=0,
+                stdout="owned-namespace\n" if argv == ["ip", "netns", "list"] else "[]")
+            errors, _exits = bed.cleanup()
+            self.assertTrue(bed.orderly_shutdown)
+            self.assertFalse(bed.cleanup_confirmed)
+            self.assertTrue(any("still present" in error for error in errors))
+
     def test_udp_kernel_drops_keep_their_own_counters(self):
         raw = ("Ip: InReceives InDiscards\nIp: 1000 4\n"
                "Udp: InDatagrams InErrors RcvbufErrors SndbufErrors\nUdp: 800 5 3 2\n")
