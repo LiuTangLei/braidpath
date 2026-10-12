@@ -131,6 +131,20 @@ Optional current flags can be passed as repeated `--client-extra-arg=VALUE`
 arguments. Do not change settings after inspecting a candidate result and then
 present the new workload as the original paired comparison.
 
+`--loss` sets a probability from 0 to 1 for independently seeded packet erasure
+in both directions throughout the session, including handshakes and ACKs. A
+`clean` phase denotes restored link capacity; it still has the configured loss.
+`--latency-target-ms` exposes the runtime's additional-queue target and retains
+the experiment's default of 20 ms. Register both values before running; the
+comparison rejects different loss or latency targets.
+
+Target receipt also reports one-way latency on the harness's single monotonic
+clock, without minimum subtraction. These quantiles include every planned
+operation, with missing or unsent operations at infinity. New payload goodput
+fields exclude the 25-byte measurement header; existing RTT and byte fields
+retain their original definitions. These controlled measurements diagnose the
+policy separately from public-link capacity and do not establish WAN acceptance.
+
 ## Acceptance must match the condition
 
 The manifest declares a finite engineering screen, not statistical proof.
