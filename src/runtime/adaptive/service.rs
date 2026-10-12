@@ -2,7 +2,7 @@
 //!
 //! Short byte reports may confirm startup progress. Capacity memory and drain
 //! hints instead need an interval long enough not to promote a brief burst.
-use super::FRESH_US;
+use super::{CONTROL_US, FRESH_US};
 use std::collections::VecDeque;
 
 const SAMPLE_US: u64 = 500_000;
@@ -23,6 +23,16 @@ pub(super) struct Admission {
     pub(super) symbols: u64,
     pub(super) bps: f64,
     pub(super) span_us: u64,
+    pub(super) started_us: u64,
+}
+
+/// Short safety evidence in one sender-local clock. Never a capacity sample.
+pub(super) struct RecentPair {
+    pub(super) delivered_bytes: u64,
+    pub(super) admitted_bytes: u64,
+    pub(super) symbols: u64,
+    pub(super) local_span_us: u64,
+    pub(super) receiver_span_us: u64,
     pub(super) started_us: u64,
 }
 
@@ -145,6 +155,31 @@ impl Window {
         })
     }
 
+    pub(super) fn recent_pair(&self, now_us: u64) -> Option<RecentPair> {
+        let current = self.recent.back()?;
+        let previous = self.recent.get(self.recent.len().checked_sub(2)?)?;
+        if now_us != current.observed_us {
+            return None;
+        }
+        let receiver_span_us = current.receiver_us.checked_sub(previous.receiver_us)?;
+        let local_span_us = current.observed_us.checked_sub(previous.observed_us)?;
+        if !(1..=CONTROL_US).contains(&receiver_span_us)
+            || !(1..=CONTROL_US).contains(&local_span_us)
+        {
+            return None;
+        }
+        let ((previous_bytes, previous_symbols), (current_bytes, current_symbols)) =
+            previous.admitted.zip(current.admitted)?;
+        Some(RecentPair {
+            delivered_bytes: current.bytes.checked_sub(previous.bytes)?,
+            admitted_bytes: current_bytes.checked_sub(previous_bytes)?,
+            symbols: current_symbols.checked_sub(previous_symbols)?,
+            local_span_us,
+            receiver_span_us,
+            started_us: previous.observed_us,
+        })
+    }
+
     fn update_discovery(&mut self, current: Endpoint, gap: bool) {
         if gap {
             self.recent.clear();
@@ -239,6 +274,31 @@ impl Window {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recent_safety_pair_uses_local_time_without_creating_a_capacity_sample() {
+        let mut window = Window::default();
+        window.observe(1, Some(100_000_000), 0, 0, Some((0, 0)));
+        window.observe(2, Some(100_100_000), 90_000, 100_000, Some((90_000, 100)));
+        window.observe(3, Some(100_250_000), 94_500, 200_000, Some((180_000, 200)));
+        let pair = window.recent_pair(200_000).unwrap();
+        assert_eq!(
+            (pair.local_span_us, pair.receiver_span_us),
+            (100_000, 150_000)
+        );
+        assert_eq!(
+            (pair.delivered_bytes, pair.admitted_bytes, pair.symbols),
+            (4500, 90_000, 100)
+        );
+        assert!(window.latest(200_000).is_none());
+        assert!(window.discovery_latest(200_000).is_none());
+        assert!(window.recent_pair(200_001).is_none());
+        window.observe(4, Some(100_550_000), 99_000, 300_000, Some((270_000, 300)));
+        assert!(
+            window.recent_pair(300_000).is_none(),
+            "a clock jump is not a short interval"
+        );
+    }
 
     #[test]
     fn rolling_discovery_keeps_the_horizon_without_renewing_capacity_or_duplicate_reports() {
