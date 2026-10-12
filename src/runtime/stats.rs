@@ -793,6 +793,19 @@ impl Scope {
         });
     }
 }
+fn write_snapshot(writer: &mut impl Write, snapshot: &impl Serialize, pretty: bool) -> Result<()> {
+    // Snapshots contain bounded ID windows. Serialize once in memory rather than
+    // issuing one filesystem write for each JSON token (especially on bind mounts).
+    let mut bytes = if pretty {
+        serde_json::to_vec_pretty(snapshot)?
+    } else {
+        serde_json::to_vec(snapshot)?
+    };
+    bytes.push(b'\n');
+    writer.write_all(&bytes)?;
+    Ok(())
+}
+
 /// Must outlive runtime cleanup. Periodic output is stopped before the final JSON.
 pub struct Reporter {
     pub metrics: Metrics,
@@ -836,8 +849,7 @@ impl Reporter {
                     tokio::select! {_=tick.tick()=>{},_=metrics.0.changed.notified()=>{}}
                     let value = metrics.snapshot(false, "running", None)?;
                     let mut file = file.lock().expect("stats file lock");
-                    serde_json::to_writer(&mut *file, &value)?;
-                    file.write_all(b"\n")?;
+                    write_snapshot(&mut *file, &value, false)?;
                     file.flush()?;
                 }
             })
@@ -866,13 +878,11 @@ impl Reporter {
         )?;
         if let Some(path) = &self.options.stats_file {
             let mut file = File::create(path)?;
-            serde_json::to_writer_pretty(&mut file, &snapshot)?;
-            file.write_all(b"\n")?;
+            write_snapshot(&mut file, &snapshot, true)?;
         }
         if let Some(file) = &self.jsonl {
             let mut file = file.lock().expect("stats file lock");
-            serde_json::to_writer(&mut *file, &snapshot)?;
-            file.write_all(b"\n")?;
+            write_snapshot(&mut *file, &snapshot, false)?;
             file.flush()?;
         }
         result?;
@@ -889,6 +899,108 @@ mod tests {
     use crate::runtime::transport::{self, Congestion};
     use bytes::Bytes;
     use tokio::time::timeout;
+
+    #[derive(Default)]
+    struct CountingWriter {
+        bytes: Vec<u8>,
+        writes: usize,
+    }
+    impl Write for CountingWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.writes += 1;
+            self.bytes.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn populated_snapshot_is_one_write_with_identical_json_and_newline() {
+        let metrics = Metrics::new("test");
+        let scope = metrics.scope("bounded-session", FORWARD);
+        for id in 0..ID_WINDOW {
+            scope.update(|d| {
+                d.records.application_received += 1;
+                d.generated_record_ids.add(id);
+                d.quinn_admitted_record_ids.add(id);
+            });
+        }
+        let snapshot = metrics.snapshot(true, "stopped", None).unwrap();
+        let mut counts = Vec::new();
+        for pretty in [false, true] {
+            let mut writer = CountingWriter::default();
+            write_snapshot(&mut writer, &snapshot, pretty).unwrap();
+            let mut expected = if pretty {
+                serde_json::to_vec_pretty(&snapshot).unwrap()
+            } else {
+                serde_json::to_vec(&snapshot).unwrap()
+            };
+            expected.push(b'\n');
+            assert_eq!(writer.bytes, expected);
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&writer.bytes).unwrap(),
+                snapshot
+            );
+            eprintln!(
+                "pretty={pretty} snapshot_bytes={} write_calls={}",
+                writer.bytes.len(),
+                writer.writes
+            );
+            counts.push(writer.writes);
+        }
+        assert_eq!(counts, [1, 1]);
+    }
+
+    #[test]
+    fn snapshot_serialization_and_write_failures_propagate() {
+        struct Rejected;
+        impl Serialize for Rejected {
+            fn serialize<S: serde::Serializer>(
+                &self,
+                _: S,
+            ) -> std::result::Result<S::Ok, S::Error> {
+                Err(serde::ser::Error::custom("snapshot serialization rejected"))
+            }
+        }
+        #[derive(Serialize)]
+        struct InvalidSnapshot {
+            prefix: u64,
+            rejected: Rejected,
+        }
+        struct FailedWriter;
+        impl Write for FailedWriter {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("snapshot write rejected"))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        for pretty in [false, true] {
+            let mut writer = CountingWriter::default();
+            let failure = write_snapshot(
+                &mut writer,
+                &InvalidSnapshot {
+                    prefix: 1,
+                    rejected: Rejected,
+                },
+                pretty,
+            )
+            .unwrap_err();
+            assert!(
+                failure
+                    .to_string()
+                    .contains("snapshot serialization rejected")
+            );
+            assert!(writer.bytes.is_empty());
+            assert_eq!(writer.writes, 0);
+            let failure = write_snapshot(&mut FailedWriter, &serde_json::json!({"ok": 1}), pretty)
+                .unwrap_err();
+            assert!(failure.to_string().contains("snapshot write rejected"));
+        }
+    }
 
     #[tokio::test(flavor = "current_thread")]
     async fn quinn_snapshot_reports_real_datagram_space_and_udp_io_operations() {
