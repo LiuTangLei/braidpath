@@ -10,6 +10,87 @@ use std::time::{Duration, Instant};
 use tokio::time::timeout;
 
 #[tokio::test(flavor = "current_thread")]
+async fn explicit_datagram_buffer_holds_eight_records_without_eviction() {
+    let temp = tempfile::tempdir().unwrap();
+    let identity = temp.path().join("identity");
+    transport::initialize(&identity, "localhost").unwrap();
+    let server = transport::server(
+        "127.0.0.1:0".parse().unwrap(),
+        &identity.join("cert.pem"),
+        &identity.join("key.pem"),
+        Congestion::Bbr,
+    )
+    .unwrap();
+    let address = server.local_addr().unwrap();
+    for invalid in [1199, 76_801, usize::MAX] {
+        assert!(
+            transport::client_bound_with_datagram_buffer(
+                address,
+                &identity.join("cert.pem"),
+                None,
+                Congestion::Bbr,
+                None,
+                invalid,
+            )
+            .is_err()
+        );
+    }
+    let client = transport::client_bound_with_datagram_buffer(
+        address,
+        &identity.join("cert.pem"),
+        None,
+        Congestion::Bbr,
+        Some("127.0.0.1:0".parse().unwrap()),
+        8 * 1200,
+    )
+    .unwrap();
+    assert_eq!(client.local_addr().unwrap().ip(), address.ip());
+    let (outgoing, incoming) = timeout(Duration::from_secs(3), async {
+        tokio::join!(client.connect(address, "localhost").unwrap(), async {
+            server.accept().await.unwrap().await
+        })
+    })
+    .await
+    .unwrap();
+    let outgoing = outgoing.unwrap();
+    let incoming = incoming.unwrap();
+    let records: Vec<_> = (0..16)
+        .map(|id| {
+            let original = Record {
+                flow: 1,
+                id,
+                payload: vec![id as u8; MAX_PAYLOAD],
+            };
+            wire::http_datagram(0, &wire::plain(&original).unwrap()).unwrap()
+        })
+        .collect();
+    // Synchronous current-thread admissions cannot be drained by the driver.
+    let mut admitted = 0;
+    for record in &records {
+        if outgoing.datagram_send_buffer_space() < record.len() {
+            break;
+        }
+        outgoing.send_datagram(record.clone()).unwrap();
+        admitted += 1;
+    }
+    // Bytes include metadata, so 9600 bytes can hold more than eight small records.
+    assert!(admitted >= 8);
+    assert!(admitted < records.len());
+    assert!(outgoing.datagram_send_buffer_space() < records[0].len());
+    for expected in records.into_iter().take(admitted) {
+        assert_eq!(
+            timeout(Duration::from_secs(3), incoming.read_datagram())
+                .await
+                .unwrap()
+                .unwrap(),
+            expected
+        );
+    }
+    client.close(0u32.into(), b"test complete");
+    server.close(0u32.into(), b"test complete");
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn bounded_transport_queue_preserves_maximum_plain_and_repair_frames() {
     let temp = tempfile::tempdir().unwrap();
     let identity = temp.path().join("identity");

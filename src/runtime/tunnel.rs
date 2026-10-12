@@ -2088,6 +2088,7 @@ pub struct ClientOptions {
     pub entrances: Vec<SocketAddr>,
     pub interfaces: Vec<String>,
     pub path_binds: Vec<SocketAddr>,
+    pub datagram_send_buffer_bytes: usize,
     pub path_groups: Vec<u8>,
     pub name: String,
     pub ca: std::path::PathBuf,
@@ -2272,6 +2273,7 @@ async fn client_session(
                     let ca=options.ca.clone();let name=options.name.clone();let token=token.clone();let sid=sid.clone();
                     let policy=options.policy.clone();let metrics=options.stats.clone();let tx=rejoin_tx.clone();
                     let congestion=options.congestion;let rejoin=has_session;
+                    let datagram_send_buffer_bytes=options.datagram_send_buffer_bytes;
                     let mut cancelled=stop.subscribe();
                     inflight[id]=true;
                     elective_inflight[id]=elective;
@@ -2279,7 +2281,7 @@ async fn client_session(
                     tasks.spawn(async move {
                         let mut diagnostic=stats::ConnectionTrace::new(metrics,config.remote,Some(id as u8),"quic_connect");
                         let attempt:Result<Option<Rejoined>>=async {
-                            let endpoint=transport::client_bound(config.remote,&ca,config.interface.as_deref(),congestion,bind)?;
+                            let endpoint=transport::client_bound_with_datagram_buffer(config.remote,&ca,config.interface.as_deref(),congestion,bind,datagram_send_buffer_bytes)?;
                             info!(path=id,generation,local=%endpoint.local_addr()?,remote=%config.remote,"path attempt source socket");
                             let connected=tokio::select! {
                                 biased;

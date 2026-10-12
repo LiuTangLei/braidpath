@@ -55,6 +55,10 @@ enum Command {
         /// One explicit local UDP bind per interface–entrance pair, in path order.
         #[arg(long = "path-bind")]
         path_binds: Vec<SocketAddr>,
+        /// Outgoing Quinn buffer bytes, including metadata; does not bound residence time.
+        /// Override only for controlled measurements; normal operation defaults to 1200.
+        #[arg(long, default_value_t = 1200, value_parser = clap::value_parser!(u32).range(1200..=76_800))]
+        datagram_send_buffer_bytes: u32,
         /// Bottleneck group per interface–entrance pair; defaults to interface index.
         #[arg(long = "path-group")]
         path_groups: Vec<u8>,
@@ -185,6 +189,7 @@ pub async fn run() -> Result<()> {
             entrances,
             interfaces,
             path_binds,
+            datagram_send_buffer_bytes,
             path_groups,
             server_name,
             ca,
@@ -201,6 +206,7 @@ pub async fn run() -> Result<()> {
                 entrances,
                 interfaces,
                 path_binds,
+                datagram_send_buffer_bytes: datagram_send_buffer_bytes as usize,
                 path_groups,
                 name: server_name,
                 ca,
@@ -287,6 +293,42 @@ fn parse_group_rates(values: &[String], aggregate: u64) -> Result<[u64; super::M
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn client_datagram_send_buffer_defaults_and_explicit_bounds() {
+        let arguments = [
+            "braidpath",
+            "client",
+            "--entrance",
+            "127.0.0.1:4433",
+            "--server-name",
+            "localhost",
+            "--ca",
+            "cert.pem",
+            "--token-file",
+            "token",
+        ];
+        let parse_size = |extra: &[&str]| {
+            let parsed = Cli::try_parse_from(arguments.iter().chain(extra));
+            parsed.map(|cli| match cli.command {
+                Command::Client {
+                    datagram_send_buffer_bytes,
+                    ..
+                } => datagram_send_buffer_bytes,
+                _ => unreachable!(),
+            })
+        };
+        assert_eq!(parse_size(&[]).unwrap(), 1200);
+        for size in ["1200", "9600", "38400", "76800"] {
+            assert_eq!(
+                parse_size(&["--datagram-send-buffer-bytes", size]).unwrap(),
+                size.parse::<u32>().unwrap()
+            );
+        }
+        for size in ["0", "1199", "76801", "4294967296"] {
+            assert!(parse_size(&["--datagram-send-buffer-bytes", size]).is_err());
+        }
+    }
+
     #[test]
     fn explicit_bottleneck_caps_are_bounded_and_unambiguous() {
         assert_eq!(

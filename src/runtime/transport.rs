@@ -7,6 +7,9 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use socket2::{Domain, Protocol, Socket, Type};
 use std::{fs, io::BufReader, net::SocketAddr, path::Path, sync::Arc, time::Duration};
 
+pub const DEFAULT_DATAGRAM_SEND_BUFFER_BYTES: usize = 1200;
+pub const MAX_DATAGRAM_SEND_BUFFER_BYTES: usize = 76_800;
+
 pub fn token(path: &Path) -> Result<String> {
     let s = fs::read_to_string(path).context("read token file")?;
     let s = s.trim();
@@ -41,7 +44,7 @@ pub fn config(_congestion: Congestion) -> TransportConfig {
     // Quinn cannot expire individual queued datagrams. Keep at most one maximum-
     // size BraidPath record (or a few small ones) beyond the application deadline
     // queue. This bounds hidden bytes, not residence time on a stalled path.
-    t.datagram_send_buffer_size(1200);
+    t.datagram_send_buffer_size(DEFAULT_DATAGRAM_SEND_BUFFER_BYTES);
     t.max_idle_timeout(Some(
         Duration::from_secs(15)
             .try_into()
@@ -84,6 +87,31 @@ pub fn client_bound(
     congestion: Congestion,
     bind: Option<SocketAddr>,
 ) -> Result<Endpoint> {
+    client_bound_with_datagram_buffer(
+        remote,
+        ca,
+        interface,
+        congestion,
+        bind,
+        DEFAULT_DATAGRAM_SEND_BUFFER_BYTES,
+    )
+}
+
+/// Bounded outgoing datagram memory for controlled measurements. This includes
+/// Quinn metadata and does not guarantee a maximum datagram residence time.
+pub fn client_bound_with_datagram_buffer(
+    remote: SocketAddr,
+    ca: &Path,
+    interface: Option<&str>,
+    congestion: Congestion,
+    bind: Option<SocketAddr>,
+    datagram_send_buffer_bytes: usize,
+) -> Result<Endpoint> {
+    ensure!(
+        (DEFAULT_DATAGRAM_SEND_BUFFER_BYTES..=MAX_DATAGRAM_SEND_BUFFER_BYTES)
+            .contains(&datagram_send_buffer_bytes),
+        "datagram send buffer must be 1200..76800 bytes"
+    );
     let mut roots = rustls::RootCertStore::empty();
     for cert in certificates(ca)? {
         roots.add(cert)?;
@@ -94,7 +122,9 @@ pub fn client_bound(
     tls.alpn_protocols = vec![b"h3".to_vec()];
     tls.enable_early_data = false;
     let mut conf = ClientConfig::new(Arc::new(QuicClientConfig::try_from(tls)?));
-    conf.transport_config(Arc::new(config(congestion)));
+    let mut transport = config(congestion);
+    transport.datagram_send_buffer_size(datagram_send_buffer_bytes);
+    conf.transport_config(Arc::new(transport));
     let s = Socket::new(
         if remote.is_ipv4() {
             Domain::IPV4
