@@ -245,6 +245,12 @@ class Testbed:
 
     def network_snapshot(self, filename):
         value = {"sample_unix_ms": int(time.time() * 1000), "namespaces": {}}
+        # Resource diagnostics explain an underfilled source; CPU is not a gate.
+        value["container_cpu"] = {
+            name: path.read_text() if path.exists() else None
+            for name in ("cpu.max", "cpu.stat")
+            for path in [Path("/sys/fs/cgroup") / name]
+        }
         for namespace in self.owned_namespaces:
             prefix = ["ip", "netns", "exec", namespace]
             snmp = self.command([*prefix, "cat", "/proc/net/snmp"]).stdout
