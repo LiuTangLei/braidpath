@@ -1,5 +1,35 @@
 # Finite benchmark runner
 
+`python3 -m bench.netem validate --output local/NEW_PREFLIGHT` checks an isolated
+Linux four-path testbed. `python3 -m bench.netem run --binary LINUX_BINARY
+--output local/NEW_RUN` validates it before one finite fixed-mode FEC0 diagnostic.
+Run only as root **inside a dedicated disposable Docker container**, with
+`BRAIDPATH_NETEM_CONTAINER=1`, namespace administration capabilities and Linux
+`ip`, `tc`, `ping`, and `iperf3` installed. Never use host networking or production hosts.
+The default 20-second workload has four independent 100 Mbps paths and RTTs
+30/45/60/80 ms; each direction gets half that delay, a 1024-packet queue and
+zero random loss.
+`validate` checks actual RTT using finite pings after a separately recorded ARP
+warmup, then calibrates all four rates concurrently with three-second raw UDP
+streams. Calibration deliberately offers 140 percent of each link rate and
+retains its drops separately from the business workload. Both actions remove their own namespaces and
+interfaces in `finally`; the enclosing disposable container bounds crash cleanup.
+No existing output is overwritten or resumed. All generated identities, topology,
+commands, raw JSONL, packet samples, readiness and completion evidence stay under
+ignored `local/`. Native stats and qdisc series are sampled every 250 ms. CSV rates
+use counter deltas; aggregate drop deltas repeated beside paths must not be summed
+across paths. One-way tails retain missing slots as infinity; deadline-useful
+goodput divides by actual source span. A single diagnostic is not acceptance.
+Boundary snapshots before/after business traffic and after runtime shutdown retain
+namespace UDP/kernel counters, interface counters and socket memory. These counters
+keep their native scopes and must not be added to application drops without
+reconciliation. Registration binds the binary and three harness source hashes.
+`--mode adaptive` is explicit; congestion remains BBR. An optional
+`--datagram-buffer-bytes` forwards the runtime buffer flag for separately registered
+experiments and does not change the runtime default.
+`python3 -m unittest bench.test_netem bench.test_readiness` checks accounting,
+bidirectional delay and the authenticated-path readiness gate.
+
 `python3 -m bench.trace_replay RAW DEST --paths PATH_A PATH_B PATH_C PATH_D`
 packs native sender/receiver samples for synchronized virtual-time replay.
 `Replay.events()` retains every source timestamp, gap and end-to-end missing
