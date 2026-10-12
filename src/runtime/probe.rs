@@ -823,6 +823,53 @@ pub async fn echo(listen: SocketAddr, ready_file: Option<PathBuf>) -> Result<()>
 mod tests {
     use super::*;
 
+    #[tokio::test(start_paused = true)]
+    async fn source_pacing_delay_short_stall_retains_original_deadlines() {
+        let period = Duration::from_secs_f64(1. / 40_000.);
+        assert_eq!(period, Duration::from_micros(25));
+        let start = tokio::time::Instant::now();
+        let mut tick = tokio::time::interval(period);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        assert_eq!(tick.tick().await, start);
+
+        tokio::time::advance(Duration::from_millis(4)).await;
+        assert_eq!(tick.tick().await, start + period);
+        let next = tick.tick().await;
+        assert_eq!(next, start + period * 2);
+        // These overdue ticks catch up without advancing the paused clock.
+        assert_eq!(
+            tokio::time::Instant::now(),
+            start + Duration::from_millis(4)
+        );
+        println!(
+            "source_pacing stall_us=4000 period_us=25 before_phase_us=0 after_phase_us={}",
+            next.duration_since(start + period * 2).as_micros()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn source_pacing_delay_long_stall_keeps_the_new_phase() {
+        let period = Duration::from_secs_f64(1. / 40_000.);
+        let start = tokio::time::Instant::now();
+        let mut tick = tokio::time::interval(period);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        assert_eq!(tick.tick().await, start);
+
+        tokio::time::advance(Duration::from_millis(6)).await;
+        assert_eq!(tick.tick().await, start + period);
+        let next = tick.tick().await;
+        assert_eq!(next, start + Duration::from_millis(6) + period);
+        let phase_offset = next.duration_since(start + period * 2);
+        assert_eq!(phase_offset, Duration::from_micros(5975));
+        // Subsequent ticks preserve the reset phase instead of recovering the
+        // original send schedule. Actual source span must remain the denominator.
+        assert_eq!(tick.tick().await, start + period * 3 + phase_offset);
+        println!(
+            "source_pacing stall_us=6000 period_us=25 before_phase_us=0 after_phase_us={}",
+            phase_offset.as_micros()
+        );
+    }
+
     fn receive_workload() -> Workload {
         Workload {
             count: 12,
