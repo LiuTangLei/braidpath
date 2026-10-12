@@ -38,6 +38,22 @@ class SharedPhysicalTopology(unittest.TestCase):
             self.assertEqual([shared[i + 1] for i, value in enumerate(shared) if value == flag],
                              [independent[i + 1] for i, value in enumerate(independent) if value == flag])
 
+    def test_common_link_calibration_targets_bridge_without_crossing_a_leaf(self):
+        calibration = self.plan["access_calibration"]
+        self.assertEqual(calibration["server_namespace"], "router")
+        self.assertEqual(calibration["physical_rate_mbps"], 400)
+        self.assertNotIn(calibration["target"], {p["entrance"].split(":")[0] for p in self.plan["paths"]})
+        self.assertNotIn(calibration["client_address"], {p["client_bind"].split(":")[0] for p in self.plan["paths"]})
+        self.assertNotIn(calibration["bridge_mac"], {p["client_mac"] for p in self.plan["paths"]}
+                         | {p["server_mac"] for p in self.plan["paths"]})
+        commands = self.plan["commands"]
+        addresses = [command for command in commands if "addr" in command and command[2] == "router"]
+        self.assertEqual(addresses, [["ip", "-n", "router", "addr", "add", "10.204.0.2/30", "dev", "br0"]])
+        neighbor = [command for command in commands if "neigh" in command and command[5] == calibration["target"]]
+        self.assertEqual(len(neighbor), 1)
+        self.assertEqual(neighbor[0][neighbor[0].index("lladdr") + 1], calibration["bridge_mac"])
+        self.assertEqual(neighbor[0][neighbor[0].index("dev") + 1], "u0c")
+
     def test_static_neighbors_and_bridge_fdb_preserve_each_paths_leaf_affinity(self):
         self.assertFalse(any("sysctl" in command for command in self.plan["commands"]))
         bridge_ports = [command for command in self.plan["commands"] if "master" in command and "bridge" not in command]

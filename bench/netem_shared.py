@@ -18,7 +18,10 @@ def shared_plan(client, server, router, rtt_ms, rate_mbps, shared_rate_mbps, que
     for namespace in (client, router, server):
         commands += [["ip", "netns", "add", namespace],
                      ["ip", "-n", namespace, "link", "set", "lo", "up"]]
+    bridge_mac = "02:42:00:00:00:03"
     commands += [["ip", "-n", router, "link", "add", "br0", "type", "bridge"],
+                 ["ip", "-n", router, "link", "set", "br0", "address", bridge_mac],
+                 ["ip", "-n", router, "addr", "add", "10.204.0.2/30", "dev", "br0"],
                  ["ip", "-n", router, "link", "set", "br0", "up"]]
 
     def link(left_ns, left_device, left_ip, left_mac, right_ns, right_device, right_ip, right_mac,
@@ -43,9 +46,11 @@ def shared_plan(client, server, router, rtt_ms, rate_mbps, shared_rate_mbps, que
                            "purpose": purpose})
 
     client_mac = "02:42:00:00:00:01"
-    link(client, "u0c", None, client_mac, router, "u0r", None, "02:42:00:00:00:02",
+    link(client, "u0c", "10.204.0.1/30", client_mac, router, "u0r", None, "02:42:00:00:00:02",
          shared_rate_mbps, 0, "shared_access")
     commands += [["ip", "-n", router, "link", "set", "u0r", "master", "br0"],
+                 ["ip", "-n", client, "neigh", "replace", "10.204.0.2", "lladdr", bridge_mac,
+                  "nud", "permanent", "dev", "u0c"],
                  ["ip", "netns", "exec", router, "bridge", "fdb", "replace", client_mac,
                   "dev", "u0r", "master", "static"]]
     for index, rtt in enumerate(rtt_ms):
@@ -77,6 +82,9 @@ def shared_plan(client, server, router, rtt_ms, rate_mbps, shared_rate_mbps, que
         "shared_access_mbps": shared_rate_mbps, "entry_link_mbps": rate_mbps,
         "rtt_ms": list(rtt_ms), "random_loss_percent": 0,
         "group_rate_bps": {"0": int(shared_rate_mbps * 1000000)},
+        "access_calibration": {"server_namespace": router, "target": "10.204.0.2",
+                               "client_address": "10.204.0.1", "bridge_mac": bridge_mac,
+                               "physical_rate_mbps": shared_rate_mbps},
         "queues": queues, "paths": paths, "commands": commands,
     }
 

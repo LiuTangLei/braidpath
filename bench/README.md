@@ -10,8 +10,8 @@ The default 20-second workload has four independent 100 Mbps paths and RTTs
 30/45/60/80 ms; each direction gets half that delay, a 1024-packet queue and
 zero random loss.
 `validate` checks actual RTT using finite pings after a separately recorded ARP
-warmup, then calibrates all four rates concurrently with three-second raw UDP
-streams. Calibration deliberately offers 140 percent of each link rate and
+warmup, then calibrates independent-path rates concurrently with three-second raw
+UDP streams. Calibration deliberately offers 140 percent of each link rate and
 retains its drops separately from the business workload. Both actions remove their own namespaces and
 interfaces in `finally`; the enclosing disposable container bounds crash cleanup.
 No existing output is overwritten or resumed. All generated identities, topology,
@@ -38,9 +38,12 @@ evidence; configuration validation checks the common link and every entry link.
 Static neighbors and bridge forwarding entries bind each entrance to its own
 delayed leaf link. Setup uses namespace-scoped link administration and requires
 no writable sysctl mount or host network settings.
-Independent topology remains the default. The initial shared calibration uses
-the clean 400 Mbps access scenario; reduced shared capacities need an aggregate
-rate calibration rather than expecting each path to receive its full leaf rate.
+Independent topology remains the default. Shared calibration measures each leaf
+sequentially for three seconds, then measures only the common access link against
+a bridge-local calibration address for three seconds. The same 85–105 percent
+receiver-rate check applies to each physical link; shared FIFO does not imply
+equal per-path shares. These setup calibrations are separate from the unchanged
+20-second business workload.
 The CSV BBR pacing rate is the controller's exported internal target; Quinn's
 packet pacer uses cwnd/RTT. UDP I/O operations are transmit batches: their ratio
 to datagrams does not by itself prove system calls or GSO usage.

@@ -292,8 +292,12 @@ class Testbed:
              "ping": observed, "qdiscs_before": qdiscs, "qdiscs_after": qdiscs_after})
         if failure:
             raise RuntimeError(failure)
-        from bench.netem_calibration import calibrate_links
-        calibrate_links(self, [f"10.203.{index + 1}.2" for index in range(4)], args.rate_mbps)
+        if getattr(args, "topology", "independent") == "shared":
+            from bench.netem_calibration import calibrate_shared
+            calibrate_shared(self, self.shared_plan, args.rate_mbps)
+        else:
+            from bench.netem_calibration import calibrate_links
+            calibrate_links(self, [f"10.203.{index + 1}.2" for index in range(4)], args.rate_mbps)
 
     def spawn(self, namespace, role, argv):
         with (self.output / f"{role}.log").open("w") as log:
