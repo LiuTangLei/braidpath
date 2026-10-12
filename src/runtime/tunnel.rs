@@ -677,6 +677,24 @@ impl SendAccounting<'_> {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static QUALITY_STATS_PUBLICATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn publish_receiver_feedback(paths: &[OutPath], metrics: &Scope) {
+    for path in paths {
+        let feedback = path
+            .quality
+            .lock()
+            .expect("quality lock")
+            .snapshot_at(quality_time(path));
+        metrics.path(path.id, |p| p.receiver_feedback = Some(feedback));
+        #[cfg(test)]
+        QUALITY_STATS_PUBLICATIONS.with(|count| count.set(count.get() + 1));
+    }
+}
+
 /// A single owner admits every business, repair, feedback and probe datagram.
 /// Each local flow gets a turn; all classes obey the aggregate and group caps.
 async fn sender(
@@ -761,6 +779,9 @@ async fn sender(
         // A different actor event invalidates this prepared queue head and its
         // budget checks. Cancel the future before touching any actor state.
         let prepared = waiting.take().map(WaitingSend::cancel);
+        // Counters live in path.quality; these clones are only JSON observability.
+        // Publish on the existing timer/evidence events, not every packet event.
+        let publish_feedback_stats = matches!(&event, SenderEvent::Tick | SenderEvent::Evidence);
         match event {
             SenderEvent::Stop => break,
             SenderEvent::Evidence => {
@@ -1524,13 +1545,8 @@ async fn sender(
             stalled_originals = 0;
             blocked_repair = false;
         }
-        for path in paths.iter() {
-            let feedback = path
-                .quality
-                .lock()
-                .expect("quality lock")
-                .snapshot_at(quality_time(path));
-            metrics.path(path.id, |p| p.receiver_feedback = Some(feedback));
+        if publish_feedback_stats {
+            publish_receiver_feedback(&paths, &metrics);
         }
         drop(paths);
         waiting = next_wait.map(WaitingSend::new);
@@ -1552,6 +1568,7 @@ async fn sender(
     while input.try_recv().is_ok() {
         metrics.update(|d| d.records.input_shutdown_dropped += 1);
     }
+    publish_receiver_feedback(&shared_paths.lock().expect("paths lock"), &metrics);
 }
 
 #[derive(Clone, Copy)]

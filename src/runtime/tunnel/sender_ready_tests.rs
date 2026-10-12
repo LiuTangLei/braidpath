@@ -473,6 +473,92 @@ async fn ready_poll_rechecks_current_group_budget_before_entering_quinn() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn sender_feedback_stats_publish_on_tick_and_final_not_each_input() {
+    let pair = Pair::connect().await;
+    let path = pair.path();
+    let paths = Arc::new(Mutex::new(vec![path.clone()]));
+    let mut policy = policy();
+    policy.fec = 0;
+    policy.redundancy = 0;
+    policy.receiver_feedback = true;
+    policy.quality_schedule = false;
+    policy.rate = 400_000_000;
+    policy.group_rates = [policy.rate; MAX_PATHS];
+    let metrics = stats::Metrics::new("client");
+    let scope = metrics.scope("stats-publication-test", stats::FORWARD);
+    metrics.register(
+        "stats-publication-test",
+        0,
+        0,
+        stats::FORWARD,
+        &pair.outgoing,
+    );
+    let (tx, rx) = mpsc::channel(QUEUE);
+    let (stop, stopped) = watch::channel(false);
+    tokio::time::pause();
+    QUALITY_STATS_PUBLICATIONS.with(|count| count.set(0));
+    let task = tokio::spawn(sender(rx, paths, policy, stopped, scope, None));
+    tokio::task::yield_now().await;
+    // Drive only setup timer-wheel readiness; the measured Input batch stays frozen.
+    tokio::time::advance(Duration::from_millis(1)).await;
+    for _ in 0..256 {
+        tokio::task::yield_now().await;
+        if QUALITY_STATS_PUBLICATIONS.with(|count| count.get()) > 0 {
+            break;
+        }
+    }
+    let initial = QUALITY_STATS_PUBLICATIONS.with(|count| count.get());
+    assert!(initial > 0, "setup tick must publish before the batch");
+    let frozen_time = tokio::time::Instant::now();
+    for id in 0..100 {
+        tx.try_send(QueuedRecord {
+            record: record(id),
+            created: Instant::now(),
+        })
+        .unwrap();
+    }
+    let mut consumed = 0;
+    for _ in 0..2048 {
+        tokio::task::yield_now().await;
+        metrics.state(|s| {
+            consumed = s.sessions["stats-publication-test"][stats::FORWARD]
+                .records
+                .sender_input_consumed;
+        });
+        if consumed == 100 {
+            break;
+        }
+    }
+    assert_eq!(consumed, 100, "the actual actor consumed every input");
+    assert_eq!(tokio::time::Instant::now(), frozen_time);
+    let after_inputs = QUALITY_STATS_PUBLICATIONS.with(|count| count.get());
+    eprintln!("initial_publications={initial} after_100_inputs={after_inputs}");
+    assert_eq!(
+        after_inputs, initial,
+        "input/readiness must not publish stats"
+    );
+    // A pending update must still appear in final stats even without another Tick.
+    path.quality.lock().unwrap().snapshot.controls_received += 1;
+    stop.send(true).unwrap();
+    task.await.unwrap();
+    assert_eq!(
+        QUALITY_STATS_PUBLICATIONS.with(|count| count.get()),
+        initial + 1
+    );
+    let expected = path.quality.lock().unwrap().snapshot.clone();
+    metrics.state(|s| {
+        let actual = s.paths["stats-publication-test/0"]
+            .receiver_feedback
+            .as_ref()
+            .unwrap();
+        assert_eq!(actual.sent_symbols, expected.sent_symbols);
+        assert_eq!(actual.sent_bytes, expected.sent_bytes);
+        assert_eq!(actual.controls_received, expected.controls_received);
+    });
+    tokio::time::resume();
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn sender_actor_drains_multiple_flows_once_and_stops_cleanly() {
     let pair = Pair::connect().await;
     let path = pair.path();
