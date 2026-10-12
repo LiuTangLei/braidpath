@@ -2273,7 +2273,12 @@ impl PathController {
             // can retain actual same-pace accounting without independent data
             // probes. This holds measurements, never growth/capacity credit.
             let business_monitor_hold = self.growth_monitor.as_ref().is_some_and(|monitor| {
-                monitor.first_reply.is_some() && self.last_control_us >= monitor.armed_us
+                self.last_control_us >= monitor.armed_us
+                    && monitor.first_reply.as_ref().is_some_and(|reply| {
+                        monitor
+                            .baseline_probe_rtt_ms
+                            .is_some_and(|baseline| reply.rtt_ms <= baseline + 0.25)
+                    })
             }) && self.admitted_interval_symbols >= 8
                 && positive_young
                 && !observation.transport_blocked
@@ -3914,6 +3919,12 @@ mod tests {
     }
 
     fn busy_business_monitor() -> (PathController, Observation, u64, u64) {
+        busy_business_monitor_with_first_rtt(80.0)
+    }
+
+    fn busy_business_monitor_with_first_rtt(
+        first_rtt_ms: f64,
+    ) -> (PathController, Observation, u64, u64) {
         let mut controller = PathController::new(2_000_000, 20);
         let mut sample = short_observation_022(0, 80.0);
         sample.delivered_bytes = 0;
@@ -3960,7 +3971,10 @@ mod tests {
         controller.probe_admitted(1_350_000);
         sample = wire_admitted_report_060(&mut controller, &sample, 1_400_000);
         sample.probe_sample_id = previous_reply + 1;
-        sample.probe_age_us = Some(70_000);
+        sample.rtt_ms = 0.0;
+        sample.probe_rtt_ms = Some(first_rtt_ms);
+        sample.probe_latest_rtt_ms = Some(first_rtt_ms);
+        sample.probe_age_us = Some(150_000 - (first_rtt_ms * 1000.0).ceil() as u64);
         controller.observe(&sample);
         assert!(controller.probe_service.reference(sample.now_us).is_none());
         let monitor = controller.growth_monitor.as_ref().unwrap();
@@ -3970,7 +3984,6 @@ mod tests {
             controller.last_control.admitted_bytes as f64
                 >= controller.last_control.integrated_allowance_bytes * 0.9
         );
-        assert!(controller.admitted_interval_symbols >= 8);
         (controller, sample, epoch, grown)
     }
 
@@ -3991,6 +4004,24 @@ mod tests {
             controller.rate_bps > grown,
             "the second clear reply does not require a new empty accounting window"
         );
+    }
+
+    #[test]
+    fn a_rising_first_reply_cannot_retain_busy_business_accounting() {
+        let (controller, sample, epoch, grown) = busy_business_monitor_with_first_rtt(80.5);
+        let monitor = controller.growth_monitor.as_ref().unwrap();
+        assert!(
+            monitor.first_reply.as_ref().unwrap().rtt_ms
+                > monitor.baseline_probe_rtt_ms.unwrap() + 0.25
+        );
+        assert_eq!(controller.rate_bps, grown);
+        assert!(monitor.second_reply.is_none());
+        assert!(sample.now_us - epoch < PROBE_US);
+        assert_eq!(
+            controller.last_control_us, sample.now_us,
+            "positive bytes do not establish that a first rising RTT is clear"
+        );
+        assert_eq!(controller.admitted_interval_symbols, 0);
     }
 
     #[test]
