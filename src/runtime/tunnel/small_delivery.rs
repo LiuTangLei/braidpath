@@ -17,46 +17,94 @@ fn delay_estimate(min_rtt_ms: f64, rtt_ms: f64, transit_ms: f64, queued: usize, 
     baseline * 0.5 + network + local
 }
 
-fn estimate(path: &OutPath) -> f64 {
+#[derive(Clone, Copy)]
+struct Quality {
+    loss_rate: f64,
+    weight: i32,
+}
+
+#[derive(Clone, Copy)]
+struct Estimate {
+    id: u8,
+    delay_ms: f64,
+    quality: Option<Quality>,
+}
+
+fn estimate(path: &OutPath) -> Estimate {
     let native = path.conn.stats();
     let rtt_ms = path.conn.rtt().as_secs_f64() * 1000.0;
     let feedback = path.quality.lock().expect("quality lock");
     let received = &feedback.snapshot.sender_estimate;
-    let transit_ms = if received
+    let now_us = super::quality_time(path);
+    let fresh = received
         .updated_us
-        .is_some_and(|at| super::quality_time(path).saturating_sub(at) <= 3_000_000)
-    {
+        .is_some_and(|at| now_us.saturating_sub(at) <= 3_000_000);
+    let transit_ms = if fresh {
         received.delay_variation_ms
     } else {
         0.0
     };
-    delay_estimate(
-        native.path.min_rtt.as_secs_f64() * 1000.0,
-        rtt_ms,
-        transit_ms,
-        path.empty_datagram_space
-            .saturating_sub(path.conn.datagram_send_buffer_space()),
-        native.path.cwnd,
-    )
+    Estimate {
+        id: path.id,
+        delay_ms: delay_estimate(
+            native.path.min_rtt.as_secs_f64() * 1000.0,
+            rtt_ms,
+            transit_ms,
+            path.empty_datagram_space
+                .saturating_sub(path.conn.datagram_send_buffer_space()),
+            native.path.cwnd,
+        ),
+        quality: (fresh && received.expected >= 16).then(|| Quality {
+            loss_rate: received.loss_rate,
+            weight: super::scheduler::weight(received, now_us, rtt_ms),
+        }),
+    }
 }
 
 pub(super) fn mask(paths: &[OutPath], eligible: u8, remaining: Duration, target_ms: u64) -> u8 {
     let estimates: Vec<_> = paths
         .iter()
         .filter(|path| eligible & (1 << path.id) != 0 && path.conn.close_reason().is_none())
-        .map(|path| (path.id, estimate(path)))
+        .map(estimate)
         .collect();
-    let Some(best) = estimates.iter().map(|(_, cost)| *cost).reduce(f64::min) else {
-        return 0;
-    };
     // Small records trade bulk shares for timeliness. Keep diversity among
     // near-equal paths, but never spend more than 20ms (or the smaller remaining
     // admission budget) solely to move a copy onto another path.
     let slack = (target_ms.min(20) as f64).min(remaining.as_secs_f64() * 1000.0);
+    select_mask(&estimates, slack)
+}
+
+fn select_mask(estimates: &[Estimate], slack: f64) -> u8 {
+    let Some(best) = estimates.iter().map(|path| path.delay_ms).reduce(f64::min) else {
+        return 0;
+    };
+    let timely = estimates
+        .iter()
+        .filter(|path| path.delay_ms <= best + slack)
+        .fold(0, |mask, path| mask | (1 << path.id));
+    if timely == 0 {
+        return 0;
+    }
+    // Fresh loss evidence must retain its existing quality preference: a cheap
+    // RTT on a lossy path cannot alone exclude a healthier, higher-weight peer.
+    // Compare every peer with the fixed timing set, never the expanded result.
+    // Unknown anchors and equal loss/weights keep the ordinary timing decision.
     estimates
-        .into_iter()
-        .filter(|(_, cost)| *cost <= best + slack)
-        .fold(0, |mask, (id, _)| mask | (1 << id))
+        .iter()
+        .filter(|path| timely & (1 << path.id) == 0)
+        .filter(|path| {
+            path.quality.is_some_and(|quality| {
+                estimates
+                    .iter()
+                    .filter(|anchor| timely & (1 << anchor.id) != 0)
+                    .all(|anchor| {
+                        anchor.quality.is_some_and(|other| {
+                            quality.loss_rate < other.loss_rate && quality.weight > other.weight
+                        })
+                    })
+            })
+        })
+        .fold(timely, |mask, path| mask | (1 << path.id))
 }
 
 pub(super) fn copy_ready(path: &OutPath, used: u8) -> bool {
@@ -80,5 +128,59 @@ mod tests {
         assert_eq!(delay_estimate(120.0, 122.0, 248.0, 0, 12_000), 308.0);
         assert_eq!(delay_estimate(120.0, 122.0, 1.0, 0, 12_000), 62.0);
         assert_eq!(delay_estimate(120.0, 120.0, 0.0, 1200, 12_000), 72.0);
+    }
+
+    fn path(id: u8, delay_ms: f64, loss_rate: f64, weight: i32) -> Estimate {
+        Estimate {
+            id,
+            delay_ms,
+            quality: Some(Quality { loss_rate, weight }),
+        }
+    }
+
+    #[test]
+    fn small_quality_guard_restores_only_fresh_strictly_better_peers() {
+        let anchor = path(0, 5.0, 0.3, 8);
+        assert_eq!(
+            select_mask(
+                &[
+                    anchor,
+                    path(1, 60.0, 0.0, 15),
+                    path(2, 80.0, 0.0, 8),
+                    path(3, 80.0, 0.3, 15),
+                    path(4, 80.0, 0.4, 16),
+                ],
+                20.0,
+            ),
+            3,
+            "lower loss and higher existing weight are both required"
+        );
+        let mut unknown = path(1, 60.0, 0.0, 15);
+        unknown.quality = None;
+        assert_eq!(select_mask(&[anchor, unknown], 20.0), 1);
+    }
+
+    #[test]
+    fn small_quality_guard_compares_every_original_timing_anchor() {
+        let anchor = path(0, 5.0, 0.3, 8);
+        let healthy = path(2, 60.0, 0.0, 15);
+        let mut second = path(1, 10.0, 0.3, 8);
+        assert_eq!(select_mask(&[anchor, second, healthy], 20.0), 7);
+        second.quality = None;
+        assert_eq!(select_mask(&[anchor, second, healthy], 20.0), 3);
+        second.quality = Some(Quality {
+            loss_rate: 0.0,
+            weight: 8,
+        });
+        assert_eq!(select_mask(&[anchor, second, healthy], 20.0), 3);
+    }
+
+    #[test]
+    fn small_quality_guard_uses_fixed_anchors_independent_of_peer_order() {
+        let anchor = path(0, 5.0, 0.4, 5);
+        let better = path(1, 60.0, 0.2, 10);
+        let intermediate = path(2, 80.0, 0.3, 8);
+        assert_eq!(select_mask(&[anchor, better, intermediate], 20.0), 7);
+        assert_eq!(select_mask(&[intermediate, better, anchor], 20.0), 7);
     }
 }

@@ -384,18 +384,38 @@ async fn adaptive_small_readiness_ignores_fast_peer_without_current_packet_credi
 
 #[tokio::test(flavor = "current_thread")]
 async fn small_sender_avoids_measured_late_path_for_both_symbols() {
+    assert_eq!(
+        small_sender_admissions([0.0, 0.0], [0.0, 500.0]).await,
+        [(1, 1), (0, 0)],
+        "measured late diversity must not override timely delivery"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn small_sender_preserves_fresh_lower_loss_peer_outside_timing_band() {
+    assert_eq!(
+        small_sender_admissions([0.3, 0.0], [0.0, 60.0]).await,
+        [(0, 1), (1, 0)],
+        "a low-ETA path with worse fresh loss must not force both symbols away from the healthier path"
+    );
+}
+
+async fn small_sender_admissions(losses: [f64; 2], delays: [f64; 2]) -> [(u64, u64); 2] {
     let fast = Pair::connect().await;
     let slow = Pair::connect().await;
     let path0 = fast.path();
     let mut path1 = slow.path();
     path1.id = 1;
-    for (path, delay) in [(&path0, 0.0), (&path1, 500.0)] {
+    for (index, path) in [&path0, &path1].into_iter().enumerate() {
+        let received = ((1.0 - losses[index]) * 100.0).round() as u64;
         path.quality.lock().unwrap().snapshot.sender_estimate = quality::Estimate {
             expected: 100,
-            received: 100,
+            received,
+            lost: 100 - received,
+            loss_rate: losses[index],
             updated_us: Some(0),
             delivered_updated_us: Some(0),
-            delay_variation_ms: delay,
+            delay_variation_ms: delays[index],
             ..Default::default()
         };
     }
@@ -441,19 +461,15 @@ async fn small_sender_avoids_measured_late_path_for_both_symbols() {
     .await;
     stop.send(true).unwrap();
     task.await.unwrap();
-    assert!(complete.is_ok(), "a timely same-path copy must remain live");
+    assert!(complete.is_ok(), "both small symbols must remain live");
+    let mut admitted = [(0, 0); 2];
     metrics.state(|s| {
-        assert_eq!(s.paths["small-delivery/0"].quinn_admitted_originals, 1);
-        assert_eq!(
-            s.paths["small-delivery/0"].quinn_admitted_repairs, 1,
-            "measured late diversity must not override timely delivery"
-        );
-        assert_eq!(
-            s.paths["small-delivery/1"].quinn_admitted_originals
-                + s.paths["small-delivery/1"].quinn_admitted_repairs,
-            0
-        );
+        for (id, value) in admitted.iter_mut().enumerate() {
+            let path = &s.paths[&format!("small-delivery/{id}")];
+            *value = (path.quinn_admitted_originals, path.quinn_admitted_repairs);
+        }
     });
+    admitted
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -481,6 +497,98 @@ async fn same_path_small_copy_waits_for_quinn_packetization() {
     let after = pair.outgoing.stats();
     assert_eq!(after.frame_tx.datagram - before.frame_tx.datagram, 2);
     assert!(after.udp_tx.datagrams - before.udp_tx.datagrams >= 2);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn small_quality_guard_requires_fresh_loss_evidence_on_real_paths() {
+    let fast = Pair::connect().await;
+    let slow = Pair::connect().await;
+    let mut path0 = fast.path();
+    let mut path1 = slow.path();
+    path1.id = 1;
+    let remaining = Duration::from_millis(100);
+    for (label, losses, expected, ages, updated, expected_mask) in [
+        (
+            "fresh better peer",
+            [0.3, 0.0],
+            [100, 100],
+            [0, 0],
+            [true, true],
+            3,
+        ),
+        (
+            "equal fresh loss",
+            [0.2, 0.2],
+            [100, 100],
+            [0, 0],
+            [true, true],
+            1,
+        ),
+        (
+            "all bad retain the timing anchor",
+            [1.0, 1.0],
+            [100, 100],
+            [0, 0],
+            [true, true],
+            1,
+        ),
+        (
+            "unknown timing anchor",
+            [0.3, 0.0],
+            [100, 100],
+            [0, 0],
+            [false, true],
+            1,
+        ),
+        (
+            "insufficient anchor evidence",
+            [0.3, 0.0],
+            [15, 100],
+            [0, 0],
+            [true, true],
+            1,
+        ),
+        (
+            "insufficient peer evidence",
+            [0.3, 0.0],
+            [100, 15],
+            [0, 0],
+            [true, true],
+            1,
+        ),
+        (
+            "stale anchor evidence",
+            [0.3, 0.0],
+            [100, 100],
+            [4, 0],
+            [true, true],
+            1,
+        ),
+        (
+            "cold paths remain live",
+            [0.0, 0.0],
+            [0, 0],
+            [0, 0],
+            [false, false],
+            3,
+        ),
+    ] {
+        for (index, path) in [&mut path0, &mut path1].into_iter().enumerate() {
+            path.epoch = Instant::now() - Duration::from_secs(ages[index]);
+            path.quality.lock().unwrap().snapshot.sender_estimate = quality::Estimate {
+                expected: expected[index],
+                loss_rate: losses[index],
+                updated_us: updated[index].then_some(0),
+                delay_variation_ms: if index == 0 { 0.0 } else { 60.0 },
+                ..Default::default()
+            };
+        }
+        assert_eq!(
+            small_delivery::mask(&[path0.clone(), path1.clone()], 3, remaining, 100),
+            expected_mask,
+            "{label}"
+        );
+    }
 }
 
 #[tokio::test(flavor = "current_thread")]
