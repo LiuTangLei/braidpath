@@ -92,6 +92,14 @@ Follow the [runtime guide](docs/runtime.md) for credentials, local forwarding, m
 
 XOR cannot generally recover an entire failed path. Sparse traffic may exhaust the repair budget; FEC does not guarantee delivery. `--fec 4`, `--block-ms 3` and the 30% repair budget are unchanged; the new mechanisms do not establish a new FEC default. Multiple connections can compete unfairly at a shared bottleneck even with explicit group caps. Multi-interface capacity, competition fairness, independent HTTP/3 interoperability and deployment reachability remain separate acceptance gates.
 
+An experimental `--fec 0 --redundancy-percent 0 --small-fec-bytes 128` gives each
+successfully admitted record with at most 128 application bytes one immediate
+XOR repair, preferring another path. Bulk remains uncoded. The copy retains the
+original ingress deadline and consumes the aggregate and group budgets; loss of
+both transmissions remains unrecoverable. The threshold defaults to zero and
+must be acknowledged by both endpoints. This does not establish a performance
+or deadline guarantee.
+
 ## Inspiration
 
 We draw inspiration from [Aggligator](https://github.com/remoc-rs/aggligator), especially its link abstraction, dynamic link lifecycle, and observability. BraidPath implements its own aggregation and recovery core.

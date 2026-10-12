@@ -144,6 +144,9 @@ struct PolicyArgs {
     receiver_feedback: bool,
     #[arg(long, default_value_t = 4)]
     fec: u8,
+    /// Immediate single-record XOR repair cutoff; requires FEC0 and redundancy-percent0. Zero disables it.
+    #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u16).range(0..=1000))]
+    small_fec_bytes: u16,
     #[arg(long, default_value_t = 30)]
     redundancy_percent: u8,
     #[arg(long, default_value_t = 10_000_000)]
@@ -226,6 +229,7 @@ pub async fn run() -> Result<()> {
                     latency_target_ms: policy.latency_target_ms,
                     group_rates,
                     fec: policy.fec,
+                    small_fec_bytes: policy.small_fec_bytes,
                     receiver_feedback: policy.receiver_feedback
                         || policy.quality_schedule
                         || policy.adaptive,
@@ -333,6 +337,66 @@ mod tests {
         }
         for size in ["0", "1199", "76801", "4294967296"] {
             assert!(parse_size(&["--datagram-send-buffer-bytes", size]).is_err());
+        }
+    }
+
+    #[test]
+    fn small_fec_bytes_explicit_flag_keeps_bulk_fec_zero() {
+        let cli = Cli::try_parse_from([
+            "braidpath",
+            "client",
+            "--entrance",
+            "127.0.0.1:4433",
+            "--server-name",
+            "localhost",
+            "--ca",
+            "cert.pem",
+            "--token-file",
+            "token",
+            "--fec",
+            "0",
+            "--small-fec-bytes",
+            "128",
+        ])
+        .expect("bounded small-record repair flag should parse");
+        match cli.command {
+            Command::Client { policy, .. } => {
+                assert_eq!(policy.fec, 0);
+                assert_eq!(policy.small_fec_bytes, 128);
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn small_fec_bytes_defaults_off_and_rejects_out_of_range_thresholds() {
+        let arguments = [
+            "braidpath",
+            "client",
+            "--entrance",
+            "127.0.0.1:4433",
+            "--server-name",
+            "localhost",
+            "--ca",
+            "cert.pem",
+            "--token-file",
+            "token",
+        ];
+        let parse_threshold = |extra: &[&str]| {
+            Cli::try_parse_from(arguments.iter().chain(extra)).map(|cli| match cli.command {
+                Command::Client { policy, .. } => policy.small_fec_bytes,
+                _ => unreachable!(),
+            })
+        };
+        assert_eq!(parse_threshold(&[]).unwrap(), 0);
+        for threshold in ["0", "1", "128", "1000"] {
+            assert_eq!(
+                parse_threshold(&["--small-fec-bytes", threshold]).unwrap(),
+                threshold.parse::<u16>().unwrap()
+            );
+        }
+        for threshold in ["-1", "1001", "65535", "65536"] {
+            assert!(parse_threshold(&["--small-fec-bytes", threshold]).is_err());
         }
     }
 

@@ -99,6 +99,10 @@ fn quality_scheduler_retains_bidirectional_integrity() {
     three_paths(2);
 }
 #[test]
+fn small_record_fec_negotiates_and_sends_bounded_repairs_in_both_directions() {
+    three_paths(4);
+}
+#[test]
 fn persistent_bad_path_rejoins_with_new_udp_port() {
     three_paths(3);
 }
@@ -255,6 +259,14 @@ fn three_paths(mode: u8) {
     if mode == 3 {
         client_args.push("--rotate-source-port".into());
     }
+    if mode == 4 {
+        client_args.extend(args(&["--fec", "0", "--small-fec-bytes", "128"]));
+        let index = client_args
+            .iter()
+            .position(|arg| arg == "--redundancy-percent")
+            .unwrap();
+        client_args[index + 1] = "0".into();
+    }
     let mut client = launch(&client_args, dir.path(), "client");
     ready(&mut client, "UDP client ready");
     let logs = fs::read_to_string(&client.log).unwrap();
@@ -267,7 +279,7 @@ fn three_paths(mode: u8) {
             "--count",
             if mode == 3 { "1200" } else { "200" },
             "--size",
-            "700",
+            if mode == 4 { "128" } else { "700" },
             "--pps",
             "200",
             "--deadline-ms",
@@ -301,6 +313,15 @@ fn three_paths(mode: u8) {
                     .unwrap();
                 let paths = snapshot["stats"]["paths"].as_object().unwrap();
                 paths.len() == 3
+                    && (mode != 4
+                        || snapshot["stats"]["directions"][if file == &&client_stats {
+                            "client_to_server"
+                        } else {
+                            "server_to_client"
+                        }]["symbols"]["repairs_quinn_admitted"]
+                            .as_u64()
+                            .unwrap_or(0)
+                            > 0)
                     && paths.values().all(|p| {
                         p["receiver_feedback"]["sender_estimate"]["expected"]
                             .as_u64()

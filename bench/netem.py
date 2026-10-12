@@ -391,7 +391,9 @@ class Testbed:
             "--rate-bps", "400000000", "--queue-ms", "100", "--latency-target-ms", "100",
             "--receiver-feedback", *stats("client")]
         client_args += client_path_arguments(args)
-        if args.mode == "adaptive":
+        if args.mode == "quality":
+            client_args += ["--quality-schedule"]
+        elif args.mode == "adaptive":
             client_args += ["--adaptive", "--capacity-probe-bps", "20000000", "--probe-guided-recovery"]
         if args.datagram_buffer_bytes is not None:
             client_args += ["--datagram-send-buffer-bytes", str(args.datagram_buffer_bytes)]
@@ -514,7 +516,7 @@ def main():
     parser.add_argument("--rtt-ms", type=float, nargs=4, default=[30, 45, 60, 80])
     parser.add_argument("--rate-mbps", type=float, default=100)
     parser.add_argument("--queue-packets", type=int, default=1024)
-    parser.add_argument("--mode", choices=["fixed", "adaptive"], default="fixed")
+    parser.add_argument("--mode", choices=["fixed", "quality", "adaptive"], default="fixed")
     parser.add_argument("--topology", choices=["independent", "shared"], default="independent")
     parser.add_argument("--shared-rate-mbps", type=float, default=400)
     parser.add_argument("--datagram-buffer-bytes", type=int)

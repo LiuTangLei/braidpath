@@ -134,6 +134,7 @@ fn policy() -> Policy {
         receiver_feedback: true,
         quality_schedule: true,
         fec: 2,
+        small_fec_bytes: 0,
         redundancy: 100,
         rate: 10_000_000,
         block_ms: 25,
@@ -222,6 +223,21 @@ impl Accounting {
     }
 
     fn commit(&mut self, prepared: &PreparedSend, at: Instant, next_cursor: usize) {
+        self.commit_on_paths(
+            prepared,
+            at,
+            next_cursor,
+            std::slice::from_ref(&prepared.path),
+        );
+    }
+
+    fn commit_on_paths(
+        &mut self,
+        prepared: &PreparedSend,
+        at: Instant,
+        next_cursor: usize,
+        paths: &[OutPath],
+    ) {
         SendAccounting {
             policy: &self.policy,
             metrics: &self.scope,
@@ -233,7 +249,7 @@ impl Accounting {
             pacer: &mut self.pacer,
             groups: &mut self.groups,
             business: &mut self.business,
-            paths: std::slice::from_ref(&prepared.path),
+            paths,
             cursor: &mut self.cursor,
             repair_turn: &mut self.repair_turn,
             epoch: self.epoch,
@@ -270,6 +286,262 @@ impl Accounting {
         assert!(self.groups[usize::from(path.group)].available(9600));
         assert_eq!(path.quality.lock().unwrap().snapshot.sent_symbols, 0);
     }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn quality_only_bulk_unready_path_cannot_steal_later_small_requests() {
+    let fast = Pair::connect().await;
+    let blocked = Pair::connect().await;
+    let path0 = fast.path();
+    let mut path1 = blocked.path();
+    path1.id = 1;
+    let paths = [path0.clone(), path1.clone()];
+    let mut accounting = Accounting::new();
+    let created = Instant::now();
+    accounting.enqueue(wire::plain(&record(1)).unwrap(), created);
+    let mut prepared = accounting.prepare(&path0, false);
+    prepared.candidates = vec![(0, 4), (1, 1)];
+    // No await between filling Quinn and committing: the current-thread driver
+    // cannot drain either buffer. Path 1 can accept a small symbol but no bulk.
+    blocked
+        .outgoing
+        .send_datagram(Bytes::from(vec![0xa5; 900]))
+        .unwrap();
+    let small_bytes = 183;
+    assert!(path1.conn.datagram_send_buffer_space() >= small_bytes);
+    assert!(path1.conn.datagram_send_buffer_space() < prepared.data.len());
+    let at = send_datagram_before_deadline(
+        &path0.conn,
+        prepared.data.clone(),
+        created,
+        Duration::from_secs(1),
+    )
+    .unwrap()
+    .unwrap();
+    assert!(path0.conn.datagram_send_buffer_space() < prepared.data.len());
+    accounting.commit_on_paths(&prepared, at, 1, &paths);
+    // The actual admitted path still pays its share after filling its buffer;
+    // the blocked peer must not acquire phantom bulk debt against small work.
+    assert_eq!(
+        accounting
+            .scheduler
+            .order(&prepared.candidates, small_bytes)[0],
+        0
+    );
+    assert_eq!(accounting.direction().symbols.originals_quinn_admitted, 1);
+    assert!(accounting.queue.is_empty());
+    assert_eq!(fast.receive().await, prepared.data);
+}
+
+#[test]
+fn small_record_fec_is_immediate_independent_of_bulk_and_keeps_ingress_deadline() {
+    let created = Instant::now();
+    let mut accounting = Accounting::new();
+    accounting.policy.fec = 0;
+    accounting.policy.small_fec_bytes = 128;
+    accounting.policy.redundancy = 0;
+    let mut encoder = Encoder::new(1, Duration::from_millis(3)).unwrap();
+    let small = Record {
+        flow: 2,
+        id: 1,
+        payload: vec![7; 128],
+    };
+    let symbols = encode_record(&small, &mut encoder, &accounting.policy, created).unwrap();
+    assert_eq!(
+        symbols.len(),
+        2,
+        "a small request needs its own immediate repair"
+    );
+    for symbol in symbols {
+        accounting.enqueue(symbol, created);
+    }
+    let bulk = record(2);
+    let bulk_symbols = encode_record(&bulk, &mut encoder, &accounting.policy, created).unwrap();
+    assert_eq!(
+        bulk_symbols,
+        vec![wire::plain(&bulk).unwrap()],
+        "bulk must remain FEC0"
+    );
+    accounting.enqueue(bulk_symbols[0].clone(), created);
+    let original = accounting.queue.pop(false).unwrap();
+    let repair = accounting.queue.front(true).unwrap();
+    assert_eq!(repair.block, original.block);
+    assert!(
+        !accounting.queue.block_pending(repair.block.unwrap()),
+        "unrelated bulk must not hold small repair"
+    );
+    assert_eq!(repair.created, created);
+    assert!(
+        !accounting.budget.can_repair(repair.data.len()),
+        "generation must not mint repair credit"
+    );
+    let expired = accounting.queue.expire(
+        created + Duration::from_millis(100),
+        Duration::from_millis(100),
+    );
+    assert_eq!(expired.len(), 2);
+    assert!(accounting.queue.is_empty());
+}
+
+#[test]
+fn independent_small_fec_erasure_grid_recovers_once_within_original_window() {
+    let created = Instant::now();
+    let mut policy = policy();
+    policy.fec = 0;
+    policy.small_fec_bytes = 128;
+    let mut encoder = Encoder::new(1, Duration::from_millis(3)).unwrap();
+    let record = Record {
+        flow: 2,
+        id: 1,
+        payload: vec![9; 128],
+    };
+    let symbols = encode_record(&record, &mut encoder, &policy, created).unwrap();
+    assert_eq!(symbols.len(), 2);
+    // Exact 5x5 erasure grid: each transmission is erased in one of five
+    // positions, independently. This proves codec behavior, not WAN delivery.
+    let mut delivered = 0;
+    for original_draw in 0..5 {
+        for repair_draw in 0..5 {
+            let mut receiver = Receiver::with_repair_wait(Duration::from_millis(100));
+            let mut records = Vec::new();
+            if repair_draw != 0 {
+                records.extend(
+                    receiver
+                        .receive(&symbols[1], created + Duration::from_millis(60))
+                        .unwrap(),
+                );
+            }
+            if original_draw != 0 {
+                records.extend(
+                    receiver
+                        .receive(&symbols[0], created + Duration::from_millis(61))
+                        .unwrap(),
+                );
+            }
+            assert!(
+                records.len() <= 1,
+                "repair-first/late original must be deduplicated"
+            );
+            if !records.is_empty() {
+                assert_eq!(records[0], record);
+                delivered += 1;
+            }
+        }
+    }
+    assert_eq!(delivered, 24, "both-erased is the only unrecoverable pair");
+}
+
+#[test]
+fn small_fec_policy_rejects_mixed_repair_or_capacity_probe_budgets() {
+    let mut policy = policy();
+    policy.small_fec_bytes = 128;
+    assert!(policy.validate().is_err());
+    policy.fec = 0;
+    assert!(policy.validate().is_err());
+    policy.redundancy = 0;
+    assert!(policy.validate().is_ok());
+    policy.small_fec_bytes = 1001;
+    assert!(policy.validate().is_err());
+    policy.small_fec_bytes = 128;
+    policy.adaptive = true;
+    policy.capacity_probe_bps = 64_000;
+    assert!(policy.validate().is_err());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn cold_small_copy_is_authorized_only_by_its_actual_original_admission() {
+    let pair = Pair::connect().await;
+    let path = pair.path();
+    let mut accounting = Accounting::new();
+    accounting.policy.fec = 0;
+    accounting.policy.small_fec_bytes = 128;
+    accounting.policy.redundancy = 0;
+    accounting.budget = outbound::RepairBudget::new(0);
+    let created = Instant::now();
+    let small = Record {
+        flow: 2,
+        id: 1,
+        payload: vec![7; 128],
+    };
+    let mut encoder = Encoder::new(1, Duration::from_millis(3)).unwrap();
+    for symbol in encode_record(&small, &mut encoder, &accounting.policy, created).unwrap() {
+        accounting.enqueue(symbol, created);
+    }
+    let repair = accounting.prepare(&path, true);
+    assert!(!repair_allowed(
+        &accounting.policy,
+        &accounting.budget,
+        &accounting.blocks,
+        &repair.front,
+        repair.data.len()
+    ));
+    let original = accounting.prepare(&path, false);
+    let at = send_datagram_before_deadline(
+        &path.conn,
+        original.data.clone(),
+        created,
+        Duration::from_secs(1),
+    )
+    .unwrap()
+    .unwrap();
+    accounting.commit(&original, at, 0);
+    assert!(
+        repair_allowed(
+            &accounting.policy,
+            &accounting.budget,
+            &accounting.blocks,
+            &repair.front,
+            repair.data.len()
+        ),
+        "one small copy must not wait for unrelated bulk credit"
+    );
+    assert!(
+        !accounting.budget.can_repair(repair.data.len()),
+        "the percentage budget remains empty"
+    );
+    assert_eq!(pair.receive().await, original.data);
+    let shared = Arc::new(Mutex::new(vec![path.clone()]));
+    let mut wait = WaitingSend::new(accounting.prepare(&path, true));
+    block_and_poll(&pair, &mut wait, &shared, Duration::from_secs(1));
+    assert_eq!(pair.receive().await.as_ref(), FILLER);
+    let ready = timeout(
+        Duration::from_secs(1),
+        poll_fn(|cx| {
+            wait.poll(cx, &shared, Duration::from_secs(1), |attempt, _, _| {
+                repair_allowed(
+                    &accounting.policy,
+                    &accounting.budget,
+                    &accounting.blocks,
+                    &attempt.front,
+                    attempt.data.len(),
+                ) && accounting.pacer.available(attempt.data.len() + 80)
+                    && accounting.groups[2].available(attempt.data.len() + 80)
+            })
+        }),
+    )
+    .await
+    .unwrap();
+    let SendReadiness::Admitted { at, .. } = ready else {
+        panic!("{ready:?}")
+    };
+    let repair = wait.cancel();
+    accounting.commit(&repair, at, 0);
+    assert!(
+        !repair_allowed(
+            &accounting.policy,
+            &accounting.budget,
+            &accounting.blocks,
+            &repair.front,
+            repair.data.len()
+        ),
+        "successful copy consumes its one-original authorization"
+    );
+    assert_eq!(accounting.direction().symbols.repairs_quinn_admitted, 1);
+    assert_eq!(pair.receive().await, repair.data);
+    let spent = original.data.len() + repair.data.len() + 160;
+    assert!(accounting.pacer.available(9600 - spent));
+    assert!(!accounting.pacer.available(9601 - spent));
+    assert!(!accounting.groups[2].available(9601 - spent));
 }
 
 #[tokio::test(flavor = "current_thread")]

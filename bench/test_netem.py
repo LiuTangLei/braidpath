@@ -42,6 +42,48 @@ class DeliveryAccounting(unittest.TestCase):
             summarize(population, source, 100)
 
 
+class SenderModeFlags(unittest.TestCase):
+    def prepared_client_arguments(self, mode):
+        class ClientPrepared(Exception):
+            pass
+        with tempfile.TemporaryDirectory() as directory:
+            bed = Testbed(Path(directory))
+            captured = {}
+            bed.command = lambda argv: None
+            def spawn(namespace, role, argv):
+                captured[role] = argv
+                return SimpleNamespace(pid=123), 1000
+            def ready(process, started, role, *args):
+                if role == "client":
+                    raise ClientPrepared()
+            bed.spawn, bed.runtime_ready = spawn, ready
+            args = SimpleNamespace(binary="/candidate/braidpath", mode=mode, datagram_buffer_bytes=None)
+            with self.assertRaises(ClientPrepared):
+                bed.run(args)
+            return captured["client"]
+
+    def test_quality_mode_only_enables_quality_schedule_with_receiver_feedback(self):
+        args = self.prepared_client_arguments("quality")
+        self.assertIn("--quality-schedule", args)
+        self.assertIn("--receiver-feedback", args)
+        self.assertEqual(args[args.index("--fec") + 1], "0")
+        self.assertEqual(args[args.index("--rate-bps") + 1], "400000000")
+        self.assertTrue(all(flag not in args for flag in
+            ["--adaptive", "--capacity-probe-bps", "--probe-guided-recovery"]))
+
+    def test_fixed_and_adaptive_modes_keep_their_existing_flags(self):
+        fixed = self.prepared_client_arguments("fixed")
+        adaptive = self.prepared_client_arguments("adaptive")
+        self.assertTrue(all(flag not in fixed for flag in
+            ["--quality-schedule", "--adaptive", "--capacity-probe-bps", "--probe-guided-recovery"]))
+        self.assertNotIn("--quality-schedule", adaptive)
+        self.assertIn("--adaptive", adaptive)
+        self.assertIn("--probe-guided-recovery", adaptive)
+        self.assertEqual(adaptive[adaptive.index("--capacity-probe-bps") + 1], "20000000")
+        self.assertIn("--receiver-feedback", fixed)
+        self.assertIn("--receiver-feedback", adaptive)
+
+
 class NetworkAndCounters(unittest.TestCase):
     def test_unavailable_resource_diagnostics_do_not_block_network_or_business_gate(self):
         with tempfile.TemporaryDirectory() as directory:

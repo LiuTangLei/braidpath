@@ -47,6 +47,7 @@ pub struct Policy {
     pub receiver_feedback: bool,
     pub quality_schedule: bool,
     pub fec: u8,
+    pub small_fec_bytes: u16,
     pub redundancy: u8,
     pub rate: u64,
     pub block_ms: u64,
@@ -96,6 +97,12 @@ impl Policy {
         ensure!(
             self.fec <= 32 && self.redundancy <= 100,
             "invalid FEC configuration"
+        );
+        ensure!(
+            usize::from(self.small_fec_bytes) <= MAX_PAYLOAD
+                && (self.small_fec_bytes == 0
+                    || (self.fec == 0 && self.capacity_probe_bps == 0 && self.redundancy == 0)),
+            "small-record FEC requires FEC0, redundancy-percent 0, no capacity probes, and a threshold at most 1000 bytes"
         );
         ensure!(
             (64_000..=1_000_000_000).contains(&self.rate),
@@ -380,6 +387,26 @@ fn enqueue_symbol(
     }
 }
 
+fn encode_record(
+    record: &Record,
+    encoder: &mut Encoder,
+    policy: &Policy,
+    now: Instant,
+) -> Result<Vec<Bytes>> {
+    if policy.fec == 0
+        && (policy.small_fec_bytes == 0
+            || record.payload.len() > usize::from(policy.small_fec_bytes))
+    {
+        Ok(vec![wire::plain(record)?])
+    } else {
+        Ok(encoder
+            .push(&record.encode()?, now)?
+            .into_iter()
+            .map(wire::shard)
+            .collect())
+    }
+}
+
 fn account_expired(pending: &outbound::Pending, now: Instant, metrics: &Scope) {
     metrics.update(|d| {
         if let Some(id) = pending.record_id {
@@ -392,6 +419,25 @@ fn account_expired(pending: &outbound::Pending, now: Instant, metrics: &Scope) {
             .expiry_wait
             .add(now.saturating_duration_since(pending.created));
     });
+}
+
+fn repair_allowed(
+    policy: &Policy,
+    budget: &outbound::RepairBudget,
+    blocks: &BTreeMap<u64, BlockSend>,
+    pending: &outbound::Pending,
+    frame_bytes: usize,
+) -> bool {
+    if policy.small_fec_bytes > 0 {
+        // Independent k=1 blocks create exactly one queued copy. Its original
+        // must have actually entered Quinn; expiry/generation grants no credit.
+        pending
+            .block
+            .and_then(|block| blocks.get(&block))
+            .is_some_and(|meta| meta.paths != 0)
+    } else {
+        budget.can_repair(frame_bytes)
+    }
 }
 
 /// This item remains at the application queue head until Quinn accepts it. The
@@ -584,6 +630,33 @@ fn business_ready_candidates(
     })
 }
 
+fn transport_ready_candidates(
+    candidates: &[(u8, i32)],
+    paths: &[OutPath],
+    measured_payload_bytes: usize,
+    admitted: u8,
+) -> Vec<(u8, i32)> {
+    scheduler::ready_candidates(candidates, |id| {
+        // Admission itself may have filled this path's buffer. It still pays.
+        if id == admitted {
+            return true;
+        }
+        let Some(path) = paths.iter().find(|path| path.id == id) else {
+            return false;
+        };
+        let Ok(mapping_bytes) = wire::http_datagram_overhead(path.stream) else {
+            return false;
+        };
+        let bytes = measured_payload_bytes + mapping_bytes;
+        path.conn.close_reason().is_none()
+            && path
+                .conn
+                .max_datagram_size()
+                .is_some_and(|max| bytes <= max)
+            && path.conn.datagram_send_buffer_space() >= bytes
+    })
+}
+
 /// The immediate path and the readiness path share the exact same successful
 /// admission transaction. Pending, cancellation and expiry never call this.
 struct SendAccounting<'a> {
@@ -626,22 +699,32 @@ impl SendAccounting<'_> {
             .as_micros()
             .min(u128::from(u64::MAX)) as u64;
         // Recheck at actual admission, including Quinn's readiness-wait path.
-        let ready_candidates = self.policy.adaptive.then(|| {
-            business_ready_candidates(
+        let measured_payload_bytes = front.data.len()
+            + if self.policy.receiver_feedback {
+                quality::HEADER
+            } else {
+                0
+            };
+        let ready_candidates = if self.policy.adaptive {
+            Some(business_ready_candidates(
                 candidates,
                 self.paths,
                 self.controllers,
                 now_us,
-                front.data.len()
-                    + if self.policy.receiver_feedback {
-                        quality::HEADER
-                    } else {
-                        0
-                    },
+                measured_payload_bytes,
                 at.saturating_duration_since(front.created).as_secs_f64() * 1000.0,
                 Some(path.id),
-            )
-        });
+            ))
+        } else if self.policy.quality_schedule {
+            Some(transport_ready_candidates(
+                candidates,
+                self.paths,
+                measured_payload_bytes,
+                path.id,
+            ))
+        } else {
+            None
+        };
         self.pacer.spend(cost);
         self.groups[usize::from(path.group)].spend(cost);
         if let Some(business) = self.business.as_mut() {
@@ -665,7 +748,9 @@ impl SendAccounting<'_> {
                 .admitted(sent.data.len());
         }
         if repair {
-            self.budget.repair_admitted(frame_bytes);
+            if self.policy.small_fec_bytes == 0 {
+                self.budget.repair_admitted(frame_bytes);
+            }
             self.metrics
                 .path(path.id, |p| p.quinn_admitted_repairs += 1);
             if used & (1 << path.id) != 0 {
@@ -787,7 +872,7 @@ async fn sender(
                     if !pacer.available(cost + attempt.feedback_reserve)
                         || !groups[usize::from(attempt.path.group)]
                             .available(cost + attempt.group_reserve)
-                        || (attempt.repair && !budget.can_repair(attempt.data.len()))
+                        || (attempt.repair && !repair_allowed(&policy, &budget, &blocks, &attempt.front, attempt.data.len()))
                     {
                         return false;
                     }
@@ -878,30 +963,13 @@ async fn sender(
                     });
                     continue;
                 }
-                if policy.fec == 0 {
-                    match wire::plain(&record) {
-                        Ok(data) => {
-                            enqueue_symbol(data, created, &mut queue, &mut blocks, &metrics)
+                match encode_record(&record, &mut encoder, &policy, Instant::now()) {
+                    Ok(symbols) => {
+                        for symbol in symbols {
+                            enqueue_symbol(symbol, created, &mut queue, &mut blocks, &metrics);
                         }
-                        Err(_) => metrics.update(|d| d.records.encoding_dropped += 1),
                     }
-                } else if let Ok(data) = record.encode() {
-                    match encoder.push(&data, Instant::now()) {
-                        Ok(shards) => {
-                            for shard in shards {
-                                enqueue_symbol(
-                                    wire::shard(shard),
-                                    created,
-                                    &mut queue,
-                                    &mut blocks,
-                                    &metrics,
-                                );
-                            }
-                        }
-                        Err(_) => metrics.update(|d| d.records.encoding_dropped += 1),
-                    }
-                } else {
-                    metrics.update(|d| d.records.encoding_dropped += 1);
+                    Err(_) => metrics.update(|d| d.records.encoding_dropped += 1),
                 }
             }
         }
@@ -1311,7 +1379,11 @@ async fn sender(
             let now_us = epoch.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
             let repair_ready = queue.front(true).is_some_and(|p| {
                 !p.block.is_some_and(|b| queue.block_pending(b))
-                    && budget.can_repair(
+                    && repair_allowed(
+                        &policy,
+                        &budget,
+                        &blocks,
+                        p,
                         p.data.len()
                             + if policy.receiver_feedback {
                                 quality::HEADER + 2
@@ -1451,7 +1523,7 @@ async fn sender(
                 {
                     continue;
                 }
-                if repair && !budget.can_repair(frame_bytes) {
+                if repair && !repair_allowed(&policy, &budget, &blocks, &front, frame_bytes) {
                     continue;
                 }
                 if policy.adaptive {
@@ -2012,7 +2084,8 @@ async fn server_connection(
                     let guided=req.headers().get("braidpath-probe-guided-recovery").map(|v|v.to_str()).transpose()?;
                     ensure!(guided.is_none() || guided==Some("1"),"invalid probe-guided recovery header");
                     let probe_guided_recovery=guided.is_some();
-                    let policy=Policy{probe_guided_recovery,capacity_probe_bps,adaptive:quality_schedule==Some("adaptive"),latency_target_ms,group_rates,quality_schedule:quality_schedule.is_some(),receiver_feedback:feedback.is_some(),fec:header("braidpath-fec")?.parse()?,redundancy:header("braidpath-redundancy")?.parse()?,rate,block_ms:header("braidpath-block-ms")?.parse()?,queue_ms:header("braidpath-queue-ms")?.parse()?};policy.validate()?;
+                    let small_fec_bytes=req.headers().get("braidpath-small-fec-bytes").map(|v|v.to_str()).transpose()?.unwrap_or("0").parse::<u16>()?;
+                    let policy=Policy{small_fec_bytes,probe_guided_recovery,capacity_probe_bps,adaptive:quality_schedule==Some("adaptive"),latency_target_ms,group_rates,quality_schedule:quality_schedule.is_some(),receiver_feedback:feedback.is_some(),fec:header("braidpath-fec")?.parse()?,redundancy:header("braidpath-redundancy")?.parse()?,rate,block_ms:header("braidpath-block-ms")?.parse()?,queue_ms:header("braidpath-queue-ms")?.parse()?};policy.validate()?;
                     let rejoin=req.headers().get("braidpath-rejoin").is_some_and(|v|v=="1");
                     let stream_id=stream.id().into_inner();
                     // Membership and idle expiry share one map -> paths -> generation lock order.
@@ -2060,6 +2133,7 @@ async fn server_connection(
                     metrics.register(&sid,pid,stream_id,stats::RETURN,&conn);
                     joined=Some((sid,session,pid,stream_id));
                     let mut response=Response::builder().status(200).header("braidpath-version","1").header("braidpath-max-payload",MAX_PAYLOAD);if feedback.is_some(){response=response.header("braidpath-feedback","2");}
+                    if small_fec_bytes>0 {response=response.header("braidpath-small-fec-bytes",small_fec_bytes);}
                     if capacity_probe_bps>0 {response=response.header("braidpath-capacity-probe-bps",capacity_probe_bps).header("braidpath-capacity-probe-format",capacity_probe::FORMAT);}
                     if probe_guided_recovery {response=response.header("braidpath-probe-guided-recovery","1");}
                     if let Some(scheduler)=quality_schedule {response=response.header("braidpath-scheduler",scheduler);}stream.send_response(response.body(())?).await?;
@@ -2582,6 +2656,9 @@ async fn connect_path(
         .header("braidpath-rate", policy.rate)
         .header("braidpath-block-ms", policy.block_ms)
         .header("braidpath-queue-ms", policy.queue_ms);
+    if policy.small_fec_bytes > 0 {
+        req = req.header("braidpath-small-fec-bytes", policy.small_fec_bytes);
+    }
     if policy.receiver_feedback {
         req = req
             .header("braidpath-feedback", "2")
@@ -2633,6 +2710,16 @@ async fn connect_path(
             .and_then(|v| v.parse::<usize>().ok())
             == Some(MAX_PAYLOAD),
         "payload size mismatch"
+    );
+    ensure!(
+        policy.small_fec_bytes == 0
+            || response
+                .headers()
+                .get("braidpath-small-fec-bytes")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.parse::<u16>().ok())
+                == Some(policy.small_fec_bytes),
+        "small-record FEC not negotiated"
     );
     ensure!(
         !policy.receiver_feedback
