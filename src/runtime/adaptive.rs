@@ -1977,10 +1977,25 @@ impl PathController {
                                 .is_some_and(|age| age <= CONTROL_US)
                                 && sample.span_us >= PROBE_US
                                 && sample.admission.is_some_and(|admission| {
-                                    admission.span_us >= PROBE_US
-                                        && admission.symbols >= 8
+                                    let crosses_brake = admission.started_us < brake
+                                        && admission.span_us >= PROBE_US
+                                        && admission.symbols >= 8;
+                                    // A low packet rate can fill the receiver
+                                    // horizon before eight actual symbols exist.
+                                    // Require possible whole-record coordinates,
+                                    // not a sparse count paired with bulk bytes.
+                                    let collecting_post_brake = admission.started_us >= brake
+                                        && admission.started_us >= last_pace_change
+                                        && admission.symbols < 8
+                                        && u128::from(admission.symbol_bytes)
+                                            <= u128::from(admission.symbols)
+                                                * super::wire::MAX_WIRE as u128
+                                        && admission.bps * self.wire_per_symbol
+                                            >= self.rate_bps as f64 * 0.9
+                                        && activity_since_us
+                                            .is_some_and(|since| since <= admission.started_us);
+                                    (crosses_brake || collecting_post_brake)
                                         && admission.bps > 0.0
-                                        && admission.started_us < brake
                                         && self
                                             .backlog_since_us
                                             .is_some_and(|since| since <= admission.started_us)
@@ -6699,6 +6714,122 @@ mod tests {
             Some(target)
         );
         assert_eq!(controller.rate_bps, target);
+    }
+
+    fn post_brake_symbol_floor_fixture(operational_bps: u64) -> (PathController, Observation) {
+        let brake = 21_142_800;
+        let mut controller = PathController::new(4_000_000, 20);
+        let mut sample = observation(brake, 0.0);
+        sample.report_number = 212;
+        sample.probe_sample_id = 175;
+        sample.probe_latest_rtt_ms = Some(327.4);
+        sample.probe_age_us = Some(13_800);
+        sample.delivered_bytes = 800_000;
+        sample.delivered_bps = Some(574_000.0);
+        sample.delivery_report_time_us = Some(100_000_000);
+        sample.delivery_sample_span_us = 100_000;
+        sample.admitted_symbol_bytes = Some(1_025_000);
+        sample.admitted_symbols = Some(1000);
+        sample.finalized_expected = Some(1000);
+        sample.finalized_lost = Some(0);
+        controller.observe(&sample);
+        controller.rate_bps = operational_bps;
+        controller.min_rtt_ms = Some(80.5);
+        controller.born_us = 0;
+        controller.congestion_seen = true;
+        controller.remembered_bps = 1_000_000.0;
+        controller.last_brake_us = Some(brake);
+        controller.last_growth_us = 18_701_500;
+        controller.draining_bps = Some((440_000.0, brake));
+        controller.drain_restore_pending = true;
+        controller.last_growth_probe = Some(175);
+        for (index, at) in [
+            21_219_000, 21_314_100, 21_375_100, 21_482_800, 21_539_700, 21_634_200,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            if index == 4 {
+                // The captured owner settled its preceding allowance round
+                // here; retain the service endpoint and actual packet clock.
+                controller.refill(21_501_500);
+                controller.last_control_us = 21_501_500;
+                controller.admitted_bytes = 0;
+                controller.admitted_symbol_bytes = 0;
+                controller.allowance_bytes = 0.0;
+            }
+            assert!(controller.allow(at, 1135, 0.0));
+            controller.admitted_symbol(at, 1135, 1025);
+        }
+        sample.now_us = 21_641_200;
+        sample.report_number = 217;
+        sample.delivery_report_time_us = Some(100_500_000);
+        sample.delivered_bytes = 823_728;
+        sample.delivered_bps = Some(328_000.0);
+        sample.admitted_symbol_bytes = Some(1_031_150);
+        sample.admitted_symbols = Some(1006);
+        sample.probe_sample_id = 178;
+        sample.probe_latest_rtt_ms = Some(136.0);
+        sample.probe_age_us = Some(37_100);
+        controller.observe(&sample);
+        let partial = controller.service_window.latest(sample.now_us).unwrap();
+        assert_eq!(partial.admission.unwrap().symbols, 6);
+        assert_eq!(partial.admission.unwrap().span_us, 498_400);
+        controller.probe_admitted(21_684_300);
+        sample.now_us = 21_701_500;
+        sample.positive_delivery_age_us = Some(60_300);
+        sample.probe_sample_id = 179;
+        sample.probe_latest_rtt_ms = Some(80.9);
+        sample.probe_age_us = Some(36_300);
+        (controller, sample)
+    }
+
+    #[test]
+    fn first_partial_recovery_waits_for_post_brake_actual_symbol_floor() {
+        let brake = 21_142_800;
+        let (mut controller, mut sample) = post_brake_symbol_floor_fixture(110_315);
+        controller.observe(&sample);
+        assert_eq!(
+            controller.rate_bps, 110_315,
+            "a small speculative step must not restart this unfinished interval"
+        );
+        assert!(controller.drain_restore_pending);
+        for at in [21_711_700, 21_784_500] {
+            assert!(controller.allow(at, 1135, 0.0));
+            controller.admitted_symbol(at, 1135, 1025);
+        }
+        sample.now_us = 21_841_200;
+        sample.report_number = 219;
+        sample.positive_delivery_age_us = Some(0);
+        sample.delivery_report_time_us = Some(100_700_000);
+        sample.delivered_bytes = 825_778;
+        sample.delivered_bps = Some(82_000.0);
+        sample.admitted_symbol_bytes = Some(1_033_200);
+        sample.admitted_symbols = Some(1008);
+        sample.probe_sample_id = 180;
+        sample.probe_age_us = Some(76_000);
+        controller.observe(&sample);
+        let complete = controller
+            .service_window
+            .discovery_with_counts(sample.now_us, 8, 1)
+            .unwrap();
+        assert_eq!(complete.admission.unwrap().started_us, brake);
+        assert_eq!(complete.admission.unwrap().symbols, 8);
+        assert!(controller.last_control.drain_service_target_bps.is_some());
+        assert!(controller.rate_bps > 200_000);
+        assert_eq!(controller.remembered_bps, 1_000_000.0);
+    }
+
+    #[test]
+    fn post_brake_symbol_floor_does_not_hold_an_underused_allowance() {
+        let (mut controller, sample) = post_brake_symbol_floor_fixture(220_630);
+        let before = controller.rate_bps;
+        let partial = controller.service_window.latest(sample.now_us).unwrap();
+        assert!(partial.admission.unwrap().bps * controller.wire_per_symbol < before as f64 * 0.9);
+        controller.observe(&sample);
+        assert!(controller.rate_bps > before);
+        assert!(controller.rate_bps <= (before as f64 * 1.25) as u64);
+        assert!(controller.last_control.drain_service_target_bps.is_none());
     }
 
     #[test]
