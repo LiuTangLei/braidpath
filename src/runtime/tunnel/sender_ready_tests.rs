@@ -794,3 +794,66 @@ async fn business_only_feedback_does_not_renew_independent_probe_evidence() {
     assert_eq!(before.controls_received, after.controls_received);
     assert_eq!(path.quality.lock().unwrap().snapshot.controls_received, 2);
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn native_sender_records_bbr_startup_budget_and_delivers_the_original() {
+    let pair = Pair::connect().await;
+    let path = pair.path();
+    let paths = Arc::new(Mutex::new(vec![path]));
+    let mut policy = policy();
+    policy.adaptive = true;
+    policy.fec = 0;
+    policy.redundancy = 0;
+    policy.latency_target_ms = 100;
+    let metrics = stats::Metrics::new("client");
+    let scope = metrics.scope("native-startup-test", stats::FORWARD);
+    metrics.register("native-startup-test", 0, 0, stats::FORWARD, &pair.outgoing);
+    let (tx, rx) = mpsc::channel(QUEUE);
+    let (stop, stopped) = watch::channel(false);
+    tx.try_send(QueuedRecord {
+        record: record(1),
+        created: Instant::now(),
+    })
+    .unwrap();
+    let task = tokio::spawn(sender(rx, paths, policy.clone(), stopped, scope, None));
+    let mut quality = quality::State::new(7);
+    let mut decoder = Receiver::default();
+    timeout(Duration::from_secs(3), async {
+        loop {
+            let frame = pair.incoming.read_datagram().await.unwrap();
+            let payload = wire::http_payload(&frame, 0).unwrap();
+            if payload.starts_with(b"BQ1D") {
+                let data = quality.receive(payload, 0).unwrap();
+                assert_eq!(
+                    decoder.receive(data, Instant::now()).unwrap(),
+                    vec![record(1)]
+                );
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    stop.send(true).unwrap();
+    timeout(Duration::from_secs(1), task)
+        .await
+        .unwrap()
+        .unwrap();
+    metrics.state(|s| {
+        let d = &s.sessions["native-startup-test"][stats::FORWARD];
+        assert_eq!(d.symbols.originals_quinn_admitted, 1);
+        let snapshot = s.paths.values().find_map(|p| p.adaptive.as_ref()).unwrap();
+        let seed = snapshot
+            .rate_changes
+            .iter()
+            .find(|change| matches!(change.reason, adaptive::RateReason::NativeStartup))
+            .unwrap();
+        let cwnd = seed.control.native_startup_cwnd_bytes.unwrap();
+        let rtt = seed.control.native_startup_rtt_us.unwrap();
+        assert!(cwnd > 0 && rtt > 0);
+        assert_eq!(
+            seed.pacing_bps,
+            (u128::from(cwnd) * 8_000_000 / u128::from(rtt)).min(u128::from(policy.rate)) as u64
+        );
+    });
+}

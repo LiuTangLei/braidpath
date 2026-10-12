@@ -877,6 +877,7 @@ async fn sender(
                 let snapshot = &q.snapshot;
                 let estimate = &snapshot.sender_estimate;
                 let at = quality_time(path);
+                let native_rtt = path.conn.rtt();
                 let observation = adaptive::Observation {
                     now_us,
                     generation: snapshot.generation,
@@ -901,7 +902,7 @@ async fn sender(
                     loss_sample_rate: (estimate.sample_symbols > 0)
                         .then_some(estimate.sample_loss_rate),
                     loss_rate: estimate.loss_rate,
-                    rtt_ms: path.conn.rtt().as_secs_f64() * 1000.0,
+                    rtt_ms: native_rtt.as_secs_f64() * 1000.0,
                     probe_rtt_ms: snapshot.probe_updated_us.map(|_| snapshot.probe_rtt_ms),
                     probe_latest_rtt_ms: snapshot
                         .probe_updated_us
@@ -919,12 +920,12 @@ async fn sender(
                     .lock()
                     .expect("capacity probe lock")
                     .snapshot(at);
-                if policy.probe_guided_recovery {
-                    controllers[usize::from(path.id)]
-                        .observe_with_delivery_probe(&observation, &probe_snapshot);
-                } else {
-                    controllers[usize::from(path.id)].observe(&observation);
-                }
+                controllers[usize::from(path.id)].observe_native(
+                    &observation,
+                    policy.probe_guided_recovery.then_some(&probe_snapshot),
+                    path.conn.stats().path.cwnd,
+                    native_rtt.as_micros().min(u128::from(u64::MAX)) as u64,
+                );
                 if policy.capacity_probe_bps > 0 {
                     let group_paths = paths
                         .iter()
