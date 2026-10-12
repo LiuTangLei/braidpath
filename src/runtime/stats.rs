@@ -171,6 +171,8 @@ pub struct Quinn {
     pub min_rtt_ms: f64,
     pub smoothed_rtt_ms: f64,
     pub congestion_window_bytes: u64,
+    /// Controller-reported pacing target in bits/s, not observed delivery capacity.
+    pub pacing_rate_bps: Option<u64>,
     /// Payload bytes currently available for another outgoing QUIC datagram.
     /// Quinn reserves its datagram metadata; this is not the configured buffer size.
     pub datagram_send_buffer_space_bytes: u64,
@@ -205,6 +207,7 @@ impl Quinn {
             min_rtt_ms: q.path.min_rtt.as_secs_f64() * 1000.,
             smoothed_rtt_ms: conn.rtt().as_secs_f64() * 1000.,
             congestion_window_bytes: q.path.cwnd,
+            pacing_rate_bps: conn.congestion_state().metrics().pacing_rate,
             datagram_send_buffer_space_bytes: conn.datagram_send_buffer_space() as u64,
             sent_packets: q.path.sent_packets,
             udp_datagrams_tx: q.udp_tx.datagrams,
@@ -934,7 +937,13 @@ mod tests {
         for conn in [&outgoing, &incoming] {
             let sampled = Quinn::sample(conn);
             let native = conn.stats();
+            let native_controller = conn.congestion_state().metrics();
             let serialized = serde_json::to_value(&sampled).unwrap();
+            assert!(native_controller.pacing_rate.is_some());
+            assert_eq!(
+                serialized["pacing_rate_bps"],
+                serde_json::to_value(native_controller.pacing_rate).unwrap()
+            );
             assert_eq!(serialized["udp_io_operations_tx"], native.udp_tx.ios);
             assert_eq!(serialized["udp_io_operations_rx"], native.udp_rx.ios);
             assert_eq!(serialized["udp_datagrams_tx"], native.udp_tx.datagrams);
