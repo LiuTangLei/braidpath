@@ -20,6 +20,8 @@ pub(super) struct Sample {
 #[derive(Clone, Copy, Debug)]
 pub(super) struct Admission {
     pub(super) symbol_bytes: u64,
+    /// Actual native admission cost on the same paired endpoints, if available.
+    pub(super) wire_bytes: Option<u64>,
     pub(super) symbols: u64,
     pub(super) bps: f64,
     pub(super) span_us: u64,
@@ -34,6 +36,7 @@ struct Endpoint {
     observed_us: u64,
     /// Successful symbol bytes and symbols at this local observation.
     admitted: Option<(u64, u64)>,
+    wire_bytes: Option<u64>,
 }
 
 #[derive(Clone, Default)]
@@ -56,7 +59,20 @@ impl Window {
         now_us: u64,
         admitted: Option<(u64, u64)>,
     ) -> bool {
+        self.observe_with_wire(number, receiver_us, bytes, now_us, admitted, None)
+    }
+
+    pub(super) fn observe_with_wire(
+        &mut self,
+        number: u64,
+        receiver_us: Option<u64>,
+        bytes: u64,
+        now_us: u64,
+        admitted: Option<(u64, u64)>,
+        wire_bytes: Option<u64>,
+    ) -> bool {
         let Some(receiver_us) = receiver_us else {
+            self.invalidate_wire();
             return false;
         };
         let mut current = Endpoint {
@@ -65,6 +81,7 @@ impl Window {
             bytes,
             observed_us: now_us,
             admitted,
+            wire_bytes,
         };
         if self.latest.is_some_and(|latest| {
             number <= latest.number
@@ -72,6 +89,9 @@ impl Window {
                 || bytes < latest.bytes
                 || now_us < latest.observed_us
         }) {
+            if self.latest.is_some_and(|latest| number > latest.number) {
+                self.invalidate_wire();
+            }
             return false;
         }
         if current.admitted.is_none_or(|(sent_bytes, sent_symbols)| {
@@ -91,6 +111,21 @@ impl Window {
             for endpoint in &mut self.recent {
                 endpoint.admitted = None;
             }
+        }
+        if current.admitted.is_none()
+            || current.wire_bytes.is_none_or(|wire| {
+                current.admitted.is_none_or(|(symbols, _)| wire < symbols)
+                    || self
+                        .latest
+                        .and_then(|previous| previous.wire_bytes)
+                        .is_some_and(|previous| wire < previous)
+            })
+        {
+            // Missing or regressed native coordinates cannot bridge an old
+            // wire-utilization proof. Receiver-only and legacy backlog service
+            // remain independent of this optional native evidence.
+            current.wire_bytes = None;
+            self.invalidate_wire();
         }
         let gap = self.latest.is_some_and(|latest| {
             receiver_us - latest.receiver_us > FRESH_US || now_us - latest.observed_us > FRESH_US
@@ -122,6 +157,10 @@ impl Window {
                 let symbols = end_symbols.checked_sub(start_symbols)?;
                 Some(Admission {
                     symbol_bytes,
+                    wire_bytes: previous
+                        .wire_bytes
+                        .zip(current.wire_bytes)
+                        .and_then(|(start, end)| end.checked_sub(start)),
                     symbols,
                     bps: symbol_bytes as f64 * 8_000_000.0 / local_span as f64,
                     span_us: local_span,
@@ -136,6 +175,23 @@ impl Window {
             admission,
         });
         true
+    }
+
+    fn invalidate_wire(&mut self) {
+        if let Some(cursor) = &mut self.cursor {
+            cursor.wire_bytes = None;
+        }
+        for endpoint in &mut self.recent {
+            endpoint.wire_bytes = None;
+        }
+        for sample in [&mut self.sample, &mut self.discovery]
+            .into_iter()
+            .flatten()
+        {
+            if let Some(admission) = &mut sample.admission {
+                admission.wire_bytes = None;
+            }
+        }
     }
 
     pub(super) fn latest(&self, now_us: u64) -> Option<Sample> {
@@ -171,6 +227,10 @@ impl Window {
             let admission = previous.admitted.zip(current.admitted).map(
                 |((start_bytes, start_symbols), (end_bytes, end_symbols))| Admission {
                     symbol_bytes: end_bytes - start_bytes,
+                    wire_bytes: previous
+                        .wire_bytes
+                        .zip(current.wire_bytes)
+                        .and_then(|(start, end)| end.checked_sub(start)),
                     symbols: end_symbols - start_symbols,
                     bps: (end_bytes - start_bytes) as f64 * 8_000_000.0 / local_span as f64,
                     span_us: local_span,
@@ -220,6 +280,10 @@ impl Window {
                 observed_us: current.observed_us,
                 admission: Some(Admission {
                     symbol_bytes,
+                    wire_bytes: previous
+                        .wire_bytes
+                        .zip(current.wire_bytes)
+                        .and_then(|(start, end)| end.checked_sub(start)),
                     symbols,
                     bps: symbol_bytes as f64 * 8_000_000.0 / local_span as f64,
                     span_us: local_span,
@@ -239,6 +303,98 @@ impl Window {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_wire_service_does_not_bridge_missing_or_regressed_coordinates() {
+        for invalid in [
+            "missing_wire",
+            "regressed_wire",
+            "missing_symbols",
+            "missing_clock",
+        ] {
+            let mut window = Window::default();
+            window.observe_with_wire(1, Some(1), 0, 0, Some((1000, 1)), Some(1110));
+            window.observe_with_wire(
+                2,
+                Some(500_001),
+                45_000,
+                500_000,
+                Some((51_000, 51)),
+                Some(56_610),
+            );
+            assert_eq!(
+                window
+                    .latest(500_000)
+                    .unwrap()
+                    .admission
+                    .unwrap()
+                    .wire_bytes,
+                Some(55_500)
+            );
+            window.observe_with_wire(
+                3,
+                (invalid != "missing_clock").then_some(600_001),
+                50_000,
+                600_000,
+                (invalid != "missing_symbols").then_some((61_000, 61)),
+                match invalid {
+                    "missing_wire" => None,
+                    "regressed_wire" => Some(55_000),
+                    _ => Some(67_710),
+                },
+            );
+            assert_eq!(
+                window
+                    .latest(600_000)
+                    .unwrap()
+                    .admission
+                    .unwrap()
+                    .wire_bytes,
+                None,
+                "{invalid}"
+            );
+            window.observe_with_wire(
+                4,
+                Some(700_001),
+                60_000,
+                700_000,
+                Some((71_000, 71)),
+                Some(78_810),
+            );
+            window.observe_with_wire(
+                5,
+                Some(1_000_001),
+                85_000,
+                1_000_000,
+                Some((101_000, 101)),
+                Some(112_110),
+            );
+            assert!(
+                window
+                    .discovery_with_counts(1_000_000, 8, 1)
+                    .is_none_or(|sample| sample.admission.unwrap().wire_bytes.is_none()),
+                "{invalid}"
+            );
+            window.observe_with_wire(
+                6,
+                Some(1_500_001),
+                130_000,
+                1_500_000,
+                Some((151_000, 151)),
+                Some(167_610),
+            );
+            assert_eq!(
+                window
+                    .latest(1_500_000)
+                    .unwrap()
+                    .admission
+                    .unwrap()
+                    .wire_bytes,
+                Some(55_500),
+                "a fresh complete interval can recover after {invalid}"
+            );
+        }
+    }
 
     #[test]
     fn rolling_discovery_keeps_the_horizon_without_renewing_capacity_or_duplicate_reports() {

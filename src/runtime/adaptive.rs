@@ -325,6 +325,10 @@ impl DemandActivity {
 #[derive(Clone, Debug, Serialize)]
 pub struct ServiceAdmission {
     pub symbol_bytes: u64,
+    /// Budget cost deducted on successful Quinn admission, including the
+    /// existing estimated 80-byte overhead; not measured UDP/IP wire bytes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub admission_cost_bytes: Option<u64>,
     pub symbols: u64,
     pub symbol_bps: f64,
     pub span_us: u64,
@@ -655,6 +659,8 @@ pub struct PathController {
     last_transport_wait_ms: f64,
     admitted_bytes: u64,
     admitted_symbol_bytes: u64,
+    /// Bounded cumulative actual (native cost, symbol bytes, symbol count).
+    native_admitted: Option<(u64, u64, u64)>,
     /// Actual business measurement start, separate from the control owner clock.
     admission_started_us: Option<u64>,
     allowance_bytes: f64,
@@ -729,6 +735,7 @@ impl PathController {
             last_transport_wait_ms: 0.0,
             admitted_bytes: 0,
             admitted_symbol_bytes: 0,
+            native_admitted: Some((0, 0, 0)),
             admission_started_us: None,
             allowance_bytes: 0.0,
             wire_per_symbol: 1.0,
@@ -904,6 +911,13 @@ impl PathController {
             && observation
                 .delivered_bps
                 .is_some_and(|rate| rate.is_finite() && rate > 0.0);
+        let native_wire_admitted = self
+            .native_admitted
+            .filter(|(_, bytes, symbols)| {
+                observation.admitted_symbol_bytes == Some(*bytes)
+                    && observation.admitted_symbols == Some(*symbols)
+            })
+            .map(|(wire, _, _)| wire);
         let mut new_service_report = false;
         if new_report {
             if observation.delivered_bytes > previous_report.map_or(0, |(_, bytes, _)| bytes) {
@@ -918,7 +932,7 @@ impl PathController {
                 self.pressure_episode_exercised = None;
             }
             self.fast_feedback_seen |= short_delivery_interval;
-            let accumulated = self.service_window.observe(
+            let accumulated = self.service_window.observe_with_wire(
                 observation.report_number,
                 observation.delivery_report_time_us,
                 observation.delivered_bytes,
@@ -926,6 +940,7 @@ impl PathController {
                 observation
                     .admitted_symbol_bytes
                     .zip(observation.admitted_symbols),
+                native_wire_admitted,
             );
             new_service_report = !self.fast_feedback_seen || accumulated;
             let explicit = observation
@@ -1179,9 +1194,17 @@ impl PathController {
                         && admission.bps.is_finite()
                         && admission.bps > 0.0
                         && admission.started_us >= last_pace_change
-                        && self
-                            .backlog_since_us
+                        && (self.backlog_since_us
                             .is_some_and(|since| since <= admission.started_us)
+                            // A briefly empty application queue is not idle
+                            // when actual native admissions exercised the whole
+                            // stable interval and the receiver kept up with them.
+                            || (native_wire_admitted.is_some()
+                                && admission.wire_bytes.is_some_and(|bytes| {
+                                    bytes as f64 * 8_000_000.0 / admission.span_us as f64
+                                        >= self.rate_bps as f64 * 0.9
+                                })
+                                && sample.bps >= admission.bps * 0.85))
                         && self
                             .demand_activity
                             .since_us
@@ -1452,6 +1475,7 @@ impl PathController {
         let service_admission = service_sample.and_then(|sample| {
             sample.admission.map(|admission| ServiceAdmission {
                 symbol_bytes: admission.symbol_bytes,
+                admission_cost_bytes: admission.wire_bytes,
                 symbols: admission.symbols,
                 symbol_bps: admission.bps,
                 span_us: admission.span_us,
@@ -2783,6 +2807,16 @@ impl PathController {
         self.admitted_symbol_bytes = self
             .admitted_symbol_bytes
             .saturating_add(measured_symbol_bytes as u64);
+        self.native_admitted = self.native_admitted.and_then(|(wire, symbols, count)| {
+            if wire_bytes == 0 || measured_symbol_bytes == 0 {
+                return None;
+            }
+            Some((
+                wire.checked_add(wire_bytes as u64)?,
+                symbols.checked_add(measured_symbol_bytes as u64)?,
+                count.checked_add(1)?,
+            ))
+        });
         self.reprobe.admitted(wire_bytes);
     }
 
@@ -4104,6 +4138,154 @@ mod tests {
             }
         }
         panic!("a complete fresh post-pace service window must still permit bounded recovery");
+    }
+
+    fn exercised_service_after_queue_clear() -> (PathController, Observation) {
+        exercised_service_after_queue_clear_with_cost(110)
+    }
+
+    fn exercised_service_after_queue_clear_with_cost(
+        overhead: usize,
+    ) -> (PathController, Observation) {
+        // Captured paired coordinates: 355 originals / 362,131 symbol bytes
+        // over 500,534 local us; 320,978 received bytes over 500,585 receiver us.
+        // Replay the actual native +110-byte admission cost, with whole packets
+        // spread through that measured interval rather than a token burst.
+        let started = 24_117_884;
+        let completed = started + 500_534;
+        let now = 24_776_275;
+        let mut controller = PathController::new(400_000_000, 100);
+        let mut endpoint = short_observation_022(started, 131.783);
+        endpoint.report_number = 162;
+        endpoint.delivery_report_time_us = Some(1);
+        endpoint.delivered_bytes = 0;
+        endpoint.delivered_bps = Some(0.0);
+        endpoint.admitted_symbol_bytes = Some(1020);
+        endpoint.admitted_symbols = Some(1);
+        endpoint.offered_backlog = false;
+        endpoint.rtt_ms = 132.194981;
+        controller.generation = Some(endpoint.generation);
+        controller.rate_bps = 6_857_088;
+        controller.min_rtt_ms = Some(85.497685);
+        controller.fast_probe_min_rtt_ms = Some(86.691);
+        controller.last_growth_us = 23_473_045;
+        controller.congestion_seen = true;
+        controller.remembered_bps = 20_000_000.0;
+        controller.last_control_us = started;
+        controller.last_control.at_us = started - 1000;
+        controller.token_us = started - 1000;
+        controller.last_evidence_us = Some(started - 1000);
+        assert!(controller.allow(started - 1000, 1130, 0.0));
+        controller.admitted_symbol(started - 1000, 1130, 1020);
+        controller.observe(&endpoint);
+        let mut bytes = 0;
+        for packet in 1..=355 {
+            let at = started + packet * 500_534 / 355;
+            let symbol_bytes = 1020 + usize::from(packet <= 31);
+            assert!(controller.allow(at, symbol_bytes + overhead, 0.0));
+            controller.admitted_symbol(at, symbol_bytes + overhead, symbol_bytes);
+            bytes += symbol_bytes as u64;
+        }
+        assert_eq!(bytes, 362_131);
+        endpoint.now_us = completed;
+        endpoint.report_number = 163;
+        endpoint.delivery_report_time_us = Some(500_586);
+        endpoint.delivered_bytes = 320_978;
+        endpoint.delivered_bps = Some(5_129_646.313812839);
+        endpoint.admitted_symbols = Some(356);
+        endpoint.admitted_symbol_bytes = Some(bytes + 1020);
+        controller.observe(&endpoint);
+        assert_eq!(controller.rate_bps, 6_857_088);
+        // The later short control interval, probe and queue coordinates are
+        // independent of that already completed full paired service window.
+        let mut sample = short_observation_022(now, 131.783);
+        sample.report_number = 164;
+        sample.delivered_bytes = endpoint.delivered_bytes;
+        sample.delivered_bps = Some(4_427_557.244275573);
+        sample.delivery_report_time_us = Some(600_596);
+        sample.admitted_symbols = endpoint.admitted_symbols;
+        sample.admitted_symbol_bytes = endpoint.admitted_symbol_bytes;
+        sample.finalized_expected = Some(24_187);
+        sample.finalized_lost = Some(3_182);
+        sample.probe_sample_id = 156;
+        sample.probe_age_us = Some(8_812);
+        sample.rtt_ms = 132.194981;
+        controller.last_growth_probe = Some(145);
+        controller.last_control.at_us = now - 1_000;
+        controller.last_report = Some((164, sample.delivered_bytes, 24_723_063));
+        controller.last_positive_report_us = Some(24_723_063);
+        controller.backlog_since_us = Some(24_767_496);
+        controller.last_control_us = now - 200_436;
+        controller.admission_started_us = Some(controller.last_control_us);
+        controller.token_us = now;
+        controller.admitted_bytes = 170_513;
+        controller.admitted_symbol_bytes = 153_911;
+        controller.allowance_bytes = 171_800.9112960054;
+        controller.loss_evidence = LossEvidence {
+            previous: Some((24_187, 3_182)),
+            batches: VecDeque::from([(now - 300_000, 1000, 126), (now - 100_000, 1719, 216)]),
+        };
+        (controller, sample)
+    }
+
+    #[test]
+    fn exercised_actual_service_keeps_recovery_qualification_after_queue_clear() {
+        let (mut controller, sample) = exercised_service_after_queue_clear();
+        let before = controller.rate_bps;
+        controller.observe(&sample);
+        assert!(controller.loss_evidence.ordinary());
+        assert!(!controller.loss_pressure);
+        let pair = controller.last_control.service_admission.as_ref().unwrap();
+        assert_eq!(pair.span_us, 500_534);
+        assert_eq!(pair.symbols, 355);
+        assert_eq!(pair.symbol_bytes, 362_131);
+        assert_eq!(pair.admission_cost_bytes, Some(401_181));
+        assert!(pair.backlog_since_us.unwrap() > pair.started_us);
+        assert!(
+            controller.rate_bps > before,
+            "a briefly empty queue cannot erase exercised stable actual service"
+        );
+    }
+
+    #[test]
+    fn queue_clear_recovery_still_requires_native_whole_window_evidence() {
+        for guard in [
+            "underused",
+            "missing_native",
+            "mismatched",
+            "interrupted",
+            "finite_burst",
+            "cross_pace",
+            "stale",
+            "blocked",
+            "generation",
+        ] {
+            let (mut controller, mut sample) = if guard == "underused" {
+                exercised_service_after_queue_clear_with_cost(0)
+            } else {
+                exercised_service_after_queue_clear()
+            };
+            match guard {
+                "underused" => {}
+                "missing_native" => controller.native_admitted = None,
+                "mismatched" => sample.admitted_symbols = Some(357),
+                "interrupted" => controller.demand_activity.since_us = Some(24_200_000),
+                "finite_burst" => controller.demand_activity.since_us = Some(24_618_418),
+                "cross_pace" => controller.last_growth_us = 24_200_000,
+                "stale" => {
+                    controller.last_positive_report_us = Some(sample.now_us - CONTROL_US - 1)
+                }
+                "blocked" => sample.transport_blocked = true,
+                "generation" => sample.generation += 1,
+                _ => unreachable!(),
+            }
+            let before = controller.rate_bps;
+            controller.observe(&sample);
+            assert!(controller.rate_bps <= before, "{guard}");
+            if guard == "generation" {
+                assert_eq!(controller.native_admitted, Some((0, 0, 0)));
+            }
+        }
     }
 
     #[test]
