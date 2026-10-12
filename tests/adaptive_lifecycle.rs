@@ -631,3 +631,121 @@ fn shared_group_small_packets_preserve_feedback_and_independent_probes() {
     );
     assert_eq!(final_client["stats"]["configured_paths"], 3);
 }
+
+#[test]
+fn fixed_initially_failed_path_rejoins_existing_session_after_network_recovers() {
+    let dir = tempfile::tempdir().unwrap();
+    let identity = dir.path().join("identity");
+    transport::initialize(&identity, "localhost").unwrap();
+    let echo = Echo::start();
+    let server_address = unused_address();
+    let mut main = server(
+        &identity,
+        server_address,
+        echo.address,
+        dir.path(),
+        "server",
+    );
+    let relay_socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let relay_address = relay_socket.local_addr().unwrap();
+    relay_socket
+        .set_read_timeout(Some(Duration::from_millis(20)))
+        .unwrap();
+    let permit = Arc::new(AtomicBool::new(false));
+    let stop = Arc::new(AtomicBool::new(false));
+    let permit_relay = permit.clone();
+    let stop_relay = stop.clone();
+    let relay = thread::spawn(move || {
+        let mut peer = None;
+        let mut buffer = [0u8; 65536];
+        while !stop_relay.load(Ordering::Relaxed) {
+            match relay_socket.recv_from(&mut buffer) {
+                Ok((n, address)) if permit_relay.load(Ordering::Relaxed) => {
+                    let target = if address == server_address {
+                        let Some(peer) = peer else {
+                            continue;
+                        };
+                        peer
+                    } else {
+                        peer = Some(address);
+                        server_address
+                    };
+                    relay_socket.send_to(&buffer[..n], target).unwrap();
+                }
+                Ok(_) => {}
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) => {}
+                Err(e) => panic!("relay: {e}"),
+            }
+        }
+    });
+    // Join the helper even when the failed-before assertion unwinds.
+    struct RelayStop(Arc<AtomicBool>, Option<thread::JoinHandle<()>>);
+    impl Drop for RelayStop {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Relaxed);
+            self.1.take().unwrap().join().unwrap();
+        }
+    }
+    let _relay = RelayStop(stop, Some(relay));
+    let client_address = unused_address();
+    let mut client = Process::launch(
+        &[
+            "client",
+            "--listen",
+            &client_address.to_string(),
+            "--entrance",
+            &server_address.to_string(),
+            "--entrance",
+            &relay_address.to_string(),
+            "--server-name",
+            "localhost",
+            "--ca",
+            identity.join("cert.pem").to_str().unwrap(),
+            "--token-file",
+            identity.join("token").to_str().unwrap(),
+            "--fec",
+            "0",
+            "--rate-bps",
+            "2000000",
+        ],
+        dir.path(),
+        "client",
+    );
+    let first = client.wait_snapshot(Duration::from_secs(12), |v| {
+        active_session(v, None).is_some()
+            && v["stats"]["handshake_failures"].as_u64().unwrap_or(0) >= 1
+    });
+    let sid = active_session(&first, None).unwrap();
+    let pid = client.child.id();
+    permit.store(true, Ordering::Relaxed);
+    let recovered = client.wait_snapshot(Duration::from_secs(6), |v| {
+        v["stats"]["paths"].as_object().is_some_and(|paths| {
+            paths.values().any(|path| {
+                path["path_id"] == 1
+                    && path["authenticated"] == true
+                    && path["quinn"]["closed"] == false
+            })
+        })
+    });
+    assert_eq!(client.child.id(), pid);
+    assert!(
+        recovered["stats"]["paths"]
+            .as_object()
+            .unwrap()
+            .values()
+            .all(|path| { path["authenticated"] != true || path["session_id"] == sid })
+    );
+    assert_eq!(recovered["stats"]["retired_session_total"], 0);
+    let application = UdpSocket::bind("127.0.0.1:0").unwrap();
+    application.connect(client_address).unwrap();
+    application
+        .set_read_timeout(Some(Duration::from_millis(100)))
+        .unwrap();
+    expect_echo(&application, b"fixed startup path recovered", &mut client);
+    client.finish();
+    main.finish();
+}

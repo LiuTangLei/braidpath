@@ -2313,7 +2313,11 @@ async fn client_session(
                         }
                         rotations[id].consider(&estimate,quality_time(path),now_us)
                     } else {false};
-                    let recovery=(!config.attempted || options.policy.adaptive)
+                    // An initial failed path can join an already established
+                    // session without coupling recovery to adaptive rate control.
+                    // Previously joined fixed-mode paths keep their old policy.
+                    let recovery=(!config.attempted || options.policy.adaptive
+                        || (has_session && endpoints[id].is_none()))
                         && rotations[id].should_retry(now_us,open);
                     if !elective && !recovery {continue;}
                     let previously_attempted=config.attempted;
