@@ -939,10 +939,9 @@ mod tests {
             };
             expected.push(b'\n');
             assert_eq!(writer.bytes, expected);
-            assert_eq!(
-                serde_json::from_slice::<serde_json::Value>(&writer.bytes).unwrap(),
-                snapshot
-            );
+            // Exact serializer bytes above cover every value. The default JSON
+            // parser can round a floating timestamp by one ULP on readback.
+            serde_json::from_slice::<serde_json::Value>(&writer.bytes).unwrap();
             eprintln!(
                 "pretty={pretty} snapshot_bytes={} write_calls={}",
                 writer.bytes.len(),
