@@ -339,18 +339,6 @@ pub struct ServiceAdmission {
 }
 
 #[derive(Clone, Debug, Serialize)]
-pub struct ReceiverQueueEvidence {
-    pub report_number: u64,
-    pub observed_us: u64,
-    pub delay_rise_ms: f64,
-    pub delivered_symbol_bytes: u64,
-    pub admitted_symbol_bytes: u64,
-    pub admitted_symbols: u64,
-    pub local_span_us: u64,
-    pub receiver_span_us: u64,
-}
-
-#[derive(Clone, Debug, Serialize)]
 pub struct GrowthMonitorReply {
     /// Quality's authenticated, deduplicated reply count, not a wire nonce.
     pub sample_id: u64,
@@ -509,16 +497,13 @@ pub struct ControlSample {
     pub observed_probe_min_rtt_ms: Option<f64>,
     pub queue_delay_ms: f64,
     pub transport_blocked: bool,
-    /// Receiver delay rise corroborated by recent, exercised actual admissions.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub receiver_queue_evidence: Option<ReceiverQueueEvidence>,
     pub offered_backlog: bool,
     pub latest_symbol_delivery_bps: Option<f64>,
     /// A real short report retained until the next control tick. `used` marks
     /// the evidence actually consumed by an initial pacing increase.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub initial_delivery_credit: Option<InitialDeliveryCredit>,
-    /// Short reports remain raw startup evidence; capacity/drain decisions use this
+    /// Short reports remain raw startup evidence; service decisions use this
     /// independently accumulated interval once fast feedback has been seen.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub service_symbol_delivery_bps: Option<f64>,
@@ -678,8 +663,6 @@ pub struct PathController {
     delay_since_us: Option<u64>,
     braked_queue_ms: Option<f64>,
     last_report: Option<(u64, u64, u64)>,
-    last_receiver_delay: Option<(f64, u64)>,
-    receiver_queue_evidence: Option<ReceiverQueueEvidence>,
     last_positive_report_us: Option<u64>,
     delivery_bps: Option<f64>,
     latest_delivery_bps: Option<f64>,
@@ -752,8 +735,6 @@ impl PathController {
             delay_since_us: None,
             braked_queue_ms: None,
             last_report: None,
-            last_receiver_delay: None,
-            receiver_queue_evidence: None,
             last_positive_report_us: None,
             delivery_bps: None,
             latest_delivery_bps: None,
@@ -921,7 +902,6 @@ impl PathController {
                 .delivered_bps
                 .is_some_and(|rate| rate.is_finite() && rate > 0.0);
         let mut new_service_report = false;
-        let previous_receiver_delay = self.last_receiver_delay;
         if new_report {
             if observation.delivered_bytes > previous_report.map_or(0, |(_, bytes, _)| bytes) {
                 self.last_positive_report_us = observation
@@ -1090,85 +1070,12 @@ impl PathController {
         let queued_beyond_burst = observation.send_queue_bytes.saturating_sub(2400);
         let transport_wait = queued_beyond_burst as f64 * 8000.0 / drain_hint;
         let previous_queue = self.queue_delay_ms;
-        // A fresh receiver interval can expose a queue before the next probe
-        // returns. A delay rise alone is unsafe across independent clocks;
-        // corroborate it with busy actual admissions and delivery in one local
-        // clock. This short pair never becomes capacity or recovery credit.
-        let previous_receiver_queue = self
-            .receiver_queue_evidence
-            .as_ref()
-            .map(|e| e.delay_rise_ms);
-        if self
-            .receiver_queue_evidence
-            .as_ref()
-            .is_some_and(|e| now.saturating_sub(e.observed_us) > CONTROL_US)
-        {
-            self.receiver_queue_evidence = None;
-        }
-        if new_report {
-            let delay = observation.transit_excess_ms;
-            let last_pace_change = self
-                .rate_changes
-                .back()
-                .map_or(self.born_us, |change| change.at_us);
-            let recent = self.service_window.recent_pair(now).filter(|pair| {
-                self.fast_feedback_seen
-                    && feedback_fresh
-                    && delivery_fresh
-                    && observation
-                        .positive_delivery_age_us
-                        .is_some_and(|age| age <= CONTROL_US)
-                    && pair.symbols >= 8
-                    && pair.delivered_bytes > 0
-                    && pair.started_us.saturating_sub(last_pace_change) >= PROBE_US + BRAKE_US
-                    && self
-                        .demand_activity
-                        .since_us
-                        .is_some_and(|since| since <= pair.started_us)
-                    && pair.admitted_bytes as f64 * self.wire_per_symbol
-                        >= self.rate_bps as f64 * pair.local_span_us as f64 / 8_000_000.0 * 0.9
-                    && (pair.delivered_bytes as f64) < pair.admitted_bytes as f64 * 0.85
-            });
-            let rise = previous_receiver_delay.and_then(|(previous, at)| {
-                (delay.is_finite() && delay >= 0.0 && now.saturating_sub(at) <= CONTROL_US)
-                    .then_some(delay - previous)
-            });
-            self.receiver_queue_evidence = recent.zip(rise).and_then(|(pair, rise)| {
-                let pressure = if rise > self.target_ms * 0.5 {
-                    rise
-                } else if rise >= -0.25 {
-                    self.receiver_queue_evidence.as_ref()?.delay_rise_ms
-                } else {
-                    return None;
-                };
-                Some(ReceiverQueueEvidence {
-                    report_number: observation.report_number,
-                    observed_us: now,
-                    delay_rise_ms: pressure,
-                    delivered_symbol_bytes: pair.delivered_bytes,
-                    admitted_symbol_bytes: pair.admitted_bytes,
-                    admitted_symbols: pair.symbols,
-                    local_span_us: pair.local_span_us,
-                    receiver_span_us: pair.receiver_span_us,
-                })
-            });
-            self.last_receiver_delay = (delay.is_finite() && delay >= 0.0).then_some((delay, now));
-        }
-        let receiver_queue = self
-            .receiver_queue_evidence
-            .as_ref()
-            .map(|e| e.delay_rise_ms)
-            .unwrap_or(0.0);
         self.queue_delay_ms = rtt_excess
             .max(transport_wait)
-            .max(startup_probe_excess.unwrap_or(0.0))
-            .max(receiver_queue);
+            .max(startup_probe_excess.unwrap_or(0.0));
         let queue_rising = self.queue_delay_ms > previous_queue + 0.25;
-        let new_queue = new_rtt
-            || new_probe
-            || (transport_wait - self.last_transport_wait_ms).abs() > 0.25
-            || (self.receiver_queue_evidence.is_some()
-                && previous_receiver_queue != Some(receiver_queue));
+        let new_queue =
+            new_rtt || new_probe || (transport_wait - self.last_transport_wait_ms).abs() > 0.25;
 
         let loss = if feedback_fresh {
             observation
@@ -1445,7 +1352,6 @@ impl PathController {
             observed_probe_min_rtt_ms: self.observed_probe_min_rtt_ms,
             queue_delay_ms: self.queue_delay_ms,
             transport_blocked: observation.transport_blocked,
-            receiver_queue_evidence: self.receiver_queue_evidence.clone(),
             offered_backlog: observation.offered_backlog,
             latest_symbol_delivery_bps: self.latest_delivery_bps,
             initial_delivery_credit: None,
@@ -1745,11 +1651,8 @@ impl PathController {
         // echo/probe jitter must not turn its small delivery sample into a path
         // capacity estimate. Backlog, blocked transport or the separately
         // qualified actual-admission deficit still permits a safety brake.
-        let active_demand = observation.offered_backlog
-            || exercised
-            || blocked_pressure
-            || service_deficit
-            || self.receiver_queue_evidence.is_some();
+        let active_demand =
+            observation.offered_backlog || exercised || blocked_pressure || service_deficit;
         if self.eligible
             && active_demand
             && new_pressure
@@ -11109,155 +11012,6 @@ mod tests {
         controller.observe(&resumed);
         assert_eq!(controller.rate_bps, 2_160_000);
         assert_eq!(controller.remembered_bps, 2_400_000.0);
-    }
-
-    fn recent_receiver_queue_fixture() -> (PathController, Observation) {
-        let mut controller = PathController::new(8_000_000, 20);
-        let mut sample = observation(0, 0.0);
-        sample.probe_latest_rtt_ms = Some(80.0);
-        sample.probe_rtt_ms = Some(80.0);
-        sample.probe_sample_id = 1;
-        sample.offered_backlog = false;
-        sample.delivered_bytes = 0;
-        sample.admitted_symbol_bytes = Some(0);
-        sample.admitted_symbols = Some(0);
-        sample.finalized_expected = Some(0);
-        sample.finalized_lost = Some(0);
-        sample.delivery_report_time_us = Some(100_000_000);
-        controller.observe(&sample);
-        controller.rate_bps = 8_000_000;
-        controller.remembered_bps = 8_000_000.0;
-        for report in 1..=8 {
-            recent_receiver_queue_report(&mut controller, &mut sample, report, false);
-            controller.observe(&sample);
-        }
-        (controller, sample)
-    }
-
-    fn recent_receiver_queue_report(
-        controller: &mut PathController,
-        sample: &mut Observation,
-        report: u64,
-        collapsed: bool,
-    ) {
-        let now = report * 100_000;
-        for at in ((now - 100_000 + 1000)..=now).step_by(1000) {
-            controller.admitted_symbol(at, 1000, 900);
-        }
-        sample.now_us = now;
-        sample.report_number = report + 1;
-        sample.probe_age_us = Some(now);
-        sample.admitted_symbols = Some(report * 100);
-        sample.admitted_symbol_bytes = Some(report * 90_000);
-        sample.delivered_bytes += if collapsed { 4500 } else { 90_000 };
-        sample.delivered_bps = Some(if collapsed { 360_000.0 } else { 7_200_000.0 });
-        sample.delivery_report_time_us = Some(100_000_000 + now);
-        sample.delivery_sample_span_us = 100_000;
-        sample.finalized_expected = Some(if collapsed {
-            (report - 1) * 100
-        } else {
-            report * 100
-        });
-        sample.feedback_sample_symbols = if collapsed { 0 } else { 100 };
-        sample.transit_excess_ms = if collapsed { 200.4 } else { 0.4 };
-    }
-
-    #[test]
-    fn recent_receiver_collapse_protects_queue_before_the_next_probe() {
-        let (mut controller, mut sample) = recent_receiver_queue_fixture();
-        let remembered = controller.remembered_bps;
-        recent_receiver_queue_report(&mut controller, &mut sample, 9, true);
-        controller.observe(&sample);
-        assert!(!controller.last_control.new_probe);
-        assert!(controller.last_control.service_symbol_delivery_bps.unwrap() > 6_000_000.0);
-        assert!(controller.last_control.new_queue);
-        assert!(controller.rate_bps < 8_000_000);
-        assert_eq!(controller.remembered_bps, remembered);
-    }
-
-    #[test]
-    fn recent_receiver_queue_requires_current_continuous_exercised_admissions() {
-        for guard in [
-            "startup",
-            "underfilled",
-            "burst",
-            "sparse",
-            "stale",
-            "duplicate",
-            "generation",
-            "clock_interval",
-        ] {
-            let (mut controller, mut sample) = recent_receiver_queue_fixture();
-            recent_receiver_queue_report(&mut controller, &mut sample, 9, true);
-            match guard {
-                "startup" => controller.born_us = 850_000,
-                "underfilled" => controller.rate_bps = 16_000_000,
-                "burst" => controller.demand_activity.since_us = Some(sample.now_us),
-                "sparse" => {
-                    sample.admitted_symbols = Some(805);
-                    sample.admitted_symbol_bytes = Some(724_500);
-                }
-                "stale" => {
-                    sample.feedback_age_us = Some(FRESH_US + 1);
-                    sample.positive_delivery_age_us = Some(FRESH_US + 1);
-                }
-                "duplicate" => sample.report_number -= 1,
-                "generation" => sample.generation += 1,
-                "clock_interval" => sample.delivery_report_time_us = Some(101_800_000),
-                _ => unreachable!(),
-            }
-            controller.observe(&sample);
-            assert!(
-                controller.last_control.receiver_queue_evidence.is_none(),
-                "{guard}"
-            );
-        }
-    }
-
-    #[test]
-    fn recent_receiver_queue_needs_a_delay_rise_and_local_delivery_deficit() {
-        for guard in [
-            "normal_delivery",
-            "gradual_drift",
-            "old_delay",
-            "invalid_delay",
-        ] {
-            let (mut controller, mut sample) = recent_receiver_queue_fixture();
-            recent_receiver_queue_report(&mut controller, &mut sample, 9, true);
-            match guard {
-                "normal_delivery" => sample.delivered_bytes = 810_000,
-                "gradual_drift" => sample.transit_excess_ms = 0.405,
-                "old_delay" => {
-                    controller.last_receiver_delay = Some((200.4, 800_000));
-                }
-                "invalid_delay" => sample.transit_excess_ms = f64::NAN,
-                _ => unreachable!(),
-            }
-            controller.observe(&sample);
-            assert!(
-                controller.last_control.receiver_queue_evidence.is_none(),
-                "{guard}"
-            );
-        }
-    }
-
-    #[test]
-    fn recent_receiver_queue_retains_existing_brake_delay_and_expires_without_new_reports() {
-        let (mut controller, mut sample) = recent_receiver_queue_fixture();
-        recent_receiver_queue_report(&mut controller, &mut sample, 9, true);
-        sample.transit_excess_ms = 15.4;
-        controller.observe(&sample);
-        assert_eq!(controller.rate_bps, 8_000_000);
-        sample.now_us += BRAKE_US - 1;
-        controller.observe(&sample);
-        assert_eq!(controller.rate_bps, 8_000_000);
-        sample.now_us += 1;
-        controller.observe(&sample);
-        assert!(controller.rate_bps < 8_000_000);
-        sample.now_us = 900_000 + CONTROL_US + 1;
-        controller.observe(&sample);
-        assert!(controller.last_control.receiver_queue_evidence.is_none());
-        assert_eq!(controller.queue_delay_ms, 0.0);
     }
 
     #[test]
