@@ -422,6 +422,15 @@ async fn small_timing_recovers_from_stale_feedback_and_keeps_cold_paths_live() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn quality_only_bulk_unready_path_cannot_steal_later_small_requests() {
+    bulk_unready_path_cannot_steal_later_small_requests(false).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn adaptive_bulk_unready_path_cannot_steal_later_small_requests() {
+    bulk_unready_path_cannot_steal_later_small_requests(true).await;
+}
+
+async fn bulk_unready_path_cannot_steal_later_small_requests(adaptive: bool) {
     let fast = Pair::connect().await;
     let blocked = Pair::connect().await;
     let path0 = fast.path();
@@ -429,6 +438,15 @@ async fn quality_only_bulk_unready_path_cannot_steal_later_small_requests() {
     path1.id = 1;
     let paths = [path0.clone(), path1.clone()];
     let mut accounting = Accounting::new();
+    accounting.policy.adaptive = adaptive;
+    if adaptive {
+        accounting.business = Some(outbound::BusinessPacer::new(
+            accounting.policy.rate,
+            accounting.policy.group_rates,
+            2400,
+        ));
+        update_business_pacer(&mut accounting.business, &paths, &accounting.controllers, 0);
+    }
     let created = Instant::now();
     accounting.enqueue(wire::plain(&record(1)).unwrap(), created);
     let mut prepared = accounting.prepare(&path0, false);
@@ -442,6 +460,21 @@ async fn quality_only_bulk_unready_path_cannot_steal_later_small_requests() {
     let small_bytes = 183;
     assert!(path1.conn.datagram_send_buffer_space() >= small_bytes);
     assert!(path1.conn.datagram_send_buffer_space() < prepared.data.len());
+    if adaptive {
+        assert_eq!(
+            business_ready_candidates(
+                &prepared.candidates,
+                &paths,
+                &mut accounting.controllers,
+                accounting.epoch.elapsed().as_micros() as u64,
+                prepared.front.data.len() + quality::HEADER,
+                created.elapsed().as_secs_f64() * 1000.0,
+                None,
+            ),
+            prepared.candidates,
+            "both business allowances are ready; only Quinn blocks the bulk peer"
+        );
+    }
     let at = send_datagram_before_deadline(
         &path0.conn,
         prepared.data.clone(),

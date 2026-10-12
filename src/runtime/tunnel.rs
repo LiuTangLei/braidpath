@@ -709,7 +709,7 @@ impl SendAccounting<'_> {
                 0
             };
         let ready_candidates = if self.policy.adaptive {
-            Some(business_ready_candidates(
+            let business_candidates = business_ready_candidates(
                 candidates,
                 self.paths,
                 self.controllers,
@@ -717,6 +717,15 @@ impl SendAccounting<'_> {
                 measured_payload_bytes,
                 at.saturating_duration_since(front.created).as_secs_f64() * 1000.0,
                 Some(path.id),
+            );
+            // Business credit does not make a full Quinn buffer ready. Filter
+            // only settled service debt; send order still retains blocked paths
+            // for readiness waits, and both filters preserve actual admission.
+            Some(transport_ready_candidates(
+                &business_candidates,
+                self.paths,
+                measured_payload_bytes,
+                path.id,
             ))
         } else if self.policy.quality_schedule {
             Some(transport_ready_candidates(
