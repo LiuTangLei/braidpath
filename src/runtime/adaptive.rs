@@ -650,6 +650,7 @@ pub struct PathController {
     last_transport_wait_ms: f64,
     admitted_bytes: u64,
     admitted_symbol_bytes: u64,
+    admitted_interval_symbols: u64,
     allowance_bytes: f64,
     wire_per_symbol: f64,
     blocked_since_us: Option<u64>,
@@ -722,6 +723,7 @@ impl PathController {
             last_transport_wait_ms: 0.0,
             admitted_bytes: 0,
             admitted_symbol_bytes: 0,
+            admitted_interval_symbols: 0,
             allowance_bytes: 0.0,
             wire_per_symbol: 1.0,
             blocked_since_us: None,
@@ -2267,6 +2269,15 @@ impl PathController {
             // next control tick can outlive that endpoint.
             // No evidence age is renewed, and an actual rate change, pressure,
             // idle or expiry still settles this bounded window.
+            // A real first monitor reply and a busy positive business sample
+            // can retain actual same-pace accounting without independent data
+            // probes. This holds measurements, never growth/capacity credit.
+            let business_monitor_hold = self.growth_monitor.as_ref().is_some_and(|monitor| {
+                monitor.first_reply.is_some() && self.last_control_us >= monitor.armed_us
+            }) && self.admitted_interval_symbols >= 8
+                && positive_young
+                && !observation.transport_blocked
+                && wire_delivery_bps.is_some_and(|bps| bps >= allowance_rate * 0.85);
             let pending_evidence = self.fast_feedback_seen
                 && self.rate_bps == previous_rate
                 && observation_contiguous
@@ -2280,13 +2291,13 @@ impl PathController {
                     || (!growth_probe_ready && self.discovery_service_window(now).is_some())
                     || (probe_covered_loss && elapsed < PROBE_US)
                     || (waiting_for_drain_window && elapsed < PROBE_US)
-                    // Independent measurement may keep the actual same-pace
-                    // interval while its monitor gates growth, even after use
-                    // reaches 90%. Without a qualified reference, ordinary
-                    // monitoring retains its original settlement behavior.
+                    // Independent measurement or confirmed busy business may
+                    // keep the actual same-pace interval while its monitor
+                    // gates growth, even after use reaches 90%. Sparse or
+                    // unconfirmed business retains its original settlement.
                     // This retains actual use, not permission to increase.
                     || (self.growth_monitor.is_some()
-                        && probe_reference.is_some()
+                        && (probe_reference.is_some() || business_monitor_hold)
                         && elapsed < PROBE_US)
                     // Whole datagrams can underfill one short tick despite
                     // continuous demand. Keep actual admissions at the same
@@ -2310,6 +2321,7 @@ impl PathController {
                 self.last_control_us = now;
                 self.admitted_bytes = 0;
                 self.admitted_symbol_bytes = 0;
+                self.admitted_interval_symbols = 0;
                 self.allowance_bytes = 0.0;
             }
         }
@@ -2432,15 +2444,17 @@ impl PathController {
         let monitor_request = active
             && probe_age.is_some_and(|age| age <= FRESH_US)
             && self.growth_monitor.as_ref().is_some_and(|monitor| {
-                monitor.successful_request_us[0].is_none() && monitor.request_due(now_us)
+                (monitor.successful_request_us[0].is_none() || monitor.first_reply.is_some())
+                    && monitor.request_due(now_us)
             });
         // These opportunities are independent. New service cannot cancel an
         // owed request after growth just because the old reply aged past 200ms.
         // Only probe_admitted spends the repair; without a reply the original
         // 500ms health deadline remains, rather than repeated stale retries.
-        // The first owned request cannot depend on the older reply remaining
-        // young while it waits for spacing. A missing first reply still keeps
-        // the original second-request/health cadence and admission-only count.
+        // An unsent owned request survives budget deferral after a confirmed
+        // first reply too. Missing replies do not create fast retries: the
+        // request slots are spent only on admission, and a missing first reply
+        // retains the original second-request/health cadence.
         (young && fast_opportunity) || service_request || phase_repair || monitor_request
     }
 
@@ -2670,6 +2684,9 @@ impl PathController {
         self.admitted_symbol_bytes = self
             .admitted_symbol_bytes
             .saturating_add(measured_symbol_bytes as u64);
+        if wire_bytes > 0 && measured_symbol_bytes > 0 {
+            self.admitted_interval_symbols = self.admitted_interval_symbols.saturating_add(1);
+        }
         self.reprobe.admitted(wire_bytes);
     }
 
@@ -3582,6 +3599,7 @@ mod tests {
         controller.last_control_us = 5_000_000;
         controller.admitted_bytes = 0;
         controller.admitted_symbol_bytes = 0;
+        controller.admitted_interval_symbols = 0;
         controller.allowance_bytes = 0.0;
         for now in [5_100_000, 5_200_000, 5_300_000, 5_400_000] {
             controller.probe_admitted(now - 100_000);
@@ -3661,6 +3679,7 @@ mod tests {
         controller.last_control_us = 1_000_000;
         controller.admitted_bytes = 0;
         controller.admitted_symbol_bytes = 0;
+        controller.admitted_interval_symbols = 0;
         controller.allowance_bytes = 0.0;
         sample = ordinary_loss_recovery_report(&mut controller, &sample, 1_100_000);
         controller.observe(&sample);
@@ -3816,6 +3835,7 @@ mod tests {
         controller.last_control_us = sample.now_us;
         controller.admitted_bytes = 0;
         controller.admitted_symbol_bytes = 0;
+        controller.admitted_interval_symbols = 0;
         controller.allowance_bytes = 0.0;
         (controller, sample)
     }
@@ -3891,6 +3911,122 @@ mod tests {
             controller.last_control.admitted_bytes as f64
                 >= controller.last_control.integrated_allowance_bytes * 0.9
         );
+    }
+
+    fn busy_business_monitor() -> (PathController, Observation, u64, u64) {
+        let mut controller = PathController::new(2_000_000, 20);
+        let mut sample = short_observation_022(0, 80.0);
+        sample.delivered_bytes = 0;
+        sample.delivered_bps = Some(0.0);
+        sample.admitted_symbols = Some(0);
+        sample.admitted_symbol_bytes = Some(0);
+        controller.observe(&sample);
+        // Start at an established pace, then earn and deliver a full second
+        // of whole datagrams. The fixture does not pretend cold discovery has
+        // already learned this rate or mint tokens for the prescribed pace.
+        controller.rate_bps = 2_000_000;
+        controller.tokens = 0.0;
+        for now in (100_000..=1_000_000).step_by(100_000) {
+            controller.probe_admitted(now - 100_000);
+            sample = wire_admitted_report_060(&mut controller, &sample, now);
+            sample.probe_age_us = Some(20_000);
+            controller.observe(&sample);
+            assert_eq!(controller.rate_bps, 2_000_000);
+        }
+        controller.maximum_bps = 20_000_000;
+        controller.congestion_seen = true;
+        controller.tokens = 0.0;
+        controller.last_control_us = sample.now_us;
+        controller.admitted_bytes = 0;
+        controller.admitted_symbol_bytes = 0;
+        controller.admitted_interval_symbols = 0;
+        controller.allowance_bytes = 0.0;
+        for now in [1_100_000, 1_200_000] {
+            controller.probe_admitted(now - 100_000);
+            sample = wire_admitted_report_060(&mut controller, &sample, now);
+            sample.probe_age_us = Some(20_000);
+            controller.observe(&sample);
+        }
+        let grown = controller.rate_bps;
+        let epoch = controller.growth_monitor.as_ref().unwrap().armed_us;
+        assert_eq!(epoch, 1_200_000);
+        controller.tokens = 0.0;
+        let previous_reply = sample.probe_sample_id;
+        controller.probe_admitted(1_250_000);
+        sample = wire_admitted_report_060(&mut controller, &sample, 1_300_000);
+        sample.probe_sample_id = previous_reply;
+        sample.probe_age_us = Some(120_000);
+        controller.observe(&sample);
+        controller.probe_admitted(1_350_000);
+        sample = wire_admitted_report_060(&mut controller, &sample, 1_400_000);
+        sample.probe_sample_id = previous_reply + 1;
+        sample.probe_age_us = Some(70_000);
+        controller.observe(&sample);
+        assert!(controller.probe_service.reference(sample.now_us).is_none());
+        let monitor = controller.growth_monitor.as_ref().unwrap();
+        assert!(monitor.first_reply.is_some() && monitor.second_reply.is_none());
+        assert_eq!(controller.rate_bps, grown);
+        assert!(
+            controller.last_control.admitted_bytes as f64
+                >= controller.last_control.integrated_allowance_bytes * 0.9
+        );
+        assert!(controller.admitted_interval_symbols >= 8);
+        (controller, sample, epoch, grown)
+    }
+
+    #[test]
+    fn busy_business_monitor_preserves_the_unchanged_pacing_interval() {
+        let (mut controller, mut sample, epoch, grown) = busy_business_monitor();
+        assert_eq!(
+            controller.last_control_us, epoch,
+            "successful busy business service must not lose its actual pacing interval while the second reply is pending"
+        );
+        let second_reply = sample.probe_sample_id + 1;
+        sample = wire_admitted_report_060(&mut controller, &sample, 1_500_000);
+        sample.probe_sample_id = second_reply;
+        sample.probe_age_us = Some(70_000);
+        controller.observe(&sample);
+        assert_eq!(controller.last_control.admission_span_us, 300_000);
+        assert!(
+            controller.rate_bps > grown,
+            "the second clear reply does not require a new empty accounting window"
+        );
+    }
+
+    #[test]
+    fn busy_business_monitor_hold_still_settles_at_unsafe_boundaries() {
+        for guard in ["idle", "old_positive", "blocked", "generation", "horizon"] {
+            let (mut controller, previous, epoch, _) = busy_business_monitor();
+            let now = if guard == "horizon" {
+                epoch + PROBE_US
+            } else {
+                previous.now_us + 100_000
+            };
+            let mut sample = wire_admitted_report_060(&mut controller, &previous, now);
+            sample.probe_sample_id = previous.probe_sample_id;
+            sample.probe_age_us = Some(previous.probe_age_us.unwrap() + now - previous.now_us);
+            // Isolate the business monitor from other service-window holds.
+            controller.service_window = service::Window::default();
+            match guard {
+                "idle" => sample.offered_backlog = false,
+                "old_positive" => {
+                    sample.positive_delivery_age_us = Some(FRESH_US + 1);
+                    sample.delivered_bps = Some(0.0);
+                }
+                "blocked" => {
+                    sample.transport_blocked = true;
+                    sample.send_queue_bytes = 20_000;
+                }
+                "generation" => sample.generation += 1,
+                "horizon" => {}
+                _ => unreachable!(),
+            }
+            controller.observe(&sample);
+            assert_eq!(controller.last_control_us, now, "{guard}");
+            assert_eq!(controller.admitted_interval_symbols, 0, "{guard}");
+            assert_eq!(controller.admitted_bytes, 0, "{guard}");
+            assert_eq!(controller.allowance_bytes, 0.0, "{guard}");
+        }
     }
 
     #[test]
@@ -4587,6 +4723,76 @@ mod tests {
                 added_queue_ms <= controller.target_ms * 0.8 + 0.001,
                 "request at {last_request}: held {held_ms}ms adds {added_queue_ms}ms beyond the original headroom"
             );
+        }
+    }
+
+    #[test]
+    fn confirmed_first_reply_keeps_the_unsent_second_request_due() {
+        let (mut controller, sample) = monitored_growth_034();
+        controller.probe_admitted(601_000);
+        let mut first = monitor_reply_034(&mut controller, &sample, 681_000, 80.0, 601_000);
+        first.probe_sample_id = sample.probe_sample_id + 1;
+        controller.observe(&first);
+        let grown = controller.rate_bps;
+        // No new service interval can supply a separate request opportunity.
+        // The owned second request must survive a rejected budget/transport
+        // attempt even when the first real reply ages beyond 200 ms.
+        controller.service_window = service::Window::default();
+        assert!(!controller.decision(700_999).probe_due);
+        assert!(controller.decision(701_000).probe_due);
+        for now in [881_001, 901_000, 1_000_000] {
+            assert!(
+                controller.decision(now).probe_due,
+                "the unsent owned request disappeared at {now}"
+            );
+            assert_eq!(controller.last_probe_us, Some(601_000));
+            assert_eq!(controller.rate_bps, grown);
+        }
+        controller.probe_admitted(1_000_000);
+        assert!(!controller.decision(1_000_000).probe_due);
+        assert!(
+            !controller.decision(1_100_000).probe_due,
+            "two admitted requests cannot turn into repeated fast retries"
+        );
+        let mut second = monitor_reply_034(&mut controller, &first, 1_080_000, 80.0, 1_000_000);
+        second.probe_sample_id = first.probe_sample_id + 1;
+        controller.observe(&second);
+        assert!(controller.growth_monitor.is_none());
+        assert_eq!(controller.rate_bps, grown);
+    }
+
+    #[test]
+    fn second_monitor_request_retains_health_and_ownership_guards() {
+        for guard in ["no_reply", "idle", "stale", "expired", "generation"] {
+            let (mut controller, sample) = monitored_growth_034();
+            controller.probe_admitted(601_000);
+            let mut first = monitor_reply_034(&mut controller, &sample, 681_000, 80.0, 601_000);
+            first.probe_sample_id = sample.probe_sample_id + 1;
+            controller.observe(&first);
+            controller.service_window = service::Window::default();
+            match guard {
+                "no_reply" => controller.growth_monitor.as_mut().unwrap().first_reply = None,
+                "idle" => controller.last_control.offered_backlog = false,
+                "stale" => controller.last_control.probe_age_us = Some(FRESH_US + 1),
+                "expired" => controller.growth_monitor.as_mut().unwrap().armed_us = 0,
+                "generation" => {
+                    first.generation += 1;
+                    first.now_us += 1;
+                    controller.observe(&first);
+                    controller.probe_admitted(first.now_us);
+                }
+                _ => unreachable!(),
+            }
+            let now = if guard == "expired" {
+                FRESH_US + 1
+            } else {
+                901_000
+            };
+            if guard == "expired" {
+                // Isolate monitor expiry from the ordinary 500 ms health probe.
+                controller.last_probe_us = Some(now - FAST_PROBE_US);
+            }
+            assert!(!controller.decision(now).probe_due, "{guard}");
         }
     }
 
@@ -9449,6 +9655,7 @@ mod tests {
         controller.last_control_us = epoch;
         controller.admitted_bytes = 0;
         controller.admitted_symbol_bytes = 0;
+        controller.admitted_interval_symbols = 0;
         controller.allowance_bytes = 0.0;
         let mut probe = probe_service::tests::probe(300);
         let mut total = 0;
@@ -9500,6 +9707,7 @@ mod tests {
             controller.last_control_us = epoch;
             controller.admitted_bytes = 0;
             controller.admitted_symbol_bytes = 0;
+            controller.admitted_interval_symbols = 0;
             controller.allowance_bytes = 0.0;
             sample.now_us = epoch + CONTROL_US;
             sample.probe_sample_id += 1;
