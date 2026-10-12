@@ -179,3 +179,88 @@ async fn bounded_transport_queue_preserves_maximum_plain_and_repair_frames() {
     );
     assert_eq!(receiver.recovered, 1);
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn server_datagram_send_buffer_override_reaches_reverse_connection_without_eviction() {
+    let temp = tempfile::tempdir().unwrap();
+    let identity = temp.path().join("identity");
+    transport::initialize(&identity, "localhost").unwrap();
+    for invalid in [1199, 76_801, usize::MAX] {
+        assert!(
+            transport::server_with_datagram_buffer(
+                "127.0.0.1:0".parse().unwrap(),
+                &identity.join("cert.pem"),
+                &identity.join("key.pem"),
+                Congestion::Bbr,
+                invalid,
+            )
+            .is_err()
+        );
+    }
+    for bytes in [1200, 9600] {
+        let server = if bytes == 1200 {
+            transport::server(
+                "127.0.0.1:0".parse().unwrap(),
+                &identity.join("cert.pem"),
+                &identity.join("key.pem"),
+                Congestion::Bbr,
+            )
+        } else {
+            transport::server_with_datagram_buffer(
+                "127.0.0.1:0".parse().unwrap(),
+                &identity.join("cert.pem"),
+                &identity.join("key.pem"),
+                Congestion::Bbr,
+                bytes,
+            )
+        }
+        .unwrap();
+        let address = server.local_addr().unwrap();
+        let client =
+            transport::client(address, &identity.join("cert.pem"), None, Congestion::Bbr).unwrap();
+        let (client_conn, server_conn) = timeout(Duration::from_secs(3), async {
+            tokio::join!(client.connect(address, "localhost").unwrap(), async {
+                server.accept().await.unwrap().await
+            })
+        })
+        .await
+        .unwrap();
+        let client_conn = client_conn.unwrap();
+        let server_conn = server_conn.unwrap();
+        let records: Vec<_> = (0..16)
+            .map(|id| {
+                let record = Record {
+                    flow: 1,
+                    id,
+                    payload: vec![id as u8; MAX_PAYLOAD],
+                };
+                wire::http_datagram(0, &wire::plain(&record).unwrap()).unwrap()
+            })
+            .collect();
+        let mut admitted = 0;
+        // No await: the current-thread driver cannot drain or mask the bound.
+        for record in &records {
+            if server_conn.datagram_send_buffer_space() < record.len() {
+                break;
+            }
+            server_conn.send_datagram(record.clone()).unwrap();
+            admitted += 1;
+        }
+        if bytes == 1200 {
+            assert_eq!(admitted, 1);
+        } else {
+            assert!(admitted >= 8 && admitted < records.len());
+        }
+        for record in records.into_iter().take(admitted) {
+            assert_eq!(
+                timeout(Duration::from_secs(3), client_conn.read_datagram())
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                record
+            );
+        }
+        client.close(0u32.into(), b"test complete");
+        server.close(0u32.into(), b"test complete");
+    }
+}

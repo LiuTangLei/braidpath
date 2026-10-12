@@ -38,6 +38,10 @@ enum Command {
         target: SocketAddr,
         #[arg(long, default_value_t = 10_000_000)]
         max_rate_bps: u64,
+        /// Outgoing Quinn buffer for reverse traffic; bytes include metadata.
+        /// Controlled measurements only; this does not bound residence time.
+        #[arg(long, default_value_t = 1200, value_parser = clap::value_parser!(u32).range(1200..=76_800))]
+        datagram_send_buffer_bytes: u32,
         /// BBR is the supported sending controller.
         #[arg(long, value_enum, default_value_t = transport::Congestion::default())]
         congestion: transport::Congestion,
@@ -167,6 +171,7 @@ pub async fn run() -> Result<()> {
             token_file,
             target,
             max_rate_bps,
+            datagram_send_buffer_bytes,
             congestion,
             stats,
         } => {
@@ -179,6 +184,7 @@ pub async fn run() -> Result<()> {
                 token: token_file,
                 target,
                 max_rate: max_rate_bps,
+                datagram_send_buffer_bytes: datagram_send_buffer_bytes as usize,
                 congestion,
             })
             .await;
@@ -293,6 +299,43 @@ fn parse_group_rates(values: &[String], aggregate: u64) -> Result<[u64; super::M
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn server_datagram_send_buffer_accepts_explicit_bounded_override() {
+        let arguments = [
+            "braidpath",
+            "server",
+            "--listen",
+            "127.0.0.1:4433",
+            "--cert",
+            "cert.pem",
+            "--key",
+            "key.pem",
+            "--token-file",
+            "token",
+            "--target",
+            "127.0.0.1:7001",
+        ];
+        let parse_size = |extra: &[&str]| {
+            Cli::try_parse_from(arguments.iter().chain(extra)).map(|cli| match cli.command {
+                Command::Server {
+                    datagram_send_buffer_bytes,
+                    ..
+                } => datagram_send_buffer_bytes,
+                _ => unreachable!(),
+            })
+        };
+        assert_eq!(parse_size(&[]).unwrap(), 1200);
+        for size in ["1200", "9600", "38400", "76800"] {
+            assert_eq!(
+                parse_size(&["--datagram-send-buffer-bytes", size]).unwrap(),
+                size.parse::<u32>().unwrap()
+            );
+        }
+        for size in ["0", "1199", "76801", "4294967296"] {
+            assert!(parse_size(&["--datagram-send-buffer-bytes", size]).is_err());
+        }
+    }
+
     #[test]
     fn client_datagram_send_buffer_defaults_and_explicit_bounds() {
         let arguments = [

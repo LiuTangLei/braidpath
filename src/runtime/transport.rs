@@ -62,13 +62,38 @@ pub fn server(
     key_path: &Path,
     congestion: Congestion,
 ) -> Result<Endpoint> {
+    server_with_datagram_buffer(
+        bind,
+        cert,
+        key_path,
+        congestion,
+        DEFAULT_DATAGRAM_SEND_BUFFER_BYTES,
+    )
+}
+
+/// Server-side outgoing buffer for bounded reverse-direction measurements.
+/// Bytes include Quinn metadata and do not bound datagram residence time.
+pub fn server_with_datagram_buffer(
+    bind: SocketAddr,
+    cert: &Path,
+    key_path: &Path,
+    congestion: Congestion,
+    datagram_send_buffer_bytes: usize,
+) -> Result<Endpoint> {
+    ensure!(
+        (DEFAULT_DATAGRAM_SEND_BUFFER_BYTES..=MAX_DATAGRAM_SEND_BUFFER_BYTES)
+            .contains(&datagram_send_buffer_bytes),
+        "datagram send buffer must be 1200..76800 bytes"
+    );
     let mut tls = rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(certificates(cert)?, key(key_path)?)?;
     tls.alpn_protocols = vec![b"h3".to_vec()];
     tls.max_early_data_size = 0;
     let mut conf = ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(tls)?));
-    conf.transport_config(Arc::new(config(congestion)));
+    let mut transport = config(congestion);
+    transport.datagram_send_buffer_size(datagram_send_buffer_bytes);
+    conf.transport_config(Arc::new(transport));
     Ok(Endpoint::server(conf, bind)?)
 }
 pub fn client(

@@ -1818,6 +1818,7 @@ pub struct ServerOptions {
     pub target: SocketAddr,
     pub max_rate: u64,
     pub congestion: transport::Congestion,
+    pub datagram_send_buffer_bytes: usize,
     pub stats: stats::Metrics,
 }
 pub async fn serve(options: ServerOptions) -> Result<()> {
@@ -1825,11 +1826,12 @@ pub async fn serve(options: ServerOptions) -> Result<()> {
         (64_000..=1_000_000_000).contains(&options.max_rate),
         "invalid server rate"
     );
-    let endpoint = transport::server(
+    let endpoint = transport::server_with_datagram_buffer(
         options.bind,
         &options.cert,
         &options.key,
         options.congestion,
+        options.datagram_send_buffer_bytes,
     )?;
     let secret = Arc::new(format!("Bearer {}", transport::token(&options.token)?));
     let sessions: Sessions = Arc::new(Mutex::new(HashMap::new()));

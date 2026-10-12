@@ -57,6 +57,10 @@ to datagrams does not by itself prove system calls or GSO usage.
 `--mode adaptive` is explicit; congestion remains BBR. An optional
 `--datagram-buffer-bytes` forwards the runtime buffer flag for separately registered
 experiments and does not change the runtime default.
+The runtime `--datagram-send-buffer-bytes` option is available independently on
+client and server. Reverse-direction experiments must configure the server's
+outgoing buffer; the client option only configures that client's outgoing bytes.
+Both endpoints default to 1200 bytes and accept bounded overrides up to 76800.
 `python3 -m unittest bench.test_netem bench.test_readiness` checks accounting,
 bidirectional delay and the authenticated-path readiness gate.
 
