@@ -23,7 +23,24 @@ goodput divides by actual source span. A single diagnostic is not acceptance.
 Boundary snapshots before/after business traffic and after runtime shutdown retain
 namespace UDP/kernel counters, interface counters and socket memory. These counters
 keep their native scopes and must not be added to application drops without
-reconciliation. Registration binds the binary and three harness source hashes.
+reconciliation. Registration binds the binary and four harness source hashes.
+Completion distinguishes orderly shutdown from verified absence of owned
+processes, namespaces and interfaces. A forced stop or partial JSONL tail makes
+the attempt invalid even when cleanup is confirmed. Complete-line CSV from an
+incomplete stream remains diagnostic and is explicitly marked in its status file;
+the original raw evidence is preserved.
+`--topology shared --shared-rate-mbps 400` routes the same four distinct client
+source addresses through one physical access link and an owned router namespace,
+then four entry links with the registered half-RTT delays. All four runtime paths
+use group zero with an explicit group budget capped by the 400 Mbps aggregate
+budget. Shared qdiscs and namespace network counters are included in the same
+evidence; configuration validation checks the common link and every entry link.
+Independent topology remains the default. The initial shared calibration uses
+the clean 400 Mbps access scenario; reduced shared capacities need an aggregate
+rate calibration rather than expecting each path to receive its full leaf rate.
+The CSV BBR pacing rate is the controller's exported internal target; Quinn's
+packet pacer uses cwnd/RTT. UDP I/O operations are transmit batches: their ratio
+to datagrams does not by itself prove system calls or GSO usage.
 `--mode adaptive` is explicit; congestion remains BBR. An optional
 `--datagram-buffer-bytes` forwards the runtime buffer flag for separately registered
 experiments and does not change the runtime default.

@@ -109,6 +109,19 @@ def path_commands(client, server, index, rtt_ms, rate_mbps, queue_packets):
     return commands
 
 
+def client_path_arguments(args):
+    shared = getattr(args, "topology", "independent") == "shared"
+    arguments = []
+    for index in range(4):
+        arguments += ["--entrance", f"10.203.{index + 1}.2:9443",
+                      "--path-bind", f"10.203.{index + 1}.1:{9500 + index}",
+                      "--path-group", str(0 if shared else index)]
+    if shared:
+        group_bps = min(int(args.shared_rate_mbps * 1000000), 400000000)
+        arguments += ["--group-rate-bps", f"0:{group_bps}"]
+    return arguments
+
+
 def shaping_errors(qdiscs, client, server, rtts, rate_mbps, queue_packets):
     errors = []
     for namespace, suffix in ((client, "c"), (server, "s")):
@@ -201,6 +214,10 @@ class Testbed:
         return result
 
     def setup(self, args):
+        if getattr(args, "topology", "independent") == "shared":
+            from bench.netem_shared import setup_shared
+            self.shared_plan = setup_shared(self, args)
+            return
         for namespace in (self.client, self.server):
             self.command(["ip", "netns", "add", namespace])
             self.owned_namespaces.append(namespace)
@@ -221,14 +238,14 @@ class Testbed:
 
     def qdiscs(self):
         result = {}
-        for namespace in (self.client, self.server):
+        for namespace in self.owned_namespaces:
             value = self.command(["ip", "netns", "exec", namespace, "tc", "-j", "-s", "qdisc", "show"])
             result[namespace] = json.loads(value.stdout)
         return result
 
     def network_snapshot(self, filename):
         value = {"sample_unix_ms": int(time.time() * 1000), "namespaces": {}}
-        for namespace in (self.client, self.server):
+        for namespace in self.owned_namespaces:
             prefix = ["ip", "netns", "exec", namespace]
             snmp = self.command([*prefix, "cat", "/proc/net/snmp"]).stdout
             value["namespaces"][namespace] = {
@@ -264,8 +281,12 @@ class Testbed:
             save(self.output / "validation.json", {"passed": False,
                  "failure": failure or "validation incomplete", "ping": observed, "qdiscs_before": qdiscs})
         qdiscs_after = self.qdiscs()
-        errors = shaping_errors(qdiscs_after, self.client, self.server, args.rtt_ms,
-                                args.rate_mbps, args.queue_packets)
+        if getattr(args, "topology", "independent") == "shared":
+            from bench.netem_shared import shared_shaping_errors
+            errors = shared_shaping_errors(qdiscs_after, self.shared_plan)
+        else:
+            errors = shaping_errors(qdiscs_after, self.client, self.server, args.rtt_ms,
+                                    args.rate_mbps, args.queue_packets)
         failure = failure or ("; ".join(errors) if errors else None)
         save(self.output / "validation.json", {"passed": failure is None, "failure": failure,
              "ping": observed, "qdiscs_before": qdiscs, "qdiscs_after": qdiscs_after})
@@ -329,9 +350,7 @@ class Testbed:
             "--ca", cert, "--token-file", token, "--fec", "0", "--redundancy-percent", "0",
             "--rate-bps", "400000000", "--queue-ms", "100", "--latency-target-ms", "100",
             "--receiver-feedback", *stats("client")]
-        for index in range(4):
-            client_args += ["--entrance", f"10.203.{index + 1}.2:9443",
-                            "--path-bind", f"10.203.{index + 1}.1:{9500 + index}", "--path-group", str(index)]
+        client_args += client_path_arguments(args)
         if args.mode == "adaptive":
             client_args += ["--adaptive", "--capacity-probe-bps", "20000000", "--probe-guided-recovery"]
         if args.datagram_buffer_bytes is not None:
@@ -456,6 +475,8 @@ def main():
     parser.add_argument("--rate-mbps", type=float, default=100)
     parser.add_argument("--queue-packets", type=int, default=1024)
     parser.add_argument("--mode", choices=["fixed", "adaptive"], default="fixed")
+    parser.add_argument("--topology", choices=["independent", "shared"], default="independent")
+    parser.add_argument("--shared-rate-mbps", type=float, default=400)
     parser.add_argument("--datagram-buffer-bytes", type=int)
     args = parser.parse_args()
     if (not Path("/.dockerenv").exists() or os.environ.get("BRAIDPATH_NETEM_CONTAINER") != "1"
@@ -471,6 +492,8 @@ def main():
         or not math.isfinite(args.rate_mbps) or not 1 <= args.rate_mbps <= 1000
         or not 32 <= args.queue_packets <= 4096):
         parser.error("invalid finite shaping settings")
+    if not math.isfinite(args.shared_rate_mbps) or not 1 <= args.shared_rate_mbps <= 400:
+        parser.error("shared physical rate must be 1..400 Mbps")
     if args.datagram_buffer_bytes is not None and not 1200 <= args.datagram_buffer_bytes <= 76800:
         parser.error("datagram buffer must be 1200..76800 bytes")
     if args.action == "run":
@@ -482,7 +505,7 @@ def main():
     registration.update({"registered_unix_ms": int(time.time() * 1000), "payload_bytes": 964,
                          "deadline_ms": 200, "outer_budget_bps": 400000000, "full_population": True})
     registration["harness_sha256"] = {name: hashlib.sha256((Path(__file__).parent / name).read_bytes()).hexdigest()
-        for name in ("netem.py", "readiness.py", "netem_calibration.py")}
+        for name in ("netem.py", "readiness.py", "netem_calibration.py", "netem_shared.py")}
     if args.binary:
         registration["binary_sha256"] = hashlib.sha256(args.binary.read_bytes()).hexdigest()
     save(args.output / "registration.json", registration)
