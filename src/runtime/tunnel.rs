@@ -469,6 +469,11 @@ impl WaitingSend {
         if !allowed(&self.prepared, now, &paths) {
             return Poll::Ready(SendReadiness::GateChanged);
         }
+        // Control checks can take time or acquire contended locks. Refresh after
+        // them, immediately before Quinn gets ownership of this datagram.
+        if admission_now().saturating_duration_since(self.prepared.front.created) >= lifetime {
+            return Poll::Ready(SendReadiness::Expired);
+        }
         match self.send.as_mut().poll(cx) {
             Poll::Pending => Poll::Pending,
             Poll::Ready(Ok(())) => Poll::Ready(SendReadiness::Admitted {
@@ -494,6 +499,27 @@ enum SenderEvent {
     Tick,
     Input(Option<QueuedRecord>),
     Ready(SendReadiness),
+}
+
+fn send_datagram_before_deadline(
+    conn: &quinn::Connection,
+    data: Bytes,
+    created: Instant,
+    lifetime: Duration,
+) -> Option<std::result::Result<Instant, quinn::SendDatagramError>> {
+    // Preparation and lock contention can outlive the queue-head preflight.
+    if admission_now().saturating_duration_since(created) >= lifetime {
+        return None;
+    }
+    Some(conn.send_datagram(data).map(|()| Instant::now()))
+}
+
+fn admission_now() -> Instant {
+    #[cfg(test)]
+    if let Some(now) = ADMISSION_CLOCK_OVERRIDE.with(|clock| clock.take()) {
+        return now;
+    }
+    Instant::now()
 }
 
 struct Admission<'a> {
@@ -680,6 +706,7 @@ impl SendAccounting<'_> {
 #[cfg(test)]
 thread_local! {
     static QUALITY_STATS_PUBLICATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static ADMISSION_CLOCK_OVERRIDE: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
 }
 
 fn publish_receiver_feedback(paths: &[OutPath], metrics: &Scope) {
@@ -1279,7 +1306,7 @@ async fn sender(
         let mut stalled_originals = 0usize;
         let mut blocked_repair = false;
         let mut next_wait = None;
-        while !queue.is_empty() {
+        'drain: while !queue.is_empty() {
             let now = Instant::now();
             let now_us = epoch.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
             let repair_ready = queue.front(true).is_some_and(|p| {
@@ -1486,12 +1513,18 @@ async fn sender(
                     });
                     continue;
                 }
-                match path.conn.send_datagram(data) {
-                    Ok(()) => {
-                        accepted = Some((i, frame_bytes, Instant::now()));
+                match send_datagram_before_deadline(&path.conn, data, front.created, lifetime) {
+                    None => {
+                        let expired = queue.pop(repair).expect("expired front");
+                        account_expired(&expired, Instant::now(), &metrics);
+                        stalled_originals = 0;
+                        continue 'drain;
+                    }
+                    Some(Ok(at)) => {
+                        accepted = Some((i, frame_bytes, at));
                         break;
                     }
-                    Err(_) => metrics.path(path.id, |p| p.quinn_send_error_attempts += 1),
+                    Some(Err(_)) => metrics.path(path.id, |p| p.quinn_send_error_attempts += 1),
                 }
             }
             let Some((index, frame_bytes, at)) = accepted else {

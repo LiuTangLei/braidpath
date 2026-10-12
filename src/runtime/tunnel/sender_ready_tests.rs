@@ -273,6 +273,98 @@ impl Accounting {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn direct_admission_rechecks_ingress_deadline_after_preparation() {
+    let pair = Pair::connect().await;
+    let path = pair.path();
+    let mut accounting = Accounting::new();
+    let created = Instant::now();
+    let lifetime = Duration::from_millis(100);
+    // Both classes inherit the original's ingress time, even after preparation.
+    accounting.enqueue(wire::plain(&record(1)).unwrap(), created);
+    let mut encoder = Encoder::new(1, Duration::from_millis(25)).unwrap();
+    let repair = encoder
+        .push(&record(2).encode().unwrap(), created)
+        .unwrap()
+        .pop()
+        .unwrap();
+    accounting.enqueue(wire::shard(repair), created);
+    let prepared: Vec<_> = [false, true]
+        .into_iter()
+        .map(|repair| accounting.prepare(&path, repair))
+        .collect();
+    let cached_preflight = created;
+    assert!(cached_preflight.saturating_duration_since(created) < lifetime);
+    for attempt in prepared {
+        assert!(pair.outgoing.datagram_send_buffer_space() >= attempt.data.len());
+        // Advance only the final admission clock, simulating time spent preparing
+        // or waiting for locks after the cached preflight, without wall-clock sleep.
+        ADMISSION_CLOCK_OVERRIDE.with(|clock| clock.set(Some(created + lifetime)));
+        assert!(
+            send_datagram_before_deadline(
+                &pair.outgoing,
+                attempt.data,
+                attempt.front.created,
+                lifetime,
+            )
+            .is_none(),
+            "an expired prepared frame must never enter a ready Quinn buffer"
+        );
+        let expired = accounting.queue.pop(attempt.repair).unwrap();
+        account_expired(&expired, created + lifetime, &accounting.scope);
+    }
+    accounting.assert_no_admission(&path, 0);
+    let counts = accounting.direction().symbols;
+    assert_eq!(counts.originals_expired_dropped, 1);
+    assert_eq!(counts.repairs_expired_dropped, 1);
+    assert_eq!(counts.expiry_wait.count, 2);
+    let fresh = wire::http_datagram(0, &wire::plain(&record(3)).unwrap()).unwrap();
+    assert!(
+        send_datagram_before_deadline(
+            &pair.outgoing,
+            fresh.clone(),
+            Instant::now(),
+            Duration::from_secs(1),
+        )
+        .unwrap()
+        .is_ok()
+    );
+    assert_eq!(pair.receive().await, fresh);
+    pair.assert_quiet().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn ready_admission_rechecks_deadline_after_control_gate() {
+    let pair = Pair::connect().await;
+    let path = pair.path();
+    let paths = Arc::new(Mutex::new(vec![path.clone()]));
+    let mut accounting = Accounting::new();
+    accounting.enqueue(wire::plain(&record(1)).unwrap(), Instant::now());
+    let mut prepared = accounting.prepare(&path, false);
+    prepared.front.created = Instant::now();
+    let lifetime = Duration::from_millis(100);
+    let expired_at = prepared.front.created + lifetime;
+    assert!(pair.outgoing.datagram_send_buffer_space() >= prepared.data.len());
+    let mut wait = WaitingSend::new(prepared);
+    let mut gate_checked = false;
+    let readiness = poll_fn(|cx| {
+        wait.poll(cx, &paths, lifetime, |_, _, _| {
+            gate_checked = true;
+            ADMISSION_CLOCK_OVERRIDE.with(|clock| clock.set(Some(expired_at)));
+            true
+        })
+    })
+    .await;
+    assert!(
+        gate_checked,
+        "the initial age check must pass before the gate"
+    );
+    assert!(matches!(readiness, SendReadiness::Expired));
+    wait.cancel();
+    accounting.assert_no_admission(&path, 1);
+    pair.assert_quiet().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn quinn_readiness_wakes_without_input_or_timer_and_commits_each_symbol_once() {
     let pair = Pair::connect().await;
     let path = pair.path();
