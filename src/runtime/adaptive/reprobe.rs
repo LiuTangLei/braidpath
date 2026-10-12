@@ -321,23 +321,44 @@ impl Measurement {
         if input.control_sample
             && input.sample.now_us.saturating_sub(input.admission_span_us) >= self.started_us
         {
-            self.admitted = self.admitted.saturating_add(input.admitted);
-            self.allowance += input.allowance;
+            let start = input.sample.now_us.saturating_sub(input.admission_span_us);
+            if let Some(previous) = self
+                .admission_samples
+                .back_mut()
+                .filter(|sample| sample.at_us.saturating_sub(sample.span_us) == start)
+            {
+                // Evidence can retain the same unsettled control interval
+                // across many observations. Replace its cumulative sample;
+                // only real increments belong to the phase totals.
+                self.admitted = self
+                    .admitted
+                    .saturating_sub(previous.wire_bytes)
+                    .saturating_add(input.admitted);
+                self.allowance += input.allowance - previous.allowance_bytes;
+                previous.at_us = input.sample.now_us;
+                previous.span_us = input.admission_span_us;
+                previous.wire_bytes = input.admitted;
+                previous.symbol_bytes = input.admitted_symbol_bytes;
+                previous.allowance_bytes = input.allowance;
+            } else {
+                self.admitted = self.admitted.saturating_add(input.admitted);
+                self.allowance += input.allowance;
+                if self.admission_samples.len() == 16 {
+                    self.admission_samples.pop_front();
+                }
+                self.admission_samples.push_back(AdmissionSample {
+                    at_us: input.sample.now_us,
+                    span_us: input.admission_span_us,
+                    wire_bytes: input.admitted,
+                    symbol_bytes: input.admitted_symbol_bytes,
+                    allowance_bytes: input.allowance,
+                });
+            }
             while self.admission_samples.front().is_some_and(|sample| {
                 input.sample.now_us.saturating_sub(sample.at_us) >= QUALIFY_US
             }) {
                 self.admission_samples.pop_front();
             }
-            if self.admission_samples.len() == 16 {
-                self.admission_samples.pop_front();
-            }
-            self.admission_samples.push_back(AdmissionSample {
-                at_us: input.sample.now_us,
-                span_us: input.admission_span_us,
-                wire_bytes: input.admitted,
-                symbol_bytes: input.admitted_symbol_bytes,
-                allowance_bytes: input.allowance,
-            });
         }
         if input.new_report
             && input.sample.now_us >= self.settle_until_us
@@ -1025,6 +1046,142 @@ impl Controller {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn admission_observation(
+        measurement: &mut Measurement,
+        now: u64,
+        span: u64,
+        wire: u64,
+        symbols: u64,
+        allowance: f64,
+    ) {
+        let sample = Observation {
+            now_us: now,
+            ..Observation::default()
+        };
+        measurement.observe(&Input {
+            sample: &sample,
+            rate_bps: 1_000_000,
+            maximum_bps: 100_000_000,
+            queue_ms: 0.0,
+            target_ms: 100.0,
+            fresh: true,
+            healthy: true,
+            fast_loss: false,
+            blocked: false,
+            ordinary_loss: true,
+            last_growth_us: 0,
+            stalled: true,
+            new_report: false,
+            control_sample: true,
+            admission_span_us: span,
+            admitted: wire,
+            admitted_symbol_bytes: symbols,
+            allowance,
+            loss_expected: 0,
+            loss_lost: 0,
+            loss_batch: None,
+        });
+    }
+
+    #[test]
+    fn repeated_actual_admission_window_consumes_only_real_increment() {
+        let mut measurement = Measurement::new(17_000_000, 0);
+        for _ in 0..100 {
+            admission_observation(
+                &mut measurement,
+                18_000_000,
+                972_000,
+                68_930,
+                61 * 1020,
+                70_511.624_25,
+            );
+        }
+        assert_eq!(measurement.admitted, 68_930);
+        assert_eq!(measurement.allowance, 70_511.624_25);
+        assert_eq!(measurement.admission_samples.len(), 1);
+        for _ in 0..100 {
+            admission_observation(
+                &mut measurement,
+                18_100_000,
+                1_072_000,
+                76_840,
+                68 * 1020,
+                77_852.761_75,
+            );
+        }
+        assert_eq!(measurement.admitted, 68_930 + 7 * 1130);
+        assert_eq!(measurement.allowance, 77_852.761_75);
+        assert_eq!(measurement.admission_samples.len(), 1);
+        let sample = &measurement.admission_samples[0];
+        assert_eq!(sample.wire_bytes, 76_840);
+        assert_eq!(sample.symbol_bytes, 68 * 1020);
+        assert_eq!(sample.span_us, 1_072_000);
+
+        for _ in 0..100 {
+            admission_observation(
+                &mut measurement,
+                18_300_000,
+                200_000,
+                14 * 1130,
+                14 * 1020,
+                20_000.0,
+            );
+        }
+        assert_eq!(measurement.admitted, 76_840 + 14 * 1130);
+        assert_eq!(measurement.allowance, 97_852.761_75);
+        assert_eq!(measurement.admission_samples.len(), 2);
+        assert_eq!(
+            measurement
+                .admission_samples
+                .iter()
+                .map(|s| s.span_us)
+                .sum::<u64>(),
+            1_272_000
+        );
+        assert_eq!(
+            measurement
+                .admission_samples
+                .iter()
+                .map(|s| s.symbol_bytes)
+                .sum::<u64>(),
+            82 * 1020
+        );
+    }
+
+    #[test]
+    fn repeated_sparse_burst_cannot_manufacture_exercise_or_service_span() {
+        let mut measurement = Measurement::new(0, 0);
+        admission_observation(&mut measurement, 1_000_000, 1_000_000, 0, 0, 10_000.0);
+        for _ in 0..100 {
+            admission_observation(&mut measurement, 1_200_000, 200_000, 1130, 1020, 1130.0);
+        }
+        assert!(
+            !measurement.exercised(),
+            "repeating one burst cannot replace unused allowance"
+        );
+        assert_eq!(measurement.admitted, 1130);
+        assert_eq!(measurement.admission_samples.len(), 2);
+
+        let mut duration = Measurement::new(0, 0);
+        for _ in 0..100 {
+            admission_observation(&mut duration, 200_000, 200_000, 1130, 1020, 1130.0);
+        }
+        for number in 0..=3 {
+            duration.window.push(Cursor {
+                number,
+                receiver_us: 7_000_000_000 + number * 500_000,
+                bytes: number * 1000,
+            });
+        }
+        assert!(duration.exercised());
+        assert!(duration.window.complete());
+        assert!(
+            !duration.service_keeps_up(Some(7_000_000_000)),
+            "one200ms admission interval is not1.5s"
+        );
+        assert_eq!(duration.admission_samples[0].span_us, 200_000);
+    }
 
     struct Driver {
         controller: Controller,
