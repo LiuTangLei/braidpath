@@ -290,6 +290,99 @@ impl Accounting {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn adaptive_small_readiness_ignores_fast_peer_without_current_packet_credit() {
+    let fast = Pair::connect().await;
+    let slow = Pair::connect().await;
+    let path0 = fast.path();
+    let mut path1 = slow.path();
+    path1.id = 1;
+    path1.quality.lock().unwrap().snapshot.sender_estimate = quality::Estimate {
+        updated_us: Some(0),
+        delay_variation_ms: 500.0,
+        ..Default::default()
+    };
+    let paths = Arc::new(Mutex::new(vec![path0.clone(), path1.clone()]));
+    let mut accounting = Accounting::new();
+    accounting.policy.adaptive = true;
+    accounting.policy.fec = 0;
+    accounting.policy.redundancy = 0;
+    accounting.policy.small_fec_bytes = 128;
+    accounting.policy.latency_target_ms = 1000;
+    accounting.controllers = std::array::from_fn(|_| {
+        adaptive::PathController::new(accounting.policy.rate, accounting.policy.latency_target_ms)
+    });
+    // Keep controller time fixed so executor scheduling cannot refill the fast
+    // peer's credit while the real Quinn driver drains the other connection.
+    accounting.controllers[0].admitted(0, 2400);
+    assert!(accounting.controllers[0].decision(0).eligible);
+    let created = Instant::now();
+    let mut encoder = Encoder::new(1, Duration::from_millis(25)).unwrap();
+    let small = Record {
+        flow: 2,
+        id: 1,
+        payload: vec![7; 128],
+    };
+    for symbol in encode_record(&small, &mut encoder, &accounting.policy, created).unwrap() {
+        accounting.enqueue(symbol, created);
+    }
+    let prepared = accounting.prepare(&path1, false);
+    assert_eq!(
+        business_ready_candidates(
+            &[(0, 1), (1, 1)],
+            &paths.lock().unwrap(),
+            &mut accounting.controllers,
+            0,
+            prepared.front.data.len() + quality::HEADER,
+            0.0,
+            None,
+        ),
+        vec![(1, 1)],
+        "the immediate drain can only select the slower, credited path"
+    );
+    let lifetime = accounting.policy.admission_lifetime();
+    let mut wait = WaitingSend::new(prepared);
+    let wakes = block_and_poll(&slow, &mut wait, &paths, lifetime);
+    let waker = Waker::from(wakes.clone());
+    let mut allowed = |attempt: &PreparedSend, now: Instant, paths: &[OutPath]| {
+        attempt.small_delivery_allowed(
+            &accounting.policy,
+            paths,
+            &mut accounting.controllers,
+            0,
+            now.saturating_duration_since(attempt.front.created),
+        )
+    };
+    let blocked = wait.poll(
+        &mut TaskContext::from_waker(&waker),
+        &paths,
+        lifetime,
+        &mut allowed,
+    );
+    assert!(
+        blocked.is_pending(),
+        "an eligible peer without this packet's credit must not invalidate the prepared path: {blocked:?}"
+    );
+    assert_eq!(slow.receive().await.as_ref(), FILLER);
+    assert!(wakes.0.load(Ordering::Relaxed) > 0);
+    let ready = timeout(
+        lifetime,
+        poll_fn(|cx| wait.poll(cx, &paths, lifetime, &mut allowed)),
+    )
+    .await
+    .unwrap();
+    let SendReadiness::Admitted { at, next_cursor } = ready else {
+        panic!("{ready:?}")
+    };
+    let prepared = wait.cancel();
+    accounting.commit_on_paths(&prepared, at, next_cursor, &paths.lock().unwrap());
+    assert_eq!(slow.receive().await, prepared.data);
+    assert_eq!(accounting.direction().symbols.originals_quinn_admitted, 1);
+    assert_eq!(accounting.direction().symbols.repairs_quinn_admitted, 0);
+    slow.assert_quiet().await;
+    fast.assert_quiet().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn small_sender_avoids_measured_late_path_for_both_symbols() {
     let fast = Pair::connect().await;
     let slow = Pair::connect().await;

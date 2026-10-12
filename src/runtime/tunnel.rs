@@ -457,6 +457,59 @@ struct PreparedSend {
     group_reserve: usize,
 }
 
+impl PreparedSend {
+    fn small_delivery_allowed(
+        &self,
+        policy: &Policy,
+        paths: &[OutPath],
+        controllers: &mut [adaptive::PathController; MAX_PATHS],
+        now_us: u64,
+        age: Duration,
+    ) -> bool {
+        if !small_delivery::applies(policy, &self.front) {
+            return true;
+        }
+        let candidates: Vec<_> = paths
+            .iter()
+            .filter(|path| {
+                path.conn.close_reason().is_none()
+                    && (!policy.adaptive
+                        || controllers[usize::from(path.id)].decision(now_us).eligible)
+            })
+            .map(|path| (path.id, 1))
+            .collect();
+        // Match the main drain's current packet cost and age. An eligible fast
+        // peer without business credit must not invalidate a writable peer.
+        let candidates = if policy.adaptive {
+            business_ready_candidates(
+                &candidates,
+                paths,
+                controllers,
+                now_us,
+                self.front.data.len()
+                    + if policy.receiver_feedback {
+                        quality::HEADER
+                    } else {
+                        0
+                    },
+                age.as_secs_f64() * 1000.0,
+                None,
+            )
+        } else {
+            candidates
+        };
+        let eligible = candidates.iter().fold(0, |mask, (id, _)| mask | (1 << id));
+        let timely = small_delivery::mask(
+            paths,
+            eligible,
+            policy.admission_lifetime().saturating_sub(age),
+            policy.latency_target_ms,
+        );
+        timely & (1 << self.path.id) != 0
+            && (!self.repair || small_delivery::copy_ready(&self.path, self.used))
+    }
+}
+
 struct WaitingSend {
     prepared: PreparedSend,
     send: Pin<Box<dyn Future<Output = Result<(), quinn::SendDatagramError>> + Send>>,
@@ -896,16 +949,8 @@ async fn sender(
                     {
                         return false;
                     }
-                    if small_delivery::applies(&policy, &attempt.front) {
-                        let eligible = paths.iter()
-                            .filter(|path| !policy.adaptive || controllers[usize::from(path.id)].decision(now_us).eligible)
-                            .fold(0, |mask, path| mask | (1 << path.id));
-                        let timely = small_delivery::mask(paths, eligible, lifetime.saturating_sub(age), policy.latency_target_ms);
-                        if timely & (1 << attempt.path.id) == 0
-                            || (attempt.repair && !small_delivery::copy_ready(&attempt.path, attempt.used))
-                        {
-                            return false;
-                        }
+                    if !attempt.small_delivery_allowed(&policy, paths, &mut controllers, now_us, age) {
+                        return false;
                     }
                     if !policy.adaptive {
                         return true;
