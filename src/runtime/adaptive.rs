@@ -2657,6 +2657,12 @@ impl PathController {
         measured_symbol_bytes: usize,
     ) {
         self.refill(now_us);
+        // A successful Quinn admission proves the queue became writable
+        // between control snapshots. Repeated full snapshots alone cannot
+        // establish uninterrupted transport blockage across that service.
+        if wire_bytes > 0 {
+            self.blocked_since_us = None;
+        }
         self.demand_activity
             .update(now_us, wire_bytes > 0 && measured_symbol_bytes > 0);
         self.tokens = (self.tokens - wire_bytes as f64).max(0.0);
@@ -2797,6 +2803,69 @@ impl PathController {
 mod tests {
     use super::*;
     use std::collections::VecDeque;
+
+    #[test]
+    fn successful_admissions_break_sampled_transport_blockage() {
+        let mut controller = PathController::new(100_000_000, 100);
+        controller.observe(&observation(0, 1.0));
+        controller.rate_bps = 100_000_000;
+        let mut received = 0;
+        for tick in 1..=20 {
+            let end = tick * 100_000;
+            // A shared producer offers this path 72 Mbps, below its 100 Mbps
+            // allowance. Quinn drains every ms, but each control snapshot
+            // happens just after the latest successful admission fills it.
+            for now in ((end - 100_000 + 1_000)..=end).step_by(1_000) {
+                for _ in 0..9 {
+                    assert!(controller.allow(now, 1000, 0.0));
+                    controller.admitted_symbol(now, 1000, 1000);
+                    received += 1000;
+                }
+            }
+            let mut sample = observation(end, 1.0);
+            sample.transport_blocked = true;
+            sample.send_queue_bytes = 1000;
+            sample.delivered_bytes = received;
+            sample.delivered_bps = Some(72_000_000.0);
+            sample.delivery_report_time_us = Some(100_000_000 + end);
+            sample.delivery_sample_span_us = 100_000;
+            sample.admitted_symbol_bytes = Some(received);
+            sample.admitted_symbols = Some(received / 1000);
+            sample.feedback_sample_symbols = 900;
+            sample.finalized_expected = Some(received / 1000);
+            sample.finalized_lost = Some(0);
+            controller.observe(&sample);
+            assert_eq!(
+                controller.rate_bps, 100_000_000,
+                "successful service between snapshots is not continuous blockage at {end}: {:?}",
+                controller.rate_changes
+            );
+        }
+        assert!(!controller.congestion_seen);
+    }
+
+    #[test]
+    fn transport_without_admission_still_reaches_the_blockage_brake() {
+        let mut controller = PathController::new(100_000_000, 100);
+        controller.observe(&observation(0, 1.0));
+        controller.rate_bps = 100_000_000;
+        for tick in 1..=5 {
+            let mut sample = observation(tick * 100_000, 1.0);
+            sample.transport_blocked = true;
+            sample.send_queue_bytes = 1000;
+            sample.delivered_bps = Some(0.0);
+            sample.delivered_bytes = 0;
+            sample.feedback_sample_symbols = 0;
+            controller.observe(&sample);
+        }
+        assert!(controller.rate_bps < 100_000_000);
+        assert!(
+            controller
+                .rate_changes
+                .iter()
+                .any(|change| matches!(change.reason, RateReason::TransportBlockedBrake))
+        );
+    }
 
     #[derive(serde::Serialize)]
     struct DeficitDelayReplay {
