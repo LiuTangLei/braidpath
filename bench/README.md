@@ -24,6 +24,13 @@ Boundary snapshots before/after business traffic and after runtime shutdown reta
 namespace UDP/kernel counters, interface counters and socket memory. These counters
 keep their native scopes and must not be added to application drops without
 reconciliation. Registration binds the binary and four harness source hashes.
+Boundary snapshots and the existing 250 ms qdisc series also retain optional
+raw Linux VM guest-wide CPU/memory/I/O pressure, container cgroup memory limits
+and events, and the owned source main thread's scheduler counters while it is
+alive. Scope labels keep guest pressure separate from container and thread
+evidence. Missing or unreadable resource telemetry is recorded without changing
+network validation or acceptance; these observations do not retroactively prove
+the cause of earlier source stalls. CPU remains diagnostic.
 Completion distinguishes orderly shutdown from verified absence of owned
 processes, namespaces and interfaces. A forced stop or partial JSONL tail makes
 the attempt invalid even when cleanup is confirmed. Complete-line CSV from an

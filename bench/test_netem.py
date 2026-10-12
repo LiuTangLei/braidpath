@@ -43,6 +43,51 @@ class DeliveryAccounting(unittest.TestCase):
 
 
 class NetworkAndCounters(unittest.TestCase):
+    def test_unavailable_resource_diagnostics_do_not_block_network_or_business_gate(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            bed = Testbed(output)
+            bed.owned_namespaces = ["owned"]
+            def command(argv):
+                raw = "Udp: InErrors RcvbufErrors\nUdp: 0 0\n" if argv[-1] == "/proc/net/snmp" else "[]"
+                return SimpleNamespace(stdout=raw)
+            bed.command = command
+            with patch("bench.netem.Path.read_text", side_effect=PermissionError("optional file unavailable")):
+                bed.network_snapshot("network.json")
+            evidence = json.loads((output / "network.json").read_text())
+            self.assertEqual(evidence["namespaces"]["owned"]["snmp_counters"]["Udp"]["RcvbufErrors"], 0)
+            self.assertIsNone(evidence["guest_pressure"]["memory"]["raw"])
+            self.assertIn("PermissionError", evidence["container_memory"]["memory.current"]["error"])
+            self.assertIsNone(evidence["container_cpu"]["cpu.stat"])
+            result = summarize(samples(40000, 40000), {"requested_count": 40000, "sent": 40000,
+                               "send_span_seconds": 1}, 40000)
+            self.assertTrue(result["joint_gate_passed"])
+            self.assertEqual(bed.sample_errors, [])
+
+    def test_resource_scopes_and_source_main_thread_require_a_live_owned_process(self):
+        with tempfile.TemporaryDirectory() as directory:
+            bed = Testbed(Path(directory))
+            source = SimpleNamespace(pid=123, poll=lambda: None)
+            bed.jobs = [("client", SimpleNamespace(pid=999, poll=lambda: None)), ("source", source)]
+            reads = []
+            def read(path):
+                reads.append(str(path))
+                return "1000 2000 3\n"
+            with patch("bench.netem.Path.read_text", side_effect=read, autospec=True):
+                evidence = bed.resource_snapshot()
+            self.assertEqual(evidence["guest_pressure"]["scope"], "linux_vm_guest_global")
+            self.assertEqual(evidence["container_memory"]["scope"], "container_cgroup")
+            self.assertEqual(evidence["source_main_thread_schedstat"]["raw"], "1000 2000 3\n")
+            self.assertEqual([path for path in reads if "/task/" in path], ["/proc/123/task/123/schedstat"])
+            source.poll = lambda: 0
+            with patch("bench.netem.Path.read_text", side_effect=read, autospec=True):
+                self.assertIsNone(bed.resource_snapshot()["source_main_thread_schedstat"]["pid"])
+            with patch.object(source, "poll", side_effect=[None, 0]), \
+                 patch("bench.netem.Path.read_text", side_effect=read, autospec=True):
+                exited = bed.resource_snapshot()["source_main_thread_schedstat"]
+            self.assertIsNone(exited["raw"])
+            self.assertIn("exited during sample", exited["error"])
+
     def test_partial_tail_is_preserved_and_marks_diagnostic_csv_incomplete(self):
         with tempfile.TemporaryDirectory() as directory:
             raw, csv_path = Path(directory) / "raw.jsonl", Path(directory) / "path.csv"

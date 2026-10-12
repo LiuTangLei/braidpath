@@ -23,6 +23,14 @@ def save(path, value):
     path.write_text(json.dumps(value, indent=2, allow_nan=False) + "\n")
 
 
+def optional_raw_text(path):
+    """Optional resource evidence must never become a benchmark validity gate."""
+    try:
+        return {"raw": path.read_text(), "error": None}
+    except (OSError, UnicodeError) as error:
+        return {"raw": None, "error": f"{type(error).__name__}: {error}"}
+
+
 def parse_snmp(text):
     sections = {}
     lines = text.splitlines()
@@ -245,12 +253,7 @@ class Testbed:
 
     def network_snapshot(self, filename):
         value = {"sample_unix_ms": int(time.time() * 1000), "namespaces": {}}
-        # Resource diagnostics explain an underfilled source; CPU is not a gate.
-        value["container_cpu"] = {
-            name: path.read_text() if path.exists() else None
-            for name in ("cpu.max", "cpu.stat")
-            for path in [Path("/sys/fs/cgroup") / name]
-        }
+        value.update(self.resource_snapshot())
         for namespace in self.owned_namespaces:
             prefix = ["ip", "netns", "exec", namespace]
             snmp = self.command([*prefix, "cat", "/proc/net/snmp"]).stdout
@@ -260,6 +263,33 @@ class Testbed:
                 "udp_sockets_with_memory": self.command([*prefix, "ss", "-u", "-a", "-m", "-n"]).stdout,
             }
         save(self.output / filename, value)
+
+    def resource_snapshot(self):
+        cpu = {name: optional_raw_text(Path("/sys/fs/cgroup") / name)
+               for name in ("cpu.max", "cpu.stat")}
+        source = {"scope": "owned_source_main_thread", "pid": None, "tid": None,
+                  "raw": None, "error": "owned source process is not running"}
+        for role, process in self.jobs:
+            if role == "source" and process.poll() is None:
+                source.update({"pid": process.pid, "tid": process.pid,
+                    **optional_raw_text(Path(f"/proc/{process.pid}/task/{process.pid}/schedstat"))})
+                # Do not attribute a re-used PID after the owned process exits.
+                if process.poll() is not None:
+                    source.update({"raw": None, "error": "owned source exited during sample"})
+                break
+        return {
+            "container_cpu": {"scope": "container_cgroup",
+                              **{name: result["raw"] for name, result in cpu.items()},
+                              "read_errors": {name: result["error"] for name, result in cpu.items()
+                                              if result["error"]}},
+            "guest_pressure": {"scope": "linux_vm_guest_global",
+                               **{name: optional_raw_text(Path("/proc/pressure") / name)
+                                  for name in ("cpu", "memory", "io")}},
+            "container_memory": {"scope": "container_cgroup",
+                                 **{name: optional_raw_text(Path("/sys/fs/cgroup") / name)
+                                    for name in ("memory.current", "memory.max", "memory.events")}},
+            "source_main_thread_schedstat": source,
+        }
 
     def validate(self, args):
         observed = []
@@ -335,7 +365,7 @@ class Testbed:
                 while not self.stop.is_set():
                     try:
                         target.write(json.dumps({"sample_unix_ms": int(time.time() * 1000),
-                                                 "qdiscs": self.qdiscs()}) + "\n")
+                            "qdiscs": self.qdiscs(), **self.resource_snapshot()}) + "\n")
                         target.flush()
                     except Exception as error:
                         self.sample_errors.append(repr(error))
