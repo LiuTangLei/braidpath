@@ -2264,6 +2264,44 @@ fn queue_error<T>(
     }
 }
 
+fn publish_retention(decoder: &Receiver, metrics: &Scope) {
+    if let Some(snapshot) = decoder.retention_snapshot() {
+        metrics.publish_fec_retention(snapshot);
+    }
+}
+
+async fn retention_deadline(decoder: &Receiver) {
+    if let Some(at) = decoder.next_retention_deadline() {
+        tokio::time::sleep_until(tokio::time::Instant::from_std(at)).await;
+    } else {
+        std::future::pending::<()>().await;
+    }
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn adaptive_retention_timer_expires_without_another_packet() {
+    let at = Instant::now();
+    let mut decoder = Receiver::configured(Duration::from_millis(900), true);
+    let record = Record {
+        flow: 1,
+        id: 1,
+        payload: vec![7; 32],
+    };
+    let packet = wire::shard(crate::fec::Shard::Data {
+        block: 0,
+        index: 0,
+        payload: record.encode().unwrap(),
+    });
+    decoder.receive(&packet, at).unwrap();
+    timeout(Duration::from_secs(1), retention_deadline(&decoder))
+        .await
+        .unwrap();
+    decoder.expire_adaptive(Instant::now());
+    assert_eq!(decoder.retention_snapshot().unwrap().live_blocks, 0);
+    assert!(decoder.next_retention_deadline().is_none());
+}
+
 fn receive_records(decoder: &mut Receiver, metrics: &Scope, pid: u8, data: &[u8]) -> Vec<Record> {
     let before = (
         decoder.original_packets,
@@ -2343,6 +2381,7 @@ fn receive_records(decoder: &mut Receiver, metrics: &Scope, pid: u8, data: &[u8]
         p.stale_symbols_dropped += delta.4;
         p.invalid_symbols_dropped += invalid;
     });
+    publish_retention(decoder, metrics);
     result.unwrap_or_default()
 }
 
@@ -2351,6 +2390,7 @@ enum Event {
     Reply(u32, Vec<u8>, Instant),
 }
 struct Session {
+    adaptive_fec_retention: bool,
     generations: Mutex<[Option<u64>; MAX_PATHS]>,
     empty_since: Mutex<Option<Instant>>,
     events: mpsc::Sender<Event>,
@@ -2382,7 +2422,11 @@ async fn session_loop(
         session.observation_notify.clone(),
     ));
     let mut stop = session.stop.subscribe();
-    let mut decoder = Receiver::with_repair_wait(Duration::from_millis(session.policy.queue_ms));
+    let mut decoder = Receiver::configured(
+        Duration::from_millis(session.policy.queue_ms),
+        session.adaptive_fec_retention,
+    );
+    publish_retention(&decoder, &session.forward);
     let mut delivery = local_delivery::Queue::new(
         session.forward.clone(),
         Duration::from_millis(
@@ -2409,6 +2453,7 @@ async fn session_loop(
                 for path in p.iter(){let stats=path.conn.stats();info!(path=path.id,rtt_ms=path.conn.rtt().as_secs_f64()*1000.0,tx_packets=stats.udp_tx.datagrams,rx_packets=stats.udp_rx.datagrams,tx_bytes=stats.udp_tx.bytes,rx_bytes=stats.udp_rx.bytes,lost=stats.path.lost_packets,cwnd=stats.path.cwnd,"server path statistics");}
                 info!(paths=p.len(),flows=flows.len(),originals=decoder.originals,recovered=decoder.recovered,duplicates=decoder.duplicates,invalid=decoder.invalid,dropped,ingress_drops=session.ingress_drops.load(Ordering::Relaxed),"server session");
             },
+            _=retention_deadline(&decoder)=>{decoder.expire_adaptive(Instant::now());publish_retention(&decoder,&session.forward);},
             completed=delivery.ready()=>dropped+=completed,
             e=events.recv()=>match e {
                 Some(Event::Wire(pid,data))=>{
@@ -2460,6 +2505,8 @@ async fn session_loop(
         while tasks.try_join_next().is_some() {}
     }
     dropped += delivery.close();
+    decoder.close_retention();
+    publish_retention(&decoder, &session.forward);
     let _ = session.stop.send(true);
     events.close();
     while let Ok(event) = events.try_recv() {
@@ -2510,6 +2557,7 @@ async fn session_loop(
 }
 
 pub struct ServerOptions {
+    pub adaptive_fec_retention: bool,
     pub bind: SocketAddr,
     pub cert: std::path::PathBuf,
     pub key: std::path::PathBuf,
@@ -2557,11 +2605,11 @@ pub async fn serve(options: ServerOptions) -> Result<()> {
             incoming=endpoint.accept()=>{
                 let Some(incoming)=incoming else{break};
                 let Ok(permit)=limit.clone().try_acquire_owned() else{incoming.refuse();continue};
-                let sessions=sessions.clone(); let secret=secret.clone(); let target=options.target; let max_rate=options.max_rate; let metrics=options.stats.clone();
+                let sessions=sessions.clone(); let secret=secret.clone(); let target=options.target; let settings=ServerSessionSettings{max_rate:options.max_rate,adaptive_fec_retention:options.adaptive_fec_retention}; let metrics=options.stats.clone();
                 tasks.spawn(async move {
                     let _permit=permit;
                     let mut diagnostic=stats::ConnectionTrace::new(metrics.clone(),incoming.remote_address(),None,"incoming");
-                    let result=server_connection(incoming,sessions,secret,target,max_rate,metrics,&mut diagnostic).await;
+                    let result=server_connection(incoming,sessions,secret,target,settings,metrics,&mut diagnostic).await;
                     let normal=diagnostic.finish(result.as_ref().err());
                     if let Err(e)=result {
                         if normal {info!(context=%diagnostic.context(),"HTTP/3 connection closed");}
@@ -2616,15 +2664,25 @@ pub async fn serve(options: ServerOptions) -> Result<()> {
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+struct ServerSessionSettings {
+    max_rate: u64,
+    adaptive_fec_retention: bool,
+}
+
 async fn server_connection(
     incoming: quinn::Incoming,
     sessions: Sessions,
     secret: Arc<String>,
     target: SocketAddr,
-    max_rate: u64,
+    settings: ServerSessionSettings,
     metrics: stats::Metrics,
     diagnostic: &mut stats::ConnectionTrace,
 ) -> Result<()> {
+    let ServerSessionSettings {
+        max_rate,
+        adaptive_fec_retention,
+    } = settings;
     let conn = timeout(Duration::from_secs(5), incoming).await??;
     diagnostic.handshake_succeeded(&conn);
     diagnostic.enter("http3", "http3_setup");
@@ -2730,7 +2788,7 @@ async fn server_connection(
                                 ensure!(map.len()<16,"session limit");
                                 let (tx,rx)=mpsc::channel(QUEUE);let (stop,_)=watch::channel(false);
                                 let observation_notify=policy.adaptive.then(||Arc::new(Notify::new()));
-                                let session=Arc::new(Session{generations:Mutex::new([None;MAX_PATHS]),empty_since:Mutex::new(Some(Instant::now())),events:tx,paths:Arc::new(Mutex::new(Vec::new())),stop,policy,observation_notify,ingress_drops:Arc::new(AtomicU64::new(0)),forward:metrics.scope(&sid,stats::FORWARD),returning:metrics.scope(&sid,stats::RETURN),finished:tokio::sync::Notify::new(),done:std::sync::atomic::AtomicBool::new(false)});
+                                let session=Arc::new(Session{adaptive_fec_retention,generations:Mutex::new([None;MAX_PATHS]),empty_since:Mutex::new(Some(Instant::now())),events:tx,paths:Arc::new(Mutex::new(Vec::new())),stop,policy,observation_notify,ingress_drops:Arc::new(AtomicU64::new(0)),forward:metrics.scope(&sid,stats::FORWARD),returning:metrics.scope(&sid,stats::RETURN),finished:tokio::sync::Notify::new(),done:std::sync::atomic::AtomicBool::new(false)});
                                 map.insert(sid.clone(),session.clone());
                                 tokio::spawn(session_loop(session.clone(),rx,target));
                                 session
@@ -2850,6 +2908,7 @@ struct Rejoined {
 }
 
 pub struct ClientOptions {
+    pub adaptive_fec_retention: bool,
     pub rotate_source_port: bool,
     pub listen: SocketAddr,
     pub entrances: Vec<SocketAddr>,
@@ -2995,7 +3054,11 @@ async fn client_session(
     let mut reverse = HashMap::new();
     let mut next_flow = 0u32;
     let mut next_id = 0u64;
-    let mut decoder = Receiver::with_repair_wait(Duration::from_millis(options.policy.queue_ms));
+    let mut decoder = Receiver::configured(
+        Duration::from_millis(options.policy.queue_ms),
+        options.adaptive_fec_retention,
+    );
+    publish_retention(&decoder, &returning);
     let mut delivery = local_delivery::Queue::new(
         returning.clone(),
         Duration::from_millis(
@@ -3014,6 +3077,7 @@ async fn client_session(
     let result:Result<()>=async {loop {
         tokio::select! {
             _=shutdown.wait()=>break,
+            _=retention_deadline(&decoder)=>{decoder.expire_adaptive(Instant::now());publish_retention(&decoder,&returning);},
             completed=delivery.ready()=>drops+=completed,
             _=tick.tick()=>{
                 let now_us=epoch.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
@@ -3170,6 +3234,8 @@ async fn client_session(
         while let Some(completion)=tasks.try_join_next() {completion.context("path task failed")?;}
     }Ok(())}.await;
     delivery.close();
+    decoder.close_retention();
+    publish_retention(&decoder, &returning);
     let _ = stop.send(true);
     options.stats.readiness(false, configs.len());
     for endpoint in endpoints.iter().flatten() {

@@ -189,6 +189,9 @@ pub struct Direction {
     pub records: Records,
     pub symbols: Symbols,
     pub udp_delivery: UdpDelivery,
+    /// Receiver-local gauges/counters, only in the owning session/direction.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fec_retention: Option<super::fec_retention::Snapshot>,
     #[serde(skip_serializing_if = "Ids::is_empty")]
     pub quinn_admitted_record_ids: Ids,
     #[serde(skip_serializing_if = "Ids::is_empty")]
@@ -824,6 +827,21 @@ impl Metrics {
     }
 }
 impl Scope {
+    /// Never overwrite process-wide gauges with the latest of multiple sessions.
+    pub fn publish_fec_retention(&self, snapshot: super::fec_retention::Snapshot) {
+        self.metrics.state(|s| {
+            if let Some(session) = s.sessions.get_mut(&self.session) {
+                if let Some(direction) = session.get_mut(self.direction) {
+                    direction.fec_retention = Some(snapshot);
+                } else {
+                    session
+                        .entry(self.direction.to_owned())
+                        .or_default()
+                        .fec_retention = Some(snapshot);
+                }
+            }
+        });
+    }
     /// This hook is outside update(): its closure must run once, not once per stats scope.
     pub fn trace_with(&self, make: impl FnOnce(trace::Context, &trace::Trace) -> trace::Event) {
         if let Some(context) = self.trace_context {
@@ -1117,6 +1135,44 @@ mod tests {
             },
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn receiver_retention_is_not_merged_across_sessions_or_directions() {
+        let metrics = Metrics::new("test");
+        let a = metrics.scope("a", FORWARD);
+        let b = metrics.scope("b", FORWARD);
+        a.update(|_| {});
+        b.update(|_| {});
+        a.publish_fec_retention(super::super::fec_retention::Snapshot {
+            enabled: true,
+            current_ms: 100,
+            ..Default::default()
+        });
+        b.publish_fec_retention(super::super::fec_retention::Snapshot {
+            enabled: true,
+            current_ms: 230,
+            ..Default::default()
+        });
+        let state = metrics.0.state.lock().unwrap();
+        assert_eq!(
+            state.sessions["a"][FORWARD]
+                .fec_retention
+                .as_ref()
+                .unwrap()
+                .current_ms,
+            100
+        );
+        assert_eq!(
+            state.sessions["b"][FORWARD]
+                .fec_retention
+                .as_ref()
+                .unwrap()
+                .current_ms,
+            230
+        );
+        assert!(state.directions[FORWARD].fec_retention.is_none());
+        assert!(!state.sessions["a"].contains_key(RETURN));
     }
 
     #[tokio::test]

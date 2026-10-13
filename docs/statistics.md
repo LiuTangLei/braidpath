@@ -1,5 +1,15 @@
 # Runtime statistics
 
+With `--adaptive-fec-retention`, receiving session/direction snapshots include
+`stats.sessions[session][direction].fec_retention`. Its current/minimum/maximum
+and peak values are milliseconds. It also records samples, distinct late samples,
+ignored duplicates/out-of-cap samples, increases/decreases, deadline retirement,
+live decoder blocks, retained timing metadata blocks and live window evictions.
+These gauges are deliberately not merged into process-wide direction counters:
+different sessions and receiving directions learn independently. After orderly
+shutdown, live/metadata counts become zero; historical controller counters remain.
+Retired blocks and stale repair symbols are not synonymous with business losses.
+
 Client, server and relay accept `--stats-file PATH` for final JSON, `--stats-jsonl PATH` for optional cumulative periodic JSON lines, and `--stats-interval-ms N` (default 1,000; bounds 10–60,000). Create the output directory first; keep private topology and run records under ignored `local/`.
 
 For example, append these flags to a runtime command:

@@ -146,6 +146,39 @@ repair age starts with the oldest original ingress in its block. Repair credit
 does not establish physical wire transmission or peer receipt. Those costs and
 outcomes require separate observations in both directions.
 
+### Receiver-local adaptive FEC retention
+
+`--adaptive-fec-retention` is an optional **local** client/server flag. Enable it
+on each receiving endpoint independently. It does not change negotiation, sender
+`--queue-ms`, pacing, repair budgets, coding or original-record delivery. Without
+the flag, the existing fixed receiver policy is unchanged.
+
+The controller starts at 100 ms and stays within 50..250 ms, measured from the
+first locally received symbol of each block. It follows the largest distinct
+symbol arrival span in eight one-second buckets, with 25% plus 5 ms margin.
+It increases immediately on new evidence and decreases at most once a second,
+by roughly 10% (at least 5 ms), only with at least 32 recently sampled block/epoch
+pairs. Quiet periods without evidence do not cause optimistic shortening.
+
+Per-block first timestamps and unique-symbol masks survive payload retirement in
+the existing 256-block window. This lets a distinct late symbol teach future
+retention without censoring all samples beyond the old limit. Duplicate symbols
+cannot train the controller or renew a deadline; observations beyond the 250 ms
+hard horizon are ignored. A still-live block may receive more time within that
+first-arrival cap. Expired state is never revived, the block-ID window is never
+expanded, and a decrease applies only to newly opened blocks.
+
+An idle expiry timer releases decoder payloads without waiting for another packet.
+Available originals and successful reconstructions are still emitted immediately;
+retention is not an extra playout buffer. The 250 ms local state horizon is **not**
+an end-to-end deadline promise, and one XOR repair still cannot recover multiple
+missing members. The feature is opt-in until workload-specific validation.
+
+`examples/receiver_retention_replay.rs` accepts a finite explicit corpus of source
+IDs, payload lengths, block membership and receiver-local arrivals. It uses the
+real codec/receiver with synthetic payloads. A replay can test mechanism and
+record-set changes, not network throughput or cross-machine deadline performance.
+
 ### Envelope and session mapping
 
 - TLS verifies the main server's certificate and name; ALPN is `h3`; 0-RTT is disabled. Both peers must advertise QUIC DATAGRAM capacity and HTTP/3 `H3_DATAGRAM` support.

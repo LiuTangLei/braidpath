@@ -103,6 +103,10 @@ fn small_record_fec_negotiates_and_sends_bounded_repairs_in_both_directions() {
     three_paths(4);
 }
 #[test]
+fn adaptive_fec_retention_works_on_authenticated_bidirectional_sockets() {
+    three_paths(5);
+}
+#[test]
 fn persistent_bad_path_rejoins_with_new_udp_port() {
     three_paths(3);
 }
@@ -145,7 +149,10 @@ fn three_paths(mode: u8) {
             token.to_str().unwrap(),
             "--target",
             &echo_addr,
-        ]),
+        ])
+        .into_iter()
+        .chain((mode == 5).then(|| "--adaptive-fec-retention".to_owned()))
+        .collect::<Vec<_>>(),
         dir.path(),
         "server",
     );
@@ -267,6 +274,14 @@ fn three_paths(mode: u8) {
             .unwrap();
         client_args[index + 1] = "0".into();
     }
+    if mode == 5 {
+        client_args.extend(args(&[
+            "--mixed-fec",
+            "--small-fec-bytes",
+            "128",
+            "--adaptive-fec-retention",
+        ]));
+    }
     let mut client = launch(&client_args, dir.path(), "client");
     ready(&mut client, "UDP client ready");
     let logs = fs::read_to_string(&client.log).unwrap();
@@ -341,6 +356,37 @@ fn three_paths(mode: u8) {
                 "feedback did not reach both senders"
             );
             thread::sleep(Duration::from_millis(50));
+        }
+    }
+    if mode == 5 {
+        for (file, direction) in [
+            (&client_stats, "server_to_client"),
+            (&server_stats, "client_to_server"),
+        ] {
+            let text = fs::read_to_string(file).unwrap();
+            let snapshot = text
+                .lines()
+                .rev()
+                .find_map(|l| serde_json::from_str::<Value>(l).ok())
+                .unwrap();
+            let sessions = snapshot["stats"]["sessions"].as_object().unwrap();
+            let gauges: Vec<_> = sessions
+                .values()
+                .filter_map(|s| s.get(direction).and_then(|d| d.get("fec_retention")))
+                .collect();
+            assert_eq!(
+                gauges.len(),
+                1,
+                "retention must be a receiving-session gauge: {snapshot}"
+            );
+            assert_eq!(gauges[0]["enabled"], true);
+            assert!((50..=250).contains(&gauges[0]["current_ms"].as_u64().unwrap()));
+            assert!(gauges[0]["metadata_blocks"].as_u64().unwrap() <= 256);
+            assert!(
+                snapshot["stats"]["directions"][direction]
+                    .get("fec_retention")
+                    .is_none()
+            );
         }
     }
     if mode == 3 {

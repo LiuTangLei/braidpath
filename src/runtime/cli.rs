@@ -45,6 +45,10 @@ enum Command {
         /// BBR is the supported sending controller.
         #[arg(long, value_enum, default_value_t = transport::Congestion::default())]
         congestion: transport::Congestion,
+        /// Adapt local FEC state retention to observed arrival skew (50..250 ms).
+        /// Does not change sender queue limits or delay original delivery.
+        #[arg(long)]
+        adaptive_fec_retention: bool,
         #[command(flatten)]
         stats: stats::Options,
     },
@@ -77,6 +81,10 @@ enum Command {
         /// Select this endpoint's sending controller independently of the peer.
         #[arg(long, value_enum, default_value_t = transport::Congestion::default())]
         congestion: transport::Congestion,
+        /// Adapt local FEC state retention to observed arrival skew (50..250 ms).
+        /// Does not change sender queue limits or delay original delivery.
+        #[arg(long)]
+        adaptive_fec_retention: bool,
         #[command(flatten)]
         stats: stats::Options,
     },
@@ -180,11 +188,13 @@ pub async fn run() -> Result<()> {
             max_rate_bps,
             datagram_send_buffer_bytes,
             congestion,
+            adaptive_fec_retention,
             stats,
         } => {
             let reporter = stats::Reporter::new("server", stats)?;
             let result = tunnel::serve(tunnel::ServerOptions {
                 stats: reporter.metrics.clone(),
+                adaptive_fec_retention,
                 bind: listen,
                 cert,
                 key,
@@ -209,12 +219,14 @@ pub async fn run() -> Result<()> {
             token_file,
             policy,
             congestion,
+            adaptive_fec_retention,
             stats,
         } => {
             let reporter = stats::Reporter::new("client", stats)?;
             let group_rates = parse_group_rates(&policy.group_rates, policy.rate_bps)?;
             let result = tunnel::client(tunnel::ClientOptions {
                 stats: reporter.metrics.clone(),
+                adaptive_fec_retention,
                 listen,
                 entrances,
                 interfaces,
@@ -308,6 +320,79 @@ fn parse_group_rates(values: &[String], aggregate: u64) -> Result<[u64; super::M
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn receiver_retention_opt_in_is_local_and_preserves_sender_policy() {
+        let client = [
+            "braidpath",
+            "client",
+            "--entrance",
+            "127.0.0.1:4433",
+            "--server-name",
+            "localhost",
+            "--ca",
+            "cert.pem",
+            "--token-file",
+            "token",
+        ];
+        let Command::Client {
+            policy,
+            adaptive_fec_retention,
+            ..
+        } = Cli::try_parse_from(client).unwrap().command
+        else {
+            unreachable!()
+        };
+        assert!(!adaptive_fec_retention);
+        assert_eq!(policy.queue_ms, 100);
+        let Command::Client {
+            policy,
+            adaptive_fec_retention,
+            ..
+        } = Cli::try_parse_from(client.into_iter().chain([
+            "--adaptive-fec-retention",
+            "--queue-ms",
+            "17",
+        ]))
+        .unwrap()
+        .command
+        else {
+            unreachable!()
+        };
+        assert!(adaptive_fec_retention);
+        assert_eq!(policy.queue_ms, 17);
+        let server = [
+            "braidpath",
+            "server",
+            "--listen",
+            "127.0.0.1:4433",
+            "--cert",
+            "cert.pem",
+            "--key",
+            "key.pem",
+            "--token-file",
+            "token",
+            "--target",
+            "127.0.0.1:7000",
+        ];
+        let Command::Server {
+            adaptive_fec_retention,
+            ..
+        } = Cli::try_parse_from(server).unwrap().command
+        else {
+            unreachable!()
+        };
+        assert!(!adaptive_fec_retention);
+        let Command::Server {
+            adaptive_fec_retention,
+            ..
+        } = Cli::try_parse_from(server.into_iter().chain(["--adaptive-fec-retention"]))
+            .unwrap()
+            .command
+        else {
+            unreachable!()
+        };
+        assert!(adaptive_fec_retention);
+    }
     #[test]
     fn mixed_fec_and_nested_packet_trace_flags_preserve_disabled_defaults() {
         let base = [

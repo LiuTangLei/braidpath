@@ -2,6 +2,7 @@
 pub mod adaptive;
 pub mod capacity_probe;
 pub mod cli;
+pub mod fec_retention;
 pub mod outbound;
 pub mod probe;
 pub mod quality;

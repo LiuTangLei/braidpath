@@ -167,6 +167,7 @@ pub fn http_payload(b: &[u8], stream: u64) -> Result<&[u8]> {
 pub struct Receiver {
     blocks: BTreeMap<u64, Option<(Decoder, Instant)>>,
     repair_wait: Duration,
+    retention: Option<super::fec_retention::Controller>,
     highest_block: u64,
     delivered: BTreeSet<u64>,
     highest_message: u64,
@@ -192,6 +193,7 @@ impl Receiver {
         Self {
             blocks: BTreeMap::new(),
             repair_wait,
+            retention: None,
             highest_block: 0,
             delivered: BTreeSet::new(),
             highest_message: 0,
@@ -202,6 +204,69 @@ impl Receiver {
             recovered: 0,
             duplicates: 0,
             invalid: 0,
+        }
+    }
+
+    /// Optional local receiver policy; it does not alter session wire negotiation
+    /// or the sender's queue/deadline. The fixed path preserves its prior behavior.
+    pub fn configured(repair_wait: Duration, adaptive: bool) -> Self {
+        if adaptive {
+            Self {
+                retention: Some(super::fec_retention::Controller::default()),
+                ..Self::default()
+            }
+        } else {
+            Self::with_repair_wait(repair_wait)
+        }
+    }
+
+    pub fn retention_snapshot(&self) -> Option<super::fec_retention::Snapshot> {
+        self.retention
+            .as_ref()
+            .map(|r| r.snapshot(self.blocks.values().filter(|s| s.is_some()).count()))
+    }
+
+    /// Wake only adaptive receivers with live state. Retirement also happens on
+    /// every arrival, so a delayed timer cannot make an expired repair eligible.
+    pub fn next_retention_deadline(&self) -> Option<Instant> {
+        let retention = self.retention.as_ref()?;
+        self.blocks
+            .iter()
+            .filter_map(|(block, slot)| {
+                slot.as_ref()
+                    .and_then(|(_, first)| first.checked_add(retention.hold(*block)))
+            })
+            .min()
+    }
+
+    fn expire_blocks(&mut self, now: Instant) {
+        for (block, slot) in &mut self.blocks {
+            let hold = self
+                .retention
+                .as_ref()
+                .map_or(self.repair_wait, |r| r.hold(*block));
+            if slot
+                .as_ref()
+                .is_some_and(|(_, first)| now.saturating_duration_since(*first) >= hold)
+            {
+                *slot = None;
+                if let Some(r) = &mut self.retention {
+                    r.retired(*block, true);
+                }
+            }
+        }
+    }
+
+    pub fn expire_adaptive(&mut self, now: Instant) {
+        if self.retention.is_some() {
+            self.expire_blocks(now);
+        }
+    }
+
+    pub fn close_retention(&mut self) {
+        if let Some(r) = &mut self.retention {
+            self.blocks.clear();
+            r.clear();
         }
     }
 
@@ -238,19 +303,22 @@ impl Receiver {
             self.highest_block = self.highest_block.max(block);
             let floor = self.highest_block.saturating_sub(BLOCK_WINDOW - 1);
             self.blocks.retain(|k, _| *k >= floor);
-            for slot in self.blocks.values_mut() {
-                if slot
-                    .as_ref()
-                    .is_some_and(|(_, t)| now.saturating_duration_since(*t) >= self.repair_wait)
-                {
-                    *slot = None;
-                }
+            if let Some(r) = &mut self.retention {
+                r.retain_floor(floor);
             }
+            self.expire_blocks(now);
             if block < floor {
                 if repair {
                     self.stale += 1;
                 }
             } else {
+                let (token, count) = match &s {
+                    Shard::Data { index, .. } => (*index, None),
+                    Shard::Repair { count, .. } => (32, Some(*count)),
+                };
+                if let Some(r) = &mut self.retention {
+                    r.register(block, now);
+                }
                 let slot = self.blocks.entry(block).or_insert_with(|| {
                     (!self.repair_wait.is_zero()).then(|| (Decoder::new(block), now))
                 });
@@ -275,17 +343,26 @@ impl Receiver {
                                 }
                                 Err(error) => {
                                     *slot = None;
+                                    if let Some(r) = &mut self.retention {
+                                        r.retired(block, false);
+                                    }
                                     return Err(error);
                                 }
                             }
                         }
                         Err(error) => {
                             *slot = None;
+                            if let Some(r) = &mut self.retention {
+                                r.retired(block, false);
+                            }
                             return Err(error.into());
                         }
                     }
                 } else if repair {
                     self.stale += 1;
+                }
+                if let Some(r) = &mut self.retention {
+                    r.observe(block, token, count, now);
                 }
             }
         }
@@ -470,6 +547,135 @@ mod tests {
         assert_eq!(receiver.duplicates, 1);
         assert_eq!(receiver.stale, 2);
         assert!(receiver.blocks.get(&0).unwrap().is_none());
+    }
+
+    #[test]
+    fn adaptive_retention_learns_late_material_without_reviving_expired_block() {
+        let at = Instant::now();
+        let mut adaptive = Receiver::configured(Duration::from_millis(1), true);
+        let mut fixed = Receiver::with_repair_wait(Duration::from_millis(100));
+        let (_, symbols) = coded_block(2);
+        for receiver in [&mut adaptive, &mut fixed] {
+            assert_eq!(receiver.receive(&symbols[0], at).unwrap().len(), 1);
+            assert!(
+                receiver
+                    .receive(&symbols[2], at + Duration::from_millis(140))
+                    .unwrap()
+                    .is_empty()
+            );
+            assert_eq!(receiver.recovered, 0);
+        }
+        assert_eq!(adaptive.retention_snapshot().unwrap().current_ms, 180);
+        // Old tombstone cannot be reopened, even though the global horizon grew.
+        assert!(
+            adaptive
+                .receive(&symbols[2], at + Duration::from_millis(141))
+                .unwrap()
+                .is_empty()
+        );
+        let records: Vec<_> = (2..4)
+            .map(|id| Record {
+                flow: 7,
+                id,
+                payload: vec![id as u8; 17],
+            })
+            .collect();
+        let mut encoder = Encoder::new(2, Duration::from_secs(1)).unwrap();
+        let mut next: Vec<_> = records
+            .iter()
+            .flat_map(|r| encoder.push(&r.encode().unwrap(), at).unwrap())
+            .collect();
+        for shard in &mut next {
+            match shard {
+                Shard::Data { block, .. } | Shard::Repair { block, .. } => *block = 1,
+            }
+        }
+        let next: Vec<_> = next.into_iter().map(shard).collect();
+        let first = at + Duration::from_millis(150);
+        for receiver in [&mut adaptive, &mut fixed] {
+            assert_eq!(
+                receiver.receive(&next[0], first).unwrap(),
+                vec![records[0].clone()]
+            );
+        }
+        assert_eq!(
+            adaptive
+                .receive(&next[2], first + Duration::from_millis(150))
+                .unwrap(),
+            vec![records[1].clone()]
+        );
+        assert!(
+            fixed
+                .receive(&next[2], first + Duration::from_millis(150))
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(adaptive.recovered, 1);
+        assert_eq!(adaptive.retention_snapshot().unwrap().late_samples, 1);
+    }
+
+    #[test]
+    fn adaptive_timer_releases_payloads_but_keeps_bounded_learning_metadata() {
+        let at = Instant::now();
+        let (_, symbols) = coded_block(2);
+        let mut r = Receiver::configured(Duration::from_millis(900), true);
+        r.receive(&symbols[0], at).unwrap();
+        assert_eq!(
+            r.next_retention_deadline(),
+            Some(at + Duration::from_millis(100))
+        );
+        r.expire_adaptive(at + Duration::from_millis(100));
+        assert_eq!(r.next_retention_deadline(), None);
+        let snapshot = r.retention_snapshot().unwrap();
+        assert_eq!(
+            (
+                snapshot.live_blocks,
+                snapshot.metadata_blocks,
+                snapshot.deadline_retired_blocks
+            ),
+            (0, 1, 1)
+        );
+        assert!(
+            r.receive(&symbols[2], at + Duration::from_millis(180))
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(r.retention_snapshot().unwrap().current_ms, 230);
+        // Uncoded original delivery remains independent of expired FEC state.
+        assert_eq!(
+            r.receive(&symbols[1], at + Duration::from_millis(500))
+                .unwrap()
+                .len(),
+            1
+        );
+        r.close_retention();
+        assert_eq!(r.retention_snapshot().unwrap().metadata_blocks, 0);
+    }
+
+    #[test]
+    fn adaptive_receiver_hard_cap_and_block_window_do_not_grow() {
+        let at = Instant::now();
+        let mut r = Receiver::configured(Duration::ZERO, true);
+        for block in 0..600u64 {
+            let record = Record {
+                flow: 1,
+                id: block,
+                payload: vec![1; 32],
+            };
+            let packet = shard(Shard::Data {
+                block,
+                index: 0,
+                payload: record.encode().unwrap(),
+            });
+            r.receive(&packet, at + Duration::from_micros(block))
+                .unwrap();
+            let snapshot = r.retention_snapshot().unwrap();
+            assert!(r.blocks.len() <= 256 && snapshot.metadata_blocks <= 256);
+            assert!(snapshot.current_ms <= super::super::fec_retention::MAX_MS);
+        }
+        r.expire_adaptive(at + Duration::from_millis(251));
+        assert_eq!(r.retention_snapshot().unwrap().live_blocks, 0);
+        assert!(r.retention_snapshot().unwrap().window_evicted_live_blocks > 0);
     }
 
     #[test]
