@@ -136,6 +136,7 @@ fn policy() -> Policy {
         quality_schedule: true,
         fec: 2,
         small_fec_bytes: 0,
+        mixed_fec: false,
         redundancy: 100,
         rate: 10_000_000,
         block_ms: 25,
@@ -812,6 +813,134 @@ fn small_fec_policy_rejects_mixed_repair_or_capacity_probe_budgets() {
     policy.adaptive = true;
     policy.capacity_probe_bps = 64_000;
     assert!(policy.validate().is_err());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn mixed_small_copy_uses_its_own_bounded_admission_credit_on_wider_http_stream() {
+    let pair = Pair::connect().await;
+    let path = pair.path();
+    let mut repair_path = path.clone();
+    repair_path.stream = 1_u64 << 40;
+    let mut accounting = Accounting::new();
+    accounting.policy.fec = 4;
+    accounting.policy.small_fec_bytes = 128;
+    accounting.policy.mixed_fec = true;
+    accounting.policy.redundancy = 30;
+    accounting.budget = outbound::RepairBudget::new(30);
+    let created = Instant::now();
+    let mut encoder = coding::RecordEncoder::new(&accounting.policy).unwrap();
+    let small = Record {
+        flow: 2,
+        id: 1,
+        payload: vec![7; 128],
+    };
+    for symbol in encoder.encode(&small, created).unwrap() {
+        enqueue_encoded(
+            symbol,
+            created,
+            &mut accounting.queue,
+            &mut accounting.blocks,
+            &accounting.policy,
+            &accounting.scope,
+        );
+    }
+    let repair = accounting.prepare(&repair_path, true);
+    assert!(!repair_allowed(
+        &accounting.policy,
+        &accounting.budget,
+        &accounting.blocks,
+        &repair.front,
+        repair.data.len(),
+    ));
+    let original = accounting.prepare(&path, false);
+    assert_eq!(repair.data.len(), original.data.len() + 9);
+    assert_eq!(
+        accounting
+            .direction()
+            .symbols
+            .mixed_small_repair_reserved_bytes,
+        0
+    );
+    let at = send_datagram_before_deadline(
+        &path.conn,
+        original.data.clone(),
+        created,
+        Duration::from_secs(1),
+    )
+    .unwrap()
+    .unwrap();
+    accounting.commit(&original, at, 0);
+    assert_eq!(pair.receive().await, original.data);
+    assert_eq!(
+        accounting
+            .direction()
+            .symbols
+            .mixed_small_repair_reserved_bytes,
+        repair.data.len() as u64,
+    );
+    assert!(repair_allowed(
+        &accounting.policy,
+        &accounting.budget,
+        &accounting.blocks,
+        &repair.front,
+        repair.data.len(),
+    ));
+    assert!(!repair_allowed(
+        &accounting.policy,
+        &accounting.budget,
+        &accounting.blocks,
+        &repair.front,
+        repair.data.len() + 1,
+    ));
+    assert!(
+        !accounting.budget.can_repair(1),
+        "small must not earn bulk credit"
+    );
+    let shared = Arc::new(Mutex::new(vec![repair_path.clone()]));
+    let mut wait = WaitingSend::new(accounting.prepare(&repair_path, true));
+    block_and_poll(&pair, &mut wait, &shared, Duration::from_secs(1));
+    assert_eq!(pair.receive().await.as_ref(), FILLER);
+    let ready = timeout(
+        Duration::from_secs(1),
+        poll_fn(|cx| {
+            wait.poll(cx, &shared, Duration::from_secs(1), |attempt, _, _| {
+                repair_allowed(
+                    &accounting.policy,
+                    &accounting.budget,
+                    &accounting.blocks,
+                    &attempt.front,
+                    attempt.data.len(),
+                )
+            })
+        }),
+    )
+    .await
+    .unwrap();
+    let SendReadiness::Admitted { at, .. } = ready else {
+        panic!("{ready:?}")
+    };
+    let repair = wait.cancel();
+    accounting.commit(&repair, at, 0);
+    assert_eq!(pair.receive().await, repair.data);
+    assert!(!repair_allowed(
+        &accounting.policy,
+        &accounting.budget,
+        &accounting.blocks,
+        &repair.front,
+        repair.data.len(),
+    ));
+    let symbols = accounting.direction().symbols;
+    assert_eq!(symbols.mixed_small_repairs_quinn_admitted, 1);
+    assert_eq!(
+        symbols.mixed_small_repair_admitted_bytes,
+        repair.data.len() as u64
+    );
+    assert_eq!(symbols.mixed_bulk_original_admitted_bytes, 0);
+    assert_eq!(symbols.mixed_bulk_repair_admitted_bytes, 0);
+    let spent = original.data.len() + repair.data.len() + 160;
+    assert!(accounting.pacer.available(9600 - spent));
+    assert!(!accounting.pacer.available(9601 - spent));
+    assert!(!accounting.groups[2].available(9601 - spent));
 }
 
 #[tokio::test(flavor = "current_thread")]

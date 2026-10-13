@@ -2,9 +2,10 @@ use super::{
     MAX_PATHS, MAX_PAYLOAD, QUEUE, adaptive, capacity_probe, outbound, quality, scheduler,
     shutdown::Shutdown,
     stats::{self, Scope},
-    transport,
+    trace, transport,
     wire::{self, Receiver, Record},
 };
+#[cfg(test)]
 use crate::fec::Encoder;
 use anyhow::{Context, Result, bail, ensure};
 use bytes::{Buf, Bytes};
@@ -34,7 +35,10 @@ use tracing::{info, warn};
 const MAX_FLOWS: usize = 64;
 const SESSION_IDLE_GRACE: Duration = Duration::from_secs(120);
 const SESSION_PATH: &str = "/session";
+mod coding;
 mod local_delivery;
+#[cfg(test)]
+mod mixed_fec_tests;
 mod small_delivery;
 
 const WEBSITE: &str = "<!doctype html><html lang=\"en\"><meta charset=\"utf-8\"><title>Welcome</title><h1>Welcome</h1><p>This service is online.</p></html>\n";
@@ -50,6 +54,7 @@ pub struct Policy {
     pub quality_schedule: bool,
     pub fec: u8,
     pub small_fec_bytes: u16,
+    pub mixed_fec: bool,
     pub redundancy: u8,
     pub rate: u64,
     pub block_ms: u64,
@@ -101,11 +106,24 @@ impl Policy {
             "invalid FEC configuration"
         );
         ensure!(
-            usize::from(self.small_fec_bytes) <= MAX_PAYLOAD
-                && (self.small_fec_bytes == 0
-                    || (self.fec == 0 && self.capacity_probe_bps == 0 && self.redundancy == 0)),
-            "small-record FEC requires FEC0, redundancy-percent 0, no capacity probes, and a threshold at most 1000 bytes"
+            usize::from(self.small_fec_bytes) <= MAX_PAYLOAD,
+            "small-record threshold must be at most 1000 bytes"
         );
+        if self.mixed_fec {
+            ensure!(
+                self.fec > 0
+                    && self.small_fec_bytes > 0
+                    && self.redundancy > 0
+                    && self.capacity_probe_bps == 0,
+                "mixed FEC requires a bulk FEC block, positive bulk redundancy, a small-record threshold, and no capacity probes"
+            );
+        } else {
+            ensure!(
+                self.small_fec_bytes == 0
+                    || (self.fec == 0 && self.capacity_probe_bps == 0 && self.redundancy == 0),
+                "small-record FEC requires FEC0 and redundancy-percent 0 without explicit mixed FEC"
+            );
+        }
         ensure!(
             (64_000..=1_000_000_000).contains(&self.rate),
             "rate must be 64000..1000000000 bits/s"
@@ -117,6 +135,19 @@ impl Policy {
         Ok(())
     }
 }
+
+fn mixed_fec_header(headers: &http::HeaderMap) -> Result<bool> {
+    let value = headers
+        .get("braidpath-mixed-fec")
+        .map(|value| value.to_str())
+        .transpose()?;
+    ensure!(
+        value.is_none_or(|value| value == "1"),
+        "unsupported mixed FEC format"
+    );
+    Ok(value.is_some())
+}
+
 #[derive(Clone)]
 struct OutPath {
     id: u8,
@@ -132,6 +163,93 @@ struct OutPath {
     probe_reply: Arc<Mutex<Option<quality::Probe>>>,
 }
 type Paths = Arc<Mutex<Vec<OutPath>>>;
+
+fn trace_path(scope: &Scope, stage: trace::Stage, path: trace::PathKey) {
+    scope.trace_with(|context, _| {
+        let mut event = trace::Event::new(context, stage);
+        event.path = Some(path);
+        event
+    });
+}
+
+/// The UDP payload may arrive before a record ID is assigned. Never invent an ID.
+fn trace_payload(
+    scope: &Scope,
+    stage: trace::Stage,
+    payload: &[u8],
+    reason: Option<trace::Reason>,
+) {
+    scope.trace_with(|context, capture| {
+        let mut event = trace::Event::new(context, stage);
+        event.bytes.payload = u32::try_from(payload.len()).ok();
+        event.probe = capture.probe_identity(payload);
+        event.reason = reason;
+        event
+    });
+}
+
+fn trace_outgoing(
+    scope: &Scope,
+    stage: trace::Stage,
+    pending: &outbound::Pending,
+    path: &OutPath,
+    http_bytes: usize,
+    reason: Option<trace::Reason>,
+) {
+    scope.trace_with(|context, capture| {
+        let mut event = trace::Event::new(context, stage);
+        stats::trace_symbol_fields(&mut event, &pending.data, capture);
+        event.coding = Some(if pending.data[3] == 2 {
+            trace::Coding::Plain
+        } else if pending.small {
+            trace::Coding::Small
+        } else {
+            trace::Coding::Ordinary
+        });
+        event.path = Some(trace::PathKey {
+            path_id: path.id,
+            generation: path
+                .quality
+                .lock()
+                .expect("quality lock")
+                .snapshot
+                .generation,
+            connection_id: path.conn.stable_id() as u64,
+        });
+        event.bytes.http_datagram = u32::try_from(http_bytes).ok();
+        event.reason = reason;
+        event
+    });
+}
+
+/// Observe the authenticated HTTP DATAGRAM before quality/queue/decoder gates.
+/// Control frames retain HTTP byte counts without being called business symbols.
+fn trace_http(
+    scope: &Scope,
+    stage: trace::Stage,
+    data: &[u8],
+    stream: u64,
+    feedback: bool,
+    path: trace::PathKey,
+    reason: Option<trace::Reason>,
+) {
+    scope.trace_with(|context, capture| {
+        let mut event = trace::Event::new(context, stage);
+        if let Ok(payload) = wire::http_payload(data, stream) {
+            if !feedback {
+                stats::trace_symbol_fields(&mut event, payload, capture);
+            } else if (quality::HEADER + wire::HEADER..=quality::MAX_FRAME).contains(&payload.len())
+                && payload.starts_with(b"BQ1D")
+            {
+                stats::trace_symbol_fields(&mut event, &payload[quality::HEADER..], capture);
+            }
+        }
+        event.path = Some(path);
+        event.bytes.http_datagram = u32::try_from(data.len()).ok();
+        event.reason = reason;
+        event
+    });
+}
 
 fn quality_time(path: &OutPath) -> u64 {
     path.epoch.elapsed().as_micros().min(u128::from(u64::MAX)) as u64
@@ -319,8 +437,11 @@ struct QueuedRecord {
 struct BlockSend {
     created: Instant,
     paths: u8,
+    small_repair_limit: usize,
+    small_repair_reserved: usize,
 }
 
+#[cfg(test)]
 fn enqueue_symbol(
     data: Bytes,
     created: Instant,
@@ -328,6 +449,50 @@ fn enqueue_symbol(
     blocks: &mut BTreeMap<u64, BlockSend>,
     metrics: &Scope,
 ) {
+    enqueue_coded_symbol(
+        coding::EncodedSymbol { data, small: false },
+        created,
+        queue,
+        blocks,
+        None,
+        metrics,
+    );
+}
+
+fn enqueue_encoded(
+    symbol: coding::EncodedSymbol,
+    created: Instant,
+    queue: &mut outbound::Queue,
+    blocks: &mut BTreeMap<u64, BlockSend>,
+    policy: &Policy,
+    metrics: &Scope,
+) {
+    enqueue_coded_symbol(symbol, created, queue, blocks, Some(policy), metrics);
+}
+
+fn enqueue_coded_symbol(
+    symbol: coding::EncodedSymbol,
+    created: Instant,
+    queue: &mut outbound::Queue,
+    blocks: &mut BTreeMap<u64, BlockSend>,
+    policy: Option<&Policy>,
+    metrics: &Scope,
+) {
+    let coding::EncodedSymbol { data, small } = symbol;
+    let mixed = policy.is_some_and(|p| p.mixed_fec);
+    let small_repair_limit = if mixed && small && data[3] == 1 {
+        // The repair can use another HTTP request stream. Reserve against the
+        // largest legal mapping, not the original's actual stream-id width.
+        data.len()
+            + if policy.is_some_and(|p| p.receiver_feedback) {
+                quality::HEADER
+            } else {
+                0
+            }
+            + 9
+    } else {
+        0
+    };
     let record = if data[3] != 1 {
         Record::decode_identity(&data[wire::HEADER..]).ok()
     } else {
@@ -343,7 +508,12 @@ fn enqueue_symbol(
     let block_created = if let Some(block) = block {
         blocks
             .entry(block)
-            .or_insert(BlockSend { created, paths: 0 })
+            .or_insert(BlockSend {
+                created,
+                paths: 0,
+                small_repair_limit: 0,
+                small_repair_reserved: 0,
+            })
             .created
             .min(created)
     } else {
@@ -368,6 +538,28 @@ fn enqueue_symbol(
         } else {
             d.symbols.repairs_generated += 1;
         }
+        if mixed {
+            match (small, record_id.is_some()) {
+                (true, true) => d.symbols.mixed_small_originals_generated += 1,
+                (true, false) => d.symbols.mixed_small_repairs_generated += 1,
+                (false, true) => d.symbols.mixed_bulk_originals_generated += 1,
+                (false, false) => d.symbols.mixed_bulk_repairs_generated += 1,
+            }
+        }
+    });
+    let mut generated_event = None;
+    metrics.trace_with(|context, capture| {
+        let mut event = trace::Event::new(context, trace::Stage::SymbolGenerated);
+        stats::trace_symbol_fields(&mut event, &data, capture);
+        event.coding = Some(if data[3] == 2 {
+            trace::Coding::Plain
+        } else if small {
+            trace::Coding::Small
+        } else {
+            trace::Coding::Ordinary
+        });
+        generated_event = Some(event);
+        event
     });
     let pending = outbound::Pending {
         data,
@@ -375,8 +567,24 @@ fn enqueue_symbol(
         record_id,
         flow,
         block,
+        small,
     };
     let accepted = queue.push(pending).is_ok();
+    if let Some(mut event) = generated_event {
+        event.stage = if accepted {
+            trace::Stage::SymbolQueued
+        } else {
+            trace::Stage::SymbolDropped
+        };
+        event.reason = (!accepted).then_some(trace::Reason::QueueFull);
+        metrics.metrics.trace().emit(event);
+    }
+    if accepted
+        && small_repair_limit > 0
+        && let Some(meta) = block.and_then(|block| blocks.get_mut(&block))
+    {
+        meta.small_repair_limit = small_repair_limit;
+    }
     metrics.update(|d| match (record_id, accepted) {
         (Some(_), true) => d.symbols.originals_enqueued += 1,
         (None, true) => d.symbols.repairs_enqueued += 1,
@@ -391,6 +599,8 @@ fn enqueue_symbol(
     }
 }
 
+// The pre-mixed encoder remains an independent byte-compatibility reference.
+#[cfg(test)]
 fn encode_record(
     record: &Record,
     encoder: &mut Encoder,
@@ -412,6 +622,13 @@ fn encode_record(
 }
 
 fn account_expired(pending: &outbound::Pending, now: Instant, metrics: &Scope) {
+    metrics.trace_symbol(
+        trace::Stage::SymbolDropped,
+        &pending.data,
+        None,
+        None,
+        Some(trace::Reason::Expired),
+    );
     metrics.update(|d| {
         if let Some(id) = pending.record_id {
             d.symbols.originals_expired_dropped += 1;
@@ -432,15 +649,98 @@ fn repair_allowed(
     pending: &outbound::Pending,
     frame_bytes: usize,
 ) -> bool {
-    if policy.small_fec_bytes > 0 {
+    if policy.small_fec_bytes > 0 && (!policy.mixed_fec || pending.small) {
         // Independent k=1 blocks create exactly one queued copy. Its original
         // must have actually entered Quinn; expiry/generation grants no credit.
         pending
             .block
             .and_then(|block| blocks.get(&block))
-            .is_some_and(|meta| meta.paths != 0)
+            .is_some_and(|meta| {
+                meta.paths != 0 && (!policy.mixed_fec || meta.small_repair_reserved >= frame_bytes)
+            })
     } else {
         budget.can_repair(frame_bytes)
+    }
+}
+
+fn repair_frame_floor(policy: &Policy, pending: &outbound::Pending) -> usize {
+    pending.data.len()
+        + if policy.receiver_feedback {
+            quality::HEADER
+        } else {
+            0
+        }
+        + 2
+}
+
+fn account_budget_skipped(policy: &Policy, pending: &outbound::Pending, metrics: &Scope) {
+    metrics.trace_symbol(
+        trace::Stage::SymbolDropped,
+        &pending.data,
+        None,
+        None,
+        Some(trace::Reason::Budget),
+    );
+    metrics.update(|d| {
+        d.symbols.repairs_budget_skipped += 1;
+        if policy.mixed_fec && !pending.small {
+            d.symbols.mixed_bulk_repairs_budget_skipped += 1;
+            // No path/HTTP stream was selected. This is encoded wire length,
+            // not hypothetical HTTP framing or admitted traffic.
+            d.symbols.mixed_bulk_repair_budget_skipped_bytes += pending.data.len() as u64;
+        }
+    });
+}
+
+/// Charge only actual Quinn admissions. The mixed small allowance belongs to
+/// one admitted k=1 original; bulk credit never borrows that allowance.
+fn budget_admitted(
+    policy: &Policy,
+    budget: &mut outbound::RepairBudget,
+    blocks: &mut BTreeMap<u64, BlockSend>,
+    pending: &outbound::Pending,
+    frame_bytes: usize,
+    metrics: &Scope,
+) {
+    let repair = pending.record_id.is_none();
+    if !policy.mixed_fec {
+        if repair {
+            if policy.small_fec_bytes == 0 {
+                budget.repair_admitted(frame_bytes);
+            }
+        } else {
+            budget.original_admitted(frame_bytes);
+        }
+        return;
+    }
+    if pending.small {
+        let meta = pending.block.and_then(|block| blocks.get_mut(&block));
+        if repair {
+            let meta = meta.expect("admitted small repair block");
+            assert!(meta.paths != 0 && meta.small_repair_reserved >= frame_bytes);
+            meta.small_repair_reserved = 0;
+            metrics.update(|d| {
+                d.symbols.mixed_small_repair_admitted_bytes += frame_bytes as u64;
+                d.symbols.mixed_small_repairs_quinn_admitted += 1;
+            });
+        } else if let Some(meta) = meta {
+            // The repair is generated and queued in the same encoder event.
+            // Queue rejection creates no authorization, nor does mere ingress.
+            debug_assert_eq!(meta.small_repair_reserved, 0);
+            meta.small_repair_reserved = meta.small_repair_limit;
+            metrics.update(|d| {
+                d.symbols.mixed_small_repair_reserved_bytes += meta.small_repair_limit as u64;
+            });
+        }
+    } else if repair {
+        budget.repair_admitted(frame_bytes);
+        metrics.update(|d| {
+            d.symbols.mixed_bulk_repair_admitted_bytes += frame_bytes as u64;
+            d.symbols.mixed_bulk_repairs_quinn_admitted += 1;
+        });
+    } else {
+        budget.original_admitted(frame_bytes);
+        metrics.update(|d| d.symbols.mixed_bulk_original_admitted_bytes += frame_bytes as u64);
     }
 }
 
@@ -750,6 +1050,15 @@ impl SendAccounting<'_> {
         debug_assert_eq!(sent.record_id, front.record_id);
         debug_assert_eq!(sent.block, front.block);
         debug_assert_eq!(sent.data, front.data);
+        debug_assert_eq!(sent.small, front.small);
+        trace_outgoing(
+            self.metrics,
+            trace::Stage::QuinnApiAdmitted,
+            &sent,
+            path,
+            frame_bytes,
+            None,
+        );
         let cost = frame_bytes + 80;
         let now_us = at
             .saturating_duration_since(self.epoch)
@@ -813,10 +1122,15 @@ impl SendAccounting<'_> {
                 .expect("quality lock")
                 .admitted(sent.data.len());
         }
+        budget_admitted(
+            self.policy,
+            self.budget,
+            self.blocks,
+            &sent,
+            frame_bytes,
+            self.metrics,
+        );
         if repair {
-            if self.policy.small_fec_bytes == 0 {
-                self.budget.repair_admitted(frame_bytes);
-            }
             self.metrics.path(path.id, |p| {
                 p.quinn_admitted_repairs += 1;
                 if small_delivery::applies(self.policy, front) {
@@ -831,7 +1145,6 @@ impl SendAccounting<'_> {
                 self.blocks.remove(&block);
             }
         } else {
-            self.budget.original_admitted(frame_bytes);
             self.metrics.path(path.id, |p| {
                 p.quinn_admitted_originals += 1;
                 if small_delivery::applies(self.policy, front) {
@@ -891,8 +1204,7 @@ async fn sender(
     metrics: Scope,
     observation_notify: Option<Arc<Notify>>,
 ) {
-    let mut encoder = Encoder::new(policy.fec.max(1), Duration::from_millis(policy.block_ms))
-        .expect("validated policy");
+    let mut encoder = coding::RecordEncoder::new(&policy).expect("validated policy");
     let mut queue = outbound::Queue::default();
     let mut blocks = BTreeMap::<u64, BlockSend>::new();
     let mut budget = outbound::RepairBudget::new(policy.redundancy);
@@ -980,16 +1292,23 @@ async fn sender(
                     .evidence_received();
             }
             SenderEvent::Tick => {
-                if policy.fec > 0
-                    && let Some(shard) = encoder.flush_due(Instant::now())
-                {
-                    enqueue_symbol(
-                        wire::shard(shard),
-                        Instant::now(),
-                        &mut queue,
-                        &mut blocks,
-                        &metrics,
-                    );
+                let now = Instant::now();
+                if policy.fec > 0 {
+                    match encoder.flush_due(now) {
+                        Ok(symbols) => {
+                            for symbol in symbols {
+                                enqueue_encoded(
+                                    symbol,
+                                    now,
+                                    &mut queue,
+                                    &mut blocks,
+                                    &policy,
+                                    &metrics,
+                                );
+                            }
+                        }
+                        Err(_) => metrics.update(|d| d.records.encoding_dropped += 1),
+                    }
                 }
             }
             SenderEvent::Ready(SendReadiness::Admitted { at, next_cursor }) => {
@@ -1024,6 +1343,14 @@ async fn sender(
             }
             SenderEvent::Ready(SendReadiness::Failed) => {
                 let attempt = prepared.expect("selected readiness attempt");
+                trace_outgoing(
+                    &metrics,
+                    trace::Stage::QuinnApiRejected,
+                    &attempt.front,
+                    &attempt.path,
+                    attempt.data.len(),
+                    Some(trace::Reason::QuinnError),
+                );
                 metrics.path(attempt.path.id, |p| p.quinn_send_error_attempts += 1);
             }
             SenderEvent::Ready(_) => {}
@@ -1032,7 +1359,14 @@ async fn sender(
                     break;
                 };
                 metrics.update(|d| d.records.sender_input_consumed += 1);
+                metrics.trace_record(trace::Stage::SenderInput, &record, None, None);
                 if created.elapsed() >= lifetime {
+                    metrics.trace_record(
+                        trace::Stage::RecordDropped,
+                        &record,
+                        None,
+                        Some(trace::Reason::Expired),
+                    );
                     metrics.update(|d| {
                         d.symbols.originals_ingress_expired_dropped += 1;
                         d.locally_dropped_original_ids.add(record.id);
@@ -1040,13 +1374,28 @@ async fn sender(
                     });
                     continue;
                 }
-                match encode_record(&record, &mut encoder, &policy, Instant::now()) {
+                match encoder.encode(&record, Instant::now()) {
                     Ok(symbols) => {
                         for symbol in symbols {
-                            enqueue_symbol(symbol, created, &mut queue, &mut blocks, &metrics);
+                            enqueue_encoded(
+                                symbol,
+                                created,
+                                &mut queue,
+                                &mut blocks,
+                                &policy,
+                                &metrics,
+                            );
                         }
                     }
-                    Err(_) => metrics.update(|d| d.records.encoding_dropped += 1),
+                    Err(_) => {
+                        metrics.trace_record(
+                            trace::Stage::RecordDropped,
+                            &record,
+                            None,
+                            Some(trace::Reason::Encoding),
+                        );
+                        metrics.update(|d| d.records.encoding_dropped += 1);
+                    }
                 }
             }
         }
@@ -1450,25 +1799,31 @@ async fn sender(
         }
         let mut stalled_originals = 0usize;
         let mut blocked_repair = false;
+        let mut stalled_repairs = Vec::new();
+        let mut repair_wait: Option<PreparedSend> = None;
         let mut next_wait = None;
         'drain: while !queue.is_empty() {
             let now = Instant::now();
             let now_us = epoch.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
-            let repair_ready = queue.front(true).is_some_and(|p| {
-                !p.block.is_some_and(|b| queue.block_pending(b))
-                    && repair_allowed(
-                        &policy,
-                        &budget,
-                        &blocks,
-                        p,
-                        p.data.len()
-                            + if policy.receiver_feedback {
-                                quality::HEADER + 2
-                            } else {
-                                2
-                            },
-                    )
-            });
+            let affordable_repair = |p: &outbound::Pending| {
+                repair_allowed(&policy, &budget, &blocks, p, repair_frame_floor(&policy, p))
+            };
+            let repair_ready = if policy.mixed_fec {
+                // At most REPAIR_LIMIT distinct heads are tried without an
+                // admission. A budget- or path-blocked lane cannot hide a
+                // separately authorized repair from the other coding lane.
+                let ready = queue.promote_ready_repair(|p| {
+                    !p.block
+                        .is_some_and(|block| stalled_repairs.contains(&block))
+                        && affordable_repair(p)
+                });
+                blocked_repair = !ready && !stalled_repairs.is_empty();
+                ready
+            } else {
+                queue.front(true).is_some_and(|p| {
+                    !p.block.is_some_and(|b| queue.block_pending(b)) && affordable_repair(p)
+                })
+            };
             let repair =
                 repair_ready && !blocked_repair && (repair_turn || queue.front(false).is_none());
             let Some(front) = queue.front(repair).cloned() else {
@@ -1480,7 +1835,7 @@ async fn sender(
                     if now.saturating_duration_since(skipped.created) >= lifetime {
                         account_expired(&skipped, now, &metrics);
                     } else {
-                        metrics.update(|d| d.symbols.repairs_budget_skipped += 1);
+                        account_budget_skipped(&policy, &skipped, &metrics);
                     }
                     if let Some(block) = skipped.block {
                         blocks.remove(&block);
@@ -1698,11 +2053,28 @@ async fn sender(
                         accepted = Some((i, frame_bytes, at));
                         break;
                     }
-                    Some(Err(_)) => metrics.path(path.id, |p| p.quinn_send_error_attempts += 1),
+                    Some(Err(_)) => {
+                        trace_outgoing(
+                            &metrics,
+                            trace::Stage::QuinnApiRejected,
+                            &front,
+                            path,
+                            frame_bytes,
+                            Some(trace::Reason::QuinnError),
+                        );
+                        metrics.path(path.id, |p| p.quinn_send_error_attempts += 1);
+                    }
                 }
             }
             let Some((index, frame_bytes, at)) = accepted else {
                 if repair {
+                    if policy.mixed_fec {
+                        stalled_repairs.push(front.block.expect("encoded repair block"));
+                        if repair_wait.is_none() {
+                            repair_wait = wait_candidate;
+                        }
+                        continue;
+                    }
                     blocked_repair = true;
                     if queue.front(false).is_some() {
                         continue;
@@ -1751,6 +2123,21 @@ async fn sender(
             });
             stalled_originals = 0;
             blocked_repair = false;
+            stalled_repairs.clear();
+            repair_wait = None;
+        }
+        if next_wait.is_none()
+            && let Some(attempt) = repair_wait
+        {
+            // A rotated candidate may wait only after restoring its exact
+            // queue head. No admission occurred since this frame was prepared.
+            if queue.promote_ready_repair(|p| {
+                p.block == attempt.front.block
+                    && p.created == attempt.front.created
+                    && p.data == attempt.front.data
+            }) {
+                next_wait = Some(attempt);
+            }
         }
         if publish_feedback_stats {
             publish_receiver_feedback(&paths, &metrics);
@@ -1761,6 +2148,13 @@ async fn sender(
     drop(waiting);
     for repair in [false, true] {
         while let Some(pending) = queue.pop(repair) {
+            metrics.trace_symbol(
+                trace::Stage::SymbolDropped,
+                &pending.data,
+                None,
+                None,
+                Some(trace::Reason::Shutdown),
+            );
             metrics.update(|d| {
                 if let Some(id) = pending.record_id {
                     d.symbols.originals_shutdown_dropped += 1;
@@ -1772,7 +2166,13 @@ async fn sender(
         }
     }
     input.close();
-    while input.try_recv().is_ok() {
+    while let Ok(pending) = input.try_recv() {
+        metrics.trace_record(
+            trace::Stage::RecordDropped,
+            &pending.record,
+            None,
+            Some(trace::Reason::Shutdown),
+        );
         metrics.update(|d| d.records.input_shutdown_dropped += 1);
     }
     publish_receiver_feedback(&shared_paths.lock().expect("paths lock"), &metrics);
@@ -1783,6 +2183,60 @@ enum QueueLayer {
     Ingress,
     Sender,
     Receiver,
+}
+fn rejected_item<T>(error: &mpsc::error::TrySendError<T>) -> &T {
+    match error {
+        mpsc::error::TrySendError::Full(value) | mpsc::error::TrySendError::Closed(value) => value,
+    }
+}
+fn queue_trace_reason<T>(layer: QueueLayer, error: &mpsc::error::TrySendError<T>) -> trace::Reason {
+    match (layer, matches!(error, mpsc::error::TrySendError::Closed(_))) {
+        (QueueLayer::Ingress, false) => trace::Reason::IngressFull,
+        (QueueLayer::Ingress, true) => trace::Reason::IngressClosed,
+        (QueueLayer::Sender, false) => trace::Reason::SenderFull,
+        (QueueLayer::Sender, true) => trace::Reason::SenderClosed,
+        (QueueLayer::Receiver, false) => trace::Reason::ReceiverFull,
+        (QueueLayer::Receiver, true) => trace::Reason::ReceiverClosed,
+    }
+}
+
+fn enqueue_record(
+    tx: &mpsc::Sender<QueuedRecord>,
+    record: Record,
+    created: Instant,
+    scope: &Scope,
+) -> bool {
+    let mut assigned_event = None;
+    scope.trace_with(|context, capture| {
+        let mut event = trace::Event::new(context, trace::Stage::RecordAssigned);
+        event.record = Some(trace::RecordKey {
+            flow: record.flow,
+            record_id: record.id,
+        });
+        event.bytes.payload = u32::try_from(record.payload.len()).ok();
+        event.probe = capture.probe_identity(&record.payload);
+        assigned_event = Some(event);
+        event
+    });
+    let result = tx.try_send(QueuedRecord { record, created });
+    if let Some(mut event) = assigned_event {
+        event.stage = if result.is_ok() {
+            trace::Stage::IngressQueued
+        } else {
+            trace::Stage::RecordDropped
+        };
+        event.reason = result
+            .as_ref()
+            .err()
+            .map(|error| queue_trace_reason(QueueLayer::Sender, error));
+        scope.metrics.trace().emit(event);
+    }
+    if let Err(error) = result {
+        queue_error(scope, QueueLayer::Sender, &error, None);
+        false
+    } else {
+        true
+    }
 }
 fn queue_error<T>(
     scope: &Scope,
@@ -1819,10 +2273,41 @@ fn receive_records(decoder: &mut Receiver, metrics: &Scope, pid: u8, data: &[u8]
         decoder.stale,
     );
     let repairs_before = decoder.repair_packets;
-    let result = decoder.receive(data, Instant::now());
+    metrics.trace_symbol(trace::Stage::PeerSymbolReceived, data, None, None, None);
+    let result = decoder.receive_observed(data, Instant::now(), |record, repaired, duplicate| {
+        metrics.trace_with(|context, capture| {
+            let mut event = trace::Event::new(
+                context,
+                if duplicate {
+                    trace::Stage::RecordDuplicate
+                } else {
+                    trace::Stage::RecordDecoded
+                },
+            );
+            stats::trace_symbol_fields(&mut event, data, capture);
+            // The triggering repair's block is real, but its decoded record is
+            // known only after successful reconstruction/record validation.
+            event.record = Some(trace::RecordKey {
+                flow: record.flow,
+                record_id: record.id,
+            });
+            event.bytes.payload = u32::try_from(record.payload.len()).ok();
+            event.probe = capture.probe_identity(&record.payload);
+            event.recovered = Some(repaired);
+            event.reason = duplicate.then_some(trace::Reason::Duplicate);
+            event
+        });
+    });
     let invalid = u64::from(result.is_err());
     if invalid > 0 {
         decoder.invalid += 1;
+        metrics.trace_symbol(
+            trace::Stage::SymbolDropped,
+            data,
+            None,
+            None,
+            Some(trace::Reason::InvalidSymbol),
+        );
     }
     let delta = (
         decoder.original_packets - before.0,
@@ -1831,6 +2316,15 @@ fn receive_records(decoder: &mut Receiver, metrics: &Scope, pid: u8, data: &[u8]
         decoder.duplicates - before.3,
         decoder.stale - before.4,
     );
+    if delta.4 > 0 {
+        metrics.trace_symbol(
+            trace::Stage::SymbolDropped,
+            data,
+            None,
+            None,
+            Some(trace::Reason::Stale),
+        );
+    }
     metrics.update(|d| {
         d.records.repair_symbols_received += decoder.repair_packets - repairs_before;
         d.records.original_packets_received += delta.0;
@@ -1922,10 +2416,10 @@ async fn session_loop(
                     let decoded=Instant::now();
                     for r in records {
                         if !flows.contains_key(&r.flow) {
-                            if flows.len()>=MAX_FLOWS{dropped+=1;session.forward.update(|d|d.records.udp_target_flow_dropped+=1);session.forward.path(pid,|p|p.udp_target_flow_dropped+=1);continue}
+                            if flows.len()>=MAX_FLOWS{dropped+=1;session.forward.trace_record(trace::Stage::RecordDropped,&r,None,Some(trace::Reason::FlowLimit));session.forward.update(|d|d.records.udp_target_flow_dropped+=1);session.forward.path(pid,|p|p.udp_target_flow_dropped+=1);continue}
                             let bind=if target.is_ipv4(){"0.0.0.0:0"}else{"[::]:0"};
-                            let Ok(socket)=UdpSocket::bind(bind).await else{dropped+=delivery.socket_error(pid);continue};
-                            if socket.connect(target).await.is_err(){dropped+=delivery.socket_error(pid);continue}
+                            let Ok(socket)=UdpSocket::bind(bind).await else{dropped+=delivery.socket_error(pid,&r);continue};
+                            if socket.connect(target).await.is_err(){dropped+=delivery.socket_error(pid,&r);continue}
                             let socket=Arc::new(socket); let weak=Arc::downgrade(&socket); let events=session.events.clone(); let flow=r.flow; let mut quit=session.stop.subscribe(); let ingress_drops=session.ingress_drops.clone();let returning=session.returning.clone();
                             tasks.spawn(async move {
                                 let mut b=vec![0;65536];
@@ -1936,9 +2430,10 @@ async fn session_loop(
                                         value=timeout(Duration::from_secs(5),socket.recv(&mut b))=>match value {
                                             Ok(Ok(n))=>{
                                                 returning.update(|d|d.records.application_received+=1);
-                                                if n>MAX_PAYLOAD{returning.update(|d|d.records.application_oversize_dropped+=1);continue;}
+                                                trace_payload(&returning,trace::Stage::RecordIngress,&b[..n],None);
+                                                if n>MAX_PAYLOAD{trace_payload(&returning,trace::Stage::RecordDropped,&b[..n],Some(trace::Reason::Oversize));returning.update(|d|d.records.application_oversize_dropped+=1);continue;}
                                                 let now=Instant::now();
-                                                if let Err(error)=events.try_send(Event::Reply(flow,b[..n].to_vec(),now)){ingress_drops.fetch_add(1,Ordering::Relaxed);queue_error(&returning,QueueLayer::Ingress,&error,None);}else{returning.update(|d|d.records.ingress_queue_enqueued+=1);}
+                                                if let Err(error)=events.try_send(Event::Reply(flow,b[..n].to_vec(),now)){trace_payload(&returning,trace::Stage::RecordDropped,&b[..n],Some(queue_trace_reason(QueueLayer::Ingress,&error)));ingress_drops.fetch_add(1,Ordering::Relaxed);queue_error(&returning,QueueLayer::Ingress,&error,None);}else{trace_payload(&returning,trace::Stage::IngressQueued,&b[..n],None);returning.update(|d|d.records.ingress_queue_enqueued+=1);}
                                             },
                                             Ok(Err(_))=>break,
                                             _=>{}
@@ -1955,9 +2450,9 @@ async fn session_loop(
                     }
                 },
                 Some(Event::Reply(flow,payload,created))=>{
-                    let Some((_,last))=flows.get_mut(&flow) else{session.returning.update(|d|d.records.application_unavailable_dropped+=1);continue}; *last=Instant::now();
+                    let Some((_,last))=flows.get_mut(&flow) else{trace_payload(&session.returning,trace::Stage::RecordDropped,&payload,Some(trace::Reason::FlowUnavailable));session.returning.update(|d|d.records.application_unavailable_dropped+=1);continue}; *last=Instant::now();
                     let Some(id)=next_id.checked_add(1) else{break}; next_id=id;
-                    if let Err(error)=tx.try_send(QueuedRecord{record:Record{flow,id,payload},created}){dropped+=1;queue_error(&session.returning,QueueLayer::Sender,&error,None);}else{session.returning.update(|d|d.records.sender_queue_enqueued+=1);}
+                    if !enqueue_record(&tx,Record{flow,id,payload},created,&session.returning){dropped+=1;}else{session.returning.update(|d|d.records.sender_queue_enqueued+=1);}
                 },
                 None=>break,
             }
@@ -1969,12 +2464,29 @@ async fn session_loop(
     events.close();
     while let Ok(event) = events.try_recv() {
         match event {
-            Event::Wire(_, _) => session
-                .forward
-                .update(|d| d.records.receiver_shutdown_dropped += 1),
-            Event::Reply(..) => session
-                .returning
-                .update(|d| d.records.ingress_shutdown_dropped += 1),
+            Event::Wire(_, data) => {
+                session.forward.trace_symbol(
+                    trace::Stage::SymbolDropped,
+                    &data,
+                    None,
+                    None,
+                    Some(trace::Reason::Shutdown),
+                );
+                session
+                    .forward
+                    .update(|d| d.records.receiver_shutdown_dropped += 1);
+            }
+            Event::Reply(_, payload, _) => {
+                trace_payload(
+                    &session.returning,
+                    trace::Stage::RecordDropped,
+                    &payload,
+                    Some(trace::Reason::Shutdown),
+                );
+                session
+                    .returning
+                    .update(|d| d.records.ingress_shutdown_dropped += 1);
+            }
         }
     }
     let joined = timeout(Duration::from_secs(2), async {
@@ -2122,7 +2634,7 @@ async fn server_connection(
         .build::<_, Bytes>(h3_quinn::Connection::new(conn.clone()))
         .await?;
     diagnostic.succeeded();
-    let mut joined: Option<(String, Arc<Session>, u8, u64)> = None;
+    let mut joined: Option<(String, Arc<Session>, u8, u64, u64)> = None;
     let mut request: Option<h3::server::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>> = None;
     let admission_deadline = tokio::time::Instant::now() + Duration::from_secs(60);
     let admission_started = Instant::now();
@@ -2200,7 +2712,8 @@ async fn server_connection(
                     ensure!(guided.is_none() || guided==Some("1"),"invalid probe-guided recovery header");
                     let probe_guided_recovery=guided.is_some();
                     let small_fec_bytes=req.headers().get("braidpath-small-fec-bytes").map(|v|v.to_str()).transpose()?.unwrap_or("0").parse::<u16>()?;
-                    let policy=Policy{small_fec_bytes,probe_guided_recovery,capacity_probe_bps,adaptive:quality_schedule==Some("adaptive"),latency_target_ms,group_rates,quality_schedule:quality_schedule.is_some(),receiver_feedback:feedback.is_some(),fec:header("braidpath-fec")?.parse()?,redundancy:header("braidpath-redundancy")?.parse()?,rate,block_ms:header("braidpath-block-ms")?.parse()?,queue_ms:header("braidpath-queue-ms")?.parse()?};policy.validate()?;
+                    let mixed_fec=mixed_fec_header(req.headers())?;
+                    let policy=Policy{small_fec_bytes,mixed_fec,probe_guided_recovery,capacity_probe_bps,adaptive:quality_schedule==Some("adaptive"),latency_target_ms,group_rates,quality_schedule:quality_schedule.is_some(),receiver_feedback:feedback.is_some(),fec:header("braidpath-fec")?.parse()?,redundancy:header("braidpath-redundancy")?.parse()?,rate,block_ms:header("braidpath-block-ms")?.parse()?,queue_ms:header("braidpath-queue-ms")?.parse()?};policy.validate()?;
                     let rejoin=req.headers().get("braidpath-rejoin").is_some_and(|v|v=="1");
                     let stream_id=stream.id().into_inner();
                     // Membership and idle expiry share one map -> paths -> generation lock order.
@@ -2246,9 +2759,13 @@ async fn server_connection(
                         bail!("session expired; a fresh session epoch is required");
                     };
                     metrics.register(&sid,pid,stream_id,stats::RETURN,&conn);
-                    joined=Some((sid,session,pid,stream_id));
+                    let trace_key=trace::PathKey{path_id:pid,generation,connection_id:conn.stable_id() as u64};
+                    trace_path(&session.forward,trace::Stage::PathOpened,trace_key);
+                    trace_path(&session.returning,trace::Stage::PathOpened,trace_key);
+                    joined=Some((sid,session,pid,stream_id,generation));
                     let mut response=Response::builder().status(200).header("braidpath-version","1").header("braidpath-max-payload",MAX_PAYLOAD);if feedback.is_some(){response=response.header("braidpath-feedback","2");}
                     if small_fec_bytes>0 {response=response.header("braidpath-small-fec-bytes",small_fec_bytes);}
+                    if mixed_fec {response=response.header("braidpath-mixed-fec","1");}
                     if capacity_probe_bps>0 {response=response.header("braidpath-capacity-probe-bps",capacity_probe_bps).header("braidpath-capacity-probe-format",capacity_probe::FORMAT);}
                     if probe_guided_recovery {response=response.header("braidpath-probe-guided-recovery","1");}
                     if let Some(scheduler)=quality_schedule {response=response.header("braidpath-scheduler",scheduler);}stream.send_response(response.body(())?).await?;
@@ -2258,12 +2775,14 @@ async fn server_connection(
                 },
                 data=conn.read_datagram()=>{
                     let data=data?;
-                    if let Some((_,session,pid,stream))=&joined {
+                    if let Some((_,session,pid,stream,generation))=&joined {
+                        let trace_key=trace::PathKey{path_id:*pid,generation:*generation,connection_id:conn.stable_id() as u64};
+                        trace_http(&session.forward,trace::Stage::PeerHttpReceived,&data,*stream,session.policy.receiver_feedback,trace_key,None);
                         session.forward.path(*pid,|p|p.http_datagrams_received+=1);
                         if let Ok(payload)=wire::http_payload(&data,*stream) && payload.len()<=(if session.policy.receiver_feedback{quality::MAX_FRAME}else{wire::MAX_WIRE}) {
                             match measured_payload(&session.paths,*pid,payload,session.policy.receiver_feedback,&session.returning,session.observation_notify.as_deref()) {
-                            Ok(Some(payload))=>{if let Err(error)=session.events.try_send(Event::Wire(*pid,payload)){session.ingress_drops.fetch_add(1,Ordering::Relaxed);queue_error(&session.forward,QueueLayer::Receiver,&error,Some(*pid));}},Ok(None)=>{},Err(_)=>session.forward.path(*pid,|p|p.invalid_http_datagrams_dropped+=1)}
-                        } else {session.forward.path(*pid,|p|p.invalid_http_datagrams_dropped+=1);session.forward.update(|d|d.records.invalid_symbols_dropped+=1);}
+                            Ok(Some(payload))=>{if let Err(error)=session.events.try_send(Event::Wire(*pid,payload)){if let Event::Wire(_,payload)=rejected_item(&error){session.forward.trace_symbol(trace::Stage::SymbolDropped,payload,Some(trace_key),Some(data.len()),Some(queue_trace_reason(QueueLayer::Receiver,&error)));}session.ingress_drops.fetch_add(1,Ordering::Relaxed);queue_error(&session.forward,QueueLayer::Receiver,&error,Some(*pid));}},Ok(None)=>{},Err(_)=>{trace_http(&session.forward,trace::Stage::SymbolDropped,&data,*stream,session.policy.receiver_feedback,trace_key,Some(trace::Reason::InvalidHttp));session.forward.path(*pid,|p|p.invalid_http_datagrams_dropped+=1);}}
+                        } else {trace_http(&session.forward,trace::Stage::SymbolDropped,&data,*stream,session.policy.receiver_feedback,trace_key,Some(trace::Reason::InvalidHttp));session.forward.path(*pid,|p|p.invalid_http_datagrams_dropped+=1);session.forward.update(|d|d.records.invalid_symbols_dropped+=1);}
                     }
                 },
                 body=async {request.as_mut().expect("guarded request").recv_data().await},if request.is_some()=>{
@@ -2276,7 +2795,14 @@ async fn server_connection(
     // Classify the original close/error before our cleanup closes the connection.
     diagnostic.finish(result.as_ref().err());
     conn.close(0u32.into(), b"request closed");
-    if let Some((sid, session, pid, _)) = joined {
+    if let Some((sid, session, pid, _, generation)) = joined {
+        let trace_key = trace::PathKey {
+            path_id: pid,
+            generation,
+            connection_id: conn.stable_id() as u64,
+        };
+        trace_path(&session.forward, trace::Stage::PathClosed, trace_key);
+        trace_path(&session.returning, trace::Stage::PathClosed, trace_key);
         let last = {
             let mut map = sessions.lock().expect("sessions lock");
             let mut paths = session.paths.lock().expect("paths lock");
@@ -2595,7 +3121,7 @@ async fn client_session(
                                 probe_reply:Arc::new(Mutex::new(None))});
                         }
                         if let Some(old)=endpoints[id].replace(value.endpoint) {old.close(0u32.into(),b"path replaced");}
-                        tasks.spawn(drive_client_path(value.conn,value.stream,value.driver,value.request,value.send,diagnostic,pid,
+                        tasks.spawn(drive_client_path(value.conn,value.stream,value.driver,value.request,value.send,diagnostic,pid,generation,
                             wire_tx.clone(),ingress_drops.clone(),returning.clone(),forward.clone(),paths.clone(),options.policy.receiver_feedback,observation_notify.clone()));
                         has_session=true;
                         if options.policy.adaptive && !announced {
@@ -2616,16 +3142,17 @@ async fn client_session(
             received=socket.recv_from(&mut input)=>{
                 let (n,peer)=received?;let created=Instant::now();
                 forward.update(|d|d.records.application_received+=1);
-                if n>MAX_PAYLOAD {drops+=1;forward.update(|d|d.records.application_oversize_dropped+=1);continue;}
+                trace_payload(&forward,trace::Stage::RecordIngress,&input[..n],None);
+                if n>MAX_PAYLOAD {drops+=1;trace_payload(&forward,trace::Stage::RecordDropped,&input[..n],Some(trace::Reason::Oversize));forward.update(|d|d.records.application_oversize_dropped+=1);continue;}
                 if !peers.contains_key(&peer) {
-                    if peers.len()>=MAX_FLOWS {drops+=1;forward.update(|d|d.records.application_flow_limit_dropped+=1);continue;}
+                    if peers.len()>=MAX_FLOWS {drops+=1;trace_payload(&forward,trace::Stage::RecordDropped,&input[..n],Some(trace::Reason::FlowLimit));forward.update(|d|d.records.application_flow_limit_dropped+=1);continue;}
                     next_flow=next_flow.checked_add(1).context("flow id exhausted")?;
                     peers.insert(peer,(next_flow,created));reverse.insert(next_flow,peer);
                 }
                 let (flow,last)=peers.get_mut(&peer).expect("inserted peer");*last=created;
                 next_id=next_id.checked_add(1).context("message id exhausted")?;
-                if let Err(error)=tx.try_send(QueuedRecord{record:Record{flow:*flow,id:next_id,payload:input[..n].to_vec()},created}) {
-                    drops+=1;queue_error(&forward,QueueLayer::Sender,&error,None);
+                if !enqueue_record(&tx,Record{flow:*flow,id:next_id,payload:input[..n].to_vec()},created,&forward) {
+                    drops+=1;
                 } else {forward.update(|d|{d.records.ingress_queue_enqueued+=1;d.records.sender_queue_enqueued+=1;});}
             },
             data=wire_rx.recv()=>{
@@ -2636,7 +3163,7 @@ async fn client_session(
                     if let Some(peer)=reverse.get(&record.flow) {
                         if let Some((_,last))=peers.get_mut(peer) {*last=Instant::now();}
                         drops+=delivery.send(&socket,Some(*peer),record,pid,decoded);
-                    } else {returning.update(|d|d.records.udp_target_flow_dropped+=1);returning.path(pid,|p|p.udp_target_flow_dropped+=1);}
+                    } else {returning.trace_record(trace::Stage::RecordDropped,&record,None,Some(trace::Reason::FlowUnavailable));returning.update(|d|d.records.udp_target_flow_dropped+=1);returning.path(pid,|p|p.udp_target_flow_dropped+=1);}
                 }
             }
         }
@@ -2658,7 +3185,14 @@ async fn client_session(
         while tasks.join_next().await.is_some() {}
     }
     wire_rx.close();
-    while wire_rx.try_recv().is_ok() {
+    while let Ok((_, data)) = wire_rx.try_recv() {
+        returning.trace_symbol(
+            trace::Stage::SymbolDropped,
+            &data,
+            None,
+            None,
+            Some(trace::Reason::Shutdown),
+        );
         returning.update(|d| d.records.receiver_shutdown_dropped += 1);
     }
     options.stats.state(|s| {
@@ -2678,6 +3212,7 @@ async fn drive_client_path(
     send: H3Send,
     mut diagnostic: stats::ConnectionTrace,
     pid: u8,
+    generation: u64,
     tx: mpsc::Sender<(u8, Bytes)>,
     ingress_drops: Arc<AtomicU64>,
     returning: Scope,
@@ -2688,20 +3223,30 @@ async fn drive_client_path(
 ) {
     // Dropping the last SendRequest closes the HTTP/3 connection.
     let _send = send;
+    let trace_key = trace::PathKey {
+        path_id: pid,
+        generation,
+        connection_id: conn.stable_id() as u64,
+    };
+    trace_path(&returning, trace::Stage::PathOpened, trace_key);
+    trace_path(&measurement_scope, trace::Stage::PathOpened, trace_key);
     let result:Result<()>=async {loop {tokio::select! {
                         e=driver.wait_idle()=>return Err(e.into()),
                         body=request.recv_data()=>{let _=body?;return Ok(())},
                         d=conn.read_datagram()=>match d {
                             Ok(d)=>{
+                                trace_http(&returning,trace::Stage::PeerHttpReceived,&d,stream,feedback,trace_key,None);
                                 returning.path(pid,|p|p.http_datagrams_received+=1);
                                 if let Ok(p)=wire::http_payload(&d,stream) && p.len()<=(if feedback{quality::MAX_FRAME}else{wire::MAX_WIRE}) {
-                                    match measured_payload(&path_view,pid,p,feedback,&measurement_scope,observation_notify.as_deref()) {Ok(Some(p))=>{if let Err(error)=tx.try_send((pid,p)){ingress_drops.fetch_add(1,Ordering::Relaxed);queue_error(&returning,QueueLayer::Receiver,&error,Some(pid));}},Ok(None)=>{},Err(_)=>returning.path(pid,|p|p.invalid_http_datagrams_dropped+=1)}
-                                }else{returning.path(pid,|p|p.invalid_http_datagrams_dropped+=1);returning.update(|d|d.records.invalid_symbols_dropped+=1);}
+                                    match measured_payload(&path_view,pid,p,feedback,&measurement_scope,observation_notify.as_deref()) {Ok(Some(p))=>{if let Err(error)=tx.try_send((pid,p)){returning.trace_symbol(trace::Stage::SymbolDropped,&rejected_item(&error).1,Some(trace_key),Some(d.len()),Some(queue_trace_reason(QueueLayer::Receiver,&error)));ingress_drops.fetch_add(1,Ordering::Relaxed);queue_error(&returning,QueueLayer::Receiver,&error,Some(pid));}},Ok(None)=>{},Err(_)=>{trace_http(&returning,trace::Stage::SymbolDropped,&d,stream,feedback,trace_key,Some(trace::Reason::InvalidHttp));returning.path(pid,|p|p.invalid_http_datagrams_dropped+=1);}}
+                                }else{trace_http(&returning,trace::Stage::SymbolDropped,&d,stream,feedback,trace_key,Some(trace::Reason::InvalidHttp));returning.path(pid,|p|p.invalid_http_datagrams_dropped+=1);returning.update(|d|d.records.invalid_symbols_dropped+=1);}
                             },
                             Err(e)=>return Err(e.into()),
                         }
                     }}}.await;
     let normal = diagnostic.finish(result.as_ref().err());
+    trace_path(&returning, trace::Stage::PathClosed, trace_key);
+    trace_path(&measurement_scope, trace::Stage::PathClosed, trace_key);
     if normal {
         info!(context=%diagnostic.context(),"client path closed");
     } else {
@@ -2782,6 +3327,9 @@ async fn connect_path(
     if policy.small_fec_bytes > 0 {
         req = req.header("braidpath-small-fec-bytes", policy.small_fec_bytes);
     }
+    if policy.mixed_fec {
+        req = req.header("braidpath-mixed-fec", "1");
+    }
     if policy.receiver_feedback {
         req = req
             .header("braidpath-feedback", "2")
@@ -2843,6 +3391,10 @@ async fn connect_path(
                 .and_then(|v| v.parse::<u16>().ok())
                 == Some(policy.small_fec_bytes),
         "small-record FEC not negotiated"
+    );
+    ensure!(
+        mixed_fec_header(response.headers())? == policy.mixed_fec,
+        "mixed FEC not negotiated"
     );
     ensure!(
         !policy.receiver_feedback

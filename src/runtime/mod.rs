@@ -9,6 +9,7 @@ pub mod relay;
 pub mod scheduler;
 mod shutdown;
 pub mod stats;
+pub mod trace;
 pub mod transport;
 pub mod tunnel;
 pub mod wire;

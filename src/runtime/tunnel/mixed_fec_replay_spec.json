@@ -1,0 +1,610 @@
+{
+  "schema_version": 1,
+  "status": "draft_not_registered_not_executed",
+  "base_head": "6bf52ad6d7a7378cb9e76716bb06b9f334b9f685",
+  "scope": "Deterministic in-process mechanism replay. No Quinn endpoints, UDP traffic, host performance, or throughput claim.",
+  "modes": [
+    {
+      "name": "legacy_small",
+      "implementation": "exact base runtime plus cfg(test) driver only",
+      "fec": 0,
+      "small_fec_bytes": 128,
+      "redundancy_percent": 0,
+      "mixed_fec": false
+    },
+    {
+      "name": "legacy_ordinary",
+      "implementation": "exact base runtime plus cfg(test) driver only",
+      "fec": 4,
+      "small_fec_bytes": 0,
+      "redundancy_percent": 25,
+      "mixed_fec": false
+    },
+    {
+      "name": "candidate_mixed",
+      "implementation": "candidate real RecordEncoder and real budget helpers",
+      "fec": 4,
+      "small_fec_bytes": 128,
+      "redundancy_percent": 25,
+      "mixed_fec": true
+    }
+  ],
+  "clock": {
+    "tick_ms": 1,
+    "block_ms": 10,
+    "sender_ttl_ms": 100,
+    "receiver_repair_wait_ms": 200,
+    "virtual_one_way_ms": 60,
+    "application_deadline_ms": 200,
+    "case_cutoff_ms": 300
+  },
+  "wire": {
+    "record_header_bytes": 12,
+    "braidpath_wire_header_bytes": 13,
+    "http_request_stream": 0,
+    "http_mapping_bytes": 2,
+    "receiver_feedback": false,
+    "payload_header": "BPP2 36-byte known test header; deterministic run/kind/seq/virtual timestamp",
+    "no_ciphertext_observation": true
+  },
+  "service_order": "For each integer virtual millisecond: generate due records and timer flush via real encoder; expire queued symbols at ingress age >= 100 ms; admit ready originals then eligible repairs once their per-case service gate opens. Admission is a virtual test shim; actual real sender scheduling is covered separately.",
+  "artificial_erasure": {
+    "unit": "record id selected from the original's real wire header; identical original ID set for every mode in a case",
+    "location": "after virtual admission, before real Receiver",
+    "repairs": "No artificial erasure of admitted repair symbols. Budget skipped or expired repairs were never admitted and are separate.",
+    "not_matched": "Block numbers and ciphertext ordinals are never treated as equal erasure events across modes."
+  },
+  "payload_pattern": "BPP2, kind 3 bulk or 2 echo, reserved zero, 16-byte case run_id, sequence=logical record id, signed 64-bit virtual timestamp nanoseconds; remaining bytes=(record_id + kind) % 251.",
+  "full_population_per_mode": {
+    "cases": 4,
+    "records": 54,
+    "bulk": 17,
+    "echo": 37
+  },
+  "cases": [
+    {
+      "name": "clean_mixed",
+      "run_id_hex": "6d697865646665630000000000000001",
+      "records": [
+        {
+          "id": 0,
+          "flow": 101,
+          "kind": "bulk",
+          "size": 1000,
+          "at_ms": 0
+        },
+        {
+          "id": 1,
+          "flow": 101,
+          "kind": "bulk",
+          "size": 1000,
+          "at_ms": 1
+        },
+        {
+          "id": 2,
+          "flow": 101,
+          "kind": "bulk",
+          "size": 1000,
+          "at_ms": 2
+        },
+        {
+          "id": 3,
+          "flow": 101,
+          "kind": "bulk",
+          "size": 1000,
+          "at_ms": 3
+        },
+        {
+          "id": 4,
+          "flow": 202,
+          "kind": "echo",
+          "size": 128,
+          "at_ms": 4
+        },
+        {
+          "id": 5,
+          "flow": 101,
+          "kind": "bulk",
+          "size": 1000,
+          "at_ms": 5
+        },
+        {
+          "id": 6,
+          "flow": 101,
+          "kind": "bulk",
+          "size": 1000,
+          "at_ms": 6
+        },
+        {
+          "id": 7,
+          "flow": 101,
+          "kind": "bulk",
+          "size": 1000,
+          "at_ms": 7
+        },
+        {
+          "id": 8,
+          "flow": 101,
+          "kind": "bulk",
+          "size": 1000,
+          "at_ms": 8
+        },
+        {
+          "id": 9,
+          "flow": 202,
+          "kind": "echo",
+          "size": 128,
+          "at_ms": 9
+        }
+      ],
+      "original_erasure_ids": [],
+      "original_service_from_ms": 0,
+      "repair_service_from_ms": 0,
+      "expected_missing": {
+        "legacy_small": [],
+        "legacy_ordinary": [],
+        "candidate_mixed": []
+      },
+      "expected_repairs": {
+        "legacy_small": {
+          "generated": 2,
+          "admitted": 2,
+          "budget_skipped": 0,
+          "expired": 0
+        },
+        "legacy_ordinary": {
+          "generated": 3,
+          "admitted": 2,
+          "budget_skipped": 1,
+          "expired": 0
+        },
+        "candidate_mixed": {
+          "generated": 4,
+          "admitted": 3,
+          "budget_skipped": 1,
+          "expired": 0
+        }
+      }
+    },
+    {
+      "name": "fixed_joint_original_erasure",
+      "run_id_hex": "6d697865646665630000000000000002",
+      "records": [
+        {
+          "id": 0,
+          "flow": 101,
+          "kind": "bulk",
+          "size": 1000,
+          "at_ms": 0
+        },
+        {
+          "id": 1,
+          "flow": 101,
+          "kind": "bulk",
+          "size": 1000,
+          "at_ms": 1
+        },
+        {
+          "id": 2,
+          "flow": 101,
+          "kind": "bulk",
+          "size": 1000,
+          "at_ms": 2
+        },
+        {
+          "id": 3,
+          "flow": 101,
+          "kind": "bulk",
+          "size": 1000,
+          "at_ms": 3
+        },
+        {
+          "id": 4,
+          "flow": 202,
+          "kind": "echo",
+          "size": 128,
+          "at_ms": 4
+        },
+        {
+          "id": 5,
+          "flow": 101,
+          "kind": "bulk",
+          "size": 1000,
+          "at_ms": 5
+        },
+        {
+          "id": 6,
+          "flow": 101,
+          "kind": "bulk",
+          "size": 1000,
+          "at_ms": 6
+        },
+        {
+          "id": 7,
+          "flow": 101,
+          "kind": "bulk",
+          "size": 1000,
+          "at_ms": 7
+        },
+        {
+          "id": 8,
+          "flow": 101,
+          "kind": "bulk",
+          "size": 1000,
+          "at_ms": 8
+        },
+        {
+          "id": 9,
+          "flow": 202,
+          "kind": "echo",
+          "size": 128,
+          "at_ms": 9
+        }
+      ],
+      "original_erasure_ids": [
+        4,
+        5
+      ],
+      "original_service_from_ms": 0,
+      "repair_service_from_ms": 0,
+      "expected_missing": {
+        "legacy_small": [
+          5
+        ],
+        "legacy_ordinary": [
+          4,
+          5
+        ],
+        "candidate_mixed": []
+      },
+      "expected_repairs": {
+        "legacy_small": {
+          "generated": 2,
+          "admitted": 2,
+          "budget_skipped": 0,
+          "expired": 0
+        },
+        "legacy_ordinary": {
+          "generated": 3,
+          "admitted": 2,
+          "budget_skipped": 1,
+          "expired": 0
+        },
+        "candidate_mixed": {
+          "generated": 4,
+          "admitted": 3,
+          "budget_skipped": 1,
+          "expired": 0
+        }
+      }
+    },
+    {
+      "name": "small_credit_cannot_fund_bulk",
+      "run_id_hex": "6d697865646665630000000000000003",
+      "records": [
+        {
+          "id": 0,
+          "flow": 202,
+          "kind": "echo",
+          "size": 128,
+          "at_ms": 0
+        },
+        {
+          "id": 1,
+          "flow": 202,
+          "kind": "echo",
+          "size": 128,
+          "at_ms": 1
+        },
+        {
+          "id": 2,
+          "flow": 202,
+          "kind": "echo",
+          "size": 128,
+          "at_ms": 2
+        },
+        {
+          "id": 3,
+          "flow": 202,
+          "kind": "echo",
+          "size": 128,
+          "at_ms": 3
+        },
+        {
+          "id": 4,
+          "flow": 202,
+          "kind": "echo",
+          "size": 128,
+          "at_ms": 4
+        },
+        {
+          "id": 5,
+          "flow": 202,
+          "kind": "echo",
+          "size": 128,
+          "at_ms": 5
+        },
+        {
+          "id": 6,
+          "flow": 202,
+          "kind": "echo",
+          "size": 128,
+          "at_ms": 6
+        },
+        {
+          "id": 7,
+          "flow": 202,
+          "kind": "echo",
+          "size": 128,
+          "at_ms": 7
+        },
+        {
+          "id": 8,
+          "flow": 202,
+          "kind": "echo",
+          "size": 128,
+          "at_ms": 8
+        },
+        {
+          "id": 9,
+          "flow": 202,
+          "kind": "echo",
+          "size": 128,
+          "at_ms": 9
+        },
+        {
+          "id": 10,
+          "flow": 202,
+          "kind": "echo",
+          "size": 128,
+          "at_ms": 10
+        },
+        {
+          "id": 11,
+          "flow": 202,
+          "kind": "echo",
+          "size": 128,
+          "at_ms": 11
+        },
+        {
+          "id": 12,
+          "flow": 202,
+          "kind": "echo",
+          "size": 128,
+          "at_ms": 12
+        },
+        {
+          "id": 13,
+          "flow": 202,
+          "kind": "echo",
+          "size": 128,
+          "at_ms": 13
+        },
+        {
+          "id": 14,
+          "flow": 202,
+          "kind": "echo",
+          "size": 128,
+          "at_ms": 14
+        },
+        {
+          "id": 15,
+          "flow": 202,
+          "kind": "echo",
+          "size": 128,
+          "at_ms": 15
+        },
+        {
+          "id": 16,
+          "flow": 202,
+          "kind": "echo",
+          "size": 128,
+          "at_ms": 16
+        },
+        {
+          "id": 17,
+          "flow": 202,
+          "kind": "echo",
+          "size": 128,
+          "at_ms": 17
+        },
+        {
+          "id": 18,
+          "flow": 202,
+          "kind": "echo",
+          "size": 128,
+          "at_ms": 18
+        },
+        {
+          "id": 19,
+          "flow": 202,
+          "kind": "echo",
+          "size": 128,
+          "at_ms": 19
+        },
+        {
+          "id": 20,
+          "flow": 202,
+          "kind": "echo",
+          "size": 128,
+          "at_ms": 20
+        },
+        {
+          "id": 21,
+          "flow": 202,
+          "kind": "echo",
+          "size": 128,
+          "at_ms": 21
+        },
+        {
+          "id": 22,
+          "flow": 202,
+          "kind": "echo",
+          "size": 128,
+          "at_ms": 22
+        },
+        {
+          "id": 23,
+          "flow": 202,
+          "kind": "echo",
+          "size": 128,
+          "at_ms": 23
+        },
+        {
+          "id": 24,
+          "flow": 202,
+          "kind": "echo",
+          "size": 128,
+          "at_ms": 24
+        },
+        {
+          "id": 25,
+          "flow": 202,
+          "kind": "echo",
+          "size": 128,
+          "at_ms": 25
+        },
+        {
+          "id": 26,
+          "flow": 202,
+          "kind": "echo",
+          "size": 128,
+          "at_ms": 26
+        },
+        {
+          "id": 27,
+          "flow": 202,
+          "kind": "echo",
+          "size": 128,
+          "at_ms": 27
+        },
+        {
+          "id": 28,
+          "flow": 202,
+          "kind": "echo",
+          "size": 128,
+          "at_ms": 28
+        },
+        {
+          "id": 29,
+          "flow": 202,
+          "kind": "echo",
+          "size": 128,
+          "at_ms": 29
+        },
+        {
+          "id": 30,
+          "flow": 202,
+          "kind": "echo",
+          "size": 128,
+          "at_ms": 30
+        },
+        {
+          "id": 31,
+          "flow": 202,
+          "kind": "echo",
+          "size": 128,
+          "at_ms": 31
+        },
+        {
+          "id": 32,
+          "flow": 101,
+          "kind": "bulk",
+          "size": 1000,
+          "at_ms": 32
+        }
+      ],
+      "original_erasure_ids": [
+        32
+      ],
+      "original_service_from_ms": 0,
+      "repair_service_from_ms": 0,
+      "expected_missing": {
+        "legacy_small": [
+          32
+        ],
+        "legacy_ordinary": [
+          32
+        ],
+        "candidate_mixed": [
+          32
+        ]
+      },
+      "expected_repairs": {
+        "legacy_small": {
+          "generated": 32,
+          "admitted": 32,
+          "budget_skipped": 0,
+          "expired": 0
+        },
+        "legacy_ordinary": {
+          "generated": 9,
+          "admitted": 7,
+          "budget_skipped": 2,
+          "expired": 0
+        },
+        "candidate_mixed": {
+          "generated": 33,
+          "admitted": 32,
+          "budget_skipped": 1,
+          "expired": 0
+        }
+      }
+    },
+    {
+      "name": "repair_original_ingress_ttl",
+      "run_id_hex": "6d697865646665630000000000000004",
+      "records": [
+        {
+          "id": 0,
+          "flow": 202,
+          "kind": "echo",
+          "size": 128,
+          "at_ms": 0
+        }
+      ],
+      "original_erasure_ids": [
+        0
+      ],
+      "original_service_from_ms": 99,
+      "repair_service_from_ms": 100,
+      "expected_missing": {
+        "legacy_small": [
+          0
+        ],
+        "legacy_ordinary": [
+          0
+        ],
+        "candidate_mixed": [
+          0
+        ]
+      },
+      "expected_repairs": {
+        "legacy_small": {
+          "generated": 1,
+          "admitted": 0,
+          "budget_skipped": 0,
+          "expired": 1
+        },
+        "legacy_ordinary": {
+          "generated": 1,
+          "admitted": 0,
+          "budget_skipped": 0,
+          "expired": 1
+        },
+        "candidate_mixed": {
+          "generated": 1,
+          "admitted": 0,
+          "budget_skipped": 0,
+          "expired": 1
+        }
+      }
+    }
+  ],
+  "proof_boundaries": [
+    "Small mode has per-original one-copy authorization, not the ordinary percentage budget. Same aggregate cap is a native condition; repair policies are explicitly different.",
+    "Exact expectations are prospective contract claims; any failure is retained. They are not generated from candidate output.",
+    "Full source IDs, symbol membership, admission outcomes, loss actions, delivered/recovered/missing IDs and wire/HTTP byte ledgers must be emitted before assertions.",
+    "The virtual test reports no echo RTT and no physical wire throughput. Native same-machine target one-way and echo RTT are measured separately."
+  ]
+}

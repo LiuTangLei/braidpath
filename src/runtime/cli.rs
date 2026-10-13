@@ -144,9 +144,13 @@ struct PolicyArgs {
     receiver_feedback: bool,
     #[arg(long, default_value_t = 4)]
     fec: u8,
-    /// Immediate single-record XOR repair cutoff; requires FEC0 and redundancy-percent0. Zero disables it.
+    /// Immediate single-record XOR repair cutoff. Use FEC0/redundancy0, or explicit --mixed-fec.
     #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u16).range(0..=1000))]
     small_fec_bytes: u16,
+    /// Combine immediate small-record repair with ordinary FEC for larger records.
+    /// Redundancy-percent limits large-record repair; every small original permits one repair.
+    #[arg(long)]
+    mixed_fec: bool,
     #[arg(long, default_value_t = 30)]
     redundancy_percent: u8,
     #[arg(long, default_value_t = 10_000_000)]
@@ -230,6 +234,7 @@ pub async fn run() -> Result<()> {
                     group_rates,
                     fec: policy.fec,
                     small_fec_bytes: policy.small_fec_bytes,
+                    mixed_fec: policy.mixed_fec,
                     receiver_feedback: policy.receiver_feedback
                         || policy.quality_schedule
                         || policy.adaptive,
@@ -303,6 +308,62 @@ fn parse_group_rates(values: &[String], aggregate: u64) -> Result<[u64; super::M
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn mixed_fec_and_nested_packet_trace_flags_preserve_disabled_defaults() {
+        let base = [
+            "braidpath",
+            "client",
+            "--entrance",
+            "127.0.0.1:4433",
+            "--server-name",
+            "localhost",
+            "--ca",
+            "cert.pem",
+            "--token-file",
+            "token",
+        ];
+        let cli = Cli::try_parse_from(base).unwrap();
+        let Command::Client { policy, stats, .. } = cli.command else {
+            unreachable!()
+        };
+        assert!(!policy.mixed_fec);
+        assert_eq!(
+            (
+                policy.fec,
+                policy.small_fec_bytes,
+                policy.redundancy_percent
+            ),
+            (4, 0, 30)
+        );
+        assert!(stats.trace.packet_trace.is_none());
+        assert!(!stats.trace.packet_trace_probe_header);
+        let extra = [
+            "--mixed-fec",
+            "--small-fec-bytes",
+            "128",
+            "--packet-trace",
+            "capture.jsonl",
+            "--packet-trace-probe-header",
+        ];
+        let cli = Cli::try_parse_from(base.iter().chain(extra.iter())).unwrap();
+        let Command::Client { policy, stats, .. } = cli.command else {
+            unreachable!()
+        };
+        assert!(policy.mixed_fec);
+        assert_eq!(
+            (
+                policy.fec,
+                policy.small_fec_bytes,
+                policy.redundancy_percent
+            ),
+            (4, 128, 30)
+        );
+        assert_eq!(
+            stats.trace.packet_trace,
+            Some(std::path::PathBuf::from("capture.jsonl"))
+        );
+        assert!(stats.trace.packet_trace_probe_header);
+    }
     #[test]
     fn server_datagram_send_buffer_accepts_explicit_bounded_override() {
         let arguments = [

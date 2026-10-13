@@ -59,7 +59,108 @@ Quinn also exposes cumulative `ack_frames_tx/rx`, `ack_frequency_frames_tx/rx` a
 
 Relay direction counters use UDP datagrams, with received/queued/forwarded counts and bytes. Drop reasons distinguish unauthorized source, oversize, deterministic impairment, rate budget, mapping limits/errors/closed queues, queue capacity, socket send errors/cancellation, expired mapping queues and shutdown. `--drop-every` impairs forward ciphertext datagrams only, including handshake/control packets; a counter cannot identify their encrypted record contents.
 
-## Bounded logical reconciliation
+## Mixed-mode repair accounts
+
+The `symbols.mixed_*` fields are additive and remain zero outside explicit mixed
+mode. `mixed_small_originals_generated`, `mixed_small_repairs_generated`,
+`mixed_bulk_originals_generated` and `mixed_bulk_repairs_generated` count actual
+generated symbols. They do not count successful FEC recoveries.
+
+`mixed_small_repair_reserved_bytes` is the cumulative maximum authorization
+created by admitted small originals for their queued repairs. It is not traffic
+and can exceed the bytes later admitted, including after expiration. Actual
+`mixed_small_repair_admitted_bytes`, `mixed_bulk_original_admitted_bytes` and
+`mixed_bulk_repair_admitted_bytes` count HTTP DATAGRAM bytes accepted by Quinn,
+including any quality envelope and HTTP stream mapping. The two corresponding
+`mixed_*_repairs_quinn_admitted` counters count repairs, not bytes. Only the bulk
+original counter earns the ordinary percentage allowance; the small reservation
+never contributes to it. Existing original/repair totals include both classes.
+
+`mixed_bulk_repairs_budget_skipped` counts terminal budget omissions. Its
+`mixed_bulk_repair_budget_skipped_bytes` partner counts the omitted encoded
+Braid/FEC bytes. No path was selected for that skip, so it excludes quality and
+HTTP headers rather than inventing an admitted frame size. Expired and shutdown
+repairs remain in their distinct existing totals. Actual encrypted UDP, IP,
+handshake/ACK/control and relay-backhaul cost require separate counters/capture.
+
+## Bounded packet evidence
+
+Client and server can write per-record/per-symbol diagnostic metadata to a new
+file. Append these flags to both endpoint commands when a finite diagnostic
+needs to locate a delivery gap:
+
+```sh
+--packet-trace local/run/client.trace.jsonl --packet-trace-probe-header
+```
+
+The second flag is optional. It recognizes only the known BPP2 magic, reserved
+bytes, kind and structural header, and records run ID/kind/sequence. It does not
+log timestamp contents, payloads, payload hashes, credentials, keys or addresses.
+It does not authenticate an application's BPP2 body. Ordinary applications can
+use record/symbol IDs with probe-header parsing disabled.
+
+| Bound | Default | Hard maximum |
+| --- | ---: | ---: |
+| `--packet-trace-max-events` | 400,000 attempts | 2,000,000 |
+| `--packet-trace-queue-events` | 4,096 fixed-size events | 16,384 |
+| `--packet-trace-max-bytes` | 134,217,728 bytes | 536,870,912 bytes |
+
+Tracing is disabled by default. Disabled hooks do not construct event metadata,
+read a trace clock, parse a probe header or allocate a trace queue. Enabled hooks
+use a bounded nonblocking queue; a dedicated thread serializes/writes the file.
+Event/file limits and a slow writer never make the transport wait for a trace
+slot. The output must be new; existing files and symlinks are not overwritten.
+Trace and cumulative stats destinations must be distinct, including existing
+aliases/hard links. Diagnostic CPU and disk cost still require measurement.
+
+`record_ingress` observes the local UDP receive and can precede assignment of a
+record ID. `record_assigned` establishes the actual flow/record ID, retaining the
+optional probe identity; the server's target-reply event queue sits between
+those two stages. `ingress_queued` identifies successful queue admissions; server
+replies can have one before record assignment and one at the sender input queue.
+`sender_input`, `symbol_generated`, `symbol_queued`, `quinn_api_admitted`,
+`peer_http_received`, `peer_symbol_received`, `record_decoded` and
+`local_udp_delivered` expose subsequent boundaries. Terminal record/symbol
+events identify their local reason. Queueing/WouldBlock and duplicate events are
+separate; a duplicate discard is not another lost business record.
+
+The key is authenticated session and direction, actual wire kind/block/index
+(repair uses source count), and flow/record ID when observed. Plain frames have
+block/index zero, so their record ID is essential. The receiver does not infer a
+coding lane from block numbers. `path` contains the logical path ID, negotiated
+generation and the local Quinn stable connection ID. Match path ID/generation
+across endpoints; connection IDs are local to the file/process and must not be
+compared across machines. Path open/close events preserve retired generations.
+Local decoder/UDP events may have no path key; associate their actual record or
+triggering symbol with the earlier received event instead of guessing a current
+generation. HTTP control arrivals can have no business-symbol key.
+
+`record_decoded.recovered=true` means reconstruction produced the first delivered
+record in that race. A later original can produce `record_duplicate`; the
+recovered count alone is not the number of records that would otherwise remain
+lost. `bytes.payload`, `bytes.wire` and `bytes.http_datagram` denote different
+observed layers; null means unobserved. Monotonic timestamps are local to one
+trace. Its wall-clock anchor is not cross-host clock calibration.
+
+Each file has a header, attempted-event sequence numbers and a footer. Concurrent
+producers may reach the file out of sequence order. Validate the complete unique
+sequence set and counters, not sorted line order. The footer and final cumulative
+stats `packet_trace` summary must agree: no queue/event/file/closed-writer losses,
+invalid contexts, unwritten accepted events, write errors or timeout. Missing or
+truncated output is incomplete evidence. Enabled incomplete tracing makes an
+otherwise successful diagnostic command return an error. Shutdown waits at most
+two seconds for the writer; an already-blocked OS write cannot be cancelled and
+is reported as incomplete. Disabled tracing is not a successful empty capture.
+
+Quinn API acceptance does not expose a QUIC packet number or prove an OS send,
+NIC transmission, network delivery or peer application receipt. A fully traced
+symbol admitted on one side but absent at peer HTTP reception locates that
+interval only. Quinn internals, the endpoint OS and the network remain separate
+possible causes. Local UDP acceptance also needs an application receipt to
+establish end-to-end delivery. Refuse loss attribution if either capture or
+required lifecycle/source-stage coverage is incomplete.
+
+## Logical ID windows
 
 Each session/direction optionally exposes `generated_record_ids`, `quinn_admitted_record_ids`, `locally_dropped_original_ids` and `udp_delivered_record_ids`. Each contains `highest_id`, `floor_id` and `recent`; IDs below its floor have been retired. At most 8,192 IDs are retained in each window. These windows are absent from aggregate direction totals because IDs restart at each session. Statistics retain at most 128 session scopes and 128 current logical-path scopes; omitted scopes are counted explicitly. Rejoins replace the current connection reference instead of consuming a lifetime connection slot. Each path keeps at most three scalar previous-generation snapshots, with `total_generations` and `retired_generations` counters. Retired sessions release all live connection references; at most eight recent retired sessions remain, and their historical scopes can be evicted to admit a new active epoch. `retired_session_total`, `evicted_session_scopes` and `evicted_path_scopes` expose pruning. Aggregate direction totals survive history pruning. Complete per-session/path assertions must be refused if scopes were omitted or the compared ID range falls below any relevant window floor. Production-long sessions require interval/window reconciliation rather than a whole-session ID claim.
 

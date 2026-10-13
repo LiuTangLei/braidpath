@@ -4,7 +4,7 @@ use super::{OutPath, Policy, outbound};
 use std::time::Duration;
 
 pub(super) fn applies(policy: &Policy, pending: &outbound::Pending) -> bool {
-    policy.small_fec_bytes > 0 && pending.block.is_some()
+    policy.small_fec_bytes > 0 && pending.block.is_some() && (!policy.mixed_fec || pending.small)
 }
 
 fn delay_estimate(min_rtt_ms: f64, rtt_ms: f64, transit_ms: f64, queued: usize, cwnd: u64) -> f64 {

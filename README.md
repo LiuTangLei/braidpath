@@ -109,6 +109,21 @@ both transmissions remains unrecoverable. The threshold defaults to zero and
 must be acknowledged by both endpoints. This does not establish a performance,
 absolute one-way deadline or black-hole detection guarantee.
 
+Explicit `--mixed-fec --fec 4 --redundancy-percent 30 --small-fec-bytes 128`
+retains immediate single-record small repairs and encodes larger records in an
+independent ordinary FEC block. Both peers must acknowledge mixed mode. Small
+repairs receive one bounded authorization per actually admitted small original;
+only admitted large-original bytes earn the configured ordinary repair credit.
+The percentage therefore limits large-record repair, not combined redundancy.
+Short blocks still cost a full repair and may be skipped for lack of credit.
+Both classes retain the same aggregate/group pacing and ingress deadlines.
+See [policy details](docs/runtime.md#mixed-small-and-large-record-protection).
+
+Opt-in [packet evidence](docs/statistics.md#bounded-packet-evidence) links real
+record and symbol IDs through Quinn API admission, peer HTTP reception, decoding
+and local UDP acceptance. Logs are bounded and record incomplete capture
+explicitly. API admission does not prove OS or physical transmission.
+
 ## Inspiration
 
 We draw inspiration from [Aggligator](https://github.com/remoc-rs/aggligator), especially its link abstraction, dynamic link lifecycle, and observability. BraidPath implements its own aggregation and recovery core.

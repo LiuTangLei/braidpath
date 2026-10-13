@@ -54,6 +54,8 @@ On Linux, repeat `--interface eth0 --interface wlan0` to create the interface–
 | `--fec 4` (default), `--fec 0` | One XOR repair per block of at most four originals, or FEC off; maximum block size 32 |
 | `--block-ms 3` | Maximum encoder block age, driven by a 1 ms timer; originals are emitted immediately |
 | `--redundancy-percent 30` | Repair HTTP-datagram byte budget credited only by successfully admitted originals; saved credit is bounded |
+| `--small-fec-bytes 0` | Optional immediate single-record XOR repair threshold, at most 1,000 application bytes; requires FEC0/redundancy0 unless mixed mode is explicit |
+| `--mixed-fec` | Explicitly combine small-record repair with ordinary FEC for larger records; disabled by default, negotiated by both peers |
 | `--congestion bbr` (client/server) | BBR is the only runtime congestion controller; each QUIC connection still controls its own congestion window |
 | `--rate-bps 10000000` | Per-session, per-direction aggregate pacing cap, including an estimated header allowance; independent QUIC congestion control remains active |
 | `--adaptive` | Opt-in per-path pacing, sender-age admission, fresh-health eligibility, independent RTT probes and automatic startup/outage recovery |
@@ -95,6 +97,56 @@ The per-flow and repair queue caps prevent one bulk flow and its repairs from fi
 Queues and decode windows are bounded, but this is not hostile-load acceptance. The server accepts up to 128 active connections and bounds handshake/request resolution time. Authenticated clients share the server token's resource domain. Process supervision and deployment quotas remain operator responsibilities.
 
 ## Wire profile v1
+
+### Mixed small and large record protection
+
+For a mixed workload, explicitly request all three coding parameters and the
+mode acknowledgement, for example:
+
+```sh
+--mixed-fec --fec 4 --small-fec-bytes 128 --redundancy-percent 30 --block-ms 8
+```
+
+This is a selected experimental policy; defaults remain FEC4, block age 3 ms,
+30% ordinary repair, no small threshold and no mixed mode. Mixed mode requires
+positive FEC, threshold and ordinary redundancy, and excludes independent
+capacity probes. A peer must explicitly acknowledge `braidpath-mixed-fec: 1`.
+Legacy ordinary-only and small-only policies preserve their existing encoding.
+
+Small records form independent k=1 blocks and retain immediate original/repair
+generation and the small-record path eligibility guard. Larger records enter
+their own k-record encoder, so a small request cannot enlarge its repair to the
+size of a neighboring bulk record or consume a bulk block position. Both
+encoders allocate block IDs from one dense sequence when a real block opens;
+the existing envelope and shared 256-block decoder window remain unchanged.
+At extreme small-record rates an unfinished bulk block can still fall behind
+that bounded receiver window. This mode does not extend the window, silently
+extend a deadline, or recover arbitrary multi-record erasures.
+
+The repair accounts are separate. An actually admitted small original grants
+at most one already-generated, queued small repair. Its reservation covers
+that repair plus negotiated quality framing and the largest legal HTTP stream
+mapping; admission consumes the authorization once using actual HTTP bytes.
+A rejected or expired original grants no authorization. Larger originals alone
+earn `redundancy-percent` credit, and larger repairs debit it only when Quinn
+accepts them. Small traffic cannot subsidize large repair. A bulk repair waiting
+for insufficient credit cannot hold an eligible small repair behind it.
+
+The configured percentage applies to ordinary large-record repair, not total
+redundancy. Each protected small record can add roughly one copy. Even a full
+k=4 block has framing differences, and a one- or two-record short block still
+needs a full repair symbol. Thus k=4 is not an exact 25% byte-cost promise and a
+25% budget need not admit every repair. Select the block wait deliberately and
+measure generated, admitted, budget-skipped and expired repairs together with
+small request deadlines and large-record delivery after recovery.
+
+Every admitted repair still consumes aggregate/group pacing, available Quinn
+space and the existing sender deadline. Original records are emitted promptly;
+repair age starts with the oldest original ingress in its block. Repair credit
+does not establish physical wire transmission or peer receipt. Those costs and
+outcomes require separate observations in both directions.
+
+### Envelope and session mapping
 
 - TLS verifies the main server's certificate and name; ALPN is `h3`; 0-RTT is disabled. Both peers must advertise QUIC DATAGRAM capacity and HTTP/3 `H3_DATAGRAM` support.
 - `GET /` serves a small ordinary HTML page. Unknown requests and unauthenticated `POST /session` return the same 404 response. This is a functional HTTP/3 endpoint, not browser impersonation or a complete production website.

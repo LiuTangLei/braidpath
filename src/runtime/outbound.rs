@@ -18,6 +18,8 @@ pub struct Pending {
     pub record_id: Option<u64>,
     pub flow: Option<u32>,
     pub block: Option<u64>,
+    /// Actual coding lane; only mixed sessions use this to classify symbols.
+    pub small: bool,
 }
 
 #[derive(Default)]
@@ -42,6 +44,21 @@ impl Queue {
         if let Some(flow) = self.turns.pop_front() {
             self.turns.push_back(flow);
         }
+    }
+    /// Mixed coding lanes may bypass a repair lacking its own admission credit.
+    /// Keep all other repair positions and original-flow turns unchanged.
+    pub fn promote_ready_repair(&mut self, mut eligible: impl FnMut(&Pending) -> bool) -> bool {
+        let position = self.repairs.iter().position(|pending| {
+            !pending.block.is_some_and(|block| self.block_pending(block)) && eligible(pending)
+        });
+        let Some(position) = position else {
+            return false;
+        };
+        if position > 0 {
+            let pending = self.repairs.remove(position).expect("selected repair");
+            self.repairs.push_front(pending);
+        }
+        true
     }
     pub fn push(&mut self, item: Pending) -> Result<(), Pending> {
         if self.len == QUEUE {
@@ -702,6 +719,7 @@ mod tests {
             record_id: Some(id),
             flow: Some(flow),
             block: Some(id / 4),
+            small: false,
         }
     }
     #[test]
@@ -777,6 +795,7 @@ mod tests {
                 record_id: None,
                 flow: None,
                 block: Some(id),
+                small: false,
             };
             if let Err(rejected) = q.push(repair) {
                 assert_eq!(rejected.block, Some(id));

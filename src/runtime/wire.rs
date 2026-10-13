@@ -206,6 +206,18 @@ impl Receiver {
     }
 
     pub fn receive(&mut self, b: &[u8], now: Instant) -> Result<Vec<Record>> {
+        self.receive_observed(b, now, |_, _, _| {})
+    }
+
+    /// Observe the actual record-ID decision without retaining payloads or
+    /// changing decoder state. Recovered means reconstruction won this arrival
+    /// race; it does not prove that the original would never arrive later.
+    pub fn receive_observed(
+        &mut self,
+        b: &[u8],
+        now: Instant,
+        mut observe: impl FnMut(&Record, bool, bool),
+    ) -> Result<Vec<Record>> {
         let decoded = decode(b)?;
         if matches!(decoded, Some(Shard::Repair { .. })) {
             self.repair_packets += 1;
@@ -286,6 +298,7 @@ impl Receiver {
             }
             if record.id < floor || !self.delivered.insert(record.id) {
                 self.duplicates += 1;
+                observe(&record, repaired, true);
                 continue;
             }
             if repaired {
@@ -293,6 +306,7 @@ impl Receiver {
             } else {
                 self.originals += 1
             }
+            observe(&record, repaired, false);
             out.push(record);
         }
         Ok(out)
@@ -303,6 +317,43 @@ impl Receiver {
 mod tests {
     use super::*;
     use crate::fec::Encoder;
+
+    #[test]
+    fn observed_receive_distinguishes_repair_first_from_later_duplicate_original() {
+        let now = Instant::now();
+        let record = Record {
+            flow: 9,
+            id: 71,
+            payload: vec![4; 1000],
+        };
+        let mut encoder = Encoder::new(1, Duration::from_millis(5)).unwrap();
+        let symbols: Vec<_> = encoder
+            .push(&record.encode().unwrap(), now)
+            .unwrap()
+            .into_iter()
+            .map(shard)
+            .collect();
+        assert_eq!(symbols.len(), 2);
+        let mut receiver = Receiver::default();
+        let mut observed = Vec::new();
+        let recovered = receiver
+            .receive_observed(&symbols[1], now, |r, repaired, duplicate| {
+                observed.push((r.flow, r.id, repaired, duplicate))
+            })
+            .unwrap();
+        let duplicate = receiver
+            .receive_observed(&symbols[0], now, |r, repaired, duplicate| {
+                observed.push((r.flow, r.id, repaired, duplicate))
+            })
+            .unwrap();
+        assert_eq!(recovered, [record]);
+        assert!(duplicate.is_empty());
+        assert_eq!(observed, [(9, 71, true, false), (9, 71, false, true)]);
+        assert_eq!(
+            (receiver.recovered, receiver.originals, receiver.duplicates),
+            (1, 0, 1)
+        );
+    }
 
     fn coded_block(count: u8) -> (Vec<Record>, Vec<Bytes>) {
         let now = Instant::now();

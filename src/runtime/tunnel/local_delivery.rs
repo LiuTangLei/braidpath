@@ -4,6 +4,7 @@
 //! retain the record rather than depend on another original/repair to deliver it.
 //! The deadline starts at local decoding; no remote/end-to-end deadline is known.
 use super::{MAX_PAYLOAD, QUEUE, Record, Scope, stats};
+use crate::runtime::trace;
 use std::{
     collections::VecDeque,
     future::{Future, poll_fn},
@@ -77,6 +78,18 @@ enum Reason {
     SocketError,
     Shutdown,
 }
+impl Reason {
+    fn trace(self) -> trace::Reason {
+        match self {
+            Self::Expired => trace::Reason::Expired,
+            Self::QueueFull => trace::Reason::QueueFull,
+            Self::FlowFull => trace::Reason::FlowFull,
+            Self::ByteLimit => trace::Reason::ByteLimit,
+            Self::SocketError => trace::Reason::SocketError,
+            Self::Shutdown => trace::Reason::Shutdown,
+        }
+    }
+}
 
 #[derive(Clone, Copy)]
 enum Outcome {
@@ -122,11 +135,11 @@ impl<S: DatagramIo> Queue<S> {
         let deadline = decoded + self.budget;
         let mut dropped = self.expire(Instant::now());
         if self.closed {
-            self.account_drop(pid, Reason::Shutdown, None);
+            self.account_drop(&record, pid, Reason::Shutdown, None);
             return dropped + 1;
         }
         if Instant::now() >= deadline {
-            self.account_drop(pid, Reason::Expired, None);
+            self.account_drop(&record, pid, Reason::Expired, None);
             return dropped + 1;
         }
         let flow = self
@@ -141,10 +154,12 @@ impl<S: DatagramIo> Queue<S> {
                 }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                     self.scope
+                        .trace_record(trace::Stage::LocalUdpWouldBlock, &record, None, None);
+                    self.scope
                         .update(|d| d.udp_delivery.would_block_events += 1);
                 }
                 _ => {
-                    self.account_drop(pid, Reason::SocketError, None);
+                    self.account_drop(&record, pid, Reason::SocketError, None);
                     return dropped + 1;
                 }
             }
@@ -166,11 +181,13 @@ impl<S: DatagramIo> Queue<S> {
             None
         };
         if let Some(reason) = reason {
-            self.account_drop(pid, reason, None);
+            self.account_drop(&record, pid, reason, None);
             dropped += 1;
             return dropped;
         }
         let bytes = record.payload.len();
+        self.scope
+            .trace_record(trace::Stage::LocalUdpQueued, &record, None, None);
         let pending = Pending {
             record,
             pid,
@@ -204,8 +221,8 @@ impl<S: DatagramIo> Queue<S> {
     }
 
     /// Local socket creation/connect failures share the terminal UDP-send total.
-    pub(super) fn socket_error(&self, pid: u8) -> u64 {
-        self.account_drop(pid, Reason::SocketError, None);
+    pub(super) fn socket_error(&self, pid: u8, record: &Record) -> u64 {
+        self.account_drop(record, pid, Reason::SocketError, None);
         1
     }
 
@@ -314,6 +331,7 @@ impl<S: DatagramIo> Queue<S> {
             }
             Outcome::Dropped(reason) => {
                 self.account_drop(
+                    &pending.record,
                     pending.pid,
                     reason,
                     Some((pending.record.payload.len(), age)),
@@ -330,6 +348,8 @@ impl<S: DatagramIo> Queue<S> {
     }
 
     fn account_success(&self, record: &Record, pid: u8, queued_age: Option<Duration>) {
+        self.scope
+            .trace_record(trace::Stage::LocalUdpDelivered, record, None, None);
         self.scope.update(|d| {
             if let Some(age) = queued_age {
                 Self::retire_pending(&mut d.udp_delivery, record.payload.len(), age);
@@ -342,7 +362,19 @@ impl<S: DatagramIo> Queue<S> {
         self.scope.path(pid, |p| p.udp_target_delivered += 1);
     }
 
-    fn account_drop(&self, pid: u8, reason: Reason, queued: Option<(usize, Duration)>) {
+    fn account_drop(
+        &self,
+        record: &Record,
+        pid: u8,
+        reason: Reason,
+        queued: Option<(usize, Duration)>,
+    ) {
+        self.scope.trace_record(
+            trace::Stage::RecordDropped,
+            record,
+            None,
+            Some(reason.trace()),
+        );
         self.scope.update(|d| {
             if let Some((bytes, age)) = queued {
                 Self::retire_pending(&mut d.udp_delivery, bytes, age);
@@ -516,6 +548,59 @@ mod tests {
             Poll::Ready(())
         })
         .await;
+    }
+
+    #[tokio::test]
+    async fn trace_keeps_one_record_identity_across_would_block_queue_and_completion() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("delivery.jsonl");
+        let (capture, guard) = trace::Trace::start(
+            "client",
+            &trace::Options {
+                packet_trace: Some(path.clone()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let scope = stats::Metrics::new_with_trace("client", capture)
+            .scope("00000000000000000000000000000001", stats::RETURN);
+        let mut queue = Queue::new(scope.clone(), Duration::from_secs(1));
+        let socket = FakeIo::new(Mode::Blocked);
+        assert_eq!(
+            queue.send(&socket, None, record(37, 8), 1, decoded_now()),
+            0
+        );
+        socket.set(Mode::Ready);
+        assert_eq!(queue.ready().await, 0);
+        queue.close();
+        assert_eq!(socket.0.lock().unwrap().sent.len(), 1);
+        assert_eq!(counters(&scope).udp_delivery.pending_records, 0);
+        assert!(guard.finish().await.complete);
+        let rows: Vec<serde_json::Value> = std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let events: Vec<_> = rows
+            .iter()
+            .filter(|row| row.get("stage").is_some())
+            .collect();
+        assert_eq!(
+            events
+                .iter()
+                .map(|row| row["stage"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            [
+                "local_udp_would_block",
+                "local_udp_queued",
+                "local_udp_delivered"
+            ]
+        );
+        assert!(
+            events
+                .iter()
+                .all(|row| row["record"] == serde_json::json!({"flow":1,"record_id":37}))
+        );
     }
 
     #[tokio::test(start_paused = true)]

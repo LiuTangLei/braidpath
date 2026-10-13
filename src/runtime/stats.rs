@@ -1,5 +1,6 @@
 //! Bounded, cumulative counters. Record, aggregate-symbol, QUIC-packet and relay
 //! UDP-datagram units are deliberately separate; transport loss is not record loss.
+use super::{trace, wire};
 use anyhow::{Context, Result, ensure};
 use clap::Args;
 use serde::Serialize;
@@ -7,7 +8,7 @@ use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     fs::{File, OpenOptions},
     io::Write,
-    path::PathBuf,
+    path::{Path as FsPath, PathBuf},
     sync::{Arc, Mutex},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -22,6 +23,8 @@ const MAX_RETIRED_SESSIONS: usize = 8;
 
 #[derive(Args, Clone, Default)]
 pub struct Options {
+    #[command(flatten)]
+    pub trace: trace::Options,
     /// Final cumulative JSON snapshot, including orderly shutdown/error status.
     #[arg(long)]
     pub stats_file: Option<PathBuf>,
@@ -126,6 +129,23 @@ pub struct Symbols {
     pub repairs_quinn_admitted: u64,
     pub originals_quinn_admitted_bytes: u64,
     pub repairs_quinn_admitted_bytes: u64,
+    /// Explicit mixed mode only. Counts are generated symbols, not FEC recoveries.
+    pub mixed_small_originals_generated: u64,
+    pub mixed_small_repairs_generated: u64,
+    pub mixed_bulk_originals_generated: u64,
+    pub mixed_bulk_repairs_generated: u64,
+    /// Per-admitted-small-original maximum repair authorization. This is not wire traffic.
+    pub mixed_small_repair_reserved_bytes: u64,
+    /// Actual HTTP DATAGRAM bytes admitted to Quinn; exclude UDP/IP/QUIC encryption overhead.
+    pub mixed_small_repair_admitted_bytes: u64,
+    pub mixed_bulk_original_admitted_bytes: u64,
+    pub mixed_bulk_repair_admitted_bytes: u64,
+    pub mixed_small_repairs_quinn_admitted: u64,
+    pub mixed_bulk_repairs_quinn_admitted: u64,
+    /// Large-record repairs omitted for lack of their own admission-earned credit.
+    pub mixed_bulk_repairs_budget_skipped: u64,
+    /// Encoded Braid/FEC bytes skipped before path selection, excluding quality/HTTP headers.
+    pub mixed_bulk_repair_budget_skipped_bytes: u64,
     pub feedback_deferred: u64,
     pub feedback_admitted: u64,
     pub probes_admitted: u64,
@@ -610,6 +630,7 @@ struct Inner {
     role: &'static str,
     instance_id: String,
     changed: tokio::sync::Notify,
+    trace: trace::Trace,
 }
 #[derive(Clone)]
 pub struct Metrics(Arc<Inner>);
@@ -618,9 +639,13 @@ pub struct Scope {
     pub metrics: Metrics,
     pub session: String,
     pub direction: &'static str,
+    trace_context: Option<trace::Context>,
 }
 impl Metrics {
     pub fn new(role: &'static str) -> Self {
+        Self::new_with_trace(role, trace::Trace::disabled())
+    }
+    pub fn new_with_trace(role: &'static str, trace: trace::Trace) -> Self {
         Self(Arc::new(Inner {
             state: Mutex::new(State::default()),
             connections: Mutex::new(BTreeMap::new()),
@@ -628,7 +653,11 @@ impl Metrics {
             role,
             instance_id: super::transport::hex(&rand::random::<[u8; 16]>()),
             changed: tokio::sync::Notify::new(),
+            trace,
         }))
+    }
+    pub fn trace(&self) -> &trace::Trace {
+        &self.0.trace
     }
     pub fn state(&self, f: impl FnOnce(&mut State)) {
         f(&mut self.0.state.lock().expect("stats lock"));
@@ -657,10 +686,20 @@ impl Metrics {
                 }
             }
         });
+        let trace_context = if self.trace().enabled() {
+            let context = trace::Context::new(session, direction);
+            if context.is_none() {
+                self.trace().invalid_context();
+            }
+            context
+        } else {
+            None
+        };
         Scope {
             metrics: self.clone(),
             session: session.to_owned(),
             direction,
+            trace_context,
         }
     }
     /// Release a finished session's connection handles while retaining a small
@@ -777,12 +816,59 @@ impl Metrics {
             // it allocates and serializes. No Connection handles enter this copy.
             (state.clone(), elapsed_ms, sample_unix_ms)
         };
-        Ok(
-            serde_json::json!({"schema_version":1,"process_id":std::process::id(),"instance_id":self.0.instance_id,"bounds":{"session_scopes":MAX_SCOPES,"path_scopes":MAX_SCOPES,"connection_events":MAX_CONNECTION_EVENTS,"record_id_window":ID_WINDOW,"previous_generations_per_path":MAX_PREVIOUS_GENERATIONS,"current_connection_references":MAX_SCOPES,"retired_session_snapshots":MAX_RETIRED_SESSIONS},"role":self.0.role,"final":final_snapshot,"outcome":outcome,"error":error,"elapsed_ms":elapsed_ms,"sample_unix_ms":sample_unix_ms,"counters":"cumulative; units separated by records/symbols/quinn/relay; pre-path queues have aggregate scope","stats":state}),
-        )
+        let mut value = serde_json::json!({"schema_version":1,"process_id":std::process::id(),"instance_id":self.0.instance_id,"bounds":{"session_scopes":MAX_SCOPES,"path_scopes":MAX_SCOPES,"connection_events":MAX_CONNECTION_EVENTS,"record_id_window":ID_WINDOW,"previous_generations_per_path":MAX_PREVIOUS_GENERATIONS,"current_connection_references":MAX_SCOPES,"retired_session_snapshots":MAX_RETIRED_SESSIONS},"role":self.0.role,"final":final_snapshot,"outcome":outcome,"error":error,"elapsed_ms":elapsed_ms,"sample_unix_ms":sample_unix_ms,"counters":"cumulative; units separated by records/symbols/quinn/relay; pre-path queues have aggregate scope","stats":state});
+        if self.trace().enabled() {
+            value["packet_trace"] = serde_json::to_value(self.trace().snapshot())?;
+        }
+        Ok(value)
     }
 }
 impl Scope {
+    /// This hook is outside update(): its closure must run once, not once per stats scope.
+    pub fn trace_with(&self, make: impl FnOnce(trace::Context, &trace::Trace) -> trace::Event) {
+        if let Some(context) = self.trace_context {
+            self.metrics
+                .trace()
+                .emit_with(|| make(context, self.metrics.trace()));
+        }
+    }
+    pub fn trace_record(
+        &self,
+        stage: trace::Stage,
+        record: &wire::Record,
+        path: Option<trace::PathKey>,
+        reason: Option<trace::Reason>,
+    ) {
+        self.trace_with(|context, capture| {
+            let mut event = trace::Event::new(context, stage);
+            event.record = Some(trace::RecordKey {
+                flow: record.flow,
+                record_id: record.id,
+            });
+            event.path = path;
+            event.bytes.payload = u32::try_from(record.payload.len()).ok();
+            event.probe = capture.probe_identity(&record.payload);
+            event.reason = reason;
+            event
+        });
+    }
+    pub fn trace_symbol(
+        &self,
+        stage: trace::Stage,
+        data: &[u8],
+        path: Option<trace::PathKey>,
+        http_bytes: Option<usize>,
+        reason: Option<trace::Reason>,
+    ) {
+        self.trace_with(|context, capture| {
+            let mut event = trace::Event::new(context, stage);
+            trace_symbol_fields(&mut event, data, capture);
+            event.path = path;
+            event.bytes.http_datagram = http_bytes.and_then(|n| u32::try_from(n).ok());
+            event.reason = reason;
+            event
+        });
+    }
     pub fn update(&self, mut f: impl FnMut(&mut Direction)) {
         self.metrics.state(|s| {
             // Borrow existing keys: constructing an occupied entry used to
@@ -821,6 +907,35 @@ impl Scope {
         });
     }
 }
+/// Read only observed wire fields. Invalid frames retain byte counts, without fabricated IDs.
+pub(super) fn trace_symbol_fields(event: &mut trace::Event, data: &[u8], capture: &trace::Trace) {
+    event.bytes.wire = u32::try_from(data.len()).ok();
+    if !(wire::HEADER..=wire::MAX_WIRE).contains(&data.len()) || data[..3] != [b'B', b'P', 1] {
+        return;
+    }
+    let block = u64::from_be_bytes(data[4..12].try_into().expect("validated wire header"));
+    let kind = match data[3] {
+        0 if data[12] < 32 => trace::SymbolKind::Original,
+        1 if (1..=32).contains(&data[12]) && data.len() >= wire::HEADER + 14 => {
+            trace::SymbolKind::Repair
+        }
+        2 if block == 0 && data[12] == 0 => trace::SymbolKind::Plain,
+        _ => return,
+    };
+    event.symbol = Some(trace::SymbolKey {
+        kind,
+        block,
+        index_or_count: data[12],
+    });
+    if kind != trace::SymbolKind::Repair
+        && let Ok((flow, record_id)) = wire::Record::decode_identity(&data[wire::HEADER..])
+    {
+        event.record = Some(trace::RecordKey { flow, record_id });
+        let payload = &data[wire::HEADER + 12..];
+        event.bytes.payload = u32::try_from(payload.len()).ok();
+        event.probe = capture.probe_identity(payload);
+    }
+}
 fn write_snapshot(writer: &mut impl Write, snapshot: &impl Serialize, pretty: bool) -> Result<()> {
     // Snapshots contain bounded ID windows. Serialize once in memory rather than
     // issuing one filesystem write for each JSON token (especially on bind mounts).
@@ -840,6 +955,46 @@ pub struct Reporter {
     options: Options,
     periodic: Option<tokio::task::JoinHandle<Result<()>>>,
     jsonl: Option<Arc<Mutex<File>>>,
+    trace_guard: Option<trace::Guard>,
+}
+/// Check aliases before any output is truncated. A new trace file is then
+/// exclusively created before either cumulative stats destination is opened.
+fn distinct_output_paths(paths: &[Option<&FsPath>]) -> Result<()> {
+    let paths: Vec<_> = paths.iter().flatten().copied().collect();
+    let canonical = paths
+        .iter()
+        .map(|path| match std::fs::symlink_metadata(path) {
+            Ok(_) => std::fs::canonicalize(path).map_err(anyhow::Error::from),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let parent = path
+                    .parent()
+                    .filter(|p| !p.as_os_str().is_empty())
+                    .unwrap_or(FsPath::new("."));
+                let name = path
+                    .file_name()
+                    .context("output path requires a filename")?;
+                Ok(std::fs::canonicalize(parent)?.join(name))
+            }
+            Err(error) => Err(error.into()),
+        })
+        .collect::<Result<Vec<_>>>()?;
+    for i in 0..paths.len() {
+        for j in 0..i {
+            ensure!(
+                canonical[i] != canonical[j],
+                "stats and packet trace require distinct paths"
+            );
+            #[cfg(unix)]
+            if let (Ok(a), Ok(b)) = (std::fs::metadata(paths[i]), std::fs::metadata(paths[j])) {
+                use std::os::unix::fs::MetadataExt;
+                ensure!(
+                    a.dev() != b.dev() || a.ino() != b.ino(),
+                    "stats and packet trace cannot share a file"
+                );
+            }
+        }
+    }
+    Ok(())
 }
 impl Reporter {
     pub fn new(role: &'static str, options: Options) -> Result<Self> {
@@ -847,10 +1002,13 @@ impl Reporter {
             (10..=60_000).contains(&options.stats_interval_ms),
             "stats interval must be 10..60000 ms"
         );
-        ensure!(
-            options.stats_file.is_none() || options.stats_file != options.stats_jsonl,
-            "final JSON and JSONL require distinct paths"
-        );
+        distinct_output_paths(&[
+            options.stats_file.as_deref(),
+            options.stats_jsonl.as_deref(),
+            options.trace.packet_trace.as_deref(),
+        ])?;
+        let (capture, trace_guard) =
+            trace::Trace::start(role, &options.trace).context("start bounded packet trace")?;
         if let Some(path) = &options.stats_file {
             File::create(path).with_context(|| format!("create stats file {}", path.display()))?;
         }
@@ -866,7 +1024,7 @@ impl Reporter {
                     .map(|f| Arc::new(Mutex::new(f)))
             })
             .transpose()?;
-        let metrics = Metrics::new(role);
+        let metrics = Metrics::new_with_trace(role, capture);
         let periodic = jsonl.clone().map(|file| {
             let metrics = metrics.clone();
             let ms = options.stats_interval_ms;
@@ -887,6 +1045,7 @@ impl Reporter {
             options,
             periodic,
             jsonl,
+            trace_guard: Some(trace_guard),
         })
     }
     pub async fn finish(mut self, result: Result<()>) -> Result<()> {
@@ -897,6 +1056,20 @@ impl Reporter {
                 report_error = Some(e);
             }
         }
+        let trace_summary = if let Some(guard) = self.trace_guard.take() {
+            guard.finish().await
+        } else {
+            self.metrics.trace().snapshot()
+        };
+        let result = result
+            .and_then(|_| report_error.map_or(Ok(()), Err))
+            .and_then(|_| {
+                ensure!(
+                    !trace_summary.enabled || trace_summary.complete,
+                    "packet trace incomplete; inspect packet_trace counters and footer"
+                );
+                Ok(())
+            });
         let error = result.as_ref().err().map(|e| format!("{e:#}"));
         self.metrics.state(|s| s.ready = false);
         let snapshot = self.metrics.snapshot(
@@ -914,10 +1087,15 @@ impl Reporter {
             file.flush()?;
         }
         result?;
-        if let Some(e) = report_error {
-            return Err(e);
-        }
         Ok(())
+    }
+}
+impl Drop for Reporter {
+    fn drop(&mut self) {
+        if let Some(task) = self.periodic.take() {
+            task.abort();
+        }
+        // Guard::drop marks cancellation incomplete and wakes the writer.
     }
 }
 
@@ -927,6 +1105,130 @@ mod tests {
     use crate::runtime::transport::{self, Congestion};
     use bytes::Bytes;
     use tokio::time::timeout;
+
+    fn diagnostic_options(dir: &std::path::Path) -> Options {
+        Options {
+            stats_file: Some(dir.join("final.json")),
+            stats_interval_ms: 1000,
+            trace: trace::Options {
+                packet_trace: Some(dir.join("trace.jsonl")),
+                packet_trace_probe_header: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn trace_alias_validation_precedes_output_truncation() {
+        let dir = tempfile::tempdir().unwrap();
+        let existing = dir.path().join("keep.json");
+        std::fs::write(&existing, b"previous evidence\n").unwrap();
+        let mut options = diagnostic_options(dir.path());
+        options.stats_file = Some(existing.clone());
+        options.trace.packet_trace = Some(dir.path().join(".").join("keep.json"));
+        assert!(Reporter::new("client", options).is_err());
+        assert_eq!(std::fs::read(&existing).unwrap(), b"previous evidence\n");
+        #[cfg(unix)]
+        {
+            let linked = dir.path().join("linked.json");
+            std::fs::hard_link(&existing, &linked).unwrap();
+            let mut options = diagnostic_options(dir.path());
+            options.stats_file = Some(existing.clone());
+            options.stats_jsonl = Some(linked);
+            assert!(Reporter::new("client", options).is_err());
+            assert_eq!(std::fs::read(&existing).unwrap(), b"previous evidence\n");
+            assert!(!dir.path().join("trace.jsonl").exists());
+        }
+    }
+
+    #[tokio::test]
+    async fn trace_record_symbol_and_final_footer_share_exact_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let reporter = Reporter::new("client", diagnostic_options(dir.path())).unwrap();
+        let scope = reporter
+            .metrics
+            .scope("00000000000000000000000000000001", FORWARD);
+        let mut payload = vec![0; 36];
+        payload[..4].copy_from_slice(b"BPP2");
+        payload[4] = 3;
+        payload[8..24].copy_from_slice(&17u128.to_be_bytes());
+        payload[24..28].copy_from_slice(&29u32.to_be_bytes());
+        let record = wire::Record {
+            flow: 7,
+            id: 9,
+            payload,
+        };
+        let frame = wire::plain(&record).unwrap();
+        scope.trace_record(trace::Stage::RecordIngress, &record, None, None);
+        scope.trace_symbol(trace::Stage::SymbolGenerated, &frame, None, None, None);
+        scope.trace_symbol(
+            trace::Stage::QuinnApiAdmitted,
+            &frame,
+            Some(trace::PathKey {
+                path_id: 2,
+                generation: 41,
+                connection_id: 63,
+            }),
+            Some(frame.len() + 2),
+            None,
+        );
+        reporter.finish(Ok(())).await.unwrap();
+        let text = std::fs::read_to_string(dir.path().join("trace.jsonl")).unwrap();
+        assert!(text.ends_with('\n'));
+        let rows: Vec<serde_json::Value> = text
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(rows.len(), 5);
+        for (i, row) in rows[1..4].iter().enumerate() {
+            assert_eq!(row["sequence"], i + 1);
+            assert_eq!(row["record"], serde_json::json!({"flow":7,"record_id":9}));
+            assert_eq!(
+                row["probe"],
+                serde_json::json!({"run_id":"00000000000000000000000000000011","kind":3,"seq":29})
+            );
+        }
+        assert_eq!(rows[3]["symbol"]["kind"], "plain");
+        assert_eq!(rows[3]["path"]["generation"], 41);
+        assert_eq!(rows[3]["bytes"]["http_datagram"], frame.len() + 2);
+        let final_stats: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join("final.json")).unwrap()).unwrap();
+        assert_eq!(final_stats["packet_trace"]["complete"], true);
+        assert_eq!(rows[4]["summary"], final_stats["packet_trace"]);
+    }
+
+    #[tokio::test]
+    async fn incomplete_trace_fails_diagnostic_and_is_visible_in_final_stats() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut options = diagnostic_options(dir.path());
+        options.trace.packet_trace_max_events = 1;
+        let reporter = Reporter::new("client", options).unwrap();
+        let scope = reporter
+            .metrics
+            .scope("00000000000000000000000000000001", FORWARD);
+        let record = wire::Record {
+            flow: 1,
+            id: 2,
+            payload: vec![3],
+        };
+        scope.trace_record(trace::Stage::RecordIngress, &record, None, None);
+        scope.trace_record(trace::Stage::SenderInput, &record, None, None);
+        assert!(
+            reporter
+                .finish(Ok(()))
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("packet trace incomplete")
+        );
+        let snapshot: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join("final.json")).unwrap()).unwrap();
+        assert_eq!(snapshot["outcome"], "error");
+        assert_eq!(snapshot["packet_trace"]["complete"], false);
+        assert_eq!(snapshot["packet_trace"]["dropped_event_limit"], 1);
+        assert_eq!(snapshot["packet_trace"]["written"], 1);
+    }
 
     #[derive(Default)]
     struct CountingWriter {
