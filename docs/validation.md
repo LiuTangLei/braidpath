@@ -101,6 +101,12 @@ Control cases include a good path plus a nearly unusable path, correlated loss t
 
 ## 5. Fair comparisons
 
+The current project priority is substantial, measured improvement over the best
+matched single connection rather than a mandatory absolute 300 Mbps target.
+See [paper-backed relative-gain methods](papers-and-relative-gain.md) for new
+controls and an offline acceptance helper. This revision applies to future
+registrations only; previous failed criteria and raw results are not rewritten.
+
 Use both **best single path** and **multipath without active redundancy**, with identical encryption, authentication, MTU limits, congestion controllers and offered load. Enable FEC as the single changed factor first. Add multi-erasure coding or hedges only in separate comparisons.
 
 For datagrams, compare useful bytes delivered before a predeclared deadline and deadline-miss rate first. Reporting P99 only for the surviving packets can make a dropping implementation look faster. For reliable streams, compare full completion latency, goodput and failure/timeout rate; do not compare unreliable completion with reliable completion as if they were the same service.
