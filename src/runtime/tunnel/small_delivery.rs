@@ -1,7 +1,16 @@
 //! Timing preference for the explicitly enabled one-copy small-record mode.
 //! These are relative delivery estimates, never a clock-synchronized one-way SLA.
 use super::{OutPath, Policy, outbound};
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+/// Spread the two small-record transmissions across time as well as paths.
+/// Only the adaptive mixed lane opts in at its call site. The original is not
+/// delayed, no copy is added, and the existing ingress deadline is unchanged.
+pub(super) fn copy_due(original_admitted: Option<Instant>, now: Instant) -> bool {
+    original_admitted
+        .and_then(|at| now.checked_duration_since(at))
+        .is_some_and(|gap| gap >= Duration::from_millis(2))
+}
 
 pub(super) fn applies(policy: &Policy, pending: &outbound::Pending) -> bool {
     policy.small_fec_bytes > 0 && pending.block.is_some() && (!policy.mixed_fec || pending.small)
@@ -121,6 +130,26 @@ pub(super) fn copy_ready(path: &OutPath, used: u8) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn temporal_copy_gate_uses_real_admission_not_ingress_or_budget_credit() {
+        let admitted = Instant::now();
+        assert!(!copy_due(None, admitted + Duration::from_secs(1)));
+        assert!(!copy_due(Some(admitted), admitted));
+        assert!(!copy_due(
+            Some(admitted),
+            admitted + Duration::from_micros(1999)
+        ));
+        assert!(copy_due(
+            Some(admitted),
+            admitted + Duration::from_millis(2)
+        ));
+        assert!(copy_due(Some(admitted), admitted + Duration::from_secs(1)));
+        assert!(!copy_due(
+            Some(admitted + Duration::from_millis(20)),
+            admitted
+        ));
+    }
 
     #[test]
     fn receiver_queue_and_rtt_excess_are_not_double_counted() {
