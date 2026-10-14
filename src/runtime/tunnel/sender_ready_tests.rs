@@ -57,8 +57,8 @@ async fn live_sender_defers_small_copy_without_losing_credit_or_resetting_ingres
         assert_eq!(symbols.repairs_quinn_admitted, 1);
         assert_eq!(symbols.repairs_budget_skipped, 0);
         assert_eq!(symbols.mixed_small_copy_admission_gap.count, 1);
-        assert!(symbols.mixed_small_copy_admission_gap.max_ms >= 10.0);
-        assert!(symbols.admitted_wait.max_ms >= ingress_age_ms as f64 + 10.0);
+        assert!(symbols.mixed_small_copy_admission_gap.max_ms >= 2.0);
+        assert!(symbols.admitted_wait.max_ms >= ingress_age_ms as f64 + 2.0);
         assert!(symbols.admitted_wait.max_ms < 100.0);
     }
 }

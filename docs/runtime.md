@@ -133,7 +133,7 @@ accepts them. Small traffic cannot subsidize large repair. A bulk repair waiting
 for insufficient credit cannot hold an eligible small repair behind it.
 
 With adaptive mixed mode, small-copy admission additionally waits until at least
-10 ms after its original actually entered Quinn. The encoder still produces both
+2 ms after its original actually entered Quinn. The encoder still produces both
 symbols immediately; only the existing copy's admission is deferred. The mixed
 lane keeps its original-earned authorization while waiting, rather than counting
 that wait as insufficient credit. Actual ingress expiry still drops it: the gap

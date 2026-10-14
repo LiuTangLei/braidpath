@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 pub(super) fn copy_due(original_admitted: Option<Instant>, now: Instant) -> bool {
     original_admitted
         .and_then(|at| now.checked_duration_since(at))
-        .is_some_and(|gap| gap >= Duration::from_millis(10))
+        .is_some_and(|gap| gap >= Duration::from_millis(2))
 }
 
 pub(super) fn applies(policy: &Policy, pending: &outbound::Pending) -> bool {
@@ -138,11 +138,11 @@ mod tests {
         assert!(!copy_due(Some(admitted), admitted));
         assert!(!copy_due(
             Some(admitted),
-            admitted + Duration::from_micros(9999)
+            admitted + Duration::from_micros(1999)
         ));
         assert!(copy_due(
             Some(admitted),
-            admitted + Duration::from_millis(10)
+            admitted + Duration::from_millis(2)
         ));
         assert!(copy_due(Some(admitted), admitted + Duration::from_secs(1)));
         assert!(!copy_due(

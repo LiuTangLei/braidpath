@@ -125,7 +125,7 @@ The percentage therefore limits large-record repair, not combined redundancy.
 Short blocks still cost a full repair and may be skipped for lack of credit.
 Both classes retain the same aggregate/group pacing and ingress deadlines.
 When combined with `--adaptive`, the original is not delayed, but its one small
-copy enters Quinn no earlier than 10 ms after the original's actual API admission.
+copy enters Quinn no earlier than 2 ms after the original's actual API admission.
 The copy keeps the same ingress deadline and budget; this is an admission-time
 separation, not a guarantee of physical packet spacing or independent loss.
 See [policy details](docs/runtime.md#mixed-small-and-large-record-protection).
