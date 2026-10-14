@@ -180,6 +180,9 @@ pub fn http_payload(b: &[u8], stream: u64) -> Result<&[u8]> {
 
 pub struct Receiver {
     blocks: BTreeMap<u64, Option<(Decoder, Instant)>>,
+    // Exact occupancy, maintained at the same mutations as retained_bytes.
+    // Publishing per-arrival telemetry must not scan the entire block window.
+    live_decoders: usize,
     repair_wait: Duration,
     dual_repairs: bool,
     retention: Option<super::fec_retention::Controller>,
@@ -211,6 +214,7 @@ impl Receiver {
     pub fn with_repair_wait(repair_wait: Duration) -> Self {
         Self {
             blocks: BTreeMap::new(),
+            live_decoders: 0,
             repair_wait,
             dual_repairs: false,
             retention: None,
@@ -253,7 +257,7 @@ impl Receiver {
 
     pub fn retention_snapshot(&self) -> Option<super::fec_retention::Snapshot> {
         self.retention.as_ref().map(|r| {
-            let mut snapshot = r.snapshot(self.blocks.values().filter(|s| s.is_some()).count());
+            let mut snapshot = r.snapshot(self.live_decoders);
             snapshot.receive_budget = self.budget.as_ref().map(|b| b.snapshot());
             snapshot
         })
@@ -285,6 +289,7 @@ impl Receiver {
                     .expect("live expiring decoder")
                     .0
                     .retained_bytes();
+                self.live_decoders -= 1;
                 *slot = None;
                 if let Some(r) = &mut self.retention {
                     r.retired(*block, true);
@@ -309,6 +314,7 @@ impl Receiver {
     pub fn close_retention(&mut self) {
         if let Some(r) = &mut self.retention {
             self.blocks.clear();
+            self.live_decoders = 0;
             r.clear();
             self.retained_bytes = 0;
             self.next_expiry = None;
@@ -374,6 +380,7 @@ impl Receiver {
                 let (_, slot) = self.blocks.pop_first().expect("known first block");
                 if let Some((decoder, _)) = slot {
                     self.retained_bytes -= decoder.retained_bytes();
+                    self.live_decoders -= 1;
                 }
             }
             if let Some(r) = &mut self.retention {
@@ -394,10 +401,12 @@ impl Receiver {
                     r.register(block, now);
                 }
                 let retained_bytes = &mut self.retained_bytes;
+                let live_decoders = &mut self.live_decoders;
                 let slot = self.blocks.entry(block).or_insert_with(|| {
                     (!self.repair_wait.is_zero()).then(|| {
                         let decoder = Decoder::new(block);
                         *retained_bytes += decoder.retained_bytes();
+                        *live_decoders += 1;
                         (decoder, now)
                     })
                 });
@@ -426,6 +435,7 @@ impl Receiver {
                                 }
                                 Err(error) => {
                                     self.retained_bytes -= after;
+                                    self.live_decoders -= 1;
                                     *slot = None;
                                     if let Some(r) = &mut self.retention {
                                         r.retired(block, false);
@@ -436,6 +446,7 @@ impl Receiver {
                         }
                         Err(error) => {
                             self.retained_bytes -= after;
+                            self.live_decoders -= 1;
                             *slot = None;
                             if let Some(r) = &mut self.retention {
                                 r.retired(block, false);
@@ -469,6 +480,7 @@ impl Receiver {
                     }
                     if let Some((decoder, _)) = slot.take() {
                         self.retained_bytes -= decoder.retained_bytes();
+                        self.live_decoders -= 1;
                         evicted += 1;
                         if let Some(r) = &mut self.retention {
                             r.retired(*block, false);
@@ -506,6 +518,78 @@ impl Receiver {
 mod tests {
     use super::*;
     use crate::fec::Encoder;
+
+    fn assert_cached_occupancy(receiver: &Receiver) {
+        let live = receiver.blocks.values().flatten().count();
+        assert_eq!(receiver.live_decoders, live);
+        assert_eq!(
+            receiver.retained_bytes,
+            receiver
+                .blocks
+                .values()
+                .flatten()
+                .map(|(decoder, _)| decoder.retained_bytes())
+                .sum::<usize>()
+        );
+        if let Some(snapshot) = receiver.retention_snapshot() {
+            assert_eq!(snapshot.live_blocks, live);
+        }
+    }
+
+    #[test]
+    fn cached_occupancy_covers_errors_duplicates_eviction_expiry_and_close() {
+        let at = Instant::now();
+        for (wait_ms, adaptive) in [(0, false), (100, false), (100, true)] {
+            let mut receiver = Receiver::configured(Duration::from_millis(wait_ms), adaptive);
+            for block in 0..600u64 {
+                let record = Record {
+                    flow: 1,
+                    id: block,
+                    payload: vec![block as u8; 1000],
+                };
+                let packet = shard(Shard::Data {
+                    block,
+                    index: 0,
+                    payload: record.encode().unwrap(),
+                });
+                let now = at + Duration::from_micros(block * 30);
+                receiver.receive(&packet, now).unwrap();
+                assert_cached_occupancy(&receiver);
+                receiver.receive(&packet, now).unwrap();
+                assert_cached_occupancy(&receiver);
+                if block % 11 == 0 {
+                    let mut conflicting = record;
+                    conflicting.payload[0] ^= 1;
+                    let _ = receiver.receive(
+                        &shard(Shard::Data {
+                            block,
+                            index: 0,
+                            payload: conflicting.encode().unwrap(),
+                        }),
+                        now,
+                    );
+                    assert_cached_occupancy(&receiver);
+                }
+            }
+            // Valid FEC wire data reconstructing an invalid one-byte Record.
+            let result = receiver.receive(
+                &shard(Shard::Repair {
+                    block: 601,
+                    count: 1,
+                    coded: [vec![0, 1], vec![0; 12]].concat(),
+                }),
+                at + Duration::from_millis(20),
+            );
+            assert_eq!(result.is_err(), wait_ms > 0 || adaptive);
+            assert_cached_occupancy(&receiver);
+            receiver.expire_blocks(at + Duration::from_secs(1));
+            assert_cached_occupancy(&receiver);
+            assert_eq!(receiver.live_decoders, 0);
+            receiver.close_retention();
+            receiver.close_retention();
+            assert_cached_occupancy(&receiver);
+        }
+    }
 
     #[test]
     fn adaptive_block_budget_preserves_a_useful_late_repair_under_high_packet_rate() {
@@ -619,6 +703,7 @@ mod tests {
                     )
                     .unwrap();
                 assert!(receiver.retained_bytes <= super::super::receiver_budget::MAX_BYTES);
+                assert_cached_occupancy(&receiver);
             }
         }
         let expected: usize = receiver
@@ -638,9 +723,11 @@ mod tests {
                 > 0
         );
         receiver.expire_adaptive(at + Duration::from_millis(400));
+        assert_cached_occupancy(&receiver);
         assert_eq!(receiver.retained_bytes, 0);
         assert_eq!(receiver.next_retention_deadline(), None);
         receiver.close_retention();
+        assert_cached_occupancy(&receiver);
         assert_eq!(
             receiver
                 .retention_snapshot()

@@ -63,6 +63,10 @@ struct Timing {
 
 pub struct Controller {
     blocks: BTreeMap<u64, Timing>,
+    // Multiset of promises on not-yet-retired blocks, including unswept expired
+    // blocks just as the original full scan did. Current policy is a separate
+    // floor: shrinking it must not shorten any existing promise.
+    live_holds: BTreeMap<Duration, usize>,
     buckets: [Bucket; TAIL_SECONDS as usize],
     epoch: Option<Instant>,
     last_decrease: Option<Instant>,
@@ -72,6 +76,7 @@ impl Default for Controller {
     fn default() -> Self {
         Self {
             blocks: BTreeMap::new(),
+            live_holds: BTreeMap::new(),
             buckets: [Bucket::default(); TAIL_SECONDS as usize],
             epoch: None,
             last_decrease: None,
@@ -90,13 +95,17 @@ impl Controller {
     pub fn register(&mut self, block: u64, now: Instant) {
         self.epoch.get_or_insert(now);
         self.last_decrease.get_or_insert(now);
-        self.blocks.entry(block).or_insert(Timing {
-            first: now,
-            hold: Duration::from_millis(self.state.current_ms),
-            retired: false,
-            seen: 0,
-            repair_count: None,
-            sampled_epoch: None,
+        self.blocks.entry(block).or_insert_with(|| {
+            let hold = Duration::from_millis(self.state.current_ms);
+            *self.live_holds.entry(hold).or_default() += 1;
+            Timing {
+                first: now,
+                hold,
+                retired: false,
+                seen: 0,
+                repair_count: None,
+                sampled_epoch: None,
+            }
         });
     }
 
@@ -109,19 +118,28 @@ impl Controller {
         {
             let (_, timing) = self.blocks.pop_first().expect("known first block");
             live_evicted += u64::from(!timing.retired);
+            if !timing.retired {
+                Self::remove_hold(&mut self.live_holds, timing.hold);
+            }
         }
         self.state.window_evicted_live_blocks += live_evicted;
     }
 
     pub fn maximum_live_hold(&self) -> Duration {
         // A new shorter target must not shorten an existing block's promise.
-        self.blocks
-            .values()
-            .filter(|t| !t.retired)
-            .map(|t| t.hold)
-            .max()
+        self.live_holds
+            .last_key_value()
+            .map(|(hold, _)| *hold)
             .unwrap_or(Duration::from_millis(self.state.current_ms))
             .max(Duration::from_millis(self.state.current_ms))
+    }
+
+    fn remove_hold(holds: &mut BTreeMap<Duration, usize>, hold: Duration) {
+        let count = holds.get_mut(&hold).expect("registered live hold");
+        *count -= 1;
+        if *count == 0 {
+            holds.remove(&hold);
+        }
     }
 
     pub fn hold(&self, block: u64) -> Duration {
@@ -135,6 +153,9 @@ impl Controller {
         if let Some(t) = self.blocks.get_mut(&block) {
             if !t.retired && deadline {
                 self.state.deadline_retired_blocks += 1;
+            }
+            if !t.retired {
+                Self::remove_hold(&mut self.live_holds, t.hold);
             }
             t.retired = true;
         }
@@ -216,7 +237,12 @@ impl Controller {
                 // Widen only still-live deadlines, anchored to the first arrival.
                 // Already-retired OR merely-not-yet-swept expired state stays dead.
                 if !t.retired && now.saturating_duration_since(t.first) < t.hold {
-                    t.hold = t.hold.max(Duration::from_millis(target));
+                    let hold = t.hold.max(Duration::from_millis(target));
+                    if hold != t.hold {
+                        Self::remove_hold(&mut self.live_holds, t.hold);
+                        *self.live_holds.entry(hold).or_default() += 1;
+                        t.hold = hold;
+                    }
                 }
             }
         } else if samples >= DECAY_BLOCKS
@@ -243,12 +269,60 @@ impl Controller {
 
     pub fn clear(&mut self) {
         self.blocks.clear();
+        self.live_holds.clear();
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn assert_hold_index(controller: &Controller) {
+        let mut scanned = BTreeMap::<Duration, usize>::new();
+        for timing in controller.blocks.values().filter(|t| !t.retired) {
+            *scanned.entry(timing.hold).or_default() += 1;
+        }
+        assert_eq!(controller.live_holds, scanned);
+        let expected = scanned
+            .last_key_value()
+            .map(|(hold, _)| *hold)
+            .unwrap_or_default()
+            .max(Duration::from_millis(controller.state.current_ms));
+        assert_eq!(controller.maximum_live_hold(), expected);
+    }
+
+    #[test]
+    fn live_hold_index_matches_full_scan_under_mixed_lifecycle() {
+        let at = Instant::now();
+        let mut c = Controller::default();
+        let mut seed = 0x8d12_ea73_4921_ae19u64;
+        for step in 0..20_000u64 {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            let now = at + Duration::from_millis(step * 5);
+            c.register(step, now);
+            c.register(step, now); // Duplicate registration must not add a hold.
+            c.observe(step, 0, None, now);
+            let old = step.saturating_sub(seed % 70);
+            c.observe(old, 1, None, now);
+            assert_hold_index(&c);
+            if seed.is_multiple_of(3) {
+                c.retired(old, seed & 8 != 0);
+                c.retired(old, true); // Retirement must remain idempotent.
+                assert_hold_index(&c);
+            }
+            c.retain_floor(step.saturating_sub(500));
+            assert_hold_index(&c);
+            if step % 6000 == 5999 {
+                c.clear();
+                assert_hold_index(&c);
+            }
+        }
+        c.clear();
+        assert_hold_index(&c);
+    }
+
     #[test]
     fn late_sample_teaches_future_without_reviving_a_tombstone() {
         let at = Instant::now();
@@ -309,6 +383,7 @@ mod tests {
                 c.observe(id, 0, None, now);
                 let hold = c.hold(id);
                 c.observe(id, 1, None, now + Duration::from_millis(1));
+                assert_hold_index(&c);
                 assert!(c.hold(id) >= hold);
                 if second < 8 {
                     assert_eq!(c.state.current_ms, 230);
