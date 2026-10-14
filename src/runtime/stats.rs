@@ -937,6 +937,9 @@ pub(super) fn trace_symbol_fields(event: &mut trace::Event, data: &[u8], capture
         1 if (1..=32).contains(&data[12]) && data.len() >= wire::HEADER + 14 => {
             trace::SymbolKind::Repair
         }
+        3 if (1..=32).contains(&data[12]) && data.len() >= wire::HEADER + 14 => {
+            trace::SymbolKind::RepairQ
+        }
         2 if block == 0 && data[12] == 0 => trace::SymbolKind::Plain,
         _ => return,
     };
@@ -945,7 +948,7 @@ pub(super) fn trace_symbol_fields(event: &mut trace::Event, data: &[u8], capture
         block,
         index_or_count: data[12],
     });
-    if kind != trace::SymbolKind::Repair
+    if !matches!(kind, trace::SymbolKind::Repair | trace::SymbolKind::RepairQ)
         && let Ok((flow, record_id)) = wire::Record::decode_identity(&data[wire::HEADER..])
     {
         event.record = Some(trace::RecordKey { flow, record_id });

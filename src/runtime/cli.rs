@@ -124,6 +124,49 @@ enum Command {
     /// Finite one-peer receiver or reverse source with a shared run identifier.
     Sink(probe::SinkOptions),
 }
+
+#[cfg(test)]
+mod dual_cli_tests {
+    use super::*;
+    #[test]
+    fn repair_cli_defaults_are_legacy_and_invalid_counts_are_rejected() {
+        let base = [
+            "braidpath",
+            "client",
+            "--entrance",
+            "127.0.0.1:7001",
+            "--server-name",
+            "localhost",
+            "--ca",
+            "cert.pem",
+            "--token-file",
+            "token",
+        ];
+        let parsed = Cli::try_parse_from(base).unwrap();
+        let Command::Client { policy, .. } = parsed.command else {
+            panic!("client")
+        };
+        assert_eq!(policy.fec_repairs, 1);
+        for value in ["0", "3", "255"] {
+            assert!(Cli::try_parse_from(base.into_iter().chain(["--fec-repairs", value])).is_err());
+        }
+        let parsed = Cli::try_parse_from(base.into_iter().chain([
+            "--fec-repairs",
+            "2",
+            "--mixed-fec",
+            "--small-fec-bytes",
+            "128",
+            "--fec",
+            "16",
+        ]))
+        .unwrap();
+        let Command::Client { policy, .. } = parsed.command else {
+            panic!("client")
+        };
+        assert_eq!(policy.fec_repairs, 2);
+        assert!(policy.mixed_fec);
+    }
+}
 #[derive(Args)]
 struct PolicyArgs {
     /// Adapt path pacing and eligibility to queue growth; automatically recover paths.
@@ -152,6 +195,9 @@ struct PolicyArgs {
     receiver_feedback: bool,
     #[arg(long, default_value_t = 4)]
     fec: u8,
+    /// Independent bulk repair equations. Two requires --mixed-fec; small records still use one copy.
+    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u8).range(1..=2))]
+    fec_repairs: u8,
     /// Immediate single-record XOR repair cutoff. Use FEC0/redundancy0, or explicit --mixed-fec.
     #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u16).range(0..=1000))]
     small_fec_bytes: u16,
@@ -245,6 +291,7 @@ pub async fn run() -> Result<()> {
                     latency_target_ms: policy.latency_target_ms,
                     group_rates,
                     fec: policy.fec,
+                    fec_repairs: policy.fec_repairs,
                     small_fec_bytes: policy.small_fec_bytes,
                     mixed_fec: policy.mixed_fec,
                     receiver_feedback: policy.receiver_feedback

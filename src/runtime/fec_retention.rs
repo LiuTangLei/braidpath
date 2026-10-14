@@ -127,16 +127,16 @@ impl Controller {
         }
     }
 
-    /// token 0..31 is an actual original index; token 32 is a repair.
+    /// token 0..31 is an actual original index; 32/33 are independent P/Q repairs.
     /// Called only after wire validation and a successful receiver operation.
     pub fn observe(&mut self, block: u64, token: u8, count: Option<u8>, now: Instant) {
         let Some(t) = self.blocks.get_mut(&block) else {
             return;
         };
-        if token > 32 {
+        if token > 33 {
             return;
         }
-        if token == 32 {
+        if token >= 32 {
             let Some(count) = count.filter(|c| (1..=32).contains(c)) else {
                 return;
             };

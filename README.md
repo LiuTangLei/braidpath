@@ -1,5 +1,10 @@
 # BraidPath
 
+The throughput `main` branch also includes an opt-in [independent bulk FEC
+extension](docs/independent-fec.md): `--fec 16 --fec-repairs 2` with explicit
+mixed FEC. Existing single-repair defaults remain unchanged; this is not a
+public-network performance or reliable-delivery guarantee.
+
 **Weave paths. Repair loss. Keep latency in check.**
 
 [![CI](https://github.com/LiuTangLei/braidpath/actions/workflows/ci.yml/badge.svg)](https://github.com/LiuTangLei/braidpath/actions/workflows/ci.yml)
@@ -87,7 +92,9 @@ Follow the [runtime guide](docs/runtime.md) for credentials, local forwarding, m
 | Adaptive pacing, sender-age admission, idle health probes and feedback v2 | Implemented opt-in mode; performance acceptance pending |
 | Aggregate and explicit bottleneck-group caps | Implemented; not automatic bottleneck detection or fairness proof |
 | Startup/outage recovery and explicit session-epoch replacement | Implemented in adaptive mode; bounded backoff and server retention |
-| Adaptive FEC, multi-erasure coding and coupled congestion control | Deferred or separate research work |
+| Receiver-local adaptive FEC retention | Implemented as an opt-in bounded policy |
+| Two independent bulk repair equations | Opt-in mixed 16+2 mode; single-repair defaults unchanged; WAN tradeoffs not yet verified |
+| Rate-adaptive FEC strength and coupled congestion control | Deferred or separate research work |
 | Reliable streams, TCP, TUN, stream fallback, browser fingerprint shaping | Planned or deferred |
 
 XOR cannot generally recover an entire failed path. Sparse traffic may exhaust the repair budget; FEC does not guarantee delivery. `--fec 4`, `--block-ms 3` and the 30% repair budget are unchanged; the new mechanisms do not establish a new FEC default. Multiple connections can compete unfairly at a shared bottleneck even with explicit group caps. Multi-interface capacity, competition fairness, independent HTTP/3 interoperability and deployment reachability remain separate acceptance gates.

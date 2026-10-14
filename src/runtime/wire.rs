@@ -63,6 +63,11 @@ pub fn shard(s: Shard) -> Bytes {
             count,
             coded,
         } => (1, block, count, coded),
+        Shard::RepairQ {
+            block,
+            count,
+            coded,
+        } => (3, block, count, coded),
     };
     frame(kind, block, index, &body)
 }
@@ -93,15 +98,24 @@ fn decode(b: &[u8]) -> Result<Option<Shard>> {
                 payload: b[HEADER..].to_vec(),
             }))
         }
-        1 => {
+        1 | 3 => {
             ensure!(
                 (1..=32).contains(&b[12]) && b.len() >= HEADER + 14,
                 "invalid repair"
             );
-            Ok(Some(Shard::Repair {
-                block,
-                count: b[12],
-                coded: b[HEADER..].to_vec(),
+            let coded = b[HEADER..].to_vec();
+            Ok(Some(if b[3] == 1 {
+                Shard::Repair {
+                    block,
+                    count: b[12],
+                    coded,
+                }
+            } else {
+                Shard::RepairQ {
+                    block,
+                    count: b[12],
+                    coded,
+                }
             }))
         }
         2 => {
@@ -167,6 +181,7 @@ pub fn http_payload(b: &[u8], stream: u64) -> Result<&[u8]> {
 pub struct Receiver {
     blocks: BTreeMap<u64, Option<(Decoder, Instant)>>,
     repair_wait: Duration,
+    dual_repairs: bool,
     retention: Option<super::fec_retention::Controller>,
     highest_block: u64,
     delivered: BTreeSet<u64>,
@@ -193,6 +208,7 @@ impl Receiver {
         Self {
             blocks: BTreeMap::new(),
             repair_wait,
+            dual_repairs: false,
             retention: None,
             highest_block: 0,
             delivered: BTreeSet::new(),
@@ -218,6 +234,12 @@ impl Receiver {
         } else {
             Self::with_repair_wait(repair_wait)
         }
+    }
+
+    /// Called only after authenticated session policy negotiation.
+    pub fn with_dual_repairs(mut self, enabled: bool) -> Self {
+        self.dual_repairs = enabled;
+        self
     }
 
     pub fn retention_snapshot(&self) -> Option<super::fec_retention::Snapshot> {
@@ -283,8 +305,12 @@ impl Receiver {
         now: Instant,
         mut observe: impl FnMut(&Record, bool, bool),
     ) -> Result<Vec<Record>> {
+        ensure!(
+            self.dual_repairs || b.get(3) != Some(&3),
+            "unnegotiated dual repair"
+        );
         let decoded = decode(b)?;
-        if matches!(decoded, Some(Shard::Repair { .. })) {
+        if matches!(decoded, Some(Shard::Repair { .. } | Shard::RepairQ { .. })) {
             self.repair_packets += 1;
         } else {
             self.original_packets += 1;
@@ -294,11 +320,11 @@ impl Receiver {
         // slower paths. Only reconstruction state is retired by that window.
         let mut deliveries = match &decoded {
             Some(Shard::Data { payload, .. }) => vec![(Record::decode(payload)?, false)],
-            Some(Shard::Repair { .. }) => Vec::new(),
+            Some(Shard::Repair { .. } | Shard::RepairQ { .. }) => Vec::new(),
             None => vec![(Record::decode(&b[HEADER..])?, false)],
         };
         if let Some(s) = decoded {
-            let repair = matches!(s, Shard::Repair { .. });
+            let repair = matches!(s, Shard::Repair { .. } | Shard::RepairQ { .. });
             let block = s.block();
             self.highest_block = self.highest_block.max(block);
             let floor = self.highest_block.saturating_sub(BLOCK_WINDOW - 1);
@@ -315,6 +341,7 @@ impl Receiver {
                 let (token, count) = match &s {
                     Shard::Data { index, .. } => (*index, None),
                     Shard::Repair { count, .. } => (32, Some(*count)),
+                    Shard::RepairQ { count, .. } => (33, Some(*count)),
                 };
                 if let Some(r) = &mut self.retention {
                     r.register(block, now);
@@ -587,7 +614,9 @@ mod tests {
             .collect();
         for shard in &mut next {
             match shard {
-                Shard::Data { block, .. } | Shard::Repair { block, .. } => *block = 1,
+                Shard::Data { block, .. }
+                | Shard::Repair { block, .. }
+                | Shard::RepairQ { block, .. } => *block = 1,
             }
         }
         let next: Vec<_> = next.into_iter().map(shard).collect();

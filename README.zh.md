@@ -1,5 +1,9 @@
 # BraidPath
 
+大吞吐 `main` 已加入可选的[双独立修复](docs/independent-fec.md)：在显式混合 FEC
+模式下使用 `--fec 16 --fec-repairs 2`。原有单修复默认值不变；该能力不代表已经
+通过公网性能或可靠交付验收。
+
 **Weave paths. Repair loss. Keep latency in check.**
 
 [![CI](https://github.com/LiuTangLei/braidpath/actions/workflows/ci.yml/badge.svg)](https://github.com/LiuTangLei/braidpath/actions/workflows/ci.yml)
@@ -85,7 +89,9 @@ cargo test --all-targets --locked
 | 逐路径自适应调速、本地入口年龄准入、空闲探测、第二版反馈 | 已实现可选模式；性能验收待完成 |
 | 总速率与显式共享瓶颈分组上限 | 已实现；不等于自动识别瓶颈或证明竞争公平 |
 | 启动失败与断网重连、明确切换新会话代际 | 自适应模式已实现；重试退避和服务端保留时间有界 |
-| 自适应 FEC、多丢失恢复编码、耦合拥塞控制 | 后置或单独研究 |
+| 接收侧自适应 FEC 保留时间 | 已实现可选的有界本地策略 |
+| 大包双独立修复方程 | 可选混合 16+2；单修复默认值不变；公网取舍尚未验收 |
+| 随线路变化的 FEC 强度与耦合拥塞控制 | 后置或单独研究 |
 | 可靠流、TCP、TUN、流承载回退、浏览器指纹整形 | 待实现或后置 |
 
 XOR 通常无法恢复整条路径故障造成的所有丢包；低频流量可能耗尽修复预算。FEC 不保证可靠交付。`--fec 4`、`--block-ms 3` 和 30% 修复预算保持不变，新机制不代表已经选出更好的 FEC 默认参数。总速率和分组上限不等于共享瓶颈竞争公平性，多网卡容量、竞争公平性、独立 HTTP/3 实现互通和真实部署可达性仍需分别验收。

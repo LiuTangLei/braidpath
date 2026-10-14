@@ -107,6 +107,10 @@ fn adaptive_fec_retention_works_on_authenticated_bidirectional_sockets() {
     three_paths(5);
 }
 #[test]
+fn dual_fec_negotiates_on_three_real_http3_paths_in_both_directions() {
+    three_paths(6);
+}
+#[test]
 fn persistent_bad_path_rejoins_with_new_udp_port() {
     three_paths(3);
 }
@@ -151,7 +155,15 @@ fn three_paths(mode: u8) {
             &echo_addr,
         ])
         .into_iter()
-        .chain((mode == 5).then(|| "--adaptive-fec-retention".to_owned()))
+        .chain((mode >= 5).then(|| "--adaptive-fec-retention".to_owned()))
+        .chain((mode == 6).then(|| "--packet-trace".to_owned()))
+        .chain((mode == 6).then(|| {
+            dir.path()
+                .join("server-trace.jsonl")
+                .to_str()
+                .unwrap()
+                .to_owned()
+        }))
         .collect::<Vec<_>>(),
         dir.path(),
         "server",
@@ -274,13 +286,28 @@ fn three_paths(mode: u8) {
             .unwrap();
         client_args[index + 1] = "0".into();
     }
-    if mode == 5 {
+    if mode >= 5 {
         client_args.extend(args(&[
             "--mixed-fec",
             "--small-fec-bytes",
             "128",
             "--adaptive-fec-retention",
         ]));
+    }
+    if mode == 6 {
+        client_args.extend(args(&[
+            "--fec",
+            "16",
+            "--fec-repairs",
+            "2",
+            "--packet-trace",
+            dir.path().join("client-trace.jsonl").to_str().unwrap(),
+        ]));
+        let index = client_args
+            .iter()
+            .position(|a| a == "--redundancy-percent")
+            .unwrap();
+        client_args[index + 1] = "13".into();
     }
     let mut client = launch(&client_args, dir.path(), "client");
     ready(&mut client, "UDP client ready");
@@ -296,7 +323,7 @@ fn three_paths(mode: u8) {
             "--size",
             if mode == 4 { "128" } else { "700" },
             "--pps",
-            "200",
+            if mode == 6 { "2000" } else { "200" },
             "--deadline-ms",
             "1000",
         ]),
@@ -358,7 +385,7 @@ fn three_paths(mode: u8) {
             thread::sleep(Duration::from_millis(50));
         }
     }
-    if mode == 5 {
+    if mode >= 5 {
         for (file, direction) in [
             (&client_stats, "server_to_client"),
             (&server_stats, "client_to_server"),
@@ -387,6 +414,44 @@ fn three_paths(mode: u8) {
                     .get("fec_retention")
                     .is_none()
             );
+        }
+    }
+    if mode == 6 {
+        let until = Instant::now() + Duration::from_secs(4);
+        loop {
+            let both = ["client-trace.jsonl", "server-trace.jsonl"]
+                .iter()
+                .all(|name| {
+                    let text = fs::read_to_string(dir.path().join(name)).unwrap();
+                    let rows: Vec<Value> = text
+                        .lines()
+                        .filter_map(|line| serde_json::from_str(line).ok())
+                        .collect();
+                    let q: Vec<_> = rows
+                        .iter()
+                        .filter(|r| r["symbol"]["kind"] == "repair_q")
+                        .collect();
+                    assert!(
+                        q.iter().all(|r| {
+                            if r["stage"] == "record_decoded" || r["stage"] == "record_duplicate" {
+                                r["recovered"] == true && r["record"]["record_id"].is_u64()
+                            } else {
+                                r["record"].is_null()
+                            }
+                        }),
+                        "Q has no wire record identity; only validated reconstruction may attach a recovered record"
+                    );
+                    q.iter().any(|r| r["stage"] == "symbol_generated")
+                        && q.iter().any(|r| r["stage"] == "peer_http_received")
+                });
+            if both {
+                break;
+            }
+            assert!(
+                Instant::now() < until,
+                "both authenticated directions must actually transmit and receive Q parity"
+            );
+            thread::sleep(Duration::from_millis(50));
         }
     }
     if mode == 3 {

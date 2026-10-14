@@ -120,6 +120,9 @@ impl Queue {
             .values()
             .any(|q| q.iter().any(|p| p.block == Some(block)))
     }
+    pub fn repair_pending(&self, block: u64) -> bool {
+        self.repairs.iter().any(|p| p.block == Some(block))
+    }
     pub fn expire(&mut self, now: Instant, age: Duration) -> Vec<Pending> {
         let mut expired = Vec::new();
         for q in self.flows.values_mut() {

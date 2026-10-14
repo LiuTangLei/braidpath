@@ -88,6 +88,9 @@ fn main() -> Result<()> {
                         *b = block.block;
                         ("repair", *count)
                     }
+                    Shard::RepairQ { .. } => {
+                        anyhow::bail!("legacy replay must use the single-parity encoder")
+                    }
                 };
                 ensure!(
                     symbols

@@ -8,7 +8,7 @@
 #[cfg(test)]
 use super::encode_record;
 use super::{Policy, Record, wire};
-use crate::fec::{Encoder, Shard};
+use crate::fec::{DualEncoder, Encoder, Shard};
 use anyhow::{Result, ensure};
 use bytes::Bytes;
 use std::time::{Duration, Instant};
@@ -20,14 +20,23 @@ pub(super) struct EncodedSymbol {
 }
 
 struct Lane {
-    encoder: Encoder,
+    encoder: LaneEncoder,
     active: Option<(u64, u64)>,
 }
 
+enum LaneEncoder {
+    Single(Encoder),
+    Dual(DualEncoder),
+}
+
 impl Lane {
-    fn new(k: u8, age: Duration) -> Result<Self> {
+    fn new(k: u8, age: Duration, repairs: u8) -> Result<Self> {
         Ok(Self {
-            encoder: Encoder::new(k, age)?,
+            encoder: if repairs == 2 {
+                LaneEncoder::Dual(DualEncoder::new(k, age)?)
+            } else {
+                LaneEncoder::Single(Encoder::new(k, age)?)
+            },
             active: None,
         })
     }
@@ -39,7 +48,8 @@ impl Lane {
         small: bool,
     ) -> Result<Vec<EncodedSymbol>> {
         let mut out = Vec::with_capacity(shards.len());
-        for mut shard in shards {
+        let mut shards = shards.into_iter().peekable();
+        while let Some(mut shard) = shards.next() {
             let local = shard.block();
             let original = matches!(shard, Shard::Data { .. });
             let global = if let Some((active, global)) = self.active {
@@ -56,9 +66,11 @@ impl Lane {
                 global
             };
             match &mut shard {
-                Shard::Data { block, .. } | Shard::Repair { block, .. } => *block = global,
+                Shard::Data { block, .. }
+                | Shard::Repair { block, .. }
+                | Shard::RepairQ { block, .. } => *block = global,
             }
-            if !original {
+            if !original && shards.peek().is_none_or(|next| next.block() != local) {
                 self.active = None;
             }
             out.push(EncodedSymbol {
@@ -76,7 +88,10 @@ impl Lane {
         next_block: &mut u64,
         small: bool,
     ) -> Result<Vec<EncodedSymbol>> {
-        let shards = self.encoder.push(bytes, now)?;
+        let shards = match &mut self.encoder {
+            LaneEncoder::Single(e) => e.push(bytes, now)?,
+            LaneEncoder::Dual(e) => e.push(bytes, now)?,
+        };
         self.remap(shards, next_block, small)
     }
 
@@ -86,7 +101,10 @@ impl Lane {
         next_block: &mut u64,
         small: bool,
     ) -> Result<Vec<EncodedSymbol>> {
-        let shards = self.encoder.flush_due(now).into_iter().collect();
+        let shards = match &mut self.encoder {
+            LaneEncoder::Single(e) => e.flush_due(now).into_iter().collect(),
+            LaneEncoder::Dual(e) => e.flush_due(now),
+        };
         self.remap(shards, next_block, small)
     }
 }
@@ -114,8 +132,8 @@ impl RecordEncoder {
         let age = Duration::from_millis(policy.block_ms);
         let mode = if policy.mixed_fec {
             Mode::Mixed {
-                bulk: Lane::new(policy.fec, age)?,
-                small: Lane::new(1, age)?,
+                bulk: Lane::new(policy.fec, age, policy.fec_repairs)?,
+                small: Lane::new(1, age, 1)?,
                 cutoff: usize::from(policy.small_fec_bytes),
                 next_block: 0,
             }
@@ -208,6 +226,7 @@ mod tests {
 
     fn policy(fec: u8, cutoff: u16, mixed: bool) -> Policy {
         Policy {
+            fec_repairs: 1,
             adaptive: false,
             capacity_probe_bps: 0,
             probe_guided_recovery: false,

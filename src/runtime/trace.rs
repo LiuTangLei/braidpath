@@ -154,6 +154,7 @@ pub enum SymbolKind {
     Plain,
     Original,
     Repair,
+    RepairQ,
 }
 
 /// These are actual wire fields. A repair index_or_count is its block count,

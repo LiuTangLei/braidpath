@@ -10,6 +10,7 @@ fn replay_implementation_identity() -> &'static str {
 }
 fn replay_policy(_mode: &str, block_ms: u64, queue_ms: u64) -> Policy {
     Policy {
+        fec_repairs: 1,
         adaptive: false,
         capacity_probe_bps: 0,
         probe_guided_recovery: false,

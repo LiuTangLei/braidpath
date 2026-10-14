@@ -36,6 +36,8 @@ const MAX_FLOWS: usize = 64;
 const SESSION_IDLE_GRACE: Duration = Duration::from_secs(120);
 const SESSION_PATH: &str = "/session";
 mod coding;
+#[cfg(test)]
+mod dual_tests;
 mod local_delivery;
 #[cfg(test)]
 mod mixed_fec_tests;
@@ -53,6 +55,7 @@ pub struct Policy {
     pub receiver_feedback: bool,
     pub quality_schedule: bool,
     pub fec: u8,
+    pub fec_repairs: u8,
     pub small_fec_bytes: u16,
     pub mixed_fec: bool,
     pub redundancy: u8,
@@ -70,6 +73,14 @@ impl Policy {
     }
 
     pub fn validate(&self) -> Result<()> {
+        ensure!(
+            (1..=2).contains(&self.fec_repairs),
+            "fec-repairs must be 1 or 2"
+        );
+        ensure!(
+            self.fec_repairs == 1 || (self.mixed_fec && self.fec >= 2),
+            "two independent repairs require explicit mixed FEC and at least two bulk records"
+        );
         ensure!(
             !self.probe_guided_recovery
                 || (self.capacity_probe_bps > 0
@@ -146,6 +157,30 @@ fn mixed_fec_header(headers: &http::HeaderMap) -> Result<bool> {
         "unsupported mixed FEC format"
     );
     Ok(value.is_some())
+}
+
+fn fec_repairs_header(headers: &http::HeaderMap) -> Result<u8> {
+    ensure!(
+        headers.get_all("braidpath-fec-repairs").iter().count() <= 1,
+        "duplicate independent repair header"
+    );
+    let value = headers
+        .get("braidpath-fec-repairs")
+        .map(|v| v.to_str())
+        .transpose()?;
+    match value {
+        None => Ok(1),
+        Some("2") => Ok(2),
+        _ => anyhow::bail!("unsupported independent repair format"),
+    }
+}
+
+fn validate_fec_repairs_echo(headers: &http::HeaderMap, expected: u8) -> Result<()> {
+    ensure!(
+        fec_repairs_header(headers)? == expected,
+        "independent FEC repairs not negotiated"
+    );
+    Ok(())
 }
 
 #[derive(Clone)]
@@ -493,7 +528,7 @@ fn enqueue_coded_symbol(
     } else {
         0
     };
-    let record = if data[3] != 1 {
+    let record = if matches!(data[3], 0 | 2) {
         Record::decode_identity(&data[wire::HEADER..]).ok()
     } else {
         None
@@ -1142,7 +1177,13 @@ impl SendAccounting<'_> {
                     .update(|d| d.symbols.repair_no_diverse_path += 1);
             }
             if let Some(block) = sent.block {
-                self.blocks.remove(&block);
+                if self.queue.repair_pending(block) {
+                    if let Some(meta) = self.blocks.get_mut(&block) {
+                        meta.paths |= 1 << path.id;
+                    }
+                } else {
+                    self.blocks.remove(&block);
+                }
             }
         } else {
             self.metrics.path(path.id, |p| {
@@ -1837,7 +1878,9 @@ async fn sender(
                     } else {
                         account_budget_skipped(&policy, &skipped, &metrics);
                     }
-                    if let Some(block) = skipped.block {
+                    if let Some(block) = skipped.block
+                        && !queue.repair_pending(block)
+                    {
                         blocks.remove(&block);
                     }
                     continue;
@@ -2425,7 +2468,8 @@ async fn session_loop(
     let mut decoder = Receiver::configured(
         Duration::from_millis(session.policy.queue_ms),
         session.adaptive_fec_retention,
-    );
+    )
+    .with_dual_repairs(session.policy.fec_repairs == 2);
     publish_retention(&decoder, &session.forward);
     let mut delivery = local_delivery::Queue::new(
         session.forward.clone(),
@@ -2771,7 +2815,8 @@ async fn server_connection(
                     let probe_guided_recovery=guided.is_some();
                     let small_fec_bytes=req.headers().get("braidpath-small-fec-bytes").map(|v|v.to_str()).transpose()?.unwrap_or("0").parse::<u16>()?;
                     let mixed_fec=mixed_fec_header(req.headers())?;
-                    let policy=Policy{small_fec_bytes,mixed_fec,probe_guided_recovery,capacity_probe_bps,adaptive:quality_schedule==Some("adaptive"),latency_target_ms,group_rates,quality_schedule:quality_schedule.is_some(),receiver_feedback:feedback.is_some(),fec:header("braidpath-fec")?.parse()?,redundancy:header("braidpath-redundancy")?.parse()?,rate,block_ms:header("braidpath-block-ms")?.parse()?,queue_ms:header("braidpath-queue-ms")?.parse()?};policy.validate()?;
+                    let fec_repairs=fec_repairs_header(req.headers())?;
+                    let policy=Policy{fec_repairs,small_fec_bytes,mixed_fec,probe_guided_recovery,capacity_probe_bps,adaptive:quality_schedule==Some("adaptive"),latency_target_ms,group_rates,quality_schedule:quality_schedule.is_some(),receiver_feedback:feedback.is_some(),fec:header("braidpath-fec")?.parse()?,redundancy:header("braidpath-redundancy")?.parse()?,rate,block_ms:header("braidpath-block-ms")?.parse()?,queue_ms:header("braidpath-queue-ms")?.parse()?};policy.validate()?;
                     let rejoin=req.headers().get("braidpath-rejoin").is_some_and(|v|v=="1");
                     let stream_id=stream.id().into_inner();
                     // Membership and idle expiry share one map -> paths -> generation lock order.
@@ -2824,6 +2869,7 @@ async fn server_connection(
                     let mut response=Response::builder().status(200).header("braidpath-version","1").header("braidpath-max-payload",MAX_PAYLOAD);if feedback.is_some(){response=response.header("braidpath-feedback","2");}
                     if small_fec_bytes>0 {response=response.header("braidpath-small-fec-bytes",small_fec_bytes);}
                     if mixed_fec {response=response.header("braidpath-mixed-fec","1");}
+                    if fec_repairs==2 {response=response.header("braidpath-fec-repairs","2");}
                     if capacity_probe_bps>0 {response=response.header("braidpath-capacity-probe-bps",capacity_probe_bps).header("braidpath-capacity-probe-format",capacity_probe::FORMAT);}
                     if probe_guided_recovery {response=response.header("braidpath-probe-guided-recovery","1");}
                     if let Some(scheduler)=quality_schedule {response=response.header("braidpath-scheduler",scheduler);}stream.send_response(response.body(())?).await?;
@@ -3057,7 +3103,8 @@ async fn client_session(
     let mut decoder = Receiver::configured(
         Duration::from_millis(options.policy.queue_ms),
         options.adaptive_fec_retention,
-    );
+    )
+    .with_dual_repairs(options.policy.fec_repairs == 2);
     publish_retention(&decoder, &returning);
     let mut delivery = local_delivery::Queue::new(
         returning.clone(),
@@ -3396,6 +3443,9 @@ async fn connect_path(
     if policy.mixed_fec {
         req = req.header("braidpath-mixed-fec", "1");
     }
+    if policy.fec_repairs == 2 {
+        req = req.header("braidpath-fec-repairs", "2");
+    }
     if policy.receiver_feedback {
         req = req
             .header("braidpath-feedback", "2")
@@ -3462,6 +3512,7 @@ async fn connect_path(
         mixed_fec_header(response.headers())? == policy.mixed_fec,
         "mixed FEC not negotiated"
     );
+    validate_fec_repairs_echo(response.headers(), policy.fec_repairs)?;
     ensure!(
         !policy.receiver_feedback
             || response

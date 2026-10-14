@@ -10,6 +10,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+mod dual;
+pub use dual::DualEncoder;
+
 pub const MAX_PAYLOAD: usize = 1200;
 pub const MAX_DATA_SHARDS: usize = 32;
 
@@ -45,12 +48,20 @@ pub enum Shard {
         count: u8,
         coded: Vec<u8>,
     },
+    /// Independent weighted parity; meaningful only in an explicitly negotiated session.
+    RepairQ {
+        block: u64,
+        count: u8,
+        coded: Vec<u8>,
+    },
 }
 
 impl Shard {
     pub fn block(&self) -> u64 {
         match self {
-            Self::Data { block, .. } | Self::Repair { block, .. } => *block,
+            Self::Data { block, .. } | Self::Repair { block, .. } | Self::RepairQ { block, .. } => {
+                *block
+            }
         }
     }
 }
@@ -165,6 +176,7 @@ pub struct Decoder {
     block: u64,
     data: Vec<Option<Vec<u8>>>,
     repair: Option<(u8, Vec<u8>)>,
+    repair_q: Option<(u8, Vec<u8>)>,
 }
 
 impl Decoder {
@@ -173,6 +185,7 @@ impl Decoder {
             block,
             data: vec![None; MAX_DATA_SHARDS],
             repair: None,
+            repair_q: None,
         }
     }
 
@@ -185,6 +198,10 @@ impl Decoder {
                 .is_some_and(|p| p.as_ref() == Some(payload)),
             Shard::Repair { count, coded, .. } => self
                 .repair
+                .as_ref()
+                .is_some_and(|p| p.0 == *count && p.1 == *coded),
+            Shard::RepairQ { count, coded, .. } => self
+                .repair_q
                 .as_ref()
                 .is_some_and(|p| p.0 == *count && p.1 == *coded),
         }
@@ -201,9 +218,13 @@ impl Decoder {
                 let index = usize::from(index);
                 if index >= MAX_DATA_SHARDS
                     || payload.len() > MAX_PAYLOAD
-                    || self.repair.as_ref().is_some_and(|(count, coded)| {
-                        index >= usize::from(*count) || payload.len() + 2 > coded.len()
-                    })
+                    || self
+                        .repair
+                        .iter()
+                        .chain(self.repair_q.iter())
+                        .any(|(count, coded)| {
+                            index >= usize::from(*count) || payload.len() + 2 > coded.len()
+                        })
                 {
                     return Err(Error::InvalidShard);
                 }
@@ -223,51 +244,120 @@ impl Decoder {
                 });
             }
             Shard::Repair { count, coded, .. } => {
-                if count == 0
-                    || usize::from(count) > MAX_DATA_SHARDS
-                    || !(2..=MAX_PAYLOAD + 2).contains(&coded.len())
-                    || self.data.iter().enumerate().any(|(i, value)| {
-                        value
-                            .as_ref()
-                            .is_some_and(|p| i >= usize::from(count) || p.len() + 2 > coded.len())
-                    })
-                {
-                    return Err(Error::InvalidShard);
-                }
-                if let Some(existing) = &self.repair {
-                    return if existing == &(count, coded) {
-                        Ok(out)
-                    } else {
-                        Err(Error::ConflictingShard)
-                    };
-                }
-                self.repair = Some((count, coded));
+                self.insert_repair(false, count, coded)?;
             }
+            Shard::RepairQ { count, coded, .. } => self.insert_repair(true, count, coded)?,
         }
-        if let Some((count, coded)) = &self.repair {
-            let missing: Vec<_> = (0..usize::from(*count))
-                .filter(|i| self.data[*i].is_none())
-                .collect();
-            if missing.len() == 1 {
-                let index = missing[0];
-                let mut recovered = coded.clone();
-                for payload in self.data[..usize::from(*count)].iter().flatten() {
-                    xor_into(&mut recovered, &symbol(payload));
-                }
-                let len = usize::from(u16::from_be_bytes([recovered[0], recovered[1]]));
-                if len + 2 > recovered.len() || recovered[len + 2..].iter().any(|b| *b != 0) {
-                    return Err(Error::InvalidShard);
-                }
-                let payload = recovered[2..len + 2].to_vec();
-                self.data[index] = Some(payload.clone());
-                out.push(Delivery {
-                    block: self.block,
-                    index: index as u8,
-                    payload,
-                    recovered: true,
-                });
-            }
-        }
+        self.recover(&mut out)?;
         Ok(out)
+    }
+
+    fn insert_repair(&mut self, q: bool, count: u8, coded: Vec<u8>) -> Result<(), Error> {
+        if count == 0
+            || usize::from(count) > MAX_DATA_SHARDS
+            || !(2..=MAX_PAYLOAD + 2).contains(&coded.len())
+            || self.data.iter().enumerate().any(|(i, value)| {
+                value
+                    .as_ref()
+                    .is_some_and(|p| i >= usize::from(count) || p.len() + 2 > coded.len())
+            })
+        {
+            return Err(Error::InvalidShard);
+        }
+        let (slot, other) = if q {
+            (&mut self.repair_q, &self.repair)
+        } else {
+            (&mut self.repair, &self.repair_q)
+        };
+        if other
+            .as_ref()
+            .is_some_and(|(n, bytes)| *n != count || bytes.len() != coded.len())
+        {
+            return Err(Error::ConflictingShard);
+        }
+        if let Some(existing) = slot {
+            return if existing == &(count, coded) {
+                Ok(())
+            } else {
+                Err(Error::ConflictingShard)
+            };
+        }
+        *slot = Some((count, coded));
+        Ok(())
+    }
+
+    fn recover(&mut self, out: &mut Vec<Delivery>) -> Result<(), Error> {
+        let Some((count, _)) = self.repair.as_ref().or(self.repair_q.as_ref()) else {
+            return Ok(());
+        };
+        let count = usize::from(*count);
+        let missing: Vec<_> = (0..count).filter(|i| self.data[*i].is_none()).collect();
+        if missing.is_empty()
+            || missing.len() > 2
+            || (missing.len() == 2 && (self.repair.is_none() || self.repair_q.is_none()))
+        {
+            return Ok(());
+        }
+        let residue = |repair: &(u8, Vec<u8>), weighted: bool| {
+            let mut bytes = repair.1.clone();
+            for (i, data) in self.data[..count].iter().enumerate() {
+                if let Some(data) = data {
+                    let input = symbol(data);
+                    if weighted {
+                        dual::weighted_xor(&mut bytes, &input, (i + 1) as u8);
+                    } else {
+                        xor_into(&mut bytes, &input);
+                    }
+                }
+            }
+            bytes
+        };
+        let reconstructed = if missing.len() == 1 {
+            let bytes = if let Some(p) = &self.repair {
+                residue(p, false)
+            } else {
+                let mut bytes = residue(self.repair_q.as_ref().expect("available parity"), true);
+                let inverse = dual::inverse((missing[0] + 1) as u8);
+                for byte in &mut bytes {
+                    *byte = dual::mul(*byte, inverse);
+                }
+                bytes
+            };
+            vec![(missing[0], bytes)]
+        } else {
+            let p = residue(self.repair.as_ref().expect("P parity"), false);
+            let q = residue(self.repair_q.as_ref().expect("Q parity"), true);
+            let a = (missing[0] + 1) as u8;
+            let b = (missing[1] + 1) as u8;
+            let divisor = dual::inverse(a ^ b);
+            let first: Vec<_> = p
+                .iter()
+                .zip(&q)
+                .map(|(p, q)| dual::mul(*q ^ dual::mul(b, *p), divisor))
+                .collect();
+            let second = p.iter().zip(&first).map(|(p, x)| p ^ x).collect();
+            vec![(missing[0], first), (missing[1], second)]
+        };
+        // Validate every decoded length/padding before committing either missing symbol.
+        let decoded = reconstructed
+            .into_iter()
+            .map(|(index, bytes)| {
+                let len = usize::from(u16::from_be_bytes([bytes[0], bytes[1]]));
+                if len + 2 > bytes.len() || bytes[len + 2..].iter().any(|b| *b != 0) {
+                    return Err(Error::InvalidShard);
+                }
+                Ok((index, bytes[2..len + 2].to_vec()))
+            })
+            .collect::<Result<Vec<_>, Error>>()?;
+        for (index, payload) in decoded {
+            self.data[index] = Some(payload.clone());
+            out.push(Delivery {
+                block: self.block,
+                index: index as u8,
+                payload,
+                recovered: true,
+            });
+        }
+        Ok(())
     }
 }
