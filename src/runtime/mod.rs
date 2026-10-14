@@ -9,6 +9,7 @@ pub mod quality;
 pub mod receiver_budget;
 pub mod relay;
 pub mod scheduler;
+pub mod sender_frontier;
 mod shutdown;
 pub mod stats;
 pub mod trace;

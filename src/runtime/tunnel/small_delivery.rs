@@ -61,6 +61,29 @@ fn estimate(path: &OutPath) -> Estimate {
     }
 }
 
+/// Read the same bounded, local timing heuristic in both experimental arms.
+/// This is not a synchronized one-way measurement or independent loss model.
+pub(super) fn frontier_sample(
+    path: &OutPath,
+    frame_bytes: usize,
+    used: u8,
+) -> Option<super::super::sender_frontier::Sample> {
+    let e = estimate(path);
+    let quality = e.quality?;
+    Some(super::super::sender_frontier::Sample {
+        id: path.id,
+        finish_ms: e.delay_ms,
+        loss: quality.loss_rate,
+        immediately_ready: path.conn.close_reason().is_none()
+            && path.conn.datagram_send_buffer_space() >= frame_bytes
+            && path
+                .conn
+                .max_datagram_size()
+                .is_some_and(|m| m >= frame_bytes),
+        already_used: used & (1 << path.id) != 0,
+    })
+}
+
 pub(super) fn mask(paths: &[OutPath], eligible: u8, remaining: Duration, target_ms: u64) -> u8 {
     let estimates: Vec<_> = paths
         .iter()

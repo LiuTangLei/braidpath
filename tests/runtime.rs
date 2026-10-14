@@ -169,6 +169,10 @@ fn dual_fec_negotiates_on_three_real_http3_paths_in_both_directions() {
     three_paths(6);
 }
 #[test]
+fn frontier_scheduler_preserves_real_three_path_integrity_and_publishes_gates() {
+    three_paths(7);
+}
+#[test]
 fn persistent_bad_path_rejoins_with_new_udp_port() {
     three_paths(3);
 }
@@ -214,6 +218,7 @@ fn three_paths(mode: u8) {
         ])
         .into_iter()
         .chain((mode >= 5).then(|| "--adaptive-fec-retention".to_owned()))
+        .chain((mode == 7).then(|| "--frontier-scheduler".to_owned()))
         .chain((mode == 6).then(|| "--packet-trace".to_owned()))
         .chain((mode == 6).then(|| {
             dir.path()
@@ -370,8 +375,28 @@ fn three_paths(mode: u8) {
             .unwrap();
         client_args[index + 1] = "13".into();
     }
+    if mode == 7 {
+        client_args.extend(args(&["--frontier-scheduler", "--adaptive"]));
+    }
     let mut client = launch(&client_args, dir.path(), "client");
     ready(&mut client, "UDP client ready");
+    if mode == 7 {
+        // Adaptive mode announces its first usable path, not completion of all
+        // joins. This three-path fixture must await the actual third join.
+        let until = Instant::now() + Duration::from_secs(12);
+        loop {
+            let log = fs::read_to_string(&client.log).unwrap();
+            if log.matches("client path ready").count() >= 3 {
+                break;
+            }
+            assert!(client.child.try_wait().unwrap().is_none(), "{log}");
+            assert!(
+                Instant::now() < until,
+                "three adaptive paths not ready: {log}"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
     let logs = fs::read_to_string(&client.log).unwrap();
     assert_eq!(logs.matches("client path ready").count(), 3, "{logs}");
     let result = run_bounded(
@@ -587,6 +612,25 @@ fn three_paths(mode: u8) {
                 "persistent bad path never rejoined: {snapshot}"
             );
             thread::sleep(Duration::from_millis(100));
+        }
+    }
+    if mode == 7 {
+        for (file, direction) in [
+            (&client_stats, "client_to_server"),
+            (&server_stats, "server_to_client"),
+        ] {
+            let snapshot = fs::read_to_string(file)
+                .unwrap()
+                .lines()
+                .rev()
+                .find_map(|line| serde_json::from_str::<Value>(line).ok())
+                .unwrap();
+            let sessions = snapshot["stats"]["sessions"].as_object().unwrap();
+            assert_eq!(sessions.len(), 1);
+            let frontier = &sessions.values().next().unwrap()[direction]["sender_frontier"];
+            assert_eq!(frontier["enabled"], true, "{snapshot}");
+            assert!(frontier["head_previews"].as_u64().unwrap() > 0);
+            assert_eq!(frontier["paths"].as_array().unwrap().len(), 8);
         }
     }
     // Losing a relay must not terminate the surviving independent paths.

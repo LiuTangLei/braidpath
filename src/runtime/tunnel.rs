@@ -1,5 +1,6 @@
 use super::{
     MAX_PATHS, MAX_PAYLOAD, QUEUE, adaptive, capacity_probe, outbound, quality, scheduler,
+    sender_frontier::{self, Gate},
     shutdown::Shutdown,
     stats::{self, Scope},
     trace, transport,
@@ -1254,6 +1255,12 @@ async fn sender(
     observation_notify: Option<Arc<Notify>>,
 ) {
     let mut encoder = coding::RecordEncoder::new(&policy).expect("validated policy");
+    let mut frontier = sender_frontier::Snapshot {
+        enabled: metrics.metrics.frontier_scheduler()
+            && policy.adaptive
+            && policy.small_fec_bytes > 0,
+        ..Default::default()
+    };
     let mut queue = outbound::Queue::default();
     let mut blocks = BTreeMap::<u64, BlockSend>::new();
     let mut budget = outbound::RepairBudget::new(policy.redundancy);
@@ -1361,6 +1368,7 @@ async fn sender(
                 }
             }
             SenderEvent::Ready(SendReadiness::Admitted { at, next_cursor }) => {
+                frontier.readiness_admitted += 1;
                 let attempt = prepared.expect("selected readiness attempt");
                 let paths = shared_paths.lock().expect("paths lock");
                 SendAccounting {
@@ -1391,6 +1399,7 @@ async fn sender(
                 });
             }
             SenderEvent::Ready(SendReadiness::Failed) => {
+                frontier.readiness_failed += 1;
                 let attempt = prepared.expect("selected readiness attempt");
                 trace_outgoing(
                     &metrics,
@@ -1402,7 +1411,9 @@ async fn sender(
                 );
                 metrics.path(attempt.path.id, |p| p.quinn_send_error_attempts += 1);
             }
-            SenderEvent::Ready(_) => {}
+            SenderEvent::Ready(_) => {
+                frontier.readiness_gate_changed += 1;
+            }
             SenderEvent::Input(item) => {
                 let Some(QueuedRecord { record, created }) = item else {
                     break;
@@ -1910,13 +1921,19 @@ async fn sender(
                 stalled_originals = 0;
                 continue;
             }
+            frontier.head_previews += 1;
+            let is_small = small_delivery::applies(&policy, &front);
             let candidates: Vec<_> = if policy.quality_schedule || policy.adaptive {
                 paths
                     .iter()
                     .filter(|p| {
-                        p.conn.close_reason().is_none()
+                        let eligible = p.conn.close_reason().is_none()
                             && (!policy.adaptive
-                                || controllers[usize::from(p.id)].decision(now_us).eligible)
+                                || controllers[usize::from(p.id)].decision(now_us).eligible);
+                        if !eligible {
+                            frontier.add(p.id, is_small, Gate::PathIneligible);
+                        }
+                        eligible
                     })
                     .map(|path| {
                         let weight = if policy.adaptive {
@@ -1939,6 +1956,9 @@ async fn sender(
             } else {
                 Vec::new()
             };
+            let before_allowance = candidates
+                .iter()
+                .fold(0u8, |mask, (id, _)| mask | (1 << id));
             let mut candidates = if policy.adaptive {
                 business_ready_candidates(
                     &candidates,
@@ -1957,7 +1977,19 @@ async fn sender(
             } else {
                 candidates
             };
-            let is_small = small_delivery::applies(&policy, &front);
+            if policy.adaptive {
+                let after = candidates
+                    .iter()
+                    .fold(0u8, |mask, (id, _)| mask | (1 << id));
+                for id in 0..MAX_PATHS as u8 {
+                    if before_allowance & !after & (1 << id) != 0 {
+                        frontier.add(id, is_small, Gate::PathAllowance);
+                    }
+                }
+                if after == 0 {
+                    frontier.no_eligible_path_previews += 1;
+                }
+            }
             let small_mask = if is_small {
                 let eligible = if policy.quality_schedule {
                     candidates.iter().fold(0, |mask, (id, _)| mask | (1 << id))
@@ -2008,18 +2040,68 @@ async fn sender(
             if repair {
                 order.sort_by_key(|i| u8::from(used & (1 << paths[*i].id) != 0));
             }
+            // Shadow evaluates identical evidence in both arms. Only the local
+            // opt-in changes order; all original gates below remain authoritative.
+            if is_small && policy.adaptive && order.len() > 1 {
+                frontier.small_rank_evaluations += 1;
+                let ids: Vec<_> = order.iter().map(|i| paths[*i].id).collect();
+                let samples: Vec<_> = order
+                    .iter()
+                    .filter_map(|i| {
+                        let path = &paths[*i];
+                        let frame = front.data.len()
+                            + quality::HEADER
+                            + wire::http_datagram_overhead(path.stream).ok()?;
+                        let mut sample = small_delivery::frontier_sample(
+                            path,
+                            frame,
+                            if repair { used } else { 0 },
+                        )?;
+                        let reserve = if Some(path.group) == reserved_group {
+                            feedback_reserve
+                        } else {
+                            0
+                        };
+                        sample.immediately_ready &= pacer.available(frame + 80 + feedback_reserve)
+                            && groups[usize::from(path.group)].available(frame + 80 + reserve)
+                            && business
+                                .as_ref()
+                                .expect("adaptive business pacer")
+                                .available(path.group, frame + 80)
+                            && (!repair
+                                || (repair_allowed(&policy, &budget, &blocks, &front, frame)
+                                    && small_delivery::copy_ready(path, used)));
+                        Some(sample)
+                    })
+                    .collect();
+                if let Some(id) = sender_frontier::preferred(&ids, &samples) {
+                    frontier.small_rank_opportunities += 1;
+                    if frontier.enabled {
+                        let at = order
+                            .iter()
+                            .position(|i| paths[*i].id == id)
+                            .expect("existing ranked path");
+                        let selected = order.remove(at);
+                        order.insert(0, selected);
+                        frontier.small_rank_changes += 1;
+                    }
+                }
+            }
             let mut accepted = None;
             let mut wait_candidate = None;
             for i in order {
                 let path = &paths[i];
                 let id = usize::from(path.id);
                 if path.conn.close_reason().is_some() {
+                    frontier.add(path.id, is_small, Gate::PathIneligible);
                     continue;
                 }
                 if is_small && repair && !small_delivery::copy_ready(path, used) {
+                    frontier.add(path.id, is_small, Gate::CopySpacing);
                     continue;
                 }
                 let Ok(mapping_bytes) = wire::http_datagram_overhead(path.stream) else {
+                    frontier.add(path.id, is_small, Gate::DatagramSize);
                     continue;
                 };
                 let frame_bytes = mapping_bytes
@@ -2035,23 +2117,31 @@ async fn sender(
                 } else {
                     0
                 };
-                if !pacer.available(cost + feedback_reserve)
-                    || !groups[usize::from(path.group)].available(cost + group_reserve)
-                {
+                if !pacer.available(cost + feedback_reserve) {
+                    frontier.add(path.id, is_small, Gate::Aggregate);
+                    continue;
+                }
+                if !groups[usize::from(path.group)].available(cost + group_reserve) {
+                    frontier.add(path.id, is_small, Gate::Group);
                     continue;
                 }
                 if repair && !repair_allowed(&policy, &budget, &blocks, &front, frame_bytes) {
+                    frontier.add(path.id, is_small, Gate::RepairCredit);
                     continue;
                 }
                 if policy.adaptive {
                     let allowed = controllers[id].allow(now_us, cost, age.as_secs_f64() * 1000.0);
                     update_business_pacer(&mut business, &paths, &controllers, now_us);
-                    if !allowed
-                        || !business
-                            .as_ref()
-                            .expect("adaptive business pacer")
-                            .available(path.group, cost)
+                    if !allowed {
+                        frontier.add(path.id, is_small, Gate::PathAllowance);
+                        continue;
+                    }
+                    if let Some(gate) = business
+                        .as_ref()
+                        .expect("adaptive business pacer")
+                        .blocked_gate(path.group, cost)
                     {
+                        frontier.add(path.id, is_small, gate);
                         continue;
                     }
                 }
@@ -2060,10 +2150,12 @@ async fn sender(
                     .max_datagram_size()
                     .is_none_or(|m| frame_bytes > m)
                 {
+                    frontier.add(path.id, is_small, Gate::DatagramSize);
                     continue;
                 }
                 let blocked = path.conn.datagram_send_buffer_space() < frame_bytes;
                 if blocked {
+                    frontier.add(path.id, is_small, Gate::ApiBuffer);
                     metrics.path(path.id, |p| p.send_buffer_full_attempts += 1);
                     if wait_candidate.is_some() {
                         continue;
@@ -2104,16 +2196,19 @@ async fn sender(
                 }
                 match send_datagram_before_deadline(&path.conn, data, front.created, lifetime) {
                     None => {
+                        frontier.add(path.id, is_small, Gate::ExpiredBeforeApi);
                         let expired = queue.pop(repair).expect("expired front");
                         account_expired(&expired, Instant::now(), &metrics);
                         stalled_originals = 0;
                         continue 'drain;
                     }
                     Some(Ok(at)) => {
+                        frontier.add(path.id, is_small, Gate::ApiAdmitted);
                         accepted = Some((i, frame_bytes, at));
                         break;
                     }
                     Some(Err(_)) => {
+                        frontier.add(path.id, is_small, Gate::ApiError);
                         trace_outgoing(
                             &metrics,
                             trace::Stage::QuinnApiRejected,
@@ -2201,6 +2296,7 @@ async fn sender(
         }
         if publish_feedback_stats {
             publish_receiver_feedback(&paths, &metrics);
+            metrics.publish_sender_frontier(frontier.clone());
         }
         drop(paths);
         waiting = next_wait.map(WaitingSend::new);
@@ -2236,6 +2332,7 @@ async fn sender(
         metrics.update(|d| d.records.input_shutdown_dropped += 1);
     }
     publish_receiver_feedback(&shared_paths.lock().expect("paths lock"), &metrics);
+    metrics.publish_sender_frontier(frontier);
 }
 
 #[derive(Clone, Copy)]

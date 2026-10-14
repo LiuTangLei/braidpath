@@ -23,6 +23,9 @@ const MAX_RETIRED_SESSIONS: usize = 8;
 
 #[derive(Args, Clone, Default)]
 pub struct Options {
+    /// Experimental local small-lane finish preference; defaults off. No new pacing credit.
+    #[arg(long)]
+    pub frontier_scheduler: bool,
     #[command(flatten)]
     pub trace: trace::Options,
     /// Final cumulative JSON snapshot, including orderly shutdown/error status.
@@ -192,6 +195,9 @@ pub struct Direction {
     /// Receiver-local gauges/counters, only in the owning session/direction.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fec_retention: Option<super::fec_retention::Snapshot>,
+    /// Sender-owned preview counters; not packet losses or time-at-limit percentages.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sender_frontier: Option<super::sender_frontier::Snapshot>,
     #[serde(skip_serializing_if = "Ids::is_empty")]
     pub quinn_admitted_record_ids: Ids,
     #[serde(skip_serializing_if = "Ids::is_empty")]
@@ -625,6 +631,7 @@ impl ConnectionTrace {
     }
 }
 struct Inner {
+    frontier_scheduler: bool,
     state: Mutex<State>,
     // Only the current connection per logical path is retained. Historical
     // generations hold scalar snapshots and cannot keep retired endpoints alive.
@@ -649,7 +656,11 @@ impl Metrics {
         Self::new_with_trace(role, trace::Trace::disabled())
     }
     pub fn new_with_trace(role: &'static str, trace: trace::Trace) -> Self {
+        Self::configured(role, trace, false)
+    }
+    fn configured(role: &'static str, trace: trace::Trace, frontier_scheduler: bool) -> Self {
         Self(Arc::new(Inner {
+            frontier_scheduler,
             state: Mutex::new(State::default()),
             connections: Mutex::new(BTreeMap::new()),
             started: Instant::now(),
@@ -661,6 +672,9 @@ impl Metrics {
     }
     pub fn trace(&self) -> &trace::Trace {
         &self.0.trace
+    }
+    pub fn frontier_scheduler(&self) -> bool {
+        self.0.frontier_scheduler
     }
     pub fn state(&self, f: impl FnOnce(&mut State)) {
         f(&mut self.0.state.lock().expect("stats lock"));
@@ -827,6 +841,16 @@ impl Metrics {
     }
 }
 impl Scope {
+    pub fn publish_sender_frontier(&self, snapshot: super::sender_frontier::Snapshot) {
+        self.metrics.state(|s| {
+            if let Some(session) = s.sessions.get_mut(&self.session) {
+                session
+                    .entry(self.direction.to_owned())
+                    .or_default()
+                    .sender_frontier = Some(snapshot);
+            }
+        });
+    }
     /// Never overwrite process-wide gauges with the latest of multiple sessions.
     pub fn publish_fec_retention(&self, snapshot: super::fec_retention::Snapshot) {
         self.metrics.state(|s| {
@@ -1020,6 +1044,10 @@ fn distinct_output_paths(paths: &[Option<&FsPath>]) -> Result<()> {
 impl Reporter {
     pub fn new(role: &'static str, options: Options) -> Result<Self> {
         ensure!(
+            !options.frontier_scheduler || matches!(role, "client" | "server"),
+            "frontier-scheduler applies only to a client or server sender"
+        );
+        ensure!(
             (10..=60_000).contains(&options.stats_interval_ms),
             "stats interval must be 10..60000 ms"
         );
@@ -1045,7 +1073,7 @@ impl Reporter {
                     .map(|f| Arc::new(Mutex::new(f)))
             })
             .transpose()?;
-        let metrics = Metrics::new_with_trace(role, capture);
+        let metrics = Metrics::configured(role, capture, options.frontier_scheduler);
         let periodic = jsonl.clone().map(|file| {
             let metrics = metrics.clone();
             let ms = options.stats_interval_ms;
@@ -1176,6 +1204,45 @@ mod tests {
         );
         assert!(state.directions[FORWARD].fec_retention.is_none());
         assert!(!state.sessions["a"].contains_key(RETURN));
+    }
+
+    #[test]
+    fn frontier_mode_and_sender_census_are_local_and_session_owned() {
+        let metrics = Metrics::configured("client", trace::Trace::disabled(), true);
+        assert!(metrics.frontier_scheduler());
+        assert!(!Metrics::new("client").frontier_scheduler());
+        let a = metrics.scope("a", FORWARD);
+        let b = metrics.scope("b", RETURN);
+        a.update(|_| {});
+        b.update(|_| {});
+        a.publish_sender_frontier(super::super::sender_frontier::Snapshot {
+            head_previews: 7,
+            enabled: true,
+            ..Default::default()
+        });
+        b.publish_sender_frontier(super::super::sender_frontier::Snapshot {
+            head_previews: 3,
+            ..Default::default()
+        });
+        let state = metrics.0.state.lock().unwrap();
+        assert_eq!(
+            state.sessions["a"][FORWARD]
+                .sender_frontier
+                .as_ref()
+                .unwrap()
+                .head_previews,
+            7
+        );
+        assert_eq!(
+            state.sessions["b"][RETURN]
+                .sender_frontier
+                .as_ref()
+                .unwrap()
+                .head_previews,
+            3
+        );
+        assert!(state.directions[FORWARD].sender_frontier.is_none());
+        assert!(state.directions[RETURN].sender_frontier.is_none());
     }
 
     #[tokio::test]

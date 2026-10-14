@@ -345,11 +345,22 @@ impl BusinessPacer {
     }
 
     pub fn available(&self, group: u8, wire_bytes: usize) -> bool {
+        self.blocked_gate(group, wire_bytes).is_none()
+    }
+
+    pub(crate) fn blocked_gate(
+        &self,
+        group: u8,
+        wire_bytes: usize,
+    ) -> Option<super::sender_frontier::Gate> {
         let group = &self.groups[usize::from(group)];
-        self.aggregate.rate > 0
-            && group.rate > 0
-            && self.aggregate.available(wire_bytes)
-            && group.available(wire_bytes)
+        if self.aggregate.rate == 0 || !self.aggregate.available(wire_bytes) {
+            Some(super::sender_frontier::Gate::BusinessAggregate)
+        } else if group.rate == 0 || !group.available(wire_bytes) {
+            Some(super::sender_frontier::Gate::BusinessGroup)
+        } else {
+            None
+        }
     }
 
     /// Call only after authoritative successful admission. Preview, rejection,

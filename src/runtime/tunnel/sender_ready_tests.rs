@@ -1481,6 +1481,18 @@ async fn sender_actor_drains_multiple_flows_once_and_stops_cleanly() {
         assert_eq!(d.symbols.originals_queue_full_dropped, 0);
         assert_eq!(d.symbols.originals_shutdown_dropped, 0);
         assert_eq!(d.symbols.admitted_wait.count, 128);
+        let frontier = d.sender_frontier.as_ref().expect("final sender census");
+        assert!(!frontier.enabled);
+        let immediate: u64 = frontier
+            .paths
+            .iter()
+            .map(|p| p.small.api_admitted + p.other.api_admitted)
+            .sum();
+        assert_eq!(
+            immediate + frontier.readiness_admitted,
+            d.symbols.originals_quinn_admitted + d.symbols.repairs_quinn_admitted
+        );
+        assert_eq!(frontier.small_rank_changes, 0);
     });
     pair.assert_quiet().await;
 }
