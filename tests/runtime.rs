@@ -412,7 +412,12 @@ fn three_paths(mode: u8) {
         wrong.to_str().unwrap(),
     ]));
     assert!(!bad.status.success());
-    assert!(String::from_utf8_lossy(&bad.stderr).contains("admission rejected"));
+    assert!(
+        String::from_utf8_lossy(&bad.stderr).contains("admission rejected"),
+        "wrong-token client failed for a different reason: {}\nserver: {}",
+        String::from_utf8_lossy(&bad.stderr),
+        fs::read_to_string(&server.log).unwrap()
+    );
     let mut relay = launch(
         &args(&[
             "relay",
