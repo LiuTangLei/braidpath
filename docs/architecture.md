@@ -142,3 +142,8 @@ Negotiate and enforce limits for paths, flows, active blocks, symbols, pending b
 The architecture has a practical implementation route, but runtime selection is gated on bounded queue behavior, profile-specific relay feasibility and real interface binding. The HTTP/3 candidate additionally needs correct HTTP behavior, authenticated datagram mapping and measured fingerprint limitations. Deployment selection requires deployment reachability evidence. Performance acceptance additionally requires shared-bottleneck competition, correlated loss, sparse traffic and both directions. CPU-efficiency optimization is deferred until the latency/throughput behavior is established. Neither a successful codec test nor a local encrypted-path probe proves those properties.
 
 The [validation plan](validation.md) defines those gates. Test records and feasibility-probe outputs stay local; this document contains design decisions and methods only.
+
+The [delivery-frontier research plan](delivery-frontier.md) separates resource
+constraints, failure correlation and deadline utility. Its current tools audit
+historical stage accounting and interpret a proposed rate-pulse contract offline;
+they are not a live scheduler or a claim of measured capacity.

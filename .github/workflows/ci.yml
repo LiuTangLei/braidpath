@@ -7,7 +7,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: python3 -m unittest bench.test_run bench.test_readiness bench.test_trace_replay
+      - run: python3 -m unittest bench.test_run bench.test_readiness bench.test_trace_replay bench.test_delivery_frontier bench.test_frontier_response
   rust:
     strategy:
       fail-fast: false
