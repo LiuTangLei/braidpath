@@ -11,9 +11,6 @@ use std::{
 pub const PER_FLOW_LIMIT: usize = QUEUE / 4;
 pub const REPAIR_LIMIT: usize = QUEUE / 4;
 
-#[cfg(test)]
-mod queue_tests;
-
 #[derive(Clone)]
 pub struct Pending {
     pub data: Bytes,
@@ -30,10 +27,6 @@ pub struct Queue {
     flows: BTreeMap<u32, VecDeque<Pending>>,
     turns: VecDeque<u32>,
     repairs: VecDeque<Pending>,
-    original_blocks: BTreeMap<u64, usize>,
-    repair_blocks: BTreeMap<u64, usize>,
-    // A conservative lower bound. Popping may leave an early hint, never a late one.
-    oldest_created: Option<Instant>,
     len: usize,
 }
 impl Queue {
@@ -71,9 +64,6 @@ impl Queue {
         if self.len == QUEUE {
             return Err(item);
         }
-        let block = item.block;
-        let original = item.flow.is_some();
-        let created = item.created;
         if let Some(flow) = item.flow {
             if self
                 .flows
@@ -93,15 +83,6 @@ impl Queue {
             }
             self.repairs.push_back(item);
         }
-        if let Some(block) = block {
-            let counts = if original {
-                &mut self.original_blocks
-            } else {
-                &mut self.repair_blocks
-            };
-            *counts.entry(block).or_default() += 1;
-        }
-        self.oldest_created = Some(self.oldest_created.map_or(created, |old| old.min(created)));
         self.len += 1;
         Ok(())
     }
@@ -129,42 +110,20 @@ impl Queue {
             }
             item
         };
-        if let Some(pending) = &item {
-            self.remove_block(pending);
+        if item.is_some() {
             self.len -= 1;
-            if self.len == 0 {
-                self.oldest_created = None;
-            }
         }
         item
     }
     pub fn block_pending(&self, block: u64) -> bool {
-        self.original_blocks.contains_key(&block)
+        self.flows
+            .values()
+            .any(|q| q.iter().any(|p| p.block == Some(block)))
     }
     pub fn repair_pending(&self, block: u64) -> bool {
-        self.repair_blocks.contains_key(&block)
-    }
-    fn remove_block(&mut self, pending: &Pending) {
-        if let Some(block) = pending.block {
-            let counts = if pending.flow.is_some() {
-                &mut self.original_blocks
-            } else {
-                &mut self.repair_blocks
-            };
-            let count = counts.get_mut(&block).expect("queued block is indexed");
-            *count -= 1;
-            if *count == 0 {
-                counts.remove(&block);
-            }
-        }
+        self.repairs.iter().any(|p| p.block == Some(block))
     }
     pub fn expire(&mut self, now: Instant, age: Duration) -> Vec<Pending> {
-        if self
-            .oldest_created
-            .is_none_or(|at| now.saturating_duration_since(at) < age)
-        {
-            return Vec::new();
-        }
         let mut expired = Vec::new();
         for q in self.flows.values_mut() {
             while q
@@ -185,19 +144,7 @@ impl Queue {
                 true
             }
         });
-        for pending in &expired {
-            self.remove_block(pending);
-        }
         self.len -= expired.len();
-        // Preserve FIFO expiry even if caller-supplied original ages are out of
-        // order: a pop can expose an older record without another insertion.
-        self.oldest_created = self
-            .flows
-            .values()
-            .flatten()
-            .chain(self.repairs.iter())
-            .map(|p| p.created)
-            .min();
         expired
     }
 }
