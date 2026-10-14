@@ -1,0 +1,34 @@
+[package]
+name = "aggligator-transport-webusb"
+version = "0.9.0"
+description = "Aggligator transport: WebUSB for targeting WebAssembly"
+categories = ["asynchronous", "network-programming", "wasm"]
+keywords = ["aggligator", "aggligator-transport"]
+readme = "README.md"
+edition = "2024"
+rust-version = "1.97"
+authors = ["Sebastian Urban <surban@surban.net>"]
+license = "Apache-2.0"
+homepage = "https://remoc.rs/aggligator/"
+repository = "https://github.com/remoc-rs/aggligator"
+
+[dependencies]
+aggligator = { version = "0.12.0", path = "../aggligator", features = ["js"] }
+
+async-trait = "0.1"
+bimap = "0.6"
+bytes = "1"
+futures = "0.3"
+threadporter = "0.1"
+tokio = { version = "1", features = ["sync"] }
+tracing = "0.1"
+wokio = { version = "0.1.1", features = ["web"] }
+
+upc = { version = "1.0", features = ["web"] }
+webusb-web = "0.5.0"
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs", "--cfg", "web_sys_unstable_apis", "--cfg", "getrandom_backend=\"wasm_js\""]
+rustc-args = ["--cfg", "web_sys_unstable_apis", "--cfg", "getrandom_backend=\"wasm_js\""]
+targets = ["wasm32-unknown-unknown"]

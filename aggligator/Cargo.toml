@@ -1,0 +1,73 @@
+[package]
+name = "aggligator"
+version = "0.12.1"
+description = "Aggregates multiple links (TCP, WebSocket, USB or similar) into one connection having their combined bandwidth and provides resiliency against failure of individual links, allowing failover and roaming between networks in user space."
+categories = ["asynchronous", "network-programming"]
+keywords = ["multipath", "bonding", "link-aggregation", "failover", "roaming"]
+readme = "README.md"
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+
+[features]
+default = []
+dump = ["serde", "serde_json", "tokio/fs", "tokio/io-util"]
+js = [
+    "wokio/web",
+    "dep:getrandom",
+    "dep:js-sys",
+    "dep:web-sys",
+    "dep:wasm-bindgen",
+    "dep:wasm-bindgen-futures",
+]
+
+[dependencies]
+async-trait = { workspace = true }
+atomic_refcell = { workspace = true }
+byteorder = { workspace = true }
+bytes = { workspace = true }
+crc-fast = { workspace = true }
+futures = { workspace = true }
+rand = { workspace = true }
+tokio = { workspace = true, features = ["rt", "time", "macros"] }
+tokio-stream = { workspace = true, features = ["sync"] }
+tokio-util = { workspace = true, features = ["codec"] }
+tracing = { workspace = true }
+wokio = { workspace = true }
+x25519-dalek = { workspace = true, features = ["static_secrets"] }
+
+# dump feature
+serde = { workspace = true, features = ["derive"], optional = true }
+serde_json = { workspace = true, optional = true }
+
+# js feature
+getrandom = { workspace = true, features = ["wasm_js"], optional = true }
+js-sys = { workspace = true, optional = true }
+web-sys = { workspace = true, features = [
+    "Performance",
+    "Window",
+    "WorkerGlobalScope",
+], optional = true }
+wasm-bindgen = { workspace = true, optional = true }
+wasm-bindgen-futures = { workspace = true, optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt"] }
+test-log = { workspace = true, default-features = false, features = ["trace"] }
+tracing-subscriber = { workspace = true, default-features = false, features = [
+    "env-filter",
+    "fmt",
+] }
+
+[target.'cfg(not(target_family = "wasm"))'.dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread"] }
+
+[target.'cfg(target_family = "wasm")'.dev-dependencies]
+wasm-bindgen-test = { workspace = true }
+
+[package.metadata.docs.rs]
+features = ["dump"]
+rustdoc-args = ["--cfg", "docsrs"]

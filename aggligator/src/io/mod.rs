@@ -1,0 +1,359 @@
+//! Wrapper types for stream-based links.
+//!
+//! These wrapper types turn stream-based links into packet-based links
+//! by applying the [integrity codec](IntegrityCodec).
+//!
+//! They are applied by the [`Server::add_incoming_io`](crate::connect::Server::add_incoming_io)
+//! and [`Control::add_io`](crate::control::Control::add_io) methods to stream-based links,
+//! using the default configuration of the integrity codec.
+//!
+
+mod codec;
+
+use bytes::Bytes;
+use futures::{Sink, SinkExt, Stream, StreamExt};
+use std::{
+    fmt, io,
+    pin::Pin,
+    task::{Context, Poll},
+};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio_util::codec::{FramedRead, FramedWrite};
+
+pub use codec::*;
+
+/// An [`AsyncRead`] that can be used by the connection task.
+///
+/// This is automatically implemented for every type fulfilling the bounds.
+pub trait DynRead: AsyncRead + Send + Sync + 'static {}
+impl<T> DynRead for T where T: AsyncRead + Send + Sync + 'static + ?Sized {}
+
+/// An [`AsyncWrite`] that can be used by the connection task.
+///
+/// This is automatically implemented for every type fulfilling the bounds.
+pub trait DynWrite: AsyncWrite + Send + Sync + 'static {}
+impl<T> DynWrite for T where T: AsyncWrite + Send + Sync + 'static + ?Sized {}
+
+/// A packet [`Sink`] that can be used by the connection task.
+///
+/// This is automatically implemented for every type fulfilling the bounds.
+pub trait DynSink: Sink<Bytes, Error = io::Error> + Send + Sync + 'static {}
+impl<T> DynSink for T where T: Sink<Bytes, Error = io::Error> + Send + Sync + 'static + ?Sized {}
+
+/// A packet [`Stream`] that can be used by the connection task.
+///
+/// This is automatically implemented for every type fulfilling the bounds.
+pub trait DynStream: Stream<Item = io::Result<Bytes>> + Send + Sync + 'static {}
+impl<T> DynStream for T where T: Stream<Item = io::Result<Bytes>> + Send + Sync + 'static + ?Sized {}
+
+struct FilterFlush<W> {
+    inner: W,
+    pub flush_allowed: bool,
+}
+
+impl<W> FilterFlush<W> {
+    pub fn new(inner: W) -> Self {
+        Self { inner, flush_allowed: false }
+    }
+}
+
+impl<W> AsyncWrite for FilterFlush<W>
+where
+    W: AsyncWrite + Unpin,
+{
+    fn poll_write(self: Pin<&mut Self>, cx: &mut Context, buf: &[u8]) -> Poll<io::Result<usize>> {
+        Pin::new(&mut Pin::into_inner(self).inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context) -> Poll<io::Result<()>> {
+        if !self.flush_allowed {
+            return Poll::Ready(Ok(()));
+        }
+
+        Pin::new(&mut Pin::into_inner(self).inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context) -> Poll<io::Result<()>> {
+        Pin::new(&mut Pin::into_inner(self).inner).poll_shutdown(cx)
+    }
+}
+
+/// Transmit wrapper for using an IO-stream-based link.
+pub struct IoTx<W>(FramedWrite<FilterFlush<W>, IntegrityCodec>);
+
+impl<W> fmt::Debug for IoTx<W>
+where
+    W: fmt::Debug,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.debug_tuple("IoTx").field(&self.0.get_ref().inner).finish()
+    }
+}
+
+impl<W> IoTx<W>
+where
+    W: AsyncWrite,
+{
+    /// Wraps an IO writer using the default configuration of the integrity codec.
+    pub fn new(write: W) -> Self {
+        Self::with_codec(write, IntegrityCodec::new())
+    }
+
+    /// Wraps and IO writer using the default configuration of the integrity codec and
+    /// the specified write buffer capacity.
+    pub fn with_capacity(write: W, capacity: usize) -> Self {
+        Self::with_codec_and_capacity(write, IntegrityCodec::new(), capacity)
+    }
+
+    /// Wraps an IO writer using a customized integrity codec.
+    pub fn with_codec(write: W, codec: IntegrityCodec) -> Self {
+        Self(FramedWrite::new(FilterFlush::new(write), codec))
+    }
+
+    /// Wraps an IO writer using a customized integrity codec and write buffer capacity.
+    pub fn with_codec_and_capacity(write: W, codec: IntegrityCodec, capacity: usize) -> Self {
+        Self(FramedWrite::with_capacity(FilterFlush::new(write), codec, capacity))
+    }
+}
+
+impl<W> Sink<Bytes> for IoTx<W>
+where
+    W: AsyncWrite + Unpin,
+{
+    type Error = io::Error;
+
+    #[inline]
+    fn poll_ready(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Result<(), Self::Error>> {
+        Pin::into_inner(self).0.poll_ready_unpin(cx)
+    }
+
+    #[inline]
+    fn start_send(self: Pin<&mut Self>, item: Bytes) -> Result<(), Self::Error> {
+        Pin::into_inner(self).0.start_send_unpin(item)
+    }
+
+    #[inline]
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Result<(), Self::Error>> {
+        let this = Pin::into_inner(self);
+        this.0.get_mut().flush_allowed = true;
+        let res = this.0.poll_flush_unpin(cx);
+        this.0.get_mut().flush_allowed = false;
+        res
+    }
+
+    fn poll_close(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Result<(), Self::Error>> {
+        let this = Pin::into_inner(self);
+        this.0.get_mut().flush_allowed = true;
+        let res = this.0.poll_close_unpin(cx);
+        this.0.get_mut().flush_allowed = false;
+        res
+    }
+}
+
+/// Receive wrapper for using an IO-stream-based link.
+pub struct IoRx<R>(FramedRead<R, IntegrityCodec>);
+
+impl<R> fmt::Debug for IoRx<R>
+where
+    R: fmt::Debug,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.debug_tuple("IoRx").field(&self.0.get_ref()).finish()
+    }
+}
+
+impl<R> IoRx<R>
+where
+    R: AsyncRead,
+{
+    /// Wraps an IO reader using the default configuration of the integrity codec.
+    pub fn new(read: R) -> Self {
+        Self::with_codec(read, IntegrityCodec::new())
+    }
+
+    /// Wraps and IO reader using the default configuration of the integrity codec and
+    /// the specified write buffer capacity.
+    pub fn with_capacity(read: R, capacity: usize) -> Self {
+        Self::with_codec_and_capacity(read, IntegrityCodec::new(), capacity)
+    }
+
+    /// Wraps an IO reader using a customized integrity codec.
+    pub fn with_codec(read: R, codec: IntegrityCodec) -> Self {
+        Self(FramedRead::new(read, codec))
+    }
+
+    /// Wraps an IO reader using a customized integrity codec and write buffer capacity.
+    pub fn with_codec_and_capacity(read: R, codec: IntegrityCodec, capacity: usize) -> Self {
+        Self(FramedRead::with_capacity(read, codec, capacity))
+    }
+}
+
+impl<R> Stream for IoRx<R>
+where
+    R: AsyncRead + Unpin,
+{
+    type Item = Result<Bytes, io::Error>;
+
+    #[inline]
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
+        Pin::into_inner(self).0.poll_next_unpin(cx).map_ok(|v| v.freeze())
+    }
+}
+
+/// Type-neutral transmit wrapper for using an IO-stream-based link.
+///
+/// Useful if a connection consists of different types of links.
+pub type IoTxBox = IoTx<Pin<Box<dyn DynWrite>>>;
+
+/// Type-neutral receive wrapper for using an IO-stream-based link.
+///
+/// Useful if a connection consists of different types of links.
+pub type IoRxBox = IoRx<Pin<Box<dyn DynRead>>>;
+
+/// A stream, either packet-based or IO-based.
+pub enum StreamBox {
+    /// Packet-based stream.
+    TxRx(TxRxBox),
+    /// IO-based stream.
+    Io(IoBox),
+}
+
+impl StreamBox {
+    /// Make stream packet-based.
+    ///
+    /// A packet-based stream is unaffacted.
+    /// An IO-based stream is wrapped in the integrity codec.
+    pub fn into_tx_rx(self) -> TxRxBox {
+        match self {
+            Self::TxRx(tx_rx) => tx_rx,
+            Self::Io(IoBox { read, write }) => {
+                let tx = IoTxBox::new(write);
+                let rx = IoRxBox::new(read);
+                TxRxBox::new(tx, rx)
+            }
+        }
+    }
+
+    /// Make stream packet-based with specified buffer capacity.
+    ///
+    /// A packet-based stream is unaffacted.
+    /// An IO-based stream is wrapped in the integrity codec with the specified buffer capacity.    
+    pub fn into_tx_rx_with_capacity(self, capacity: usize) -> TxRxBox {
+        match self {
+            Self::TxRx(tx_rx) => tx_rx,
+            Self::Io(IoBox { read, write }) => {
+                let tx = IoTxBox::with_capacity(write, capacity);
+                let rx = IoRxBox::with_capacity(read, capacity);
+                TxRxBox::new(tx, rx)
+            }
+        }
+    }
+}
+
+impl From<TxRxBox> for StreamBox {
+    fn from(value: TxRxBox) -> Self {
+        Self::TxRx(value)
+    }
+}
+
+impl From<IoBox> for StreamBox {
+    fn from(value: IoBox) -> Self {
+        Self::Io(value)
+    }
+}
+
+pub(crate) type TxBox = Pin<Box<dyn DynSink>>;
+pub(crate) type RxBox = Pin<Box<dyn DynStream>>;
+
+/// A boxed packet-based stream.
+pub struct TxRxBox {
+    /// Sender.
+    pub tx: TxBox,
+    /// Receiver.
+    pub rx: RxBox,
+}
+
+impl TxRxBox {
+    /// Creates a new instance.
+    pub fn new(tx: impl DynSink, rx: impl DynStream) -> Self {
+        Self { tx: Box::pin(tx), rx: Box::pin(rx) }
+    }
+
+    /// Splits this into boxed transmitter and receiver.
+    pub fn into_split(self) -> (TxBox, RxBox) {
+        let Self { tx, rx } = self;
+        (tx, rx)
+    }
+}
+
+impl Sink<Bytes> for TxRxBox {
+    type Error = io::Error;
+
+    fn poll_ready(self: Pin<&mut Self>, cx: &mut Context) -> Poll<io::Result<()>> {
+        self.get_mut().tx.poll_ready_unpin(cx)
+    }
+
+    fn start_send(self: Pin<&mut Self>, item: Bytes) -> io::Result<()> {
+        self.get_mut().tx.start_send_unpin(item)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context) -> Poll<io::Result<()>> {
+        self.get_mut().tx.poll_flush_unpin(cx)
+    }
+
+    fn poll_close(self: Pin<&mut Self>, cx: &mut Context) -> Poll<io::Result<()>> {
+        self.get_mut().tx.poll_close_unpin(cx)
+    }
+}
+
+impl Stream for TxRxBox {
+    type Item = io::Result<Bytes>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
+        self.get_mut().rx.poll_next_unpin(cx)
+    }
+}
+
+pub(crate) type ReadBox = Pin<Box<dyn DynRead>>;
+pub(crate) type WriteBox = Pin<Box<dyn DynWrite>>;
+
+/// A boxed IO stream.
+pub struct IoBox {
+    /// Reader.
+    pub read: ReadBox,
+    /// Writer.
+    pub write: WriteBox,
+}
+
+impl IoBox {
+    /// Creates a new instance.
+    pub fn new(read: impl DynRead, write: impl DynWrite) -> Self {
+        Self { read: Box::pin(read), write: Box::pin(write) }
+    }
+
+    /// Splits this into boxed reader and writer.
+    pub fn into_split(self) -> (ReadBox, WriteBox) {
+        let Self { read, write } = self;
+        (read, write)
+    }
+}
+
+impl AsyncRead for IoBox {
+    fn poll_read(self: Pin<&mut Self>, cx: &mut Context, buf: &mut ReadBuf) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().read).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for IoBox {
+    fn poll_write(self: Pin<&mut Self>, cx: &mut Context, buf: &[u8]) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.get_mut().write).poll_write(cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().write).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().write).poll_shutdown(cx)
+    }
+}

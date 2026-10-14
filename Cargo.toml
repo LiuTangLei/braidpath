@@ -1,0 +1,59 @@
+[workspace]
+members = [
+    "aggligator",
+    "aggligator-fec",
+    "aggligator-monitor",
+    "aggligator-transport-bluer",
+    "aggligator-transport-socks",
+    "aggligator-transport-tcp",
+    "aggligator-transport-usb",
+    "aggligator-transport-websocket",
+    "aggligator-util",
+    "aggligator-wrapper-tls",
+]
+exclude = ["aggligator-transport-websocket-web", "aggligator-transport-webusb"]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.97"
+authors = ["Sebastian Urban <surban@surban.net>"]
+license = "Apache-2.0"
+readme = "README.md"
+homepage = "https://remoc.rs/aggligator/"
+repository = "https://github.com/remoc-rs/aggligator"
+
+[workspace.dependencies]
+async-trait = "0.1"
+atomic_refcell = "0.1.8"
+byteorder = "1.4"
+bytes = "1.11"
+crc-fast = { version = "1", default-features = false, features = ["std"] }
+crossterm = "0.29"
+futures = "0.3"
+getrandom = "0.4"
+js-sys = "0.3.72"
+rand = "0.10"
+serde = "1"
+serde_json = "1"
+test-log = { version = "0.2", default-features = false }
+tokio = "1.45"
+tokio-stream = "0.1"
+tokio-util = "0.7"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false }
+wasm-bindgen = "0.2.95"
+wasm-bindgen-futures = "0.4.45"
+wasm-bindgen-test = "0.3.45"
+web-sys = "0.3.72"
+wokio = { version = "0.1.1" }
+x25519-dalek = "3"
+
+
+# for WASI on the web (wasm32-wasip1-threads target with `js` feature):
+# [patch.crates-io]
+# js-sys = { git = "https://github.com/rust-wasi-web/wasm-bindgen.git" }
+# web-sys = { git = "https://github.com/rust-wasi-web/wasm-bindgen.git" }
+# wasm-bindgen = { git = "https://github.com/rust-wasi-web/wasm-bindgen.git" }
+# wasm-bindgen-futures = { git = "https://github.com/rust-wasi-web/wasm-bindgen.git" }
+# wasm-bindgen-test = { git = "https://github.com/rust-wasi-web/wasm-bindgen.git" }

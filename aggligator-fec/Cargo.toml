@@ -1,0 +1,45 @@
+[package]
+name = "aggligator-fec"
+version = "0.2.0-latency.1"
+description = "Latency-first multi-port TCP relay with persistent warm sessions and redundant multipath delivery"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[features]
+default = []
+runtime = ["dep:tokio", "dep:socket2", "dep:libc", "dep:rand"]
+cli = ["runtime", "dep:clap", "dep:serde_json", "tokio/rt-multi-thread", "tokio/signal"]
+managed = ["cli", "dep:serde", "dep:base64", "dep:ring", "dep:rustls", "dep:tokio-rustls"]
+
+[dependencies]
+reed-solomon-erasure = "6.0"
+serde = { workspace = true, features = ["derive"], optional = true }
+base64 = { version = "0.22", optional = true }
+ring = { version = "0.17", optional = true }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"], optional = true }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"], optional = true }
+clap = { version = "4.5", features = ["derive"], optional = true }
+serde_json = { workspace = true, optional = true }
+tokio = { workspace = true, features = ["net", "sync", "time", "rt", "io-util", "macros"], optional = true }
+rand = { workspace = true, optional = true }
+socket2 = { version = "0.6", features = ["all"], optional = true }
+libc = { version = "0.2", optional = true }
+
+[[bin]]
+name = "agg-fec-tunnel"
+path = "src/bin/agg-fec-tunnel.rs"
+required-features = ["cli"]
+
+[[example]]
+name = "live_lab"
+required-features = ["runtime"]
+
+[dev-dependencies]
+aggligator = { path = "../aggligator" }
+bytes.workspace = true
+futures.workspace = true
+serde_json.workspace = true
+socket2 = { version = "0.6", features = ["all"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "time", "sync", "io-util"] }
