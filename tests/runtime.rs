@@ -148,6 +148,140 @@ fn latest_directions(file: &Path) -> Value {
 fn authenticated_http3_three_paths_and_udp_integrity() {
     three_paths(0);
 }
+
+#[test]
+fn same_entrance_four_connections_have_distinct_sockets_and_preserve_uncoded_integrity() {
+    use std::collections::BTreeSet;
+    let dir = tempfile::tempdir().unwrap();
+    let identity = dir.path().join("identity");
+    assert!(
+        run(&args(&[
+            "init",
+            "--dir",
+            identity.to_str().unwrap(),
+            "--name",
+            "localhost"
+        ]))
+        .status
+        .success()
+    );
+    let cert = identity.join("cert.pem");
+    let key = identity.join("key.pem");
+    let token = identity.join("token");
+    let echo_addr = port();
+    let server_addr = port();
+    let client_addr = port();
+    let stats_file = dir.path().join("client.jsonl");
+    let mut echo = launch(&args(&["echo", "--listen", &echo_addr]), dir.path(), "echo");
+    ready(&mut echo, "test echo ready");
+    let mut server = launch(
+        &args(&[
+            "server",
+            "--listen",
+            &server_addr,
+            "--cert",
+            cert.to_str().unwrap(),
+            "--key",
+            key.to_str().unwrap(),
+            "--token-file",
+            token.to_str().unwrap(),
+            "--target",
+            &echo_addr,
+            "--max-rate-bps",
+            "10000000",
+        ]),
+        dir.path(),
+        "server",
+    );
+    ready(&mut server, "HTTP/3 server ready");
+    let mut client_args = args(&[
+        "client",
+        "--listen",
+        &client_addr,
+        "--server-name",
+        "localhost",
+        "--ca",
+        cert.to_str().unwrap(),
+        "--token-file",
+        token.to_str().unwrap(),
+        "--adaptive",
+        "--fec",
+        "0",
+        "--small-fec-bytes",
+        "0",
+        "--redundancy-percent",
+        "0",
+        "--rate-bps",
+        "10000000",
+        "--group-rate-bps",
+        "0:10000000",
+        "--stats-jsonl",
+        stats_file.to_str().unwrap(),
+        "--stats-interval-ms",
+        "50",
+    ]);
+    for _ in 0..4 {
+        client_args.extend(args(&["--entrance", &server_addr, "--path-group", "0"]));
+    }
+    let mut client = launch(&client_args, dir.path(), "client");
+    let until = Instant::now() + Duration::from_secs(12);
+    loop {
+        let last = fs::read_to_string(&stats_file)
+            .unwrap_or_default()
+            .lines()
+            .rev()
+            .find_map(|line| serde_json::from_str::<Value>(line).ok());
+        if let Some(v) = last
+            && let Some(paths) = v["stats"]["paths"].as_object()
+            && paths.len() == 4
+        {
+            assert!(paths.values().all(|p| p["authenticated"] == true));
+            let ids: BTreeSet<_> = paths
+                .values()
+                .map(|p| p["connection_id"].as_u64().unwrap())
+                .collect();
+            let sockets: BTreeSet<_> = paths
+                .values()
+                .map(|p| p["local_socket"].as_str().unwrap())
+                .collect();
+            assert_eq!(ids.len(), 4);
+            assert_eq!(sockets.len(), 4);
+            assert!(paths.values().all(|p| p["peer_socket"] == server_addr));
+            break;
+        }
+        assert!(client.child.try_wait().unwrap().is_none());
+        assert!(
+            Instant::now() < until,
+            "four distinct connections not ready: {}",
+            fs::read_to_string(&client.log).unwrap()
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+    let result = run(&args(&[
+        "probe",
+        "--target",
+        &client_addr,
+        "--count",
+        "40",
+        "--size",
+        "100",
+        "--pps",
+        "20",
+        "--deadline-ms",
+        "1000",
+    ]));
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let values: Value = serde_json::from_slice(&result.stdout).unwrap();
+    assert_eq!(values["received"], 40);
+    assert_eq!(values["corrupt"], 0);
+    assert_eq!(values["duplicate"], 0);
+    let d = latest_directions(&stats_file);
+    assert_eq!(d["client_to_server"]["symbols"]["repairs_generated"], 0);
+}
 #[test]
 fn authenticated_receiver_feedback_both_directions() {
     three_paths(1);
