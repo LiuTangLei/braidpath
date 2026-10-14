@@ -180,6 +180,19 @@ pub struct Decoder {
 }
 
 impl Decoder {
+    /// Owned decoder/vector capacities. BTree bookkeeping and transient output
+    /// records are separately bounded by the receive window and record limit.
+    pub(crate) fn retained_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + self.data.capacity() * std::mem::size_of::<Option<Vec<u8>>>()
+            + self.data.iter().flatten().map(Vec::capacity).sum::<usize>()
+            + self
+                .repair
+                .iter()
+                .chain(self.repair_q.iter())
+                .map(|(_, v)| v.capacity())
+                .sum::<usize>()
+    }
     pub fn new(block: u64) -> Self {
         Self {
             block,

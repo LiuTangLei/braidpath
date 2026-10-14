@@ -44,11 +44,11 @@ the existing bulk repair budget and the ordinary total/group rate budget.
 They cannot spend the separately reserved small-record allowance. Merely
 generating a symbol or losing an original creates no repair credit.
 
-The original sender age, short queues, record-ID deduplication, receiver-local
-retention, and 256-block receive window remain in force. Retention is not a
-playout delay. The block-count limit can still retire state before the time
-limit at sufficiently high packet rates; this change does not yet implement a
-rate-adaptive block/byte budget. More than two missing source symbols, or
+The original sender age, short queues, record-ID deduplication and receiver-local
+retention remain in force. Fixed reception uses 256 block IDs; adaptive retention
+also uses the bounded [rate-derived block and byte budget](receiver-budgets.md).
+Retention is not a playout delay. Both hard bounds can still retire state before
+the time limit when demand exceeds their capacity. More than two missing source symbols, or
 insufficient independent received equations, remain unrecoverable without later
 original arrival. No reliable-stream or retransmission layer is introduced.
 

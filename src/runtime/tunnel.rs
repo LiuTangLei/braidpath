@@ -197,6 +197,13 @@ struct OutPath {
     epoch: Instant,
     probe_reply: Arc<Mutex<Option<quality::Probe>>>,
 }
+
+fn transport_pressure(empty_space: usize, available: usize, frame_bytes: usize) -> (usize, bool) {
+    (
+        empty_space.saturating_sub(available),
+        available < frame_bytes,
+    )
+}
 type Paths = Arc<Mutex<Vec<OutPath>>>;
 
 fn trace_path(scope: &Scope, stage: trace::Stage, path: trace::PathKey) {
@@ -1461,6 +1468,16 @@ async fn sender(
                 let estimate = &snapshot.sender_estimate;
                 let at = quality_time(path);
                 let native_rtt = path.conn.rtt();
+                let space = path.conn.datagram_send_buffer_space();
+                let frame_bytes = wire::MAX_WIRE
+                    + if policy.receiver_feedback {
+                        quality::HEADER
+                    } else {
+                        0
+                    }
+                    + wire::http_datagram_overhead(path.stream).expect("admitted stream");
+                let (send_queue_bytes, transport_blocked) =
+                    transport_pressure(path.empty_datagram_space, space, frame_bytes);
                 let observation = adaptive::Observation {
                     now_us,
                     generation: snapshot.generation,
@@ -1493,10 +1510,9 @@ async fn sender(
                     probe_sample_id: snapshot.replies_received,
                     probe_age_us: snapshot.probe_updated_us.map(|t| at.saturating_sub(t)),
                     transit_excess_ms: estimate.delay_variation_ms,
-                    send_queue_bytes: 1200usize
-                        .saturating_sub(path.conn.datagram_send_buffer_space()),
+                    send_queue_bytes,
                     offered_backlog: !queue.is_empty(),
-                    transport_blocked: path.conn.datagram_send_buffer_space() < wire::MAX_WIRE,
+                    transport_blocked,
                 };
                 let probe_snapshot = path
                     .capacity_probe

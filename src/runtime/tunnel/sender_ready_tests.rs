@@ -1,4 +1,13 @@
 use super::*;
+#[test]
+fn adaptive_pressure_uses_actual_configured_buffer_and_full_framed_size() {
+    assert_eq!(transport_pressure(9568, 4000, 1057), (5568, false));
+    assert_eq!(transport_pressure(9568, 1030, 1057), (8538, true));
+    assert_eq!(transport_pressure(1168, 1168, 1057), (0, false));
+    assert_eq!(transport_pressure(9568, 9568, 1057), (0, false));
+    assert_eq!(transport_pressure(9568, 1057, 1057), (8511, false));
+    assert_eq!(transport_pressure(9568, 9999, 1057), (0, false));
+}
 use std::{
     collections::BTreeSet,
     sync::atomic::AtomicUsize,

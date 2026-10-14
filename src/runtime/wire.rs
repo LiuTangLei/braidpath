@@ -183,6 +183,10 @@ pub struct Receiver {
     repair_wait: Duration,
     dual_repairs: bool,
     retention: Option<super::fec_retention::Controller>,
+    budget: Option<super::receiver_budget::Controller>,
+    block_floor: u64,
+    retained_bytes: usize,
+    next_expiry: Option<Instant>,
     highest_block: u64,
     delivered: BTreeSet<u64>,
     highest_message: u64,
@@ -210,6 +214,10 @@ impl Receiver {
             repair_wait,
             dual_repairs: false,
             retention: None,
+            budget: None,
+            block_floor: 0,
+            retained_bytes: 0,
+            next_expiry: None,
             highest_block: 0,
             delivered: BTreeSet::new(),
             highest_message: 0,
@@ -229,6 +237,7 @@ impl Receiver {
         if adaptive {
             Self {
                 retention: Some(super::fec_retention::Controller::default()),
+                budget: Some(super::receiver_budget::Controller::default()),
                 ..Self::default()
             }
         } else {
@@ -243,25 +252,25 @@ impl Receiver {
     }
 
     pub fn retention_snapshot(&self) -> Option<super::fec_retention::Snapshot> {
-        self.retention
-            .as_ref()
-            .map(|r| r.snapshot(self.blocks.values().filter(|s| s.is_some()).count()))
+        self.retention.as_ref().map(|r| {
+            let mut snapshot = r.snapshot(self.blocks.values().filter(|s| s.is_some()).count());
+            snapshot.receive_budget = self.budget.as_ref().map(|b| b.snapshot());
+            snapshot
+        })
     }
 
     /// Wake only adaptive receivers with live state. Retirement also happens on
     /// every arrival, so a delayed timer cannot make an expired repair eligible.
     pub fn next_retention_deadline(&self) -> Option<Instant> {
-        let retention = self.retention.as_ref()?;
-        self.blocks
-            .iter()
-            .filter_map(|(block, slot)| {
-                slot.as_ref()
-                    .and_then(|(_, first)| first.checked_add(retention.hold(*block)))
-            })
-            .min()
+        self.retention.as_ref()?;
+        self.next_expiry
     }
 
     fn expire_blocks(&mut self, now: Instant) {
+        if self.next_expiry.is_none_or(|at| now < at) {
+            return;
+        }
+        self.next_expiry = None;
         for (block, slot) in &mut self.blocks {
             let hold = self
                 .retention
@@ -271,11 +280,23 @@ impl Receiver {
                 .as_ref()
                 .is_some_and(|(_, first)| now.saturating_duration_since(*first) >= hold)
             {
+                self.retained_bytes -= slot
+                    .as_ref()
+                    .expect("live expiring decoder")
+                    .0
+                    .retained_bytes();
                 *slot = None;
                 if let Some(r) = &mut self.retention {
                     r.retired(*block, true);
                 }
+            } else if let Some((_, first)) = slot
+                && let Some(at) = first.checked_add(hold)
+            {
+                self.next_expiry = Some(self.next_expiry.map_or(at, |old| old.min(at)));
             }
+        }
+        if let Some(b) = &mut self.budget {
+            b.account(self.retained_bytes, 0);
         }
     }
 
@@ -289,6 +310,11 @@ impl Receiver {
         if let Some(r) = &mut self.retention {
             self.blocks.clear();
             r.clear();
+            self.retained_bytes = 0;
+            self.next_expiry = None;
+            if let Some(b) = &mut self.budget {
+                b.account(0, 0);
+            }
         }
     }
 
@@ -326,9 +352,30 @@ impl Receiver {
         if let Some(s) = decoded {
             let repair = matches!(s, Shard::Repair { .. } | Shard::RepairQ { .. });
             let block = s.block();
+            let window = if let (Some(b), Some(r)) = (&mut self.budget, &self.retention) {
+                if block > self.highest_block || self.blocks.is_empty() {
+                    b.observe(block, now, r.maximum_live_hold())
+                } else {
+                    b.current_blocks()
+                }
+            } else {
+                BLOCK_WINDOW
+            };
             self.highest_block = self.highest_block.max(block);
-            let floor = self.highest_block.saturating_sub(BLOCK_WINDOW - 1);
-            self.blocks.retain(|k, _| *k >= floor);
+            self.block_floor = self
+                .block_floor
+                .max(self.highest_block.saturating_sub(window - 1));
+            let floor = self.block_floor;
+            while self
+                .blocks
+                .first_key_value()
+                .is_some_and(|(id, _)| *id < floor)
+            {
+                let (_, slot) = self.blocks.pop_first().expect("known first block");
+                if let Some((decoder, _)) = slot {
+                    self.retained_bytes -= decoder.retained_bytes();
+                }
+            }
             if let Some(r) = &mut self.retention {
                 r.retain_floor(floor);
             }
@@ -346,12 +393,21 @@ impl Receiver {
                 if let Some(r) = &mut self.retention {
                     r.register(block, now);
                 }
+                let retained_bytes = &mut self.retained_bytes;
                 let slot = self.blocks.entry(block).or_insert_with(|| {
-                    (!self.repair_wait.is_zero()).then(|| (Decoder::new(block), now))
+                    (!self.repair_wait.is_zero()).then(|| {
+                        let decoder = Decoder::new(block);
+                        *retained_bytes += decoder.retained_bytes();
+                        (decoder, now)
+                    })
                 });
                 if let Some((decoder, _)) = slot {
                     let duplicate_repair = repair && decoder.is_duplicate(&s);
-                    match decoder.receive(s) {
+                    let before = decoder.retained_bytes();
+                    let received = decoder.receive(s);
+                    let after = decoder.retained_bytes();
+                    self.retained_bytes = self.retained_bytes - before + after;
+                    match received {
                         Ok(v) => {
                             // The independently validated original above is the
                             // sole original candidate, including decoder repeats.
@@ -369,6 +425,7 @@ impl Receiver {
                                     }
                                 }
                                 Err(error) => {
+                                    self.retained_bytes -= after;
                                     *slot = None;
                                     if let Some(r) = &mut self.retention {
                                         r.retired(block, false);
@@ -378,6 +435,7 @@ impl Receiver {
                             }
                         }
                         Err(error) => {
+                            self.retained_bytes -= after;
                             *slot = None;
                             if let Some(r) = &mut self.retention {
                                 r.retired(block, false);
@@ -391,7 +449,34 @@ impl Receiver {
                 if let Some(r) = &mut self.retention {
                     r.observe(block, token, count, now);
                 }
+                if let Some((_, first)) = slot {
+                    let hold = self
+                        .retention
+                        .as_ref()
+                        .map_or(self.repair_wait, |r| r.hold(block));
+                    if let Some(at) = first.checked_add(hold) {
+                        self.next_expiry = Some(self.next_expiry.map_or(at, |old| old.min(at)));
+                    }
+                }
             }
+        }
+        if let Some(budget) = &mut self.budget {
+            let mut evicted = 0;
+            if self.retained_bytes > super::receiver_budget::MAX_BYTES {
+                for (block, slot) in &mut self.blocks {
+                    if self.retained_bytes <= super::receiver_budget::MAX_BYTES {
+                        break;
+                    }
+                    if let Some((decoder, _)) = slot.take() {
+                        self.retained_bytes -= decoder.retained_bytes();
+                        evicted += 1;
+                        if let Some(r) = &mut self.retention {
+                            r.retired(*block, false);
+                        }
+                    }
+                }
+            }
+            budget.account(self.retained_bytes, evicted);
         }
         let mut out = Vec::new();
         for (record, repaired) in deliveries {
@@ -421,6 +506,151 @@ impl Receiver {
 mod tests {
     use super::*;
     use crate::fec::Encoder;
+
+    #[test]
+    fn adaptive_block_budget_preserves_a_useful_late_repair_under_high_packet_rate() {
+        let at = Instant::now();
+        let mut encoder = Encoder::new(2, Duration::from_millis(8)).unwrap();
+        let first = Record {
+            flow: 1,
+            id: 0,
+            payload: vec![0; 1000],
+        };
+        let missing = Record {
+            flow: 1,
+            id: 1,
+            payload: vec![1; 1000],
+        };
+        let data = encoder
+            .push(&first.encode().unwrap(), at)
+            .unwrap()
+            .remove(0);
+        let repair = encoder
+            .push(&missing.encode().unwrap(), at)
+            .unwrap()
+            .remove(1);
+        let mut old = Receiver::with_repair_wait(Duration::from_millis(100));
+        let mut new = Receiver::configured(Duration::from_millis(100), true);
+        for receiver in [&mut old, &mut new] {
+            receiver.receive(&shard(data.clone()), at).unwrap();
+        }
+        for block in 1..=600 {
+            let r = Record {
+                flow: 1,
+                id: block + 1,
+                payload: vec![block as u8; 1000],
+            };
+            let packet = shard(Shard::Data {
+                block,
+                index: 0,
+                payload: r.encode().unwrap(),
+            });
+            let now = at + Duration::from_micros(block * 100);
+            old.receive(&packet, now).unwrap();
+            new.receive(&packet, now).unwrap();
+        }
+        assert!(
+            old.receive(&shard(repair.clone()), at + Duration::from_millis(90))
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            new.receive(&shard(repair), at + Duration::from_millis(90))
+                .unwrap(),
+            vec![missing]
+        );
+        let s = new.retention_snapshot().unwrap();
+        assert_eq!(s.window_evicted_live_blocks, 0);
+        assert!(s.receive_budget.as_ref().unwrap().current_blocks > 256);
+        assert!(new.retained_bytes <= super::super::receiver_budget::MAX_BYTES);
+    }
+
+    #[test]
+    fn widening_never_revives_a_block_already_retired_by_the_id_floor() {
+        let at = Instant::now();
+        let mut receiver = Receiver::configured(Duration::from_millis(100), true);
+        let packet = |block, id| {
+            shard(Shard::Data {
+                block,
+                index: 0,
+                payload: Record {
+                    flow: 1,
+                    id,
+                    payload: vec![4; 1000],
+                }
+                .encode()
+                .unwrap(),
+            })
+        };
+        receiver.receive(&packet(0, 0), at).unwrap();
+        receiver.receive(&packet(1000, 1000), at).unwrap();
+        let old_floor = receiver.block_floor;
+        assert!(old_floor > 0);
+        receiver
+            .receive(&packet(1064, 1064), at + Duration::from_millis(6))
+            .unwrap();
+        assert!(receiver.budget.as_ref().unwrap().current_blocks() > 256);
+        assert!(receiver.block_floor >= old_floor);
+        receiver
+            .receive(&packet(0, 0), at + Duration::from_millis(7))
+            .unwrap();
+        assert!(!receiver.blocks.contains_key(&0));
+    }
+
+    #[test]
+    fn decoder_byte_limit_and_timer_expiry_keep_dynamic_state_bounded() {
+        let at = Instant::now();
+        let mut receiver = Receiver::configured(Duration::from_millis(100), true);
+        for block in 0..400 {
+            for index in 0..32u8 {
+                let r = Record {
+                    flow: 1,
+                    id: block * 32 + u64::from(index),
+                    payload: vec![index; 1000],
+                };
+                receiver
+                    .receive(
+                        &shard(Shard::Data {
+                            block,
+                            index,
+                            payload: r.encode().unwrap(),
+                        }),
+                        at + Duration::from_micros(block * 100),
+                    )
+                    .unwrap();
+                assert!(receiver.retained_bytes <= super::super::receiver_budget::MAX_BYTES);
+            }
+        }
+        let expected: usize = receiver
+            .blocks
+            .values()
+            .flatten()
+            .map(|(d, _)| d.retained_bytes())
+            .sum();
+        assert_eq!(receiver.retained_bytes, expected);
+        assert!(
+            receiver
+                .retention_snapshot()
+                .unwrap()
+                .receive_budget
+                .unwrap()
+                .byte_evicted_blocks
+                > 0
+        );
+        receiver.expire_adaptive(at + Duration::from_millis(400));
+        assert_eq!(receiver.retained_bytes, 0);
+        assert_eq!(receiver.next_retention_deadline(), None);
+        receiver.close_retention();
+        assert_eq!(
+            receiver
+                .retention_snapshot()
+                .unwrap()
+                .receive_budget
+                .unwrap()
+                .retained_decoder_bytes,
+            0
+        );
+    }
 
     #[test]
     fn observed_receive_distinguishes_repair_first_from_later_duplicate_original() {

@@ -17,6 +17,8 @@ const DECAY_BLOCKS: u64 = 32;
 
 #[derive(Clone, Default, Debug, Serialize)]
 pub struct Snapshot {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub receive_budget: Option<super::receiver_budget::Snapshot>,
     pub enabled: bool,
     pub current_ms: u64,
     pub minimum_ms: u64,
@@ -100,15 +102,26 @@ impl Controller {
 
     pub fn retain_floor(&mut self, floor: u64) {
         let mut live_evicted = 0;
-        self.blocks.retain(|id, timing| {
-            if *id < floor {
-                live_evicted += u64::from(!timing.retired);
-                false
-            } else {
-                true
-            }
-        });
+        while self
+            .blocks
+            .first_key_value()
+            .is_some_and(|(id, _)| *id < floor)
+        {
+            let (_, timing) = self.blocks.pop_first().expect("known first block");
+            live_evicted += u64::from(!timing.retired);
+        }
         self.state.window_evicted_live_blocks += live_evicted;
+    }
+
+    pub fn maximum_live_hold(&self) -> Duration {
+        // A new shorter target must not shorten an existing block's promise.
+        self.blocks
+            .values()
+            .filter(|t| !t.retired)
+            .map(|t| t.hold)
+            .max()
+            .unwrap_or(Duration::from_millis(self.state.current_ms))
+            .max(Duration::from_millis(self.state.current_ms))
     }
 
     pub fn hold(&self, block: u64) -> Duration {

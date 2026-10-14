@@ -6,6 +6,7 @@ pub mod fec_retention;
 pub mod outbound;
 pub mod probe;
 pub mod quality;
+pub mod receiver_budget;
 pub mod relay;
 pub mod scheduler;
 mod shutdown;
