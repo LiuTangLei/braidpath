@@ -10,6 +10,7 @@ jobs:
       - run: python3 -m unittest bench.test_run bench.test_readiness bench.test_trace_replay
   rust:
     strategy:
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}

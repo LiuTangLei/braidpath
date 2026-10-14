@@ -9,6 +9,54 @@ use std::{
     time::{Duration, Instant},
 };
 const BIN: &str = env!("CARGO_BIN_EXE_braidpath");
+// Negotiation/integrity fixture: retain 2000 pps, but provision the encoded cost.
+const DUAL_FEC_TEST_RATE_BPS: u64 = 20_000_000;
+
+#[test]
+fn dual_fec_fixture_budget_covers_its_unchanged_source_and_encoded_frames() {
+    use braidpath::{
+        fec::DualEncoder,
+        runtime::{
+            quality,
+            wire::{self, Record},
+        },
+    };
+    let created = Instant::now();
+    let mut encoder = DualEncoder::new(16, Duration::from_millis(25)).unwrap();
+    let mut symbols = Vec::new();
+    for id in 0..200 {
+        let record = Record {
+            flow: 1,
+            id,
+            payload: vec![7; 700],
+        };
+        symbols.extend(
+            encoder
+                .push(
+                    &record.encode().unwrap(),
+                    created + Duration::from_micros(id * 500),
+                )
+                .unwrap(),
+        );
+    }
+    symbols.extend(encoder.flush());
+    let quality = quality::State::new(1);
+    let cost: usize = symbols
+        .into_iter()
+        .map(|shard| {
+            // Largest stream mapping in the actual three-path fixture is two bytes.
+            wire::http_datagram(0, &quality.wrap(&wire::shard(shard), 0))
+                .unwrap()
+                .len()
+                + 80
+        })
+        .sum();
+    let supplied_bytes = DUAL_FEC_TEST_RATE_BPS / 8 / 10; // 200 records at 2000 pps, 100 ms.
+    assert!(
+        cost as u64 <= supplied_bytes,
+        "integrity fixture overloads its own sender budget: {cost} bytes demand, {supplied_bytes} supplied; source/count/codec are unchanged"
+    );
+}
 struct Process {
     child: Child,
     log: PathBuf,
@@ -85,6 +133,16 @@ fn port() -> String {
 }
 fn args(v: &[&str]) -> Vec<String> {
     v.iter().map(|s| s.to_string()).collect()
+}
+
+fn latest_directions(file: &Path) -> Value {
+    fs::read_to_string(file)
+        .unwrap_or_default()
+        .lines()
+        .rev()
+        .find_map(|line| serde_json::from_str::<Value>(line).ok())
+        .map(|snapshot| snapshot["stats"]["directions"].clone())
+        .unwrap_or(Value::Null)
 }
 #[test]
 fn authenticated_http3_three_paths_and_udp_integrity() {
@@ -164,6 +222,8 @@ fn three_paths(mode: u8) {
                 .unwrap()
                 .to_owned()
         }))
+        .chain((mode == 6).then(|| "--max-rate-bps".to_owned()))
+        .chain((mode == 6).then(|| DUAL_FEC_TEST_RATE_BPS.to_string()))
         .collect::<Vec<_>>(),
         dir.path(),
         "server",
@@ -303,6 +363,7 @@ fn three_paths(mode: u8) {
             "--packet-trace",
             dir.path().join("client-trace.jsonl").to_str().unwrap(),
         ]));
+        client_args.extend(["--rate-bps".into(), DUAL_FEC_TEST_RATE_BPS.to_string()]);
         let index = client_args
             .iter()
             .position(|a| a == "--redundancy-percent")
@@ -341,7 +402,9 @@ fn three_paths(mode: u8) {
     assert_eq!(stats["duplicate"], 0);
     assert!(
         stats["received"].as_u64().unwrap() > if mode == 3 { 900 } else { 150 },
-        "{stats}"
+        "{stats}\nclient counters:{}\nserver counters:{}",
+        latest_directions(&client_stats),
+        latest_directions(&server_stats),
     );
     if feedback && mode != 3 {
         let until = Instant::now() + Duration::from_secs(4);

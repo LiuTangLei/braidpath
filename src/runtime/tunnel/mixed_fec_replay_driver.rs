@@ -62,7 +62,7 @@ fn payload(input: &InputRecord, run_hex: &str) -> Vec<u8> {
     let mut value = Vec::with_capacity(input.size);
     value.extend_from_slice(b"BPP2");
     value.extend_from_slice(&[kind, 0, 0, 0]);
-    for pair in run_hex.as_bytes().chunks_exact(2) {
+    for pair in run_hex.as_bytes().as_chunks::<2>().0 {
         value.push(u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap());
     }
     value.extend_from_slice(&u32::try_from(input.id).unwrap().to_be_bytes());

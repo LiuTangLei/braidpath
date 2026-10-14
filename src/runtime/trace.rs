@@ -561,15 +561,21 @@ impl Trace {
         let Some(inner) = &self.0 else {
             return EmitResult::Disabled;
         };
-        if inner
-            .gate
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |state| {
-                (state & CLOSED_BIT == 0).then_some(state + 1)
-            })
-            .is_err()
-        {
-            inner.counters.after_close.fetch_add(1, Ordering::Relaxed);
-            return EmitResult::Closed;
+        let mut state = inner.gate.load(Ordering::Acquire);
+        loop {
+            if state & CLOSED_BIT != 0 {
+                inner.counters.after_close.fetch_add(1, Ordering::Relaxed);
+                return EmitResult::Closed;
+            }
+            match inner.gate.compare_exchange_weak(
+                state,
+                state + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(current) => state = current,
+            }
         }
         let _active = ActiveEmitter(inner);
         let previous = inner.counters.attempted.fetch_add(1, Ordering::Relaxed);
