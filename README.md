@@ -117,17 +117,13 @@ must be acknowledged by both endpoints. This does not establish a performance,
 absolute one-way deadline or black-hole detection guarantee.
 
 Explicit `--mixed-fec --fec 4 --redundancy-percent 30 --small-fec-bytes 128`
-retains immediate single-record small-repair generation and encodes larger records in an
+retains immediate single-record small repairs and encodes larger records in an
 independent ordinary FEC block. Both peers must acknowledge mixed mode. Small
 repairs receive one bounded authorization per actually admitted small original;
 only admitted large-original bytes earn the configured ordinary repair credit.
 The percentage therefore limits large-record repair, not combined redundancy.
 Short blocks still cost a full repair and may be skipped for lack of credit.
 Both classes retain the same aggregate/group pacing and ingress deadlines.
-When combined with `--adaptive`, the original is not delayed, but its one small
-copy enters Quinn no earlier than 2 ms after the original's actual API admission.
-The copy keeps the same ingress deadline and budget; this is an admission-time
-separation, not a guarantee of physical packet spacing or independent loss.
 See [policy details](docs/runtime.md#mixed-small-and-large-record-protection).
 
 Opt-in [packet evidence](docs/statistics.md#bounded-packet-evidence) links real
