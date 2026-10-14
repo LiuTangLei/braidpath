@@ -2,16 +2,8 @@
 members = [
     "aggligator",
     "aggligator-fec",
-    "aggligator-monitor",
-    "aggligator-transport-bluer",
-    "aggligator-transport-socks",
-    "aggligator-transport-tcp",
-    "aggligator-transport-usb",
-    "aggligator-transport-websocket",
-    "aggligator-util",
-    "aggligator-wrapper-tls",
 ]
-exclude = ["aggligator-transport-websocket-web", "aggligator-transport-webusb"]
+default-members = ["aggligator-fec"]
 resolver = "2"
 
 [workspace.package]
