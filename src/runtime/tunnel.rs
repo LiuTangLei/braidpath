@@ -482,7 +482,6 @@ struct BlockSend {
     paths: u8,
     small_repair_limit: usize,
     small_repair_reserved: usize,
-    small_original_admitted: Option<Instant>,
 }
 
 #[cfg(test)]
@@ -557,7 +556,6 @@ fn enqueue_coded_symbol(
                 paths: 0,
                 small_repair_limit: 0,
                 small_repair_reserved: 0,
-                small_original_admitted: None,
             })
             .created
             .min(created)
@@ -1176,20 +1174,6 @@ impl SendAccounting<'_> {
             self.metrics,
         );
         if repair {
-            if self.policy.adaptive
-                && self.policy.mixed_fec
-                && sent.small
-                && let Some(original_at) = sent
-                    .block
-                    .and_then(|b| self.blocks.get(&b))
-                    .and_then(|b| b.small_original_admitted)
-            {
-                self.metrics.update(|d| {
-                    d.symbols
-                        .mixed_small_copy_admission_gap
-                        .add(at.saturating_duration_since(original_at))
-                });
-            }
             self.metrics.path(path.id, |p| {
                 p.quinn_admitted_repairs += 1;
                 if small_delivery::applies(self.policy, front) {
@@ -1220,9 +1204,6 @@ impl SendAccounting<'_> {
                 && let Some(meta) = self.blocks.get_mut(&block)
             {
                 meta.paths |= 1 << path.id;
-                if small_delivery::applies(self.policy, &sent) {
-                    meta.small_original_admitted.get_or_insert(at);
-                }
             }
         }
         *self.cursor = next_cursor;
@@ -2035,25 +2016,8 @@ async fn sender(
                 if path.conn.close_reason().is_some() {
                     continue;
                 }
-                if is_small && repair {
-                    if !small_delivery::copy_ready(path, used) {
-                        continue;
-                    }
-                    if policy.adaptive
-                        && policy.mixed_fec
-                        && !small_delivery::copy_due(
-                            front
-                                .block
-                                .and_then(|b| blocks.get(&b))
-                                .and_then(|b| b.small_original_admitted),
-                            now,
-                        )
-                    {
-                        // Remain an admitted-credit repair, not a budget skip.
-                        // The existing mixed-lane stalled handling keeps it
-                        // queued until the normal timer or another actor event.
-                        continue;
-                    }
+                if is_small && repair && !small_delivery::copy_ready(path, used) {
+                    continue;
                 }
                 let Ok(mapping_bytes) = wire::http_datagram_overhead(path.stream) else {
                     continue;

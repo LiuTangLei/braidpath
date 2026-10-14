@@ -141,8 +141,6 @@ pub struct Symbols {
     pub mixed_bulk_original_admitted_bytes: u64,
     pub mixed_bulk_repair_admitted_bytes: u64,
     pub mixed_small_repairs_quinn_admitted: u64,
-    /// Actual original-to-copy API admission gap for adaptive mixed small records.
-    pub mixed_small_copy_admission_gap: Wait,
     pub mixed_bulk_repairs_quinn_admitted: u64,
     /// Large-record repairs omitted for lack of their own admission-earned credit.
     pub mixed_bulk_repairs_budget_skipped: u64,
