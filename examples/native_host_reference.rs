@@ -47,26 +47,9 @@ enum Frame {
     Thin,
     Matched,
 }
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
-enum AckProfile {
-    #[default]
-    Unchanged,
-    EveryEight,
-}
-fn reference_transport(ack: AckProfile) -> quinn::TransportConfig {
-    let mut policy = transport::config(transport::Congestion::Bbr);
-    policy.datagram_send_buffer_size(9600);
-    if ack == AckProfile::EveryEight {
-        let mut frequency = quinn::AckFrequencyConfig::default();
-        // A threshold of seven means ACK by the eighth ack-eliciting packet.
-        // Keep finite delay and prompt reordering feedback; never disable ACKs.
-        frequency.ack_eliciting_threshold(7u32.into());
-        frequency.max_ack_delay(Some(Duration::from_millis(10)));
-        frequency.reordering_threshold(2u32.into());
-        policy.ack_frequency_config(Some(frequency));
-    }
-    policy
-}
+#[path = "support/ack_policy.rs"]
+mod ack_policy;
+use ack_policy::{AckProfile, reference_transport};
 impl Frame {
     fn header(self) -> usize {
         match self {
@@ -609,7 +592,11 @@ mod tests {
     }
     #[tokio::test]
     async fn bounded_ack_request_is_negotiated_without_changing_default() {
-        for profile in [AckProfile::Unchanged, AckProfile::EveryEight] {
+        for profile in [
+            AckProfile::Unchanged,
+            AckProfile::EveryTwo,
+            AckProfile::EveryEight,
+        ] {
             let (_temp, _server, _client, outgoing, incoming) = native_pair(profile).await;
             let token = "a".repeat(64);
             let (a, b) = timeout(Duration::from_secs(2), async {
@@ -632,7 +619,7 @@ mod tests {
                     .unwrap();
                 assert_eq!(decode(Frame::Matched, value).unwrap().1, id);
             }
-            if profile == AckProfile::EveryEight {
+            if profile != AckProfile::Unchanged {
                 timeout(Duration::from_secs(2), async {
                     while outgoing.stats().frame_rx.ack_frequency == 0
                         || incoming.stats().frame_rx.ack_frequency == 0

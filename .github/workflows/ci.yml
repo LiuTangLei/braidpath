@@ -7,7 +7,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: python3 -m unittest bench.test_run bench.test_readiness bench.test_trace_replay bench.test_delivery_frontier bench.test_frontier_response bench.test_relative_gain bench.test_topology_plan bench.test_topology_results bench.test_warmup_profile bench.test_host_reference bench.test_request_path_audit
+      - run: python3 -m unittest bench.test_run bench.test_readiness bench.test_trace_replay bench.test_delivery_frontier bench.test_frontier_response bench.test_relative_gain bench.test_topology_plan bench.test_topology_results bench.test_warmup_profile bench.test_host_reference bench.test_request_path_audit bench.test_directional_ack_study
   rust:
     strategy:
       fail-fast: false

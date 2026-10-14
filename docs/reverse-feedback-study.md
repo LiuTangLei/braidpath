@@ -42,8 +42,8 @@ project's bottleneck or promise their reported gains here.
 
 ## Implemented laboratory surface
 
-The loopback-only `native_host_reference` example now has `--ack-profile
-unchanged|every-eight`. The default leaves the existing configuration intact.
+The loopback-only `native_host_reference` example has `--ack-profile
+unchanged|every-two|every-eight`. The default leaves the existing configuration intact.
 The experimental profile asks the peer to ACK by eight ack-eliciting packets,
 requests a maximum ACK delay of 10 ms, and retains a nonzero reordering trigger
 of two. These are requested settings, subject to peer negotiation/clamping; they
@@ -62,6 +62,13 @@ explicit ACK-every-two control with the **same** delay/reordering settings, so
 changes from extension negotiation or reordering handling are not mistaken for
 a frequency effect. Start with only the downstream sender requesting changes
 at its peer; a symmetric request is a separate treatment.
+
+The [directional ACK laboratory](directional-ack-lab.md) now implements that
+frequency-only comparison with real local QUIC sockets. Its two explicit profiles
+share the same delay/reordering parameters and only the downstream sender requests
+a change. It uses a native in-process source, rather than the earlier Python UDP
+adapter, and a bounded user-space loopback resource model. It is not a workaround
+for a denied remote action and does not access Linux servers or production links.
 
 The pinned Quinn documentation says its implementation follows the fourth
 ACK-Frequency draft. This is not a claim of compatibility with the much newer
