@@ -132,6 +132,17 @@ earn `redundancy-percent` credit, and larger repairs debit it only when Quinn
 accepts them. Small traffic cannot subsidize large repair. A bulk repair waiting
 for insufficient credit cannot hold an eligible small repair behind it.
 
+With adaptive mixed mode, small-copy admission additionally waits until at least
+2 ms after its original actually entered Quinn. The encoder still produces both
+symbols immediately; only the existing copy's admission is deferred. The mixed
+lane keeps its original-earned authorization while waiting, rather than counting
+that wait as insufficient credit. Actual ingress expiry still drops it: the gap
+does not reset or extend the record deadline. Ordinary and small-only profiles
+are unchanged. This adds no redundancy, retry or congestion-control exception.
+`symbols.mixed_small_copy_admission_gap` reports actual API-admission intervals,
+not network timestamps. Driver scheduling and shared bottlenecks can still make
+physical losses correlated even with different admission times and paths.
+
 The configured percentage applies to ordinary large-record repair, not total
 redundancy. Each protected small record can add roughly one copy. Even a full
 k=4 block has framing differences, and a one- or two-record short block still

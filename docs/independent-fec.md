@@ -15,7 +15,9 @@ must agree on `braidpath-fec-repairs: 2`; a missing, unknown, duplicate or misma
 response does not silently downgrade. The absent header means the legacy
 single-repair format. The new flag defaults to `1`, and `2` requires explicit
 mixed FEC with a bulk block size of at least two. Small records retain their
-existing immediate original-plus-one-repair path, not two repair copies.
+existing immediate original-plus-one-repair encoding, not two repair copies.
+In adaptive mixed mode, that one small copy is admitted to Quinn at least 2 ms
+after its original's actual admission, without extending the ingress deadline.
 
 ## Coding and delivery
 
