@@ -38,6 +38,7 @@ const SESSION_PATH: &str = "/session";
 mod coding;
 #[cfg(test)]
 mod dual_tests;
+mod ingress;
 mod local_delivery;
 #[cfg(test)]
 mod mixed_fec_tests;
@@ -2264,6 +2265,7 @@ fn enqueue_record(
     record: Record,
     created: Instant,
     scope: &Scope,
+    small_threshold: usize,
 ) -> bool {
     let mut assigned_event = None;
     scope.trace_with(|context, capture| {
@@ -2277,7 +2279,13 @@ fn enqueue_record(
         assigned_event = Some(event);
         event
     });
-    let result = tx.try_send(QueuedRecord { record, created });
+    let payload_bytes = record.payload.len();
+    let result = ingress::try_send(
+        tx,
+        QueuedRecord { record, created },
+        payload_bytes,
+        small_threshold,
+    );
     if let Some(mut event) = assigned_event {
         event.stage = if result.is_ok() {
             trace::Stage::IngressQueued
@@ -2525,7 +2533,7 @@ async fn session_loop(
                             let bind=if target.is_ipv4(){"0.0.0.0:0"}else{"[::]:0"};
                             let Ok(socket)=UdpSocket::bind(bind).await else{dropped+=delivery.socket_error(pid,&r);continue};
                             if socket.connect(target).await.is_err(){dropped+=delivery.socket_error(pid,&r);continue}
-                            let socket=Arc::new(socket); let weak=Arc::downgrade(&socket); let events=session.events.clone(); let flow=r.flow; let mut quit=session.stop.subscribe(); let ingress_drops=session.ingress_drops.clone();let returning=session.returning.clone();
+                            let socket=Arc::new(socket); let weak=Arc::downgrade(&socket); let events=session.events.clone(); let flow=r.flow; let mut quit=session.stop.subscribe(); let ingress_drops=session.ingress_drops.clone();let returning=session.returning.clone();let small_threshold=ingress::small_threshold(&session.policy);
                             tasks.spawn(async move {
                                 let mut b=vec![0;65536];
                                 loop {
@@ -2538,7 +2546,7 @@ async fn session_loop(
                                                 trace_payload(&returning,trace::Stage::RecordIngress,&b[..n],None);
                                                 if n>MAX_PAYLOAD{trace_payload(&returning,trace::Stage::RecordDropped,&b[..n],Some(trace::Reason::Oversize));returning.update(|d|d.records.application_oversize_dropped+=1);continue;}
                                                 let now=Instant::now();
-                                                if let Err(error)=events.try_send(Event::Reply(flow,b[..n].to_vec(),now)){trace_payload(&returning,trace::Stage::RecordDropped,&b[..n],Some(queue_trace_reason(QueueLayer::Ingress,&error)));ingress_drops.fetch_add(1,Ordering::Relaxed);queue_error(&returning,QueueLayer::Ingress,&error,None);}else{trace_payload(&returning,trace::Stage::IngressQueued,&b[..n],None);returning.update(|d|d.records.ingress_queue_enqueued+=1);}
+                                                if let Err(error)=ingress::try_send(&events,Event::Reply(flow,b[..n].to_vec(),now),n,small_threshold){trace_payload(&returning,trace::Stage::RecordDropped,&b[..n],Some(queue_trace_reason(QueueLayer::Ingress,&error)));ingress_drops.fetch_add(1,Ordering::Relaxed);queue_error(&returning,QueueLayer::Ingress,&error,None);}else{trace_payload(&returning,trace::Stage::IngressQueued,&b[..n],None);returning.update(|d|d.records.ingress_queue_enqueued+=1);}
                                             },
                                             Ok(Err(_))=>break,
                                             _=>{}
@@ -2557,7 +2565,7 @@ async fn session_loop(
                 Some(Event::Reply(flow,payload,created))=>{
                     let Some((_,last))=flows.get_mut(&flow) else{trace_payload(&session.returning,trace::Stage::RecordDropped,&payload,Some(trace::Reason::FlowUnavailable));session.returning.update(|d|d.records.application_unavailable_dropped+=1);continue}; *last=Instant::now();
                     let Some(id)=next_id.checked_add(1) else{break}; next_id=id;
-                    if !enqueue_record(&tx,Record{flow,id,payload},created,&session.returning){dropped+=1;}else{session.returning.update(|d|d.records.sender_queue_enqueued+=1);}
+                    if !enqueue_record(&tx,Record{flow,id,payload},created,&session.returning,ingress::small_threshold(&session.policy)){dropped+=1;}else{session.returning.update(|d|d.records.sender_queue_enqueued+=1);}
                 },
                 None=>break,
             }
@@ -3278,7 +3286,7 @@ async fn client_session(
                 }
                 let (flow,last)=peers.get_mut(&peer).expect("inserted peer");*last=created;
                 next_id=next_id.checked_add(1).context("message id exhausted")?;
-                if !enqueue_record(&tx,Record{flow:*flow,id:next_id,payload:input[..n].to_vec()},created,&forward) {
+                if !enqueue_record(&tx,Record{flow:*flow,id:next_id,payload:input[..n].to_vec()},created,&forward,ingress::small_threshold(&options.policy)) {
                     drops+=1;
                 } else {forward.update(|d|{d.records.ingress_queue_enqueued+=1;d.records.sender_queue_enqueued+=1;});}
             },

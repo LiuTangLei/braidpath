@@ -46,3 +46,26 @@ These changes have deterministic regression coverage for high block rates,
 monotonic retirement, low-rate behavior, memory bounds, idle expiry and framed
 queue pressure. Public-network throughput/latency claims require separately
 recorded comparisons against the exact prior executable.
+
+## Small-record admission under overload
+
+The explicitly enabled adaptive mixed-FEC profile also preserves 16 of each
+existing 256-slot sender-input and server-reply channel for records at or below
+the negotiated `small-fec-bytes` threshold. Bulk admission first reserves a real
+channel permit and checks the remaining allowance, so concurrent producers
+cannot all spend the same last bulk slot. Rejected permits are returned, and
+small records retain the ordinary channel-full and channel-closed behavior.
+
+This changes overload admission, not the total slot count, deadline, pacing,
+FEC repair percentage, congestion control or FIFO order of accepted inputs.
+Bulk admission rejected by this class allowance uses the existing queue-full
+counter for the corresponding layer; that counter is not a statement that all
+physical channel slots were occupied. Other profiles keep their previous full
+channel allowance. The reserve does not guarantee delivery if the small lane
+itself overloads or the network loses its packets.
+
+The purpose is to keep small requests from being discarded before the existing
+per-flow sender scheduler can protect them. Native regression tests include the
+old FIFO failure, unchanged total capacity, permit release, closure, exact size
+boundary and competing bulk producers. Public-network claims still require a
+fresh bounded comparison; these checks do not establish a throughput gain.
