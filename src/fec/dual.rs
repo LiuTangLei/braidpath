@@ -5,20 +5,28 @@
 use super::{Error, MAX_DATA_SHARDS, MAX_PAYLOAD, Shard, symbol, xor_into};
 use std::time::{Duration, Instant};
 
-pub(super) fn mul(mut a: u8, mut b: u8) -> u8 {
-    let mut out = 0;
-    while b != 0 {
-        if b & 1 != 0 {
-            out ^= a;
+// A row stays hot while encoding one source or eliminating one known symbol.
+// Build the same polynomial arithmetic once at compile time, not for every byte.
+const fn multiplication_table() -> [[u8; 256]; 256] {
+    let mut table = [[0; 256]; 256];
+    let mut a = 0;
+    while a < 256 {
+        let mut b = 1;
+        while b < 256 {
+            let half = table[a][b >> 1];
+            let doubled = (half << 1) ^ if half & 0x80 != 0 { 0x1d } else { 0 };
+            table[a][b] = doubled ^ if b & 1 != 0 { a as u8 } else { 0 };
+            b += 1;
         }
-        let high = a & 0x80 != 0;
-        a <<= 1;
-        if high {
-            a ^= 0x1d;
-        }
-        b >>= 1;
+        a += 1;
     }
-    out
+    table
+}
+
+static MULTIPLICATION: [[u8; 256]; 256] = multiplication_table();
+
+pub(super) fn mul(a: u8, b: u8) -> u8 {
+    MULTIPLICATION[usize::from(a)][usize::from(b)]
 }
 
 pub(super) fn inverse(value: u8) -> u8 {
@@ -38,8 +46,9 @@ pub(super) fn inverse(value: u8) -> u8 {
 
 pub(super) fn weighted_xor(target: &mut Vec<u8>, input: &[u8], weight: u8) {
     target.resize(target.len().max(input.len()), 0);
+    let row = &MULTIPLICATION[usize::from(weight)];
     for (out, value) in target.iter_mut().zip(input) {
-        *out ^= mul(*value, weight);
+        *out ^= row[usize::from(*value)];
     }
 }
 
@@ -134,6 +143,48 @@ impl DualEncoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn reference_mul(mut a: u8, mut b: u8) -> u8 {
+        let mut out = 0;
+        while b != 0 {
+            if b & 1 != 0 {
+                out ^= a;
+            }
+            let high = a & 0x80 != 0;
+            a <<= 1;
+            if high {
+                a ^= 0x1d;
+            }
+            b >>= 1;
+        }
+        out
+    }
+
+    #[test]
+    fn lookup_matches_polynomial_for_every_field_pair() {
+        for a in 0..=255 {
+            for b in 0..=255 {
+                assert_eq!(mul(a, b), reference_mul(a, b), "a={a} b={b}");
+            }
+        }
+    }
+
+    #[test]
+    fn weighted_lookup_preserves_padding_and_existing_target_bytes() {
+        let input: Vec<u8> = (0..=255).collect();
+        for weight in 0..=255 {
+            for len in [0, 17, 256, 279] {
+                let mut expected = vec![0x5a; len];
+                expected.resize(len.max(input.len()), 0);
+                for (out, value) in expected.iter_mut().zip(&input) {
+                    *out ^= reference_mul(*value, weight);
+                }
+                let mut actual = vec![0x5a; len];
+                weighted_xor(&mut actual, &input, weight);
+                assert_eq!(actual, expected, "weight={weight} len={len}");
+            }
+        }
+    }
+
     #[test]
     fn every_nonzero_field_element_has_a_valid_inverse() {
         for a in 1..=255 {

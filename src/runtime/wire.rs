@@ -91,7 +91,7 @@ fn decode(b: &[u8]) -> Result<Option<Shard>> {
     match b[3] {
         0 => {
             ensure!(b[12] < 32, "invalid symbol index");
-            Record::decode(&b[HEADER..])?;
+            Record::decode_identity(&b[HEADER..])?;
             Ok(Some(Shard::Data {
                 block,
                 index: b[12],
