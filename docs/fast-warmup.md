@@ -39,6 +39,15 @@ deadline timing. Echo RTT is recomputed from its own monotonic send/receive pair
 Bulk and echo each have their own registered prefix; their clocks are not claimed
 to be synchronized. Warm readiness is not assumed merely because 3 seconds elapsed.
 
+The follow-up source-clock-only preparation does not require a cross-host SSH
+clock-bracketing probe: no primary metric consumes a cross-host offset. Its local
+timing-scope marker explicitly records that no remote clock bound exists, while
+the same production observer and source-clock validation remain mandatory. If a
+previous preparation fails, it remains failed. Newly registered unfinished cases
+must not replay completed traffic or silently merge different preparations into
+one successful historical campaign. Comparisons still require their declared
+window population; single observations are descriptive only.
+
 First judge each topology's warm/cold suffix gain and deadline cost. An acceptable
 candidate must not regress completion or a comparable finite P95; missing tails
 cannot pass. Then report same-study warm multipath versus the preselected warm
@@ -57,6 +66,6 @@ admission/queue evidence, cooldown, state-expiry and rollback validation.
 - BBR working draft (not evidence that the pinned Quinn BBR is BBRv3): model
   learning from delivery and restarting after idle are separate from keepalive.
   https://datatracker.ietf.org/doc/html/draft-ietf-ccwg-bbr-06
-- Rapid Start is an individual Internet-Draft, not a deployed or accepted project
+- Rapid Start is an expired individual Internet-Draft, not a deployed or accepted project
   feature. Its more aggressive startup still uses pacing and congestion handling.
   https://datatracker.ietf.org/doc/html/draft-kazuho-ccwg-rapid-start-02
