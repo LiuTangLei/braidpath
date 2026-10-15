@@ -16,13 +16,13 @@ class SourceObserverStudyTests(unittest.TestCase):
         for signum, handler in self.handlers.items():
             signal.signal(signum, handler)
 
-    def run_main(self, root, function):
+    def run_main(self, root, function, profile='presence'):
         binary = root/'binary'
         binary.write_bytes(b'fixed-source')
         output = root/'results'
         with patch.dict('os.environ', {'BRAIDPATH_SOURCE_STUDY':'1'}), \
              patch.object(Path, 'exists', return_value=True), \
-             patch('sys.argv', ['study','--binary',str(binary),'--output',str(output)]), \
+             patch('sys.argv', ['study','--binary',str(binary),'--output',str(output),'--study',profile]), \
              patch.object(study, 'window', side_effect=function):
             code = study.main()
         return code, json.loads((output/'result.json').read_text())
@@ -65,6 +65,19 @@ class SourceObserverStudyTests(unittest.TestCase):
         self.assertEqual(calls, [False])
         self.assertEqual(code, 1)
         self.assertIn('binary changed', result['error'])
+
+    def test_flush_study_keeps_collection_and_fixed_buffer_in_every_arm(self):
+        calls=[]
+        def run(root, binary, enabled, flush_each_sample):
+            calls.append((enabled,flush_each_sample))
+            return {'window':root.name}
+        with tempfile.TemporaryDirectory() as name:
+            code,result=self.run_main(Path(name),run,'flush')
+            registration=json.loads((Path(name)/'results/registration.json').read_text())
+        self.assertEqual(calls,[(True,True),(True,False),(True,False),(True,True)])
+        self.assertEqual(registration['file_buffer_bytes'],65536)
+        self.assertEqual(code,0)
+        self.assertTrue(result['complete'])
 
     def test_observer_close_failure_cannot_skip_owned_process_cleanup(self):
         owner = MagicMock()

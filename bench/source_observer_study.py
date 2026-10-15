@@ -22,13 +22,16 @@ from bench.source_burst import burst_summary
 
 
 class Observer:
-    def __init__(self, process, output, enabled):
+    def __init__(self, process, output, enabled, flush_each_sample=True):
         self.process, self.output, self.enabled = process, output, enabled
+        self.flush_each_sample = flush_each_sample
         self.stop = threading.Event()
         self.thread = None
         self.status = dict(enabled=enabled, interval_ms=5, max_rows=10000,
                            max_tasks=16, rows=0, errors=[], maximum_collection_ms=0,
-                           maximum_total_work_ms=0, dropped_samples=0)
+                           maximum_total_work_ms=0, dropped_samples=0,
+                           flush_each_sample=flush_each_sample, file_buffer_bytes=65536,
+                           maximum_work_event=None)
 
     def start(self):
         if self.enabled:
@@ -56,11 +59,16 @@ class Observer:
                     row['collection_duration_ns'] = time.monotonic_ns()-begin
                     row['source_alive_at_end'] = self.process.poll() is None
                     stream.write(json.dumps(row)+'\n')
-                    stream.flush()
+                    if self.flush_each_sample:
+                        stream.flush()
                     work = time.monotonic_ns()-begin
                     self.status['rows'] += 1
                     self.status['maximum_collection_ms'] = max(self.status['maximum_collection_ms'], row['collection_duration_ns']/1e6)
-                    self.status['maximum_total_work_ms'] = max(self.status['maximum_total_work_ms'], work/1e6)
+                    if work/1e6 > self.status['maximum_total_work_ms']:
+                        self.status['maximum_total_work_ms'] = work/1e6
+                        self.status['maximum_work_event'] = dict(sample_number=self.status['rows']-1,
+                            begin_unix_ns=wall, begin_monotonic_ns=begin,
+                            collection_duration_ns=row['collection_duration_ns'], total_work_ns=work)
                 except (OSError, ValueError) as error:
                     self.status['errors'].append(type(error).__name__+': '+str(error))
                     break
@@ -75,7 +83,7 @@ class Observer:
         save_new(self.output/'observer-status.json', self.status)
 
 
-def window(root, binary, enabled):
+def window(root, binary, enabled, flush_each_sample=True):
     root.mkdir()
     owner, observer = Owned(root), None
     address, run = port(), uuid.uuid4().hex
@@ -89,7 +97,7 @@ def window(root, binary, enabled):
         wait_ready(sink, root/'sink/ready.json', limit=10)
         source = owner.launch('source', [binary,'probe','--mode','send','--target',address,*common,
             '--result-file',root/'source/result.json','--samples-file',root/'source/samples.json'])
-        observer = Observer(source, root, enabled)
+        observer = Observer(source, root, enabled, flush_each_sample)
         observer.start()
         source.wait(timeout=40)
         sink.wait(timeout=10)
@@ -122,7 +130,10 @@ def window(root, binary, enabled):
         burst=burst_summary(samples,40000), observer_status=observer.status,
         runtime_source_changed=False, network_operations_outside_loopback=0)
     save_new(root/'analysis.json',row)
-    print(json.dumps({k:v for k,v in row.items() if k not in ['burst','qualification','source_pacing']}),flush=True)
+    print(json.dumps({**{k:v for k,v in row.items() if k not in ['burst','qualification','source_pacing']},
+        'source_qualified':row['qualification']['source_qualified'],
+        'maximum_wake_lateness_ms':row['source_pacing']['max_wake_lateness']['nanoseconds']/1e6,
+        'maximum_input_gap_us':row['burst']['gap_us']['maximum']}),flush=True)
     return row
 
 
@@ -130,15 +141,21 @@ def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--binary', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
+    parser.add_argument('--study', choices=['presence','flush'], default='presence',
+        help='presence toggles5ms collection; flush keeps it enabled and toggles per-row flush only')
     args=parser.parse_args()
     if not Path('/.dockerenv').exists() or os.environ.get('BRAIDPATH_SOURCE_STUDY') != '1':
         parser.error('dedicated network-none test container required')
     root,binary=args.output.resolve(),args.binary.resolve()
     root.mkdir(parents=True,exist_ok=False)
     sha=digest(binary)
+    order = [False,True,True,False] if args.study=='presence' else [True]*4
+    flush_order = [True]*4 if args.study=='presence' else [True,False,False,True]
     save_new(root/'registration.json',dict(utc=datetime.now(timezone.utc).isoformat(),
-        order=[False,True,True,False],source_count=400000,source_pps=40000,size_bytes=1000,
+        study=args.study,order=order,flush_order=flush_order,
+        source_count=400000,source_pps=40000,size_bytes=1000,
         nominal_seconds=10,deadline_ms=200,unchanged_binary_sha256=sha,no_retries=True,
+        script_sha256=digest(Path(__file__)), file_buffer_bytes=65536,
         scope='observer attribution, not tunnel acceptance',performance_promotion=False,
         collector='Python bounded per-task schedstat/wchan + cgroup cpu,5ms,16tasks,10000rows'))
     def cancel(signum,frame):
@@ -146,9 +163,12 @@ def main():
     for s in [signal.SIGINT,signal.SIGTERM]:signal.signal(s,cancel)
     rows,error=[],None
     try:
-        for i,enabled in enumerate([False,True,True,False]):
+        for i,enabled in enumerate(order):
             if digest(binary)!=sha:raise ValueError('frozen binary changed')
-            rows.append(window(root/('window_'+chr(97+i)),binary,enabled))
+            if args.study=='presence':
+                rows.append(window(root/('window_'+chr(97+i)),binary,enabled))
+            else:
+                rows.append(window(root/('window_'+chr(97+i)),binary,enabled,flush_order[i]))
     except BaseException as exc:
         error=type(exc).__name__+': '+str(exc)
     save_new(root/'result.json',dict(error=error,complete=error is None and len(rows)==4,

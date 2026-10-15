@@ -21,6 +21,13 @@ time. It is a specifically described Python observer, not assumed identical to
 another collector implementation. Use only in a dedicated network-none container
 with `BRAIDPATH_SOURCE_STUDY=1` and explicit resource limits.
 
+`--study flush` is a separate fixed on/off/off/on diagnostic for per-row file
+flushes. All four arms retain5ms collection and the same64KiB file buffer; only
+explicit flushing of each row varies. All buffered data is flushed on close.
+It does not change any tunnel or socket queue, source timer, production monitor
+or default collector behavior. It records the timestamp and work of the most
+expensive collection/write event without retaining an unbounded event history.
+
 Source qualification still uses the existing95% whole-source and one-second
 cohort floor. Qualification failures remain evidence; lifecycle failure stops
 later windows. The runner makes no causal attribution or performance promotion.
