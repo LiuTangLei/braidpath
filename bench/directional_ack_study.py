@@ -15,6 +15,7 @@ import resource
 import signal
 import subprocess
 import time
+from bench.lab_health import classify
 
 
 def digest(path):
@@ -44,6 +45,8 @@ def plan():
         'ack_max_delay_ms':10,'ack_reorder_threshold':2,'client_ack_profile':'unchanged',
         'native_transport':'pinned QUIC BBR + TLS; no production policy changes',
         'runtime_threads':4,'maximum_windows':8,'no_retries':True,
+        'relay_runtime_threads':2,'relay_executor_isolation':True,
+        'socket_receive_bytes':0,'socket_send_bytes':0,
         'nominal_source_seconds':80,'synthetic_link_not_public_network':True,
         'capacity_or_multilink_acceptance':False,
         'hypothesis':'Does a one-direction matched ACK-frequency request reduce reverse packet resource pressure without losing useful service?',
@@ -92,6 +95,8 @@ def audit_window(directory, registered, settings):
     if config['requested_ack_tuple']!=([1,10,2] if expected_profile=='EveryTwo' else [7,10,2]):raise ValueError('unmatched delay or reorder treatment')
     for key in ['bulk_pps','echo_pps','warmup_ms','business_ms','drain_ms','one_way_delay_ms','link_queue_ms','runtime_threads']:
         if config[key]!=settings[key]:raise ValueError('changed setting: '+key)
+    for key in ['relay_runtime_threads','relay_executor_isolation','socket_receive_bytes','socket_send_bytes']:
+        if key in settings and config.get(key)!=settings[key]:raise ValueError('changed instrument setting: '+key)
     if config['reverse_pps']!=registered['reverse_pps']:raise ValueError('wrong synthetic link')
     if not cleanup['all_owned_relay_tasks_joined'] or not cleanup['no_remote_actions']:raise ValueError('incomplete cleanup')
     for direction in ['reverse','forward']:
@@ -124,7 +129,10 @@ def audit_window(directory, registered, settings):
         'server_received_no_reply_admitted':sum(s['server_received_us'] is not None and s['reply_admitted_us'] is None for s in echo),
         'reply_admitted_not_received':sum(s['reply_admitted_us'] is not None and s['received_us'] is None for s in echo)}
     if sum(request_missing.values())!=len(echo)-actual_latency['received']:raise ValueError('request boundary census does not close')
+    socket_evidence=read(d/'sockets.json') if (d/'sockets.json').exists() else None
+    measurement_health=classify(result,config,socket_evidence)
     return {**registered,'goodput_mbps':goodput,'delivered_bytes':delivered*settings['bulk_payload_bytes'],
+        'measurement_health':measurement_health,
         'actual_business_source_seconds':span,'echo':actual_latency,'request_missing_boundaries':request_missing,
         'native_business_interval':native_interval(timeline,settings['warmup_ms'],settings['business_ms']),
         'relay_complete_census':cleanup,'application_counters':result['application_counters'],
@@ -171,7 +179,8 @@ def main(argv=None):
     if not binary.is_file():raise FileNotFoundError(binary)
     root.mkdir(parents=True,exist_ok=False);settings=plan()
     repo=Path(__file__).resolve().parent.parent
-    sources=['examples/directional_ack_lab.rs','examples/support/ack_policy.rs','Cargo.lock','bench/directional_ack_study.py']
+    sources=['examples/directional_ack_lab.rs','examples/support/ack_policy.rs','examples/support/lab_socket.rs',
+             'Cargo.lock','bench/directional_ack_study.py','bench/lab_health.py']
     registration={**settings,'binary_sha256':digest(binary),'source_sha256':{x:digest(repo/x) for x in sources},
         'system':platform.platform(),'cpu_count':os.cpu_count(),'created_unix_ns':time.time_ns()}
     save_new(root/'registration.json',registration)
@@ -210,6 +219,11 @@ def main(argv=None):
             except subprocess.TimeoutExpired:active.kill();active.wait(timeout=5)
         for sig,handler in old.items():signal.signal(sig,handler)
     summaries,comparisons=aggregate(rows,settings)
+    clean_controls=[r for r in rows if r['reverse_pps']==0]
+    clean_calibration=(len(clean_controls)==4 and all(r['measurement_health']['clean_reference_passed'] for r in clean_controls))
+    application_receivers_healthy=all(r['measurement_health']['consumer_loss_free'] is True
+                                    and r['measurement_health']['api_to_native_closed'] is True
+                                    and r['measurement_health']['model_timer_fidelity_passed'] is True for r in rows)
     for key,s in summaries.items():
         limit,profile=key.split('/');all_slots=[]
         for row in rows:
@@ -219,7 +233,10 @@ def main(argv=None):
     for limit,c in comparisons.items():
         b=summaries[limit+'/every-two'];n=summaries[limit+'/every-eight'];g=settings['screen']
         c['p95_evaluable']=b['p95_ms'] is not None and n['p95_ms'] is not None
-        c['mechanism_screen_passed']=(error is None and b['windows']==2 and n['windows']==2 and
+        c['clean_reference_calibration_passed']=clean_calibration
+        c['application_receiver_and_model_healthy']=application_receivers_healthy
+        c['mechanism_screen_passed']=(error is None and clean_calibration and application_receivers_healthy
+            and b['windows']==2 and n['windows']==2 and
             c['goodput_ratio']>=g['goodput_min_ratio'] and c['on_time_change_percentage_points']>=0 and
             n['on_time_fraction']>=g['on_time_fraction_target'] and c['p95_evaluable'] and
             n['p95_ms']<=b['p95_ms']*g['finite_p95_max_ratio'] and

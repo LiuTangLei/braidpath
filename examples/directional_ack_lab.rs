@@ -14,10 +14,12 @@ use serde_json::{Value, json};
 use std::{
     collections::VecDeque,
     fs,
-    io::{BufReader, Write},
+    future::{Future, poll_fn},
+    io::{BufReader, IoSliceMut, Write},
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
+    task::Poll,
     time::Duration,
 };
 use subtle::ConstantTimeEq;
@@ -30,6 +32,8 @@ use tokio::{
 #[path = "support/ack_policy.rs"]
 mod ack_policy;
 use ack_policy::{AckProfile, reference_transport};
+#[path = "support/lab_socket.rs"]
+mod lab_socket;
 
 const ALPN: &[u8] = b"braidpath-directional-ack-lab/1";
 const HEADER: usize = 55;
@@ -62,9 +66,17 @@ struct Args {
     business_ms: u64,
     #[arg(long, default_value_t = 2000)]
     drain_ms: u64,
+    /// Receive headroom on the four owned loopback sockets; zero preserves OS defaults.
+    #[arg(long, default_value_t = 0)]
+    socket_receive_bytes: usize,
+    /// Send headroom for owned loopback sockets only, independently registered.
+    #[arg(long, default_value_t = 0)]
+    socket_send_bytes: usize,
 }
 impl Args {
     fn validate(&self) -> Result<()> {
+        lab_socket::validate(self.socket_receive_bytes)?;
+        lab_socket::validate(self.socket_send_bytes)?;
         ensure!(!self.output.exists(), "preserve previous evidence");
         ensure!(
             (1..=20_000).contains(&self.bulk_pps),
@@ -149,6 +161,9 @@ struct LinkStats {
     maximum_queue_packets: usize,
     maximum_model_wait_us: u64,
     maximum_timer_lateness_us: u64,
+    receive_batches: u64,
+    maximum_receive_batch_packets: usize,
+    maximum_forward_batch_packets: usize,
 }
 struct Flight {
     due: Instant,
@@ -196,7 +211,7 @@ impl LinkQueue {
     }
 }
 async fn link_loop(
-    input: Arc<UdpSocket>,
+    input: Arc<dyn quinn::AsyncUdpSocket>,
     output: Arc<UdpSocket>,
     allowed: SocketAddr,
     destination: SocketAddr,
@@ -208,34 +223,76 @@ async fn link_loop(
         allowed.ip().is_loopback() && destination.ip().is_loopback(),
         "loopback only"
     );
-    let mut b = [0u8; 2048];
+    // Use the carrier's safe platform UDP adapter: it supports recvmmsg/GRO
+    // when present and handles readiness once for a bounded receive batch.
+    // Sixteen 64KiB slots cap receive workspace at one MiB per relay direction.
+    let mut storage = vec![vec![0u8; 65536]; 16];
+    let mut slices: Vec<_> = storage.iter_mut().map(|b| IoSliceMut::new(b)).collect();
+    let mut metadata = vec![Default::default(); 16];
     loop {
+        if *stop.borrow() {
+            break;
+        }
+        // Work-conserving service: an expired timer must not be recreated and
+        // cancelled by a hot receive branch before its ready packets advance.
+        let mut count = 0;
+        let mut bytes = 0;
+        let mut maximum_late = 0;
+        for _ in 0..64 {
+            if queue.queue.front().is_none_or(|p| p.due > Instant::now()) {
+                break;
+            }
+            let p = queue.queue.pop_front().unwrap();
+            let late = Instant::now().saturating_duration_since(p.due).as_micros() as u64;
+            let n = output.send_to(&p.data, destination).await?;
+            ensure!(n == p.data.len(), "short relay send");
+            count += 1;
+            bytes += n as u64;
+            maximum_late = maximum_late.max(late);
+        }
+        if count != 0 {
+            let mut s = stats.lock().unwrap();
+            s.forwarded_packets += count;
+            s.forwarded_bytes += bytes;
+            s.maximum_timer_lateness_us = s.maximum_timer_lateness_us.max(maximum_late);
+            s.maximum_forward_batch_packets = s.maximum_forward_batch_packets.max(count as usize);
+        }
+        if count == 64 {
+            tokio::task::yield_now().await;
+            continue;
+        }
         let due = queue.queue.front().map(|p| p.due);
         tokio::select! {
             _=stop.changed()=>break,
-            r=input.recv_from(&mut b)=>{
-                let (n,from)=r?;
-                if from!=allowed {stats.lock().unwrap().foreign_packets+=1;continue;}
-                ensure!(n<b.len(),"oversized or truncated UDP packet");
-                queue.offer(Instant::now(),Bytes::copy_from_slice(&b[..n]),&mut stats.lock().unwrap());
-            },
-            _=async {if let Some(t)=due {sleep_until(t).await}else{std::future::pending::<()>().await}}=>{
-                for _ in 0..64 {
-                    if queue.queue.front().is_none_or(|p|p.due>Instant::now()) {break;}
-                    let p=queue.queue.pop_front().unwrap();
-                    let late=Instant::now().saturating_duration_since(p.due).as_micros() as u64;
-                    let n=output.send_to(&p.data,destination).await?;
-                    ensure!(n==p.data.len(),"short relay send");
-                    let mut s=stats.lock().unwrap();s.forwarded_packets+=1;s.forwarded_bytes+=n as u64;
-                    s.maximum_timer_lateness_us=s.maximum_timer_lateness_us.max(late);
+            r=poll_fn(|cx|input.poll_recv(cx,&mut slices,&mut metadata))=>{
+                let buffers=r?;
+                let mut received=0;
+                let mut counts=stats.lock().unwrap();
+                for index in 0..buffers {
+                    let meta=&metadata[index];
+                    ensure!(meta.len<=slices[index].len() && meta.stride>0,"invalid native UDP batch metadata");
+                    for packet in slices[index][..meta.len].chunks(meta.stride) {
+                        received+=1;
+                        if meta.addr!=allowed {counts.foreign_packets+=1;continue;}
+                        ensure!(packet.len()<2048,"oversized or truncated UDP packet");
+                        queue.offer(Instant::now(),Bytes::copy_from_slice(packet),&mut counts);
+                    }
                 }
-            }
+                counts.receive_batches+=1;
+                counts.maximum_receive_batch_packets=counts.maximum_receive_batch_packets.max(received);
+            },
+            _=async {if let Some(t)=due {sleep_until(t).await}else{std::future::pending::<()>().await}}=>{}
         }
     }
     stats.lock().unwrap().shutdown_discarded_packets += queue.queue.len() as u64;
     Ok(())
 }
-fn make_endpoint(identity: &Path, server: bool, profile: AckProfile) -> Result<Endpoint> {
+fn make_endpoint(
+    identity: &Path,
+    server: bool,
+    profile: AckProfile,
+    socket: std::net::UdpSocket,
+) -> Result<Endpoint> {
     let cert = transport::certificates(&identity.join("cert.pem"))?;
     if server {
         let key = rustls_pemfile::private_key(&mut BufReader::new(fs::File::open(
@@ -249,7 +306,12 @@ fn make_endpoint(identity: &Path, server: bool, profile: AckProfile) -> Result<E
         tls.max_early_data_size = 0;
         let mut config = ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(tls)?));
         config.transport_config(Arc::new(reference_transport(profile)));
-        Ok(Endpoint::server(config, "127.0.0.1:0".parse()?)?)
+        Ok(Endpoint::new(
+            quinn::EndpointConfig::default(),
+            Some(config),
+            socket,
+            Arc::new(quinn::TokioRuntime),
+        )?)
     } else {
         let mut roots = rustls::RootCertStore::empty();
         for c in cert {
@@ -262,7 +324,12 @@ fn make_endpoint(identity: &Path, server: bool, profile: AckProfile) -> Result<E
         tls.enable_early_data = false;
         let mut config = ClientConfig::new(Arc::new(QuicClientConfig::try_from(tls)?));
         config.transport_config(Arc::new(reference_transport(profile)));
-        let mut endpoint = Endpoint::client("127.0.0.1:0".parse()?)?;
+        let mut endpoint = Endpoint::new(
+            quinn::EndpointConfig::default(),
+            None,
+            socket,
+            Arc::new(quinn::TokioRuntime),
+        )?;
         endpoint.set_default_client_config(config);
         Ok(endpoint)
     }
@@ -308,6 +375,63 @@ struct Sample {
     received_us: Option<u64>,
     disposition: Option<&'static str>,
 }
+
+/// Whole-run observations after the registered drain, before closing QUIC.
+/// Raw packet differences include control traffic and possible snapshot races;
+/// they locate an observation boundary, not a physical loss cause.
+fn boundary_census(counters: &Value, bulk: &[Sample], echo: &[Sample]) -> Value {
+    let bulk_admitted = bulk.iter().filter(|s| s.admitted_us.is_some()).count() as u64;
+    let bulk_received = bulk.iter().filter(|s| s.received_us.is_some()).count() as u64;
+    let request_admitted = echo.iter().filter(|s| s.admitted_us.is_some()).count() as u64;
+    let request_received = echo
+        .iter()
+        .filter(|s| s.server_received_us.is_some())
+        .count() as u64;
+    let reply_admitted = echo
+        .iter()
+        .filter(|s| s.reply_admitted_us.is_some())
+        .count() as u64;
+    let reply_received = echo.iter().filter(|s| s.received_us.is_some()).count() as u64;
+    let mut output = serde_json::Map::new();
+    for (name, from, to, link, admitted, received) in [
+        (
+            "server_to_client",
+            "server",
+            "client",
+            "forward",
+            bulk_admitted + reply_admitted,
+            bulk_received + reply_received,
+        ),
+        (
+            "client_to_server",
+            "client",
+            "server",
+            "reverse",
+            request_admitted,
+            request_received,
+        ),
+    ] {
+        let tx = &counters[from];
+        let rx = &counters[to];
+        let model = &counters[link];
+        let n = |v: &Value, field: &str| v[field].as_u64().expect("native u64 counter");
+        let delta = |a: u64, b: u64| i128::from(a) - i128::from(b);
+        output.insert(name.into(), json!({
+            "application_api_admitted":admitted, "application_datagrams_received":received,
+            "native_datagram_frames_tx":n(tx,"datagram_frames_tx"),
+            "native_datagram_frames_rx":n(rx,"datagram_frames_rx"),
+            "api_admitted_not_native_transmitted":delta(admitted,n(tx,"datagram_frames_tx")),
+            "native_received_not_read_by_application":delta(n(rx,"datagram_frames_rx"),received),
+            "endpoint_udp_tx":n(tx,"udp_packets_tx"),"endpoint_udp_rx":n(rx,"udp_packets_rx"),
+            "model_received":n(model,"input_packets"),"model_forwarded":n(model,"forwarded_packets"),
+            "observed_endpoint_to_model_packet_gap":delta(n(tx,"udp_packets_tx"),n(model,"input_packets")),
+            "observed_model_to_endpoint_packet_gap":delta(n(model,"forwarded_packets"),n(rx,"udp_packets_rx")),
+            "model_queue_discards":n(model,"queue_discarded_packets"),
+            "scope":"cumulative matched-direction boundaries; packet gaps are diagnostic, not assigned network loss"
+        }));
+    }
+    Value::Object(output)
+}
 struct Pending {
     seq: usize,
     data: Bytes,
@@ -326,6 +450,99 @@ struct AppStats {
     reply_expired: usize,
     request_queue_dropped: usize,
     request_expired: usize,
+    source_max_lateness_us: u64,
+    request_max_lateness_us: u64,
+    receive_batches: usize,
+    receive_batch_frames: usize,
+}
+
+/// Consume only immediately available data, without waiting or enlarging any queue.
+/// Quinn removes a datagram only when its read future returns Ready.
+async fn ready_datagram(conn: &quinn::Connection) -> Result<Option<Bytes>> {
+    let mut read = std::pin::pin!(conn.read_datagram());
+    poll_fn(|cx| match read.as_mut().poll(cx) {
+        Poll::Ready(result) => Poll::Ready(result.map(Some)),
+        Poll::Pending => Poll::Ready(Ok(None)),
+    })
+    .await
+    .map_err(Into::into)
+}
+
+/// Unlike a periodic retry, this future is woken when Quinn frees send space.
+/// Check expiry before polling the sending operation: a late wake must not
+/// silently accept a record whose application lifetime has already ended.
+async fn wait_datagram_before(
+    conn: &quinn::Connection,
+    data: Bytes,
+    expires: Instant,
+) -> Result<bool> {
+    let mut send = std::pin::pin!(conn.send_datagram_wait(data));
+    let mut expiry = std::pin::pin!(sleep_until(expires));
+    poll_fn(|cx| {
+        if Instant::now() >= expires || expiry.as_mut().poll(cx).is_ready() {
+            return Poll::Ready(Ok(false));
+        }
+        send.as_mut().poll(cx).map(|result| result.map(|()| true))
+    })
+    .await
+    .map_err(Into::into)
+}
+
+struct ReceiverView<'a> {
+    run: &'a [u8; 16],
+    epoch: Instant,
+    bulk: &'a mut [Sample],
+    echo: &'a mut [Sample],
+    replies: &'a mut VecDeque<Pending>,
+    stats: &'a mut AppStats,
+}
+impl ReceiverView<'_> {
+    fn consume(&mut self, at_server: bool, data: Bytes) -> Result<()> {
+        let (kind, seq, stamp) = decode(&data, self.run)?;
+        let now = micros(self.epoch);
+        if at_server {
+            ensure!(
+                kind == 1 && seq < self.echo.len() && self.echo[seq].issued_us == Some(stamp),
+                "request cohort mismatch"
+            );
+            if self.echo[seq].server_received_us.is_some() {
+                self.stats.request_duplicates += 1;
+                return Ok(());
+            }
+            self.echo[seq].server_received_us = Some(now);
+            if self.replies.len() >= 64 {
+                self.echo[seq].disposition = Some("reply_queue_full");
+                self.stats.reply_queue_dropped += 1;
+            } else {
+                self.replies.push_back(Pending {
+                    seq,
+                    data: frame(2, seq as u32, self.run, stamp),
+                    issued: now,
+                });
+            }
+        } else if kind == 0 {
+            ensure!(
+                seq < self.bulk.len() && self.bulk[seq].issued_us == Some(stamp),
+                "bulk cohort mismatch"
+            );
+            if self.bulk[seq].received_us.is_some() {
+                self.stats.bulk_duplicates += 1;
+            } else {
+                self.bulk[seq].received_us = Some(now);
+            }
+        } else {
+            ensure!(
+                kind == 2 && seq < self.echo.len() && self.echo[seq].issued_us == Some(stamp),
+                "response cohort mismatch"
+            );
+            if self.echo[seq].received_us.is_some() {
+                self.stats.response_duplicates += 1;
+            } else {
+                self.echo[seq].received_us = Some(now);
+            }
+        }
+        Ok(())
+    }
 }
 fn flush(
     conn: &quinn::Connection,
@@ -411,6 +628,20 @@ async fn measure(
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut snapshots = Vec::new();
     loop {
+        let mut received = None;
+        // At most one waiter per endpoint. The queued head is only removed in
+        // the branch that completed its send (or expired); all other select
+        // branches cancel the waiter and leave the original head unchanged.
+        let server_head = rq
+            .front()
+            .map(|p: &Pending| (true, p.seq, p.data.clone(), p.issued))
+            .or_else(|| {
+                bq.front()
+                    .map(|p: &Pending| (false, p.seq, p.data.clone(), p.issued))
+            });
+        let client_head = eq
+            .front()
+            .map(|p: &Pending| (p.seq, p.data.clone(), p.issued));
         tokio::select! {
             _=sleep_until(end)=>break,
             _=tick.tick()=>{
@@ -418,6 +649,7 @@ async fn measure(
                 if bs<count || es<requests {
                     for _ in 0..64 {
                         if bs>=count || bs as u64*1_000_000/u64::from(args.bulk_pps)>now {break;}
+                        stats.source_max_lateness_us=stats.source_max_lateness_us.max(now.saturating_sub(bs as u64*1_000_000/u64::from(args.bulk_pps)));
                         bulk[bs].issued_us=Some(now);stats.bulk_generated+=1;
                         if bq.len()>=QUEUE {bulk[bs].disposition=Some("queue_full");stats.bulk_queue_dropped+=1;}
                         else {bq.push_back(Pending{seq:bs,data:frame(0,bs as u32,&run,now),issued:now});}
@@ -425,6 +657,7 @@ async fn measure(
                     }
                     for _ in 0..4 {
                         if es>=requests || es as u64*1_000_000/u64::from(args.echo_pps)>now {break;}
+                        stats.request_max_lateness_us=stats.request_max_lateness_us.max(now.saturating_sub(es as u64*1_000_000/u64::from(args.echo_pps)));
                         echo[es].issued_us=Some(now);
                         if eq.len()>=64 {echo[es].disposition=Some("request_queue_full");stats.request_queue_dropped+=1;}
                         else {eq.push_back(Pending{seq:es,data:frame(1,es as u32,&run,now),issued:now});}
@@ -432,25 +665,65 @@ async fn measure(
                     }
                 }
             },
-            data=server.read_datagram()=>{
-                let data=data?;let (kind,seq,stamp)=decode(&data,&run)?;
-                ensure!(kind==1 && seq<echo.len() && echo[seq].issued_us==Some(stamp),"request cohort mismatch");
-                if echo[seq].server_received_us.is_some(){stats.request_duplicates+=1;continue;}
-                let now=micros(epoch);echo[seq].server_received_us=Some(now);
-                if rq.len()>=64 {echo[seq].disposition=Some("reply_queue_full");stats.reply_queue_dropped+=1;}
-                else {rq.push_back(Pending{seq,data:frame(2,seq as u32,&run,stamp),issued:now});}
-            },
-            data=client.read_datagram()=>{
-                let data=data?;let (kind,seq,stamp)=decode(&data,&run)?;
+            data=server.read_datagram()=>received=Some((true,data?)),
+            data=client.read_datagram()=>received=Some((false,data?)),
+            ready=async {
+                if let Some((_,_,data,issued))=&server_head {
+                    wait_datagram_before(server,data.clone(),epoch+Duration::from_micros(*issued+DEADLINE_US)).await
+                } else {std::future::pending::<Result<bool>>().await}
+            }=>{
+                let sent=ready?;let (reply,seq,_,_)=server_head.unwrap();
+                let (queue,samples)=if reply {(&mut rq,&mut echo)} else {(&mut bq,&mut bulk)};
+                ensure!(queue.pop_front().is_some_and(|p|p.seq==seq),"readiness head changed");
                 let now=micros(epoch);
-                if kind==0 {
-                    ensure!(seq<bulk.len() && bulk[seq].issued_us==Some(stamp),"bulk cohort mismatch");
-                    if bulk[seq].received_us.is_some(){stats.bulk_duplicates+=1;}else{bulk[seq].received_us=Some(now);}
-                }else{
-                    ensure!(kind==2 && seq<echo.len() && echo[seq].issued_us==Some(stamp),"response cohort mismatch");
-                    if echo[seq].received_us.is_some(){stats.response_duplicates+=1;}else{echo[seq].received_us=Some(now);}
+                if sent {
+                    if reply {samples[seq].reply_admitted_us=Some(now);}
+                    else {samples[seq].admitted_us=Some(now);stats.bulk_admitted+=1;}
+                } else if reply {
+                    samples[seq].disposition=Some("reply_expired");stats.reply_expired+=1;
+                } else {
+                    samples[seq].disposition=Some("send_expired");stats.bulk_expired+=1;
+                }
+            },
+            ready=async {
+                if let Some((_,data,issued))=&client_head {
+                    wait_datagram_before(client,data.clone(),epoch+Duration::from_micros(*issued+DEADLINE_US)).await
+                } else {std::future::pending::<Result<bool>>().await}
+            }=>{
+                let sent=ready?;let (seq,_,_)=client_head.unwrap();
+                ensure!(eq.pop_front().is_some_and(|p|p.seq==seq),"request readiness head changed");
+                if sent {echo[seq].admitted_us=Some(micros(epoch));}
+                else {echo[seq].disposition=Some("send_expired");stats.request_expired+=1;}
+            },
+        }
+        // The old loop received one datagram, then re-evaluated all send queues.
+        // A source burst could outpace that loop and evict already received data.
+        // Drain a bounded ready batch first; this adds no storage and no waiting.
+        {
+            let mut receive = ReceiverView {
+                run: &run,
+                epoch,
+                bulk: &mut bulk,
+                echo: &mut echo,
+                replies: &mut rq,
+                stats: &mut stats,
+            };
+            let mut frames = 0;
+            if let Some((at_server, data)) = received {
+                receive.consume(at_server, data)?;
+                frames += 1;
+            }
+            for (at_server, conn) in [(true, server), (false, client)] {
+                for _ in 0..64 {
+                    let Some(data) = ready_datagram(conn).await? else {
+                        break;
+                    };
+                    receive.consume(at_server, data)?;
+                    frames += 1;
                 }
             }
+            receive.stats.receive_batches += usize::from(frames != 0);
+            receive.stats.receive_batch_frames += frames;
         }
         let now = micros(epoch);
         let (_, expired) = flush(client, &mut eq, &mut echo, now, false)?;
@@ -472,6 +745,7 @@ async fn measure(
     }
     let final_counters = json!({"elapsed_us":micros(epoch),"server":native(server),"client":native(client),
         "reverse":reverse.lock().unwrap().clone(),"forward":forward.lock().unwrap().clone()});
+    let boundary = boundary_census(&final_counters, &bulk, &echo);
     let business = &bulk[split..];
     let delivered = business.iter().filter(|s| s.received_us.is_some()).count();
     let span = match (
@@ -520,6 +794,7 @@ async fn measure(
         "business_delivery_fraction":delivered as f64/(count-split) as f64,"business_echo":latency(&echo[esplit..]),
         "generator_complete":generator_complete,"generator_pacing_fraction":(count-split) as f64/span/f64::from(args.bulk_pps),
         "source_prefix_payload_bytes":split*BULK,"application_counters":stats,"final_counters":final_counters,
+        "boundary_census":boundary,"ending_application_queues":{"bulk":bq.len(),"request":eq.len(),"reply":rq.len()},
         "ack_request_confirmed":ack_request_confirmed,"client_ack_request_sent":false,
         "phase_aligned_native_counters":"timeline snapshots; boundary-spanning in-flight packets are not per-source-cohort wire attribution",
         "loopback_only":true,"synthetic_reverse_resource":args.reverse_pps>0,
@@ -529,36 +804,83 @@ async fn measure(
 async fn run(args: &Args) -> Result<Value> {
     let identity = args.output.join("identity");
     transport::initialize(&identity, "localhost")?;
-    let server = make_endpoint(&identity, true, args.ack_profile)?;
-    let client = make_endpoint(&identity, false, AckProfile::Unchanged)?;
-    let front = Arc::new(UdpSocket::bind("127.0.0.1:0").await?);
-    let back = Arc::new(UdpSocket::bind("127.0.0.1:0").await?);
+    let mut evidence = Vec::new();
+    let mut sockets = Vec::new();
+    let mut clones = Vec::new();
+    for role in [
+        "server_endpoint",
+        "client_endpoint",
+        "relay_front",
+        "relay_back",
+    ] {
+        let (socket, report) =
+            lab_socket::bind(role, args.socket_receive_bytes, args.socket_send_bytes)?;
+        clones.push(socket.try_clone()?);
+        sockets.push(socket);
+        evidence.push(report);
+    }
+    let back = sockets.pop().unwrap();
+    let front = sockets.pop().unwrap();
+    let front_address = front.local_addr()?;
+    let client = make_endpoint(
+        &identity,
+        false,
+        AckProfile::Unchanged,
+        sockets.pop().unwrap(),
+    )?;
+    let server = make_endpoint(&identity, true, args.ack_profile, sockets.pop().unwrap())?;
+    for (socket, report) in clones.iter().zip(evidence.iter_mut()) {
+        lab_socket::observe(socket, report)?;
+    }
+    save(&args.output.join("sockets.json"), &evidence)?;
     let reverse = Arc::new(Mutex::new(LinkStats::default()));
     let forward = Arc::new(Mutex::new(LinkStats::default()));
     let (stop, rx) = watch::channel(false);
     let mut jobs = JoinSet::new();
     let delay = Duration::from_millis(args.one_way_delay_ms);
     let limit = Duration::from_millis(args.link_queue_ms);
-    jobs.spawn(link_loop(
-        front.clone(),
-        back.clone(),
-        client.local_addr()?,
-        server.local_addr()?,
-        LinkQueue::new(args.reverse_pps, delay, limit),
-        reverse.clone(),
-        rx.clone(),
-    ));
-    jobs.spawn(link_loop(
-        back.clone(),
-        front.clone(),
-        server.local_addr()?,
-        client.local_addr()?,
-        LinkQueue::new(0, delay, limit),
-        forward.clone(),
-        rx,
-    ));
+    for (input, output, allowed, destination, pps, stats) in [
+        (
+            front.try_clone()?,
+            back.try_clone()?,
+            client.local_addr()?,
+            server.local_addr()?,
+            args.reverse_pps,
+            reverse.clone(),
+        ),
+        (
+            back,
+            front,
+            server.local_addr()?,
+            client.local_addr()?,
+            0,
+            forward.clone(),
+        ),
+    ] {
+        let shutdown = rx.clone();
+        // The simulated resource must not compete in the very executor whose
+        // congestion/receive behavior is under test. Exactly two finite relay
+        // workers, each with its own IO/timer driver; no busy-wait or global tuning.
+        jobs.spawn_blocking(move || -> Result<()> {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?
+                .block_on(async move {
+                    link_loop(
+                        quinn::Runtime::wrap_udp_socket(&quinn::TokioRuntime, input)?,
+                        Arc::new(UdpSocket::from_std(output)?),
+                        allowed,
+                        destination,
+                        LinkQueue::new(pps, delay, limit),
+                        stats,
+                        shutdown,
+                    )
+                    .await
+                })
+        });
+    }
     let connection = async {
-        let connecting = client.connect(front.local_addr()?, "localhost")?;
+        let connecting = client.connect(front_address, "localhost")?;
         let a = async { connecting.await.map_err(anyhow::Error::from) };
         let b = async {
             server
@@ -606,7 +928,9 @@ async fn run(args: &Args) -> Result<Value> {
         &json!({"all_owned_relay_tasks_joined":true,"reverse":r,"forward":f,
         "no_external_processes":true,"no_remote_actions":true}),
     )?;
-    value?
+    let mut result = value??;
+    result["socket_evidence"] = serde_json::to_value(evidence)?;
+    Ok(result)
 }
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() -> Result<()> {
@@ -621,6 +945,11 @@ async fn main() -> Result<()> {
         "bulk_pps":args.bulk_pps,"bulk_payload_bytes":BULK,"record_overhead_bytes":HEADER,"echo_payload_bytes":ECHO,
         "echo_pps":args.echo_pps,"warmup_ms":args.warmup_ms,"business_ms":args.business_ms,"drain_ms":args.drain_ms,
         "runtime_threads":4,"socket_scope":"127.0.0.1 only, ephemeral ports","source":"native in-process source; no Python data path",
+        "relay_runtime_threads":2,"relay_executor_isolation":true,
+        "relay_receive_adapter":"native QUIC runtime UDP adapter; bounded 16 slots with GRO metadata",
+        "socket_receive_bytes":args.socket_receive_bytes,"quic_application_receive_buffer_bytes":256*1200,
+        "socket_send_bytes":args.socket_send_bytes,
+        "application_send_buffer_bytes":9600,"application_queue_deadline_us":DEADLINE_US,
         "synthetic_not_public_network":true,"production_policy_changed":false}),
     )?;
     let result = run(&args).await;
@@ -648,6 +977,217 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn expired_send_wait_does_not_transmit_or_consume_a_later_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let identity = dir.path().join("identity");
+        transport::initialize(&identity, "localhost").unwrap();
+        let server = make_endpoint(
+            &identity,
+            true,
+            AckProfile::EveryTwo,
+            lab_socket::bind("expiry-server", 256 * 1024, 0).unwrap().0,
+        )
+        .unwrap();
+        let client = make_endpoint(
+            &identity,
+            false,
+            AckProfile::Unchanged,
+            lab_socket::bind("expiry-client", 256 * 1024, 0).unwrap().0,
+        )
+        .unwrap();
+        let (outgoing, incoming) = timeout(Duration::from_secs(3), async {
+            tokio::join!(
+                client
+                    .connect(server.local_addr().unwrap(), "localhost")
+                    .unwrap(),
+                async { server.accept().await.unwrap().await }
+            )
+        })
+        .await
+        .unwrap();
+        let outgoing = outgoing.unwrap();
+        let incoming = incoming.unwrap();
+        let token = transport::token(&identity.join("token")).unwrap();
+        let (a, b) = tokio::join!(
+            auth(&outgoing, false, &token),
+            auth(&incoming, true, &token)
+        );
+        a.unwrap();
+        b.unwrap();
+        assert!(
+            !wait_datagram_before(
+                &outgoing,
+                Bytes::from_static(b"expired"),
+                Instant::now() - Duration::from_millis(1)
+            )
+            .await
+            .unwrap()
+        );
+        assert_eq!(outgoing.stats().frame_tx.datagram, 0);
+        assert!(
+            timeout(Duration::from_millis(30), incoming.read_datagram())
+                .await
+                .is_err()
+        );
+        assert!(
+            wait_datagram_before(
+                &outgoing,
+                Bytes::from_static(b"valid next record"),
+                Instant::now() + Duration::from_secs(1)
+            )
+            .await
+            .unwrap()
+        );
+        let payload = timeout(Duration::from_secs(1), incoming.read_datagram())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(payload, Bytes::from_static(b"valid next record"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "hardware-dependent 80Mbps calibration; explicitly run in release and retain failures"]
+    async fn calibrated_clean_link_preserves_both_request_and_bulk_cohorts() {
+        let temporary = tempfile::tempdir().unwrap();
+        let args = Args {
+            output: temporary.path().join("clean-reference"),
+            ack_profile: AckProfile::EveryTwo,
+            reverse_pps: 0,
+            one_way_delay_ms: 20,
+            link_queue_ms: 20,
+            bulk_pps: 10_000,
+            echo_pps: 50,
+            warmup_ms: 1000,
+            business_ms: 2000,
+            drain_ms: 1000,
+            socket_receive_bytes: 1024 * 1024,
+            socket_send_bytes: 256 * 1024,
+        };
+        args.validate().unwrap();
+        fs::create_dir_all(&args.output).unwrap();
+        let result = run(&args).await.unwrap();
+        eprintln!("clean-reference regression: {result}");
+        assert_eq!(result["generator_complete"], true);
+        assert!(result["generator_pacing_fraction"].as_f64().unwrap() >= 0.95);
+        assert_eq!(result["business_population"], 20_000);
+        assert_eq!(result["business_delivered"], 20_000);
+        assert_eq!(result["business_echo"]["population"], 100);
+        assert_eq!(result["business_echo"]["received"], 100);
+        assert_eq!(result["business_echo"]["on_time_200ms"], 100);
+        for direction in ["server_to_client", "client_to_server"] {
+            let counts = &result["boundary_census"][direction];
+            assert_eq!(counts["native_received_not_read_by_application"], 0);
+            assert_eq!(counts["api_admitted_not_native_transmitted"], 0);
+            assert_eq!(counts["model_queue_discards"], 0);
+        }
+        let evidence: Vec<Value> =
+            serde_json::from_slice(&fs::read(args.output.join("sockets.json")).unwrap()).unwrap();
+        assert_eq!(evidence.len(), 4);
+        for socket in evidence {
+            assert_eq!(socket["requested_headroom_satisfied"], true);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn corrected_queues_preserve_both_ack_profiles_at_functional_load() {
+        for profile in [AckProfile::EveryTwo, AckProfile::EveryEight] {
+            let temporary = tempfile::tempdir().unwrap();
+            let args = Args {
+                output: temporary.path().join("functional"),
+                ack_profile: profile,
+                reverse_pps: 0,
+                one_way_delay_ms: 20,
+                link_queue_ms: 20,
+                bulk_pps: 200,
+                echo_pps: 20,
+                warmup_ms: 500,
+                business_ms: 1000,
+                drain_ms: 500,
+                socket_receive_bytes: 256 * 1024,
+                socket_send_bytes: 0,
+            };
+            args.validate().unwrap();
+            fs::create_dir_all(&args.output).unwrap();
+            let result = run(&args).await.unwrap();
+            assert_eq!(result["generator_complete"], true, "{result}");
+            assert_eq!(result["business_delivered"], 200, "{result}");
+            assert_eq!(result["business_echo"]["received"], 20, "{result}");
+            assert_eq!(result["business_echo"]["on_time_200ms"], 20, "{result}");
+            assert_eq!(result["ack_request_confirmed"], true);
+            for direction in ["server_to_client", "client_to_server"] {
+                assert_eq!(
+                    result["boundary_census"][direction]["native_received_not_read_by_application"],
+                    0
+                );
+                assert_eq!(
+                    result["boundary_census"][direction]["api_admitted_not_native_transmitted"],
+                    0
+                );
+            }
+            eprintln!("functional {profile:?}: {}", result["business_echo"]);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "host-dependent plaintext 80Mbps reference; not a CI speed requirement"]
+    async fn plaintext_relay_reference_preserves_sustained_datagrams() {
+        let (source, _) = lab_socket::bind("plain-source", 1024 * 1024, 256 * 1024).unwrap();
+        let (middle, _) = lab_socket::bind("plain-relay", 1024 * 1024, 256 * 1024).unwrap();
+        let (sink, _) = lab_socket::bind("plain-sink", 1024 * 1024, 256 * 1024).unwrap();
+        let source = UdpSocket::from_std(source).unwrap();
+        let middle_input =
+            quinn::Runtime::wrap_udp_socket(&quinn::TokioRuntime, middle.try_clone().unwrap())
+                .unwrap();
+        let middle = Arc::new(UdpSocket::from_std(middle).unwrap());
+        let sink = UdpSocket::from_std(sink).unwrap();
+        let target = middle.local_addr().unwrap();
+        let stats = Arc::new(Mutex::new(LinkStats::default()));
+        let (stop, watch) = watch::channel(false);
+        let task = tokio::spawn(link_loop(
+            middle_input,
+            middle,
+            source.local_addr().unwrap(),
+            sink.local_addr().unwrap(),
+            LinkQueue::new(0, Duration::from_millis(20), Duration::from_millis(20)),
+            stats.clone(),
+            watch,
+        ));
+        let epoch = Instant::now();
+        let send = tokio::spawn(async move {
+            let mut p = [7u8; 1000];
+            for seq in 0..20_000u32 {
+                sleep_until(epoch + Duration::from_micros(u64::from(seq) * 100)).await;
+                p[..4].copy_from_slice(&seq.to_be_bytes());
+                source.send_to(&p, target).await.unwrap();
+            }
+        });
+        let mut seen = vec![false; 20_000];
+        let mut received = 0;
+        let mut p = [0; 2048];
+        let deadline = epoch + Duration::from_secs(3);
+        loop {
+            tokio::select! {
+                _=sleep_until(deadline)=>break,
+                value=sink.recv(&mut p)=>{
+                    assert_eq!(value.unwrap(),1000);
+                    let seq=u32::from_be_bytes(p[..4].try_into().unwrap()) as usize;
+                    assert!(seq<20_000 && !seen[seq]);assert!(p[4..1000].iter().all(|b|*b==7));
+                    seen[seq]=true;received+=1;if received==20_000 {break;}
+                }
+            }
+        }
+        send.await.unwrap();
+        stop.send(true).unwrap();
+        task.await.unwrap().unwrap();
+        eprintln!(
+            "plain reference: received={received}; {}",
+            serde_json::to_string(&*stats.lock().unwrap()).unwrap()
+        );
+        assert_eq!(received, 20_000);
+    }
+
     #[test]
     fn queue_applies_bounded_service_without_credit_on_discard() {
         let now = Instant::now();
@@ -690,5 +1230,33 @@ mod tests {
         assert_eq!(value["population"], 2);
         assert_eq!(value["on_time_fraction"], 0.5);
         assert!(value["p95_ms"].is_null());
+    }
+
+    #[test]
+    fn census_separates_api_wire_model_and_application_disappearance() {
+        let row = Sample {
+            issued_us: Some(0),
+            admitted_us: Some(1),
+            received_us: Some(9),
+            ..Default::default()
+        };
+        let reply = Sample {
+            issued_us: Some(0),
+            admitted_us: Some(1),
+            server_received_us: Some(3),
+            reply_admitted_us: Some(4),
+            ..Default::default()
+        };
+        let value = json!({
+            "server":{"udp_packets_tx":10,"udp_packets_rx":8,"datagram_frames_tx":2,"datagram_frames_rx":1},
+            "client":{"udp_packets_tx":8,"udp_packets_rx":8,"datagram_frames_tx":1,"datagram_frames_rx":1},
+            "forward":{"input_packets":9,"forwarded_packets":9,"queue_discarded_packets":0},
+            "reverse":{"input_packets":8,"forwarded_packets":8,"queue_discarded_packets":0}});
+        let census = boundary_census(&value, &[row], &[reply]);
+        let forward = &census["server_to_client"];
+        assert_eq!(forward["api_admitted_not_native_transmitted"], 0);
+        assert_eq!(forward["observed_endpoint_to_model_packet_gap"], 1);
+        assert_eq!(forward["observed_model_to_endpoint_packet_gap"], 1);
+        assert_eq!(forward["native_received_not_read_by_application"], 0);
     }
 }
