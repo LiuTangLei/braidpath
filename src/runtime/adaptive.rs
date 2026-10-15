@@ -18,6 +18,68 @@ const MIN_BPS: u64 = 64_000;
 const LOSS_WINDOW_US: u64 = 4_000_000;
 const LOSS_BATCHES: usize = 8;
 const WEIGHT_EVIDENCE_SYMBOLS: u64 = 16;
+const LOSS_FLOOR_SYMBOLS: u64 = 512;
+const LOSS_FLOOR_BUCKETS: usize = 6;
+const LOSS_FLOOR_MIN_BUCKETS: usize = 3;
+const LOSS_FLOOR_AGE_US: u64 = 10_000_000;
+const LOSS_FLOOR_MAX: f64 = 0.25;
+
+/// Finalized loss observed while this path's own queue signal was clear.
+/// The floor is the smallest recent bucket, so a congestion episode can only
+/// lower it. It never describes capacity; it only discounts delivery deficit.
+#[derive(Default)]
+struct LossFloor {
+    previous: Option<(u64, u64)>,
+    bucket: (u64, u64),
+    buckets: VecDeque<(u64, f64)>,
+}
+
+impl LossFloor {
+    fn observe(&mut self, now_us: u64, finalized: Option<(u64, u64)>, clear_queue: bool) {
+        while self
+            .buckets
+            .front()
+            .is_some_and(|(at, _)| now_us.saturating_sub(*at) > LOSS_FLOOR_AGE_US)
+        {
+            self.buckets.pop_front();
+        }
+        let Some((expected, lost)) = finalized.filter(|(expected, lost)| lost <= expected) else {
+            return;
+        };
+        let Some((old_expected, old_lost)) = self.previous.replace((expected, lost)) else {
+            return;
+        };
+        if expected < old_expected || lost < old_lost || lost - old_lost > expected - old_expected {
+            self.bucket = (0, 0);
+            self.buckets.clear();
+            return;
+        }
+        if !clear_queue {
+            // Deltas observed with a queue may include queue loss; skip them.
+            return;
+        }
+        self.bucket.0 += expected - old_expected;
+        self.bucket.1 += lost - old_lost;
+        if self.bucket.0 >= LOSS_FLOOR_SYMBOLS {
+            if self.buckets.len() == LOSS_FLOOR_BUCKETS {
+                self.buckets.pop_front();
+            }
+            self.buckets
+                .push_back((now_us, self.bucket.1 as f64 / self.bucket.0 as f64));
+            self.bucket = (0, 0);
+        }
+    }
+
+    fn floor(&self) -> f64 {
+        if self.buckets.len() < LOSS_FLOOR_MIN_BUCKETS {
+            return 0.0;
+        }
+        self.buckets
+            .iter()
+            .map(|(_, fraction)| *fraction)
+            .fold(LOSS_FLOOR_MAX, f64::min)
+    }
+}
 
 #[derive(Default)]
 struct LossEvidence {
@@ -479,6 +541,9 @@ pub struct ControlSample {
     pub mixed_rtt_excess_ms: f64,
     /// Observation count, not saved packets or a count of prevented brakes.
     pub rtt_source_baseline_corrections: u64,
+    /// Local experiment: delivery compensated by this low-queue loss floor.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub random_loss_floor: Option<f64>,
     /// Local opt-in, never negotiated from an untrusted peer. A native window
     /// is a sending allowance, not measured path capacity.
     pub native_service_guard_enabled: bool,
@@ -637,6 +702,10 @@ struct GrowthRetry {
 
 pub struct PathController {
     rtt_source_baselines_enabled: bool,
+    random_loss_service_enabled: bool,
+    loss_floor: LossFloor,
+    /// Raw and compensated cumulative delivered symbol bytes in this generation.
+    compensated_delivery: Option<(u64, u64)>,
     source_local_min_rtt_ms: Option<f64>,
     source_probe_min_rtt_ms: Option<f64>,
     source_probe_sample_id: Option<u64>,
@@ -725,6 +794,9 @@ impl PathController {
         Self {
             maximum_bps,
             rtt_source_baselines_enabled: false,
+            random_loss_service_enabled: false,
+            loss_floor: LossFloor::default(),
+            compensated_delivery: None,
             source_local_min_rtt_ms: None,
             source_probe_min_rtt_ms: None,
             source_probe_sample_id: None,
@@ -805,6 +877,59 @@ impl PathController {
     pub(crate) fn with_rtt_source_baselines(mut self, enabled: bool) -> Self {
         self.rtt_source_baselines_enabled = enabled;
         self
+    }
+
+    /// Configure once at creation, like the RTT-source experiment. Random
+    /// loss learned in one generation is never inherited by the next.
+    pub(crate) fn with_random_loss_service(mut self, enabled: bool) -> Self {
+        self.random_loss_service_enabled = enabled;
+        self
+    }
+
+    /// Delivered bytes as if the low-queue loss floor had arrived. Every
+    /// downstream deficit/growth comparison sees the same compensated report;
+    /// it is clamped to admitted bytes, so it never exceeds what was sent.
+    fn compensate_delivery(&mut self, observation: &Observation) -> Option<(Observation, f64)> {
+        if !self.random_loss_service_enabled {
+            return None;
+        }
+        // Shallow drop-tail queues lose packets well below the delay brake.
+        // Only a nearly empty queue can attribute loss to the path itself.
+        let clear_queue = self.queue_delay_ms <= (self.target_ms * 0.05).max(2.0)
+            && !observation.transport_blocked
+            && observation
+                .feedback_age_us
+                .is_some_and(|age| age <= FRESH_US);
+        self.loss_floor.observe(
+            observation.now_us,
+            observation
+                .finalized_expected
+                .zip(observation.finalized_lost),
+            clear_queue,
+        );
+        let floor = self.loss_floor.floor();
+        let delivered = observation.delivered_bytes;
+        let compensated = match self.compensated_delivery {
+            Some((raw, compensated)) if delivered >= raw => {
+                compensated + ((delivered - raw) as f64 / (1.0 - floor)).round() as u64
+            }
+            _ => delivered,
+        };
+        let compensated = observation
+            .admitted_symbol_bytes
+            .map_or(compensated, |admitted| {
+                compensated.min(admitted.max(delivered))
+            })
+            .max(delivered);
+        self.compensated_delivery = Some((delivered, compensated));
+        Some((
+            Observation {
+                delivered_bytes: compensated,
+                delivered_bps: observation.delivered_bps.map(|rate| rate / (1.0 - floor)),
+                ..observation.clone()
+            },
+            floor,
+        ))
     }
 
     /// Opt-in independent-stream credit. Ordinary callers retain every old gate.
@@ -919,13 +1044,17 @@ impl PathController {
         let now = observation.now_us;
         if self.generation != Some(observation.generation) {
             *self = Self::new(self.maximum_bps, self.target_ms as u64)
-                .with_rtt_source_baselines(self.rtt_source_baselines_enabled);
+                .with_rtt_source_baselines(self.rtt_source_baselines_enabled)
+                .with_random_loss_service(self.random_loss_service_enabled);
             self.generation = Some(observation.generation);
             self.born_us = now;
             self.last_control_us = now;
             self.last_growth_us = now;
             self.token_us = now;
         }
+        let compensated = self.compensate_delivery(observation);
+        let random_loss_floor = compensated.as_ref().map(|(_, floor)| *floor);
+        let observation = compensated.as_ref().map_or(observation, |(value, _)| value);
         if let Some(probe) = probe {
             self.probe_service
                 .observe(probe, now, observation.generation);
@@ -1491,6 +1620,7 @@ impl PathController {
             source_probe_min_rtt_ms: self.source_probe_min_rtt_ms,
             mixed_rtt_excess_ms,
             rtt_source_baseline_corrections: self.rtt_source_baseline_corrections,
+            random_loss_floor,
             native_service_guard_enabled: false,
             native_service_hint_bps: None,
             at_us: now,
@@ -4084,6 +4214,112 @@ mod tests {
         assert!(controller.last_control.service_admission.unwrap().deficit);
         assert!(controller.rate_bps < before);
         assert!(controller.congestion_seen);
+    }
+
+    fn random_loss_fixture(enabled: bool) -> (PathController, Observation) {
+        let (mut controller, mut sample) = paired_loss_service_fixture();
+        controller.random_loss_service_enabled = enabled;
+        controller.compensated_delivery = Some((3_000_000, 3_000_000));
+        let now = sample.now_us;
+        controller.loss_floor = LossFloor {
+            previous: Some((3_000, 240)),
+            bucket: (0, 0),
+            buckets: VecDeque::from([
+                (now - 1_000_000, 0.15),
+                (now - 800_000, 0.16),
+                (now - 600_000, 0.155),
+            ]),
+        };
+        // 15% of the new finalized interval and 81% of admitted symbol bytes.
+        sample.finalized_lost = Some(353);
+        sample.delivered_bytes = 3_620_000;
+        sample.delivered_bps = Some(9_920_000.0);
+        (controller, sample)
+    }
+
+    #[test]
+    fn random_loss_floor_discounts_clear_queue_loss_from_service_deficit() {
+        let (mut baseline, sample) = random_loss_fixture(false);
+        let before = baseline.rate_bps;
+        baseline.observe(&sample);
+        assert!(baseline.last_control.service_admission.unwrap().deficit);
+        assert!(baseline.rate_bps < before);
+        assert!(baseline.last_control.random_loss_floor.is_none());
+
+        let (mut candidate, sample) = random_loss_fixture(true);
+        candidate.observe(&sample);
+        assert_eq!(candidate.last_control.random_loss_floor, Some(0.15));
+        assert!(!candidate.last_control.service_admission.unwrap().deficit);
+        assert!(!candidate.loss_pressure);
+        assert_eq!(candidate.rate_bps, before);
+        // Compensation never reports more than this generation admitted.
+        let (raw, compensated) = candidate.compensated_delivery.unwrap();
+        assert_eq!(raw, 3_620_000);
+        assert_eq!(
+            compensated,
+            3_000_000 + (620_000.0f64 / 0.85).round() as u64
+        );
+        assert!(compensated <= sample.admitted_symbol_bytes.unwrap());
+    }
+
+    #[test]
+    fn random_loss_floor_still_brakes_loss_beyond_the_floor() {
+        let (mut controller, mut sample) = random_loss_fixture(true);
+        let before = controller.rate_bps;
+        sample.delivered_bytes = 3_420_000;
+        sample.delivered_bps = Some(6_700_000.0);
+        controller.observe(&sample);
+        assert!(controller.last_control.service_admission.unwrap().deficit);
+        assert!(controller.rate_bps < before);
+    }
+
+    #[test]
+    fn random_loss_floor_requires_three_clear_queue_buckets_and_keeps_the_minimum() {
+        let mut floor = LossFloor::default();
+        floor.observe(0, Some((0, 0)), true);
+        for (index, lost) in [80u64, 70, 90].into_iter().enumerate() {
+            let at = (index as u64 + 1) * 100_000;
+            let (expected, old_lost) = floor.previous.unwrap();
+            // Queued deltas never enter a bucket, only advance the prefix.
+            floor.observe(at, Some((expected + 512, old_lost + 400)), false);
+            let (expected, old_lost) = floor.previous.unwrap();
+            assert_eq!(floor.bucket, (0, 0));
+            assert_eq!(floor.floor(), 0.0);
+            floor.observe(at + 1, Some((expected + 512, old_lost + lost)), true);
+        }
+        assert_eq!(floor.buckets.len(), 3);
+        assert_eq!(floor.floor(), 70.0 / 512.0);
+        // Large clear loss is capped; buckets expire; a regression resets.
+        let (expected, lost) = floor.previous.unwrap();
+        floor.observe(400_000, Some((expected + 512, lost + 500)), true);
+        assert_eq!(floor.floor(), 70.0 / 512.0);
+        floor.observe(
+            400_000 + LOSS_FLOOR_AGE_US,
+            Some((expected + 512, lost + 500)),
+            true,
+        );
+        assert_eq!(floor.floor(), 0.0);
+        floor.observe(400_000 + LOSS_FLOOR_AGE_US, Some((1, 0)), true);
+        assert!(floor.buckets.is_empty());
+        let mut capped = LossFloor {
+            buckets: VecDeque::from([(0, 0.6), (0, 0.7), (0, 0.8)]),
+            ..LossFloor::default()
+        };
+        assert_eq!(capped.floor(), LOSS_FLOOR_MAX);
+        capped.observe(0, None, true);
+        assert_eq!(capped.floor(), LOSS_FLOOR_MAX);
+    }
+
+    #[test]
+    fn random_loss_service_is_inert_when_disabled_and_survives_generations() {
+        let (mut controller, sample) = random_loss_fixture(false);
+        assert!(controller.compensate_delivery(&sample).is_none());
+        let mut enabled = PathController::new(1_000_000, 100).with_random_loss_service(true);
+        let mut next = observation(1_000, 50.0);
+        next.generation = 7;
+        enabled.observe(&next);
+        assert!(enabled.random_loss_service_enabled);
+        assert_eq!(enabled.last_control.random_loss_floor, Some(0.0));
     }
 
     #[test]

@@ -31,6 +31,11 @@ pub struct Options {
     /// queue, pacing credit, loss exemption or altered absolute RTT sample.
     #[arg(long)]
     pub rtt_source_baselines: bool,
+    /// Experimental random-loss service accounting; off by default. Delivery
+    /// is compensated only by a bounded loss floor learned at low queue delay.
+    /// No new queue, pacing credit or cap; queue/fast-loss brakes remain.
+    #[arg(long)]
+    pub random_loss_service: bool,
     /// Experimental native-window service recovery; off by default. Adaptive
     /// health, delay/loss brakes, native BBR and all configured caps remain.
     #[arg(long)]
@@ -651,6 +656,7 @@ impl ConnectionTrace {
 struct Inner {
     repair_usefulness_guard: bool,
     rtt_source_baselines: bool,
+    random_loss_service: bool,
     native_service_guard: bool,
     frontier_scheduler: bool,
     state: Mutex<State>,
@@ -704,6 +710,7 @@ impl Metrics {
             native_service_guard,
             rtt_source_baselines,
             false,
+            false,
         )
     }
     fn configured_repair(
@@ -713,10 +720,12 @@ impl Metrics {
         native_service_guard: bool,
         rtt_source_baselines: bool,
         repair_usefulness_guard: bool,
+        random_loss_service: bool,
     ) -> Self {
         Self(Arc::new(Inner {
             repair_usefulness_guard,
             rtt_source_baselines,
+            random_loss_service,
             native_service_guard,
             frontier_scheduler,
             state: Mutex::new(State::default()),
@@ -740,12 +749,23 @@ impl Metrics {
     pub fn rtt_source_baselines(&self) -> bool {
         self.0.rtt_source_baselines
     }
+    pub fn random_loss_service(&self) -> bool {
+        self.0.random_loss_service
+    }
     pub fn repair_usefulness_guard(&self) -> bool {
         self.0.repair_usefulness_guard
     }
     #[cfg(test)]
     pub(crate) fn new_with_repair_guard(role: &'static str, enabled: bool) -> Self {
-        Self::configured_repair(role, trace::Trace::disabled(), false, false, false, enabled)
+        Self::configured_repair(
+            role,
+            trace::Trace::disabled(),
+            false,
+            false,
+            false,
+            enabled,
+            false,
+        )
     }
     pub fn state(&self, f: impl FnOnce(&mut State)) {
         f(&mut self.0.state.lock().expect("stats lock"));
@@ -1124,6 +1144,10 @@ impl Reporter {
             "rtt-source-baselines applies only to a client or server sender"
         );
         ensure!(
+            !options.random_loss_service || matches!(role, "client" | "server"),
+            "random-loss-service applies only to a client or server sender"
+        );
+        ensure!(
             !options.native_service_guard || matches!(role, "client" | "server"),
             "native-service-guard applies only to a client or server sender"
         );
@@ -1164,6 +1188,7 @@ impl Reporter {
             options.native_service_guard,
             options.rtt_source_baselines,
             options.repair_usefulness_guard,
+            options.random_loss_service,
         );
         let periodic = jsonl.clone().map(|file| {
             let metrics = metrics.clone();
