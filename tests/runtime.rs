@@ -500,11 +500,17 @@ fn frontier_scheduler_preserves_real_three_path_integrity_and_publishes_gates() 
     three_paths(7);
 }
 #[test]
+fn frontier_with_dual_recovery_keeps_both_authenticated_lanes_and_budgets() {
+    three_paths(8);
+}
+#[test]
 fn persistent_bad_path_rejoins_with_new_udp_port() {
     three_paths(3);
 }
 fn three_paths(mode: u8) {
     let feedback = mode > 0;
+    let dual = matches!(mode, 6 | 8);
+    let frontier_enabled = matches!(mode, 7 | 8);
     let dir = tempfile::tempdir().unwrap();
     let identity = dir.path().join("identity");
     let ident = identity.to_str().unwrap();
@@ -545,17 +551,17 @@ fn three_paths(mode: u8) {
         ])
         .into_iter()
         .chain((mode >= 5).then(|| "--adaptive-fec-retention".to_owned()))
-        .chain((mode == 7).then(|| "--frontier-scheduler".to_owned()))
-        .chain((mode == 6).then(|| "--packet-trace".to_owned()))
-        .chain((mode == 6).then(|| {
+        .chain(frontier_enabled.then(|| "--frontier-scheduler".to_owned()))
+        .chain(dual.then(|| "--packet-trace".to_owned()))
+        .chain(dual.then(|| {
             dir.path()
                 .join("server-trace.jsonl")
                 .to_str()
                 .unwrap()
                 .to_owned()
         }))
-        .chain((mode == 6).then(|| "--max-rate-bps".to_owned()))
-        .chain((mode == 6).then(|| DUAL_FEC_TEST_RATE_BPS.to_string()))
+        .chain(dual.then(|| "--max-rate-bps".to_owned()))
+        .chain(dual.then(|| DUAL_FEC_TEST_RATE_BPS.to_string()))
         .collect::<Vec<_>>(),
         dir.path(),
         "server",
@@ -691,7 +697,7 @@ fn three_paths(mode: u8) {
             "--adaptive-fec-retention",
         ]));
     }
-    if mode == 6 {
+    if dual {
         client_args.extend(args(&[
             "--fec",
             "16",
@@ -707,12 +713,12 @@ fn three_paths(mode: u8) {
             .unwrap();
         client_args[index + 1] = "13".into();
     }
-    if mode == 7 {
+    if frontier_enabled {
         client_args.extend(args(&["--frontier-scheduler", "--adaptive"]));
     }
     let mut client = launch(&client_args, dir.path(), "client");
     ready(&mut client, "UDP client ready");
-    if mode == 7 {
+    if frontier_enabled {
         // Adaptive mode announces its first usable path, not completion of all
         // joins. This three-path fixture must await the actual third join.
         let until = Instant::now() + Duration::from_secs(12);
@@ -741,7 +747,7 @@ fn three_paths(mode: u8) {
             "--size",
             if mode == 4 { "128" } else { "700" },
             "--pps",
-            if mode == 6 { "2000" } else { "200" },
+            if dual { "2000" } else { "200" },
             "--deadline-ms",
             "1000",
         ]),
@@ -836,7 +842,7 @@ fn three_paths(mode: u8) {
             );
         }
     }
-    if mode == 6 {
+    if dual {
         let until = Instant::now() + Duration::from_secs(4);
         loop {
             let both = ["client-trace.jsonl", "server-trace.jsonl"]
@@ -946,7 +952,47 @@ fn three_paths(mode: u8) {
             thread::sleep(Duration::from_millis(100));
         }
     }
-    if mode == 7 {
+    if mode == 8 {
+        // Exercise the configured small lane too; bulk-only traffic cannot
+        // prove that finish preference and small-copy accounting coexist.
+        let result = run(&args(&[
+            "probe",
+            "--target",
+            &client_addr,
+            "--count",
+            "40",
+            "--size",
+            "128",
+            "--pps",
+            "20",
+            "--deadline-ms",
+            "200",
+        ]));
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let small: Value = serde_json::from_slice(&result.stdout).unwrap();
+        assert_eq!(small["corrupt"], 0);
+        assert_eq!(small["duplicate"], 0);
+        assert!(small["received"].as_u64().unwrap() >= 38, "{small}");
+        for (file, direction) in [
+            (&client_stats, "client_to_server"),
+            (&server_stats, "server_to_client"),
+        ] {
+            let d = latest_directions(file);
+            let s = &d[direction]["symbols"];
+            assert!(s["mixed_small_originals_generated"].as_u64().unwrap() > 0);
+            assert!(s["mixed_small_repairs_quinn_admitted"].as_u64().unwrap() > 0);
+            assert!(s["mixed_bulk_repairs_quinn_admitted"].as_u64().unwrap() > 0);
+            assert!(
+                s["mixed_bulk_repair_admitted_bytes"].as_u64().unwrap()
+                    <= s["mixed_bulk_original_admitted_bytes"].as_u64().unwrap() * 13 / 100
+            );
+        }
+    }
+    if frontier_enabled {
         for (file, direction) in [
             (&client_stats, "client_to_server"),
             (&server_stats, "server_to_client"),
