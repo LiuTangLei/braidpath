@@ -23,6 +23,9 @@ const LOSS_FLOOR_BUCKETS: usize = 6;
 const LOSS_FLOOR_MIN_BUCKETS: usize = 3;
 const LOSS_FLOOR_AGE_US: u64 = 10_000_000;
 const LOSS_FLOOR_MAX: f64 = 0.25;
+/// Queue-gated loss: loss-only brakes below this fraction of the latency
+/// target treat loss as path loss rather than congestion.
+const QUEUE_GATED_LOSS_FRACTION: f64 = 0.25;
 
 /// Finalized loss observed while this path's own queue signal was clear.
 /// The floor is the smallest recent bucket, so a congestion episode can only
@@ -78,6 +81,17 @@ impl LossFloor {
             .iter()
             .map(|(_, fraction)| *fraction)
             .fold(LOSS_FLOOR_MAX, f64::min)
+    }
+
+    /// Typical clear-queue loss for queue-gated pacing: the lower median, so a
+    /// single quiet bucket cannot hide sustained random loss. Same cap.
+    fn median(&self) -> f64 {
+        if self.buckets.len() < LOSS_FLOOR_MIN_BUCKETS {
+            return 0.0;
+        }
+        let mut fractions: Vec<f64> = self.buckets.iter().map(|(_, f)| *f).collect();
+        fractions.sort_by(f64::total_cmp);
+        fractions[(fractions.len() - 1) / 2].min(LOSS_FLOOR_MAX)
     }
 }
 
@@ -544,6 +558,9 @@ pub struct ControlSample {
     /// Local experiment: delivery compensated by this low-queue loss floor.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub random_loss_floor: Option<f64>,
+    /// Queue-gated loss experiment: loss-only brakes were held this sample.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub queue_gated_loss_hold: Option<bool>,
     /// Local opt-in, never negotiated from an untrusted peer. A native window
     /// is a sending allowance, not measured path capacity.
     pub native_service_guard_enabled: bool,
@@ -703,6 +720,7 @@ struct GrowthRetry {
 pub struct PathController {
     rtt_source_baselines_enabled: bool,
     random_loss_service_enabled: bool,
+    queue_gated_loss_enabled: bool,
     loss_floor: LossFloor,
     /// Raw and compensated cumulative delivered symbol bytes in this generation.
     compensated_delivery: Option<(u64, u64)>,
@@ -795,6 +813,7 @@ impl PathController {
             maximum_bps,
             rtt_source_baselines_enabled: false,
             random_loss_service_enabled: false,
+            queue_gated_loss_enabled: false,
             loss_floor: LossFloor::default(),
             compensated_delivery: None,
             source_local_min_rtt_ms: None,
@@ -886,6 +905,19 @@ impl PathController {
         self
     }
 
+    /// Throughput experiment, configured once like random-loss service (which
+    /// it implies). Loss alone does not brake while the queue stays shallow.
+    pub(crate) fn with_queue_gated_loss(mut self, enabled: bool) -> Self {
+        self.queue_gated_loss_enabled = enabled;
+        self.random_loss_service_enabled |= enabled;
+        self
+    }
+
+    /// Queue delay below which loss-only brakes are held (queue-gated mode).
+    fn queue_gated_loss_limit_ms(&self) -> f64 {
+        self.target_ms * QUEUE_GATED_LOSS_FRACTION
+    }
+
     /// Delivered bytes as if the low-queue loss floor had arrived. Every
     /// downstream deficit/growth comparison sees the same compensated report;
     /// it is clamped to admitted bytes, so it never exceeds what was sent.
@@ -895,6 +927,7 @@ impl PathController {
         }
         // Shallow drop-tail queues lose packets well below the delay brake.
         // Only a nearly empty queue can attribute loss to the path itself.
+        // Drop-tail loss below the queue-gated brake limit must not enter it.
         let clear_queue = self.queue_delay_ms <= (self.target_ms * 0.05).max(2.0)
             && !observation.transport_blocked
             && observation
@@ -907,7 +940,11 @@ impl PathController {
                 .zip(observation.finalized_lost),
             clear_queue,
         );
-        let floor = self.loss_floor.floor();
+        let floor = if self.queue_gated_loss_enabled {
+            self.loss_floor.median()
+        } else {
+            self.loss_floor.floor()
+        };
         let delivered = observation.delivered_bytes;
         let compensated = match self.compensated_delivery {
             Some((raw, compensated)) if delivered >= raw => {
@@ -1045,7 +1082,8 @@ impl PathController {
         if self.generation != Some(observation.generation) {
             *self = Self::new(self.maximum_bps, self.target_ms as u64)
                 .with_rtt_source_baselines(self.rtt_source_baselines_enabled)
-                .with_random_loss_service(self.random_loss_service_enabled);
+                .with_random_loss_service(self.random_loss_service_enabled)
+                .with_queue_gated_loss(self.queue_gated_loss_enabled);
             self.generation = Some(observation.generation);
             self.born_us = now;
             self.last_control_us = now;
@@ -1395,6 +1433,13 @@ impl PathController {
         }) && wire_delivery_bps
             .is_none_or(|rate| rate < self.rate_bps as f64 * 0.85);
         let delay_pressure = self.queue_delay_ms > self.target_ms * 0.5;
+        // Queue-gated mode: with a shallow queue and an unblocked transport,
+        // loss is path loss. Zero service, queue and blocked brakes still run.
+        let loss_hold = self.queue_gated_loss_enabled
+            && self.queue_delay_ms <= self.queue_gated_loss_limit_ms()
+            && !observation.transport_blocked;
+        // Growth holds for ordinary loss only where that loss could be queue loss.
+        let growth_ordinary_loss = ordinary_loss && !loss_hold;
         let persistent_delay = if delay_pressure {
             let since = *self.delay_since_us.get_or_insert(now);
             now.saturating_sub(since) >= BRAKE_US
@@ -1499,7 +1544,7 @@ impl PathController {
         // ordinary-loss capacity evidence or positive growth permission.
         let fast_loss_service_pressure =
             allowance_shortfall && now.saturating_sub(last_change) >= PROBE_US + BRAKE_US;
-        self.loss_pressure = ordinary_loss && settled_shortfall;
+        self.loss_pressure = ordinary_loss && settled_shortfall && !loss_hold;
         let probe_began_us = probe_fresh
             .then_some(observation.probe_age_us.zip(probe_rtt))
             .flatten()
@@ -1586,6 +1631,7 @@ impl PathController {
             && !observation.transport_blocked
             && wire_delivery_bps.is_some_and(|bps| bps > 0.0);
         let fast_loss_actionable = !probe_covered_loss
+            && !loss_hold
             && brake_loss
                 .as_ref()
                 .map_or(fast_loss, |evidence| evidence.actionable);
@@ -1621,6 +1667,7 @@ impl PathController {
             mixed_rtt_excess_ms,
             rtt_source_baseline_corrections: self.rtt_source_baseline_corrections,
             random_loss_floor,
+            queue_gated_loss_hold: self.queue_gated_loss_enabled.then_some(loss_hold),
             native_service_guard_enabled: false,
             native_service_hint_bps: None,
             at_us: now,
@@ -1782,10 +1829,11 @@ impl PathController {
         // invalidate every measurement. Zero service remains an immediate
         // deficit; queue, fast-loss and blocked-transport protections still run.
         let service_deficit_actionable = service_deficit
-            && ((!protect_ordinary_loss && !probe_covered_loss) || service_bps == Some(0.0));
+            && ((!protect_ordinary_loss && !probe_covered_loss && !loss_hold)
+                || service_bps == Some(0.0));
         let pressure = delay_pressure
             || (self.loss_pressure && !protect_ordinary_loss && !probe_covered_loss)
-            || (fast_loss && !probe_covered_loss && !historic_fast_loss_deferred)
+            || (fast_loss && !probe_covered_loss && !historic_fast_loss_deferred && !loss_hold)
             || blocked_pressure
             || service_deficit_actionable;
         if pressure {
@@ -2478,7 +2526,7 @@ impl PathController {
                 // Qualified newer evidence may release the shortfall guard,
                 // but grants no service memory or rate credit and never
                 // bypasses missing qualifications or the independent brakes.
-                && !(ordinary_loss
+                && !(growth_ordinary_loss
                     && (unqualified_loss_service
                         || (service_shortfall && !current_recovery_service)))
                 && observation.offered_backlog
@@ -2518,7 +2566,7 @@ impl PathController {
                 // discovery beyond retained delivery. Its arrival may precede
                 // this control tick; an intervening increase spends the credit.
                 // The receiver interval itself can overlap an earlier pace.
-                let service_discovery = !ordinary_loss
+                let service_discovery = !growth_ordinary_loss
                     && self.queue_delay_ms <= self.target_ms * 0.25
                     && observation
                         .positive_delivery_age_us
@@ -4320,6 +4368,74 @@ mod tests {
         enabled.observe(&next);
         assert!(enabled.random_loss_service_enabled);
         assert_eq!(enabled.last_control.random_loss_floor, Some(0.0));
+    }
+
+    fn queue_gated_fixture() -> (PathController, Observation) {
+        // Loss beyond the learned floor: random-loss service alone still brakes.
+        let (mut controller, mut sample) = random_loss_fixture(true);
+        controller.queue_gated_loss_enabled = true;
+        sample.delivered_bytes = 3_420_000;
+        sample.delivered_bps = Some(6_700_000.0);
+        (controller, sample)
+    }
+
+    #[test]
+    fn queue_gated_loss_holds_loss_only_brakes_while_the_queue_is_shallow() {
+        let (mut controller, sample) = queue_gated_fixture();
+        let before = controller.rate_bps;
+        controller.observe(&sample);
+        assert!(controller.queue_delay_ms <= 25.0);
+        assert_eq!(controller.last_control.queue_gated_loss_hold, Some(true));
+        assert!(controller.last_control.service_admission.unwrap().deficit);
+        assert!(!controller.loss_pressure);
+        assert_eq!(controller.rate_bps, before);
+        assert!(!controller.congestion_seen);
+    }
+
+    #[test]
+    fn queue_gated_loss_still_brakes_zero_service_and_loss_with_a_queue() {
+        let (mut controller, mut sample) = queue_gated_fixture();
+        let before = controller.rate_bps;
+        sample.delivered_bytes = 3_000_000;
+        sample.delivered_bps = Some(0.0);
+        controller.observe(&sample);
+        assert_eq!(controller.last_control.queue_gated_loss_hold, Some(true));
+        assert!(controller.rate_bps < before);
+
+        let (mut controller, mut sample) = queue_gated_fixture();
+        let before = controller.rate_bps;
+        // A blocked transport reopens every loss brake, like a queue would.
+        sample.transport_blocked = true;
+        controller.observe(&sample);
+        assert_eq!(controller.last_control.queue_gated_loss_hold, Some(false));
+        assert!(controller.rate_bps < before);
+    }
+
+    #[test]
+    fn queue_gated_loss_uses_the_lower_median_and_survives_generations() {
+        let floor = LossFloor {
+            buckets: VecDeque::from([(0, 0.08), (0, 0.17), (0, 0.15), (0, 0.19)]),
+            ..LossFloor::default()
+        };
+        assert_eq!(floor.floor(), 0.08);
+        assert_eq!(floor.median(), 0.15);
+        let capped = LossFloor {
+            buckets: VecDeque::from([(0, 0.6), (0, 0.7), (0, 0.8)]),
+            ..LossFloor::default()
+        };
+        assert_eq!(capped.median(), LOSS_FLOOR_MAX);
+        assert_eq!(LossFloor::default().median(), 0.0);
+
+        let mut enabled = PathController::new(1_000_000, 100).with_queue_gated_loss(true);
+        assert!(enabled.random_loss_service_enabled);
+        let mut next = observation(1_000, 50.0);
+        next.generation = 7;
+        enabled.observe(&next);
+        assert!(enabled.queue_gated_loss_enabled && enabled.random_loss_service_enabled);
+        assert!(enabled.last_control.queue_gated_loss_hold.is_some());
+        let mut disabled = PathController::new(1_000_000, 100);
+        disabled.observe(&next);
+        assert!(disabled.last_control.queue_gated_loss_hold.is_none());
     }
 
     #[test]

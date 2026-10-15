@@ -36,6 +36,11 @@ pub struct Options {
     /// No new queue, pacing credit or cap; queue/fast-loss brakes remain.
     #[arg(long)]
     pub random_loss_service: bool,
+    /// Experimental throughput pacing; off by default. Implies random-loss
+    /// service. Loss-only brakes need queue delay above a quarter of the
+    /// latency target; queue, blocked-transport and zero-service brakes remain.
+    #[arg(long)]
+    pub queue_gated_loss: bool,
     /// Experimental native-window service recovery; off by default. Adaptive
     /// health, delay/loss brakes, native BBR and all configured caps remain.
     #[arg(long)]
@@ -657,6 +662,7 @@ struct Inner {
     repair_usefulness_guard: bool,
     rtt_source_baselines: bool,
     random_loss_service: bool,
+    queue_gated_loss: bool,
     native_service_guard: bool,
     frontier_scheduler: bool,
     state: Mutex<State>,
@@ -711,8 +717,10 @@ impl Metrics {
             rtt_source_baselines,
             false,
             false,
+            false,
         )
     }
+    #[allow(clippy::too_many_arguments)]
     fn configured_repair(
         role: &'static str,
         trace: trace::Trace,
@@ -721,11 +729,13 @@ impl Metrics {
         rtt_source_baselines: bool,
         repair_usefulness_guard: bool,
         random_loss_service: bool,
+        queue_gated_loss: bool,
     ) -> Self {
         Self(Arc::new(Inner {
             repair_usefulness_guard,
             rtt_source_baselines,
             random_loss_service,
+            queue_gated_loss,
             native_service_guard,
             frontier_scheduler,
             state: Mutex::new(State::default()),
@@ -752,6 +762,9 @@ impl Metrics {
     pub fn random_loss_service(&self) -> bool {
         self.0.random_loss_service
     }
+    pub fn queue_gated_loss(&self) -> bool {
+        self.0.queue_gated_loss
+    }
     pub fn repair_usefulness_guard(&self) -> bool {
         self.0.repair_usefulness_guard
     }
@@ -764,6 +777,7 @@ impl Metrics {
             false,
             false,
             enabled,
+            false,
             false,
         )
     }
@@ -1148,6 +1162,10 @@ impl Reporter {
             "random-loss-service applies only to a client or server sender"
         );
         ensure!(
+            !options.queue_gated_loss || matches!(role, "client" | "server"),
+            "queue-gated-loss applies only to a client or server sender"
+        );
+        ensure!(
             !options.native_service_guard || matches!(role, "client" | "server"),
             "native-service-guard applies only to a client or server sender"
         );
@@ -1189,6 +1207,7 @@ impl Reporter {
             options.rtt_source_baselines,
             options.repair_usefulness_guard,
             options.random_loss_service,
+            options.queue_gated_loss,
         );
         let periodic = jsonl.clone().map(|file| {
             let metrics = metrics.clone();
