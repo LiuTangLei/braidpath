@@ -133,7 +133,22 @@ class Owned:
             raise RuntimeError('forced cleanup required; do not accept reference')
 
 
-def run_window(root, mode, binary, native, bundle, identity):
+def reference_profile(pilot_ack=None):
+    """The optional pilot is a distinct, fixed no-simulator readiness profile."""
+    if pilot_ack is None:
+        return dict(CASE), dict(SOURCE), 500_000_000
+    if pilot_ack not in ('every-two', 'every-eight'):
+        raise ValueError('only the two matched directional ACK requests are allowed')
+    case = dict(warmup_bulk_records=0, warmup_echo_requests=0,
+                bulk_count=20000, echo_count=200, business_bulk_records=20000,
+                business_echo_requests=200, warmup_seconds=0)
+    return case, {**SOURCE, 'bulk_pps': 2000}, 50_000_000
+
+
+def run_window(root, mode, binary, native, bundle, identity, *, pilot_ack=None):
+    case, source_spec, rate = reference_profile(pilot_ack)
+    if pilot_ack is not None and mode != 'overlay_adaptive':
+        raise ValueError('public pilot readiness must use the real adaptive HTTP/3 path')
     root.mkdir()
     owner=Owned(root)
     adapter, source_addr, listener, entrance = port(), port(), port(), port()
@@ -141,12 +156,13 @@ def run_window(root, mode, binary, native, bundle, identity):
     results_error=None
     usage0=resource.getrusage(resource.RUSAGE_CHILDREN)
     started=time.monotonic()
-    save_new(root/'case.json',dict(mode=mode,source=SOURCE,case=CASE,
+    save_new(root/'case.json',dict(mode=mode,source=source_spec,case=case,
+                                 pilot_ack_request=pilot_ack, rate_cap_bps=rate,
                                  addresses=dict(adapter=adapter,source=source_addr,listener=listener,entrance=entrance)))
     try:
         owner.launch('adapter',[sys.executable,'-B',bundle/'mixed_adapter.py','--listen',adapter,
-            '--source',source_addr,'--direction','reverse','--bulk-count',CASE['bulk_count'],
-            '--bulk-run-id',run,'--echo-ids',json.dumps({echo_run:CASE['echo_count']}),
+            '--source',source_addr,'--direction','reverse','--bulk-count',case['bulk_count'],
+            '--bulk-run-id',run,'--echo-ids',json.dumps({echo_run:case['echo_count']}),
             '--ready-file',root/'adapter/ready.json','--result-file',root/'adapter/result.json',
             '--lifetime-seconds','90'])
         wait_ready(owner.children[-1][1],root/'adapter/ready.json')
@@ -160,8 +176,9 @@ def run_window(root, mode, binary, native, bundle, identity):
         elif mode.startswith('overlay_'):
             server=owner.launch('server',[binary,'server','--listen',entrance,'--cert',identity/'cert.pem',
                 '--key',identity/'key.pem','--token-file',identity/'token','--target',adapter,
-                '--max-rate-bps','500000000','--datagram-send-buffer-bytes','9600',
-                '--stats-file',root/'server/stats.json','--stats-jsonl',root/'server/stats.jsonl','--stats-interval-ms','250'])
+                '--max-rate-bps',str(rate),'--datagram-send-buffer-bytes','9600',
+                '--stats-file',root/'server/stats.json','--stats-jsonl',root/'server/stats.jsonl','--stats-interval-ms','250',
+                *(['--ack-request',pilot_ack] if pilot_ack is not None else [])])
             # Server readiness has no app connection yet; retain finite JSON lifecycle check.
             deadline=time.monotonic()+8
             while True:
@@ -175,7 +192,7 @@ def run_window(root, mode, binary, native, bundle, identity):
             args=[binary,'client','--listen',listener,'--entrance',entrance,'--server-name','localhost',
                   '--ca',identity/'cert.pem','--token-file',identity/'token','--fec','0',
                   '--small-fec-bytes','0','--redundancy-percent','0','--receiver-feedback','--quality-schedule',
-                  '--rate-bps','500000000','--group-rate-bps','0:500000000',
+                  '--rate-bps',str(rate),'--group-rate-bps','0:'+str(rate),
                   '--queue-ms','100','--latency-target-ms','100','--datagram-send-buffer-bytes','9600',
                   '--stats-file',root/'client/stats.json','--stats-jsonl',root/'client/stats.jsonl','--stats-interval-ms','250']
             if mode=='overlay_adaptive':args+=['--adaptive']
@@ -184,17 +201,17 @@ def run_window(root, mode, binary, native, bundle, identity):
         else:
             listener=adapter
         source=owner.launch('source',[binary,'sink','--role','reverse-source','--listen',source_addr,
-            '--count',CASE['bulk_count'],'--pps',SOURCE['bulk_pps'],'--size','1000','--deadline-ms','200',
+            '--count',case['bulk_count'],'--pps',source_spec['bulk_pps'],'--size','1000','--deadline-ms','200',
             '--drain-ms','3000','--startup-timeout-ms','30000','--run-id',run,
             '--ready-file',root/'source/ready.json','--result-file',root/'source/result.json',
             '--samples-file',root/'source/samples.json'])
         wait_ready(source,root/'source/ready.json')
         bulk=owner.launch('bulk',[binary,'probe','--mode','receive','--target',listener,
-            '--count',CASE['bulk_count'],'--pps',SOURCE['bulk_pps'],'--size','1000','--deadline-ms','200',
+            '--count',case['bulk_count'],'--pps',source_spec['bulk_pps'],'--size','1000','--deadline-ms','200',
             '--drain-ms','3000','--startup-timeout-ms','30000','--run-id',run,
             '--result-file',root/'bulk/result.json','--samples-file',root/'bulk/samples.json'])
         echo=owner.launch('interactive',[sys.executable,'-B',bundle/'bpp2_echo.py','--target',listener,
-            '--count',CASE['echo_count'],'--pps','20','--size','128','--deadline-ms','200',
+            '--count',case['echo_count'],'--pps','20','--size','128','--deadline-ms','200',
             '--drain-ms','3000','--startup-timeout-ms','30000','--run-id',echo_run,
             '--result-file',root/'interactive/result.json','--samples-file',root/'interactive/samples.json'])
         until=time.monotonic()+45
@@ -220,7 +237,7 @@ def run_window(root, mode, binary, native, bundle, identity):
     for role in reports:
         assert reports[role]['pid']==read(root/role/'launch.json')['pid']
     phase=analyze(samples['source'],samples['bulk'],samples['interactive'],reports['source'],
-        reports['bulk'],reports['interactive'],CASE,SOURCE)
+        reports['bulk'],reports['interactive'],case,source_spec)
     endpoints={}
     if mode!='udp':
         for role in ['server','client']:
