@@ -257,6 +257,45 @@ fn source_interval(pps: u32) -> (Duration, tokio::time::Interval) {
     (period, tick)
 }
 
+#[cfg(test)]
+mod source_burst_clock_tests {
+    use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn delay_mode_still_releases_eighty_overdue_ticks_after_two_ms() {
+        let (period, mut tick) = source_interval(40_000);
+        assert_eq!(period, Duration::from_micros(25));
+        let first = tick.tick().await;
+        tokio::time::advance(Duration::from_millis(2)).await;
+        let resumed = tokio::time::Instant::now();
+        let due_count = ((resumed - first).as_nanos() / period.as_nanos()) as u32;
+        assert_eq!(due_count, 80);
+        for seq in 1..=due_count {
+            assert_eq!(tick.tick().await, first + period * seq);
+            assert_eq!(
+                tokio::time::Instant::now(),
+                resumed,
+                "sub-threshold overdue ticks need no new timer wait"
+            );
+        }
+        // This demonstrates source pressure only. It does not claim a tunnel
+        // drop: concurrent path service may consume packets during that burst.
+        assert!(due_count as usize > crate::runtime::outbound::PER_FLOW_LIMIT);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn delay_mode_reanchors_after_ten_ms_without_hiding_nominal_slip() {
+        let (period, mut tick) = source_interval(40_000);
+        let first = tick.tick().await;
+        tokio::time::advance(Duration::from_millis(10)).await;
+        let resumed = tokio::time::Instant::now();
+        assert_eq!(tick.tick().await, first + period);
+        let next = tick.tick().await;
+        assert_eq!(next, resumed + period);
+        assert!(next > first + period * 2);
+    }
+}
+
 struct State {
     shutdown: Shutdown,
     samples: Vec<Option<Sample>>,
