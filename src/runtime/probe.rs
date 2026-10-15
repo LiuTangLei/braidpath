@@ -23,7 +23,8 @@ const REGISTRATION_ATTEMPTS: u32 = 3;
 // Validation precedes the two per-record allocations, and sample output streams
 // one record at a time instead of building a second JSON object tree in memory.
 const MAX_RECORDS: u32 = 1_000_000;
-const MAX_PPS: u32 = 40_000;
+// 50 kpps x 1000 B is the 400 Mbps four-route bench source.
+const MAX_PPS: u32 = 50_000;
 const MAX_SEND_SPAN_SECONDS: u64 = 180;
 
 #[derive(Clone, Copy, Debug, ValueEnum, Serialize, PartialEq)]
@@ -1419,8 +1420,9 @@ mod tests {
         for (count, pps, valid) in [
             (600_000, 5_000, true),
             (1_000_000, 40_000, true),
+            (1_000_000, 50_000, true),
             (1_000_001, 40_000, false),
-            (1_000_000, 40_001, false),
+            (1_000_000, 50_001, false),
             (180_001, 1_000, true),
             (180_002, 1_000, false),
             (0, 1_000, false),
