@@ -23,6 +23,10 @@ const MAX_RETIRED_SESSIONS: usize = 8;
 
 #[derive(Args, Clone, Default)]
 pub struct Options {
+    /// Experimental per-RTT-source queue baselines; off by default. No new
+    /// queue, pacing credit, loss exemption or altered absolute RTT sample.
+    #[arg(long)]
+    pub rtt_source_baselines: bool,
     /// Experimental native-window service recovery; off by default. Adaptive
     /// health, delay/loss brakes, native BBR and all configured caps remain.
     #[arg(long)]
@@ -635,6 +639,7 @@ impl ConnectionTrace {
     }
 }
 struct Inner {
+    rtt_source_baselines: bool,
     native_service_guard: bool,
     frontier_scheduler: bool,
     state: Mutex<State>,
@@ -672,7 +677,17 @@ impl Metrics {
         frontier_scheduler: bool,
         native_service_guard: bool,
     ) -> Self {
+        Self::configured_rtt(role, trace, frontier_scheduler, native_service_guard, false)
+    }
+    fn configured_rtt(
+        role: &'static str,
+        trace: trace::Trace,
+        frontier_scheduler: bool,
+        native_service_guard: bool,
+        rtt_source_baselines: bool,
+    ) -> Self {
         Self(Arc::new(Inner {
+            rtt_source_baselines,
             native_service_guard,
             frontier_scheduler,
             state: Mutex::new(State::default()),
@@ -692,6 +707,9 @@ impl Metrics {
     }
     pub fn native_service_guard(&self) -> bool {
         self.0.native_service_guard
+    }
+    pub fn rtt_source_baselines(&self) -> bool {
+        self.0.rtt_source_baselines
     }
     pub fn state(&self, f: impl FnOnce(&mut State)) {
         f(&mut self.0.state.lock().expect("stats lock"));
@@ -1061,6 +1079,10 @@ fn distinct_output_paths(paths: &[Option<&FsPath>]) -> Result<()> {
 impl Reporter {
     pub fn new(role: &'static str, options: Options) -> Result<Self> {
         ensure!(
+            !options.rtt_source_baselines || matches!(role, "client" | "server"),
+            "rtt-source-baselines applies only to a client or server sender"
+        );
+        ensure!(
             !options.native_service_guard || matches!(role, "client" | "server"),
             "native-service-guard applies only to a client or server sender"
         );
@@ -1094,11 +1116,12 @@ impl Reporter {
                     .map(|f| Arc::new(Mutex::new(f)))
             })
             .transpose()?;
-        let metrics = Metrics::configured_service(
+        let metrics = Metrics::configured_rtt(
             role,
             capture,
             options.frontier_scheduler,
             options.native_service_guard,
+            options.rtt_source_baselines,
         );
         let periodic = jsonl.clone().map(|file| {
             let metrics = metrics.clone();

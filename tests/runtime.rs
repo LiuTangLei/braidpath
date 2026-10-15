@@ -308,6 +308,15 @@ fn native_service_guard_preserves_four_connection_uncoded_integrity() {
 }
 
 fn four_connection_integrity(native_service_guard: bool) {
+    four_connection_profile(native_service_guard, false);
+}
+
+#[test]
+fn rtt_source_baselines_preserve_four_connection_integrity_and_local_opt_in() {
+    four_connection_profile(false, true);
+}
+
+fn four_connection_profile(native_service_guard: bool, rtt_source_baselines: bool) {
     use std::collections::BTreeSet;
     let dir = tempfile::tempdir().unwrap();
     let identity = dir.path().join("identity");
@@ -354,6 +363,7 @@ fn four_connection_integrity(native_service_guard: bool) {
         ])
         .into_iter()
         .chain(native_service_guard.then(|| "--native-service-guard".to_owned()))
+        .chain(rtt_source_baselines.then(|| "--rtt-source-baselines".to_owned()))
         .collect::<Vec<_>>(),
         dir.path(),
         "server",
@@ -390,6 +400,9 @@ fn four_connection_integrity(native_service_guard: bool) {
     }
     if native_service_guard {
         client_args.push("--native-service-guard".into());
+    }
+    if rtt_source_baselines {
+        client_args.push("--rtt-source-baselines".into());
     }
     let mut client = launch(&client_args, dir.path(), "client");
     let until = Instant::now() + Duration::from_secs(12);
@@ -462,6 +475,8 @@ fn four_connection_integrity(native_service_guard: bool) {
                         path["sending_direction"] == direction
                             && path["adaptive"]["last_control"]["native_service_guard_enabled"]
                                 == native_service_guard
+                            && path["adaptive"]["last_control"]["rtt_source_baselines_enabled"]
+                                == rtt_source_baselines
                     })
             });
             if observed {

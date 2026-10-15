@@ -471,6 +471,14 @@ impl GrowthMonitor {
 
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct ControlSample {
+    /// Local experiment: compare the selected RTT only with its own source's
+    /// minimum. Absolute RTTs and the legacy mixed minimum remain observable.
+    pub rtt_source_baselines_enabled: bool,
+    pub source_local_min_rtt_ms: Option<f64>,
+    pub source_probe_min_rtt_ms: Option<f64>,
+    pub mixed_rtt_excess_ms: f64,
+    /// Observation count, not saved packets or a count of prevented brakes.
+    pub rtt_source_baseline_corrections: u64,
     /// Local opt-in, never negotiated from an untrusted peer. A native window
     /// is a sending allowance, not measured path capacity.
     pub native_service_guard_enabled: bool,
@@ -628,6 +636,11 @@ struct GrowthRetry {
 }
 
 pub struct PathController {
+    rtt_source_baselines_enabled: bool,
+    source_local_min_rtt_ms: Option<f64>,
+    source_probe_min_rtt_ms: Option<f64>,
+    source_probe_sample_id: Option<u64>,
+    rtt_source_baseline_corrections: u64,
     maximum_bps: u64,
     target_ms: f64,
     generation: Option<u64>,
@@ -711,6 +724,11 @@ impl PathController {
         let maximum_bps = max_rate_bps.max(1);
         Self {
             maximum_bps,
+            rtt_source_baselines_enabled: false,
+            source_local_min_rtt_ms: None,
+            source_probe_min_rtt_ms: None,
+            source_probe_sample_id: None,
+            rtt_source_baseline_corrections: 0,
             target_ms: latency_target_ms.max(1) as f64,
             generation: None,
             born_us: 0,
@@ -780,6 +798,13 @@ impl PathController {
 
     pub fn observe(&mut self, observation: &Observation) {
         self.observe_inner(observation, None);
+    }
+
+    /// Configure once at creation. A new path generation retains the local
+    /// setting but cannot inherit another generation's RTT samples or credit.
+    pub(crate) fn with_rtt_source_baselines(mut self, enabled: bool) -> Self {
+        self.rtt_source_baselines_enabled = enabled;
+        self
     }
 
     /// Opt-in independent-stream credit. Ordinary callers retain every old gate.
@@ -893,7 +918,8 @@ impl PathController {
     ) {
         let now = observation.now_us;
         if self.generation != Some(observation.generation) {
-            *self = Self::new(self.maximum_bps, self.target_ms as u64);
+            *self = Self::new(self.maximum_bps, self.target_ms as u64)
+                .with_rtt_source_baselines(self.rtt_source_baselines_enabled);
             self.generation = Some(observation.generation);
             self.born_us = now;
             self.last_control_us = now;
@@ -1102,6 +1128,41 @@ impl PathController {
             let minimum = self.min_rtt_ms.get_or_insert(rtt);
             *minimum = (*minimum).min(rtt);
             rtt_excess = (rtt - *minimum).max(0.0);
+        }
+        let mixed_rtt_excess_ms = rtt_excess;
+        // Independent shadow minima are updated in both modes, so opt-in does
+        // not change which samples are collected. The diagnostic-only minima
+        // below remain diagnostic-only and are not used as control state.
+        if fresh && let Some(local) = local_rtt {
+            let minimum = self.source_local_min_rtt_ms.get_or_insert(local);
+            *minimum = (*minimum).min(local);
+        }
+        if probe_fresh
+            && self
+                .source_probe_sample_id
+                .is_none_or(|id| observation.probe_sample_id > id)
+            && let Some(probe) = probe_rtt
+        {
+            let minimum = self.source_probe_min_rtt_ms.get_or_insert(probe);
+            *minimum = (*minimum).min(probe);
+            self.source_probe_sample_id = Some(observation.probe_sample_id);
+        }
+        if self.rtt_source_baselines_enabled
+            && fresh
+            && let Some(selected) = rtt
+        {
+            let minimum = if local_rtt == Some(selected) {
+                self.source_local_min_rtt_ms
+            } else {
+                self.source_probe_min_rtt_ms
+            };
+            if let Some(minimum) = minimum {
+                rtt_excess = (selected - minimum).max(0.0);
+                if mixed_rtt_excess_ms - rtt_excess > 0.25 {
+                    self.rtt_source_baseline_corrections =
+                        self.rtt_source_baseline_corrections.saturating_add(1);
+                }
+            }
         }
         let service_sample = self
             .fast_feedback_seen
@@ -1322,7 +1383,11 @@ impl PathController {
         // brake watermark, nor borrow authority from a small local RTT change.
         let severe_local = fresh
             && local_rtt
-                .zip(self.min_rtt_ms)
+                .zip(if self.rtt_source_baselines_enabled {
+                    self.source_local_min_rtt_ms
+                } else {
+                    self.min_rtt_ms
+                })
                 .is_some_and(|(local, minimum)| local - minimum >= self.target_ms * 4.0);
         let severe_probe = new_probe
             && probe_began_us
@@ -1421,6 +1486,11 @@ impl PathController {
             None => RttSource::Unavailable,
         };
         self.last_control = ControlSample {
+            rtt_source_baselines_enabled: self.rtt_source_baselines_enabled,
+            source_local_min_rtt_ms: self.source_local_min_rtt_ms,
+            source_probe_min_rtt_ms: self.source_probe_min_rtt_ms,
+            mixed_rtt_excess_ms,
+            rtt_source_baseline_corrections: self.rtt_source_baseline_corrections,
             native_service_guard_enabled: false,
             native_service_hint_bps: None,
             at_us: now,
@@ -9922,6 +9992,134 @@ mod tests {
         sample.probe_latest_rtt_ms = sample.probe_rtt_ms;
         sample.probe_age_us = probe.map(|(_, _, age)| age);
         sample
+    }
+
+    #[test]
+    fn rtt_sources_stable_offsets_do_not_become_queue_or_extra_tokens() {
+        let mut legacy = PathController::new(START_BPS, 20);
+        let mut fixed = PathController::new(START_BPS, 20).with_rtt_source_baselines(true);
+        for now in [0, 600_000, 700_000] {
+            let sample = rtt_evidence_observation(now, 100.0, Some((1, 80.0, now)));
+            legacy.observe(&sample);
+            fixed.observe(&sample);
+        }
+        assert_eq!(
+            legacy.rate_bps, 236_800,
+            "retain the legacy negative control"
+        );
+        assert_eq!(fixed.rate_bps, START_BPS);
+        assert_eq!(fixed.queue_delay_ms, 0.0);
+        assert!(fixed.last_brake_us.is_none());
+        let s = &fixed.last_control;
+        assert_eq!(s.selected_rtt_ms, Some(100.0));
+        assert_eq!(s.mixed_min_rtt_ms, Some(80.0));
+        assert_eq!(s.source_local_min_rtt_ms, Some(100.0));
+        assert_eq!(s.source_probe_min_rtt_ms, Some(80.0));
+        assert_eq!(s.mixed_rtt_excess_ms, 20.0);
+        assert_eq!(s.rtt_excess_ms, 0.0);
+        assert_eq!(s.rtt_source_baseline_corrections, 2);
+        assert!(
+            !fixed.allow(700_000, 100, 21.0),
+            "original deadline unchanged"
+        );
+        // No immediate grant: old remaining credit, not the removed RTT offset,
+        // bounds admissions at this same instant.
+        fixed.tokens = 0.0;
+        fixed.observe(&rtt_evidence_observation(
+            700_000,
+            100.0,
+            Some((1, 80.0, 700_000)),
+        ));
+        assert_eq!(fixed.tokens, 0.0);
+        assert!(!fixed.allow(700_000, 1, 0.0));
+    }
+
+    #[test]
+    fn rtt_sources_real_rise_in_either_estimator_still_brakes() {
+        for use_probe in [false, true] {
+            let mut c = PathController::new(START_BPS, 20).with_rtt_source_baselines(true);
+            let local = if use_probe { 200.0 } else { 100.0 };
+            c.observe(&rtt_evidence_observation(0, local, Some((1, 80.0, 0))));
+            for now in [600_000, 700_000] {
+                let sample = if use_probe {
+                    rtt_evidence_observation(now, local, Some((2, 110.0, now - 600_000)))
+                } else {
+                    rtt_evidence_observation(now, 130.0, Some((1, 80.0, now)))
+                };
+                c.observe(&sample);
+            }
+            assert_eq!(c.last_control.rtt_excess_ms, 30.0);
+            assert!(c.rate_bps < START_BPS, "source={use_probe}");
+            assert!(c.last_brake_us.is_some());
+        }
+    }
+
+    #[test]
+    fn rtt_sources_preserve_socket_pressure_and_fast_loss_brakes() {
+        for loss in [false, true] {
+            let mut c = PathController::new(START_BPS, 20).with_rtt_source_baselines(true);
+            c.observe(&rtt_evidence_observation(0, 100.0, Some((1, 80.0, 0))));
+            let mut sample = rtt_evidence_observation(600_000, 100.0, Some((2, 80.0, 0)));
+            if loss {
+                sample.feedback_sample_symbols = 64;
+                sample.loss_sample_rate = Some(1.0);
+                sample.loss_rate = 1.0;
+                sample.finalized_expected = Some(64);
+                sample.finalized_lost = Some(64);
+                sample.delivered_bytes = 0;
+                sample.delivered_bps = Some(0.0);
+            } else {
+                sample.send_queue_bytes = 5000;
+            }
+            c.observe(&sample);
+            assert!(c.rate_bps < START_BPS, "loss={loss}");
+            if loss {
+                assert!(c.last_control.fast_loss);
+            } else {
+                assert_eq!(c.last_control.transport_wait_ms, 81.25);
+            }
+        }
+    }
+
+    #[test]
+    fn rtt_sources_unknown_stale_replayed_and_new_generations_keep_separate_state() {
+        let mut c = PathController::new(START_BPS, 20).with_rtt_source_baselines(true);
+        c.observe(&rtt_evidence_observation(0, 100.0, Some((7, 80.0, 0))));
+        c.observe(&rtt_evidence_observation(100_000, 100.0, Some((6, 1.0, 0))));
+        assert_eq!(c.source_probe_min_rtt_ms, Some(80.0));
+        let mut stale = rtt_evidence_observation(4_000_000, f64::NAN, Some((8, 1.0, FRESH_US + 1)));
+        stale.positive_delivery_age_us = None;
+        c.observe(&stale);
+        assert_eq!(c.source_probe_min_rtt_ms, Some(80.0));
+        assert_eq!(c.source_local_min_rtt_ms, Some(100.0));
+        assert_eq!(c.last_control.selected_rtt_ms, None);
+        let mut next = rtt_evidence_observation(4_500_000, 220.0, Some((1, 200.0, 0)));
+        next.generation += 1;
+        c.observe(&next);
+        assert!(c.rtt_source_baselines_enabled);
+        assert_eq!(c.source_local_min_rtt_ms, Some(220.0));
+        assert_eq!(c.source_probe_min_rtt_ms, Some(200.0));
+        assert_eq!(c.rtt_source_baseline_corrections, 0);
+    }
+
+    #[test]
+    fn rtt_sources_equal_estimators_keep_existing_admission_and_brake_behavior() {
+        let mut legacy = PathController::new(2_000_000, 20);
+        let mut fixed = PathController::new(2_000_000, 20).with_rtt_source_baselines(true);
+        for now in (0..=2_000_000).step_by(100_000) {
+            let rtt = if (500_000..1_000_000).contains(&now) {
+                140.0
+            } else {
+                100.0
+            };
+            let sample = rtt_evidence_observation(now, rtt, Some((now / 100_000 + 1, rtt, 0)));
+            legacy.observe(&sample);
+            fixed.observe(&sample);
+            assert_eq!(legacy.rate_bps, fixed.rate_bps);
+            assert_eq!(legacy.queue_delay_ms, fixed.queue_delay_ms);
+            assert_eq!(legacy.tokens, fixed.tokens);
+            assert_eq!(legacy.allow(now, 1000, 0.0), fixed.allow(now, 1000, 0.0));
+        }
     }
 
     #[test]

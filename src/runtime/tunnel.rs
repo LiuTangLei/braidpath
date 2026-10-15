@@ -1313,6 +1313,7 @@ async fn sender(
     let mut scheduler = scheduler::Scheduler::default();
     let mut controllers: [adaptive::PathController; MAX_PATHS] = std::array::from_fn(|_| {
         adaptive::PathController::new(policy.rate, policy.latency_target_ms)
+            .with_rtt_source_baselines(metrics.metrics.rtt_source_baselines())
     });
     let burst = if policy.adaptive { 2400 } else { 9600 };
     let mut pacer = outbound::Pacer::for_sender(policy.rate, burst);
