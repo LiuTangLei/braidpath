@@ -2002,12 +2002,21 @@ impl PathController {
         // qualified actual-admission deficit still permits a safety brake.
         let active_demand =
             observation.offered_backlog || exercised || blocked_pressure || service_deficit;
+        // Queue-gated mode reduces at most once per current RTT (queue included):
+        // a queue reading still rising from pre-brake traffic is not new pressure.
+        // Severe queues and zero service keep the original short debounce.
+        let brake_interval_us =
+            if self.queue_gated_loss_enabled && !severe_pressure && service_bps != Some(0.0) {
+                rtt.map_or(BRAKE_US, |ms| BRAKE_US.max((ms * 1000.0) as u64))
+            } else {
+                BRAKE_US
+            };
         if self.eligible
             && active_demand
             && new_pressure
             && self
                 .last_brake_us
-                .is_none_or(|at| now.saturating_sub(at) >= BRAKE_US)
+                .is_none_or(|at| now.saturating_sub(at) >= brake_interval_us)
         {
             // Pace below the observed drain while a queue exists. A single old
             // RTT/loss value cannot cause repeated multiplicative reductions.
@@ -4409,6 +4418,37 @@ mod tests {
         controller.observe(&sample);
         assert_eq!(controller.last_control.queue_gated_loss_hold, Some(false));
         assert!(controller.rate_bps < before);
+    }
+
+    #[test]
+    fn queue_gated_loss_brakes_a_rising_queue_at_most_once_per_rtt() {
+        let brakes = |gated: bool| {
+            let mut controller = PathController::new(100_000_000, 100).with_queue_gated_loss(gated);
+            let mut now = 0;
+            while now <= 1_000_000 {
+                exercise_budget(&mut controller, now, 50_000);
+                controller.observe(&observation(now, 80.0));
+                now += 50_000;
+            }
+            let start = controller.rate_changes.len();
+            // Queue delay keeps rising for 300 ms after the first brake, as
+            // in-flight pre-brake traffic drains: 70 ms then +12 ms per 50 ms.
+            for step in 0..6u64 {
+                exercise_budget(&mut controller, now, 50_000);
+                controller.observe(&observation(now, 150.0 + 12.0 * step as f64));
+                now += 50_000;
+            }
+            controller
+                .rate_changes
+                .iter()
+                .skip(start)
+                .filter(|change| matches!(change.reason, RateReason::QueueBrake))
+                .count()
+        };
+        let baseline = brakes(false);
+        let gated = brakes(true);
+        assert!(baseline >= 2, "baseline repeats the brake: {baseline}");
+        assert_eq!(gated, 1);
     }
 
     #[test]
