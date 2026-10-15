@@ -56,7 +56,19 @@ packet pacer uses cwnd/RTT. UDP I/O operations are transmit batches: their ratio
 to datagrams does not by itself prove system calls or GSO usage.
 `--mode adaptive` is explicit; congestion remains BBR. An optional
 `--datagram-buffer-bytes` forwards the runtime buffer flag for separately registered
-experiments and does not change the runtime default.
+experiments to both endpoints and does not change the runtime default.
+`--mode native-service` selects adaptive original-only traffic without capacity
+probes or probe-guided recovery. Its optional `--native-service-guard` enables
+the local experiment on both endpoints. `--paths 0`, `--paths 0 0 0 0`, and
+`--paths 0 1 2 3` select a single connection, four connections sharing one physical
+link, and four independent links respectively; repeated indices retain distinct
+source ports and share the same physical queue and rate limit. Total budgets,
+deadlines, BBR and the other physical links' calibration remain unchanged.
+The source sample file and summary retain actual source timestamps, the overall
+offered rate, and each nominal one-second cohort's rate. Any cohort below the
+existing 95 percent source floor invalidates the measurement; its raw data and
+delivery summary remain available. Source qualification does not replace the
+300 Mbps and 95-percent-within-200-ms joint delivery gate.
 The runtime `--datagram-send-buffer-bytes` option is available independently on
 client and server. Reverse-direction experiments must configure the server's
 outgoing buffer; the client option only configures that client's outgoing bytes.

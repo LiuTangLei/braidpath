@@ -207,6 +207,7 @@ pub struct Decision {
 pub struct Snapshot {
     #[serde(flatten)]
     pub decision: Decision,
+    pub native_service_recoveries: u64,
     pub reprobe: reprobe::Snapshot,
     pub probe_service: Option<probe_service::Reference>,
     pub rate_changes: VecDeque<RateChange>,
@@ -219,6 +220,7 @@ pub struct Snapshot {
 #[serde(rename_all = "snake_case")]
 pub enum RateReason {
     NativeStartup,
+    NativeServiceRecovery,
     InitialGrowth,
     KnownServiceRecovery,
     CautiousGrowth,
@@ -469,6 +471,11 @@ impl GrowthMonitor {
 
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct ControlSample {
+    /// Local opt-in, never negotiated from an untrusted peer. A native window
+    /// is a sending allowance, not measured path capacity.
+    pub native_service_guard_enabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub native_service_hint_bps: Option<u64>,
     pub at_us: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub native_startup_cwnd_bytes: Option<u64>,
@@ -694,6 +701,7 @@ pub struct PathController {
     probe_service: probe_service::Window,
     rate_changes: VecDeque<RateChange>,
     rate_changes_total: u64,
+    native_service_recoveries: u64,
     last_control: ControlSample,
 }
 
@@ -765,6 +773,7 @@ impl PathController {
             probe_service: probe_service::Window::default(),
             rate_changes: VecDeque::new(),
             rate_changes_total: 0,
+            native_service_recoveries: 0,
             last_control: ControlSample::default(),
         }
     }
@@ -813,6 +822,67 @@ impl PathController {
                 self.last_control.native_startup_rtt_us = Some(rtt_us);
                 self.record_rate_change(observation.now_us, previous, RateReason::NativeStartup);
             }
+        }
+    }
+
+    /// Renew native service only with a NEW positive receiver report and a
+    /// clear local delay guard. Unlike disabling adaptive control, this cannot
+    /// undo a brake, bypass health/deadlines, or manufacture burst tokens.
+    pub(crate) fn observe_native_service(
+        &mut self,
+        observation: &Observation,
+        cwnd_bytes: u64,
+        rtt_us: u64,
+    ) {
+        let previous_generation = self.generation;
+        let previous_report = self.last_report;
+        let previous_rate = self.rate_bps;
+        self.observe_native(observation, None, cwnd_bytes, rtt_us);
+        self.last_control.native_service_guard_enabled = true;
+        let now = observation.now_us;
+        let native_bps = (rtt_us > 0 && cwnd_bytes > 0).then(|| {
+            (u128::from(cwnd_bytes) * 8_000_000 / u128::from(rtt_us))
+                .min(u128::from(self.maximum_bps)) as u64
+        });
+        self.last_control.native_service_hint_bps = native_bps;
+        let fresh_positive = observation
+            .positive_delivery_age_us
+            .is_some_and(|age| age <= CONTROL_US)
+            && observation
+                .feedback_age_us
+                .is_some_and(|age| age <= CONTROL_US);
+        let new_positive = previous_generation == Some(observation.generation)
+            && previous_report.is_some_and(|(number, bytes, _)| {
+                observation.report_number > number && observation.delivered_bytes > bytes
+            });
+        let eligible = self.decision(now).eligible
+            && observation.offered_backlog
+            && fresh_positive
+            && new_positive
+            && !observation.transport_blocked
+            && self.queue_delay_ms <= self.target_ms * 0.25
+            && !self.loss_pressure
+            && !self.last_control.fast_loss
+            && !self.reprobe.active()
+            && self.rate_bps >= previous_rate
+            && now >= self.growth_not_before_us
+            && now.saturating_sub(self.last_growth_us) >= rtt_us.max(10_000)
+            && self.last_brake_us.is_none_or(|brake| {
+                now.saturating_sub(brake) >= RETRY_GROWTH_US.max(rtt_us.saturating_mul(2))
+                    && observation.positive_delivery_age_us.is_some_and(|age| {
+                        now.checked_sub(age)
+                            .is_some_and(|delivered| delivered > brake)
+                    })
+            });
+        if eligible && let Some(native_bps) = native_bps.filter(|rate| *rate > self.rate_bps) {
+            // At most one doubling per native RTT. Existing admission tokens
+            // were integrated at the old rate by observe_native; changing the
+            // allowance below grants no instantaneous sending credit.
+            let previous = self.rate_bps;
+            self.rate_bps = native_bps.min(previous.saturating_mul(2));
+            self.last_growth_us = now;
+            self.native_service_recoveries = self.native_service_recoveries.saturating_add(1);
+            self.record_rate_change(now, previous, RateReason::NativeServiceRecovery);
         }
     }
 
@@ -1351,6 +1421,8 @@ impl PathController {
             None => RttSource::Unavailable,
         };
         self.last_control = ControlSample {
+            native_service_guard_enabled: false,
+            native_service_hint_bps: None,
             at_us: now,
             native_startup_cwnd_bytes: None,
             native_startup_rtt_us: None,
@@ -2730,6 +2802,7 @@ impl PathController {
 
     pub fn snapshot(&self, now_us: u64) -> Snapshot {
         Snapshot {
+            native_service_recoveries: self.native_service_recoveries,
             decision: self.decision(now_us),
             reprobe: self.reprobe.snapshot(),
             probe_service: self.probe_service.reference(now_us),
@@ -2950,6 +3023,156 @@ impl PathController {
 mod tests {
     use super::*;
     use std::collections::VecDeque;
+
+    fn native_service_fixture() -> (PathController, Observation) {
+        let mut controller = PathController::new(100_000_000, 100);
+        let mut sample = observation(0, 50.0);
+        sample.report_number = 1;
+        sample.delivered_bytes = 0;
+        sample.delivered_bps = None;
+        controller.observe_native(&sample, None, 12_000, 50_000);
+        // A previously cautious path can have ample native service even when
+        // its application allowance remains small. No brake is pending here.
+        controller.congestion_seen = true;
+        let admitted = exercise_budget(&mut controller, 0, 100_000);
+        sample.now_us = 100_000;
+        sample.report_number = 2;
+        sample.delivered_bytes = admitted;
+        sample.delivered_bps = Some(admitted as f64 * 80.0);
+        sample.delivery_sample_span_us = 100_000;
+        sample.delivery_report_time_us = Some(100_000);
+        (controller, sample)
+    }
+
+    #[test]
+    fn native_service_recovers_clean_native_allowance_without_tokens_or_capacity_claim() {
+        let (mut ordinary, sample) = native_service_fixture();
+        let (mut candidate, _) = native_service_fixture();
+        ordinary.observe_native(&sample, None, 200_000, 50_000);
+        candidate.observe_native_service(&sample, 200_000, 50_000);
+        assert!(candidate.rate_bps > ordinary.rate_bps);
+        assert!(candidate.rate_bps <= ordinary.rate_bps * 2);
+        assert_eq!(candidate.tokens, ordinary.tokens);
+        assert_eq!(candidate.remembered_bps, ordinary.remembered_bps);
+        assert!(!ordinary.last_control.native_service_guard_enabled);
+        assert!(candidate.last_control.native_service_guard_enabled);
+        assert_eq!(
+            candidate.last_control.native_service_hint_bps,
+            Some(32_000_000)
+        );
+        assert!(matches!(
+            candidate.rate_changes.back().unwrap().reason,
+            RateReason::NativeServiceRecovery
+        ));
+        assert!(!candidate.allow(sample.now_us, 1000, 101.0));
+    }
+
+    #[test]
+    fn native_service_requires_new_positive_fresh_unblocked_demand_and_no_pressure() {
+        for case in 0..11 {
+            let (mut controller, mut sample) = native_service_fixture();
+            match case {
+                0 => sample.offered_backlog = false,
+                1 => sample.report_number = 1,
+                2 => sample.delivered_bytes = 0,
+                3 => sample.positive_delivery_age_us = Some(CONTROL_US + 1),
+                4 => sample.feedback_age_us = None,
+                5 => sample.transport_blocked = true,
+                6 => {
+                    sample.loss_sample_rate = Some(1.0);
+                    sample.loss_rate = 1.0;
+                }
+                7 => {
+                    sample.rtt_ms = 150.0;
+                    sample.probe_rtt_ms = Some(150.0);
+                    sample.probe_latest_rtt_ms = Some(150.0);
+                }
+                8 => controller.growth_not_before_us = sample.now_us + 1,
+                9 => controller.last_brake_us = Some(sample.now_us - 1),
+                10 => controller.last_growth_us = sample.now_us - 49_999,
+                _ => unreachable!(),
+            }
+            controller.observe_native_service(&sample, 200_000, 50_000);
+            assert!(
+                !controller
+                    .rate_changes
+                    .iter()
+                    .any(|r| matches!(r.reason, RateReason::NativeServiceRecovery)),
+                "case {case}"
+            );
+        }
+    }
+
+    #[test]
+    fn native_service_does_not_reuse_reports_or_seed_new_generations_as_service() {
+        let (mut controller, mut sample) = native_service_fixture();
+        controller.observe_native_service(&sample, 200_000, 50_000);
+        let count = |c: &PathController| {
+            c.rate_changes
+                .iter()
+                .filter(|r| matches!(r.reason, RateReason::NativeServiceRecovery))
+                .count()
+        };
+        assert_eq!(count(&controller), 1);
+        for at in [110_000, 150_000, 199_000] {
+            sample.now_us = at;
+            controller.observe_native_service(&sample, 200_000, 50_000);
+            assert_eq!(count(&controller), 1);
+        }
+        sample.generation += 1;
+        controller.observe_native_service(&sample, 200_000, 50_000);
+        assert_eq!(
+            count(&controller),
+            0,
+            "new generation resets history and retains only native startup"
+        );
+    }
+
+    #[test]
+    fn native_service_preserves_native_unknown_fallback_and_integer_caps() {
+        for (cwnd, rtt) in [(0, 50_000), (200_000, 0)] {
+            let (mut controller, sample) = native_service_fixture();
+            controller.observe_native_service(&sample, cwnd, rtt);
+            assert_eq!(controller.last_control.native_service_hint_bps, None);
+            assert!(
+                !controller
+                    .rate_changes
+                    .iter()
+                    .any(|r| matches!(r.reason, RateReason::NativeServiceRecovery))
+            );
+        }
+        let (mut controller, sample) = native_service_fixture();
+        controller.observe_native_service(&sample, u64::MAX, 1);
+        assert_eq!(
+            controller.last_control.native_service_hint_bps,
+            Some(100_000_000)
+        );
+        assert!(controller.rate_bps <= 100_000_000);
+    }
+
+    #[test]
+    fn native_service_recovery_cannot_override_a_subsequent_queue_brake() {
+        let (mut controller, mut sample) = native_service_fixture();
+        controller.observe_native_service(&sample, 200_000, 50_000);
+        let recovered = controller.rate_bps;
+        assert_eq!(controller.native_service_recoveries, 1);
+        for now in [200_000, 300_000, 400_000] {
+            let admitted = exercise_budget(&mut controller, sample.now_us, now - sample.now_us);
+            sample.now_us = now;
+            sample.report_number += 1;
+            sample.delivered_bytes += admitted;
+            sample.delivered_bps = Some(admitted as f64 * 80.0);
+            sample.delivery_report_time_us = Some(now);
+            sample.rtt_ms = 150.0;
+            sample.probe_rtt_ms = Some(150.0);
+            sample.probe_latest_rtt_ms = Some(150.0);
+            sample.probe_sample_id += 1;
+            controller.observe_native_service(&sample, 2_000_000, 150_000);
+        }
+        assert!(controller.rate_bps < recovered);
+        assert!(controller.last_brake_us.is_some());
+        assert_eq!(controller.native_service_recoveries, 1);
+    }
 
     #[test]
     fn idle_allowance_is_excluded_from_business_measurement_without_retiming_control() {

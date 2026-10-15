@@ -4,11 +4,13 @@ from pathlib import Path
 import tempfile
 import signal
 import subprocess
+import contextlib
+import io
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
-from bench.netem import Testbed, latest_complete_snapshot, parse_snmp, path_commands, shaping_errors, summarize, timeseries
+from bench.netem import Testbed, client_path_arguments, latest_complete_snapshot, main, parse_snmp, path_commands, shaping_errors, summarize, timeseries
 
 
 def samples(count, received):
@@ -18,6 +20,37 @@ def samples(count, received):
 
 
 class DeliveryAccounting(unittest.TestCase):
+    def test_source_cohort_stall_is_not_hidden_by_later_catchup_or_whole_average(self):
+        # First nominal second takes1.1s, second catches up in.9s.
+        population = [{"seq": i, "send_unix_us": int(1000000 + (i * .011 if i < 100 else 1.1 + (i - 100) * .009) * 1e6),
+                       "receive_unix_us": None} for i in range(200)]
+        source = {"requested_count": 200, "sent": 200, "send_span_seconds": 2}
+        old = summarize(population, source, 200)
+        checked = summarize(population, source, 200, source_samples=population, pps=100)
+        self.assertFalse(checked["source_qualified"])
+        quality = checked["source_qualification"]
+        self.assertEqual(quality["actual_raw_rate_bps"], quality["expected_raw_rate_bps"])
+        self.assertIn("source cohort0 pacing below95percent", quality["reasons"])
+        self.assertTrue(quality["one_second_source_cohorts"][1]["qualified"])
+        for key, value in old.items():
+            self.assertEqual(checked[key], value)  # The300Mbps/95% delivery gate is untouched.
+
+    def test_source_wall_clock_population_and_whole_span_are_qualified(self):
+        population = samples(200, 200)
+        for row in population:
+            row["send_unix_us"] = 1000000 + row["seq"] * 10000
+            row["receive_unix_us"] = row["send_unix_us"] + 1000
+        source = {"requested_count": 200, "sent": 200, "send_span_seconds": 1.99}
+        checked = summarize(population, source, 200, source_samples=population, pps=100)
+        self.assertTrue(checked["source_qualified"])
+        self.assertEqual(len(checked["source_qualification"]["one_second_source_cohorts"]), 2)
+        slow = dict(source, send_span_seconds=2.2)
+        checked = summarize(population, slow, 200, source_samples=population, pps=100)
+        self.assertFalse(checked["source_qualified"])
+        self.assertIn("whole-source pacing below95percent", checked["source_qualification"]["reasons"])
+        for broken in (population[:-1], [dict(row, send_unix_us=None) for row in population]):
+            self.assertFalse(summarize(population, source, 200, source_samples=broken, pps=100)["source_qualified"])
+
     def test_missing_records_remain_in_tail_and_deadline_denominator(self):
         result = summarize(samples(100, 97), {"requested_count": 100, "sent": 100, "send_span_seconds": 1}, 100)
         self.assertEqual(result["on_time_ratio"], .97)
@@ -43,7 +76,7 @@ class DeliveryAccounting(unittest.TestCase):
 
 
 class SenderModeFlags(unittest.TestCase):
-    def prepared_client_arguments(self, mode):
+    def prepared_endpoint_arguments(self, mode, **options):
         class ClientPrepared(Exception):
             pass
         with tempfile.TemporaryDirectory() as directory:
@@ -55,12 +88,17 @@ class SenderModeFlags(unittest.TestCase):
                 return SimpleNamespace(pid=123), 1000
             def ready(process, started, role, *args):
                 if role == "client":
+                    captured["required_paths"] = list(args[0])
                     raise ClientPrepared()
             bed.spawn, bed.runtime_ready = spawn, ready
-            args = SimpleNamespace(binary="/candidate/braidpath", mode=mode, datagram_buffer_bytes=None)
+            args = SimpleNamespace(binary="/candidate/braidpath", mode=mode,
+                datagram_buffer_bytes=options.pop("buffer_override", None), **options)
             with self.assertRaises(ClientPrepared):
                 bed.run(args)
-            return captured["client"]
+            return captured
+
+    def prepared_client_arguments(self, mode):
+        return self.prepared_endpoint_arguments(mode)["client"]
 
     def test_quality_mode_only_enables_quality_schedule_with_receiver_feedback(self):
         args = self.prepared_client_arguments("quality")
@@ -82,6 +120,70 @@ class SenderModeFlags(unittest.TestCase):
         self.assertEqual(adaptive[adaptive.index("--capacity-probe-bps") + 1], "20000000")
         self.assertIn("--receiver-feedback", fixed)
         self.assertIn("--receiver-feedback", adaptive)
+
+    def test_native_service_mode_has_no_independent_probes_and_guard_defaults_off(self):
+        commands = self.prepared_endpoint_arguments("native-service")
+        client = commands["client"]
+        self.assertIn("--adaptive", client)
+        self.assertIn("--quality-schedule", client)
+        self.assertIn("--receiver-feedback", client)
+        self.assertEqual(client[client.index("--capacity-probe-bps") + 1], "0")
+        self.assertNotIn("--probe-guided-recovery", client)
+        for role in ("client", "server"):
+            self.assertNotIn("--native-service-guard", commands[role])
+            self.assertEqual(commands[role][commands[role].index("--datagram-send-buffer-bytes") + 1], "1200")
+        enabled = self.prepared_endpoint_arguments("native-service", native_service_guard=True)
+        self.assertIn("--native-service-guard", enabled["client"])
+        self.assertIn("--native-service-guard", enabled["server"])
+        # The server receives adaptive policy in the authenticated session;
+        # it has no independent --adaptive CLI option.
+        self.assertNotIn("--adaptive", enabled["server"])
+
+    def test_explicit_buffer_is_matched_on_both_endpoints_and_old_defaults_remain(self):
+        for buffer in (1200, 9600):
+            commands = self.prepared_endpoint_arguments("native-service", buffer_override=buffer)
+            for role in ("server", "client"):
+                argv = commands[role]
+                self.assertEqual(argv[argv.index("--datagram-send-buffer-bytes") + 1], str(buffer))
+            client = commands["client"]
+            self.assertEqual(client[client.index("--rate-bps") + 1], "400000000")
+            self.assertEqual(commands["server"][commands["server"].index("--max-rate-bps") + 1], "400000000")
+        for mode in ("fixed", "quality", "adaptive"):
+            defaults = self.prepared_endpoint_arguments(mode)
+            self.assertNotIn("--datagram-send-buffer-bytes", defaults["server"])
+            self.assertNotIn("--datagram-send-buffer-bytes", defaults["client"])
+        with self.assertRaisesRegex(ValueError, "native-service"):
+            self.prepared_endpoint_arguments("quality", native_service_guard=True)
+
+    def test_selected_physical_routes_keep_independent_connection_ports_and_common_budget(self):
+        for routes in ([2], [0, 3], [0, 1, 2, 3], [2, 2, 2, 2]):
+            args = SimpleNamespace(paths=routes, topology="shared", shared_rate_mbps=400)
+            argv = client_path_arguments(args)
+            values = lambda flag: [argv[i + 1] for i, item in enumerate(argv) if item == flag]
+            self.assertEqual(values("--entrance"), [f"10.203.{i + 1}.2:9443" for i in routes])
+            self.assertEqual(values("--path-bind"), [f"10.203.{route + 1}.1:{9500 + i}" for i, route in enumerate(routes)])
+            self.assertEqual(len(set(values("--path-bind"))), len(routes))
+            self.assertEqual(values("--path-group"), ["0"] * len(routes))
+            self.assertEqual(values("--group-rate-bps"), ["0:400000000"])
+        for routes in ([], [4], [-1], [0] * 5):
+            with self.assertRaises(ValueError):
+                client_path_arguments(SimpleNamespace(paths=routes))
+
+    def test_readiness_uses_logical_connection_ids_not_physical_route_indices(self):
+        for routes in ([3], [0, 3], [2, 2, 2, 2]):
+            commands = self.prepared_endpoint_arguments("native-service", paths=routes)
+            self.assertEqual(commands["required_paths"], list(range(len(routes))))
+
+    def test_invalid_cli_topology_or_guard_mode_is_rejected_before_setup(self):
+        for options in (["--paths", "4"], ["--paths", "0", "0", "0", "0", "0"],
+                        ["--mode", "quality", "--native-service-guard"]):
+            with patch("sys.argv", ["netem", "validate", "--output", "/tmp/local/unused", *options]), \
+                 patch("bench.netem.Testbed") as bed, contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as rejected:
+                    main()
+                self.assertEqual(rejected.exception.code, 2)
+                bed.assert_not_called()
+
 
 
 class NetworkAndCounters(unittest.TestCase):

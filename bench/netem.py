@@ -62,7 +62,46 @@ def latest_complete_snapshot(path, maximum_bytes=1024 * 1024):
     return None
 
 
-def summarize(samples, source, count):
+def source_qualification(samples, source, count, pps):
+    """Apply warmup_profile's95% whole-source and nominal1s cohort floor."""
+    expected = pps * 1000 * 8
+    span = source["send_span_seconds"]
+    result = {"expected_raw_rate_bps": expected, "actual_raw_rate_bps": count * 1000 * 8 / span,
+              "minimum_pacing_fraction": .95, "reasons": [], "one_second_source_cohorts": []}
+    reasons = result["reasons"]
+    if len(samples) != count or any(row.get("seq") != i for i, row in enumerate(samples)):
+        reasons.append("source sample population missing, duplicated or unordered")
+    stamps = [row.get("send_unix_us") for row in samples]
+    if any(type(stamp) is not int for stamp in stamps):
+        reasons.append("source timestamp missing")
+    if reasons:
+        return {"source_qualified": False, "source_qualification": result}
+    if any(b < a for a, b in zip(stamps, stamps[1:])):
+        reasons.append("source wall clock regressed")
+    tolerance = max(.01, span * .005)
+    wall_span = (stamps[-1] - stamps[0]) / 1e6
+    result["clock_check"] = {"full_monotonic_span_seconds": span, "full_wall_span_seconds": wall_span,
+                             "allowed_difference_seconds": tolerance}
+    if abs(wall_span - span) > tolerance:
+        reasons.append("source wall interval disagrees with monotonic full-source span")
+    if result["actual_raw_rate_bps"] < expected * .95:
+        reasons.append("whole-source pacing below95percent")
+    end_us = stamps[0] + span * 1e6
+    if end_us < stamps[-1]:
+        end_us = stamps[-1] + 1e6 / pps
+    for start in range(0, count, pps):
+        stop = min(start + pps, count)
+        duration = ((stamps[stop] if stop < count else end_us) - stamps[start]) / 1e6
+        rate = (stop - start) * 1000 * 8 / duration if duration > 0 else None
+        qualified = rate is not None and rate >= expected * .95
+        result["one_second_source_cohorts"].append({"first_seq": start, "exclusive_end_seq": stop,
+            "actual_span_seconds": duration, "actual_raw_rate_bps": rate, "qualified": qualified})
+        if not qualified:
+            reasons.append(f"source cohort{start // pps} pacing below95percent")
+    return {"source_qualified": not reasons, "source_qualification": result}
+
+
+def summarize(samples, source, count, *, source_samples=None, pps=None):
     """Use every planned slot and actual source span, never received-only tails."""
     if source.get("sent") != count or source.get("requested_count") != count:
         raise ValueError("source did not send the full registered population")
@@ -87,7 +126,7 @@ def summarize(samples, source, count):
     def quantile(p):
         value = ordered[math.ceil(count * p) - 1]
         return value if math.isfinite(value) else "infinity"
-    return {
+    result = {
         "planned": count, "received": sum(math.isfinite(d) for d in delays),
         "within_200ms": timely, "on_time_ratio": timely / count,
         "p95_ms": quantile(.95), "p99_ms": quantile(.99),
@@ -95,6 +134,11 @@ def summarize(samples, source, count):
         "joint_gate_passed": timely / count >= .95 and goodput >= 300,
         "scope": "single controlled diagnostic; not statistical performance acceptance",
     }
+    if source_samples is not None:
+        if type(pps) is not int or pps <= 0:
+            raise ValueError("source qualification requires a positive registered pps")
+        result.update(source_qualification(source_samples, source, count, pps))
+    return result
 
 
 def path_commands(client, server, index, rtt_ms, rate_mbps, queue_packets):
@@ -117,12 +161,20 @@ def path_commands(client, server, index, rtt_ms, rate_mbps, queue_packets):
     return commands
 
 
+def selected_paths(args):
+    """Logical connections select existing physical links; repeats share that link."""
+    paths = getattr(args, "paths", [0, 1, 2, 3])
+    if not 1 <= len(paths) <= 4 or any(type(path) is not int or not 0 <= path <= 3 for path in paths):
+        raise ValueError("paths must contain one to four physical indices in 0..3")
+    return paths
+
+
 def client_path_arguments(args):
     shared = getattr(args, "topology", "independent") == "shared"
     arguments = []
-    for index in range(4):
+    for connection, index in enumerate(selected_paths(args)):
         arguments += ["--entrance", f"10.203.{index + 1}.2:9443",
-                      "--path-bind", f"10.203.{index + 1}.1:{9500 + index}",
+                      "--path-bind", f"10.203.{index + 1}.1:{9500 + connection}",
                       "--path-group", str(0 if shared else index)]
     if shared:
         group_bps = min(int(args.shared_rate_mbps * 1000000), 400000000)
@@ -375,6 +427,16 @@ class Testbed:
         self.sampler.start()
 
     def run(self, args):
+        paths = selected_paths(args)
+        native_service = args.mode == "native-service"
+        guard = getattr(args, "native_service_guard", False)
+        if guard and not native_service:
+            raise ValueError("native-service-guard requires native-service mode")
+        buffer = args.datagram_buffer_bytes
+        if native_service and buffer is None:
+            buffer = 1200
+        buffer_args = [] if buffer is None else ["--datagram-send-buffer-bytes", str(buffer)]
+        guard_args = ["--native-service-guard"] if guard else []
         binary = str(args.binary)
         identity = self.output / "identity"
         self.command([binary, "init", "--dir", str(identity)])
@@ -384,7 +446,7 @@ class Testbed:
                     str(self.output / f"{role}.jsonl"), "--stats-interval-ms", "250"]
         server, started = self.spawn(self.server, "server", [binary, "server", "--listen", "0.0.0.0:9443",
             "--target", "127.0.0.1:9200", "--cert", cert, "--key", key, "--token-file", token,
-            "--max-rate-bps", "400000000", *stats("server")])
+            "--max-rate-bps", "400000000", *buffer_args, *guard_args, *stats("server")])
         self.runtime_ready(server, started, "server")
         client_args = [binary, "client", "--listen", "127.0.0.1:9100", "--server-name", "localhost",
             "--ca", cert, "--token-file", token, "--fec", "0", "--redundancy-percent", "0",
@@ -395,11 +457,15 @@ class Testbed:
             client_args += ["--quality-schedule"]
         elif args.mode == "adaptive":
             client_args += ["--adaptive", "--capacity-probe-bps", "20000000", "--probe-guided-recovery"]
-        if args.datagram_buffer_bytes is not None:
-            client_args += ["--datagram-send-buffer-bytes", str(args.datagram_buffer_bytes)]
+        elif native_service:
+            # Adaptive policy is negotiated in both directions. The server has
+            # no --adaptive CLI flag; its guard remains a local opt-in above.
+            client_args += ["--adaptive", "--quality-schedule", "--small-fec-bytes", "0",
+                            "--capacity-probe-bps", "0"]
+        client_args += [*buffer_args, *guard_args]
         client, client_started = self.spawn(self.client, "client", client_args)
-        session = self.runtime_ready(client, client_started, "client", range(4))
-        self.runtime_ready(server, started, "server", range(4), session)
+        session = self.runtime_ready(client, client_started, "client", range(len(paths)))
+        self.runtime_ready(server, started, "server", range(len(paths)), session)
         count = args.duration_seconds * args.pps
         run_id = uuid.uuid4().hex
         common = ["--run-id", run_id, "--count", str(count), "--pps", str(args.pps),
@@ -424,7 +490,8 @@ class Testbed:
         self.business_started = True
         self.start_sampling()
         source, _ = self.spawn(self.client, "source", [binary, "probe", "--mode", "send", "--target", "127.0.0.1:9100",
-            *common, "--result-file", str(self.output / "source-result.json")])
+            *common, "--result-file", str(self.output / "source-result.json"),
+            "--samples-file", str(self.output / "source-samples.json")])
         source.wait(timeout=args.duration_seconds + 20)
         sink.wait(timeout=10)
         if source.returncode or sink.returncode:
@@ -435,7 +502,11 @@ class Testbed:
         if source_result.get("corrupt", 0) or sink_result.get("corrupt", 0):
             raise RuntimeError("probe integrity failure")
         samples = json.loads((self.output / "sink-samples.json").read_text())["samples"]
-        save(self.output / "summary.json", summarize(samples, source_result, count))
+        source_samples = json.loads((self.output / "source-samples.json").read_text())["samples"]
+        summary = summarize(samples, source_result, count, source_samples=source_samples, pps=args.pps)
+        save(self.output / "summary.json", summary)
+        if not summary["source_qualified"]:
+            raise RuntimeError("invalid source: " + "; ".join(summary["source_qualification"]["reasons"]))
 
     def cleanup(self):
         errors, exits = [], {}
@@ -516,11 +587,21 @@ def main():
     parser.add_argument("--rtt-ms", type=float, nargs=4, default=[30, 45, 60, 80])
     parser.add_argument("--rate-mbps", type=float, default=100)
     parser.add_argument("--queue-packets", type=int, default=1024)
-    parser.add_argument("--mode", choices=["fixed", "quality", "adaptive"], default="fixed")
+    parser.add_argument("--mode", choices=["fixed", "quality", "adaptive", "native-service"], default="fixed")
+    parser.add_argument("--native-service-guard", action="store_true",
+                        help="local opt-in on both endpoints; requires native-service mode")
+    parser.add_argument("--paths", type=int, nargs="+", default=[0, 1, 2, 3],
+                        help="one to four logical connections: physical link indices0..3; repeats share a link")
     parser.add_argument("--topology", choices=["independent", "shared"], default="independent")
     parser.add_argument("--shared-rate-mbps", type=float, default=400)
     parser.add_argument("--datagram-buffer-bytes", type=int)
     args = parser.parse_args()
+    try:
+        selected_paths(args)
+    except ValueError as error:
+        parser.error(str(error))
+    if args.native_service_guard and args.mode != "native-service":
+        parser.error("native-service-guard requires native-service mode")
     if (not Path("/.dockerenv").exists() or os.environ.get("BRAIDPATH_NETEM_CONTAINER") != "1"
         or os.geteuid() != 0):
         parser.error("requires root inside a dedicated Docker test container with BRAIDPATH_NETEM_CONTAINER=1")

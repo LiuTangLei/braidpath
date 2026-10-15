@@ -39,6 +39,13 @@ impl Queue {
     pub fn original_flows(&self) -> usize {
         self.turns.len()
     }
+    pub fn would_be_full(&self, flow: u32) -> bool {
+        self.len == QUEUE
+            || self
+                .flows
+                .get(&flow)
+                .is_some_and(|q| q.len() >= PER_FLOW_LIMIT)
+    }
     /// Try another flow without dropping or charging an unaffordable head record.
     pub fn rotate_original(&mut self) {
         if let Some(flow) = self.turns.pop_front() {

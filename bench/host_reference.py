@@ -133,8 +133,15 @@ class Owned:
             raise RuntimeError('forced cleanup required; do not accept reference')
 
 
-def reference_profile(pilot_ack=None):
+def reference_profile(pilot_ack=None, service_profile=None):
     """The optional pilot is a distinct, fixed no-simulator readiness profile."""
+    if service_profile is not None:
+        if service_profile != 'native-service-80' or pilot_ack is not None:
+            raise ValueError('native-service-80 cannot be combined with an ACK experiment')
+        case = dict(warmup_bulk_records=0, warmup_echo_requests=0,
+                    bulk_count=100000, echo_count=200, business_bulk_records=100000,
+                    business_echo_requests=200, warmup_seconds=0)
+        return case, {**SOURCE, 'bulk_pps': 10000}, 125_000_000
     if pilot_ack is None:
         return dict(CASE), dict(SOURCE), 500_000_000
     if pilot_ack not in ('every-two', 'every-eight'):
@@ -145,8 +152,11 @@ def reference_profile(pilot_ack=None):
     return case, {**SOURCE, 'bulk_pps': 2000}, 50_000_000
 
 
-def run_window(root, mode, binary, native, bundle, identity, *, pilot_ack=None):
-    case, source_spec, rate = reference_profile(pilot_ack)
+def run_window(root, mode, binary, native, bundle, identity, *, pilot_ack=None,
+               service_profile=None, native_service_guard=False):
+    case, source_spec, rate = reference_profile(pilot_ack, service_profile)
+    if (service_profile is not None or native_service_guard) and mode != 'overlay_adaptive':
+        raise ValueError('native service study requires actual adaptive HTTP/3')
     if pilot_ack is not None and mode != 'overlay_adaptive':
         raise ValueError('public pilot readiness must use the real adaptive HTTP/3 path')
     root.mkdir()
@@ -157,6 +167,7 @@ def run_window(root, mode, binary, native, bundle, identity, *, pilot_ack=None):
     usage0=resource.getrusage(resource.RUSAGE_CHILDREN)
     started=time.monotonic()
     save_new(root/'case.json',dict(mode=mode,source=source_spec,case=case,
+                                 service_profile=service_profile, native_service_guard=native_service_guard,
                                  pilot_ack_request=pilot_ack, rate_cap_bps=rate,
                                  addresses=dict(adapter=adapter,source=source_addr,listener=listener,entrance=entrance)))
     try:
@@ -178,7 +189,8 @@ def run_window(root, mode, binary, native, bundle, identity, *, pilot_ack=None):
                 '--key',identity/'key.pem','--token-file',identity/'token','--target',adapter,
                 '--max-rate-bps',str(rate),'--datagram-send-buffer-bytes','9600',
                 '--stats-file',root/'server/stats.json','--stats-jsonl',root/'server/stats.jsonl','--stats-interval-ms','250',
-                *(['--ack-request',pilot_ack] if pilot_ack is not None else [])])
+                *(['--ack-request',pilot_ack] if pilot_ack is not None else []),
+                *(['--native-service-guard'] if native_service_guard else [])])
             # Server readiness has no app connection yet; retain finite JSON lifecycle check.
             deadline=time.monotonic()+8
             while True:
@@ -196,6 +208,7 @@ def run_window(root, mode, binary, native, bundle, identity, *, pilot_ack=None):
                   '--queue-ms','100','--latency-target-ms','100','--datagram-send-buffer-bytes','9600',
                   '--stats-file',root/'client/stats.json','--stats-jsonl',root/'client/stats.jsonl','--stats-interval-ms','250']
             if mode=='overlay_adaptive':args+=['--adaptive']
+            if native_service_guard:args+=['--native-service-guard']
             client=owner.launch('client',args)
             wait_ready(client,root/'client/stats.jsonl',paths=1)
         else:

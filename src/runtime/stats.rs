@@ -23,6 +23,10 @@ const MAX_RETIRED_SESSIONS: usize = 8;
 
 #[derive(Args, Clone, Default)]
 pub struct Options {
+    /// Experimental native-window service recovery; off by default. Adaptive
+    /// health, delay/loss brakes, native BBR and all configured caps remain.
+    #[arg(long)]
+    pub native_service_guard: bool,
     /// Experimental local small-lane finish preference; defaults off. No new pacing credit.
     #[arg(long)]
     pub frontier_scheduler: bool,
@@ -631,6 +635,7 @@ impl ConnectionTrace {
     }
 }
 struct Inner {
+    native_service_guard: bool,
     frontier_scheduler: bool,
     state: Mutex<State>,
     // Only the current connection per logical path is retained. Historical
@@ -659,7 +664,16 @@ impl Metrics {
         Self::configured(role, trace, false)
     }
     fn configured(role: &'static str, trace: trace::Trace, frontier_scheduler: bool) -> Self {
+        Self::configured_service(role, trace, frontier_scheduler, false)
+    }
+    fn configured_service(
+        role: &'static str,
+        trace: trace::Trace,
+        frontier_scheduler: bool,
+        native_service_guard: bool,
+    ) -> Self {
         Self(Arc::new(Inner {
+            native_service_guard,
             frontier_scheduler,
             state: Mutex::new(State::default()),
             connections: Mutex::new(BTreeMap::new()),
@@ -675,6 +689,9 @@ impl Metrics {
     }
     pub fn frontier_scheduler(&self) -> bool {
         self.0.frontier_scheduler
+    }
+    pub fn native_service_guard(&self) -> bool {
+        self.0.native_service_guard
     }
     pub fn state(&self, f: impl FnOnce(&mut State)) {
         f(&mut self.0.state.lock().expect("stats lock"));
@@ -1044,6 +1061,10 @@ fn distinct_output_paths(paths: &[Option<&FsPath>]) -> Result<()> {
 impl Reporter {
     pub fn new(role: &'static str, options: Options) -> Result<Self> {
         ensure!(
+            !options.native_service_guard || matches!(role, "client" | "server"),
+            "native-service-guard applies only to a client or server sender"
+        );
+        ensure!(
             !options.frontier_scheduler || matches!(role, "client" | "server"),
             "frontier-scheduler applies only to a client or server sender"
         );
@@ -1073,7 +1094,12 @@ impl Reporter {
                     .map(|f| Arc::new(Mutex::new(f)))
             })
             .transpose()?;
-        let metrics = Metrics::configured(role, capture, options.frontier_scheduler);
+        let metrics = Metrics::configured_service(
+            role,
+            capture,
+            options.frontier_scheduler,
+            options.native_service_guard,
+        );
         let periodic = jsonl.clone().map(|file| {
             let metrics = metrics.clone();
             let ms = options.stats_interval_ms;

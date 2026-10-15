@@ -514,6 +514,47 @@ fn enqueue_encoded(
     enqueue_coded_symbol(symbol, created, queue, blocks, Some(policy), metrics);
 }
 
+fn encode_input(
+    input: QueuedRecord,
+    encoder: &mut coding::RecordEncoder,
+    policy: &Policy,
+    queue: &mut outbound::Queue,
+    blocks: &mut BTreeMap<u64, BlockSend>,
+    metrics: &Scope,
+) {
+    let QueuedRecord { record, created } = input;
+    if created.elapsed() >= policy.admission_lifetime() {
+        metrics.trace_record(
+            trace::Stage::RecordDropped,
+            &record,
+            None,
+            Some(trace::Reason::Expired),
+        );
+        metrics.update(|d| {
+            d.symbols.originals_ingress_expired_dropped += 1;
+            d.locally_dropped_original_ids.add(record.id);
+            d.symbols.expiry_wait.add(created.elapsed());
+        });
+        return;
+    }
+    match encoder.encode(&record, Instant::now()) {
+        Ok(symbols) => {
+            for symbol in symbols {
+                enqueue_encoded(symbol, created, queue, blocks, policy, metrics);
+            }
+        }
+        Err(_) => {
+            metrics.trace_record(
+                trace::Stage::RecordDropped,
+                &record,
+                None,
+                Some(trace::Reason::Encoding),
+            );
+            metrics.update(|d| d.records.encoding_dropped += 1);
+        }
+    }
+}
+
 fn enqueue_coded_symbol(
     symbol: coding::EncodedSymbol,
     created: Instant,
@@ -963,6 +1004,10 @@ fn send_datagram_before_deadline(
 
 fn admission_now() -> Instant {
     #[cfg(test)]
+    if let Some(now) = ADMISSION_CLOCK_FIXED.with(|clock| clock.get()) {
+        return now;
+    }
+    #[cfg(test)]
     if let Some(now) = ADMISSION_CLOCK_OVERRIDE.with(|clock| clock.take()) {
         return now;
     }
@@ -1229,6 +1274,7 @@ impl SendAccounting<'_> {
 thread_local! {
     static QUALITY_STATS_PUBLICATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static ADMISSION_CLOCK_OVERRIDE: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
+    static ADMISSION_CLOCK_FIXED: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
 }
 
 fn publish_receiver_feedback(paths: &[OutPath], metrics: &Scope) {
@@ -1336,6 +1382,9 @@ async fn sender(
         // A different actor event invalidates this prepared queue head and its
         // budget checks. Cancel the future before touching any actor state.
         let prepared = waiting.take().map(WaitingSend::cancel);
+        // Only this already-owned Input may defer until existing service has a
+        // chance to free its slot. It never survives the current actor turn.
+        let mut deferred_input = None;
         // Counters live in path.quality; these clones are only JSON observability.
         // Publish on the existing timer/evidence events, not every packet event.
         let publish_feedback_stats = matches!(&event, SenderEvent::Tick | SenderEvent::Evidence);
@@ -1415,47 +1464,30 @@ async fn sender(
                 frontier.readiness_gate_changed += 1;
             }
             SenderEvent::Input(item) => {
+                #[cfg(test)]
+                sender_ready_tests::prime_full_input_turn(
+                    &mut queue,
+                    &mut blocks,
+                    &metrics,
+                    &mut pacer,
+                    &mut groups,
+                );
                 let Some(QueuedRecord { record, created }) = item else {
                     break;
                 };
                 metrics.update(|d| d.records.sender_input_consumed += 1);
                 metrics.trace_record(trace::Stage::SenderInput, &record, None, None);
-                if created.elapsed() >= lifetime {
-                    metrics.trace_record(
-                        trace::Stage::RecordDropped,
-                        &record,
-                        None,
-                        Some(trace::Reason::Expired),
+                if created.elapsed() < lifetime && queue.would_be_full(record.flow) {
+                    deferred_input = Some(QueuedRecord { record, created });
+                } else {
+                    encode_input(
+                        QueuedRecord { record, created },
+                        &mut encoder,
+                        &policy,
+                        &mut queue,
+                        &mut blocks,
+                        &metrics,
                     );
-                    metrics.update(|d| {
-                        d.symbols.originals_ingress_expired_dropped += 1;
-                        d.locally_dropped_original_ids.add(record.id);
-                        d.symbols.expiry_wait.add(created.elapsed());
-                    });
-                    continue;
-                }
-                match encoder.encode(&record, Instant::now()) {
-                    Ok(symbols) => {
-                        for symbol in symbols {
-                            enqueue_encoded(
-                                symbol,
-                                created,
-                                &mut queue,
-                                &mut blocks,
-                                &policy,
-                                &metrics,
-                            );
-                        }
-                    }
-                    Err(_) => {
-                        metrics.trace_record(
-                            trace::Stage::RecordDropped,
-                            &record,
-                            None,
-                            Some(trace::Reason::Encoding),
-                        );
-                        metrics.update(|d| d.records.encoding_dropped += 1);
-                    }
                 }
             }
         }
@@ -1531,12 +1563,28 @@ async fn sender(
                     .lock()
                     .expect("capacity probe lock")
                     .snapshot(at);
-                controllers[usize::from(path.id)].observe_native(
-                    &observation,
-                    policy.probe_guided_recovery.then_some(&probe_snapshot),
-                    path.conn.stats().path.cwnd,
-                    native_rtt.as_micros().min(u128::from(u64::MAX)) as u64,
-                );
+                let cwnd = path.conn.stats().path.cwnd;
+                let rtt_us = native_rtt.as_micros().min(u128::from(u64::MAX)) as u64;
+                if metrics.metrics.native_service_guard()
+                    && policy.fec == 0
+                    && policy.small_fec_bytes == 0
+                    && policy.redundancy == 0
+                    && policy.capacity_probe_bps == 0
+                    && !policy.probe_guided_recovery
+                {
+                    controllers[usize::from(path.id)].observe_native_service(
+                        &observation,
+                        cwnd,
+                        rtt_us,
+                    );
+                } else {
+                    controllers[usize::from(path.id)].observe_native(
+                        &observation,
+                        policy.probe_guided_recovery.then_some(&probe_snapshot),
+                        cwnd,
+                        rtt_us,
+                    );
+                }
                 if policy.capacity_probe_bps > 0 {
                     let group_paths = paths
                         .iter()
@@ -1871,7 +1919,23 @@ async fn sender(
         let mut stalled_repairs = Vec::new();
         let mut repair_wait: Option<PreparedSend> = None;
         let mut next_wait = None;
-        'drain: while !queue.is_empty() {
+        'drain: loop {
+            if deferred_input
+                .as_ref()
+                .is_some_and(|input| !queue.would_be_full(input.record.flow))
+            {
+                encode_input(
+                    deferred_input.take().expect("current input"),
+                    &mut encoder,
+                    &policy,
+                    &mut queue,
+                    &mut blocks,
+                    &metrics,
+                );
+            }
+            if queue.is_empty() {
+                break;
+            }
             let now = Instant::now();
             let now_us = epoch.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
             let affordable_repair = |p: &outbound::Pending| {
@@ -2280,6 +2344,19 @@ async fn sender(
             blocked_repair = false;
             stalled_repairs.clear();
             repair_wait = None;
+        }
+        if let Some(input) = deferred_input {
+            // No immediate service freed the original slot. Keep the existing
+            // bounded rejection, without changing a prepared wait's queue head.
+            debug_assert!(queue.would_be_full(input.record.flow));
+            encode_input(
+                input,
+                &mut encoder,
+                &policy,
+                &mut queue,
+                &mut blocks,
+                &metrics,
+            );
         }
         if next_wait.is_none()
             && let Some(attempt) = repair_wait

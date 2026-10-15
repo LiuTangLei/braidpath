@@ -135,14 +135,18 @@ fn args(v: &[&str]) -> Vec<String> {
     v.iter().map(|s| s.to_string()).collect()
 }
 
-fn latest_directions(file: &Path) -> Value {
+fn latest_stats(file: &Path) -> Value {
     fs::read_to_string(file)
         .unwrap_or_default()
         .lines()
         .rev()
         .find_map(|line| serde_json::from_str::<Value>(line).ok())
-        .map(|snapshot| snapshot["stats"]["directions"].clone())
+        .map(|snapshot| snapshot["stats"].clone())
         .unwrap_or(Value::Null)
+}
+
+fn latest_directions(file: &Path) -> Value {
+    latest_stats(file)["directions"].clone()
 }
 #[test]
 fn authenticated_http3_three_paths_and_udp_integrity() {
@@ -295,6 +299,15 @@ fn server_ack_request_is_opt_in_and_directional_on_real_http3() {
 
 #[test]
 fn same_entrance_four_connections_have_distinct_sockets_and_preserve_uncoded_integrity() {
+    four_connection_integrity(false);
+}
+
+#[test]
+fn native_service_guard_preserves_four_connection_uncoded_integrity() {
+    four_connection_integrity(true);
+}
+
+fn four_connection_integrity(native_service_guard: bool) {
     use std::collections::BTreeSet;
     let dir = tempfile::tempdir().unwrap();
     let identity = dir.path().join("identity");
@@ -316,6 +329,7 @@ fn same_entrance_four_connections_have_distinct_sockets_and_preserve_uncoded_int
     let server_addr = port();
     let client_addr = port();
     let stats_file = dir.path().join("client.jsonl");
+    let server_stats = dir.path().join("server.jsonl");
     let mut echo = launch(&args(&["echo", "--listen", &echo_addr]), dir.path(), "echo");
     ready(&mut echo, "test echo ready");
     let mut server = launch(
@@ -333,7 +347,14 @@ fn same_entrance_four_connections_have_distinct_sockets_and_preserve_uncoded_int
             &echo_addr,
             "--max-rate-bps",
             "10000000",
-        ]),
+            "--stats-jsonl",
+            server_stats.to_str().unwrap(),
+            "--stats-interval-ms",
+            "50",
+        ])
+        .into_iter()
+        .chain(native_service_guard.then(|| "--native-service-guard".to_owned()))
+        .collect::<Vec<_>>(),
         dir.path(),
         "server",
     );
@@ -366,6 +387,9 @@ fn same_entrance_four_connections_have_distinct_sockets_and_preserve_uncoded_int
     ]);
     for _ in 0..4 {
         client_args.extend(args(&["--entrance", &server_addr, "--path-group", "0"]));
+    }
+    if native_service_guard {
+        client_args.push("--native-service-guard".into());
     }
     let mut client = launch(&client_args, dir.path(), "client");
     let until = Instant::now() + Duration::from_secs(12);
@@ -425,6 +449,31 @@ fn same_entrance_four_connections_have_distinct_sockets_and_preserve_uncoded_int
     assert_eq!(values["duplicate"], 0);
     let d = latest_directions(&stats_file);
     assert_eq!(d["client_to_server"]["symbols"]["repairs_generated"], 0);
+    for (file, direction) in [
+        (&stats_file, "client_to_server"),
+        (&server_stats, "server_to_client"),
+    ] {
+        let until = Instant::now() + Duration::from_secs(2);
+        loop {
+            let d = latest_stats(file);
+            let observed = d["paths"].as_object().is_some_and(|paths| {
+                paths.len() == 4
+                    && paths.values().all(|path| {
+                        path["sending_direction"] == direction
+                            && path["adaptive"]["last_control"]["native_service_guard_enabled"]
+                                == native_service_guard
+                    })
+            });
+            if observed {
+                break;
+            }
+            assert!(
+                Instant::now() < until,
+                "missing live native-service mode on all four paths: {d}"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
 }
 #[test]
 fn authenticated_receiver_feedback_both_directions() {

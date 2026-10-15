@@ -179,6 +179,84 @@ struct Sample {
     receive_unix_us: Option<i64>,
     rtt_ms: Option<f64>,
 }
+
+#[derive(Default, Serialize)]
+struct TimingPeak {
+    nanoseconds: u64,
+    sequence: Option<u32>,
+}
+impl TimingPeak {
+    fn observe(&mut self, sequence: u32, duration: Duration) {
+        let nanoseconds = duration.as_nanos().min(u128::from(u64::MAX)) as u64;
+        if self.sequence.is_none() || nanoseconds > self.nanoseconds {
+            self.nanoseconds = nanoseconds;
+            self.sequence = Some(sequence);
+        }
+    }
+}
+
+struct SourceSendTimes {
+    scheduled_due: Instant,
+    woke: Instant,
+    send_begin: Instant,
+    send_end: Instant,
+}
+
+/// Constant-space diagnostics of successful sends; never used to drive pacing.
+/// `scheduled_due` is Tokio's effective deadline, which Delay may reanchor.
+/// Phase shift and nominal lateness retain the original first-due/sequence clock.
+#[derive(Default, Serialize)]
+struct SourcePacing {
+    completed_sends: u32,
+    max_wake_lateness: TimingPeak,
+    max_schedule_phase_shift: TimingPeak,
+    max_nominal_send_lateness: TimingPeak,
+    max_prepare_duration: TimingPeak,
+    max_socket_send_wait: TimingPeak,
+    send_begin_span_ns: u64,
+    send_end_span_ns: u64,
+    #[serde(skip)]
+    first_due: Option<Instant>,
+    #[serde(skip)]
+    first_send_begin: Option<Instant>,
+    #[serde(skip)]
+    first_send_end: Option<Instant>,
+}
+impl SourcePacing {
+    fn observe(&mut self, seq: u32, period: Duration, times: SourceSendTimes) {
+        let first_due = *self.first_due.get_or_insert(times.scheduled_due);
+        let nominal_due = first_due + period * seq;
+        self.max_wake_lateness.observe(
+            seq,
+            times.woke.saturating_duration_since(times.scheduled_due),
+        );
+        self.max_schedule_phase_shift.observe(
+            seq,
+            times.scheduled_due.saturating_duration_since(nominal_due),
+        );
+        self.max_nominal_send_lateness
+            .observe(seq, times.send_begin.saturating_duration_since(nominal_due));
+        self.max_prepare_duration
+            .observe(seq, times.send_begin.saturating_duration_since(times.woke));
+        self.max_socket_send_wait.observe(
+            seq,
+            times.send_end.saturating_duration_since(times.send_begin),
+        );
+        let first_begin = *self.first_send_begin.get_or_insert(times.send_begin);
+        let first_end = *self.first_send_end.get_or_insert(times.send_end);
+        self.send_begin_span_ns = times.send_begin.duration_since(first_begin).as_nanos() as u64;
+        self.send_end_span_ns = times.send_end.duration_since(first_end).as_nanos() as u64;
+        self.completed_sends += 1;
+    }
+}
+
+fn source_interval(pps: u32) -> (Duration, tokio::time::Interval) {
+    let period = Duration::from_secs_f64(1. / f64::from(pps));
+    let mut tick = tokio::time::interval(period);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    (period, tick)
+}
+
 struct State {
     shutdown: Shutdown,
     samples: Vec<Option<Sample>>,
@@ -191,6 +269,7 @@ struct State {
     registration_attempts: u32,
     rejected: u64,
     actual_span: Option<f64>,
+    source_pacing: Option<SourcePacing>,
     interrupted: bool,
     local_addr: Option<SocketAddr>,
     peer_addr: Option<SocketAddr>,
@@ -209,6 +288,7 @@ impl State {
             registration_attempts: 0,
             rejected: 0,
             actual_span: None,
+            source_pacing: None,
             interrupted: false,
             local_addr: None,
             peer_addr: None,
@@ -433,20 +513,23 @@ async fn send_stream(
     echo: bool,
 ) -> Result<f64> {
     let start = Instant::now();
-    let mut tick = tokio::time::interval(Duration::from_secs_f64(1. / f64::from(w.pps)));
-    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let (period, mut tick) = source_interval(w.pps);
+    state.source_pacing = Some(SourcePacing::default());
     let mut until = None;
     let mut b = [0u8; MAX_PAYLOAD + 1];
     let mut first = None;
     loop {
         tokio::select! {
             _=state.shutdown.wait()=>{state.interrupted=true;break;},
-            _=tick.tick(),if state.sent<w.count=>{
+            scheduled_due=tick.tick(),if state.sent<w.count=>{
+                let woke=Instant::now();
                 let seq=state.sent;
                 let stamp=unix_us()?;
                 let data=if echo {let mut b=vec![(seq%251)as u8;w.size];b[..8].copy_from_slice(&id[..8]);b[8..12].copy_from_slice(&seq.to_be_bytes());b} else {packet(DATA,id,seq,stamp,w.size)};
                 let instant=Instant::now();
                 socket.send(&data).await?;
+                let send_end=Instant::now();
+                state.source_pacing.as_mut().expect("source diagnostics").observe(seq,period,SourceSendTimes{scheduled_due:scheduled_due.into_std(),woke,send_begin:instant,send_end});
                 first.get_or_insert(instant);
                 state.sent_times[seq as usize]=Some(instant);
                 state.samples[seq as usize]=Some(Sample{seq,send_unix_us:stamp,receive_unix_us:None,rtt_ms:None});
@@ -537,6 +620,7 @@ fn report(
         "final":true,"outcome":if state.interrupted {"interrupted"}else{"ok"},
         "requested_count":w.count,"expected_count":w.count,"run_id":w.run_id,"sample_unix_ms":unix_us().ok().map(|us|us/1000),"pid":std::process::id(),"sent":state.sent,"payload_bytes":w.size,"offered_pps":w.pps,
         "requested_send_span_seconds":requested_span(w),"send_span_seconds":state.actual_span,
+        "source_pacing":state.source_pacing,
         "observation_seconds":observation,"deadline_ms":w.deadline_ms,"drain_ms":w.drain_ms,
         "duplicate":state.duplicate,"corrupt":state.corrupt,"rejected_datagrams":state.rejected,
         "control_datagrams_sent":state.control_sent,"control_datagrams_received":state.control_received,
@@ -883,6 +967,112 @@ mod tests {
             result_file: None,
             samples_file: None,
         }
+    }
+
+    #[test]
+    fn report_exposes_source_pacing_without_claiming_receiver_observations() {
+        let w = receive_workload();
+        let state = State::new(w.count);
+        let sender = report(
+            ("probe", "send", "client_to_server"),
+            &w,
+            &state,
+            1.,
+            false,
+            false,
+        );
+        assert!(sender.get("source_pacing").is_some());
+        assert_eq!(sender["source_pacing"], Value::Null);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn production_source_diagnostics_separate_delay_phase_from_socket_wait() {
+        let (period, mut tick) = source_interval(40_000);
+        let mut pacing = SourcePacing::default();
+        let origin = tick.tick().await;
+        pacing.observe(
+            0,
+            period,
+            SourceSendTimes {
+                scheduled_due: origin.into_std(),
+                woke: origin.into_std(),
+                send_begin: origin.into_std(),
+                send_end: origin.into_std(),
+            },
+        );
+        tokio::time::advance(Duration::from_millis(6)).await;
+        let due = tick.tick().await;
+        assert_eq!(due, origin + period);
+        let begin = tokio::time::Instant::now();
+        // An independently controlled socket-await delay must not be counted as
+        // task wake lateness or packet preparation.
+        tokio::time::advance(Duration::from_millis(2)).await;
+        let end = tokio::time::Instant::now();
+        pacing.observe(
+            1,
+            period,
+            SourceSendTimes {
+                scheduled_due: due.into_std(),
+                woke: begin.into_std(),
+                send_begin: begin.into_std(),
+                send_end: end.into_std(),
+            },
+        );
+        let due = tick.tick().await;
+        assert_eq!(due, origin + Duration::from_micros(6025));
+        let last = tokio::time::Instant::now();
+        pacing.observe(
+            2,
+            period,
+            SourceSendTimes {
+                scheduled_due: due.into_std(),
+                woke: last.into_std(),
+                send_begin: last.into_std(),
+                send_end: last.into_std(),
+            },
+        );
+        assert_eq!(pacing.completed_sends, 3);
+        assert_eq!(pacing.max_schedule_phase_shift.nanoseconds, 5_975_000);
+        assert_eq!(pacing.max_schedule_phase_shift.sequence, Some(2));
+        assert_eq!(pacing.max_wake_lateness.nanoseconds, 5_975_000);
+        assert_eq!(pacing.max_wake_lateness.sequence, Some(1));
+        assert_eq!(pacing.max_socket_send_wait.nanoseconds, 2_000_000);
+        assert_eq!(pacing.max_prepare_duration.nanoseconds, 0);
+        assert_eq!(pacing.max_nominal_send_lateness.nanoseconds, 7_950_000);
+        assert_eq!(pacing.send_begin_span_ns, 8_000_000);
+        let mut w = receive_workload();
+        w.count = 3;
+        w.pps = 40_000;
+        let mut state = State::new(3);
+        state.sent = 3;
+        // The source's unchanged report denominator is actual send-begin span,
+        // never the nominal 50 us schedule or its reanchored effective ticks.
+        state.actual_span = Some(
+            last.into_std()
+                .duration_since(origin.into_std())
+                .as_secs_f64(),
+        );
+        state.source_pacing = Some(pacing);
+        let value = report(
+            ("probe", "send", "client_to_server"),
+            &w,
+            &state,
+            1.,
+            false,
+            false,
+        );
+        assert_eq!(value["send_span_seconds"], json!(0.008));
+        assert_eq!(value["actual_offered_load_bps"], json!(200_000.));
+        assert_eq!(value["requested_offered_load_bps"], json!(32_000_000.));
+        assert_eq!(value["source_pacing"]["completed_sends"], 3);
+        assert_eq!(
+            value["source_pacing"]["max_socket_send_wait"]["sequence"],
+            1
+        );
+        assert!(value["source_pacing"].get("first_due").is_none());
+        println!(
+            "source_diagnostics stall_us=6000 phase_shift_ns=5975000 socket_wait_ns=2000000 actual_span_s=0.008 actual_offered_bps=200000 nominal_offered_bps=32000000"
+        );
     }
 
     #[test]

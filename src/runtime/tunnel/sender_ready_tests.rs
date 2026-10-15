@@ -162,6 +162,204 @@ fn record(id: u64) -> Record {
     }
 }
 
+thread_local! {
+    static PRIME_FULL_INPUT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static EXHAUST_INPUT_GROUPS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+// Set up the exact full-queue transition inside the real actor, after selection
+// of its Input event. No executor race or timer delay decides whether it is full.
+pub(super) fn prime_full_input_turn(
+    queue: &mut outbound::Queue,
+    blocks: &mut BTreeMap<u64, BlockSend>,
+    metrics: &Scope,
+    pacer: &mut outbound::Pacer,
+    groups: &mut [outbound::Pacer; MAX_PATHS],
+) {
+    if !PRIME_FULL_INPUT.with(|prime| prime.replace(false)) {
+        return;
+    }
+    assert!(queue.is_empty());
+    for id in 0..outbound::PER_FLOW_LIMIT as u64 {
+        enqueue_symbol(
+            wire::plain(&record(id)).unwrap(),
+            Instant::now(),
+            queue,
+            blocks,
+            metrics,
+        );
+    }
+    // Ordinary earned budget, using the actual Pacer implementation. The first
+    // actor turn now has service available; no production token grant is added.
+    pacer.refill(1_000_000);
+    let exhaust = EXHAUST_INPUT_GROUPS.with(|value| value.replace(false));
+    for group in groups {
+        group.refill(1_000_000);
+        if exhaust {
+            while group.available(1) {
+                group.spend(1);
+            }
+        }
+    }
+}
+
+async fn full_input_turn_services_old_records(expires: bool) {
+    let pair = Pair::connect().await;
+    let paths = Arc::new(Mutex::new(vec![pair.path()]));
+    let mut policy = policy();
+    policy.fec = 0;
+    policy.redundancy = 0;
+    policy.receiver_feedback = false;
+    policy.quality_schedule = false;
+    policy.rate = 125_000_000;
+    policy.group_rates = [policy.rate; MAX_PATHS];
+    let metrics = stats::Metrics::new("client");
+    let scope = metrics.scope("full-input", stats::FORWARD);
+    let (tx, rx) = mpsc::channel(QUEUE);
+    let (stop, stopped) = watch::channel(false);
+    let created = Instant::now() - Duration::from_millis(if expires { 500 } else { 20 });
+    if expires {
+        // Reuse the real admission clock hook: old heads remain within their
+        // unchanged 1000ms lifetime, but this older Input expires at the API.
+        ADMISSION_CLOCK_FIXED.with(|clock| clock.set(Some(created + Duration::from_millis(1001))));
+    }
+    tx.try_send(QueuedRecord {
+        record: record(64),
+        created,
+    })
+    .unwrap();
+    PRIME_FULL_INPUT.with(|prime| prime.set(true));
+    let task = tokio::spawn(sender(rx, paths, policy, stopped, scope, None));
+    let mut received = BTreeSet::new();
+    let mut decoder = Receiver::default();
+    while received.len() < outbound::PER_FLOW_LIMIT {
+        for record in decoder
+            .receive(
+                wire::http_payload(&pair.receive().await, 0).unwrap(),
+                Instant::now(),
+            )
+            .unwrap()
+        {
+            assert!(received.insert(record.id));
+        }
+    }
+    metrics.state(|s| {
+        let d = &s.sessions["full-input"][stats::FORWARD];
+        assert_eq!(
+            d.symbols.originals_queue_full_dropped, 0,
+            "a serviceable old head must free an existing slot before rejecting this Input"
+        );
+    });
+    while !expires && received.len() < outbound::PER_FLOW_LIMIT + 1 {
+        for record in decoder
+            .receive(
+                wire::http_payload(&pair.receive().await, 0).unwrap(),
+                Instant::now(),
+            )
+            .unwrap()
+        {
+            assert!(received.insert(record.id));
+        }
+    }
+    stop.send(true).unwrap();
+    task.await.unwrap();
+    ADMISSION_CLOCK_FIXED.with(|clock| clock.set(None));
+    assert_eq!(received, (0..if expires { 64 } else { 65 }).collect());
+    metrics.state(|s| {
+        let d = &s.sessions["full-input"][stats::FORWARD];
+        assert_eq!(d.symbols.originals_generated, 65);
+        assert_eq!(
+            d.symbols.originals_quinn_admitted,
+            if expires { 64 } else { 65 }
+        );
+        assert_eq!(d.symbols.originals_expired_dropped, u64::from(expires));
+        assert_eq!(d.symbols.originals_shutdown_dropped, 0);
+        if !expires {
+            assert!(
+                d.symbols.admitted_wait.max_ms >= 20.0,
+                "preserve the new record's ingress clock"
+            );
+        }
+    });
+    pair.assert_quiet().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn full_input_turn_services_old_records_before_rejecting_new_original() {
+    full_input_turn_services_old_records(false).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn full_input_turn_cannot_revive_deferred_record_past_its_ingress_deadline() {
+    full_input_turn_services_old_records(true).await;
+}
+
+async fn full_input_turn_with_blocked_group(new_flow: u32) {
+    let pair = Pair::connect().await;
+    let paths = Arc::new(Mutex::new(vec![pair.path()]));
+    let mut policy = policy();
+    policy.fec = 0;
+    policy.redundancy = 0;
+    policy.receiver_feedback = false;
+    policy.quality_schedule = false;
+    policy.rate = 125_000_000;
+    policy.group_rates = [64_000; MAX_PATHS];
+    let metrics = stats::Metrics::new("client");
+    let scope = metrics.scope("blocked-full-input", stats::FORWARD);
+    let (tx, rx) = mpsc::channel(QUEUE);
+    let (stop, stopped) = watch::channel(false);
+    let mut input = record(64);
+    input.flow = new_flow;
+    if new_flow != 1 {
+        input.payload.resize(128, 0);
+    }
+    tx.try_send(QueuedRecord {
+        record: input,
+        created: Instant::now(),
+    })
+    .unwrap();
+    PRIME_FULL_INPUT.with(|prime| prime.set(true));
+    EXHAUST_INPUT_GROUPS.with(|value| value.set(true));
+    let mut task = Box::pin(sender(rx, paths, policy, stopped, scope, None));
+    poll_fn(|cx| {
+        assert!(task.as_mut().poll(cx).is_pending());
+        Poll::Ready(())
+    })
+    .await;
+    metrics.state(|s| {
+        assert_eq!(
+            s.sessions["blocked-full-input"][stats::FORWARD]
+                .records
+                .sender_input_consumed,
+            1,
+            "full bulk flow must not pause actor input"
+        )
+    });
+    stop.send(true).unwrap();
+    task.await;
+    metrics.state(|s| {
+        let d = &s.sessions["blocked-full-input"][stats::FORWARD];
+        let same_flow = u64::from(new_flow == 1);
+        assert_eq!(d.symbols.originals_generated, 65);
+        assert_eq!(d.symbols.originals_queue_full_dropped, same_flow);
+        assert_eq!(d.symbols.originals_quinn_admitted, 0);
+        assert_eq!(d.symbols.originals_shutdown_dropped, 65 - same_flow);
+        assert_eq!(d.symbols.originals_expired_dropped, 0);
+        assert_eq!(d.symbols.originals_ingress_expired_dropped, 0);
+    });
+    pair.assert_quiet().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn full_input_turn_keeps_original_limit_when_all_paths_are_budget_blocked() {
+    full_input_turn_with_blocked_group(1).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn full_input_turn_does_not_defer_small_record_from_another_flow() {
+    full_input_turn_with_blocked_group(2).await;
+}
+
 struct Accounting {
     policy: Policy,
     scope: Scope,
