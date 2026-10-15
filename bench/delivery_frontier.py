@@ -126,7 +126,10 @@ def record_ledger(direction):
         "repair_symbols_separate": {k: count(s, k) for k in [
             "repairs_generated", "repairs_enqueued", "repairs_queue_full_dropped",
             "repairs_quinn_admitted", "repairs_budget_skipped", "repairs_expired_dropped",
-            "repairs_shutdown_dropped"]},
+            "repairs_shutdown_dropped"]} | {
+                k: integer(s.get(k, 0), k) for k in [
+                    "repairs_locally_unrecoverable", "repairs_locally_unrecoverable_bytes",
+                    "repairs_locally_unrecoverable_skipped", "repairs_locally_unrecoverable_skipped_bytes"]},
         "interpretation": {
             "pre_encoding_disposals_never_entered_fec": True,
             "encoded_original_disposal_may_still_be_recovered": True,

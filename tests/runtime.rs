@@ -519,13 +519,18 @@ fn frontier_with_dual_recovery_keeps_both_authenticated_lanes_and_budgets() {
     three_paths(8);
 }
 #[test]
+fn repair_usefulness_guard_preserves_real_dual_and_small_lane_delivery() {
+    three_paths(9);
+}
+#[test]
 fn persistent_bad_path_rejoins_with_new_udp_port() {
     three_paths(3);
 }
 fn three_paths(mode: u8) {
     let feedback = mode > 0;
-    let dual = matches!(mode, 6 | 8);
+    let dual = matches!(mode, 6 | 8 | 9);
     let frontier_enabled = matches!(mode, 7 | 8);
+    let repair_guard = mode == 9;
     let dir = tempfile::tempdir().unwrap();
     let identity = dir.path().join("identity");
     let ident = identity.to_str().unwrap();
@@ -567,6 +572,7 @@ fn three_paths(mode: u8) {
         .into_iter()
         .chain((mode >= 5).then(|| "--adaptive-fec-retention".to_owned()))
         .chain(frontier_enabled.then(|| "--frontier-scheduler".to_owned()))
+        .chain(repair_guard.then(|| "--repair-usefulness-guard".to_owned()))
         .chain(dual.then(|| "--packet-trace".to_owned()))
         .chain(dual.then(|| {
             dir.path()
@@ -731,9 +737,12 @@ fn three_paths(mode: u8) {
     if frontier_enabled {
         client_args.extend(args(&["--frontier-scheduler", "--adaptive"]));
     }
+    if repair_guard {
+        client_args.extend(args(&["--repair-usefulness-guard", "--adaptive"]));
+    }
     let mut client = launch(&client_args, dir.path(), "client");
     ready(&mut client, "UDP client ready");
-    if frontier_enabled {
+    if frontier_enabled || repair_guard {
         // Adaptive mode announces its first usable path, not completion of all
         // joins. This three-path fixture must await the actual third join.
         let until = Instant::now() + Duration::from_secs(12);
@@ -967,7 +976,7 @@ fn three_paths(mode: u8) {
             thread::sleep(Duration::from_millis(100));
         }
     }
-    if mode == 8 {
+    if matches!(mode, 8 | 9) {
         // Exercise the configured small lane too; bulk-only traffic cannot
         // prove that finish preference and small-copy accounting coexist.
         let result = run(&args(&[
@@ -1005,6 +1014,17 @@ fn three_paths(mode: u8) {
                 s["mixed_bulk_repair_admitted_bytes"].as_u64().unwrap()
                     <= s["mixed_bulk_original_admitted_bytes"].as_u64().unwrap() * 13 / 100
             );
+        }
+    }
+    if repair_guard {
+        for file in [&client_stats, &server_stats] {
+            let snapshot = fs::read_to_string(file)
+                .unwrap()
+                .lines()
+                .rev()
+                .find_map(|line| serde_json::from_str::<Value>(line).ok())
+                .unwrap();
+            assert_eq!(snapshot["repair_usefulness_guard"], true);
         }
     }
     if frontier_enabled {

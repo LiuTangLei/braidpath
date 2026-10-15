@@ -43,6 +43,8 @@ mod ingress;
 mod local_delivery;
 #[cfg(test)]
 mod mixed_fec_tests;
+#[cfg(test)]
+mod repair_usefulness_tests;
 mod small_delivery;
 
 const WEBSITE: &str = "<!doctype html><html lang=\"en\"><meta charset=\"utf-8\"><title>Welcome</title><h1>Welcome</h1><p>This service is online.</p></html>\n";
@@ -481,8 +483,30 @@ struct QueuedRecord {
 struct BlockSend {
     created: Instant,
     paths: u8,
+    /// Only permanent original queue rejections, never pending/in-flight loss.
+    /// Forgetting metadata loses evidence conservatively; it cannot add bits.
+    locally_rejected_originals: u32,
     small_repair_limit: usize,
     small_repair_reserved: usize,
+}
+
+fn repair_locally_unrecoverable(
+    policy: Option<&Policy>,
+    data: &[u8],
+    small: bool,
+    meta: Option<&BlockSend>,
+) -> bool {
+    if small
+        || !policy.is_some_and(|p| p.mixed_fec && p.fec_repairs == 2)
+        || data.len() < wire::HEADER
+        || !matches!(data[3], 1 | 3)
+        || !(1..=32).contains(&data[12])
+    {
+        return false;
+    }
+    let count = u32::from(data[12]);
+    let mask = u32::MAX >> (32 - count);
+    meta.is_some_and(|m| (m.locally_rejected_originals & mask).count_ones() > 2)
 }
 
 #[cfg(test)]
@@ -596,6 +620,7 @@ fn enqueue_coded_symbol(
             .or_insert(BlockSend {
                 created,
                 paths: 0,
+                locally_rejected_originals: 0,
                 small_repair_limit: 0,
                 small_repair_reserved: 0,
             })
@@ -646,6 +671,17 @@ fn enqueue_coded_symbol(
         generated_event = Some(event);
         event
     });
+    let locally_unrecoverable =
+        repair_locally_unrecoverable(policy, &data, small, block.and_then(|b| blocks.get(&b)));
+    let skipped = locally_unrecoverable && metrics.metrics.repair_usefulness_guard();
+    let encoded_bytes = data.len() as u64;
+    let original_index = (data[3] == 0 && !small && mixed).then_some(u32::from(data[12]));
+    if locally_unrecoverable {
+        metrics.update(|d| {
+            d.symbols.repairs_locally_unrecoverable += 1;
+            d.symbols.repairs_locally_unrecoverable_bytes += encoded_bytes;
+        });
+    }
     let pending = outbound::Pending {
         data,
         created,
@@ -654,14 +690,25 @@ fn enqueue_coded_symbol(
         block,
         small,
     };
-    let accepted = queue.push(pending).is_ok();
+    let accepted = !skipped && queue.push(pending).is_ok();
+    if !accepted
+        && !skipped
+        && let Some(bit) = original_index.and_then(|index| 1u32.checked_shl(index))
+        && let Some(meta) = block.and_then(|b| blocks.get_mut(&b))
+    {
+        meta.locally_rejected_originals |= bit;
+    }
     if let Some(mut event) = generated_event {
         event.stage = if accepted {
             trace::Stage::SymbolQueued
         } else {
             trace::Stage::SymbolDropped
         };
-        event.reason = (!accepted).then_some(trace::Reason::QueueFull);
+        event.reason = if skipped {
+            Some(trace::Reason::LocallyUnrecoverable)
+        } else {
+            (!accepted).then_some(trace::Reason::QueueFull)
+        };
         metrics.metrics.trace().emit(event);
     }
     if accepted
@@ -670,14 +717,21 @@ fn enqueue_coded_symbol(
     {
         meta.small_repair_limit = small_repair_limit;
     }
-    metrics.update(|d| match (record_id, accepted) {
-        (Some(_), true) => d.symbols.originals_enqueued += 1,
-        (None, true) => d.symbols.repairs_enqueued += 1,
-        (Some(id), false) => {
-            d.symbols.originals_queue_full_dropped += 1;
-            d.locally_dropped_original_ids.add(id);
+    metrics.update(|d| {
+        if skipped {
+            d.symbols.repairs_locally_unrecoverable_skipped += 1;
+            d.symbols.repairs_locally_unrecoverable_skipped_bytes += encoded_bytes;
+        } else {
+            match (record_id, accepted) {
+                (Some(_), true) => d.symbols.originals_enqueued += 1,
+                (None, true) => d.symbols.repairs_enqueued += 1,
+                (Some(id), false) => {
+                    d.symbols.originals_queue_full_dropped += 1;
+                    d.locally_dropped_original_ids.add(id);
+                }
+                (None, false) => d.symbols.repairs_queue_full_dropped += 1,
+            }
         }
-        (None, false) => d.symbols.repairs_queue_full_dropped += 1,
     });
     while blocks.len() > QUEUE * 2 {
         blocks.pop_first();

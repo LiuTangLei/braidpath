@@ -23,6 +23,10 @@ const MAX_RETIRED_SESSIONS: usize = 8;
 
 #[derive(Args, Clone, Default)]
 pub struct Options {
+    /// Omit dual bulk repairs only when more than two originals in that block
+    /// were permanently rejected locally. Off by default; no added credit.
+    #[arg(long)]
+    pub repair_usefulness_guard: bool,
     /// Experimental per-RTT-source queue baselines; off by default. No new
     /// queue, pacing credit, loss exemption or altered absolute RTT sample.
     #[arg(long)]
@@ -125,6 +129,12 @@ pub struct UdpDelivery {
 pub struct Symbols {
     pub originals_generated: u64,
     pub repairs_generated: u64,
+    /// Shadow census in both modes. Counts repairs, not recoverable records.
+    pub repairs_locally_unrecoverable: u64,
+    pub repairs_locally_unrecoverable_bytes: u64,
+    /// Generated but not queued/admitted. Bytes exclude quality/HTTP framing.
+    pub repairs_locally_unrecoverable_skipped: u64,
+    pub repairs_locally_unrecoverable_skipped_bytes: u64,
     pub repairs_budget_skipped: u64,
     pub originals_enqueued: u64,
     pub repairs_enqueued: u64,
@@ -639,6 +649,7 @@ impl ConnectionTrace {
     }
 }
 struct Inner {
+    repair_usefulness_guard: bool,
     rtt_source_baselines: bool,
     native_service_guard: bool,
     frontier_scheduler: bool,
@@ -686,7 +697,25 @@ impl Metrics {
         native_service_guard: bool,
         rtt_source_baselines: bool,
     ) -> Self {
+        Self::configured_repair(
+            role,
+            trace,
+            frontier_scheduler,
+            native_service_guard,
+            rtt_source_baselines,
+            false,
+        )
+    }
+    fn configured_repair(
+        role: &'static str,
+        trace: trace::Trace,
+        frontier_scheduler: bool,
+        native_service_guard: bool,
+        rtt_source_baselines: bool,
+        repair_usefulness_guard: bool,
+    ) -> Self {
         Self(Arc::new(Inner {
+            repair_usefulness_guard,
             rtt_source_baselines,
             native_service_guard,
             frontier_scheduler,
@@ -710,6 +739,13 @@ impl Metrics {
     }
     pub fn rtt_source_baselines(&self) -> bool {
         self.0.rtt_source_baselines
+    }
+    pub fn repair_usefulness_guard(&self) -> bool {
+        self.0.repair_usefulness_guard
+    }
+    #[cfg(test)]
+    pub(crate) fn new_with_repair_guard(role: &'static str, enabled: bool) -> Self {
+        Self::configured_repair(role, trace::Trace::disabled(), false, false, false, enabled)
     }
     pub fn state(&self, f: impl FnOnce(&mut State)) {
         f(&mut self.0.state.lock().expect("stats lock"));
@@ -869,6 +905,7 @@ impl Metrics {
             (state.clone(), elapsed_ms, sample_unix_ms)
         };
         let mut value = serde_json::json!({"schema_version":1,"process_id":std::process::id(),"instance_id":self.0.instance_id,"bounds":{"session_scopes":MAX_SCOPES,"path_scopes":MAX_SCOPES,"connection_events":MAX_CONNECTION_EVENTS,"record_id_window":ID_WINDOW,"previous_generations_per_path":MAX_PREVIOUS_GENERATIONS,"current_connection_references":MAX_SCOPES,"retired_session_snapshots":MAX_RETIRED_SESSIONS},"role":self.0.role,"final":final_snapshot,"outcome":outcome,"error":error,"elapsed_ms":elapsed_ms,"sample_unix_ms":sample_unix_ms,"counters":"cumulative; units separated by records/symbols/quinn/relay; pre-path queues have aggregate scope","stats":state});
+        value["repair_usefulness_guard"] = serde_json::json!(self.0.repair_usefulness_guard);
         if self.trace().enabled() {
             value["packet_trace"] = serde_json::to_value(self.trace().snapshot())?;
         }
@@ -1079,6 +1116,10 @@ fn distinct_output_paths(paths: &[Option<&FsPath>]) -> Result<()> {
 impl Reporter {
     pub fn new(role: &'static str, options: Options) -> Result<Self> {
         ensure!(
+            !options.repair_usefulness_guard || matches!(role, "client" | "server"),
+            "repair-usefulness-guard applies only to a client or server sender"
+        );
+        ensure!(
             !options.rtt_source_baselines || matches!(role, "client" | "server"),
             "rtt-source-baselines applies only to a client or server sender"
         );
@@ -1116,12 +1157,13 @@ impl Reporter {
                     .map(|f| Arc::new(Mutex::new(f)))
             })
             .transpose()?;
-        let metrics = Metrics::configured_rtt(
+        let metrics = Metrics::configured_repair(
             role,
             capture,
             options.frontier_scheduler,
             options.native_service_guard,
             options.rtt_source_baselines,
+            options.repair_usefulness_guard,
         );
         let periodic = jsonl.clone().map(|file| {
             let metrics = metrics.clone();

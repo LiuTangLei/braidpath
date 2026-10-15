@@ -250,6 +250,7 @@ pub enum Reason {
     Stale,
     Duplicate,
     Budget,
+    LocallyUnrecoverable,
     NoDiversePath,
     NoPath,
     QuinnError,

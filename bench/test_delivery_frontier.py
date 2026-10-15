@@ -65,6 +65,19 @@ def campaign(root, complete=True):
 
 
 class LedgerTests(unittest.TestCase):
+    def test_optional_prequeue_repair_pruning_never_changes_original_population(self):
+        d = direction()
+        before = record_ledger(d)
+        d['symbols'].update(repairs_locally_unrecoverable=8,
+            repairs_locally_unrecoverable_bytes=8000,
+            repairs_locally_unrecoverable_skipped=8,
+            repairs_locally_unrecoverable_skipped_bytes=8000)
+        d['symbols']['repairs_generated'] += 8
+        after = record_ledger(d)
+        self.assertEqual(before['nodes_records'], after['nodes_records'])
+        self.assertEqual(before['dispositions_records'], after['dispositions_records'])
+        self.assertEqual(after['repair_symbols_separate']['repairs_locally_unrecoverable_skipped'], 8)
+
     def test_dispositions_close_without_mixing_repairs(self):
         result = record_ledger(direction())
         self.assertEqual(result["pre_encoding_disposed_records"], 330)
