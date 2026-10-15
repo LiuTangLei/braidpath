@@ -150,6 +150,150 @@ fn authenticated_http3_three_paths_and_udp_integrity() {
 }
 
 #[test]
+fn server_ack_request_is_opt_in_and_directional_on_real_http3() {
+    let directory = tempfile::tempdir().unwrap();
+    let identity = directory.path().join("identity");
+    assert!(
+        run(&args(&[
+            "init",
+            "--dir",
+            identity.to_str().unwrap(),
+            "--name",
+            "localhost"
+        ]))
+        .status
+        .success()
+    );
+    for profile in ["unchanged", "every-two", "every-eight"] {
+        let folder = directory.path().join(profile);
+        fs::create_dir(&folder).unwrap();
+        let echo_addr = port();
+        let server_addr = port();
+        let client_addr = port();
+        let cert = identity.join("cert.pem");
+        let key = identity.join("key.pem");
+        let token = identity.join("token");
+        let server_stats = folder.join("server.jsonl");
+        let client_stats = folder.join("client.jsonl");
+        let mut echo = launch(&args(&["echo", "--listen", &echo_addr]), &folder, "echo");
+        ready(&mut echo, "test echo ready");
+        let mut server = launch(
+            &args(&[
+                "server",
+                "--listen",
+                &server_addr,
+                "--cert",
+                cert.to_str().unwrap(),
+                "--key",
+                key.to_str().unwrap(),
+                "--token-file",
+                token.to_str().unwrap(),
+                "--target",
+                &echo_addr,
+                "--ack-request",
+                profile,
+                "--stats-jsonl",
+                server_stats.to_str().unwrap(),
+                "--stats-interval-ms",
+                "50",
+            ]),
+            &folder,
+            "server",
+        );
+        ready(&mut server, "HTTP/3 server ready");
+        let mut client = launch(
+            &args(&[
+                "client",
+                "--listen",
+                &client_addr,
+                "--entrance",
+                &server_addr,
+                "--server-name",
+                "localhost",
+                "--ca",
+                cert.to_str().unwrap(),
+                "--token-file",
+                token.to_str().unwrap(),
+                "--fec",
+                "0",
+                "--small-fec-bytes",
+                "0",
+                "--stats-jsonl",
+                client_stats.to_str().unwrap(),
+                "--stats-interval-ms",
+                "50",
+            ]),
+            &folder,
+            "client",
+        );
+        ready(&mut client, "UDP client ready");
+        let out = run(&args(&[
+            "probe",
+            "--target",
+            &client_addr,
+            "--count",
+            "100",
+            "--pps",
+            "100",
+            "--size",
+            "128",
+            "--deadline-ms",
+            "1000",
+        ]));
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let probe: Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(probe["received"], 100, "{profile}: {probe}");
+        assert_eq!(probe["corrupt"], 0);
+        let read = |path: &Path| -> Value {
+            fs::read_to_string(path)
+                .unwrap()
+                .lines()
+                .rev()
+                .find_map(|s| serde_json::from_str(s).ok())
+                .unwrap()
+        };
+        let end = Instant::now() + Duration::from_secs(3);
+        loop {
+            let s = read(&server_stats);
+            let c = read(&client_stats);
+            let s = &s["stats"]["paths"]
+                .as_object()
+                .unwrap()
+                .values()
+                .next()
+                .unwrap()["quinn"];
+            let c = &c["stats"]["paths"]
+                .as_object()
+                .unwrap()
+                .values()
+                .next()
+                .unwrap()["quinn"];
+            assert_eq!(c["ack_frequency_frames_tx"], 0);
+            assert_eq!(s["ack_frequency_frames_rx"], 0);
+            if profile == "unchanged" {
+                assert_eq!(s["ack_frequency_frames_tx"], 0);
+                assert_eq!(c["ack_frequency_frames_rx"], 0);
+                break;
+            }
+            if s["ack_frequency_frames_tx"].as_u64().unwrap() > 0
+                && c["ack_frequency_frames_rx"].as_u64().unwrap() > 0
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < end,
+                "{profile}: no actual directional negotiation"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+}
+
+#[test]
 fn same_entrance_four_connections_have_distinct_sockets_and_preserve_uncoded_integrity() {
     use std::collections::BTreeSet;
     let dir = tempfile::tempdir().unwrap();

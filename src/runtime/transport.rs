@@ -35,6 +35,37 @@ pub enum Congestion {
     #[default]
     Bbr,
 }
+
+/// Explicit peer ACK-frequency requests for controlled directional comparisons.
+/// The default preserves Quinn's existing behavior. Native recovery and BBR are
+/// unchanged, and the peer can clamp or decline an extension request.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
+pub enum AckRequest {
+    #[default]
+    Unchanged,
+    EveryTwo,
+    EveryEight,
+}
+impl AckRequest {
+    /// (ack-eliciting threshold, maximum requested delay ms, reordering threshold).
+    pub fn request(self) -> Option<(u32, u64, u32)> {
+        match self {
+            Self::Unchanged => None,
+            Self::EveryTwo => Some((1, 10, 2)),
+            Self::EveryEight => Some((7, 10, 2)),
+        }
+    }
+
+    pub fn apply(self, transport: &mut TransportConfig) {
+        if let Some((threshold, delay, reorder)) = self.request() {
+            let mut request = quinn::AckFrequencyConfig::default();
+            request.ack_eliciting_threshold(threshold.into());
+            request.max_ack_delay(Some(Duration::from_millis(delay)));
+            request.reordering_threshold(reorder.into());
+            transport.ack_frequency_config(Some(request));
+        }
+    }
+}
 pub fn config(_congestion: Congestion) -> TransportConfig {
     let mut t = TransportConfig::default();
     t.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
@@ -80,6 +111,24 @@ pub fn server_with_datagram_buffer(
     congestion: Congestion,
     datagram_send_buffer_bytes: usize,
 ) -> Result<Endpoint> {
+    server_with_ack_request(
+        bind,
+        cert,
+        key_path,
+        congestion,
+        datagram_send_buffer_bytes,
+        AckRequest::Unchanged,
+    )
+}
+
+pub fn server_with_ack_request(
+    bind: SocketAddr,
+    cert: &Path,
+    key_path: &Path,
+    congestion: Congestion,
+    datagram_send_buffer_bytes: usize,
+    ack_request: AckRequest,
+) -> Result<Endpoint> {
     ensure!(
         (DEFAULT_DATAGRAM_SEND_BUFFER_BYTES..=MAX_DATAGRAM_SEND_BUFFER_BYTES)
             .contains(&datagram_send_buffer_bytes),
@@ -93,6 +142,7 @@ pub fn server_with_datagram_buffer(
     let mut conf = ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(tls)?));
     let mut transport = config(congestion);
     transport.datagram_send_buffer_size(datagram_send_buffer_bytes);
+    ack_request.apply(&mut transport);
     conf.transport_config(Arc::new(transport));
     Ok(Endpoint::server(conf, bind)?)
 }

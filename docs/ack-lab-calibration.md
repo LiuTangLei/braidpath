@@ -39,8 +39,18 @@ including the adapter's received-segmentation metadata. Sixteen 64 KiB receive
 slots limit the workspace to one MiB per direction. The existing modeled FIFO,
 service rate, propagation time and maximum queue size are unchanged. Due packets
 advance before another timer is armed. The relay uses two finite dedicated
-IO/timer workers, separate from the four workers serving the test connections.
+IO/timer workers in one shared runtime, separate from the four workers serving the test connections.
 This is additional instrument resource use, not evidence of lower production CPU.
+
+Each relay socket is registered once and shared through the native async socket
+adapter. A blocked send retains the exact FIFO head and waits for native write
+readiness while permitting receive progress. The existing memory, queue-time and
+propagation bounds remain. This removes overlapping registrations; it does not
+by itself prove why any historical host dropped packets.
+
+Sample files use a bounded 64 KiB buffered writer, flushed explicitly. Token-by-token
+JSON writes must not turn a finite post-load artifact save into an unbounded
+mounted-filesystem operation. Serialization/flush failure remains a failed run.
 
 Socket headroom does not guarantee bounded residence time, establish network
 capacity, or permit accepting a misleading benchmark. Timer lateness and source

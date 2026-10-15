@@ -2734,16 +2734,25 @@ pub struct ServerOptions {
     pub stats: stats::Metrics,
 }
 pub async fn serve(options: ServerOptions) -> Result<()> {
+    serve_with_ack_request(options, transport::AckRequest::Unchanged).await
+}
+
+/// Server-only opt-in experiment; ordinary callers retain the existing policy.
+pub async fn serve_with_ack_request(
+    options: ServerOptions,
+    ack_request: transport::AckRequest,
+) -> Result<()> {
     ensure!(
         (64_000..=1_000_000_000).contains(&options.max_rate),
         "invalid server rate"
     );
-    let endpoint = transport::server_with_datagram_buffer(
+    let endpoint = transport::server_with_ack_request(
         options.bind,
         &options.cert,
         &options.key,
         options.congestion,
         options.datagram_send_buffer_bytes,
+        ack_request,
     )?;
     let secret = Arc::new(format!("Bearer {}", transport::token(&options.token)?));
     let sessions: Sessions = Arc::new(Mutex::new(HashMap::new()));
@@ -2752,7 +2761,7 @@ pub async fn serve(options: ServerOptions) -> Result<()> {
     let mut maintenance = interval(Duration::from_secs(1));
     let mut shutdown = Shutdown::new();
     options.stats.readiness(true, 0);
-    info!(address=%endpoint.local_addr()?,target=%options.target,congestion=?options.congestion,"HTTP/3 server ready");
+    info!(address=%endpoint.local_addr()?,target=%options.target,congestion=?options.congestion,?ack_request,"HTTP/3 server ready");
     loop {
         tokio::select! {
             _=shutdown.wait()=>break,

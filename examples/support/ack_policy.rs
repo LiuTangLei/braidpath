@@ -1,37 +1,11 @@
-//! Laboratory-only peer requests. No change to production transport defaults.
+//! Laboratory adapter for shared opt-in peer requests. Defaults stay unchanged.
 use braidpath::runtime::transport;
-use clap::ValueEnum;
-use std::time::Duration;
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
-pub enum AckProfile {
-    #[default]
-    Unchanged,
-    EveryTwo,
-    EveryEight,
-}
-
-impl AckProfile {
-    /// (ack-eliciting threshold, requested maximum delay ms, reordering threshold).
-    pub fn request(self) -> Option<(u32, u64, u32)> {
-        match self {
-            Self::Unchanged => None,
-            Self::EveryTwo => Some((1, 10, 2)),
-            Self::EveryEight => Some((7, 10, 2)),
-        }
-    }
-}
+pub use transport::AckRequest as AckProfile;
 
 pub fn reference_transport(profile: AckProfile) -> quinn::TransportConfig {
     let mut transport = transport::config(transport::Congestion::Bbr);
     transport.datagram_send_buffer_size(9600);
-    if let Some((threshold, delay, reorder)) = profile.request() {
-        let mut request = quinn::AckFrequencyConfig::default();
-        request.ack_eliciting_threshold(threshold.into());
-        request.max_ack_delay(Some(Duration::from_millis(delay)));
-        request.reordering_threshold(reorder.into());
-        transport.ack_frequency_config(Some(request));
-    }
+    profile.apply(&mut transport);
     transport
 }
 

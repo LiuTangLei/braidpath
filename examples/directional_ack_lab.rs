@@ -15,7 +15,7 @@ use std::{
     collections::VecDeque,
     fs,
     future::{Future, poll_fn},
-    io::{BufReader, IoSliceMut, Write},
+    io::{BufReader, BufWriter, IoSliceMut, Write},
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
@@ -24,7 +24,6 @@ use std::{
 };
 use subtle::ConstantTimeEq;
 use tokio::{
-    net::UdpSocket,
     sync::watch,
     task::JoinSet,
     time::{Instant, MissedTickBehavior, sleep_until, timeout},
@@ -111,12 +110,17 @@ impl Args {
     }
 }
 fn save(path: &Path, value: &impl Serialize) -> Result<()> {
-    let mut file = fs::OpenOptions::new()
+    let file = fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(path)?;
-    serde_json::to_writer(&mut file, value)?;
-    writeln!(file)?;
+    // serde_json streams small tokens. Buffer them so mounted evidence storage
+    // does not turn one finite cohort into millions of synchronous file writes.
+    // A flush error is still a failed run, not a successful partial artifact.
+    let mut writer = BufWriter::with_capacity(64 * 1024, file);
+    serde_json::to_writer(&mut writer, value)?;
+    writeln!(writer)?;
+    writer.flush()?;
     Ok(())
 }
 fn micros(epoch: Instant) -> u64 {
@@ -164,6 +168,7 @@ struct LinkStats {
     receive_batches: u64,
     maximum_receive_batch_packets: usize,
     maximum_forward_batch_packets: usize,
+    send_would_block: u64,
 }
 struct Flight {
     due: Instant,
@@ -212,7 +217,7 @@ impl LinkQueue {
 }
 async fn link_loop(
     input: Arc<dyn quinn::AsyncUdpSocket>,
-    output: Arc<UdpSocket>,
+    output: Arc<dyn quinn::AsyncUdpSocket>,
     allowed: SocketAddr,
     destination: SocketAddr,
     mut queue: LinkQueue,
@@ -229,6 +234,7 @@ async fn link_loop(
     let mut storage = vec![vec![0u8; 65536]; 16];
     let mut slices: Vec<_> = storage.iter_mut().map(|b| IoSliceMut::new(b)).collect();
     let mut metadata = vec![Default::default(); 16];
+    let mut writable = output.clone().create_io_poller();
     loop {
         if *stop.borrow() {
             break;
@@ -238,14 +244,30 @@ async fn link_loop(
         let mut count = 0;
         let mut bytes = 0;
         let mut maximum_late = 0;
+        let mut blocked = false;
         for _ in 0..64 {
             if queue.queue.front().is_none_or(|p| p.due > Instant::now()) {
                 break;
             }
-            let p = queue.queue.pop_front().unwrap();
+            let p = queue.queue.front().unwrap();
             let late = Instant::now().saturating_duration_since(p.due).as_micros() as u64;
-            let n = output.send_to(&p.data, destination).await?;
-            ensure!(n == p.data.len(), "short relay send");
+            let transmit = quinn::udp::Transmit {
+                destination,
+                ecn: None,
+                contents: &p.data,
+                segment_size: None,
+                src_ip: None,
+            };
+            match output.try_send(&transmit) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    blocked = true;
+                    stats.lock().unwrap().send_would_block += 1;
+                    break;
+                }
+                Err(error) => return Err(error.into()),
+            }
+            let n = queue.queue.pop_front().unwrap().data.len();
             count += 1;
             bytes += n as u64;
             maximum_late = maximum_late.max(late);
@@ -261,7 +283,7 @@ async fn link_loop(
             tokio::task::yield_now().await;
             continue;
         }
-        let due = queue.queue.front().map(|p| p.due);
+        let due = queue.queue.front().filter(|_| !blocked).map(|p| p.due);
         tokio::select! {
             _=stop.changed()=>break,
             r=poll_fn(|cx|input.poll_recv(cx,&mut slices,&mut metadata))=>{
@@ -282,6 +304,7 @@ async fn link_loop(
                 counts.maximum_receive_batch_packets=counts.maximum_receive_batch_packets.max(received);
             },
             _=async {if let Some(t)=due {sleep_until(t).await}else{std::future::pending::<()>().await}}=>{}
+            ready=poll_fn(|cx|writable.as_mut().poll_writable(cx)), if blocked =>{ready?;}
         }
     }
     stats.lock().unwrap().shutdown_discarded_packets += queue.queue.len() as u64;
@@ -774,6 +797,7 @@ async fn measure(
             "delivery without source admission"
         );
     }
+    eprintln!("source and drain complete; persisting full finite sample cohorts");
     save(
         &args.output.join("samples.json"),
         &json!({"bulk":bulk,"echo":echo,"bulk_split":split,"echo_split":esplit}),
@@ -839,46 +863,46 @@ async fn run(args: &Args) -> Result<Value> {
     let mut jobs = JoinSet::new();
     let delay = Duration::from_millis(args.one_way_delay_ms);
     let limit = Duration::from_millis(args.link_queue_ms);
-    for (input, output, allowed, destination, pps, stats) in [
-        (
-            front.try_clone()?,
-            back.try_clone()?,
-            client.local_addr()?,
-            server.local_addr()?,
-            args.reverse_pps,
-            reverse.clone(),
-        ),
-        (
-            back,
-            front,
-            server.local_addr()?,
-            client.local_addr()?,
-            0,
-            forward.clone(),
-        ),
-    ] {
-        let shutdown = rx.clone();
-        // The simulated resource must not compete in the very executor whose
-        // congestion/receive behavior is under test. Exactly two finite relay
-        // workers, each with its own IO/timer driver; no busy-wait or global tuning.
-        jobs.spawn_blocking(move || -> Result<()> {
-            tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()?
-                .block_on(async move {
-                    link_loop(
-                        quinn::Runtime::wrap_udp_socket(&quinn::TokioRuntime, input)?,
-                        Arc::new(UdpSocket::from_std(output)?),
-                        allowed,
-                        destination,
-                        LinkQueue::new(pps, delay, limit),
-                        stats,
-                        shutdown,
-                    )
-                    .await
-                })
-        });
-    }
+    let (client_address, server_address) = (client.local_addr()?, server.local_addr()?);
+    let reverse_stats = reverse.clone();
+    let forward_stats = forward.clone();
+    let reverse_pps = args.reverse_pps;
+    // Exactly one registration per socket. Both directions share a native
+    // adapter in one isolated IO driver instead of registering cloned file
+    // descriptions independently in different reactors. A blocked writer keeps
+    // its head and polls readiness without suspending the receive side.
+    jobs.spawn_blocking(move || -> Result<()> {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()?
+            .block_on(async move {
+                let front = quinn::Runtime::wrap_udp_socket(&quinn::TokioRuntime, front)?;
+                let back = quinn::Runtime::wrap_udp_socket(&quinn::TokioRuntime, back)?;
+                let a = tokio::spawn(link_loop(
+                    front.clone(),
+                    back.clone(),
+                    client_address,
+                    server_address,
+                    LinkQueue::new(reverse_pps, delay, limit),
+                    reverse_stats,
+                    rx.clone(),
+                ));
+                let b = tokio::spawn(link_loop(
+                    back,
+                    front,
+                    server_address,
+                    client_address,
+                    LinkQueue::new(0, delay, limit),
+                    forward_stats,
+                    rx,
+                ));
+                let (a, b) = tokio::join!(a, b);
+                a??;
+                b??;
+                Ok(())
+            })
+    });
     let connection = async {
         let connecting = client.connect(front_address, "localhost")?;
         let a = async { connecting.await.map_err(anyhow::Error::from) };
@@ -977,6 +1001,114 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::net::UdpSocket;
+
+    #[derive(Debug, Default)]
+    struct BlockOnceSocket {
+        attempts: std::sync::atomic::AtomicUsize,
+        writes: Mutex<Vec<Vec<u8>>>,
+        polls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    #[derive(Debug)]
+    struct ImmediateWritable(Arc<std::sync::atomic::AtomicUsize>);
+    impl quinn::UdpPoller for ImmediateWritable {
+        fn poll_writable(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Poll::Ready(Ok(()))
+        }
+    }
+    impl quinn::AsyncUdpSocket for BlockOnceSocket {
+        fn create_io_poller(self: Arc<Self>) -> std::pin::Pin<Box<dyn quinn::UdpPoller>> {
+            Box::pin(ImmediateWritable(self.polls.clone()))
+        }
+        fn try_send(&self, packet: &quinn::udp::Transmit<'_>) -> std::io::Result<()> {
+            if self
+                .attempts
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                == 0
+            {
+                return Err(std::io::ErrorKind::WouldBlock.into());
+            }
+            self.writes.lock().unwrap().push(packet.contents.to_vec());
+            Ok(())
+        }
+        fn poll_recv(
+            &self,
+            _: &mut std::task::Context<'_>,
+            _: &mut [IoSliceMut<'_>],
+            _: &mut [quinn::udp::RecvMeta],
+        ) -> Poll<std::io::Result<usize>> {
+            Poll::Pending
+        }
+        fn local_addr(&self) -> std::io::Result<SocketAddr> {
+            Ok("127.0.0.1:9000".parse().unwrap())
+        }
+    }
+    #[tokio::test]
+    async fn blocked_relay_head_is_retained_until_native_write_readiness() {
+        let socket = Arc::new(BlockOnceSocket::default());
+        let statistics = Arc::new(Mutex::new(LinkStats::default()));
+        let mut queue = LinkQueue::new(0, Duration::ZERO, Duration::ZERO);
+        queue.offer(
+            Instant::now(),
+            Bytes::from_static(b"same head after WouldBlock"),
+            &mut statistics.lock().unwrap(),
+        );
+        let (stop, receiver) = watch::channel(false);
+        let task = tokio::spawn(link_loop(
+            socket.clone(),
+            socket.clone(),
+            "127.0.0.1:9000".parse().unwrap(),
+            "127.0.0.1:9001".parse().unwrap(),
+            queue,
+            statistics.clone(),
+            receiver,
+        ));
+        timeout(Duration::from_secs(1), async {
+            while statistics.lock().unwrap().forwarded_packets == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        stop.send(true).unwrap();
+        task.await.unwrap().unwrap();
+        assert_eq!(
+            *socket.writes.lock().unwrap(),
+            vec![b"same head after WouldBlock".to_vec()]
+        );
+        assert!(socket.polls.load(std::sync::atomic::Ordering::Relaxed) > 0);
+        let stats = statistics.lock().unwrap();
+        assert_eq!(
+            (
+                stats.input_packets,
+                stats.forwarded_packets,
+                stats.send_would_block
+            ),
+            (1, 1, 1)
+        );
+        assert_eq!(stats.shutdown_discarded_packets, 0);
+    }
+
+    #[test]
+    fn buffered_evidence_is_complete_and_never_replaces_an_attempt() {
+        let temporary = tempfile::tempdir().unwrap();
+        let file = temporary.path().join("cohort.json");
+        let data = json!({"records":vec![vec![7u8;100];2000],"complete":true});
+        save(&file, &data).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&fs::read(&file).unwrap()).unwrap(),
+            data
+        );
+        assert!(save(&file, &json!({"replacement":true})).is_err());
+        assert_eq!(
+            serde_json::from_slice::<Value>(&fs::read(&file).unwrap()).unwrap(),
+            data
+        );
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn expired_send_wait_does_not_transmit_or_consume_a_later_record() {
@@ -1137,16 +1269,13 @@ mod tests {
         let (middle, _) = lab_socket::bind("plain-relay", 1024 * 1024, 256 * 1024).unwrap();
         let (sink, _) = lab_socket::bind("plain-sink", 1024 * 1024, 256 * 1024).unwrap();
         let source = UdpSocket::from_std(source).unwrap();
-        let middle_input =
-            quinn::Runtime::wrap_udp_socket(&quinn::TokioRuntime, middle.try_clone().unwrap())
-                .unwrap();
-        let middle = Arc::new(UdpSocket::from_std(middle).unwrap());
+        let middle = quinn::Runtime::wrap_udp_socket(&quinn::TokioRuntime, middle).unwrap();
         let sink = UdpSocket::from_std(sink).unwrap();
         let target = middle.local_addr().unwrap();
         let stats = Arc::new(Mutex::new(LinkStats::default()));
         let (stop, watch) = watch::channel(false);
         let task = tokio::spawn(link_loop(
-            middle_input,
+            middle.clone(),
             middle,
             source.local_addr().unwrap(),
             sink.local_addr().unwrap(),

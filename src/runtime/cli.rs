@@ -15,6 +15,48 @@ pub struct Cli {
     #[command(subcommand)]
     command: Command,
 }
+
+#[cfg(test)]
+mod ack_request_tests {
+    use super::*;
+    #[test]
+    fn server_ack_request_preserves_default_and_rejects_unregistered_profiles() {
+        let base = [
+            "braidpath",
+            "server",
+            "--listen",
+            "127.0.0.1:7001",
+            "--cert",
+            "cert",
+            "--key",
+            "key",
+            "--token-file",
+            "token",
+            "--target",
+            "127.0.0.1:7002",
+        ];
+        let parsed = Cli::try_parse_from(base).unwrap();
+        assert!(matches!(
+            parsed.command,
+            Command::Server {
+                ack_request: transport::AckRequest::Unchanged,
+                ..
+            }
+        ));
+        for (name, expected) in [
+            ("every-two", transport::AckRequest::EveryTwo),
+            ("every-eight", transport::AckRequest::EveryEight),
+        ] {
+            let parsed =
+                Cli::try_parse_from(base.into_iter().chain(["--ack-request", name])).unwrap();
+            let Command::Server { ack_request, .. } = parsed.command else {
+                panic!("server expected")
+            };
+            assert_eq!(ack_request, expected);
+        }
+        assert!(Cli::try_parse_from(base.into_iter().chain(["--ack-request", "no-acks"])).is_err());
+    }
+}
 #[derive(Subcommand)]
 enum Command {
     /// Create a dedicated test identity. Trust cert.pem explicitly on the client.
@@ -26,6 +68,10 @@ enum Command {
     },
     /// Serve a website and authenticated datagrams to one configured UDP target.
     Server {
+        /// Experimental server-to-peer ACK request. Does not change native BBR,
+        /// recovery, or the client's request policy; default remains unchanged.
+        #[arg(long, value_enum, default_value_t = transport::AckRequest::Unchanged)]
+        ack_request: transport::AckRequest,
         #[arg(long)]
         listen: SocketAddr,
         #[arg(long)]
@@ -226,6 +272,7 @@ pub async fn run() -> Result<()> {
             Ok(())
         }
         Command::Server {
+            ack_request,
             listen,
             cert,
             key,
@@ -238,18 +285,21 @@ pub async fn run() -> Result<()> {
             stats,
         } => {
             let reporter = stats::Reporter::new("server", stats)?;
-            let result = tunnel::serve(tunnel::ServerOptions {
-                stats: reporter.metrics.clone(),
-                adaptive_fec_retention,
-                bind: listen,
-                cert,
-                key,
-                token: token_file,
-                target,
-                max_rate: max_rate_bps,
-                datagram_send_buffer_bytes: datagram_send_buffer_bytes as usize,
-                congestion,
-            })
+            let result = tunnel::serve_with_ack_request(
+                tunnel::ServerOptions {
+                    stats: reporter.metrics.clone(),
+                    adaptive_fec_retention,
+                    bind: listen,
+                    cert,
+                    key,
+                    token: token_file,
+                    target,
+                    max_rate: max_rate_bps,
+                    datagram_send_buffer_bytes: datagram_send_buffer_bytes as usize,
+                    congestion,
+                },
+                ack_request,
+            )
             .await;
             reporter.finish(result).await
         }

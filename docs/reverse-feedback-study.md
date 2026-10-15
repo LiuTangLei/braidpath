@@ -54,7 +54,10 @@ A real-pair unit test verifies both peers send and receive ACK_FREQUENCY frames,
 retains payload integrity and checks that the unchanged profile emits no such
 request. This is negotiation/correctness evidence only: no public-network gain
 or local throughput improvement is claimed for this profile. Production
-`transport::config` and all production command-line options are unchanged.
+`transport::config` stays unchanged by default. The separate server-only
+`--ack-request` experiment is documented in
+[server-ack-request.md](server-ack-request.md). Its presence does not establish
+field performance or deploy a policy.
 
 The three experimental settings form one bounded profile, not a one-parameter
 causal isolation. A later frequency-only ablation should also include an
