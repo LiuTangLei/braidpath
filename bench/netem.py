@@ -437,6 +437,8 @@ class Testbed:
             buffer = 1200
         buffer_args = [] if buffer is None else ["--datagram-send-buffer-bytes", str(buffer)]
         guard_args = ["--native-service-guard"] if guard else []
+        if getattr(args, "legacy_recovery", False):
+            guard_args += ["--legacy-recovery"]
         binary = str(args.binary)
         identity = self.output / "identity"
         self.command([binary, "init", "--dir", str(identity)])
@@ -593,6 +595,8 @@ def main():
     parser.add_argument("--paths", type=int, nargs="+", default=[0, 1, 2, 3],
                         help="one to four logical connections: physical link indices0..3; repeats share a link")
     parser.add_argument("--topology", choices=["independent", "shared"], default="independent")
+    parser.add_argument("--legacy-recovery", action="store_true",
+                        help="forward the runtime's earlier adaptive recovery to both endpoints")
     parser.add_argument("--shared-rate-mbps", type=float, default=400)
     parser.add_argument("--datagram-buffer-bytes", type=int)
     args = parser.parse_args()

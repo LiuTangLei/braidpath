@@ -299,6 +299,8 @@ pub enum RateReason {
     NativeServiceRecovery,
     InitialGrowth,
     KnownServiceRecovery,
+    /// One-step return to the service measured when a queue brake began.
+    DrainReturn,
     CautiousGrowth,
     ServiceDiscovery,
     ProbeServiceRecovery,
@@ -711,6 +713,19 @@ pub struct Observation {
     pub transport_blocked: bool,
 }
 
+/// Service measured by a queue brake, returned to once the queue has drained.
+#[derive(Clone, Copy)]
+struct DrainReturn {
+    target_bps: u64,
+    /// 90% of the pace before the first brake of this queue episode.
+    pace_cap_bps: u64,
+    braked_us: u64,
+    /// First post-brake report (local time, cumulative delivered bytes).
+    drain_start: Option<(u64, u64)>,
+    /// Average wire delivery since then while the queue kept the path busy.
+    drain_bps: Option<f64>,
+}
+
 struct GrowthRetry {
     baseline_bps: u64,
     increment_bps: u64,
@@ -718,6 +733,9 @@ struct GrowthRetry {
 }
 
 pub struct PathController {
+    /// Per-RTT brake debounce and one-step return after a drained queue
+    /// brake. On by default; `--legacy-recovery` restores the earlier policy.
+    fast_recovery_enabled: bool,
     rtt_source_baselines_enabled: bool,
     random_loss_service_enabled: bool,
     queue_gated_loss_enabled: bool,
@@ -751,6 +769,7 @@ pub struct PathController {
     initial_delivery_credit: Option<InitialDeliveryCredit>,
     growth_monitor: Option<GrowthMonitor>,
     growth_retry: Option<GrowthRetry>,
+    drain_return: Option<DrainReturn>,
     last_growth_probe: Option<u64>,
     fast_feedback_seen: bool,
     fast_probe_min_rtt_ms: Option<f64>,
@@ -811,6 +830,7 @@ impl PathController {
         let maximum_bps = max_rate_bps.max(1);
         Self {
             maximum_bps,
+            fast_recovery_enabled: true,
             rtt_source_baselines_enabled: false,
             random_loss_service_enabled: false,
             queue_gated_loss_enabled: false,
@@ -839,6 +859,7 @@ impl PathController {
             initial_delivery_credit: None,
             growth_monitor: None,
             growth_retry: None,
+            drain_return: None,
             last_growth_probe: None,
             fast_feedback_seen: false,
             fast_probe_min_rtt_ms: None,
@@ -907,6 +928,11 @@ impl PathController {
 
     /// Throughput experiment, configured once like random-loss service (which
     /// it implies). Loss alone does not brake while the queue stays shallow.
+    pub(crate) fn with_legacy_recovery(mut self, legacy: bool) -> Self {
+        self.fast_recovery_enabled = !legacy;
+        self
+    }
+
     pub(crate) fn with_queue_gated_loss(mut self, enabled: bool) -> Self {
         self.queue_gated_loss_enabled = enabled;
         self.random_loss_service_enabled |= enabled;
@@ -1083,7 +1109,8 @@ impl PathController {
             *self = Self::new(self.maximum_bps, self.target_ms as u64)
                 .with_rtt_source_baselines(self.rtt_source_baselines_enabled)
                 .with_random_loss_service(self.random_loss_service_enabled)
-                .with_queue_gated_loss(self.queue_gated_loss_enabled);
+                .with_queue_gated_loss(self.queue_gated_loss_enabled)
+                .with_legacy_recovery(!self.fast_recovery_enabled);
             self.generation = Some(observation.generation);
             self.born_us = now;
             self.last_control_us = now;
@@ -1219,6 +1246,28 @@ impl PathController {
                     })
                 });
             if let Some(rate) = explicit.or(inferred) {
+                // While a braked queue drains, the bottleneck stays busy, so
+                // average delivery since the first post-brake report is the
+                // current bottleneck rate. A single short report is too noisy.
+                if let Some(target) = self.drain_return.as_mut()
+                    && observation.offered_backlog
+                    && self.queue_delay_ms > self.target_ms * 0.25
+                {
+                    match target.drain_start {
+                        None => target.drain_start = Some((now, observation.delivered_bytes)),
+                        Some((at, bytes))
+                            if now.saturating_sub(at) >= BRAKE_US
+                                && observation.delivered_bytes >= bytes =>
+                        {
+                            target.drain_bps = Some(
+                                (observation.delivered_bytes - bytes) as f64 * 8_000_000.0
+                                    / (now - at) as f64
+                                    * self.wire_per_symbol,
+                            );
+                        }
+                        _ => {}
+                    }
+                }
                 self.latest_delivery_bps = Some(rate);
                 self.delivery_bps =
                     Some(self.delivery_bps.map_or(rate, |old| old * 0.5 + rate * 0.5));
@@ -2002,15 +2051,17 @@ impl PathController {
         // qualified actual-admission deficit still permits a safety brake.
         let active_demand =
             observation.offered_backlog || exercised || blocked_pressure || service_deficit;
-        // Queue-gated mode reduces at most once per current RTT (queue included):
-        // a queue reading still rising from pre-brake traffic is not new pressure.
-        // Severe queues and zero service keep the original short debounce.
-        let brake_interval_us =
-            if self.queue_gated_loss_enabled && !severe_pressure && service_bps != Some(0.0) {
-                rtt.map_or(BRAKE_US, |ms| BRAKE_US.max((ms * 1000.0) as u64))
-            } else {
-                BRAKE_US
-            };
+        // Reduce at most once per current RTT (queue included): a queue reading
+        // still rising from pre-brake traffic is not new pressure. Severe queues
+        // and zero service keep the original short debounce.
+        let brake_interval_us = if (self.fast_recovery_enabled || self.queue_gated_loss_enabled)
+            && !severe_pressure
+            && service_bps != Some(0.0)
+        {
+            rtt.map_or(BRAKE_US, |ms| BRAKE_US.max((ms * 1000.0) as u64))
+        } else {
+            BRAKE_US
+        };
         if self.eligible
             && active_demand
             && new_pressure
@@ -2127,6 +2178,49 @@ impl PathController {
                     self.braked_queue_ms = Some(self.queue_delay_ms);
                     self.drain_restore_pending = true;
                 }
+                // Only a pure queue brake measures the bottleneck: its fresh,
+                // backlogged delivery is the drain rate. Other evidence (loss,
+                // shortfall, blocked transport) forgets the target. A later
+                // fresh measurement replaces it, so a capacity drop lowers it.
+                let queue_only = new_delay
+                    && !fast_loss_actionable
+                    && !new_loss
+                    && !delivery_shortfall
+                    && !blocked_pressure;
+                let fresh_service = current_queue_service
+                    .map(|sample| sample.bps * self.wire_per_symbol)
+                    .or_else(|| {
+                        wire_delivery_bps.filter(|_| {
+                            self.last_report
+                                .is_some_and(|(_, _, at)| now.saturating_sub(at) <= CONTROL_US)
+                        })
+                    });
+                // Repeated brakes while one queue drains are one episode: its
+                // pace cap and drain measurement come from the first brake, not
+                // from a pace that this episode has already cut.
+                let episode = self
+                    .drain_return
+                    .filter(|old| now.saturating_sub(old.braked_us) < FRESH_US);
+                let pace_cap_bps = episode.map_or(
+                    (self.rate_bps as f64 * 0.9).min(self.maximum_bps as f64) as u64,
+                    |old| old.pace_cap_bps,
+                );
+                self.drain_return =
+                    (self.fast_recovery_enabled && queue_only && observation.offered_backlog)
+                        .then(|| {
+                            fresh_service
+                                .filter(|rate| *rate > 0.0)
+                                .map(|rate| (rate * 0.9) as u64)
+                                .or(episode.map(|old| old.target_bps))
+                        })
+                        .flatten()
+                        .map(|target| DrainReturn {
+                            target_bps: target.min(pace_cap_bps),
+                            pace_cap_bps,
+                            braked_us: now,
+                            drain_start: episode.and_then(|old| old.drain_start),
+                            drain_bps: episode.and_then(|old| old.drain_bps),
+                        });
                 self.rate_bps = reduced;
                 rate_reason = if fast_loss_actionable {
                     RateReason::FastLossBrake
@@ -2309,6 +2403,52 @@ impl PathController {
             });
         let elapsed = now.saturating_sub(self.last_control_us);
         let mut waiting_for_drain_window = false;
+        if self
+            .drain_return
+            .is_some_and(|target| now.saturating_sub(target.braked_us) >= FRESH_US)
+        {
+            self.drain_return = None;
+        }
+        // Once a reply sent after the latest brake shows the queue drained,
+        // return to 90% of the drain rate in one step instead of re-searching
+        // a range the path just served. The increase owns the usual withdrawal
+        // monitor, and a later brake measures the target again.
+        if elapsed >= CONTROL_US
+            && self.fast_recovery_enabled
+            && let Some(target) = self.drain_return
+            && let Some(brake) = self.last_brake_us
+            && !monitor_withdrawn
+            && fresh
+            && self.eligible
+            && !pressure
+            && !protect_ordinary_loss
+            && !self.loss_pressure
+            && observation.offered_backlog
+            && self.rate_bps == previous_rate
+            && self.queue_delay_ms <= self.target_ms * 0.25
+            && observation
+                .probe_age_us
+                .zip(probe_rtt)
+                .and_then(|(age, rtt)| {
+                    now.checked_sub(age)?
+                        .checked_sub((rtt * 1000.0).ceil() as u64)
+                })
+                .is_some_and(|sent_us| sent_us > brake)
+        {
+            self.drain_return = None;
+            // A measured drain rate replaces a stale, higher brake-time sample,
+            // e.g. after a capacity drop; it never raises the target.
+            let target_bps = target.drain_bps.map_or(target.target_bps, |drain| {
+                target.target_bps.min((drain * 0.9) as u64)
+            });
+            if target_bps > self.rate_bps {
+                self.rate_bps = target_bps;
+                rate_reason = RateReason::DrainReturn;
+                self.last_growth_us = now;
+                self.drain_restore_pending = false;
+                ordinary_growth = true;
+            }
+        }
         if elapsed >= CONTROL_US {
             if !monitor_withdrawn
                 && fresh
@@ -4422,8 +4562,10 @@ mod tests {
 
     #[test]
     fn queue_gated_loss_brakes_a_rising_queue_at_most_once_per_rtt() {
-        let brakes = |gated: bool| {
-            let mut controller = PathController::new(100_000_000, 100).with_queue_gated_loss(gated);
+        let brakes = |gated: bool, legacy: bool| {
+            let mut controller = PathController::new(100_000_000, 100)
+                .with_queue_gated_loss(gated)
+                .with_legacy_recovery(legacy);
             let mut now = 0;
             while now <= 1_000_000 {
                 exercise_budget(&mut controller, now, 50_000);
@@ -4445,10 +4587,50 @@ mod tests {
                 .filter(|change| matches!(change.reason, RateReason::QueueBrake))
                 .count()
         };
-        let baseline = brakes(false);
-        let gated = brakes(true);
-        assert!(baseline >= 2, "baseline repeats the brake: {baseline}");
-        assert_eq!(gated, 1);
+        let legacy = brakes(false, true);
+        assert!(legacy >= 2, "legacy repeats the brake: {legacy}");
+        assert_eq!(brakes(false, false), 1, "default");
+        assert_eq!(brakes(true, true), 1, "queue-gated keeps its own debounce");
+        let mut controller = PathController::new(100_000_000, 100).with_legacy_recovery(true);
+        controller.observe(&observation(0, 80.0));
+        let mut next = observation(50_000, 80.0);
+        next.generation += 1;
+        controller.observe(&next);
+        assert!(
+            !controller.fast_recovery_enabled,
+            "a new generation keeps the setting"
+        );
+    }
+
+    #[test]
+    fn cascaded_queue_brakes_keep_the_first_brake_pace_cap() {
+        let mut controller = PathController::new(100_000_000, 100);
+        let mut now = 0;
+        while now <= 1_000_000 {
+            exercise_budget(&mut controller, now, 50_000);
+            let mut sample = observation(now, 80.0);
+            sample.delivered_bps = Some(controller.rate_bps as f64);
+            controller.observe(&sample);
+            now += 50_000;
+        }
+        let first_pace = controller.rate_bps;
+        // The queue keeps rising for well over one RTT, so it brakes again.
+        for step in 0..16u64 {
+            exercise_budget(&mut controller, now, 50_000);
+            let mut sample = observation(now, 150.0 + 12.0 * step as f64);
+            sample.delivered_bps = Some(first_pace as f64 * 0.8);
+            controller.observe(&sample);
+            now += 50_000;
+        }
+        let brakes = controller
+            .rate_changes
+            .iter()
+            .filter(|change| matches!(change.reason, RateReason::QueueBrake))
+            .count();
+        assert!(brakes >= 2, "{brakes}");
+        let target = controller.drain_return.expect("queue episode target");
+        assert_eq!(target.pace_cap_bps, (first_pace as f64 * 0.9) as u64);
+        assert!(target.target_bps > controller.rate_bps);
     }
 
     #[test]
@@ -6579,6 +6761,7 @@ mod tests {
     fn growth_monitor_034_releases_lifecycle_without_blocking_growth() {
         for invalid in ["idle", "probe", "clock", "gap", "generation"] {
             let (mut controller, mut sample) = monitored_growth_034();
+            controller.fast_recovery_enabled = false;
             match invalid {
                 "idle" => sample.offered_backlog = false,
                 "probe" => sample.probe_age_us = Some(FRESH_US + 1),
@@ -6595,6 +6778,7 @@ mod tests {
             );
         }
         let (mut controller, _) = monitored_growth_034();
+        controller.fast_recovery_enabled = false;
         let before = controller.rate_bps;
         controller.record_rate_change(700_000, before, RateReason::CautiousGrowth);
         assert_eq!(
@@ -6610,6 +6794,7 @@ mod tests {
         );
 
         let (mut controller, mut sample) = monitored_growth_034();
+        controller.fast_recovery_enabled = false;
         let reply_id = sample.probe_sample_id;
         for now in [700_000, 800_000, 900_000] {
             sample = admitted_report_026(&mut controller, &sample, now, u64::MAX);
@@ -6646,6 +6831,7 @@ mod tests {
         );
 
         let (mut controller, sample) = initial_credit_026(20_000_000);
+        controller.fast_recovery_enabled = false;
         let next = admitted_report_026(&mut controller, &sample, 400_000, u64::MAX);
         controller.observe(&next);
         assert_eq!(controller.rate_bps, 368_640);
@@ -6655,6 +6841,7 @@ mod tests {
         );
 
         let mut controller = PathController::new(20_000_000, 20);
+        controller.fast_recovery_enabled = false;
         controller.observe(&observation(0, 80.0));
         controller.rate_bps = 500_000;
         controller.remembered_bps = 4_000_000.0;
@@ -6668,6 +6855,7 @@ mod tests {
         );
 
         let (mut controller, sample) = draining_service_029(0, 1_000_000);
+        controller.fast_recovery_enabled = false;
         controller.observe(&sample);
         assert_eq!(
             controller.last_control.drain_service_target_bps,
@@ -6788,6 +6976,7 @@ mod tests {
     #[test]
     fn service_clock_032_preserves_initial_legacy_safety_and_measured_drain() {
         let (mut controller, sample) = initial_credit_026(20_000_000);
+        controller.fast_recovery_enabled = false;
         let next = admitted_report_026(&mut controller, &sample, 400_000, u64::MAX);
         controller.observe(&next);
         assert_eq!(controller.rate_bps, 368_640);
@@ -6800,6 +6989,7 @@ mod tests {
         );
 
         let (mut controller, _) = cautious_probe_028();
+        controller.fast_recovery_enabled = false;
         assert!(!controller.decision(400_000).probe_due);
         controller.queue_delay_ms = 6.0;
         assert!(
@@ -6808,6 +6998,7 @@ mod tests {
         );
 
         let mut controller = PathController::new(20_000_000, 20);
+        controller.fast_recovery_enabled = false;
         controller.observe(&observation(0, 80.0));
         controller.rate_bps = 500_000;
         controller.remembered_bps = 4_000_000.0;
@@ -6819,6 +7010,7 @@ mod tests {
         assert_eq!(controller.rate_bps, 625_000);
 
         let (mut controller, sample) = draining_service_029(0, 1_000_000);
+        controller.fast_recovery_enabled = false;
         let before = controller.rate_bps;
         let latest = controller.service_window.latest(sample.now_us).unwrap();
         let target = (latest.bps * controller.wire_per_symbol * 0.9) as u64;
@@ -7693,6 +7885,7 @@ mod tests {
     fn changing_packet_sizes_cannot_end_the_wait_before_real_symbols_mature() {
         let (mut controller, sample) =
             draining_service_packets_064(0, 400_000, 12, 8, 3, (0, 0), (500, 1000));
+        controller.fast_recovery_enabled = false;
         let before = controller.rate_bps;
         controller.observe(&sample);
         let current = controller
@@ -7731,6 +7924,7 @@ mod tests {
     fn post_brake_wait_preserves_the_original_symbol_floor_at_low_rates() {
         let (mut controller, sample) =
             draining_service_packets_064(0, 400_000, 12, 8, 3, (0, 0), (1000, 1000));
+        controller.fast_recovery_enabled = false;
         let before = controller.rate_bps;
         assert_eq!(controller.last_brake_us, Some(600_000));
         controller.observe(&sample);
@@ -7771,6 +7965,7 @@ mod tests {
     fn first_partial_recovery_waits_for_the_original_post_brake_horizon() {
         let (mut controller, sample) =
             draining_service_after_idle_063(100_000, 1_000_000, 10, 7, 3, 100_000);
+        controller.fast_recovery_enabled = false;
         let before = controller.rate_bps;
         assert!(before < 1_000_000);
         assert_eq!(controller.last_brake_us, Some(700_000));
@@ -7932,6 +8127,7 @@ mod tests {
         for mode in ["pressure", "interrupted", "idle"] {
             let (mut controller, sample) =
                 draining_service_after_idle_063(100_000, 1_000_000, 10, 7, 3, 100_000);
+            controller.fast_recovery_enabled = false;
             let before = controller.rate_bps;
             let tokens = controller.tokens;
             controller.observe(&sample);
@@ -7987,6 +8183,7 @@ mod tests {
     #[test]
     fn fresh_pre_brake_sample_does_not_hide_post_brake_service() {
         let (mut controller, sample) = draining_service_from_062(0, 1_000_000, 12, 8, 3);
+        controller.fast_recovery_enabled = false;
         let before = controller.rate_bps;
         assert_eq!(before, 224_000);
         assert_eq!(controller.last_brake_us, Some(600_000));
@@ -8031,6 +8228,7 @@ mod tests {
             "pressure",
         ] {
             let (mut controller, mut sample) = draining_service_from_062(0, 1_000_000, 12, 8, 3);
+            controller.fast_recovery_enabled = false;
             let old = controller.service_window.latest(sample.now_us).unwrap();
             assert!(sample.now_us - old.observed_us <= CONTROL_US);
             assert!(old.admission.unwrap().started_us < controller.last_brake_us.unwrap());
@@ -8064,6 +8262,7 @@ mod tests {
     fn a_short_local_disjoint_interval_does_not_hide_complete_paired_drainage() {
         let (mut controller, sample) =
             draining_service_packets_064(0, 1_000_000, 17, 11, 6, (0, 1600), (500, 500));
+        controller.fast_recovery_enabled = false;
         let old = controller.service_window.latest(sample.now_us).unwrap();
         assert_eq!(old.span_us, PROBE_US);
         assert_eq!(old.admission.unwrap().span_us, PROBE_US - 1600);
@@ -8101,6 +8300,7 @@ mod tests {
         ] {
             let (mut controller, mut sample) =
                 draining_service_packets_064(0, 1_000_000, 17, 11, 6, (0, 1600), (500, 500));
+            controller.fast_recovery_enabled = false;
             match guard {
                 "used_probe" => controller.last_growth_probe = Some(sample.probe_sample_id),
                 "old_probe" => sample.probe_age_us = Some(CONTROL_US + 1),
@@ -8135,6 +8335,7 @@ mod tests {
     #[test]
     fn fresh_paired_drain_window_is_not_hidden_by_an_old_disjoint_sample() {
         let (mut controller, sample) = draining_service_until_029(0, 1_000_000, 18);
+        controller.fast_recovery_enabled = false;
         let old = controller.service_window.latest(sample.now_us).unwrap();
         assert!(sample.now_us - old.observed_us > CONTROL_US);
         let before = controller.rate_bps;
@@ -8172,6 +8373,7 @@ mod tests {
             "interrupted",
         ] {
             let (mut controller, mut sample) = draining_service_until_029(0, 1_000_000, 18);
+            controller.fast_recovery_enabled = false;
             let before = controller.rate_bps;
             let latest = controller.service_window.latest(sample.now_us).unwrap();
             assert!(sample.now_us - latest.observed_us > CONTROL_US);
@@ -8205,6 +8407,7 @@ mod tests {
     #[test]
     fn partial_drain_exploration_does_not_finish_the_bounded_recovery_intent() {
         let (mut controller, sample) = draining_service_029(0, 1_000_000);
+        controller.fast_recovery_enabled = false;
         let admission = controller
             .service_window
             .latest(sample.now_us)
@@ -8256,10 +8459,106 @@ mod tests {
         );
     }
 
+    /// A queue brake at 700 ms whose first clear post-brake reply arrives
+    /// before the legacy 500 ms post-brake service window exists.
+    fn early_clear_reply_after_queue_brake() -> (PathController, Observation) {
+        let (controller, sample) =
+            draining_service_after_idle_063(100_000, 1_000_000, 10, 7, 3, 100_000);
+        assert_eq!(controller.last_brake_us, Some(700_000));
+        assert_eq!(sample.now_us, 1_100_000);
+        (controller, sample)
+    }
+
+    #[test]
+    fn drained_queue_brake_returns_to_its_measured_service_in_one_step() {
+        let (mut legacy, sample) = early_clear_reply_after_queue_brake();
+        legacy.fast_recovery_enabled = false;
+        let before = legacy.rate_bps;
+        legacy.observe(&sample);
+        assert_eq!(legacy.rate_bps, before, "legacy waits for its window");
+
+        let (mut controller, sample) = early_clear_reply_after_queue_brake();
+        let target = controller.drain_return.unwrap();
+        assert_eq!(target.braked_us, 700_000);
+        assert!(target.target_bps > before);
+        // Never above 90% of the pace that built the queue.
+        assert!(target.target_bps <= 900_000);
+        controller.observe(&sample);
+        let returned = controller.rate_bps;
+        assert!(returned > before && returned <= target.target_bps);
+        assert!(matches!(
+            controller.rate_changes.back().unwrap().reason,
+            RateReason::DrainReturn
+        ));
+        assert!(controller.drain_return.is_none());
+        assert!(!controller.drain_restore_pending);
+        // The increase owns the ordinary withdrawal monitor back to `before`.
+        let monitor = controller.growth_monitor.as_ref().unwrap();
+        assert_eq!(
+            (monitor.previous_bps, monitor.pacing_bps),
+            (before, returned)
+        );
+        let mut repeated = sample.clone();
+        repeated.now_us += CONTROL_US;
+        controller.observe(&repeated);
+        assert_eq!(controller.rate_bps, returned, "returns only once");
+    }
+
+    #[test]
+    fn drain_return_needs_a_post_brake_reply_and_a_clear_queue() {
+        for case in ["pre_brake_reply", "queue", "legacy"] {
+            let (mut controller, mut sample) = early_clear_reply_after_queue_brake();
+            let before = controller.rate_bps;
+            match case {
+                // Sent at about 620 ms, before the brake: it cannot show drainage.
+                "pre_brake_reply" => sample.probe_age_us = Some(400_000),
+                "queue" => {
+                    sample.probe_rtt_ms = Some(280.0);
+                    sample.probe_latest_rtt_ms = Some(280.0);
+                }
+                "legacy" => controller.fast_recovery_enabled = false,
+                _ => unreachable!(),
+            }
+            controller.observe(&sample);
+            assert!(
+                !controller
+                    .rate_changes
+                    .iter()
+                    .any(|change| matches!(change.reason, RateReason::DrainReturn)),
+                "{case}"
+            );
+            assert!(controller.rate_bps <= before, "{case}");
+        }
+    }
+
+    #[test]
+    fn drain_time_delivery_lowers_a_stale_return_target() {
+        // Delivery reported while the braked queue drains replaces a stale,
+        // higher pre-brake measurement, e.g. after a capacity drop.
+        let (mut controller, sample) = draining_service_029(0, 1_000_000);
+        assert!(controller.queue_delay_ms > controller.target_ms * 0.25);
+        let measured = controller.drain_return.unwrap();
+        let drain_bps = measured.drain_bps.unwrap();
+        controller.drain_return = Some(DrainReturn {
+            target_bps: 3_000_000,
+            pace_cap_bps: 3_000_000,
+            ..measured
+        });
+        controller.observe(&sample);
+        assert!(matches!(
+            controller.rate_changes.back().unwrap().reason,
+            RateReason::DrainReturn
+        ));
+        assert!(controller.rate_bps < 1_000_000);
+        // The clear report itself may extend the drain average once more.
+        assert!(controller.rate_bps as f64 <= drain_bps * 1.5, "{drain_bps}");
+    }
+
     #[test]
     fn drain_service_029_restores_latest_post_brake_service_once() {
         for cap in ["latest", "maximum", "no_increase"] {
             let (mut controller, sample) = draining_service_029(0, 1_000_000);
+            controller.fast_recovery_enabled = false;
             let latest = controller.service_window.latest(sample.now_us).unwrap();
             let before = controller.rate_bps;
             let measured = (latest.bps * controller.wire_per_symbol * 0.9) as u64;
@@ -8332,6 +8631,7 @@ mod tests {
             "pace_change",
         ] {
             let (mut controller, mut sample) = draining_service_029(0, 1_000_000);
+            controller.fast_recovery_enabled = false;
             let latest = controller.service_window.latest(sample.now_us).unwrap();
             let admission = latest.admission.unwrap();
             let mut observed = latest.observed_us;
@@ -8443,6 +8743,7 @@ mod tests {
             "legacy",
         ] {
             let (mut controller, mut sample) = draining_service_029(0, 1_000_000);
+            controller.fast_recovery_enabled = false;
             let before = controller.rate_bps;
             let legacy_target = (controller.draining_bps.unwrap().0 * 0.9) as u64;
             match guard {
@@ -8509,6 +8810,7 @@ mod tests {
             let now = started + if expiry { 4_000_000 } else { 3_800_000 };
             let (mut controller, mut sample) =
                 draining_service_029(now - 1_600_000, trial.rate_bps * 8);
+            controller.fast_recovery_enabled = false;
             assert!(controller.rate_bps > baseline);
             controller.reprobe = trial.reprobe;
             sample.reprobe_enabled = expiry;

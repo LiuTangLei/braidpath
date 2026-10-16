@@ -41,6 +41,10 @@ pub struct Options {
     /// latency target; queue, blocked-transport and zero-service brakes remain.
     #[arg(long)]
     pub queue_gated_loss: bool,
+    /// Restore the earlier adaptive recovery: 100 ms brake debounce and
+    /// post-brake restoration only from a qualified 500 ms service window.
+    #[arg(long)]
+    pub legacy_recovery: bool,
     /// Experimental native-window service recovery; off by default. Adaptive
     /// health, delay/loss brakes, native BBR and all configured caps remain.
     #[arg(long)]
@@ -659,6 +663,7 @@ impl ConnectionTrace {
     }
 }
 struct Inner {
+    legacy_recovery: bool,
     repair_usefulness_guard: bool,
     rtt_source_baselines: bool,
     random_loss_service: bool,
@@ -732,6 +737,7 @@ impl Metrics {
         queue_gated_loss: bool,
     ) -> Self {
         Self(Arc::new(Inner {
+            legacy_recovery: false,
             repair_usefulness_guard,
             rtt_source_baselines,
             random_loss_service,
@@ -764,6 +770,16 @@ impl Metrics {
     }
     pub fn queue_gated_loss(&self) -> bool {
         self.0.queue_gated_loss
+    }
+    /// Configure before the metrics are shared with any sender.
+    fn with_legacy_recovery(mut self, legacy: bool) -> Self {
+        Arc::get_mut(&mut self.0)
+            .expect("metrics not yet shared")
+            .legacy_recovery = legacy;
+        self
+    }
+    pub fn legacy_recovery(&self) -> bool {
+        self.0.legacy_recovery
     }
     pub fn repair_usefulness_guard(&self) -> bool {
         self.0.repair_usefulness_guard
@@ -1166,6 +1182,10 @@ impl Reporter {
             "queue-gated-loss applies only to a client or server sender"
         );
         ensure!(
+            !options.legacy_recovery || matches!(role, "client" | "server"),
+            "legacy-recovery applies only to a client or server sender"
+        );
+        ensure!(
             !options.native_service_guard || matches!(role, "client" | "server"),
             "native-service-guard applies only to a client or server sender"
         );
@@ -1208,7 +1228,8 @@ impl Reporter {
             options.repair_usefulness_guard,
             options.random_loss_service,
             options.queue_gated_loss,
-        );
+        )
+        .with_legacy_recovery(options.legacy_recovery);
         let periodic = jsonl.clone().map(|file| {
             let metrics = metrics.clone();
             let ms = options.stats_interval_ms;

@@ -82,8 +82,9 @@ enum Command {
         token_file: PathBuf,
         #[arg(long)]
         target: SocketAddr,
-        #[arg(long, default_value_t = 10_000_000)]
-        max_rate_bps: u64,
+        /// Session sender cap in bits/s; `auto` defers to the client's request.
+        #[arg(long, default_value = "auto", value_parser = parse_rate_cap)]
+        max_rate_bps: RateCap,
         /// Outgoing Quinn buffer for reverse traffic; bytes include metadata.
         /// Controlled measurements only; this does not bound residence time.
         #[arg(long, default_value_t = 1200, value_parser = clap::value_parser!(u32).range(1200..=76_800))]
@@ -253,8 +254,11 @@ struct PolicyArgs {
     mixed_fec: bool,
     #[arg(long, default_value_t = 30)]
     redundancy_percent: u8,
-    #[arg(long, default_value_t = 10_000_000)]
-    rate_bps: u64,
+    /// Aggregate cap in bits/s. `auto` (requires --adaptive) sets no operator
+    /// cap below the validated maximum; per-path control finds the pace.
+    /// Defaults to `auto` with --adaptive and 10000000 otherwise.
+    #[arg(long, value_parser = parse_rate_cap)]
+    rate_bps: Option<RateCap>,
     #[arg(long, default_value_t = 3)]
     block_ms: u64,
     #[arg(long, default_value_t = 100)]
@@ -294,7 +298,7 @@ pub async fn run() -> Result<()> {
                     key,
                     token: token_file,
                     target,
-                    max_rate: max_rate_bps,
+                    max_rate: max_rate_bps.bps(),
                     datagram_send_buffer_bytes: datagram_send_buffer_bytes as usize,
                     congestion,
                 },
@@ -318,8 +322,9 @@ pub async fn run() -> Result<()> {
             adaptive_fec_retention,
             stats,
         } => {
+            let rate = client_rate(&policy)?;
             let reporter = stats::Reporter::new("client", stats)?;
-            let group_rates = parse_group_rates(&policy.group_rates, policy.rate_bps)?;
+            let group_rates = parse_group_rates(&policy.group_rates, rate)?;
             let result = tunnel::client(tunnel::ClientOptions {
                 stats: reporter.metrics.clone(),
                 adaptive_fec_retention,
@@ -349,7 +354,7 @@ pub async fn run() -> Result<()> {
                         || policy.adaptive,
                     quality_schedule: policy.quality_schedule || policy.adaptive,
                     redundancy: policy.redundancy_percent,
-                    rate: policy.rate_bps,
+                    rate,
                     block_ms: policy.block_ms,
                     queue_ms: policy.queue_ms,
                 },
@@ -389,6 +394,50 @@ pub async fn run() -> Result<()> {
         Command::Probe(options) => probe::run_probe(options).await,
         Command::Sink(options) => probe::run_sink(options).await,
     }
+}
+
+/// The validated session maximum, used when no explicit cap is configured.
+const AUTO_RATE_BPS: u64 = 1_000_000_000;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RateCap {
+    Bps(u64),
+    Auto,
+}
+
+impl RateCap {
+    fn bps(self) -> u64 {
+        match self {
+            Self::Bps(rate) => rate,
+            Self::Auto => AUTO_RATE_BPS,
+        }
+    }
+}
+
+/// Fixed-pace (non-adaptive) sessions keep the historical explicit default.
+const FIXED_RATE_BPS: u64 = 10_000_000;
+
+fn client_rate(policy: &PolicyArgs) -> Result<u64> {
+    let rate = policy.rate_bps.unwrap_or(if policy.adaptive {
+        RateCap::Auto
+    } else {
+        RateCap::Bps(FIXED_RATE_BPS)
+    });
+    ensure!(
+        policy.adaptive || rate != RateCap::Auto,
+        "--rate-bps auto requires --adaptive; otherwise the cap is the sending pace"
+    );
+    Ok(rate.bps())
+}
+
+fn parse_rate_cap(value: &str) -> std::result::Result<RateCap, String> {
+    if value == "auto" {
+        return Ok(RateCap::Auto);
+    }
+    value
+        .parse()
+        .map(RateCap::Bps)
+        .map_err(|_| "expected bits per second or auto".into())
 }
 
 fn parse_group_rates(values: &[String], aggregate: u64) -> Result<[u64; super::MAX_PATHS]> {
@@ -677,6 +726,66 @@ mod tests {
         for size in ["0", "1199", "76801", "4294967296"] {
             assert!(parse_size(&["--datagram-send-buffer-bytes", size]).is_err());
         }
+    }
+
+    #[test]
+    fn rate_cap_defaults_to_auto_only_for_adaptive_sessions() {
+        let client = [
+            "braidpath",
+            "client",
+            "--entrance",
+            "127.0.0.1:4433",
+            "--server-name",
+            "localhost",
+            "--ca",
+            "cert.pem",
+            "--token-file",
+            "token",
+        ];
+        let rate = |extra: &[&str]| match Cli::try_parse_from(client.iter().chain(extra))
+            .unwrap()
+            .command
+        {
+            Command::Client { policy, .. } => client_rate(&policy),
+            _ => unreachable!(),
+        };
+        assert_eq!(rate(&[]).unwrap(), FIXED_RATE_BPS);
+        assert_eq!(rate(&["--adaptive"]).unwrap(), AUTO_RATE_BPS);
+        assert_eq!(
+            rate(&["--adaptive", "--rate-bps", "400000000"]).unwrap(),
+            400_000_000
+        );
+        assert_eq!(rate(&["--rate-bps", "400000000"]).unwrap(), 400_000_000);
+        assert_eq!(
+            rate(&["--adaptive", "--rate-bps", "auto"]).unwrap(),
+            AUTO_RATE_BPS
+        );
+        // Without adaptive control the cap is the pace, so `auto` is rejected.
+        assert!(rate(&["--rate-bps", "auto"]).is_err());
+        assert!(Cli::try_parse_from(client.iter().chain(&["--rate-bps", "fast"])).is_err());
+        let server = [
+            "braidpath",
+            "server",
+            "--listen",
+            "127.0.0.1:4433",
+            "--cert",
+            "cert.pem",
+            "--key",
+            "key.pem",
+            "--token-file",
+            "token",
+            "--target",
+            "127.0.0.1:7000",
+        ];
+        let maximum = |extra: &[&str]| match Cli::try_parse_from(server.iter().chain(extra))
+            .unwrap()
+            .command
+        {
+            Command::Server { max_rate_bps, .. } => max_rate_bps.bps(),
+            _ => unreachable!(),
+        };
+        assert_eq!(maximum(&[]), AUTO_RATE_BPS);
+        assert_eq!(maximum(&["--max-rate-bps", "8000000"]), 8_000_000);
     }
 
     #[test]

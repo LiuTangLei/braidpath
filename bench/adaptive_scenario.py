@@ -597,6 +597,7 @@ async def experiment(args):
                 "bulk_pps": args.bulk_pps, "bulk_bytes": 1000,
                 "interactive_pps": args.interactive_pps, "interactive_bytes": 128,
                 "client_extra_args": args.client_extra_arg,
+                "server_extra_args": args.server_extra_arg,
                 "adaptive_path_groups": (list(range(args.paths)) if args.topology == "independent"
                                          else [0] * args.paths),
                 "phases": phases, "drain_seconds": 2,
@@ -659,7 +660,7 @@ async def experiment(args):
             binary, "server", "--listen", address(server_addr), "--cert", cert, "--key", key,
             "--token-file", token, "--target", address(target_addr), "--max-rate-bps", args.rate_bps,
             "--stats-file", output / "server.final.json", "--stats-jsonl", output / "server.stats.jsonl",
-            "--stats-interval-ms", "200"])
+            "--stats-interval-ms", "200", *args.server_extra_arg])
         await ready(server, output / "server.stats.jsonl")
         client_args = [binary, "client", "--listen", address(client_addr), "--server-name", "localhost",
                        "--ca", cert, "--token-file", token, "--rate-bps", args.rate_bps,
@@ -757,6 +758,11 @@ async def experiment(args):
     return output
 
 
+def rate_cap(value):
+    """Bits per second, or `auto` for the runtime's adaptive-only uncapped mode."""
+    return value if value == "auto" else int(value)
+
+
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", required=True, type=Path)
@@ -768,7 +774,7 @@ def parse_args(argv=None):
     parser.add_argument("--interactive-pps", type=int, default=20)
     parser.add_argument("--link-mbps", type=float, default=3.0)
     parser.add_argument("--congested-mbps", type=float, default=.35)
-    parser.add_argument("--rate-bps", type=int, default=8_000_000)
+    parser.add_argument("--rate-bps", type=rate_cap, default=8_000_000)
     parser.add_argument("--queue-ms", type=int, default=40)
     parser.add_argument("--latency-target-ms", type=int, default=20)
     parser.add_argument("--fec", type=int, default=0)
@@ -781,10 +787,12 @@ def parse_args(argv=None):
     parser.add_argument("--seed", type=int, default=20261009)
     parser.add_argument("--outages", action="store_true")
     parser.add_argument("--client-extra-arg", action="append", default=[])
+    parser.add_argument("--server-extra-arg", action="append", default=[])
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args(argv)
     if not (1 <= args.bulk_pps <= 3000 and 1 <= args.interactive_pps <= 200
-            and 3 <= args.phase_seconds <= 60 and 1 <= args.rate_bps <= 100_000_000
+            and 3 <= args.phase_seconds <= 60
+            and (args.rate_bps == "auto" or 1 <= args.rate_bps <= 100_000_000)
             and 1 <= args.queue_ms <= 1000 and args.fec in (0, 2, 3, 4, 8)
             and 0 <= args.loss <= 1 and 1 <= args.latency_target_ms <= 1000
             and 1 <= args.deadline_ms <= 2000):

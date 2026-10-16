@@ -132,6 +132,9 @@ class SenderModeFlags(unittest.TestCase):
         for role in ("client", "server"):
             self.assertNotIn("--native-service-guard", commands[role])
             self.assertEqual(commands[role][commands[role].index("--datagram-send-buffer-bytes") + 1], "1200")
+        legacy = self.prepared_endpoint_arguments("adaptive", legacy_recovery=True)
+        self.assertIn("--legacy-recovery", legacy["client"])
+        self.assertIn("--legacy-recovery", legacy["server"])
         enabled = self.prepared_endpoint_arguments("native-service", native_service_guard=True)
         self.assertIn("--native-service-guard", enabled["client"])
         self.assertIn("--native-service-guard", enabled["server"])
