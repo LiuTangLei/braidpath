@@ -9,6 +9,16 @@ use std::{
     time::{Duration, Instant},
 };
 const BIN: &str = env!("CARGO_BIN_EXE_braidpath");
+// Real-time UDP admission ages are part of the runtime contract. Concurrent
+// multi-process fixtures on a two-core runner can exhaust those ages before
+// the sender runs; isolate these socket fixtures without changing production
+// queue limits, source rates, or assertions.
+static SOCKET_FIXTURE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+fn socket_fixture() -> std::sync::MutexGuard<'static, ()> {
+    SOCKET_FIXTURE
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+}
 // Negotiation/integrity fixture: retain 2000 pps, but provision the encoded cost.
 const DUAL_FEC_TEST_RATE_BPS: u64 = 20_000_000;
 
@@ -175,6 +185,7 @@ fn authenticated_http3_three_paths_and_udp_integrity() {
 
 #[test]
 fn server_ack_request_is_opt_in_and_directional_on_real_http3() {
+    let _fixture = socket_fixture();
     let directory = tempfile::tempdir().unwrap();
     let identity = directory.path().join("identity");
     assert!(
@@ -337,6 +348,7 @@ fn rtt_source_baselines_preserve_four_connection_integrity_and_local_opt_in() {
 }
 
 fn four_connection_profile(native_service_guard: bool, rtt_source_baselines: bool) {
+    let _fixture = socket_fixture();
     use std::collections::BTreeSet;
     let dir = tempfile::tempdir().unwrap();
     let identity = dir.path().join("identity");
@@ -547,6 +559,7 @@ fn persistent_bad_path_rejoins_with_new_udp_port() {
     three_paths(3);
 }
 fn three_paths(mode: u8) {
+    let _fixture = socket_fixture();
     let feedback = mode > 0;
     let dual = matches!(mode, 6 | 8 | 9);
     let frontier_enabled = matches!(mode, 7 | 8);
@@ -1100,6 +1113,7 @@ fn guided_recovery_negotiates_without_promoting_idle_probe_bytes_to_business() {
 }
 
 fn independent_probe_session(guided: bool) {
+    let _fixture = socket_fixture();
     let dir = tempfile::tempdir().unwrap();
     let identity = dir.path().join("identity");
     assert!(
