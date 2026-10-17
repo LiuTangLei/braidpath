@@ -13,13 +13,14 @@ use tokio::{net::UdpSocket, time::timeout};
 type Received = Arc<Mutex<Vec<Vec<u8>>>>;
 
 /// Echo every stream and record what arrived, including 0-RTT streams.
-fn echo_server(tls: rustls::ServerConfig) -> (SocketAddr, Received) {
+fn echo_server(tls: rustls::ServerConfig) -> (SocketAddr, Received, quinn::Endpoint) {
     let config =
         quinn::ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(tls).unwrap()));
     let endpoint = quinn::Endpoint::server(config, "127.0.0.1:0".parse().unwrap()).unwrap();
     let address = endpoint.local_addr().unwrap();
     let received = Received::default();
     let record = received.clone();
+    let server = endpoint.clone();
     tokio::spawn(async move {
         while let Some(incoming) = endpoint.accept().await {
             let record = record.clone();
@@ -41,7 +42,7 @@ fn echo_server(tls: rustls::ServerConfig) -> (SocketAddr, Received) {
             });
         }
     });
-    (address, received)
+    (address, received, server)
 }
 
 async fn exchange(conn: &quinn::Connection, message: &[u8]) -> Vec<u8> {
@@ -83,9 +84,9 @@ async fn recording_relay(server: SocketAddr) -> (SocketAddr, Arc<Mutex<Vec<Vec<u
     (address, flight)
 }
 
-/// Resume through a relay, then replay that first flight from a new address.
-async fn replay_against(tls: rustls::ServerConfig, ca: &Path) -> (bool, Vec<Vec<u8>>) {
-    let (server, received) = echo_server(tls);
+/// A full connection that leaves the client with tickets, then a 0-RTT
+/// connection through a relay that records its first flight.
+async fn resume_recorded(server: SocketAddr, ca: &Path) -> (quinn::Endpoint, bool, Vec<Vec<u8>>) {
     let client = transport::client(server, ca, None, Congestion::Bbr).unwrap();
     let first = client.connect(server, "localhost").unwrap();
     let Err(first) = first.into_0rtt() else {
@@ -104,15 +105,27 @@ async fn replay_against(tls: rustls::ServerConfig, ca: &Path) -> (bool, Vec<Vec<
     let accepted = timeout(Duration::from_secs(2), accepted).await.unwrap();
     early.close(0u32.into(), b"done");
     reconnect.wait_idle().await;
-    // Let the server retire the original connection IDs, then replay.
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    let attacker = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let flight = flight.lock().unwrap().clone();
     assert!(flight.len() >= 2, "Initial and 0-RTT datagrams expected");
-    for datagram in &flight {
+    (client, accepted, flight)
+}
+
+/// Send a recorded first flight from a new address.
+async fn replay(flight: &[Vec<u8>], server: SocketAddr) {
+    let attacker = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    for datagram in flight {
         attacker.send_to(datagram, server).await.unwrap();
     }
     tokio::time::sleep(Duration::from_millis(300)).await;
+}
+
+/// Resume through a relay, then replay that first flight from a new address.
+async fn replay_against(tls: rustls::ServerConfig, ca: &Path) -> (bool, Vec<Vec<u8>>) {
+    let (server, received, _endpoint) = echo_server(tls);
+    let (_client, accepted, flight) = resume_recorded(server, ca).await;
+    // Let the server retire the original connection IDs, then replay.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    replay(&flight, server).await;
     let received = received.lock().unwrap().clone();
     (accepted, received)
 }
@@ -163,4 +176,42 @@ async fn replay_succeeds_only_when_tickets_are_reusable() {
         received,
         [b"full".to_vec(), b"early".to_vec(), b"early".to_vec()]
     );
+}
+
+/// A journal keeps unused tickets across a restart and the take of a used one,
+/// so the restarted server resumes the client but refuses the replay.
+#[tokio::test]
+async fn tickets_survive_a_restart_but_a_replay_of_a_used_one_does_not() {
+    let (dir, cert, key) = identity();
+    let journal = dir.path().join("key.tickets");
+    let (server, _, endpoint) =
+        echo_server(transport::persistent_server_tls(&cert, &key, &journal).unwrap());
+    let (client, accepted, flight) = resume_recorded(server, &cert).await;
+    assert!(accepted);
+    endpoint.close(0u32.into(), b"restart");
+    endpoint.wait_idle().await;
+    drop(endpoint);
+    // The journal lock is released once the last connection lets go of it.
+    let restarted = timeout(Duration::from_secs(5), async {
+        loop {
+            match transport::persistent_server_tls(&cert, &key, &journal) {
+                Ok(tls) => break tls,
+                Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
+            }
+        }
+    })
+    .await
+    .expect("journal released");
+    let (server, received, _endpoint) = echo_server(restarted);
+    replay(&flight, server).await;
+    assert!(
+        received.lock().unwrap().is_empty(),
+        "replayed early data accepted"
+    );
+    let Ok((resumed, accepted)) = client.connect(server, "localhost").unwrap().into_0rtt() else {
+        panic!("no ticket left for the restarted server");
+    };
+    assert_eq!(exchange(&resumed, b"after restart").await, b"after restart");
+    assert!(timeout(Duration::from_secs(2), accepted).await.unwrap());
+    assert_eq!(*received.lock().unwrap(), [b"after restart".to_vec()]);
 }

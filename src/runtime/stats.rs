@@ -613,6 +613,16 @@ impl ConnectionTrace {
         self.succeeded();
         rx
     }
+    /// A fresh handshake on the same path attempt, after the server rejected
+    /// 0-RTT. The rejected handshake completed and was counted; this one is a
+    /// new attempt with its own outcome.
+    pub fn retry_handshake(&mut self) {
+        self.handshake_complete = false;
+        self.early_confirmed = None;
+        self.conn = None;
+        self.metrics.state(|s| s.handshake_attempts += 1);
+        self.enter("quic_handshake", "quic_connect");
+    }
     fn handshake_done(&self) -> bool {
         self.handshake_complete
             || self
@@ -1881,6 +1891,69 @@ mod tests {
                 Some("local_shutdown")
             );
         });
+    }
+
+    #[tokio::test]
+    async fn a_full_handshake_after_rejected_early_data_is_a_further_attempt() {
+        let temp = tempfile::tempdir().unwrap();
+        let identity = temp.path().join("identity");
+        transport::initialize(&identity, "localhost").unwrap();
+        let cert = identity.join("cert.pem");
+        // Two servers with separate ticket stores, as across a restart.
+        let servers = [(); 2].map(|()| {
+            let server = transport::server(
+                "127.0.0.1:0".parse().unwrap(),
+                &cert,
+                &identity.join("key.pem"),
+                Congestion::Bbr,
+            )
+            .unwrap();
+            let address = server.local_addr().unwrap();
+            tokio::spawn(async move {
+                let mut held = Vec::new();
+                while let Some(incoming) = server.accept().await {
+                    if let Ok(conn) = incoming.await {
+                        held.push(conn);
+                    }
+                }
+            });
+            address
+        });
+        let client = transport::client(servers[0], &cert, None, Congestion::Bbr).unwrap();
+        let first = client
+            .connect(servers[0], "localhost")
+            .unwrap()
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let metrics = Metrics::new("client");
+        let mut trace = ConnectionTrace::new(metrics.clone(), servers[1], Some(0), "quic_connect");
+        let Ok((conn, accepted)) = client.connect(servers[1], "localhost").unwrap().into_0rtt()
+        else {
+            panic!("no ticket from the first server");
+        };
+        let mut outcome = trace.early_data(&conn, accepted);
+        let outcome = *timeout(Duration::from_secs(3), outcome.wait_for(Option::is_some))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(outcome, Some(EarlyData::Rejected));
+        conn.close(0u32.into(), b"0-RTT rejected");
+        trace.retry_handshake();
+        let conn = client
+            .connect(servers[1], "localhost")
+            .unwrap()
+            .await
+            .unwrap();
+        trace.handshake_succeeded(&conn);
+        metrics.state(|state| {
+            assert_eq!(state.handshake_attempts, 2);
+            assert_eq!(state.handshake_successes, 2);
+            assert_eq!(state.handshake_failures, 0);
+            assert_eq!(state.zero_rtt_rejected, 1);
+            assert_eq!(state.zero_rtt_accepted, 0);
+        });
+        first.close(0u32.into(), b"done");
     }
 
     #[tokio::test(flavor = "current_thread")]

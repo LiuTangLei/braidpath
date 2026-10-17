@@ -6,6 +6,9 @@ use quinn::{
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use socket2::{Domain, Protocol, Socket, Type};
 use std::{fs, io::BufReader, net::SocketAddr, path::Path, sync::Arc, time::Duration};
+use tracing::{info, warn};
+
+mod tickets;
 
 pub const DEFAULT_DATAGRAM_SEND_BUFFER_BYTES: usize = 1200;
 pub const MAX_DATAGRAM_SEND_BUFFER_BYTES: usize = 76_800;
@@ -149,6 +152,7 @@ pub fn server_with_datagram_buffer(
         congestion,
         datagram_send_buffer_bytes,
         AckRequest::Unchanged,
+        None,
     )
 }
 
@@ -160,10 +164,27 @@ pub fn server_tls(cert: &Path, key_path: &Path) -> Result<rustls::ServerConfig> 
     tls.alpn_protocols = vec![b"h3".to_vec()];
     // 0-RTT. rustls accepts early data only with stateful resumption and takes
     // each ticket out of this store on use, so a replayed first flight cannot
-    // have its early data accepted again. A restart forgets every ticket.
+    // have its early data accepted again. A restart forgets every ticket
+    // unless the store is a journal (see `persistent_server_tls`).
     tls.max_early_data_size = u32::MAX;
     tls.session_storage = rustls::server::ServerSessionMemoryCache::new(SERVER_TICKETS);
     tls.send_tls13_tickets = TICKETS_PER_HANDSHAKE;
+    Ok(tls)
+}
+
+/// [`server_tls`] with tickets kept in a journal at `journal`, so clients
+/// resume with 0-RTT across a server restart; a take is on stable storage
+/// before its ticket is used, so single use also survives the restart.
+pub fn persistent_server_tls(
+    cert: &Path,
+    key_path: &Path,
+    journal: &Path,
+) -> Result<rustls::ServerConfig> {
+    let mut tls = server_tls(cert, key_path)?;
+    let identity = certificates(cert)?.swap_remove(0);
+    let store = tickets::Journal::open(journal, &identity, SERVER_TICKETS)?;
+    info!(path = %journal.display(), tickets = store.len(), "resumption tickets loaded");
+    tls.session_storage = Arc::new(store);
     Ok(tls)
 }
 
@@ -174,13 +195,20 @@ pub fn server_with_ack_request(
     congestion: Congestion,
     datagram_send_buffer_bytes: usize,
     ack_request: AckRequest,
+    tickets: Option<&Path>,
 ) -> Result<Endpoint> {
     ensure!(
         (DEFAULT_DATAGRAM_SEND_BUFFER_BYTES..=MAX_DATAGRAM_SEND_BUFFER_BYTES)
             .contains(&datagram_send_buffer_bytes),
         "datagram send buffer must be 1200..76800 bytes"
     );
-    let tls = server_tls(cert, key_path)?;
+    let tls = match tickets {
+        Some(journal) => persistent_server_tls(cert, key_path, journal).or_else(|error| {
+            warn!(error = %format!("{error:#}"), "resumption tickets kept in memory only");
+            server_tls(cert, key_path)
+        })?,
+        None => server_tls(cert, key_path)?,
+    };
     let mut conf = ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(tls)?));
     let mut transport = config(congestion);
     transport.datagram_send_buffer_size(datagram_send_buffer_bytes);

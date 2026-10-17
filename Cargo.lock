@@ -146,6 +146,7 @@ dependencies = [
  "quinn",
  "rand 0.9.5",
  "rcgen",
+ "rustix",
  "rustls",
  "rustls-pemfile",
  "serde",

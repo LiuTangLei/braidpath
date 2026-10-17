@@ -2972,6 +2972,8 @@ pub async fn serve_with_ack_request(
         options.congestion,
         options.datagram_send_buffer_bytes,
         ack_request,
+        // Beside the key: tickets are secrets of the same identity.
+        Some(&options.key.with_extension("tickets")),
     )?;
     let secret = Arc::new(format!("Bearer {}", transport::token(&options.token)?));
     let sessions: Sessions = Arc::new(Mutex::new(HashMap::new()));
@@ -3828,7 +3830,7 @@ async fn connect_path(
     // The server lost or refused the ticket; early data never reached it.
     info!(path = pid, "0-RTT rejected; retrying with a full handshake");
     conn.close(0u32.into(), b"0-RTT rejected");
-    diagnostic.enter("quic_handshake", "quic_connect");
+    diagnostic.retry_handshake();
     let conn = endpoint.connect(remote, name)?.await?;
     diagnostic.handshake_succeeded(&conn);
     admit!(conn).await
