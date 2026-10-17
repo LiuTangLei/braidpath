@@ -50,6 +50,7 @@ mod small_delivery;
 mod tcp;
 pub use proxy::Access as ProxyAccess;
 
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const WEBSITE: &str = "<!doctype html><html lang=\"en\"><meta charset=\"utf-8\"><title>Welcome</title><h1>Welcome</h1><p>This service is online.</p></html>\n";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -3077,8 +3078,19 @@ async fn server_connection(
         adaptive_fec_retention,
         tcp,
     } = settings;
-    let conn = timeout(Duration::from_secs(5), incoming).await??;
-    diagnostic.handshake_succeeded(&conn);
+    // 0.5-RTT: a resumed client's 0-RTT session request is served before its
+    // handshake completes. rustls accepts each ticket's early data once.
+    let Ok((conn, accepted)) = incoming.accept()?.into_0rtt() else {
+        bail!("incoming connection did not convert to 0.5-RTT");
+    };
+    let mut handshake = diagnostic.early_data(&conn, accepted);
+    let bounded = conn.clone();
+    tokio::spawn(async move {
+        let completed = timeout(HANDSHAKE_TIMEOUT, handshake.wait_for(Option::is_some)).await;
+        if !completed.is_ok_and(|o| o.is_ok_and(|o| *o != Some(stats::EarlyData::Failed))) {
+            bounded.close(0u32.into(), b"handshake incomplete");
+        }
+    });
     diagnostic.enter("http3", "http3_setup");
     let mut h3 = h3::server::builder()
         .enable_datagram(true)
@@ -3779,8 +3791,62 @@ async fn connect_path(
     policy: &Policy,
     diagnostic: &mut stats::ConnectionTrace,
 ) -> Result<(quinn::Connection, u64, H3Client, H3Request, H3Send)> {
+    macro_rules! admit {
+        ($conn:expr) => {
+            admit_path(
+                $conn, name, token, sid, pid, group, generation, rejoin, policy, diagnostic,
+            )
+        };
+    }
+    // With a resumption ticket the session request travels as 0-RTT data, so
+    // admission completes one round trip after the first packet.
+    let (conn, accepted) = match endpoint.connect(remote, name)?.into_0rtt() {
+        Ok(early) => early,
+        Err(connecting) => {
+            let conn = connecting.await?;
+            diagnostic.handshake_succeeded(&conn);
+            return admit!(conn).await;
+        }
+    };
+    let outcome = diagnostic.early_data(&conn, accepted);
+    let mut rejection = outcome.clone();
+    let error = tokio::select! {
+        admitted = admit!(conn.clone()) => match admitted {
+            Ok(admitted) => return Ok(admitted),
+            Err(error) => error,
+        },
+        Ok(_) = rejection.wait_for(|o| *o == Some(stats::EarlyData::Rejected)) => anyhow::anyhow!("0-RTT rejected"),
+    };
+    let mut outcome = outcome;
+    let rejected = outcome
+        .wait_for(Option::is_some)
+        .await
+        .is_ok_and(|o| *o == Some(stats::EarlyData::Rejected));
+    if !rejected {
+        return Err(error);
+    }
+    // The server lost or refused the ticket; early data never reached it.
+    info!(path = pid, "0-RTT rejected; retrying with a full handshake");
+    conn.close(0u32.into(), b"0-RTT rejected");
+    diagnostic.enter("quic_handshake", "quic_connect");
     let conn = endpoint.connect(remote, name)?.await?;
     diagnostic.handshake_succeeded(&conn);
+    admit!(conn).await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn admit_path(
+    conn: quinn::Connection,
+    name: &str,
+    token: &str,
+    sid: &str,
+    pid: u8,
+    group: u8,
+    generation: u64,
+    rejoin: bool,
+    policy: &Policy,
+    diagnostic: &mut stats::ConnectionTrace,
+) -> Result<(quinn::Connection, u64, H3Client, H3Request, H3Send)> {
     diagnostic.enter("http3", "datagram_capacity");
     ensure!(
         conn.max_datagram_size().is_some_and(|n| n
@@ -3798,13 +3864,6 @@ async fn connect_path(
         .max_field_section_size(8192)
         .build::<_, _, Bytes>(h3_quinn::Connection::new(conn.clone()))
         .await?;
-    diagnostic.succeeded();
-    diagnostic.enter("http3", "peer_settings");
-    // Poll the driver concurrently so peer SETTINGS are processed before admission.
-    tokio::select! {
-        e=driver.wait_idle()=>bail!("HTTP/3 closed before settings: {e}"),
-        _=async {while !send.settings().enable_datagram(){tokio::time::sleep(Duration::from_millis(1)).await;}}=>{}
-    }
     diagnostic.succeeded();
     diagnostic.begin_admission();
     diagnostic.enter("path_admission", "admission");
@@ -3873,6 +3932,7 @@ async fn connect_path(
             .header("braidpath-capacity-probe-format", capacity_probe::FORMAT);
     }
     let req = req.body(())?;
+    // Sent without waiting for peer SETTINGS, so that 0-RTT saves its round trip.
     let mut stream = send.send_request(req).await?;
     let response = tokio::select! {e=driver.wait_idle()=>bail!("HTTP/3 closed during admission: {e}"),r=stream.recv_response()=>r?};
     if response.status() == StatusCode::GONE {
@@ -3880,6 +3940,14 @@ async fn connect_path(
         conn.close(0u32.into(), b"session epoch expired");
         return Err(SessionExpired.into());
     }
+    diagnostic.enter("http3", "peer_settings");
+    // Poll the driver so peer SETTINGS are processed before datagrams are used.
+    tokio::select! {
+        e=driver.wait_idle()=>bail!("HTTP/3 closed before settings: {e}"),
+        _=async {while !send.settings().enable_datagram(){tokio::time::sleep(Duration::from_millis(1)).await;}}=>{}
+    }
+    diagnostic.succeeded();
+    diagnostic.enter("path_admission", "admission");
     ensure!(
         response.status() == StatusCode::OK
             && response

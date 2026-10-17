@@ -45,10 +45,9 @@ curl -p -x http://127.0.0.1:1080 https://example.com/
 
 The proxy listener has no authentication, so it should stay on loopback.
 
-The session itself uses ordinary 1-RTT QUIC handshakes; QUIC 0-RTT early data is not
-enabled, because replayed early data could replay session admission. A session is
-long-lived, so the handshake cost applies at startup and reconnection, not per TCP
-connection.
+Path handshakes are separate from proxy replies: a session is long-lived, so QUIC
+handshakes (with [0-RTT](runtime.md#0-rtt) for resumed paths) occur at startup and
+reconnection, not per TCP connection.
 
 ## Design
 

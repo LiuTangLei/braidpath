@@ -9,6 +9,37 @@ use std::{fs, io::BufReader, net::SocketAddr, path::Path, sync::Arc, time::Durat
 
 pub const DEFAULT_DATAGRAM_SEND_BUFFER_BYTES: usize = 1200;
 pub const MAX_DATAGRAM_SEND_BUFFER_BYTES: usize = 76_800;
+/// Server resumption tickets held for 0-RTT; each is single use.
+const SERVER_TICKETS: usize = 4096;
+/// Tickets per handshake. Every attempt spends one, including attempts that
+/// fail during an outage, and a client keeps at most eight per server.
+const TICKETS_PER_HANDSHAKE: usize = 4;
+
+/// One TLS client configuration per trusted CA set. rustls binds resumption
+/// tickets to the verifier that checked the original handshake, so every
+/// endpoint for the same CA must share it to send 0-RTT data; a reconnecting
+/// path binds a new endpoint.
+fn client_crypto(ca: &Path) -> Result<Arc<QuicClientConfig>> {
+    type Configs = Vec<(Vec<CertificateDer<'static>>, Arc<QuicClientConfig>)>;
+    static CONFIGS: std::sync::Mutex<Configs> = std::sync::Mutex::new(Vec::new());
+    let certificates = certificates(ca)?;
+    let mut configs = CONFIGS.lock().expect("client TLS configurations");
+    if let Some((_, config)) = configs.iter().find(|(c, _)| *c == certificates) {
+        return Ok(config.clone());
+    }
+    let mut roots = rustls::RootCertStore::empty();
+    for cert in certificates.iter().cloned() {
+        roots.add(cert)?;
+    }
+    let mut tls = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    tls.alpn_protocols = vec![b"h3".to_vec()];
+    tls.enable_early_data = true;
+    let config = Arc::new(QuicClientConfig::try_from(tls)?);
+    configs.push((certificates, config.clone()));
+    Ok(config)
+}
 
 pub fn token(path: &Path) -> Result<String> {
     let s = fs::read_to_string(path).context("read token file")?;
@@ -121,6 +152,21 @@ pub fn server_with_datagram_buffer(
     )
 }
 
+/// The server's TLS configuration, including 0-RTT acceptance.
+pub fn server_tls(cert: &Path, key_path: &Path) -> Result<rustls::ServerConfig> {
+    let mut tls = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certificates(cert)?, key(key_path)?)?;
+    tls.alpn_protocols = vec![b"h3".to_vec()];
+    // 0-RTT. rustls accepts early data only with stateful resumption and takes
+    // each ticket out of this store on use, so a replayed first flight cannot
+    // have its early data accepted again. A restart forgets every ticket.
+    tls.max_early_data_size = u32::MAX;
+    tls.session_storage = rustls::server::ServerSessionMemoryCache::new(SERVER_TICKETS);
+    tls.send_tls13_tickets = TICKETS_PER_HANDSHAKE;
+    Ok(tls)
+}
+
 pub fn server_with_ack_request(
     bind: SocketAddr,
     cert: &Path,
@@ -134,11 +180,7 @@ pub fn server_with_ack_request(
             .contains(&datagram_send_buffer_bytes),
         "datagram send buffer must be 1200..76800 bytes"
     );
-    let mut tls = rustls::ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(certificates(cert)?, key(key_path)?)?;
-    tls.alpn_protocols = vec![b"h3".to_vec()];
-    tls.max_early_data_size = 0;
+    let tls = server_tls(cert, key_path)?;
     let mut conf = ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(tls)?));
     let mut transport = config(congestion);
     transport.datagram_send_buffer_size(datagram_send_buffer_bytes);
@@ -187,16 +229,7 @@ pub fn client_bound_with_datagram_buffer(
             .contains(&datagram_send_buffer_bytes),
         "datagram send buffer must be 1200..76800 bytes"
     );
-    let mut roots = rustls::RootCertStore::empty();
-    for cert in certificates(ca)? {
-        roots.add(cert)?;
-    }
-    let mut tls = rustls::ClientConfig::builder()
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-    tls.alpn_protocols = vec![b"h3".to_vec()];
-    tls.enable_early_data = false;
-    let mut conf = ClientConfig::new(Arc::new(QuicClientConfig::try_from(tls)?));
+    let mut conf = ClientConfig::new(client_crypto(ca)?);
     let mut transport = config(congestion);
     transport.datagram_send_buffer_size(datagram_send_buffer_bytes);
     conf.transport_config(Arc::new(transport));

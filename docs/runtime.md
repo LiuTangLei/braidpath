@@ -184,10 +184,23 @@ record-set changes, not network throughput or cross-machine deadline performance
 
 ### Envelope and session mapping
 
-- TLS verifies the main server's certificate and name; ALPN is `h3`; 0-RTT is disabled. Both peers must advertise QUIC DATAGRAM capacity and HTTP/3 `H3_DATAGRAM` support.
+- TLS verifies the main server's certificate and name; ALPN is `h3`. A resumed connection sends its session request as 0-RTT data and the server answers at 0.5-RTT, so a path with a ticket is admitted one round trip after its first packet; see [0-RTT](#0-rtt). Both peers must advertise QUIC DATAGRAM capacity and HTTP/3 `H3_DATAGRAM` support.
 - `GET /` serves a small ordinary HTML page. Unknown requests and unauthenticated `POST /session` return the same 404 response. This is a functional HTTP/3 endpoint, not browser impersonation or a complete production website.
 - A long-lived `POST /session` carries the bearer token and version, random 128-bit session ID, path ID and policy headers. Joining another path requires the same credential and session policy. A request FIN or connection closure removes that path. An adaptive session retains an empty-path epoch for approximately 120 s; a baseline session ends when its last path leaves.
 - This is a BraidPath application mapping using RFC 9297 HTTP Datagrams, **not CONNECT-UDP, MASQUE, WebTransport or Xray compatibility**. It has no Capsule or reliable HTTP-body fallback.
+
+#### 0-RTT
+
+| Element | Behavior |
+| --- | --- |
+| Tickets | The server issues four TLS 1.3 tickets per handshake and keeps them in memory (up to 4096). Tickets are stateful: rustls accepts early data only for a ticket it holds and removes the ticket on use, so a replayed first flight is completed, if at all, without its early data. A restart forgets every ticket. |
+| Client | Every endpoint with the same CA shares one TLS configuration, so a reconnecting path (which binds a new endpoint) uses a ticket from any earlier connection. rustls binds tickets to that verifier and keeps eight per server name. Every attempt spends a ticket, including attempts that fail during an outage. |
+| Admission | The session request is sent without waiting for peer SETTINGS; SETTINGS are checked after the response, before datagrams are used. With a ticket, admission takes one round trip; without one, two. |
+| Rejection | If the server refuses early data (restart, spent or evicted ticket), the request never reached it. The client closes that connection and repeats the attempt with a full handshake inside the same 8 s path limit. |
+| Server bound | The server serves 0.5-RTT before the handshake completes and closes any connection whose handshake does not complete within 5 s. |
+| Statistics | `zero_rtt_accepted` (both roles) and `zero_rtt_rejected` (client only; a server cannot tell a rejection from a client that sent no early data). |
+
+Early data has no forward secrecy against compromise of the server's in-memory ticket state.
 - Each QUIC DATAGRAM contains the request's Quarter Stream ID, context ID zero and one BraidPath record. Variable-width Quarter Stream IDs are encoded and checked; contexts, versions, lengths and bounds are validated.
 - BraidPath envelope: `BP`, version byte `1`, kind byte (data `0`, XOR repair `1`, plain `2`), big-endian 64-bit block ID and 8-bit shard index (or source count for repair records). The payload is the codec shard (length-protected XOR bytes for repair), or a plain record. Canonical application records contain a big-endian 32-bit flow ID, 64-bit delivery ID and UDP payload. Maximum encoded envelope: 1,027 bytes.
 - Flow/delivery IDs are scoped to the authenticated session and sending direction. Delivery IDs survive FEC reconstruction; late originals and duplicates are suppressed within the bounded window. Expired blocks cannot be reallocated by delayed shards.

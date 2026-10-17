@@ -26,7 +26,7 @@ Test the selected Quinn version and configuration before expanding the runtime:
 | Area | Required check |
 | --- | --- |
 | Datagram negotiation | Unsupported peers and send-size errors are handled explicitly |
-| TLS and session join | Trusted client succeeds; wrong client/server identity and foreign session join fail; no 0-RTT data |
+| TLS and session join | Trusted client succeeds; wrong client/server identity and foreign session join fail; 0-RTT data accepted at most once per ticket; a replayed first flight is refused |
 | Encryption/FEC | Recover canonical records from authenticated originals/repair; invalid records cannot allocate unbounded state |
 | Transport buffering | Saturate send/receive buffers; distinguish queue admission, local drop, wire loss and application acceptance |
 | ACK semantics | Lose/delay reports; cumulative reports converge without crediting repaired bytes to the failed path |

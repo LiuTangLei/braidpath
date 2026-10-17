@@ -327,6 +327,17 @@ fn adaptive_restart_preserves_listener_replaces_session_and_cancels_failed_recon
         b"after fresh authenticated session",
         &mut client,
     );
+    // The restarted server holds no tickets: 0-RTT is rejected and the path
+    // completes with a full handshake.
+    let rejected = client.wait_snapshot(Duration::from_secs(2), |v| {
+        v["stats"]["zero_rtt_rejected"].as_u64().unwrap_or(0) >= 1
+    });
+    assert!(
+        client
+            .logs()
+            .contains("0-RTT rejected; retrying with a full handshake"),
+        "{rejected}"
+    );
 
     // Keep the destination UDP port open without responding so this is a pending
     // reconnect handshake, not immediate ICMP refusal or an idle ready client.
@@ -740,6 +751,12 @@ fn fixed_initially_failed_path_rejoins_existing_session_after_network_recovers()
             .all(|path| { path["authenticated"] != true || path["session_id"] == sid })
     );
     assert_eq!(recovered["stats"]["retired_session_total"], 0);
+    // The recovering path resumes with a ticket from the first path.
+    assert!(
+        recovered["stats"]["zero_rtt_accepted"].as_u64().unwrap() >= 1,
+        "{}",
+        client.logs()
+    );
     let application = UdpSocket::bind("127.0.0.1:0").unwrap();
     application.connect(client_address).unwrap();
     application

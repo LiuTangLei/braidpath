@@ -418,6 +418,10 @@ pub struct State {
     pub handshake_successes: u64,
     pub handshake_failures: u64,
     pub handshake_cancelled: u64,
+    /// Handshakes whose 0-RTT data was accepted (either role) or rejected
+    /// (client only).
+    pub zero_rtt_accepted: u64,
+    pub zero_rtt_rejected: u64,
     pub path_admission_attempts: u64,
     pub path_admission_successes: u64,
     pub path_admission_failures: u64,
@@ -460,6 +464,15 @@ pub struct ConnectionEvent {
 }
 
 /// Observes existing operations and timeouts without imposing additional ones.
+/// How a handshake that allowed early data completed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EarlyData {
+    Accepted,
+    /// Completed without early data: rejected, or (server) none was sent.
+    Rejected,
+    Failed,
+}
+
 pub struct ConnectionTrace {
     metrics: Metrics,
     connection_id: u64,
@@ -470,6 +483,8 @@ pub struct ConnectionTrace {
     started: Instant,
     stage_started: Instant,
     handshake_complete: bool,
+    /// Set when a handshake that began with early data completes.
+    early_confirmed: Option<Arc<std::sync::atomic::AtomicBool>>,
     admission_pending: bool,
     authenticated: bool,
     conn: Option<quinn::Connection>,
@@ -499,6 +514,7 @@ impl ConnectionTrace {
             started: now,
             stage_started: now,
             handshake_complete: false,
+            early_confirmed: None,
             admission_pending: false,
             authenticated: false,
             conn: None,
@@ -559,6 +575,51 @@ impl ConnectionTrace {
         self.metrics.state(|s| s.handshake_successes += 1);
         self.succeeded();
     }
+    /// The connection is usable before its handshake completes (client 0-RTT,
+    /// server 0.5-RTT). A handshake success is counted when it completes; the
+    /// receiver reports the outcome.
+    pub fn early_data(
+        &mut self,
+        conn: &quinn::Connection,
+        accepted: quinn::ZeroRttAccepted,
+    ) -> tokio::sync::watch::Receiver<Option<EarlyData>> {
+        self.conn = Some(conn.clone());
+        let confirmed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        self.early_confirmed = Some(confirmed.clone());
+        let metrics = self.metrics.clone();
+        let client = self.metrics.0.role == "client";
+        let (tx, rx) = tokio::sync::watch::channel(None);
+        let conn = conn.clone();
+        tokio::spawn(async move {
+            // False also when the handshake fails, or (server) no early data was sent.
+            let outcome = if accepted.await {
+                EarlyData::Accepted
+            } else if conn.close_reason().is_none() {
+                EarlyData::Rejected
+            } else {
+                EarlyData::Failed
+            };
+            let completed = outcome != EarlyData::Failed;
+            confirmed.store(completed, std::sync::atomic::Ordering::Relaxed);
+            metrics.state(|s| {
+                s.handshake_successes += u64::from(completed);
+                s.zero_rtt_accepted += u64::from(outcome == EarlyData::Accepted);
+                // A client offers early data only with a ticket; a server
+                // cannot tell a rejection from a client that sent none.
+                s.zero_rtt_rejected += u64::from(client && outcome == EarlyData::Rejected);
+            });
+            let _ = tx.send(Some(outcome));
+        });
+        self.succeeded();
+        rx
+    }
+    fn handshake_done(&self) -> bool {
+        self.handshake_complete
+            || self
+                .early_confirmed
+                .as_ref()
+                .is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+    }
     pub fn begin_admission(&mut self) {
         self.admission_pending = true;
         self.metrics.state(|s| s.path_admission_attempts += 1);
@@ -594,7 +655,7 @@ impl ConnectionTrace {
         )
     }
     pub fn failed(&mut self, reason: &'static str) {
-        if !self.handshake_complete {
+        if !self.handshake_done() {
             self.metrics.state(|s| s.handshake_failures += 1);
         }
         if self.admission_pending {
@@ -610,8 +671,9 @@ impl ConnectionTrace {
         if self.finished.is_some() {
             return;
         }
+        let handshake_done = self.handshake_done();
         self.metrics.state(|s| {
-            if !self.handshake_complete {
+            if !handshake_done {
                 s.handshake_cancelled += 1;
             }
             if self.admission_pending {
