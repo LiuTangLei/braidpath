@@ -782,12 +782,12 @@ fn fixed_initially_failed_path_rejoins_existing_session_after_network_recovers()
             .all(|path| { path["authenticated"] != true || path["session_id"] == sid })
     );
     assert_eq!(recovered["stats"]["retired_session_total"], 0);
-    // The recovering path resumes with a ticket from the first path.
-    assert!(
-        recovered["stats"]["zero_rtt_accepted"].as_u64().unwrap() >= 1,
-        "{}",
-        client.logs()
-    );
+    // Admission can complete at 0.5-RTT, before the handshake observer counts
+    // acceptance. Await that distinct boundary rather than reading the first
+    // authenticated-path snapshot as though the handshake had completed.
+    client.wait_snapshot(Duration::from_secs(2), |v| {
+        v["stats"]["zero_rtt_accepted"].as_u64().unwrap_or(0) >= 1
+    });
     let application = UdpSocket::bind("127.0.0.1:0").unwrap();
     application.connect(client_address).unwrap();
     application
