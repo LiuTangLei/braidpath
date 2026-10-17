@@ -371,6 +371,11 @@ Adaptive mode retries initially unavailable and disconnected paths, including an
 
 `--rotate-source-port` additionally permits elective replacement of an open degraded path and requires quality scheduling or adaptive mode. The legacy quality criterion uses at least 32 finalized symbols, fresh forward feedback and 4 continuous seconds with loss above 5% or transit variation above 100 ms. Adaptive mode corroborates the delay criterion with local RTT-probe evidence. Return-only degradation does not independently trigger this client-side elective policy. An initial connection does not spend the elective cooldown; a successful elective rotation starts a 30-second cooldown. Replacement can discard in-flight old-generation datagrams, which remain losses.
 
+Before a path is excluded or replaced, the sender withholds data from a path
+whose ack-eliciting QUIC frames have gone unanswered for `max(2·RTT + 25 ms,
+100 ms)` and resumes on its next ACK ([path liveness](reliable-streams.md#scheduling));
+this applies to UDP records and streams alike, in every mode.
+
 Generation numbers increase within the authenticated session. The server keeps one highest admitted generation per path, rejecting replay or regression without an expanding history. Old-handler cleanup cannot remove its replacement. During a short all-path outage, session and record identity remain intact. If the server has expired its empty session or restarted, it rejects rejoin explicitly; the client then creates a fresh session ID and resets that epoch's flow/record state while retaining the local UDP listener. This is an explicit new epoch, not replay of already delivered records or reliable delivery across the outage.
 
 Paired fixed-load observations, availability failures, port histories and unconditional latency must be reported before considering a default change. Multi-interface capacity, shared-bottleneck competition, long-running field behavior and deployment reachability remain separate acceptance gates. Automatic bottleneck detection, coupled congestion control, adaptive FEC and multi-erasure coding remain deferred.

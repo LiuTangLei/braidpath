@@ -87,6 +87,23 @@ retransmitted segments and bytes, local-drop retransmissions, probe timeouts,
 spurious-repair reports, duplicate bytes received, and acknowledgments sent and
 received.
 
+## Scheduling
+
+Two scheduler rules serve TCP streams and fixed UDP alike:
+
+| Rule | Behavior |
+| --- | --- |
+| Path liveness | A path whose ack-eliciting QUIC frames (datagrams, stream data, pings) have gone unanswered by any ACK for `max(2·RTT + 25 ms, 100 ms)` is withheld from data scheduling until an ACK arrives; the controller's and Quinn's probes still elicit one. If every open path is silent, none is withheld. A queue delays ACKs without stopping them, so this is reachability evidence, not a congestion signal; it acts before the adaptive controller's receiver-report exclusion, which takes seconds. |
+| Latency class | A record of at most 320 encoded bytes, or a stream segment while that stream has at most 64 KiB outstanding, is offered to paths in order of expected delivery delay (half the base RTT plus network and local queueing) instead of the throughput order. Bulk transfers keep the throughput order. Where the opt-in small-record FEC policy (`--small-fec-bytes`) applies, its delay and loss ranking decides instead. |
+
+The adaptive controller's queue brake cuts to a delivery sample only if that
+sample measured the bottleneck: most of its admission interval lies inside the
+current backlog, or the queue was observed within one base RTT of the interval's
+end. A sample from an application-limited period before a burst meets neither and
+gets the ordinary 20% brake; it could otherwise cut a newly busy path to the
+minimum rate. At startup the transport window limits sends before a local backlog
+forms, so the queue condition keeps the immediate cut there.
+
 ## Controlled measurement
 
 `bench/tcp_lab.py` runs one TCP transfer through the native link emulator
@@ -101,6 +118,13 @@ python3 -m bench.tcp_lab --binary target/release/braidpath \
 python3 -m bench.tcp_lab ... --output local/tcp-lab/single --use-path 0
 ```
 
+`--connections N` runs N concurrent transfers. With `--entrance socks5`,
+`--probe-interval-ms` sends 64-byte echo probes on a separate connection, reported as
+idle and during-transfer RTT percentiles. `--event SECONDS:JSON` sends a control line
+to the emulator, for example `--event '2:{"path":0,"down":true}'` to take a path down
+(both queued and new packets are dropped). Each result reports the largest gap
+between received bytes.
+
 Results stay under `local/`. Loopback shares one host, CPU and kernel; an emulated
 result is not a WAN, independent-capacity or deployment acceptance result.
 
@@ -110,6 +134,6 @@ result is not a WAN, independent-capacity or deployment acceptance result.
   allow-lists beyond the public-address rule.
 - Path-aware loss detection: the stream layer does not know which path carried a
   segment, so a loss on a fast path waits for the slowest observed RTT.
-- Priority classes between interactive and bulk streams beyond the existing
-  per-flow round robin.
+- Priority classes between interactive and bulk streams beyond the latency class
+  and the existing per-flow round robin.
 - Coordinated FEC strength for streams, and cross-host WAN acceptance.

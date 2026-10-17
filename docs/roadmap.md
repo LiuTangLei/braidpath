@@ -90,6 +90,7 @@ Current protocol, commands and limits: [experimental runtime](runtime.md). Check
 - [x] TCP forwarding to a fixed target on the reliable-flow service ([design](reliable-streams.md)).
 - [x] SOCKS5 CONNECT and HTTP CONNECT entrances with per-stream destinations and public-address authorization ([design](reliable-streams.md#proxy-entrances)).
 - [ ] SOCKS5 UDP ASSOCIATE over datagram flows.
+- [x] Faster path-outage exclusion from QUIC acknowledgment silence, and a latency class for small records and latency-bound streams ([scheduling](reliable-streams.md#scheduling)); emulated-link evidence only.
 - [ ] Compare FEC with the no-FEC reliable baseline; verify bytes, completion, timeout rates and latency under bulk/interactive coexistence.
 
 **Exit gate:** reliable-stream correctness and the selected latency/goodput targets pass. A UDP delivery metric cannot substitute for this gate.

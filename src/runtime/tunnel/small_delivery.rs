@@ -17,6 +17,12 @@ fn delay_estimate(min_rtt_ms: f64, rtt_ms: f64, transit_ms: f64, queued: usize, 
     baseline * 0.5 + network + local
 }
 
+/// Relative delivery estimate for ranking paths: half the base RTT plus
+/// network and local queueing.
+pub(super) fn delay_ms(path: &OutPath) -> f64 {
+    estimate(path).delay_ms
+}
+
 #[derive(Clone, Copy)]
 struct Quality {
     loss_rate: f64,

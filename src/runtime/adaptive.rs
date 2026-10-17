@@ -2129,13 +2129,35 @@ impl PathController {
             // A new queue behind offered backlog shows the bottleneck, not the
             // application, limits fresh short-feedback delivery, even while the
             // transport (e.g. its own window) leaves part of this allowance unused.
+            // The sample must have measured the bottleneck: most of its admission
+            // lies inside the backlog, or the queue was observed within one base
+            // RTT of that admission's end. Startup can meet only the
+            // second, since the transport window limits sends before any local
+            // backlog forms. A sample that predates both (sparse traffic, then a
+            // burst) measured the application and would brake to the floor.
             let backlogged_queue_delivery = self.fast_recovery_enabled
                 && self.fast_feedback_seen
                 && new_delay
                 && observation.offered_backlog
                 && self
                     .last_report
-                    .is_some_and(|(_, _, at)| now.saturating_sub(at) <= CONTROL_US);
+                    .is_some_and(|(_, _, at)| now.saturating_sub(at) <= CONTROL_US)
+                && service_sample.is_some_and(|sample| {
+                    sample.admission.is_some_and(|admission| {
+                        let end = admission.started_us.saturating_add(admission.span_us);
+                        self.backlog_since_us.is_some_and(|since| {
+                            end.saturating_sub(since.max(admission.started_us)) * 2
+                                >= admission.span_us
+                        }) || self.delay_since_us.is_some_and(|since| {
+                            // The base RTT bounds how late a queue that admission
+                            // met can first be observed.
+                            since
+                                <= end.saturating_add(
+                                    self.min_rtt_ms.map_or(0, |ms| (ms * 1000.0) as u64),
+                                )
+                        })
+                    })
+                });
             let mut desired = service_hint
                 .filter(|rate| {
                     *rate > 0.0
@@ -7525,6 +7547,12 @@ mod tests {
         /// The transport admits only half of each allowance through step 6.
         TransportLimited,
         TransportLimitedLegacy,
+        /// As `TransportLimited`, but the backlog begins just before the brake
+        /// report, after the interval it pairs with.
+        TransportLimitedLateBacklog,
+        /// As `TransportLimitedLateBacklog`, with the queue already observed
+        /// during that interval.
+        TransportLimitedLateBacklogQueued,
         /// Business exercised the allowance, but the queue is empty at the brake sample.
         SampledEmpty,
     }
@@ -7543,7 +7571,15 @@ mod tests {
         let standing_queue = variant == DrainVariant::StandingQueue;
         let limited = matches!(
             variant,
-            DrainVariant::TransportLimited | DrainVariant::TransportLimitedLegacy
+            DrainVariant::TransportLimited
+                | DrainVariant::TransportLimitedLegacy
+                | DrainVariant::TransportLimitedLateBacklog
+                | DrainVariant::TransportLimitedLateBacklogQueued
+        );
+        let late_backlog = matches!(
+            variant,
+            DrainVariant::TransportLimitedLateBacklog
+                | DrainVariant::TransportLimitedLateBacklogQueued
         );
         let (warmup_us, report_delay_us) = timing;
         let mut controller = PathController::new(start_bps * 4, 20);
@@ -7668,6 +7704,12 @@ mod tests {
             }
             if variant == DrainVariant::SampledEmpty && step == 6 {
                 sample.offered_backlog = false;
+            }
+            if late_backlog && step == 6 {
+                controller.backlog_since_us = Some(now - 10_000);
+                if variant == DrainVariant::TransportLimitedLateBacklogQueued {
+                    controller.delay_since_us = Some(start_us + 400_000);
+                }
             }
             controller.observe(&sample);
             // The standing queue brakes only once a paired interval shows the
@@ -8748,6 +8790,15 @@ mod tests {
         assert_eq!(brake(DrainVariant::TransportLimitedLegacy), 750_000);
         // The collapsed fresh delivery, drained at the large-queue fraction.
         assert_eq!(brake(DrainVariant::TransportLimited), 94_000);
+        // An interval before both the backlog and the queue measured the
+        // application: an ordinary 20% brake, not a cut to its delivery.
+        assert_eq!(brake(DrainVariant::TransportLimitedLateBacklog), 750_000);
+        // A queue during that interval shows the bottleneck although the
+        // backlog began later, as at startup.
+        assert_eq!(
+            brake(DrainVariant::TransportLimitedLateBacklogQueued),
+            94_000
+        );
     }
 
     #[test]

@@ -40,6 +40,7 @@ mod coding;
 #[cfg(test)]
 mod dual_tests;
 mod ingress;
+mod liveness;
 mod local_delivery;
 #[cfg(test)]
 mod mixed_fec_tests;
@@ -51,6 +52,9 @@ mod tcp;
 pub use proxy::Access as ProxyAccess;
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Encoded symbols up to this size are latency traffic: stream
+/// acknowledgments, keystrokes, DNS and similar small datagrams.
+const LATENCY_RECORD_BYTES: usize = 320;
 const WEBSITE: &str = "<!doctype html><html lang=\"en\"><meta charset=\"utf-8\"><title>Welcome</title><h1>Welcome</h1><p>This service is online.</p></html>\n";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1436,6 +1440,7 @@ async fn sender(
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let lifetime = policy.admission_lifetime();
     let mut waiting: Option<WaitingSend> = None;
+    let mut liveness: [liveness::Liveness; MAX_PATHS] = Default::default();
     loop {
         if *stop.borrow() {
             break;
@@ -1612,6 +1617,18 @@ async fn sender(
             account_expired(&expired, now, &metrics);
         }
         let paths = shared_paths.lock().expect("paths lock");
+        // Paths that stopped acknowledging carry no data, unless every open
+        // path has: then nothing is gained by withholding it.
+        let silent = {
+            let (mut open, mut silent) = (0u8, 0u8);
+            for path in paths.iter().filter(|p| p.conn.close_reason().is_none()) {
+                let id = usize::from(path.id);
+                liveness[id].observe(&path.conn, now);
+                open |= 1 << id;
+                silent |= u8::from(liveness[id].silent()) << id;
+            }
+            if silent == open { 0 } else { silent }
+        };
         if observation_schedule
             .as_mut()
             .and_then(|schedule| schedule.take_due(now_us))
@@ -2103,6 +2120,7 @@ async fn sender(
                     .iter()
                     .filter(|p| {
                         let eligible = p.conn.close_reason().is_none()
+                            && silent & (1 << p.id) == 0
                             && (!policy.adaptive
                                 || controllers[usize::from(p.id)].decision(now_us).eligible);
                         if !eligible {
@@ -2214,6 +2232,22 @@ async fn sender(
             }
             if repair {
                 order.sort_by_key(|i| u8::from(used & (1 << paths[*i].id) != 0));
+            } else if order.len() > 1
+                && !is_small
+                && (front.data.len() <= LATENCY_RECORD_BYTES
+                    || front.hold.as_ref().is_some_and(|hold| hold.interactive()))
+            {
+                // Small records (acknowledgments, interactive and control
+                // traffic) and latency-bound streams take the earliest ready
+                // path; bulk keeps the weighted spread across paths. Where the
+                // small-delivery policy applies, its delay and loss ranking
+                // decides instead.
+                let mut ranked: Vec<_> = order
+                    .iter()
+                    .map(|&i| (small_delivery::delay_ms(&paths[i]), i))
+                    .collect();
+                ranked.sort_by(|a, b| a.0.total_cmp(&b.0));
+                order = ranked.into_iter().map(|(_, i)| i).collect();
             }
             // Shadow evaluates identical evidence in both arms. Only the local
             // opt-in changes order; all original gates below remain authoritative.
@@ -2267,7 +2301,7 @@ async fn sender(
             for i in order {
                 let path = &paths[i];
                 let id = usize::from(path.id);
-                if path.conn.close_reason().is_some() {
+                if path.conn.close_reason().is_some() || silent & (1 << path.id) != 0 {
                     frontier.add(path.id, is_small, Gate::PathIneligible);
                     continue;
                 }

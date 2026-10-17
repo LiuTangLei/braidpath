@@ -6,7 +6,7 @@
 //! seeded random erasure at enqueue and a netem-style packet limit that counts
 //! queued and propagating packets. An optional byte-token policer drops excess
 //! arrivals without a serialization backlog. JSON lines on stdin change a direction's
-//! shape; stdin EOF stops the emulator. Not a WAN model or production relay.
+//! shape or take it down; stdin EOF stops the emulator. Not a WAN model or production relay.
 use anyhow::{Context, Result, ensure};
 use clap::Parser;
 use rand::{Rng, SeedableRng, rngs::StdRng};
@@ -67,6 +67,9 @@ struct Shape {
     delay_us: u64,
     loss: f64,
     queue_packets: usize,
+    /// An outage: every arriving and propagating packet is dropped.
+    #[serde(default)]
+    down: bool,
 }
 
 impl Shape {
@@ -93,6 +96,7 @@ struct Counters {
     forwarded_ip_udp_bytes: u64,
     send_errors: u64,
     no_peer_drops: u64,
+    outage_drops: u64,
     peak_packets: usize,
     max_sojourn_us: u64,
 }
@@ -151,6 +155,7 @@ struct Change {
     rate_mbps: Option<f64>,
     loss_percent: Option<f64>,
     delay_ms: Option<f64>,
+    down: Option<bool>,
 }
 
 fn unix_ms() -> u128 {
@@ -171,6 +176,7 @@ fn parse_path(text: &str, queue_packets: usize) -> Result<Shape> {
         delay_us: (rtt * 500.0).round() as u64,
         loss: 0.0,
         queue_packets,
+        down: false,
     };
     shape.validate()?;
     Ok(shape)
@@ -215,6 +221,10 @@ async fn shape_direction(
                 let shape = direction.shape;
                 direction.counters.received_packets += 1;
                 direction.counters.received_ip_udp_bytes += size as u64;
+                if shape.down {
+                    direction.counters.outage_drops += 1;
+                    continue;
+                }
                 if shape.loss > 0.0 && random.random::<f64>() < shape.loss {
                     direction.counters.loss_drops += 1;
                     continue;
@@ -244,6 +254,10 @@ async fn shape_direction(
                 let target = fixed_target.or(*peer.lock().unwrap());
                 while queue.front().is_some_and(|entry| entry.1 <= now) {
                     let (entered, _, data) = queue.pop_front().unwrap();
+                    if state.lock().unwrap().shape.down {
+                        state.lock().unwrap().counters.outage_drops += 1;
+                        continue;
+                    }
                     let sent = match target {
                         Some(target) => output.try_send_to(&data, target).is_ok(),
                         None => false,
@@ -300,6 +314,9 @@ fn apply(paths: &[(Shared, Shared)], line: &str) -> Result<()> {
         }
         if let Some(delay) = change.delay_ms {
             shape.delay_us = (delay * 1000.0).round() as u64;
+        }
+        if let Some(down) = change.down {
+            shape.down = down;
         }
         shape.validate()?;
         // Settle credit at the old rate before the control boundary, so a

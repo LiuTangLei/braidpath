@@ -55,6 +55,10 @@ const PUBLISH_EVERY: Duration = Duration::from_millis(500);
 const RETRY_FULL: Duration = Duration::from_millis(1);
 /// Stream identifiers with this bit carry a destination header.
 const ADDRESSED: u32 = 1 << 28;
+/// A stream with at most this much unacknowledged data is latency-bound, not
+/// bandwidth-bound: its segments take the earliest path rather than a share
+/// of every path.
+const INTERACTIVE_BYTES: u64 = 64 * 1024;
 
 /// Client listeners; the mux exists when either is configured and negotiated.
 #[derive(Clone, Default)]
@@ -750,8 +754,11 @@ impl Mux {
             };
             idle = 0;
             let payload = t.frame.encode();
-            let hold = (t.transmission > 0)
-                .then(|| self.gauge.hold(id, t.start, t.transmission, payload.len()));
+            let interactive = s.send.written() - s.send.retained_from() <= INTERACTIVE_BYTES;
+            let hold = (t.transmission > 0).then(|| {
+                self.gauge
+                    .hold(id, t.start, t.transmission, payload.len(), interactive)
+            });
             if !out.enqueue(stream::data_flow(id), payload, hold) {
                 // The unadmitted hold reports this transmission as dropped.
                 self.blocked_until = Some(now + RETRY_FULL);

@@ -61,12 +61,14 @@ impl Gauge {
         start: u64,
         transmission: u32,
         bytes: usize,
+        interactive: bool,
     ) -> Arc<Hold> {
         self.queued.fetch_add(bytes, Ordering::AcqRel);
         Arc::new(Hold {
             gauge: self.clone(),
             identity: (stream, start, transmission),
             bytes,
+            interactive,
             admitted: AtomicBool::new(false),
         })
     }
@@ -76,9 +78,14 @@ pub struct Hold {
     gauge: Arc<Gauge>,
     identity: (u32, u64, u32),
     bytes: usize,
+    /// The stream has little outstanding data: send it on the earliest path.
+    interactive: bool,
     admitted: AtomicBool,
 }
 impl Hold {
+    pub fn interactive(&self) -> bool {
+        self.interactive
+    }
     pub fn admitted(&self) {
         self.admitted.store(true, Ordering::Release);
     }
@@ -958,8 +965,8 @@ mod tests {
     fn stream_holds_release_occupancy_and_report_only_unadmitted_originals() {
         let gauge = Arc::new(Gauge::default());
         gauge.set_low_water(1500);
-        let admitted = gauge.hold(3, 0, 1, 1000);
-        let dropped = gauge.hold(3, 1000, 2, 1000);
+        let admitted = gauge.hold(3, 0, 1, 1000, false);
+        let dropped = gauge.hold(3, 1000, 2, 1000, false);
         let clone = dropped.clone();
         assert_eq!(gauge.queued(), 2000);
         admitted.admitted();
