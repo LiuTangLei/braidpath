@@ -11,6 +11,14 @@ use std::{
     time::{Duration, Instant},
 };
 const BIN: &str = env!("CARGO_BIN_EXE_braidpath");
+// Isolate independent multi-process topologies on small CI runners. Each
+// topology still exercises its original concurrent streams and lossy paths.
+static SOCKET_FIXTURE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+fn socket_fixture() -> std::sync::MutexGuard<'static, ()> {
+    SOCKET_FIXTURE
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+}
 
 struct Process {
     child: Child,
@@ -94,9 +102,29 @@ fn echo_target() -> String {
 }
 
 struct Topology {
-    dir: tempfile::TempDir,
     _processes: Vec<Process>,
+    dir: tempfile::TempDir,
     tcp_listen: String,
+    _fixture: std::sync::MutexGuard<'static, ()>,
+}
+impl Drop for Topology {
+    fn drop(&mut self) {
+        // Close children before moving their open logs, including on Windows.
+        self._processes.clear();
+        if thread::panicking() {
+            let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("local/test-failures");
+            let stamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let destination = root.join(format!("tcp-{}-{stamp}", std::process::id()));
+            let _ = fs::create_dir_all(&root);
+            match fs::rename(self.dir.path(), &destination) {
+                Ok(()) => eprintln!("fixture evidence retained at {}", destination.display()),
+                Err(error) => eprintln!("could not retain fixture evidence: {error}"),
+            }
+        }
+    }
 }
 impl Topology {
     /// The latest `tcp_streams` snapshot that `role` wrote.
@@ -116,6 +144,7 @@ impl Topology {
 /// `server` selects the stream kind on the server; `local` is the client flag
 /// for the matching local listener.
 fn topology(server: &[&str], relays: &[&str], local: &str) -> Topology {
+    let fixture = socket_fixture();
     let dir = tempfile::tempdir().unwrap();
     let identity = dir.path().join("identity");
     assert!(
@@ -212,6 +241,7 @@ fn topology(server: &[&str], relays: &[&str], local: &str) -> Topology {
         dir,
         _processes: processes,
         tcp_listen,
+        _fixture: fixture,
     }
 }
 
@@ -324,6 +354,7 @@ fn server_without_the_stream_kind_rejects_the_session() {
 }
 
 fn rejected(server_flag: &str, local: &str, message: &str) {
+    let _fixture = socket_fixture();
     let dir = tempfile::tempdir().unwrap();
     let identity = dir.path().join("identity");
     Command::new(BIN)
