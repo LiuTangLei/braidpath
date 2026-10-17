@@ -765,6 +765,16 @@ impl Receiver {
         self.final_size
             .is_some_and(|f| self.consumed == f && self.cumulative == f)
     }
+    /// The acknowledgment of everything, including FIN, once finished: what a
+    /// retired stream answers if the peer missed it and sends its FIN again.
+    pub fn final_ack(&self) -> Option<Ack> {
+        self.finished().then(|| Ack {
+            cumulative: self.cumulative + 1,
+            limit: self.advertised,
+            duplicate_bytes: self.duplicates,
+            ranges: Vec::new(),
+        })
+    }
     /// Bytes held locally: delivered but unconsumed, plus out-of-order data.
     pub fn buffered(&self) -> u64 {
         self.cumulative - self.consumed + self.out_of_order
@@ -812,6 +822,20 @@ impl Receiver {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_finished_receiver_keeps_an_acknowledgment_of_everything() {
+        let now = Instant::now();
+        let mut r = Receiver::default();
+        assert_eq!(r.on_data(0, true, b"done".to_vec(), now).unwrap(), b"done");
+        assert!(r.final_ack().is_none(), "not yet consumed");
+        r.consumed(4, MAX_WINDOW);
+        let ack = r.final_ack().unwrap();
+        // Four bytes and the virtual FIN byte, as the live acknowledgment says.
+        assert_eq!(ack.cumulative, 5);
+        assert_eq!(r.take_ack(now, MAX_WINDOW).unwrap().cumulative, 5);
+        assert!(ack.ranges.is_empty());
+    }
 
     fn data(frame: &Frame) -> (u64, bool, Vec<u8>) {
         match frame {

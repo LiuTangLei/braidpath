@@ -70,7 +70,7 @@ target sees.
 | Local backlog | Stream bytes waiting for admission are capped at half the admission lifetime of the measured admission rate, between 8 and 56 records, so stream data does not age out of the adaptive 20 ms sender lifetime. |
 | Windows | 256 KiB initial, then the receiver advertises its share of a 64 MiB session budget, between 256 KiB and 8 MiB per stream. The sender reads from its local socket only up to the peer limit plus 256 KiB. |
 | Probes | An empty client stream announces itself with a zero-length segment, repeated until acknowledged, so server-first protocols work. A closed window is probed with zero-length segments. |
-| End | FIN after local EOF, and write shutdown after the peer FIN and all data are written, for full half-close. A stream retires when both directions finish. |
+| End | FIN after local EOF, and write shutdown after the peer FIN and all data are written, for full half-close. A stream retires when both directions finish, after acknowledging the peer's FIN; its tombstone answers a repeated FIN with that final acknowledgment rather than RESET, so the peer completes instead of resetting a finished exchange. |
 | Reset | Socket errors, violations, connect failure (10 s), or 30 s without acknowledgment progress send RESET (twice) and close the local socket with RST, never FIN. Frames for a closed stream are answered with RESET. A new session epoch resets all streams. |
 | Limits | 256 concurrent streams per session; 120 s tombstones prevent late frames from reopening a closed stream. |
 

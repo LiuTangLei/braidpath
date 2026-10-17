@@ -251,7 +251,8 @@ pub(super) struct Mux {
     targets: Targets,
     streams: HashMap<u32, Stream>,
     turns: VecDeque<u32>,
-    closed: HashMap<u32, Instant>,
+    /// Retired streams; a completed one keeps its final acknowledgment.
+    closed: HashMap<u32, (Instant, Option<Vec<u8>>)>,
     control: VecDeque<(u32, Vec<u8>)>,
     next_stream: u32,
     events_tx: mpsc::UnboundedSender<Io>,
@@ -399,12 +400,13 @@ impl Mux {
             && let Some(oldest) = self
                 .closed
                 .iter()
-                .min_by_key(|(_, at)| **at)
+                .min_by_key(|(_, (at, _))| *at)
                 .map(|(id, _)| *id)
         {
             self.closed.remove(&oldest);
         }
-        self.closed.insert(id, Instant::now());
+        let final_ack = s.recv.final_ack().map(|ack| Frame::Ack(ack).encode());
+        self.closed.insert(id, (Instant::now(), final_ack));
         Some(s)
     }
 
@@ -541,6 +543,12 @@ impl Mux {
         } else {
             self.targets.fixed.is_some()
         };
+        if let Some((_, Some(ack))) = self.closed.get(&id) {
+            // The peer missed the final acknowledgment of a completed stream.
+            self.control.push_back((stream::ack_flow(id), ack.clone()));
+            self.stats.acks_sent += 1;
+            return false;
+        }
         if !accepted || self.closed.contains_key(&id) {
             // Stale, unnegotiated, or peer-opened toward a client.
             self.control
@@ -549,7 +557,7 @@ impl Mux {
         }
         if self.streams.len() >= MAX_STREAMS {
             self.stats.rejected += 1;
-            self.closed.insert(id, now);
+            self.closed.insert(id, (now, None));
             self.control
                 .push_back((stream::data_flow(id), Frame::Reset.encode()));
             return false;
@@ -703,7 +711,19 @@ impl Mux {
         for (id, reason) in failed {
             self.reset(id, reason);
         }
+        let window = self.window();
         for id in done {
+            // The peer's FIN may have arrived in this batch: acknowledge it
+            // before the stream retires, or the peer retransmits it.
+            if let Some(ack) = self
+                .streams
+                .get_mut(&id)
+                .and_then(|s| s.recv.take_ack(now, window))
+            {
+                self.control
+                    .push_back((stream::ack_flow(id), Frame::Ack(ack).encode()));
+                self.stats.acks_sent += 1;
+            }
             // The writer finishes its own shutdown; the reader already ended.
             if self.close(id).is_some() {
                 self.stats.completed += 1;
@@ -715,7 +735,6 @@ impl Mux {
                 break;
             }
         }
-        let window = self.window();
         for (id, s) in &mut self.streams {
             if let Some(ack) = s.recv.take_ack(now, window) {
                 if out.enqueue(stream::ack_flow(*id), Frame::Ack(ack).encode(), None) {
@@ -729,7 +748,7 @@ impl Mux {
         // Finished tasks stay in the set until reaped.
         while self.tasks.try_join_next().is_some() {}
         self.closed
-            .retain(|_, at| now.saturating_duration_since(*at) < TOMBSTONE);
+            .retain(|_, (at, _)| now.saturating_duration_since(*at) < TOMBSTONE);
         if now.saturating_duration_since(self.published) >= PUBLISH_EVERY {
             self.publish(now);
         }

@@ -93,9 +93,23 @@ fn echo_target() -> String {
 }
 
 struct Topology {
-    _dir: tempfile::TempDir,
+    dir: tempfile::TempDir,
     _processes: Vec<Process>,
     tcp_listen: String,
+}
+impl Topology {
+    /// The latest `tcp_streams` snapshot that `role` wrote.
+    fn streams(&self, role: &str) -> Option<serde_json::Value> {
+        let text = std::fs::read_to_string(self.dir.path().join(format!("{role}.jsonl"))).ok()?;
+        let line = text
+            .lines()
+            .rev()
+            .find_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())?;
+        line["stats"]["directions"]
+            .as_object()?
+            .values()
+            .find_map(|direction| direction.get("tcp_streams").cloned())
+    }
 }
 
 /// `server` selects the stream kind on the server; `local` is the client flag
@@ -116,6 +130,8 @@ fn topology(server: &[&str], relays: &[&str], local: &str) -> Topology {
     let token = identity.join("token");
     let main = port();
     let mut processes = Vec::new();
+    let server_stats = dir.path().join("server.jsonl");
+    let client_stats = dir.path().join("client.jsonl");
     let mut server = launch(
         &[
             "server",
@@ -127,6 +143,10 @@ fn topology(server: &[&str], relays: &[&str], local: &str) -> Topology {
             key.to_str().unwrap(),
             "--token-file",
             token.to_str().unwrap(),
+            "--stats-jsonl",
+            server_stats.to_str().unwrap(),
+            "--stats-interval-ms",
+            "100",
         ]
         .into_iter()
         .chain(server.iter().copied())
@@ -176,6 +196,10 @@ fn topology(server: &[&str], relays: &[&str], local: &str) -> Topology {
         token.to_str().unwrap(),
         "--rate-bps",
         "200000000",
+        "--stats-jsonl",
+        client_stats.to_str().unwrap(),
+        "--stats-interval-ms",
+        "100",
     ];
     for entrance in &entrances {
         args.extend(["--entrance", entrance]);
@@ -184,7 +208,7 @@ fn topology(server: &[&str], relays: &[&str], local: &str) -> Topology {
     ready(&mut client, "UDP client ready");
     processes.push(client);
     Topology {
-        _dir: dir,
+        dir,
         _processes: processes,
         tcp_listen,
     }
@@ -404,6 +428,49 @@ fn assert_reset(conn: &mut TcpStream) {
             "{error}"
         ),
         Ok(n) => panic!("expected a reset, got {n} bytes"),
+    }
+}
+
+/// Each side retires a finished stream only after acknowledging the peer's FIN,
+/// and a retired stream answers a repeated FIN with that acknowledgment, so
+/// neither side waits for one that never comes or resets a complete exchange.
+#[test]
+fn finished_streams_complete_on_both_sides_without_reset() {
+    let target = echo_target();
+    let topology = topology(
+        &["--proxy", "--proxy-allow-private"],
+        &["5"],
+        "--proxy-listen",
+    );
+    const EXCHANGES: u64 = 24;
+    for i in 0..EXCHANGES {
+        let (status, mut conn) = socks(&topology.tcp_listen, &socks_ipv4(&target));
+        assert_eq!(status, 0);
+        let request = format!("request {i}");
+        conn.write_all(request.as_bytes()).unwrap();
+        conn.shutdown(Shutdown::Write).unwrap();
+        let mut got = Vec::new();
+        conn.read_to_end(&mut got).unwrap();
+        assert_eq!(got, [b"banner\n", request.as_bytes()].concat());
+    }
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let settled = loop {
+        let both = ["client", "server"].map(|role| topology.streams(role));
+        if let [Some(client), Some(server)] = &both
+            && [client, server].iter().all(|s| s["completed"] == EXCHANGES)
+        {
+            break both;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "streams did not complete: {both:?}"
+        );
+        thread::sleep(Duration::from_millis(100));
+    };
+    for streams in settled.iter().flatten() {
+        assert_eq!(streams["reset_local"], 0, "{streams}");
+        assert_eq!(streams["reset_peer"], 0, "{streams}");
+        assert_eq!(streams["active"], 0, "{streams}");
     }
 }
 
