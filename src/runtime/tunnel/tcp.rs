@@ -1,11 +1,19 @@
-//! TCP adapters for reliable streams: a client listener and a server target.
+//! TCP adapters for reliable streams: client listeners and server targets.
+//!
+//! A fixed stream goes to the server's configured TCP target. An addressed
+//! stream comes from a local proxy entrance and names its own destination
+//! (see `proxy`).
 //!
 //! Each accepted connection is one stream with its own windows and
 //! retransmission state, so a stalled transfer never blocks another
 //! connection. Stream records share the session's sender queue, paths, pacing
 //! and FEC with UDP records. Local backpressure keeps only a short backlog,
 //! sized from the measured admission rate, waiting for Quinn admission.
-use super::{Policy, QueuedRecord, Scope, enqueue_record, outbound::Gauge};
+use super::{
+    Policy, QueuedRecord, Scope, enqueue_record,
+    outbound::Gauge,
+    proxy::{self, Destination},
+};
 use crate::runtime::{
     stream::{self, Frame},
     wire::Record,
@@ -45,6 +53,22 @@ const DRAIN_SAMPLE: Duration = Duration::from_millis(10);
 const DRAIN_WINDOW: Duration = Duration::from_secs(1);
 const PUBLISH_EVERY: Duration = Duration::from_millis(500);
 const RETRY_FULL: Duration = Duration::from_millis(1);
+/// Stream identifiers with this bit carry a destination header.
+const ADDRESSED: u32 = 1 << 28;
+
+/// Client listeners; the mux exists when either is configured and negotiated.
+#[derive(Clone, Default)]
+pub(super) struct Listeners {
+    pub fixed: Option<Arc<TcpListener>>,
+    pub proxy: Option<Arc<TcpListener>>,
+}
+
+/// Server destinations; the mux exists when either is configured and negotiated.
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct Targets {
+    pub fixed: Option<SocketAddr>,
+    pub proxy: Option<proxy::Access>,
+}
 
 pub(super) enum Io {
     Read(u32, Vec<u8>),
@@ -52,6 +76,12 @@ pub(super) enum Io {
     Written(u32, usize),
     Failed(u32),
     Connected(u32, TcpStream),
+    /// Server: an addressed stream reached its destination.
+    Reached(u32, TcpStream),
+    /// Server: an addressed stream's destination failed with this status.
+    Refused(u32, u8),
+    /// Client: a local proxy handshake completed.
+    Proxied(TcpStream, proxy::Request),
 }
 
 enum WriteOp {
@@ -62,6 +92,7 @@ enum WriteOp {
 pub(super) enum Wake {
     Io(Io),
     Accept(io::Result<(TcpStream, SocketAddr)>),
+    ProxyAccept(io::Result<(TcpStream, SocketAddr)>),
     Queue,
     Timer,
 }
@@ -105,6 +136,12 @@ struct Stream {
     undelivered: Vec<Vec<u8>>,
     write_finished: bool,
     tasks: Vec<AbortHandle>,
+    /// Client: the local proxy connection waits for the server's status byte.
+    awaiting: Option<(proxy::Kind, TcpStream)>,
+    /// Server: destination header bytes received so far.
+    header: Option<Vec<u8>>,
+    /// Server: the destination failed; only the status and FIN remain to send.
+    refused: bool,
 }
 impl Stream {
     fn new(open: bool) -> Self {
@@ -118,10 +155,13 @@ impl Stream {
             undelivered: Vec::new(),
             write_finished: false,
             tasks: Vec::new(),
+            awaiting: None,
+            header: None,
+            refused: false,
         }
     }
     fn deliver(&mut self, data: Vec<u8>) {
-        if data.is_empty() {
+        if data.is_empty() || self.refused {
             return;
         }
         match &self.writer {
@@ -157,6 +197,9 @@ impl Stream {
         }
         for task in self.tasks.drain(..) {
             task.abort();
+        }
+        if let Some((_, tcp)) = self.awaiting.take() {
+            let _ = socket2::SockRef::from(&tcp).set_linger(Some(Duration::ZERO));
         }
     }
 }
@@ -203,8 +246,8 @@ impl Drain {
 }
 
 pub(super) struct Mux {
-    listener: Option<Arc<TcpListener>>,
-    target: Option<SocketAddr>,
+    listeners: Listeners,
+    targets: Targets,
     streams: HashMap<u32, Stream>,
     turns: VecDeque<u32>,
     closed: HashMap<u32, Instant>,
@@ -225,17 +268,12 @@ pub(super) struct Mux {
 }
 
 impl Mux {
-    fn new(
-        listener: Option<Arc<TcpListener>>,
-        target: Option<SocketAddr>,
-        policy: &Policy,
-        scope: Scope,
-    ) -> Self {
+    fn new(listeners: Listeners, targets: Targets, policy: &Policy, scope: Scope) -> Self {
         let (events_tx, events) = mpsc::unbounded_channel();
         let now = Instant::now();
         Self {
-            listener,
-            target,
+            listeners,
+            targets,
             streams: HashMap::new(),
             turns: VecDeque::new(),
             closed: HashMap::new(),
@@ -255,13 +293,19 @@ impl Mux {
             published: now,
         }
     }
-    /// Accepts local connections; the peer connects each stream to its target.
-    pub(super) fn client(listener: Arc<TcpListener>, policy: &Policy, scope: Scope) -> Self {
-        Self::new(Some(listener), None, policy, scope)
+    /// Accepts local connections; the peer connects each stream onward.
+    pub(super) fn client(listeners: Listeners, policy: &Policy, scope: Scope) -> Option<Self> {
+        (listeners.fixed.is_some() || listeners.proxy.is_some())
+            .then(|| Self::new(listeners, Targets::default(), policy, scope))
     }
-    /// Connects each peer-opened stream to the configured target.
-    pub(super) fn server(target: SocketAddr, policy: &Policy, scope: Scope) -> Self {
-        Self::new(None, Some(target), policy, scope)
+    /// Connects peer-opened streams of the kinds this session negotiated.
+    pub(super) fn server(targets: Targets, policy: &Policy, scope: Scope) -> Option<Self> {
+        let targets = Targets {
+            fixed: targets.fixed.filter(|_| policy.streams),
+            proxy: targets.proxy.filter(|_| policy.proxy),
+        };
+        (targets.fixed.is_some() || targets.proxy.is_some())
+            .then(|| Self::new(Listeners::default(), targets, policy, scope))
     }
 
     fn deadline(&self, now: Instant) -> Instant {
@@ -286,16 +330,17 @@ impl Mux {
     pub(super) async fn wake(&mut self) -> Wake {
         let now = Instant::now();
         let deadline = tokio::time::Instant::from_std(self.deadline(now));
-        let accepting = self.listener.is_some()
-            && self.streams.len() < MAX_STREAMS
-            && self.accept_paused_until.is_none_or(|at| now >= at);
-        let listener = self.listener.clone();
+        let accepting =
+            self.streams.len() < MAX_STREAMS && self.accept_paused_until.is_none_or(|at| now >= at);
+        let fixed = self.listeners.fixed.clone().filter(|_| accepting);
+        let proxy = self.listeners.proxy.clone().filter(|_| accepting);
         let queue_waiting = self.streams.values().any(|s| s.send.has_transmit());
         tokio::select! {
             biased;
             Some(event) = self.events.recv() => Wake::Io(event),
             _ = self.gauge.notify.notified(), if queue_waiting => Wake::Queue,
-            accepted = async { listener.as_ref().expect("listener").accept().await }, if accepting => Wake::Accept(accepted),
+            accepted = async { fixed.as_ref().expect("listener").accept().await }, if fixed.is_some() => Wake::Accept(accepted),
+            accepted = async { proxy.as_ref().expect("listener").accept().await }, if proxy.is_some() => Wake::ProxyAccept(accepted),
             _ = sleep_until(deadline) => Wake::Timer,
         }
     }
@@ -376,17 +421,20 @@ impl Mux {
         match wake {
             Wake::Io(event) => self.io(event),
             Wake::Accept(Ok((tcp, _))) => {
-                if self.next_stream >= stream::MAX_STREAM_ID {
-                    warn!("stream identifiers exhausted; refusing local connection");
-                    self.stats.rejected += 1;
-                } else {
-                    self.next_stream += 1;
-                    let id = self.next_stream;
+                if let Some(id) = self.next_id(false) {
                     self.open(id, true);
                     self.attach(id, tcp);
                 }
             }
-            Wake::Accept(Err(error)) => {
+            Wake::ProxyAccept(Ok((mut tcp, _))) => {
+                let events = self.events_tx.clone();
+                self.tasks.spawn(async move {
+                    if let Some(request) = proxy::handshake(&mut tcp).await {
+                        let _ = events.send(Io::Proxied(tcp, request));
+                    }
+                });
+            }
+            Wake::Accept(Err(error)) | Wake::ProxyAccept(Err(error)) => {
                 warn!(%error, "TCP accept failed");
                 self.accept_paused_until = Some(Instant::now() + Duration::from_millis(100));
             }
@@ -417,7 +465,153 @@ impl Mux {
             }
             Io::Failed(id) => self.reset(id, "local socket failed"),
             Io::Connected(id, tcp) => self.attach(id, tcp),
+            Io::Reached(id, tcp) => {
+                if let Some(s) = self.streams.get_mut(&id) {
+                    s.send.push(&[proxy::OK]);
+                    self.attach(id, tcp);
+                }
+            }
+            Io::Refused(id, status) => {
+                if let Some(s) = self.streams.get_mut(&id) {
+                    debug!(stream = id, status, "proxy destination refused");
+                    s.refused = true;
+                    s.undelivered.clear();
+                    s.send.push(&[status]);
+                    s.send.finish();
+                    self.stats.rejected += 1;
+                }
+            }
+            Io::Proxied(tcp, request) => {
+                if self.streams.len() >= MAX_STREAMS {
+                    self.stats.rejected += 1;
+                    self.tasks
+                        .spawn(refuse(tcp, request.kind, proxy::GENERAL_FAILURE));
+                    return;
+                }
+                let Some(id) = self.next_id(true) else {
+                    self.tasks
+                        .spawn(refuse(tcp, request.kind, proxy::GENERAL_FAILURE));
+                    return;
+                };
+                self.open(id, false);
+                let s = self.streams.get_mut(&id).expect("opened");
+                s.send.push(&request.destination.encode());
+                s.send.push(&request.early);
+                self.stats.bytes_from_application += request.early.len() as u64;
+                s.awaiting = Some((request.kind, tcp));
+            }
         }
+    }
+
+    /// Client stream identifiers; addressed streams set `ADDRESSED`.
+    fn next_id(&mut self, addressed: bool) -> Option<u32> {
+        if self.next_stream + 1 >= ADDRESSED {
+            warn!("stream identifiers exhausted; refusing local connection");
+            self.stats.rejected += 1;
+            return None;
+        }
+        self.next_stream += 1;
+        Some(self.next_stream | if addressed { ADDRESSED } else { 0 })
+    }
+
+    /// Open a peer-initiated stream if this session accepts its kind.
+    fn accept_stream(&mut self, id: u32, now: Instant) -> bool {
+        let addressed = id & ADDRESSED != 0;
+        let accepted = if addressed {
+            self.targets.proxy.is_some()
+        } else {
+            self.targets.fixed.is_some()
+        };
+        if !accepted || self.closed.contains_key(&id) {
+            // Stale, unnegotiated, or peer-opened toward a client.
+            self.control
+                .push_back((stream::data_flow(id), Frame::Reset.encode()));
+            return false;
+        }
+        if self.streams.len() >= MAX_STREAMS {
+            self.stats.rejected += 1;
+            self.closed.insert(id, now);
+            self.control
+                .push_back((stream::data_flow(id), Frame::Reset.encode()));
+            return false;
+        }
+        self.open(id, false);
+        let s = self.streams.get_mut(&id).expect("opened");
+        match self.targets.fixed.filter(|_| !addressed) {
+            Some(target) => {
+                let events = self.events_tx.clone();
+                s.tasks.push(self.tasks.spawn(async move {
+                    match timeout(CONNECT_TIMEOUT, TcpStream::connect(target)).await {
+                        Ok(Ok(tcp)) => {
+                            let _ = events.send(Io::Connected(id, tcp));
+                        }
+                        _ => {
+                            let _ = events.send(Io::Failed(id));
+                        }
+                    }
+                }));
+            }
+            None => s.header = Some(Vec::new()),
+        }
+        true
+    }
+
+    /// Handle in-order bytes: destination headers and status bytes first.
+    fn arrived(&mut self, id: u32, mut ready: Vec<u8>) {
+        let window = self.window();
+        let allow_private = self.targets.proxy.is_some_and(|p| p.allow_private);
+        let Some(s) = self.streams.get_mut(&id) else {
+            return;
+        };
+        if let Some(header) = &mut s.header {
+            header.append(&mut ready);
+            match Destination::decode(header) {
+                Ok(None) if s.recv.fin_received() => {
+                    return self.reset(id, "incomplete destination");
+                }
+                Ok(None) => return,
+                Err(()) => return self.reset(id, "malformed destination"),
+                Ok(Some((destination, used))) => {
+                    let mut header = s.header.take().expect("header");
+                    ready = header.split_off(used);
+                    s.recv.consumed(used as u64, window);
+                    let events = self.events_tx.clone();
+                    s.tasks.push(self.tasks.spawn(async move {
+                        let _ =
+                            events.send(match proxy::connect(destination, allow_private).await {
+                                Ok(tcp) => Io::Reached(id, tcp),
+                                Err(status) => Io::Refused(id, status),
+                            });
+                    }));
+                }
+            }
+        }
+        if s.awaiting.is_some() {
+            let status = if ready.is_empty() {
+                if !s.recv.fin_received() {
+                    return;
+                }
+                proxy::GENERAL_FAILURE
+            } else {
+                s.recv.consumed(1, window);
+                ready.remove(0)
+            };
+            let (kind, tcp) = s.awaiting.take().expect("awaiting");
+            if status != proxy::OK {
+                self.tasks.spawn(refuse(tcp, kind, status));
+                return self.reset(id, "proxy destination refused");
+            }
+            let events = self.events_tx.clone();
+            s.tasks.push(self.tasks.spawn(async move {
+                let mut tcp = tcp;
+                let _ = events.send(match tcp.write_all(&proxy::reply(kind, status)).await {
+                    Ok(()) => Io::Connected(id, tcp),
+                    Err(_) => Io::Failed(id),
+                });
+            }));
+        }
+        s.deliver(ready);
+        s.finish_writes();
     }
 
     /// Apply one stream record. Call `flush` after a batch of records.
@@ -451,41 +645,12 @@ impl Mux {
                 }
             }
             Frame::Data { offset, fin, data } => {
-                if !self.streams.contains_key(&id) {
-                    let Some(target) = self.target.filter(|_| !self.closed.contains_key(&id))
-                    else {
-                        // Stale or peer-opened toward a client: tell the peer it is gone.
-                        self.control
-                            .push_back((stream::data_flow(id), Frame::Reset.encode()));
-                        return;
-                    };
-                    if self.streams.len() >= MAX_STREAMS {
-                        self.stats.rejected += 1;
-                        self.closed.insert(id, now);
-                        self.control
-                            .push_back((stream::data_flow(id), Frame::Reset.encode()));
-                        return;
-                    }
-                    self.open(id, false);
-                    let events = self.events_tx.clone();
-                    let task = self.tasks.spawn(async move {
-                        match timeout(CONNECT_TIMEOUT, TcpStream::connect(target)).await {
-                            Ok(Ok(tcp)) => {
-                                let _ = events.send(Io::Connected(id, tcp));
-                            }
-                            _ => {
-                                let _ = events.send(Io::Failed(id));
-                            }
-                        }
-                    });
-                    self.streams.get_mut(&id).expect("opened").tasks.push(task);
+                if !self.streams.contains_key(&id) && !self.accept_stream(id, now) {
+                    return;
                 }
                 let s = self.streams.get_mut(&id).expect("stream");
                 match s.recv.on_data(offset, fin, data, now) {
-                    Ok(ready) => {
-                        s.deliver(ready);
-                        s.finish_writes();
-                    }
+                    Ok(ready) => self.arrived(id, ready),
                     Err(violation) => self.reset(
                         id,
                         if violation == stream::Violation::FlowControl {
@@ -517,13 +682,15 @@ impl Mux {
                 self.stats.probe_timeouts += 1;
             }
             if s.send.failed(now) {
-                failed.push(*id);
+                failed.push((*id, "peer stopped acknowledging"));
+            } else if s.refused && s.send.finished() {
+                failed.push((*id, "proxy destination refused"));
             } else if s.send.finished() && s.recv.finished() && s.write_finished {
                 done.push(*id);
             }
         }
-        for id in failed {
-            self.reset(id, "peer stopped acknowledging");
+        for (id, reason) in failed {
+            self.reset(id, reason);
         }
         for id in done {
             // The writer finishes its own shutdown; the reader already ended.
@@ -548,6 +715,8 @@ impl Mux {
             }
         }
         self.pump(out, now);
+        // Finished tasks stay in the set until reaped.
+        while self.tasks.try_join_next().is_some() {}
         self.closed
             .retain(|_, at| now.saturating_duration_since(*at) < TOMBSTONE);
         if now.saturating_duration_since(self.published) >= PUBLISH_EVERY {
@@ -616,6 +785,13 @@ impl Mux {
         }
         self.publish(Instant::now());
         self.tasks.abort_all();
+    }
+}
+
+/// Answer a local proxy client that cannot be connected, then close.
+async fn refuse(mut tcp: TcpStream, kind: proxy::Kind, status: u8) {
+    if tcp.write_all(&proxy::reply(kind, status)).await.is_ok() {
+        let _ = tcp.shutdown().await;
     }
 }
 

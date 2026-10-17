@@ -16,7 +16,7 @@ BraidPath is a Rust multipath transport project combining **forward error correc
 
 “Braid” means weaving several imperfect paths into a more resilient connection.
 
-> **Status: experimental UDP and TCP tunnel.** The client, main server and fixed-target relays run over real HTTP/3 and HTTP Datagrams. Opt-in `--tcp-listen`/`--tcp-target` carries each TCP connection as one reliable stream across every path ([reliable streams](docs/reliable-streams.md)). Opt-in `--adaptive` adds per-path pacing, independent health probes, sender-age admission and bounded outage recovery. These mechanisms are implemented; sustained WAN benefit and deployment readiness are not established. Round robin and the existing XOR settings remain the defaults.
+> **Status: experimental UDP and TCP tunnel.** The client, main server and fixed-target relays run over real HTTP/3 and HTTP Datagrams. Opt-in `--tcp-listen`/`--tcp-target` carries each TCP connection as one reliable stream across every path, and `--proxy-listen`/`--proxy` does the same for SOCKS5 and HTTP CONNECT clients ([reliable streams](docs/reliable-streams.md)). Opt-in `--adaptive` adds per-path pacing, independent health probes, sender-age admission and bounded outage recovery. These mechanisms are implemented; sustained WAN benefit and deployment readiness are not established. Round robin and the existing XOR settings remain the defaults.
 
 ## One interface works. Several can contribute.
 
@@ -96,7 +96,8 @@ Follow the [runtime guide](docs/runtime.md) for credentials, local forwarding, m
 | Two independent bulk repair equations | Opt-in mixed 16+2 mode; single-repair defaults unchanged; WAN tradeoffs not yet verified |
 | Rate-adaptive FEC strength and coupled congestion control | Deferred or separate research work |
 | Reliable TCP streams to a fixed target | Implemented experimental adapter; one connection uses every path; WAN acceptance pending |
-| SOCKS5/HTTP CONNECT entrances, TUN, stream fallback, browser fingerprint shaping | Planned or deferred |
+| SOCKS5 CONNECT and HTTP CONNECT entrances | Implemented experimental adapter on the same streams; public destinations only by default; WAN acceptance pending |
+| SOCKS5 UDP ASSOCIATE, TUN, stream fallback, browser fingerprint shaping | Planned or deferred |
 
 XOR cannot generally recover an entire failed path. Sparse traffic may exhaust the repair budget; FEC does not guarantee delivery. `--fec 4`, `--block-ms 3` and the 30% repair budget are unchanged; the new mechanisms do not establish a new FEC default. Multiple connections can compete unfairly at a shared bottleneck even with explicit group caps. Multi-interface capacity, competition fairness, independent HTTP/3 interoperability and deployment reachability remain separate acceptance gates.
 

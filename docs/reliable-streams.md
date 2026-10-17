@@ -15,8 +15,34 @@ both may be used in one session.
   --server-name localhost --ca local/identity/cert.pem --token-file local/identity/token
 ```
 
-This is a fixed-target port forward, not a SOCKS or HTTP proxy. The local listener
-should stay on loopback: every local caller uses the tunnel credential.
+The local listener should stay on loopback: every local caller uses the tunnel
+credential.
+
+## Proxy entrances
+
+`client --proxy-listen ADDRESS` accepts SOCKS5 and HTTP CONNECT on one port; the first
+byte selects the protocol (`0x05` is SOCKS5). `server --proxy` connects each such
+stream to the destination it names. The client requests `braidpath-proxy: 1`; a
+server without `--proxy` refuses the session. Fixed-target and proxy streams can be
+used in the same session.
+
+```bash
+./target/release/braidpath server ... --proxy
+./target/release/braidpath client --proxy-listen 127.0.0.1:1080 --entrance ... --adaptive ...
+curl --socks5-hostname 127.0.0.1:1080 https://example.com/
+curl -p -x http://127.0.0.1:1080 https://example.com/
+```
+
+| Element | Behavior |
+| --- | --- |
+| SOCKS5 | RFC 1928 without authentication. CONNECT with IPv4, IPv6 or domain addresses. BIND and UDP ASSOCIATE are answered with `07` (command not supported). The reply's bound address is `0.0.0.0:0`. |
+| HTTP CONNECT | `CONNECT host:port` (bracketed IPv6 accepted); headers up to 8 KiB; other methods get `405`. Bytes sent after the request header are carried as early data. |
+| Destination | The first stream bytes are a SOCKS-style address header (type, address or name, port). Stream identifiers with bit 28 set carry one. Names resolve on the server. |
+| Status | The server's first stream byte is a status: success, or a SOCKS5 reply code. The client sends the local success reply only after it arrives, so a client sees connect failures. HTTP maps denial to `403`, unreachable to `504`, and other failures to `502`. |
+| Authorization | Only globally routable unicast addresses are permitted: loopback, private, link-local, shared (100.64/10), benchmarking, reserved, multicast, unspecified, IPv6 unique-local, link-local and IPv4-mapped forms of these are denied, after name resolution. `--proxy-allow-private` permits all but unspecified and multicast. A denial is status `02`. |
+| Failure | Resolution or connection failure, or 10 s without connection, returns a status, then FIN; both sides then retire the stream. |
+
+The proxy listener has no authentication, so it should stay on loopback.
 
 ## Design
 
@@ -75,8 +101,10 @@ result is not a WAN, independent-capacity or deployment acceptance result.
 
 ## Not yet implemented
 
-- SOCKS5 and HTTP CONNECT entrances with per-stream destinations. The first stream
-  bytes can carry a destination header without a new frame type.
+- SOCKS5 UDP ASSOCIATE, SOCKS5 user/password authentication, and destination
+  allow-lists beyond the public-address rule.
+- Optimistic proxy replies (sending application data before the server's status), which
+  would save one round trip per connection.
 - Path-aware loss detection: the stream layer does not know which path carried a
   segment, so a loss on a fast path waits for the slowest observed RTT.
 - Priority classes between interactive and bulk streams beyond the existing

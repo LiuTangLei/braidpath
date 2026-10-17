@@ -4,7 +4,8 @@ Runs on the development host without privileges. The emulator shapes every
 path in both directions (FIFO serializer, propagation delay, optional loss).
 One TCP connection carries a seeded payload; the target verifies integrity.
 Selecting a subset of paths gives the matched single-path baseline on the same
-emulated topology. Loopback shares one CPU and kernel: this is a controlled
+emulated topology. `--entrance socks5` carries the same transfer as a SOCKS5
+CONNECT stream to the target address instead of a fixed-target stream. Loopback shares one CPU and kernel: this is a controlled
 diagnostic, not a WAN or independent-bandwidth acceptance result.
 """
 from __future__ import annotations
@@ -41,6 +42,7 @@ def parse_args(argv=None):
                         help="client entrance subset by emulator path index; default all")
     parser.add_argument("--bytes", type=int, default=16 * 1024 * 1024)
     parser.add_argument("--direction", choices=("up", "down"), default="up")
+    parser.add_argument("--entrance", choices=("fixed", "socks5"), default="fixed")
     parser.add_argument("--loss-percent", type=float, default=0.0)
     parser.add_argument("--queue-packets", type=int, default=1024)
     parser.add_argument("--seed", type=int, default=20261017)
@@ -93,11 +95,29 @@ class Target(threading.Thread):
             self.error = repr(error)
 
 
-def transfer(address, direction, data, limit):
+def socks_connect(conn, address):
+    """SOCKS5 CONNECT to an IPv4 address; raises unless the proxy succeeds."""
+    host, port = address.rsplit(":", 1)
+    conn.sendall(b"\x05\x01\x00")
+    if conn.recv(2) != b"\x05\x00":
+        raise RuntimeError("SOCKS5 method refused")
+    conn.sendall(b"\x05\x01\x00\x01" + socket.inet_aton(host) + struct.pack("!H", int(port)))
+    reply = b""
+    while len(reply) < 10 and (chunk := conn.recv(10 - len(reply))):
+        reply += chunk
+    if reply[:2] != b"\x05\x00":
+        raise RuntimeError(f"SOCKS5 CONNECT failed: {reply!r}")
+
+
+def transfer(address, direction, data, limit, socks_target=None):
     host, port = address.rsplit(":", 1)
     conn = socket.create_connection((host, int(port)), timeout=limit)
     started = time.monotonic()
+    setup = None
     with conn:
+        if socks_target:
+            socks_connect(conn, socks_target)
+            setup = time.monotonic() - started
         if direction == "up":
             conn.sendall(data)
             conn.shutdown(socket.SHUT_WR)
@@ -116,6 +136,7 @@ def transfer(address, direction, data, limit):
             elapsed = time.monotonic() - started
             exact = digest.digest() == hashlib.sha256(data).digest() and count == len(data)
     return {"elapsed_seconds": elapsed, "exact": exact, "received_bytes": count,
+            "proxy_setup_seconds": setup,
             "goodput_mbps": len(data) * 8 / elapsed / 1e6 if exact else 0.0}
 
 
@@ -168,17 +189,21 @@ def run(args):
                 emulator.stdin.write(json.dumps({"path": index, "loss_percent": args.loss_percent}) + "\n")
             emulator.stdin.flush()
         server = spawn("server", [args.binary, "server", "--listen", server_addr, "--cert", cert,
-                                  "--key", key, "--token-file", token, "--tcp-target", target.address,
+                                  "--key", key, "--token-file", token,
+                                  *(["--tcp-target", target.address] if args.entrance == "fixed"
+                                    else ["--proxy", "--proxy-allow-private"]),
                                   "--stats-file", args.output / "server.json", *args.server_arg])
         wait_log(args.output / "server.log", "HTTP/3 server ready", server)
         entrances = [ready["paths"][i]["entrance"] for i in args.use_path]
-        client = spawn("client", [args.binary, "client", "--listen", udp_listen, "--tcp-listen", tcp_listen,
+        client = spawn("client", [args.binary, "client", "--listen", udp_listen,
+                                  "--tcp-listen" if args.entrance == "fixed" else "--proxy-listen", tcp_listen,
                                   *sum((["--entrance", e] for e in entrances), []),
                                   "--server-name", "localhost", "--ca", cert, "--token-file", token,
                                   "--stats-file", args.output / "client.json", *args.client_arg])
         wait_log(args.output / "client.log", "UDP client ready", client)
         time.sleep(0.5)
-        result = transfer(tcp_listen, args.direction, data, args.timeout_seconds)
+        result = transfer(tcp_listen, args.direction, data, args.timeout_seconds,
+                          target.address if args.entrance == "socks5" else None)
         target.join(5)
         for process in (client, server):
             process.send_signal(2)
@@ -194,7 +219,7 @@ def run(args):
         capacity = sum(args.path[i][1] for i in args.use_path)
         summary = {
             **result,
-            "direction": args.direction, "bytes": args.bytes, "paths": args.path,
+            "direction": args.direction, "entrance": args.entrance, "bytes": args.bytes, "paths": args.path,
             "used_paths": args.use_path, "loss_percent_each_direction": args.loss_percent,
             "used_capacity_mbps": capacity,
             "goodput_to_used_capacity": result["goodput_mbps"] / capacity,

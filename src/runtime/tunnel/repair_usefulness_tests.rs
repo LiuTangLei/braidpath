@@ -4,6 +4,7 @@ use std::collections::BTreeSet;
 fn policy() -> Policy {
     Policy {
         streams: false,
+        proxy: false,
         adaptive: false,
         capacity_probe_bps: 0,
         probe_guided_recovery: false,

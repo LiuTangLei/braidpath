@@ -227,6 +227,7 @@ mod tests {
     fn policy(fec: u8, cutoff: u16, mixed: bool) -> Policy {
         Policy {
             streams: false,
+            proxy: false,
             fec_repairs: 1,
             adaptive: false,
             capacity_probe_bps: 0,

@@ -86,7 +86,8 @@ Current protocol, commands and limits: [experimental runtime](runtime.md). Check
 - [x] Preserve reliable-flow acknowledgment/reassembly state across path changes and define terminal delivery failure (30 s without acknowledgment progress); a new session epoch still resets every stream.
 - [x] UDP forwarding to a fixed target with explicit 1,000-byte maximum messages.
 - [x] TCP forwarding to a fixed target on the reliable-flow service ([design](reliable-streams.md)).
-- [ ] SOCKS5 and HTTP CONNECT entrances with per-stream destinations and destination authorization.
+- [x] SOCKS5 CONNECT and HTTP CONNECT entrances with per-stream destinations and public-address authorization ([design](reliable-streams.md#proxy-entrances)).
+- [ ] SOCKS5 UDP ASSOCIATE over datagram flows.
 - [ ] Compare FEC with the no-FEC reliable baseline; verify bytes, completion, timeout rates and latency under bulk/interactive coexistence.
 
 **Exit gate:** reliable-stream correctness and the selected latency/goodput targets pass. A UDP delivery metric cannot substitute for this gate.

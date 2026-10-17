@@ -43,17 +43,21 @@ mod ingress;
 mod local_delivery;
 #[cfg(test)]
 mod mixed_fec_tests;
+mod proxy;
 #[cfg(test)]
 mod repair_usefulness_tests;
 mod small_delivery;
 mod tcp;
+pub use proxy::Access as ProxyAccess;
 
 const WEBSITE: &str = "<!doctype html><html lang=\"en\"><meta charset=\"utf-8\"><title>Welcome</title><h1>Welcome</h1><p>This service is online.</p></html>\n";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Policy {
-    /// Reliable TCP streams negotiated for this session.
+    /// Reliable TCP streams to the server's fixed TCP target.
     pub streams: bool,
+    /// Addressed streams from proxy entrances to client-named destinations.
+    pub proxy: bool,
     pub adaptive: bool,
     pub capacity_probe_bps: u64,
     pub probe_guided_recovery: bool,
@@ -2769,7 +2773,7 @@ async fn session_loop(
     session: Arc<Session>,
     mut events: mpsc::Receiver<Event>,
     target: Option<SocketAddr>,
-    tcp_target: Option<SocketAddr>,
+    tcp: tcp::Targets,
 ) {
     let (tx, rx) = mpsc::channel(QUEUE);
     let mut tasks = JoinSet::new();
@@ -2798,9 +2802,7 @@ async fn session_loop(
         ),
     );
     let mut flows: HashMap<u32, (Arc<UdpSocket>, Instant)> = HashMap::new();
-    let mut streams = tcp_target
-        .filter(|_| session.policy.streams)
-        .map(|target| tcp::Mux::server(target, &session.policy, session.returning.clone()));
+    let mut streams = tcp::Mux::server(tcp, &session.policy, session.returning.clone());
     let small_threshold = ingress::small_threshold(&session.policy);
     let mut next_id = 0u64;
     let mut tick = interval(Duration::from_secs(5));
@@ -2938,6 +2940,8 @@ pub struct ServerOptions {
     pub target: Option<SocketAddr>,
     /// TCP destination for reliable streams; enables stream negotiation.
     pub tcp_target: Option<SocketAddr>,
+    /// Destinations named by client proxy entrances; enables proxy negotiation.
+    pub proxy: Option<ProxyAccess>,
     pub max_rate: u64,
     pub congestion: transport::Congestion,
     pub datagram_send_buffer_bytes: usize,
@@ -2957,8 +2961,8 @@ pub async fn serve_with_ack_request(
         "invalid server rate"
     );
     ensure!(
-        options.target.is_some() || options.tcp_target.is_some(),
-        "configure a UDP target, a TCP target, or both"
+        options.target.is_some() || options.tcp_target.is_some() || options.proxy.is_some(),
+        "configure a UDP target, a TCP target, a proxy, or several"
     );
     let endpoint = transport::server_with_ack_request(
         options.bind,
@@ -2975,7 +2979,7 @@ pub async fn serve_with_ack_request(
     let mut maintenance = interval(Duration::from_secs(1));
     let mut shutdown = Shutdown::new();
     options.stats.readiness(true, 0);
-    info!(address=%endpoint.local_addr()?,target=?options.target,tcp_target=?options.tcp_target,congestion=?options.congestion,?ack_request,"HTTP/3 server ready");
+    info!(address=%endpoint.local_addr()?,target=?options.target,tcp_target=?options.tcp_target,proxy=?options.proxy,congestion=?options.congestion,?ack_request,"HTTP/3 server ready");
     loop {
         tokio::select! {
             _=shutdown.wait()=>break,
@@ -2993,7 +2997,7 @@ pub async fn serve_with_ack_request(
             incoming=endpoint.accept()=>{
                 let Some(incoming)=incoming else{break};
                 let Ok(permit)=limit.clone().try_acquire_owned() else{incoming.refuse();continue};
-                let sessions=sessions.clone(); let secret=secret.clone(); let target=options.target; let settings=ServerSessionSettings{max_rate:options.max_rate,adaptive_fec_retention:options.adaptive_fec_retention,tcp_target:options.tcp_target}; let metrics=options.stats.clone();
+                let sessions=sessions.clone(); let secret=secret.clone(); let target=options.target; let settings=ServerSessionSettings{max_rate:options.max_rate,adaptive_fec_retention:options.adaptive_fec_retention,tcp:tcp::Targets{fixed:options.tcp_target,proxy:options.proxy}}; let metrics=options.stats.clone();
                 tasks.spawn(async move {
                     let _permit=permit;
                     let mut diagnostic=stats::ConnectionTrace::new(metrics.clone(),incoming.remote_address(),None,"incoming");
@@ -3056,7 +3060,7 @@ pub async fn serve_with_ack_request(
 struct ServerSessionSettings {
     max_rate: u64,
     adaptive_fec_retention: bool,
-    tcp_target: Option<SocketAddr>,
+    tcp: tcp::Targets,
 }
 
 async fn server_connection(
@@ -3071,7 +3075,7 @@ async fn server_connection(
     let ServerSessionSettings {
         max_rate,
         adaptive_fec_retention,
-        tcp_target,
+        tcp,
     } = settings;
     let conn = timeout(Duration::from_secs(5), incoming).await??;
     diagnostic.handshake_succeeded(&conn);
@@ -3164,9 +3168,13 @@ async fn server_connection(
                     let fec_repairs=fec_repairs_header(req.headers())?;
                     let streams=req.headers().get("braidpath-streams").map(|v|v.to_str()).transpose()?;
                     ensure!(streams.is_none() || streams==Some("1"),"unsupported stream version");
-                    ensure!(streams.is_none() || tcp_target.is_some(),"TCP streams are not enabled on this server");
+                    ensure!(streams.is_none() || tcp.fixed.is_some(),"TCP streams are not enabled on this server");
                     let streams=streams.is_some();
-                    let policy=Policy{streams,fec_repairs,small_fec_bytes,mixed_fec,probe_guided_recovery,capacity_probe_bps,adaptive:quality_schedule==Some("adaptive"),latency_target_ms,group_rates,quality_schedule:quality_schedule.is_some(),receiver_feedback:feedback.is_some(),fec:header("braidpath-fec")?.parse()?,redundancy:header("braidpath-redundancy")?.parse()?,rate,block_ms:header("braidpath-block-ms")?.parse()?,queue_ms:header("braidpath-queue-ms")?.parse()?};policy.validate()?;
+                    let proxy=req.headers().get("braidpath-proxy").map(|v|v.to_str()).transpose()?;
+                    ensure!(proxy.is_none() || proxy==Some("1"),"unsupported proxy version");
+                    ensure!(proxy.is_none() || tcp.proxy.is_some(),"proxy streams are not enabled on this server");
+                    let proxy=proxy.is_some();
+                    let policy=Policy{streams,proxy,fec_repairs,small_fec_bytes,mixed_fec,probe_guided_recovery,capacity_probe_bps,adaptive:quality_schedule==Some("adaptive"),latency_target_ms,group_rates,quality_schedule:quality_schedule.is_some(),receiver_feedback:feedback.is_some(),fec:header("braidpath-fec")?.parse()?,redundancy:header("braidpath-redundancy")?.parse()?,rate,block_ms:header("braidpath-block-ms")?.parse()?,queue_ms:header("braidpath-queue-ms")?.parse()?};policy.validate()?;
                     let rejoin=req.headers().get("braidpath-rejoin").is_some_and(|v|v=="1");
                     let stream_id=stream.id().into_inner();
                     // Membership and idle expiry share one map -> paths -> generation lock order.
@@ -3185,7 +3193,7 @@ async fn server_connection(
                                 let observation_notify=policy.adaptive.then(||Arc::new(Notify::new()));
                                 let session=Arc::new(Session{adaptive_fec_retention,generations:Mutex::new([None;MAX_PATHS]),empty_since:Mutex::new(Some(Instant::now())),events:tx,paths:Arc::new(Mutex::new(Vec::new())),stop,policy,observation_notify,ingress_drops:Arc::new(AtomicU64::new(0)),forward:metrics.scope(&sid,stats::FORWARD),returning:metrics.scope(&sid,stats::RETURN),finished:tokio::sync::Notify::new(),done:std::sync::atomic::AtomicBool::new(false)});
                                 map.insert(sid.clone(),session.clone());
-                                tokio::spawn(session_loop(session.clone(),rx,target,tcp_target));
+                                tokio::spawn(session_loop(session.clone(),rx,target,tcp));
                                 session
                             };
                             {
@@ -3220,6 +3228,7 @@ async fn server_connection(
                     if small_fec_bytes>0 {response=response.header("braidpath-small-fec-bytes",small_fec_bytes);}
                     if mixed_fec {response=response.header("braidpath-mixed-fec","1");}
                     if streams {response=response.header("braidpath-streams","1");}
+                    if proxy {response=response.header("braidpath-proxy","1");}
                     if fec_repairs==2 {response=response.header("braidpath-fec-repairs","2");}
                     if capacity_probe_bps>0 {response=response.header("braidpath-capacity-probe-bps",capacity_probe_bps).header("braidpath-capacity-probe-format",capacity_probe::FORMAT);}
                     if probe_guided_recovery {response=response.header("braidpath-probe-guided-recovery","1");}
@@ -3310,6 +3319,8 @@ pub struct ClientOptions {
     pub listen: SocketAddr,
     /// Local TCP listener; each connection becomes one reliable stream.
     pub tcp_listen: Option<SocketAddr>,
+    /// Local SOCKS5 and HTTP CONNECT listener for addressed streams.
+    pub proxy_listen: Option<SocketAddr>,
     pub entrances: Vec<SocketAddr>,
     pub interfaces: Vec<String>,
     pub path_binds: Vec<SocketAddr>,
@@ -3373,18 +3384,26 @@ pub async fn client(options: ClientOptions) -> Result<()> {
         options.policy.streams == options.tcp_listen.is_some(),
         "TCP streams require a TCP listener"
     );
+    ensure!(
+        options.policy.proxy == options.proxy_listen.is_some(),
+        "proxy streams require a proxy listener"
+    );
     let socket = Arc::new(UdpSocket::bind(options.listen).await?);
-    let listener = match options.tcp_listen {
-        Some(address) => Some(Arc::new(TcpListener::bind(address).await?)),
-        None => None,
-    };
-    if let Some(listener) = &listener {
+    let mut listeners = tcp::Listeners::default();
+    if let Some(address) = options.tcp_listen {
+        let listener = TcpListener::bind(address).await?;
         info!(listen=%listener.local_addr()?,"TCP listener bound");
+        listeners.fixed = Some(Arc::new(listener));
+    }
+    if let Some(address) = options.proxy_listen {
+        let listener = TcpListener::bind(address).await?;
+        info!(listen=%listener.local_addr()?,"proxy listener bound");
+        listeners.proxy = Some(Arc::new(listener));
     }
     let mut shutdown = Shutdown::new();
     loop {
         let result =
-            client_session(&options, socket.clone(), listener.clone(), &mut shutdown).await;
+            client_session(&options, socket.clone(), listeners.clone(), &mut shutdown).await;
         if options.policy.adaptive
             && result
                 .as_ref()
@@ -3407,7 +3426,7 @@ pub async fn client(options: ClientOptions) -> Result<()> {
 async fn client_session(
     options: &ClientOptions,
     socket: Arc<UdpSocket>,
-    listener: Option<Arc<TcpListener>>,
+    listeners: tcp::Listeners,
     shutdown: &mut Shutdown,
 ) -> Result<()> {
     let token = transport::token(&options.token)?;
@@ -3462,8 +3481,7 @@ async fn client_session(
         observation_notify.clone(),
     ));
     // Streams do not survive a session epoch; a new epoch accepts new connections.
-    let mut streams =
-        listener.map(|listener| tcp::Mux::client(listener, &options.policy, forward.clone()));
+    let mut streams = tcp::Mux::client(listeners, &options.policy, forward.clone());
     let small_threshold = ingress::small_threshold(&options.policy);
     let mut input = vec![0; 65536];
     let mut peers: HashMap<SocketAddr, (u32, Instant)> = HashMap::new();
@@ -3822,6 +3840,9 @@ async fn connect_path(
     if policy.streams {
         req = req.header("braidpath-streams", "1");
     }
+    if policy.proxy {
+        req = req.header("braidpath-proxy", "1");
+    }
     if policy.fec_repairs == 2 {
         req = req.header("braidpath-fec-repairs", "2");
     }
@@ -3898,6 +3919,14 @@ async fn connect_path(
                 .get("braidpath-streams")
                 .is_some_and(|v| v == "1"),
         "TCP streams not negotiated"
+    );
+    ensure!(
+        !policy.proxy
+            || response
+                .headers()
+                .get("braidpath-proxy")
+                .is_some_and(|v| v == "1"),
+        "proxy streams not negotiated"
     );
     validate_fec_repairs_echo(response.headers(), policy.fec_repairs)?;
     ensure!(

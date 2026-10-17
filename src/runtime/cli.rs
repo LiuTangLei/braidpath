@@ -81,11 +81,19 @@ enum Command {
         #[arg(long)]
         token_file: PathBuf,
         /// UDP destination for datagram flows.
-        #[arg(long, required_unless_present = "tcp_target")]
+        #[arg(long, required_unless_present_any = ["tcp_target", "proxy"])]
         target: Option<SocketAddr>,
         /// TCP destination; each client TCP connection becomes one reliable stream.
         #[arg(long)]
         tcp_target: Option<SocketAddr>,
+        /// Connect streams from client proxy entrances (SOCKS5, HTTP CONNECT) to
+        /// the destination each one names. Names resolve here; only globally
+        /// routable unicast addresses are permitted.
+        #[arg(long)]
+        proxy: bool,
+        /// Also permit loopback, private, link-local and shared address ranges.
+        #[arg(long, requires = "proxy")]
+        proxy_allow_private: bool,
         /// Session sender cap in bits/s; `auto` defers to the client's request.
         #[arg(long, default_value = "auto", value_parser = parse_rate_cap)]
         max_rate_bps: RateCap,
@@ -111,6 +119,10 @@ enum Command {
         /// over all paths. The server must configure --tcp-target.
         #[arg(long)]
         tcp_listen: Option<SocketAddr>,
+        /// Accept SOCKS5 CONNECT and HTTP CONNECT on one local port; the server
+        /// must enable --proxy. Without authentication: keep it on loopback.
+        #[arg(long)]
+        proxy_listen: Option<SocketAddr>,
         #[arg(long = "entrance", required = true)]
         entrances: Vec<SocketAddr>,
         #[arg(long = "interface")]
@@ -291,6 +303,8 @@ pub async fn run() -> Result<()> {
             token_file,
             target,
             tcp_target,
+            proxy,
+            proxy_allow_private,
             max_rate_bps,
             datagram_send_buffer_bytes,
             congestion,
@@ -308,6 +322,9 @@ pub async fn run() -> Result<()> {
                     token: token_file,
                     target,
                     tcp_target,
+                    proxy: proxy.then_some(tunnel::ProxyAccess {
+                        allow_private: proxy_allow_private,
+                    }),
                     max_rate: max_rate_bps.bps(),
                     datagram_send_buffer_bytes: datagram_send_buffer_bytes as usize,
                     congestion,
@@ -320,6 +337,7 @@ pub async fn run() -> Result<()> {
         Command::Client {
             listen,
             tcp_listen,
+            proxy_listen,
             entrances,
             interfaces,
             path_binds,
@@ -341,6 +359,7 @@ pub async fn run() -> Result<()> {
                 adaptive_fec_retention,
                 listen,
                 tcp_listen,
+                proxy_listen,
                 entrances,
                 interfaces,
                 path_binds,
@@ -353,6 +372,7 @@ pub async fn run() -> Result<()> {
                 rotate_source_port: policy.rotate_source_port,
                 policy: tunnel::Policy {
                     streams: tcp_listen.is_some(),
+                    proxy: proxy_listen.is_some(),
                     adaptive: policy.adaptive,
                     capacity_probe_bps: policy.capacity_probe_bps,
                     probe_guided_recovery: policy.probe_guided_recovery,

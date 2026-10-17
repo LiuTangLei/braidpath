@@ -1,4 +1,5 @@
-//! Reliable TCP streams over real HTTP/3 paths, relays and loopback sockets.
+//! Reliable TCP streams over real HTTP/3 paths, relays and loopback sockets:
+//! fixed-target forwarding and SOCKS5 / HTTP CONNECT entrances.
 use std::{
     fs,
     io::{ErrorKind, Read, Write},
@@ -97,7 +98,9 @@ struct Topology {
     tcp_listen: String,
 }
 
-fn topology(tcp_target: &str, relays: &[&str]) -> Topology {
+/// `server` selects the stream kind on the server; `local` is the client flag
+/// for the matching local listener.
+fn topology(server: &[&str], relays: &[&str], local: &str) -> Topology {
     let dir = tempfile::tempdir().unwrap();
     let identity = dir.path().join("identity");
     assert!(
@@ -124,9 +127,10 @@ fn topology(tcp_target: &str, relays: &[&str]) -> Topology {
             key.to_str().unwrap(),
             "--token-file",
             token.to_str().unwrap(),
-            "--tcp-target",
-            tcp_target,
-        ],
+        ]
+        .into_iter()
+        .chain(server.iter().copied())
+        .collect::<Vec<_>>(),
         dir.path(),
         "server",
     );
@@ -162,7 +166,7 @@ fn topology(tcp_target: &str, relays: &[&str]) -> Topology {
         "client",
         "--listen",
         &udp_listen,
-        "--tcp-listen",
+        local,
         &tcp_listen,
         "--server-name",
         "localhost",
@@ -195,7 +199,7 @@ fn read_exact_or_eof(conn: &mut TcpStream, n: usize) -> Vec<u8> {
 #[test]
 fn single_connections_survive_lossy_multipath_with_half_close_and_isolation() {
     let target = echo_target();
-    let topology = topology(&target, &["0", "13"]);
+    let topology = topology(&["--tcp-target", &target], &["0", "13"], "--tcp-listen");
     // A server-first protocol: nothing is written before the banner arrives.
     let mut idle = TcpStream::connect(&topology.tcp_listen).unwrap();
     idle.set_read_timeout(Some(Duration::from_secs(10)))
@@ -256,7 +260,7 @@ fn single_connections_survive_lossy_multipath_with_half_close_and_isolation() {
 #[test]
 fn unreachable_target_resets_the_local_connection() {
     let closed = tcp_port();
-    let topology = topology(&closed, &[]);
+    let topology = topology(&["--tcp-target", &closed], &[], "--tcp-listen");
     let mut conn = TcpStream::connect(&topology.tcp_listen).unwrap();
     conn.set_read_timeout(Some(Duration::from_secs(10)))
         .unwrap();
@@ -277,7 +281,24 @@ fn unreachable_target_resets_the_local_connection() {
 }
 
 #[test]
-fn server_without_tcp_target_rejects_stream_sessions() {
+fn server_without_the_stream_kind_rejects_the_session() {
+    for (server, local, message) in [
+        (
+            "--target",
+            "--tcp-listen",
+            "TCP streams are not enabled on this server",
+        ),
+        (
+            "--tcp-target",
+            "--proxy-listen",
+            "proxy streams are not enabled on this server",
+        ),
+    ] {
+        rejected(server, local, message);
+    }
+}
+
+fn rejected(server_flag: &str, local: &str, message: &str) {
     let dir = tempfile::tempdir().unwrap();
     let identity = dir.path().join("identity");
     Command::new(BIN)
@@ -297,7 +318,7 @@ fn server_without_tcp_target_rejects_stream_sessions() {
             identity.join("key.pem").to_str().unwrap(),
             "--token-file",
             identity.join("token").to_str().unwrap(),
-            "--target",
+            server_flag,
             &port(),
         ],
         dir.path(),
@@ -309,7 +330,7 @@ fn server_without_tcp_target_rejects_stream_sessions() {
             "client",
             "--listen",
             &port(),
-            "--tcp-listen",
+            local,
             &tcp_port(),
             "--entrance",
             &main,
@@ -327,8 +348,122 @@ fn server_without_tcp_target_rejects_stream_sessions() {
         "stream session must not be admitted"
     );
     let server_log = fs::read_to_string(&server.log).unwrap();
-    assert!(
-        server_log.contains("TCP streams are not enabled on this server"),
-        "{server_log}"
+    assert!(server_log.contains(message), "{server_log}");
+}
+
+/// SOCKS5 CONNECT; returns the reply code and the connection.
+fn socks(proxy: &str, request: &[u8]) -> (u8, TcpStream) {
+    let mut conn = TcpStream::connect(proxy).unwrap();
+    conn.set_read_timeout(Some(Duration::from_secs(20)))
+        .unwrap();
+    conn.write_all(&[5, 1, 0]).unwrap();
+    assert_eq!(read_exact_or_eof(&mut conn, 2), [5, 0]);
+    conn.write_all(request).unwrap();
+    let reply = read_exact_or_eof(&mut conn, 10);
+    assert_eq!((reply[0], reply[2], reply[3]), (5, 0, 1), "{reply:?}");
+    (reply[1], conn)
+}
+fn socks_ipv4(address: &str) -> Vec<u8> {
+    let address: std::net::SocketAddrV4 = address.parse().unwrap();
+    let mut request = vec![5, 1, 0, 1];
+    request.extend(address.ip().octets());
+    request.extend(address.port().to_be_bytes());
+    request
+}
+fn socks_domain(host: &str, port: u16) -> Vec<u8> {
+    let mut request = vec![5, 1, 0, 3, host.len() as u8];
+    request.extend(host.as_bytes());
+    request.extend(port.to_be_bytes());
+    request
+}
+/// HTTP CONNECT; returns the status line and the connection after the header.
+fn http_connect(proxy: &str, authority: &str, early: &[u8]) -> (String, TcpStream) {
+    let mut conn = TcpStream::connect(proxy).unwrap();
+    conn.set_read_timeout(Some(Duration::from_secs(20)))
+        .unwrap();
+    let mut request =
+        format!("CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n\r\n").into_bytes();
+    request.extend(early);
+    conn.write_all(&request).unwrap();
+    let mut head = Vec::new();
+    while !head.ends_with(b"\r\n\r\n") {
+        head.extend(read_exact_or_eof(&mut conn, 1));
+    }
+    let head = String::from_utf8(head).unwrap();
+    (head.lines().next().unwrap().to_owned(), conn)
+}
+fn assert_closed(conn: &mut TcpStream) {
+    let mut rest = Vec::new();
+    let _ = conn.read_to_end(&mut rest);
+    assert!(rest.is_empty(), "{} bytes after a refusal", rest.len());
+}
+
+#[test]
+fn proxy_entrances_reach_named_destinations_over_lossy_multipath() {
+    let target = echo_target();
+    let port: u16 = target.rsplit_once(':').unwrap().1.parse().unwrap();
+    let closed = tcp_port();
+    let topology = topology(
+        &["--proxy", "--proxy-allow-private"],
+        &["13"],
+        "--proxy-listen",
     );
+    let proxy = topology.tcp_listen.as_str();
+    // SOCKS5 to an address, carrying a verified bulk transfer with half-close.
+    let (status, mut conn) = socks(proxy, &socks_ipv4(&target));
+    assert_eq!(status, 0);
+    let data: Vec<u8> = (0..2u32 << 20)
+        .map(|i| i.wrapping_mul(2654435761) as u8)
+        .collect();
+    let mut reader = conn.try_clone().unwrap();
+    let read = thread::spawn(move || {
+        let mut got = Vec::new();
+        reader.read_to_end(&mut got).unwrap();
+        got
+    });
+    conn.write_all(&data).unwrap();
+    conn.shutdown(Shutdown::Write).unwrap();
+    let got = read.join().unwrap();
+    assert_eq!(&got[..7], b"banner\n");
+    assert!(
+        got[7..] == data[..],
+        "SOCKS stream corrupted: {} bytes",
+        got.len()
+    );
+    // A name resolved by the server; IPv6 candidates refuse, IPv4 succeeds.
+    let (status, mut conn) = socks(proxy, &socks_domain("localhost", port));
+    assert_eq!(status, 0);
+    assert_eq!(read_exact_or_eof(&mut conn, 7), b"banner\n");
+    // HTTP CONNECT with bytes sent before the response.
+    let (line, mut conn) = http_connect(proxy, &target, b"early");
+    assert!(line.starts_with("HTTP/1.1 200 "), "{line}");
+    assert_eq!(read_exact_or_eof(&mut conn, 12), b"banner\nearly");
+    // Refused destinations map to each protocol's failure reply.
+    let (status, mut conn) = socks(proxy, &socks_ipv4(&closed));
+    assert_eq!(status, 5);
+    assert_closed(&mut conn);
+    let (line, mut conn) = http_connect(proxy, &closed, b"");
+    assert!(line.starts_with("HTTP/1.1 502 "), "{line}");
+    assert_closed(&mut conn);
+    // Commands other than CONNECT are answered locally.
+    let mut associate = socks_ipv4(&target);
+    associate[1] = 3;
+    let (status, _) = socks(proxy, &associate);
+    assert_eq!(status, 7);
+}
+
+#[test]
+fn proxy_server_denies_private_destinations_by_default() {
+    let target = echo_target();
+    let port: u16 = target.rsplit_once(':').unwrap().1.parse().unwrap();
+    let topology = topology(&["--proxy"], &[], "--proxy-listen");
+    let proxy = topology.tcp_listen.as_str();
+    for request in [socks_ipv4(&target), socks_domain("localhost", port)] {
+        let (status, mut conn) = socks(proxy, &request);
+        assert_eq!(status, 2);
+        assert_closed(&mut conn);
+    }
+    let (line, mut conn) = http_connect(proxy, &target, b"");
+    assert!(line.starts_with("HTTP/1.1 403 "), "{line}");
+    assert_closed(&mut conn);
 }

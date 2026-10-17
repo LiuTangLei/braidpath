@@ -5,7 +5,7 @@ import socket
 import threading
 import unittest
 
-from bench.tcp_lab import ROOT, Target, parse_args, payload, transfer
+from bench.tcp_lab import ROOT, Target, parse_args, payload, socks_connect, transfer
 
 
 def args(*extra, output="local/tcp-lab/test"):
@@ -44,6 +44,26 @@ class Transfer(unittest.TestCase):
                 self.assertTrue(result["exact"])
                 self.assertEqual(result["received_bytes"], len(data))
                 self.assertIsNone(target.error)
+
+    def test_socks_handshake_is_sent_before_the_transfer(self):
+        listener = socket.create_server(("127.0.0.1", 0))
+        seen = []
+
+        def serve():
+            conn, _ = listener.accept()
+            with conn:
+                seen.append(conn.recv(3))
+                conn.sendall(b"\x05\x00")
+                seen.append(conn.recv(10))
+                conn.sendall(b"\x05\x05\x00\x01" + bytes(6))
+        thread = threading.Thread(target=serve)
+        thread.start()
+        conn = socket.create_connection(listener.getsockname(), timeout=5)
+        with conn, self.assertRaises(RuntimeError):
+            socks_connect(conn, "10.1.2.3:4660")
+        thread.join()
+        listener.close()
+        self.assertEqual(seen, [b"\x05\x01\x00", b"\x05\x01\x00\x01\x0a\x01\x02\x03\x12\x34"])
 
     def test_truncated_download_is_not_exact(self):
         data = payload(100_000, 4)

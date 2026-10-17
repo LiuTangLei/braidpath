@@ -137,6 +137,7 @@ fn block_and_poll(
 fn policy() -> Policy {
     Policy {
         streams: false,
+        proxy: false,
         fec_repairs: 1,
         adaptive: false,
         capacity_probe_bps: 0,
