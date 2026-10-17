@@ -182,6 +182,12 @@ IDs, payload lengths, block membership and receiver-local arrivals. It uses the
 real codec/receiver with synthetic payloads. A replay can test mechanism and
 record-set changes, not network throughput or cross-machine deadline performance.
 
+A client's `--interface` binds each QUIC socket without changing system routing:
+Linux accepts the device name; macOS accepts `ifindex:<nonzero index>` (resolve it
+with `python3 -c 'import socket; print(socket.if_nametoindex("en0"))'`). macOS reads
+back the kernel option and fails if the binding was not retained. Use `--path-bind`
+for an explicit local source address. These options do not alter system proxies.
+
 ### Envelope and session mapping
 
 - TLS verifies the main server's certificate and name; ALPN is `h3`. A resumed connection sends its session request as 0-RTT data and the server answers at 0.5-RTT, so a path with a ticket is admitted one round trip after its first packet; see [0-RTT](#0-rtt). Both peers must advertise QUIC DATAGRAM capacity and HTTP/3 `H3_DATAGRAM` support.

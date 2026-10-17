@@ -125,6 +125,7 @@ enum Command {
         proxy_listen: Option<SocketAddr>,
         #[arg(long = "entrance", required = true)]
         entrances: Vec<SocketAddr>,
+        /// Linux interface name, or macOS ifindex:<nonzero index>.
         #[arg(long = "interface")]
         interfaces: Vec<String>,
         /// One explicit local UDP bind per interface–entrance pair, in path order.

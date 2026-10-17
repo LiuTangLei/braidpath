@@ -35,10 +35,13 @@ async fn explicit_datagram_buffer_holds_eight_records_without_eviction() {
             .is_err()
         );
     }
+    // Darwin loopback is interface index1. Exercise the real bound endpoint
+    // handshake and datagram path, rather than only parsing an interface name.
+    let interface = cfg!(target_os = "macos").then_some("ifindex:1");
     let client = transport::client_bound_with_datagram_buffer(
         address,
         &identity.join("cert.pem"),
-        None,
+        interface,
         Congestion::Bbr,
         Some("127.0.0.1:0".parse().unwrap()),
         8 * 1200,

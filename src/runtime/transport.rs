@@ -274,8 +274,39 @@ pub fn client_bound_with_datagram_buffer(
         #[cfg(target_os = "linux")]
         s.bind_device(Some(name.as_bytes()))
             .with_context(|| format!("bind interface {name}"))?;
-        #[cfg(not(target_os = "linux"))]
-        anyhow::bail!("explicit interface binding is currently supported only on Linux: {name}");
+        #[cfg(target_os = "macos")]
+        {
+            // Darwin binds this socket without changing system routes or proxies.
+            let index: std::num::NonZeroU32 = name
+                .strip_prefix("ifindex:")
+                .context("macOS interface must be ifindex:<nonzero index>")?
+                .parse()
+                .context("invalid macOS interface index")?;
+            if remote.is_ipv4() {
+                s.bind_device_by_index_v4(Some(index))
+                    .with_context(|| format!("bind IPv4 endpoint to interface {name}"))?;
+                ensure!(
+                    s.device_index_v4()? == Some(index),
+                    "IPv4 interface binding not retained"
+                );
+            } else {
+                s.bind_device_by_index_v6(Some(index))
+                    .with_context(|| format!("bind IPv6 endpoint to interface {name}"))?;
+                ensure!(
+                    s.device_index_v6()? == Some(index),
+                    "IPv6 interface binding not retained"
+                );
+            }
+            tracing::info!(
+                interface = name,
+                interface_index = index.get(),
+                "endpoint interface binding verified"
+            );
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        anyhow::bail!(
+            "explicit interface binding is currently supported only on Linux and macOS: {name}"
+        );
     }
     let bind: SocketAddr = bind.unwrap_or(
         if remote.is_ipv4() {
