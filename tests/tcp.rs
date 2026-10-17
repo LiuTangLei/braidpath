@@ -569,19 +569,56 @@ fn udp_request(address: SocketAddr, data: &[u8]) -> Vec<u8> {
     .concat()
 }
 /// Send until a reply arrives: the tunnel's datagrams are unreliable.
-fn udp_exchange(socket: &UdpSocket, relay: SocketAddr, request: &[u8]) -> Option<Vec<u8>> {
-    socket
-        .set_read_timeout(Some(Duration::from_millis(250)))
-        .unwrap();
+fn udp_exchange(
+    socket: &UdpSocket,
+    relay: SocketAddr,
+    request: &[u8],
+    previous_replies: &[Vec<u8>],
+) -> Option<Vec<u8>> {
     let mut buffer = [0; 2048];
     for _ in 0..12 {
         socket.send_to(request, relay).unwrap();
-        if let Ok((n, from)) = socket.recv_from(&mut buffer) {
+        let deadline = Instant::now() + Duration::from_millis(250);
+        while let Some(remaining) = deadline
+            .checked_duration_since(Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+        {
+            socket.set_read_timeout(Some(remaining)).unwrap();
+            let Ok((n, from)) = socket.recv_from(&mut buffer) else {
+                break;
+            };
             assert_eq!(from, relay);
+            // Retried unreliable requests can have multiple valid replies.
+            // Only exact replies from earlier phases may be ignored; an
+            // unexpected or malformed reply must still fail the caller.
+            if previous_replies.iter().any(|reply| reply == &buffer[..n]) {
+                continue;
+            }
             return Some(buffer[..n].to_vec());
         }
     }
     None
+}
+
+#[test]
+fn udp_exchange_discards_known_replies_but_returns_unexpected_data() {
+    for reply in [b"current".as_slice(), b"unexpected".as_slice()] {
+        let relay = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let address = relay.local_addr().unwrap();
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let reply = reply.to_vec();
+        let expected = reply.clone();
+        let worker = thread::spawn(move || {
+            let (_, peer) = relay.recv_from(&mut [0; 2048]).unwrap();
+            relay.send_to(b"previous", peer).unwrap();
+            relay.send_to(&reply, peer).unwrap();
+        });
+        assert_eq!(
+            udp_exchange(&socket, address, b"request", &[b"previous".to_vec()]),
+            Some(expected)
+        );
+        worker.join().unwrap();
+    }
 }
 
 #[test]
@@ -596,24 +633,29 @@ fn socks_udp_associate_relays_datagrams_by_address_and_name() {
     assert!(relay.ip().is_loopback());
     let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
     let request = udp_request(echo, b"one");
-    let reply = udp_exchange(&socket, relay, &request).expect("reply by address");
-    assert_eq!(reply, udp_request(echo, b"echo:one"));
+    let reply_one = udp_exchange(&socket, relay, &request, &[]).expect("reply by address");
+    assert_eq!(reply_one, udp_request(echo, b"echo:one"));
     // A name is resolved by the server, preferring IPv4; the reply names the
     // address that answered.
     let mut named = vec![0, 0, 0, 3, 9];
     named.extend(b"localhost");
     named.extend(echo.port().to_be_bytes());
     named.extend(b"two");
-    let reply = udp_exchange(&socket, relay, &named).expect("reply by name");
-    assert_eq!(reply, udp_request(echo, b"echo:two"));
+    let reply_two = udp_exchange(&socket, relay, &named, std::slice::from_ref(&reply_one))
+        .expect("reply by name");
+    assert_eq!(reply_two, udp_request(echo, b"echo:two"));
+    let previous = [reply_one, reply_two];
     // Fragments are not reassembled.
     let mut fragment = udp_request(echo, b"three");
     fragment[2] = 1;
-    assert_eq!(udp_exchange(&socket, relay, &fragment), None);
+    assert_eq!(udp_exchange(&socket, relay, &fragment, &previous), None);
     // Closing the control connection ends the association.
     drop(control);
     thread::sleep(Duration::from_millis(300));
-    assert_eq!(udp_exchange(&socket, relay, &request), None);
+    assert_eq!(
+        udp_exchange(&socket, relay, &udp_request(echo, b"closed"), &previous),
+        None
+    );
 }
 
 #[test]
@@ -634,7 +676,7 @@ fn proxy_server_denies_private_destinations_by_default() {
     let (_control, relay) = associate(proxy);
     let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
     assert_eq!(
-        udp_exchange(&socket, relay, &udp_request(echo, b"private")),
+        udp_exchange(&socket, relay, &udp_request(echo, b"private"), &[]),
         None
     );
 }
