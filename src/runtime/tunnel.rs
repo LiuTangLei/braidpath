@@ -1154,6 +1154,9 @@ fn latency_candidates(
     if !policy.adaptive
         || repair
         || small_delivery::applies(policy, front)
+        || front
+            .flow
+            .is_none_or(|flow| stream::stream_id(flow).is_none())
         || (front.data.len() > LATENCY_RECORD_BYTES
             && !front.hold.as_ref().is_some_and(|hold| hold.interactive()))
     {

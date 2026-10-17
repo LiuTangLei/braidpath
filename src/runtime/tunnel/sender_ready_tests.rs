@@ -526,7 +526,7 @@ async fn plain_interactive_waits_for_fast_credit_instead_of_entering_a_slow_queu
         data: Bytes::from(vec![7; 100]),
         created: Instant::now(),
         record_id: Some(1),
-        flow: Some(1),
+        flow: Some(stream::data_flow(1)),
         block: None,
         small: false,
         hold: None,
@@ -575,6 +575,20 @@ async fn plain_interactive_waits_for_fast_credit_instead_of_entering_a_slow_queu
         "bulk keeps every eligible route"
     );
     front.data = Bytes::from(vec![7; 100]);
+    front.flow = Some(1);
+    assert_eq!(
+        latency_candidates(
+            eligible.to_vec(),
+            &paths,
+            &front,
+            false,
+            &policy,
+            Duration::ZERO
+        ),
+        eligible,
+        "ordinary UDP keeps its work-conserving ready-path selection"
+    );
+    front.flow = Some(stream::data_flow(1));
     front.block = Some(1);
     policy.small_fec_bytes = 128;
     assert_eq!(
