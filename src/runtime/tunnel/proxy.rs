@@ -1,7 +1,8 @@
 //! Standard local proxy entrances and addressed-stream destinations.
 //!
-//! One client port accepts SOCKS5 (RFC 1928, no authentication, CONNECT) and
-//! HTTP CONNECT. An addressed stream begins with a destination header in the
+//! One client port accepts SOCKS5 (RFC 1928, no authentication, CONNECT and
+//! UDP ASSOCIATE, see `associate`) and HTTP CONNECT. An addressed stream begins
+//! with a destination header in the
 //! client's bytes and a one-byte status in the server's bytes, both inside the
 //! reliable stream, so no new frame type or session round trip is needed. The
 //! server resolves names itself and refuses non-public addresses by default.
@@ -117,6 +118,8 @@ pub(super) struct Request {
     pub destination: Destination,
     /// Application bytes already read past the handshake.
     pub early: Vec<u8>,
+    /// SOCKS5 UDP ASSOCIATE; `destination` is the client's declared source.
+    pub associate: bool,
 }
 
 /// The local reply for a status reported by the server.
@@ -134,6 +137,13 @@ pub(super) fn reply(kind: Kind, status: u8) -> Vec<u8> {
             format!("HTTP/1.1 {line}\r\n\r\n").into_bytes()
         }
     }
+}
+
+/// A SOCKS5 success naming the UDP relay address.
+pub(super) fn bound_reply(relay: SocketAddr) -> Vec<u8> {
+    let mut out = vec![5, OK, 0];
+    out.extend(Destination::Ip(relay).encode());
+    out
 }
 
 /// Read one SOCKS5 or HTTP CONNECT request. Unsupported requests are answered
@@ -184,8 +194,8 @@ async fn socks(tcp: &mut TcpStream) -> Option<Request> {
     }
     let start = if head[3] == DOMAIN { 2 } else { 1 };
     tcp.read_exact(&mut header[start..]).await.ok()?;
-    if head[1] != 1 {
-        // BIND and UDP ASSOCIATE are not carried.
+    if head[1] != 1 && head[1] != 3 {
+        // BIND is not carried.
         let _ = tcp
             .write_all(&reply(Kind::Socks, COMMAND_UNSUPPORTED))
             .await;
@@ -201,6 +211,7 @@ async fn socks(tcp: &mut TcpStream) -> Option<Request> {
         kind: Kind::Socks,
         destination,
         early: Vec::new(),
+        associate: head[1] == 3,
     })
 }
 
@@ -243,6 +254,7 @@ async fn http(tcp: &mut TcpStream, first: u8) -> Option<Request> {
         kind: Kind::Http,
         destination,
         early,
+        associate: false,
     })
 }
 

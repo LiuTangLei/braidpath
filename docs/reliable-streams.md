@@ -35,7 +35,7 @@ curl -p -x http://127.0.0.1:1080 https://example.com/
 
 | Element | Behavior |
 | --- | --- |
-| SOCKS5 | RFC 1928 without authentication. CONNECT with IPv4, IPv6 or domain addresses. BIND and UDP ASSOCIATE are answered with `07` (command not supported). The reply's bound address is `0.0.0.0:0`. |
+| SOCKS5 | RFC 1928 without authentication. CONNECT and [UDP ASSOCIATE](#udp-associate) with IPv4, IPv6 or domain addresses. BIND is answered with `07` (command not supported). A CONNECT reply's bound address is `0.0.0.0:0`. |
 | HTTP CONNECT | `CONNECT host:port` (bracketed IPv6 accepted); headers up to 8 KiB; other methods get `405`. Bytes sent after the request header are carried as early data. |
 | Destination | The first stream bytes are a SOCKS-style address header (type, address or name, port). Stream identifiers with bit 28 set carry one. Names resolve on the server. |
 | Zero round trip | The client answers success (`00`, or `200 Connection established`) as soon as the local handshake completes, so the application's first bytes follow the destination header in the same flight instead of one tunnel round trip later. |
@@ -43,7 +43,49 @@ curl -p -x http://127.0.0.1:1080 https://example.com/
 | Authorization | Only globally routable unicast addresses are permitted: loopback, private, link-local, shared (100.64/10), benchmarking, reserved, multicast, unspecified, IPv6 unique-local, link-local and IPv4-mapped forms of these are denied, after name resolution. `--proxy-allow-private` permits all but unspecified and multicast. A denial is status `02`. |
 | Failure | Resolution or connection failure, or 10 s without connection, returns a status, then FIN; both sides then retire the stream. Application bytes sent before the failure are discarded. |
 
-The proxy listener has no authentication, so it should stay on loopback.
+The proxy listener has no authentication, so it should stay on loopback; the
+client warns at startup when either local listener is bound elsewhere. A caller
+that reaches it can use the tunnel for TCP and, through UDP ASSOCIATE, as a UDP
+relay.
+
+### Client interoperability
+
+`bench/proxy_interop.py` chains a third-party client to the entrance: the tool's
+own SOCKS5 inbound forwards through one BraidPath outbound (SOCKS5 or HTTP
+CONNECT), over one loopback path, to loopback targets. It verifies a 1 MiB HTTP
+body by address and by name (`localhost`) and, with the SOCKS5 outbound, 20 UDP
+ASSOCIATE echoes, byte for byte; client and server stream statistics confirm the
+traffic crossed the tunnel. The tool runs from its own directory under `local/`.
+
+```bash
+python3 -m bench.proxy_interop --binary target/release/braidpath \
+  --tool sing-box --tool-binary PATH/sing-box --outbound socks5 --output local/interop/sing-box
+```
+
+| Client | SOCKS5 outbound (TCP, name, UDP) | HTTP CONNECT outbound (TCP, name) |
+| --- | --- | --- |
+| mihomo 1.19.31 | passed | passed |
+| sing-box 1.14.3 | passed | passed |
+| Xray 26.3.27 | passed | passed |
+
+These are local protocol checks on macOS arm64, not performance or reachability
+results. Xray's fetches take about one second longer with either outbound: its
+default one-second half-close policy, also seen with its direct outbound.
+
+### UDP ASSOCIATE
+
+UDP ASSOCIATE is part of `braidpath-proxy: 1`; it uses no stream. The client binds
+a UDP relay socket on the address the SOCKS client connected to and returns it in
+the reply. Datagrams travel as unreliable records, with the same scheduling and FEC
+as fixed UDP forwarding.
+
+| Element | Behavior |
+| --- | --- |
+| Flow | One flow per association, `2^31 | n`. A client record is the SOCKS UDP request without its reserved and fragment fields, `[type][address][port][data]`; a server record names the reply's source in the same form. An empty client record ends the association. |
+| Relay socket | Accepts datagrams only from the IP address of the control connection's peer; replies go to that host's most recent source port. The association ends when the control connection closes. |
+| Server | One socket per association, dual-stack where the host allows it. Names resolve on the server, IPv4 addresses first, cached for 60 s. The CONNECT destination rule applies, including `--proxy-allow-private`. Replies are accepted only from addresses this association has sent to (at most 256). |
+| Limits | 64 associations per session; a server association idle for 120 s is retired and recreated when the client sends again. Fragmented datagrams (`FRAG` ≠ 0) and datagrams over the record payload (about 1000 bytes including the address) are dropped and counted; nothing is fragmented or reassembled. QUIC and other protocols that need 1200-byte datagrams therefore do not fit. |
+| Delivery | Unreliable: a datagram lost on every path and not repaired by FEC is lost, as with fixed UDP forwarding. |
 
 Path handshakes are separate from proxy replies: a session is long-lived, so QUIC
 handshakes (with [0-RTT](runtime.md#0-rtt) for resumed paths) occur at startup and
@@ -85,7 +127,8 @@ The sending direction's JSON contains `tcp_streams`: opened, completed, local an
 peer resets, rejected streams, bytes from and to the application, segments sent,
 retransmitted segments and bytes, local-drop retransmissions, probe timeouts,
 spurious-repair reports, duplicate bytes received, and acknowledgments sent and
-received.
+received. `udp_associations`, `udp_datagrams_to_tunnel`, `udp_datagrams_from_tunnel`
+and `udp_datagrams_dropped` count UDP ASSOCIATE traffic.
 
 ## Scheduling
 
@@ -130,8 +173,9 @@ result is not a WAN, independent-capacity or deployment acceptance result.
 
 ## Not yet implemented
 
-- SOCKS5 UDP ASSOCIATE, SOCKS5 user/password authentication, and destination
-  allow-lists beyond the public-address rule.
+- SOCKS5 user/password authentication, and destination allow-lists beyond the
+  public-address rule.
+- UDP ASSOCIATE datagrams above the record payload, and SOCKS UDP fragmentation.
 - Path-aware loss detection: the stream layer does not know which path carried a
   segment, so a loss on a fast path waits for the slowest observed RTT.
 - Priority classes between interactive and bulk streams beyond the latency class

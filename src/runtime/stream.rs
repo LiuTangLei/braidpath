@@ -170,6 +170,11 @@ pub struct Snapshot {
     pub duplicate_bytes_received: u64,
     pub acks_sent: u64,
     pub acks_received: u64,
+    /// SOCKS5 UDP associations opened, and their datagrams.
+    pub udp_associations: u64,
+    pub udp_datagrams_to_tunnel: u64,
+    pub udp_datagrams_from_tunnel: u64,
+    pub udp_datagrams_dropped: u64,
 }
 
 #[derive(Clone, Copy)]

@@ -320,3 +320,14 @@ observation goodputs from an approximate common-window value (total useful bytes
 divided by maximum observation duration); slight start offsets prevent treating
 that approximation as exact simultaneous throughput. Host/QUIC datagram counters,
 logical record counts and probe losses are distinct measurement layers.
+
+## Proxy client interoperability
+
+`python3 -m bench.proxy_interop --binary B --tool mihomo|sing-box|xray
+--tool-binary T --outbound socks5|http --output local/...` runs one BraidPath
+client/server pair on loopback with a third-party client chained in front of the
+proxy entrance, and verifies HTTP bodies (by address and by name) and, for the
+SOCKS5 outbound, UDP ASSOCIATE echoes. `summary.json` keeps the tool version,
+each check, and both sides' final stream statistics. It checks protocol
+interoperability only. `python3 -m unittest bench.test_proxy_interop` checks the
+generated configurations and the SOCKS request encoding.

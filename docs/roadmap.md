@@ -89,7 +89,8 @@ Current protocol, commands and limits: [experimental runtime](runtime.md). Check
 - [x] UDP forwarding to a fixed target with explicit 1,000-byte maximum messages.
 - [x] TCP forwarding to a fixed target on the reliable-flow service ([design](reliable-streams.md)).
 - [x] SOCKS5 CONNECT and HTTP CONNECT entrances with per-stream destinations and public-address authorization ([design](reliable-streams.md#proxy-entrances)).
-- [ ] SOCKS5 UDP ASSOCIATE over datagram flows.
+- [x] SOCKS5 UDP ASSOCIATE over datagram flows (datagrams up to the record payload; no fragmentation).
+- [x] Third-party client interoperability on loopback: mihomo, sing-box and Xray through SOCKS5 (TCP, names, UDP) and HTTP CONNECT outbounds ([method](reliable-streams.md#client-interoperability)).
 - [x] Faster path-outage exclusion from QUIC acknowledgment silence, and a latency class for small records and latency-bound streams ([scheduling](reliable-streams.md#scheduling)); emulated-link evidence only.
 - [ ] Compare FEC with the no-FEC reliable baseline; verify bytes, completion, timeout rates and latency under bulk/interactive coexistence.
 

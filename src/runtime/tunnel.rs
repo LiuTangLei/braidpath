@@ -36,6 +36,7 @@ use tracing::{info, warn};
 const MAX_FLOWS: usize = 64;
 const SESSION_IDLE_GRACE: Duration = Duration::from_secs(120);
 const SESSION_PATH: &str = "/session";
+mod associate;
 mod coding;
 #[cfg(test)]
 mod dual_tests;
@@ -2862,7 +2863,8 @@ async fn session_loop(
                     let records=receive_records(&mut decoder,&session.forward,pid,&data);
                     let decoded=Instant::now();
                     for r in records {
-                        if let Some(mux)=streams.as_mut() && stream::stream_id(r.flow).is_some() {mux.receive(r);continue}
+                        if let Some(mux)=streams.as_mut() && (stream::stream_id(r.flow).is_some() || associate::is_flow(r.flow)) {mux.receive(r);continue}
+                        if associate::is_flow(r.flow) {dropped+=1;continue}
                         if !flows.contains_key(&r.flow) {
                             let Some(target)=target else{dropped+=delivery.socket_error(pid,&r);continue};
                             if flows.len()>=MAX_FLOWS{dropped+=1;session.forward.trace_record(trace::Stage::RecordDropped,&r,None,Some(trace::Reason::FlowLimit));session.forward.update(|d|d.records.udp_target_flow_dropped+=1);session.forward.path(pid,|p|p.udp_target_flow_dropped+=1);continue}
@@ -3438,14 +3440,23 @@ pub async fn client(options: ClientOptions) -> Result<()> {
     );
     let socket = Arc::new(UdpSocket::bind(options.listen).await?);
     let mut listeners = tcp::Listeners::default();
+    // Neither listener authenticates its callers: every caller spends the
+    // tunnel credential, and a proxy caller also gets a UDP relay.
+    let exposed = |address: SocketAddr, kind: &str| {
+        if !address.ip().is_loopback() {
+            warn!(listen = %address, "{kind} listener is not on loopback; it has no authentication");
+        }
+    };
     if let Some(address) = options.tcp_listen {
         let listener = TcpListener::bind(address).await?;
         info!(listen=%listener.local_addr()?,"TCP listener bound");
+        exposed(address, "TCP");
         listeners.fixed = Some(Arc::new(listener));
     }
     if let Some(address) = options.proxy_listen {
         let listener = TcpListener::bind(address).await?;
         info!(listen=%listener.local_addr()?,"proxy listener bound");
+        exposed(address, "proxy");
         listeners.proxy = Some(Arc::new(listener));
     }
     let mut shutdown = Shutdown::new();
@@ -3707,7 +3718,7 @@ async fn client_session(
                 let records=receive_records(&mut decoder,&returning,pid,&data);
                 let decoded=Instant::now();
                 for record in records {
-                    if let Some(mux)=streams.as_mut() && stream::stream_id(record.flow).is_some() {mux.receive(record);continue}
+                    if let Some(mux)=streams.as_mut() && (stream::stream_id(record.flow).is_some() || associate::is_flow(record.flow)) {mux.receive(record);continue}
                     if let Some(peer)=reverse.get(&record.flow) {
                         if let Some((_,last))=peers.get_mut(peer) {*last=Instant::now();}
                         drops+=delivery.send(&socket,Some(*peer),record,pid,decoded);

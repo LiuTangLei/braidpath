@@ -96,8 +96,8 @@ Follow the [runtime guide](docs/runtime.md) for credentials, local forwarding, m
 | Two independent bulk repair equations | Opt-in mixed 16+2 mode; single-repair defaults unchanged; WAN tradeoffs not yet verified |
 | Rate-adaptive FEC strength and coupled congestion control | Deferred or separate research work |
 | Reliable TCP streams to a fixed target | Implemented experimental adapter; one connection uses every path; WAN acceptance pending |
-| SOCKS5 CONNECT and HTTP CONNECT entrances | Implemented experimental adapter on the same streams; public destinations only by default; WAN acceptance pending |
-| SOCKS5 UDP ASSOCIATE, TUN, stream fallback, browser fingerprint shaping | Planned or deferred |
+| SOCKS5 CONNECT, SOCKS5 UDP ASSOCIATE and HTTP CONNECT entrances | Implemented experimental adapter; CONNECT on the same streams, UDP as datagram records up to the record payload; public destinations only by default; WAN acceptance pending |
+| TUN, stream fallback, browser fingerprint shaping | Planned or deferred |
 
 XOR cannot generally recover an entire failed path. Sparse traffic may exhaust the repair budget; FEC does not guarantee delivery. `--fec 4`, `--block-ms 3` and the 30% repair budget are unchanged; the new mechanisms do not establish a new FEC default. Multiple connections can compete unfairly at a shared bottleneck even with explicit group caps. Multi-interface capacity, competition fairness, independent HTTP/3 interoperability and deployment reachability remain separate acceptance gates.
 

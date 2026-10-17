@@ -1,9 +1,10 @@
 //! Reliable TCP streams over real HTTP/3 paths, relays and loopback sockets:
-//! fixed-target forwarding and SOCKS5 / HTTP CONNECT entrances.
+//! fixed-target forwarding, SOCKS5 / HTTP CONNECT entrances and SOCKS5 UDP
+//! ASSOCIATE.
 use std::{
     fs,
     io::{ErrorKind, Read, Write},
-    net::{Shutdown, TcpListener, TcpStream, UdpSocket},
+    net::{Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     thread,
@@ -522,11 +523,97 @@ fn proxy_entrances_reach_named_destinations_over_lossy_multipath() {
     let (line, mut conn) = http_connect(proxy, &closed, b"request");
     assert!(line.starts_with("HTTP/1.1 200 "), "{line}");
     assert_reset(&mut conn);
-    // Commands other than CONNECT are answered locally.
-    let mut associate = socks_ipv4(&target);
-    associate[1] = 3;
-    let (status, _) = socks(proxy, &associate);
+    // BIND is answered locally.
+    let mut bind = socks_ipv4(&target);
+    bind[1] = 2;
+    let (status, _) = socks(proxy, &bind);
     assert_eq!(status, 7);
+}
+
+/// UDP echo on loopback that prefixes every reply.
+fn udp_echo() -> SocketAddr {
+    let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let address = socket.local_addr().unwrap();
+    thread::spawn(move || {
+        let mut buffer = [0; 2048];
+        while let Ok((n, from)) = socket.recv_from(&mut buffer) {
+            let _ = socket.send_to(&[b"echo:", &buffer[..n]].concat(), from);
+        }
+    });
+    address
+}
+/// SOCKS5 UDP ASSOCIATE; returns the control connection and the relay.
+fn associate(proxy: &str) -> (TcpStream, SocketAddr) {
+    let mut conn = TcpStream::connect(proxy).unwrap();
+    conn.set_read_timeout(Some(Duration::from_secs(20)))
+        .unwrap();
+    conn.write_all(&[5, 1, 0]).unwrap();
+    assert_eq!(read_exact_or_eof(&mut conn, 2), [5, 0]);
+    conn.write_all(&[5, 3, 0, 1, 0, 0, 0, 0, 0, 0]).unwrap();
+    let reply = read_exact_or_eof(&mut conn, 10);
+    assert_eq!(reply[..4], [5, 0, 0, 1], "{reply:?}");
+    let ip: [u8; 4] = reply[4..8].try_into().unwrap();
+    let relay = SocketAddr::from((ip, u16::from_be_bytes([reply[8], reply[9]])));
+    (conn, relay)
+}
+fn udp_request(address: SocketAddr, data: &[u8]) -> Vec<u8> {
+    let SocketAddr::V4(address) = address else {
+        panic!("IPv4 test address")
+    };
+    [
+        &[0, 0, 0, 1][..],
+        &address.ip().octets(),
+        &address.port().to_be_bytes(),
+        data,
+    ]
+    .concat()
+}
+/// Send until a reply arrives: the tunnel's datagrams are unreliable.
+fn udp_exchange(socket: &UdpSocket, relay: SocketAddr, request: &[u8]) -> Option<Vec<u8>> {
+    socket
+        .set_read_timeout(Some(Duration::from_millis(250)))
+        .unwrap();
+    let mut buffer = [0; 2048];
+    for _ in 0..12 {
+        socket.send_to(request, relay).unwrap();
+        if let Ok((n, from)) = socket.recv_from(&mut buffer) {
+            assert_eq!(from, relay);
+            return Some(buffer[..n].to_vec());
+        }
+    }
+    None
+}
+
+#[test]
+fn socks_udp_associate_relays_datagrams_by_address_and_name() {
+    let echo = udp_echo();
+    let topology = topology(
+        &["--proxy", "--proxy-allow-private"],
+        &["13"],
+        "--proxy-listen",
+    );
+    let (control, relay) = associate(&topology.tcp_listen);
+    assert!(relay.ip().is_loopback());
+    let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let request = udp_request(echo, b"one");
+    let reply = udp_exchange(&socket, relay, &request).expect("reply by address");
+    assert_eq!(reply, udp_request(echo, b"echo:one"));
+    // A name is resolved by the server, preferring IPv4; the reply names the
+    // address that answered.
+    let mut named = vec![0, 0, 0, 3, 9];
+    named.extend(b"localhost");
+    named.extend(echo.port().to_be_bytes());
+    named.extend(b"two");
+    let reply = udp_exchange(&socket, relay, &named).expect("reply by name");
+    assert_eq!(reply, udp_request(echo, b"echo:two"));
+    // Fragments are not reassembled.
+    let mut fragment = udp_request(echo, b"three");
+    fragment[2] = 1;
+    assert_eq!(udp_exchange(&socket, relay, &fragment), None);
+    // Closing the control connection ends the association.
+    drop(control);
+    thread::sleep(Duration::from_millis(300));
+    assert_eq!(udp_exchange(&socket, relay, &request), None);
 }
 
 #[test]
@@ -543,4 +630,11 @@ fn proxy_server_denies_private_destinations_by_default() {
     let (line, mut conn) = http_connect(proxy, &target, b"");
     assert!(line.starts_with("HTTP/1.1 200 "), "{line}");
     assert_reset(&mut conn);
+    let echo = udp_echo();
+    let (_control, relay) = associate(proxy);
+    let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+    assert_eq!(
+        udp_exchange(&socket, relay, &udp_request(echo, b"private")),
+        None
+    );
 }

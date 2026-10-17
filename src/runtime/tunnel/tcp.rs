@@ -2,7 +2,8 @@
 //!
 //! A fixed stream goes to the server's configured TCP target. An addressed
 //! stream comes from a local proxy entrance and names its own destination
-//! (see `proxy`).
+//! (see `proxy`). The mux also owns SOCKS5 UDP associations (see `associate`),
+//! whose datagrams bypass the stream layer.
 //!
 //! Each accepted connection is one stream with its own windows and
 //! retransmission state, so a stalled transfer never blocks another
@@ -10,7 +11,7 @@
 //! and FEC with UDP records. Local backpressure keeps only a short backlog,
 //! sized from the measured admission rate, waiting for Quinn admission.
 use super::{
-    Policy, QueuedRecord, Scope, enqueue_record,
+    Policy, QueuedRecord, Scope, associate, enqueue_record,
     outbound::Gauge,
     proxy::{self, Destination},
 };
@@ -28,7 +29,7 @@ use std::{
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{
-        TcpListener, TcpStream,
+        TcpListener, TcpStream, UdpSocket,
         tcp::{OwnedReadHalf, OwnedWriteHalf},
     },
     sync::{Notify, Semaphore, mpsc},
@@ -59,6 +60,8 @@ const ADDRESSED: u32 = 1 << 28;
 /// bandwidth-bound: its segments take the earliest path rather than a share
 /// of every path.
 const INTERACTIVE_BYTES: u64 = 64 * 1024;
+/// Association datagrams waiting for the session queue; more are dropped.
+const DATAGRAM_QUEUE: usize = 256;
 
 /// Client listeners; the mux exists when either is configured and negotiated.
 #[derive(Clone, Default)]
@@ -86,6 +89,36 @@ pub(super) enum Io {
     Refused(u32, u8),
     /// Client: a local proxy handshake completed.
     Proxied(TcpStream, proxy::Request),
+    /// Client: a UDP association's relay is bound and answered.
+    Associated(u32, Arc<UdpSocket>, associate::Peer),
+    /// A datagram for the tunnel: from a SOCKS client, or a server reply.
+    Datagram(u32, Vec<u8>),
+    DatagramDropped,
+    Unassociated(u32),
+}
+
+enum Association {
+    /// Client: the relay task before its socket is reported.
+    Starting(AbortHandle),
+    Client {
+        socket: Arc<UdpSocket>,
+        peer: associate::Peer,
+        task: AbortHandle,
+    },
+    Server {
+        datagrams: mpsc::Sender<Vec<u8>>,
+        last: Instant,
+        task: AbortHandle,
+    },
+}
+impl Association {
+    fn task(&self) -> &AbortHandle {
+        match self {
+            Association::Starting(task)
+            | Association::Client { task, .. }
+            | Association::Server { task, .. } => task,
+        }
+    }
 }
 
 enum WriteOp {
@@ -267,6 +300,9 @@ pub(super) struct Mux {
     closed_duplicates: u64,
     scope: Scope,
     published: Instant,
+    associations: HashMap<u32, Association>,
+    next_association: u32,
+    datagrams: VecDeque<(u32, Vec<u8>)>,
 }
 
 impl Mux {
@@ -293,6 +329,9 @@ impl Mux {
             closed_duplicates: 0,
             scope,
             published: now,
+            associations: HashMap::new(),
+            next_association: 0,
+            datagrams: VecDeque::new(),
         }
     }
     /// Accepts local connections; the peer connects each stream onward.
@@ -336,7 +375,9 @@ impl Mux {
             self.streams.len() < MAX_STREAMS && self.accept_paused_until.is_none_or(|at| now >= at);
         let fixed = self.listeners.fixed.clone().filter(|_| accepting);
         let proxy = self.listeners.proxy.clone().filter(|_| accepting);
-        let queue_waiting = self.streams.values().any(|s| s.send.has_transmit());
+        let queue_waiting = !self.datagrams.is_empty()
+            || !self.control.is_empty()
+            || self.streams.values().any(|s| s.send.has_transmit());
         tokio::select! {
             biased;
             Some(event) = self.events.recv() => Wake::Io(event),
@@ -487,6 +528,32 @@ impl Mux {
                     self.stats.rejected += 1;
                 }
             }
+            Io::Proxied(tcp, request) if request.associate => self.associate(tcp),
+            Io::Associated(flow, socket, peer) => {
+                if let Some(Association::Starting(task)) = self.associations.remove(&flow) {
+                    self.associations
+                        .insert(flow, Association::Client { socket, peer, task });
+                }
+            }
+            Io::Datagram(flow, payload) => {
+                if let Some(Association::Server { last, .. }) = self.associations.get_mut(&flow) {
+                    *last = Instant::now();
+                }
+                self.queue_datagram(flow, payload);
+            }
+            Io::DatagramDropped => self.stats.udp_datagrams_dropped += 1,
+            Io::Unassociated(flow) => {
+                let client = matches!(
+                    self.associations.remove(&flow),
+                    Some(Association::Client { .. } | Association::Starting(_))
+                );
+                if client {
+                    // Unreliable: two copies; the server also retires it when idle.
+                    for _ in 0..2 {
+                        self.queue_datagram(flow, Vec::new());
+                    }
+                }
+            }
             Io::Proxied(tcp, request) => {
                 if self.streams.len() >= MAX_STREAMS {
                     self.stats.rejected += 1;
@@ -520,6 +587,95 @@ impl Mux {
                         },
                     );
                 });
+            }
+        }
+    }
+
+    /// Client: start a UDP association for a SOCKS5 UDP ASSOCIATE request.
+    fn associate(&mut self, tcp: TcpStream) {
+        if self.associations.len() >= associate::MAX_ASSOCIATIONS
+            || self.next_association + 1 >= associate::FLAG
+        {
+            self.stats.rejected += 1;
+            self.tasks
+                .spawn(refuse(tcp, proxy::Kind::Socks, proxy::GENERAL_FAILURE));
+            return;
+        }
+        self.next_association += 1;
+        let flow = associate::FLAG | self.next_association;
+        let task = self
+            .tasks
+            .spawn(associate::client(flow, tcp, self.events_tx.clone()));
+        self.associations.insert(flow, Association::Starting(task));
+        self.stats.udp_associations += 1;
+    }
+
+    fn queue_datagram(&mut self, flow: u32, payload: Vec<u8>) {
+        if self.datagrams.len() >= DATAGRAM_QUEUE {
+            self.stats.udp_datagrams_dropped += 1;
+            return;
+        }
+        self.datagrams.push_back((flow, payload));
+    }
+
+    /// An association record from the peer.
+    fn datagram(&mut self, record: Record) {
+        let flow = record.flow;
+        if self.listeners.proxy.is_some() {
+            // Client: a reply for the SOCKS client.
+            if let Some(Association::Client { socket, peer, .. }) = self.associations.get(&flow)
+                && !record.payload.is_empty()
+                && let Some(peer) = *peer.lock().expect("association peer")
+            {
+                self.stats.udp_datagrams_from_tunnel += 1;
+                if socket
+                    .try_send_to(&associate::to_client(&record.payload), peer)
+                    .is_err()
+                {
+                    self.stats.udp_datagrams_dropped += 1;
+                }
+            }
+            return;
+        }
+        let Some(access) = self.targets.proxy else {
+            return;
+        };
+        if record.payload.is_empty() {
+            if let Some(association) = self.associations.remove(&flow) {
+                association.task().abort();
+            }
+            return;
+        }
+        if !self.associations.contains_key(&flow) {
+            if self.associations.len() >= associate::MAX_ASSOCIATIONS {
+                self.stats.udp_datagrams_dropped += 1;
+                return;
+            }
+            let (datagrams, receiver) = mpsc::channel(associate::CHANNEL);
+            let task = self.tasks.spawn(associate::server(
+                flow,
+                access.allow_private,
+                receiver,
+                self.events_tx.clone(),
+            ));
+            self.associations.insert(
+                flow,
+                Association::Server {
+                    datagrams,
+                    last: Instant::now(),
+                    task,
+                },
+            );
+            self.stats.udp_associations += 1;
+        }
+        if let Some(Association::Server {
+            datagrams, last, ..
+        }) = self.associations.get_mut(&flow)
+        {
+            *last = Instant::now();
+            self.stats.udp_datagrams_from_tunnel += 1;
+            if datagrams.try_send(record.payload).is_err() {
+                self.stats.udp_datagrams_dropped += 1;
             }
         }
     }
@@ -635,6 +791,9 @@ impl Mux {
 
     /// Apply one stream record. Call `flush` after a batch of records.
     pub(super) fn receive(&mut self, record: Record) {
+        if associate::is_flow(record.flow) {
+            return self.datagram(record);
+        }
         let Some(id) = stream::stream_id(record.flow) else {
             return;
         };
@@ -735,6 +894,25 @@ impl Mux {
                 break;
             }
         }
+        while let Some((flow, payload)) = self.datagrams.pop_front() {
+            if !out.enqueue(flow, payload.clone(), None) {
+                self.datagrams.push_front((flow, payload));
+                break;
+            }
+            if !payload.is_empty() {
+                self.stats.udp_datagrams_to_tunnel += 1;
+            }
+        }
+        self.associations
+            .retain(|_, association| match association {
+                Association::Server { last, task, .. }
+                    if now.saturating_duration_since(*last) >= associate::IDLE =>
+                {
+                    task.abort();
+                    false
+                }
+                _ => true,
+            });
         for (id, s) in &mut self.streams {
             if let Some(ack) = s.recv.take_ack(now, window) {
                 if out.enqueue(stream::ack_flow(*id), Frame::Ack(ack).encode(), None) {
@@ -809,6 +987,9 @@ impl Mux {
     }
 
     pub(super) fn close_all(&mut self) {
+        for (_, association) in self.associations.drain() {
+            association.task().abort();
+        }
         let ids: Vec<u32> = self.streams.keys().copied().collect();
         for id in ids {
             if let Some(mut s) = self.close(id) {

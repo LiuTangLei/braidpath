@@ -1,6 +1,6 @@
 # Experimental runtime
 
-BraidPath forwards unreliable UDP messages to one operator-configured destination and, optionally, TCP connections to one operator-configured TCP destination as [reliable streams](reliable-streams.md). An optional SOCKS5 CONNECT / HTTP CONNECT entrance carries TCP connections to client-named public destinations on the same streams. Each path uses real HTTP/3 over Quinn/rustls, with authenticated HTTP Datagrams. There is no Xray runtime, SOCKS5 UDP ASSOCIATE, TUN device or transparent IP tunnel.
+BraidPath forwards unreliable UDP messages to one operator-configured destination and, optionally, TCP connections to one operator-configured TCP destination as [reliable streams](reliable-streams.md). An optional SOCKS5 CONNECT / HTTP CONNECT entrance carries TCP connections to client-named public destinations on the same streams. Each path uses real HTTP/3 over Quinn/rustls, with authenticated HTTP Datagrams. The same entrance carries SOCKS5 UDP ASSOCIATE datagrams as unreliable records. There is no Xray runtime, TUN device or transparent IP tunnel.
 
 ## Local quick start
 
