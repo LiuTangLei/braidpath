@@ -26,6 +26,11 @@ const LOSS_FLOOR_MAX: f64 = 0.25;
 /// Queue-gated loss: loss-only brakes below this fraction of the latency
 /// target treat loss as path loss rather than congestion.
 const QUEUE_GATED_LOSS_FRACTION: f64 = 0.25;
+/// Queue-gated pacing already treats clear-queue loss as path loss, so its
+/// typical floor may discount up to half of the admitted bytes.
+const QUEUE_GATED_LOSS_FLOOR_MAX: f64 = 0.5;
+/// Three clean monitored increases raise the cautious step from 3% to 24%.
+const CLEAN_GROWTH_STREAK_MAX: u32 = 3;
 
 /// Finalized loss observed while this path's own queue signal was clear.
 /// The floor is the smallest recent bucket, so a congestion episode can only
@@ -84,14 +89,14 @@ impl LossFloor {
     }
 
     /// Typical clear-queue loss for queue-gated pacing: the lower median, so a
-    /// single quiet bucket cannot hide sustained random loss. Same cap.
+    /// single quiet bucket cannot hide sustained random loss. Its own cap.
     fn median(&self) -> f64 {
         if self.buckets.len() < LOSS_FLOOR_MIN_BUCKETS {
             return 0.0;
         }
         let mut fractions: Vec<f64> = self.buckets.iter().map(|(_, f)| *f).collect();
         fractions.sort_by(f64::total_cmp);
-        fractions[(fractions.len() - 1) / 2].min(LOSS_FLOOR_MAX)
+        fractions[(fractions.len() - 1) / 2].min(QUEUE_GATED_LOSS_FLOOR_MAX)
     }
 }
 
@@ -770,6 +775,9 @@ pub struct PathController {
     growth_monitor: Option<GrowthMonitor>,
     growth_retry: Option<GrowthRetry>,
     drain_return: Option<DrainReturn>,
+    /// Consecutive growth monitors that settled without a rising RTT or
+    /// queue. Each doubles the cautious step; any brake resets it.
+    clean_growth_streak: u32,
     last_growth_probe: Option<u64>,
     fast_feedback_seen: bool,
     fast_probe_min_rtt_ms: Option<f64>,
@@ -860,6 +868,7 @@ impl PathController {
             growth_monitor: None,
             growth_retry: None,
             drain_return: None,
+            clean_growth_streak: 0,
             last_growth_probe: None,
             fast_feedback_seen: false,
             fast_probe_min_rtt_ms: None,
@@ -1482,11 +1491,12 @@ impl PathController {
         }) && wire_delivery_bps
             .is_none_or(|rate| rate < self.rate_bps as f64 * 0.85);
         let delay_pressure = self.queue_delay_ms > self.target_ms * 0.5;
-        // Queue-gated mode: with a shallow queue and an unblocked transport,
-        // loss is path loss. Zero service, queue and blocked brakes still run.
+        // Queue-gated mode: with a shallow queue and no sustained transport
+        // block, loss is path loss. A momentarily occupied datagram buffer is
+        // not congestion. Zero service, queue and blocked brakes still run.
         let loss_hold = self.queue_gated_loss_enabled
             && self.queue_delay_ms <= self.queue_gated_loss_limit_ms()
-            && !observation.transport_blocked;
+            && !blocked_pressure;
         // Growth holds for ordinary loss only where that loss could be queue loss.
         let growth_ordinary_loss = ordinary_loss && !loss_hold;
         let persistent_delay = if delay_pressure {
@@ -2116,11 +2126,22 @@ impl PathController {
                         .or(recent_drain)
                 });
             let episode_exercised = self.pressure_episode_exercised.unwrap_or(exercised);
+            // A new queue behind offered backlog shows the bottleneck, not the
+            // application, limits fresh short-feedback delivery, even while the
+            // transport (e.g. its own window) leaves part of this allowance unused.
+            let backlogged_queue_delivery = self.fast_recovery_enabled
+                && self.fast_feedback_seen
+                && new_delay
+                && observation.offered_backlog
+                && self
+                    .last_report
+                    .is_some_and(|(_, _, at)| now.saturating_sub(at) <= CONTROL_US);
             let mut desired = service_hint
                 .filter(|rate| {
                     *rate > 0.0
                         && (episode_exercised
                             || delivery_shortfall
+                            || backlogged_queue_delivery
                             || *rate >= self.rate_bps as f64)
                 })
                 .map_or(self.rate_bps as f64 * 0.8, |rate| rate * drain_fraction);
@@ -2178,14 +2199,21 @@ impl PathController {
                     self.braked_queue_ms = Some(self.queue_delay_ms);
                     self.drain_restore_pending = true;
                 }
-                // Only a pure queue brake measures the bottleneck: its fresh,
-                // backlogged delivery is the drain rate. Other evidence (loss,
-                // shortfall, blocked transport) forgets the target. A later
-                // fresh measurement replaces it, so a capacity drop lowers it.
-                let queue_only = new_delay
+                // Only a queue brake measures the bottleneck: its fresh,
+                // backlogged delivery is the drain rate. A positive shortfall
+                // under the same standing queue is that measurement too when
+                // it comes from short feedback; loss, blocked transport and zero
+                // service forget the target. A later fresh measurement replaces
+                // it, so a capacity drop lowers it.
+                let queue_shortfall = self.fast_recovery_enabled
+                    && self.fast_feedback_seen
+                    && delivery_shortfall
+                    && delay_pressure
+                    && service_bps != Some(0.0);
+                let measured_brake = (new_delay || queue_shortfall)
                     && !fast_loss_actionable
                     && !new_loss
-                    && !delivery_shortfall
+                    && (!delivery_shortfall || queue_shortfall)
                     && !blocked_pressure;
                 let fresh_service = current_queue_service
                     .map(|sample| sample.bps * self.wire_per_symbol)
@@ -2206,7 +2234,7 @@ impl PathController {
                     |old| old.pace_cap_bps,
                 );
                 self.drain_return =
-                    (self.fast_recovery_enabled && queue_only && observation.offered_backlog)
+                    (self.fast_recovery_enabled && measured_brake && observation.offered_backlog)
                         .then(|| {
                             fresh_service
                                 .filter(|rate| *rate > 0.0)
@@ -2333,6 +2361,14 @@ impl PathController {
                 rejected.increment_bps = rejected.increment_bps.saturating_mul(2);
                 rejected.observed_us = now;
             }
+            // An increase whose two replies show neither a rising RTT nor a
+            // queue was not near capacity, so the next cautious step may be
+            // larger. Anything else restarts from the smallest step.
+            self.clean_growth_streak = if !rising && self.queue_delay_ms <= self.target_ms * 0.25 {
+                (self.clean_growth_streak + 1).min(CLEAN_GROWTH_STREAK_MAX)
+            } else {
+                0
+            };
             self.last_control.growth_monitor = Some(monitor);
         } else {
             self.last_control.growth_monitor = self.growth_monitor.clone();
@@ -2744,7 +2780,7 @@ impl PathController {
                     // steps. A failed trial brakes and waits before another attempt.
                     (CONTROL_US, 1.25, self.remembered_bps * 0.95)
                 } else {
-                    (500_000, 1.03, self.maximum_bps as f64)
+                    (500_000, self.cautious_gain(), self.maximum_bps as f64)
                 };
                 let gain = gain.min(growth_gain_limit);
                 if now.saturating_sub(self.last_growth_us) >= interval
@@ -2920,6 +2956,17 @@ impl PathController {
         self.tokens = self
             .tokens
             .min(super::outbound::pacing_burst_bytes(self.rate_bps, 2400));
+    }
+
+    /// 3% per step, doubled for each consecutive clean monitored increase up
+    /// to 24%. The RTT headroom gain limit still applies to the result.
+    fn cautious_gain(&self) -> f64 {
+        let streak = if self.fast_recovery_enabled {
+            self.clean_growth_streak
+        } else {
+            0
+        };
+        1.0 + 0.03 * f64::from(1u32 << streak)
     }
 
     fn in_known_service_range(&self) -> bool {
@@ -3333,6 +3380,7 @@ impl PathController {
     }
 
     fn record_brake(&mut self, observation: &Observation) {
+        self.clean_growth_streak = 0;
         self.last_brake_us = Some(observation.now_us);
         self.last_brake_admitted_symbols = self
             .fast_feedback_seen
@@ -4553,8 +4601,18 @@ mod tests {
 
         let (mut controller, mut sample) = queue_gated_fixture();
         let before = controller.rate_bps;
-        // A blocked transport reopens every loss brake, like a queue would.
+        // One sampled datagram waiting in the send buffer is not a block.
         sample.transport_blocked = true;
+        controller.observe(&sample);
+        assert_eq!(controller.last_control.queue_gated_loss_hold, Some(true));
+        assert_eq!(controller.rate_bps, before);
+
+        let (mut controller, mut sample) = queue_gated_fixture();
+        let before = controller.rate_bps;
+        // A sustained block reopens every loss brake, like a queue would.
+        sample.transport_blocked = true;
+        let held_us = (controller.target_ms * 1000.0).max(100_000.0) as u64;
+        controller.blocked_since_us = Some(sample.now_us - held_us);
         controller.observe(&sample);
         assert_eq!(controller.last_control.queue_gated_loss_hold, Some(false));
         assert!(controller.rate_bps < before);
@@ -4645,7 +4703,8 @@ mod tests {
             buckets: VecDeque::from([(0, 0.6), (0, 0.7), (0, 0.8)]),
             ..LossFloor::default()
         };
-        assert_eq!(capped.median(), LOSS_FLOOR_MAX);
+        assert_eq!(capped.floor(), LOSS_FLOOR_MAX);
+        assert_eq!(capped.median(), QUEUE_GATED_LOSS_FLOOR_MAX);
         assert_eq!(LossFloor::default().median(), 0.0);
 
         let mut enabled = PathController::new(1_000_000, 100).with_queue_gated_loss(true);
@@ -6271,6 +6330,34 @@ mod tests {
     }
 
     #[test]
+    fn clean_monitored_growth_doubles_the_next_cautious_step() {
+        let (mut controller, sample) = first_monitored_reply_034(80.0);
+        assert_eq!(controller.clean_growth_streak, 0);
+        assert_eq!(controller.cautious_gain(), 1.03);
+        let settled = monitor_reply_034(&mut controller, &sample, 900_000, 80.0, 800_000);
+        controller.observe(&settled);
+        let evidence = controller.last_control.growth_monitor.as_ref().unwrap();
+        assert!(evidence.second_reply.is_some() && !evidence.withdrawn);
+        assert_eq!(controller.clean_growth_streak, 1);
+        assert!((controller.cautious_gain() - 1.06).abs() < 1e-12);
+        controller.clean_growth_streak = CLEAN_GROWTH_STREAK_MAX;
+        assert!((controller.cautious_gain() - 1.24).abs() < 1e-12);
+        controller.fast_recovery_enabled = false;
+        assert_eq!(controller.cautious_gain(), 1.03, "legacy keeps 3%");
+
+        // A withdrawn increase restarts from the smallest step.
+        let (mut controller, sample) = first_monitored_reply_034(85.5);
+        controller.clean_growth_streak = 2;
+        let rising = monitor_reply_034(&mut controller, &sample, 900_000, 86.0, 800_000);
+        controller.observe(&rising);
+        assert!(matches!(
+            controller.rate_changes.back().unwrap().reason,
+            RateReason::GrowthWithdrawalBrake
+        ));
+        assert_eq!(controller.clean_growth_streak, 0);
+    }
+
+    #[test]
     fn growth_monitor_034_withdraws_only_its_increment_after_original_brakes() {
         let (mut controller, sample) = first_monitored_reply_034(85.5);
         assert_eq!(
@@ -7414,8 +7501,48 @@ mod tests {
         timing: (u64, u64),
         packet_sizes: (u64, u64),
     ) -> (PathController, Observation) {
+        draining_service_fixture(
+            start_us,
+            start_bps,
+            clear_step,
+            drain_start,
+            drain_slices,
+            timing,
+            packet_sizes,
+            DrainVariant::Plain,
+        )
+    }
+
+    #[derive(Clone, Copy, PartialEq)]
+    enum DrainVariant {
+        Plain,
+        /// The step-6 queue is an older, already braked one, so the collapse
+        /// brakes as a delivery shortfall instead of a new queue.
+        StandingQueue,
+        /// The transport admits only half of each allowance through step 6.
+        TransportLimited,
+        TransportLimitedLegacy,
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn draining_service_fixture(
+        start_us: u64,
+        start_bps: u64,
+        clear_step: u64,
+        drain_start: u64,
+        drain_slices: u64,
+        timing: (u64, u64),
+        packet_sizes: (u64, u64),
+        variant: DrainVariant,
+    ) -> (PathController, Observation) {
+        let standing_queue = variant == DrainVariant::StandingQueue;
+        let limited = matches!(
+            variant,
+            DrainVariant::TransportLimited | DrainVariant::TransportLimitedLegacy
+        );
         let (warmup_us, report_delay_us) = timing;
         let mut controller = PathController::new(start_bps * 4, 20);
+        controller.fast_recovery_enabled = variant != DrainVariant::TransportLimitedLegacy;
         let mut quality = crate::runtime::quality::State::new(7);
         let mut sample = short_observation_022(start_us - warmup_us, 80.0);
         sample.report_number = 1;
@@ -7453,8 +7580,16 @@ mod tests {
                 controller.probe_admitted(now - 100_000);
             }
             let before = quality.snapshot.sent_bytes;
+            // Half of one 100 ms allowance at the starting pace.
+            let window = if limited && step <= 6 {
+                start_bps / 160
+            } else {
+                u64::MAX
+            };
             for at in (previous_local_us..now).step_by(1000) {
-                while controller.allow(at, packet_bytes as usize, 0.0) {
+                while quality.snapshot.sent_bytes - before < window
+                    && controller.allow(at, packet_bytes as usize, 0.0)
+                {
                     controller.admitted_symbol(at, packet_bytes as usize, packet_bytes as usize);
                     quality.admitted(packet_bytes as usize);
                 }
@@ -7506,6 +7641,9 @@ mod tests {
             sample.delivered_bps = Some((received - previous_received) as f64 * 80.0);
             sample.admitted_symbols = Some(quality.snapshot.sent_symbols);
             sample.admitted_symbol_bytes = Some(quality.snapshot.sent_bytes);
+            if step == clear_step && standing_queue {
+                return (controller, sample);
+            }
             if step == clear_step {
                 let latest = controller.service_window.latest(now).unwrap();
                 let admitted = latest.admission.unwrap();
@@ -7520,22 +7658,37 @@ mod tests {
                 assert!(controller.drain_restore_pending);
                 return (controller, sample);
             }
+            if standing_queue && step == 6 {
+                controller.braked_queue_ms = Some(1_000.0);
+            }
             controller.observe(&sample);
-            if step >= 6 {
-                assert_eq!(controller.last_brake_us, Some(start_us + 600_000));
+            // The standing queue brakes only once a paired interval shows the
+            // collapsed delivery.
+            let brake_step = if standing_queue { 9 } else { 6 };
+            if step >= brake_step {
+                assert_eq!(
+                    controller.last_brake_us,
+                    Some(start_us + brake_step * 100_000)
+                );
+                if limited {
+                    // An unexercised budget is a measured, not a proven, limit.
+                    return (controller, sample);
+                }
                 assert!(controller.congestion_seen);
             }
-            if step == 6 {
+            if step == brake_step {
                 assert!(controller.rate_bps < start_bps);
                 if packet_sizes.0 != packet_sizes.1 {
                     // The larger post-brake symbols must earn their entire
                     // allowance, independent of the old small-packet phase.
                     controller.tokens = 0.0;
                 }
-                assert!(matches!(
-                    controller.rate_changes.back().unwrap().reason,
-                    RateReason::QueueBrake
-                ));
+                let reason = controller.rate_changes.back().unwrap().reason;
+                if standing_queue {
+                    assert!(matches!(reason, RateReason::DeliveryShortfallBrake));
+                } else {
+                    assert!(matches!(reason, RateReason::QueueBrake));
+                }
             }
         }
         unreachable!()
@@ -8502,6 +8655,63 @@ mod tests {
         repeated.now_us += CONTROL_US;
         controller.observe(&repeated);
         assert_eq!(controller.rate_bps, returned, "returns only once");
+    }
+
+    #[test]
+    fn standing_queue_shortfall_brake_also_returns_to_its_measured_service() {
+        // A collapse under an already braked queue brakes as a shortfall; its
+        // backlogged delivery measures the bottleneck exactly like a new queue.
+        let (mut controller, sample) = draining_service_fixture(
+            100_000,
+            1_000_000,
+            16,
+            11,
+            6,
+            (100_000, 0),
+            (500, 500),
+            DrainVariant::StandingQueue,
+        );
+        let target = controller.drain_return.unwrap();
+        assert_eq!(target.braked_us, 1_000_000);
+        let before = controller.rate_bps;
+        assert!(target.target_bps > before && target.target_bps <= 900_000);
+        controller.observe(&sample);
+        let returned = controller.rate_changes.back().unwrap();
+        assert!(matches!(returned.reason, RateReason::DrainReturn));
+        assert!(returned.pacing_bps > before && returned.pacing_bps <= target.target_bps);
+    }
+
+    #[test]
+    fn new_queue_brake_uses_backlogged_delivery_while_the_transport_limits_sends() {
+        // Startup can seed a pace far above what the transport window sends.
+        // A new queue behind backlog still measures the bottleneck: brake to
+        // its delivery once instead of 20% per RTT while the queue keeps growing.
+        let brake = |variant| {
+            let (controller, _) = draining_service_fixture(
+                100_000,
+                1_000_000,
+                10,
+                7,
+                3,
+                (100_000, 0),
+                (500, 500),
+                variant,
+            );
+            let change = controller
+                .rate_changes
+                .iter()
+                .find(|change| change.at_us == 700_000)
+                .unwrap();
+            assert!(matches!(change.reason, RateReason::QueueBrake));
+            assert!(
+                (change.control.admitted_bytes as f64)
+                    < change.control.integrated_allowance_bytes * 0.9
+            );
+            change.pacing_bps
+        };
+        assert_eq!(brake(DrainVariant::TransportLimitedLegacy), 750_000);
+        // The collapsed fresh delivery, drained at the large-queue fraction.
+        assert_eq!(brake(DrainVariant::TransportLimited), 94_000);
     }
 
     #[test]

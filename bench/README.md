@@ -76,6 +76,24 @@ Both endpoints default to 1200 bytes and accept bounded overrides up to 76800.
 `python3 -m unittest bench.test_netem bench.test_readiness` checks accounting,
 bidirectional delay and the authenticated-path readiness gate.
 
+`python3 -m bench.native_lab --binary HOST_BINARY --lab-binary LINK_LAB
+--output local/NEW_RUN` runs the same finite source/sink workload on the
+development host without containers, namespaces or privileges. Build the
+emulator with `cargo build --release --example link_lab`. It binds only
+loopback sockets and shapes every path in both directions: a virtual-clock
+serializer over IPv4+UDP bytes, half the registered RTT as one-way delay, a
+packet limit that counts queued and propagating packets like netem, and seeded
+random loss. `--rtt-ms` takes one to eight paths and `--rate-mbps` one value
+or one per path. `--loss-percent` applies after readiness, and
+`--step AT_SECONDS:PATH:RATE_MBPS` changes both directions of a path relative
+to the source launch. `--mode` selects `native-service` (default) or `adaptive`;
+`--rate-bps` defaults to 400000000 and accepts `auto`. The summary adds the
+time-averaged forward capacity and per-second on-time goodput. Timer jitter
+and other host load can stall the source; source qualification then marks the
+run invalid instead of retrying it. This is a loopback diagnostic, not a WAN or
+kernel-qdisc equivalent. `python3 -m unittest bench.test_native_lab` checks its
+argument limits and accounting.
+
 `python3 -m bench.trace_replay RAW DEST --paths PATH_A PATH_B PATH_C PATH_D`
 packs native sender/receiver samples for synchronized virtual-time replay.
 `Replay.events()` retains every source timestamp, gap and end-to-end missing

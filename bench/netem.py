@@ -161,6 +161,17 @@ def path_commands(client, server, index, rtt_ms, rate_mbps, queue_packets):
     return commands
 
 
+def business_loss_commands(client, server, rtts, rate_mbps, queue_packets, loss_percent):
+    """Random loss starts after validation so preflight RTT, rate and drop checks stay exact."""
+    commands = []
+    for index, rtt_ms in enumerate(rtts):
+        for namespace, device in ((client, f"p{index}c"), (server, f"p{index}s")):
+            commands.append(["ip", "netns", "exec", namespace, "tc", "qdisc", "change", "dev", device,
+                             "root", "netem", "limit", str(queue_packets), "delay", f"{rtt_ms / 2:g}ms",
+                             "rate", f"{rate_mbps:g}mbit", "loss", "random", f"{loss_percent:g}%"])
+    return commands
+
+
 def selected_paths(args):
     """Logical connections select existing physical links; repeats share that link."""
     paths = getattr(args, "paths", [0, 1, 2, 3])
@@ -488,6 +499,14 @@ class Testbed:
             if sink.poll() is not None or time.monotonic() >= deadline:
                 raise RuntimeError("sink JSON readiness failed")
             time.sleep(.05)
+        loss = getattr(args, "loss_percent", 0)
+        if loss:
+            for command in business_loss_commands(self.client, self.server, args.rtt_ms, args.rate_mbps,
+                                                  args.queue_packets, loss):
+                self.command(command)
+            save(self.output / "business-loss.json", {"random_loss_percent_each_direction": loss,
+                                                      "applied_after_validation": True,
+                                                      "qdiscs": self.qdiscs()})
         self.network_snapshot("network-before-business.json")
         self.business_started = True
         self.start_sampling()
@@ -597,6 +616,8 @@ def main():
     parser.add_argument("--topology", choices=["independent", "shared"], default="independent")
     parser.add_argument("--legacy-recovery", action="store_true",
                         help="forward the runtime's earlier adaptive recovery to both endpoints")
+    parser.add_argument("--loss-percent", type=float, default=0,
+                        help="random loss per direction during business only (independent topology)")
     parser.add_argument("--shared-rate-mbps", type=float, default=400)
     parser.add_argument("--datagram-buffer-bytes", type=int)
     args = parser.parse_args()
@@ -606,6 +627,10 @@ def main():
         parser.error(str(error))
     if args.native_service_guard and args.mode != "native-service":
         parser.error("native-service-guard requires native-service mode")
+    if not math.isfinite(args.loss_percent) or not 0 <= args.loss_percent <= 90:
+        parser.error("business loss must be 0..90 percent")
+    if args.loss_percent and args.topology != "independent":
+        parser.error("business loss is only defined for the independent topology")
     if (not Path("/.dockerenv").exists() or os.environ.get("BRAIDPATH_NETEM_CONTAINER") != "1"
         or os.geteuid() != 0):
         parser.error("requires root inside a dedicated Docker test container with BRAIDPATH_NETEM_CONTAINER=1")

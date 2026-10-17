@@ -10,7 +10,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
-from bench.netem import Testbed, client_path_arguments, latest_complete_snapshot, main, parse_snmp, path_commands, shaping_errors, summarize, timeseries
+from bench.netem import Testbed, business_loss_commands, client_path_arguments, latest_complete_snapshot, main, parse_snmp, path_commands, shaping_errors, summarize, timeseries
 
 
 def samples(count, received):
@@ -179,7 +179,8 @@ class SenderModeFlags(unittest.TestCase):
 
     def test_invalid_cli_topology_or_guard_mode_is_rejected_before_setup(self):
         for options in (["--paths", "4"], ["--paths", "0", "0", "0", "0", "0"],
-                        ["--mode", "quality", "--native-service-guard"]):
+                        ["--mode", "quality", "--native-service-guard"],
+                        ["--loss-percent", "91"], ["--loss-percent", "5", "--topology", "shared"]):
             with patch("sys.argv", ["netem", "validate", "--output", "/tmp/local/unused", *options]), \
                  patch("bench.netem.Testbed") as bed, contextlib.redirect_stderr(io.StringIO()):
                 with self.assertRaises(SystemExit) as rejected:
@@ -367,6 +368,15 @@ class NetworkAndCounters(unittest.TestCase):
         self.assertTrue(all(argv[argv.index("delay") + 1] == "40ms" for argv in shaping))
         self.assertTrue(all(argv[argv.index("rate") + 1] == "100mbit" for argv in shaping))
         self.assertTrue(all(argv[argv.index("limit") + 1] == "1024" for argv in shaping))
+
+    def test_business_loss_changes_every_validated_direction_without_new_queues(self):
+        commands = business_loss_commands("client", "server", [30, 45, 60, 80], 60, 1024, 10)
+        self.assertEqual(len(commands), 8)
+        self.assertTrue(all(argv[5:8] == ["qdisc", "change", "dev"] for argv in commands))
+        self.assertEqual([argv[argv.index("delay") + 1] for argv in commands[::2]],
+                         ["15ms", "22.5ms", "30ms", "40ms"])
+        self.assertTrue(all(argv[-3:] == ["loss", "random", "10%"] for argv in commands))
+        self.assertTrue(all(argv[argv.index("rate") + 1] == "60mbit" for argv in commands))
 
     def test_cumulative_samples_become_deltas_not_repeated_drop_totals(self):
         def snapshot(at, sent_bytes, full, ingress, symbol):

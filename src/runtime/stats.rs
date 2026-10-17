@@ -31,18 +31,17 @@ pub struct Options {
     /// queue, pacing credit, loss exemption or altered absolute RTT sample.
     #[arg(long)]
     pub rtt_source_baselines: bool,
-    /// Experimental random-loss service accounting; off by default. Delivery
-    /// is compensated only by a bounded loss floor learned at low queue delay.
-    /// No new queue, pacing credit or cap; queue/fast-loss brakes remain.
-    #[arg(long)]
+    /// Random-loss service accounting with the minimum floor (at most 25%).
+    /// Only meaningful with --legacy-recovery; hidden, kept for old scripts.
+    #[arg(long, hide = true)]
     pub random_loss_service: bool,
-    /// Experimental throughput pacing; off by default. Implies random-loss
-    /// service. Loss-only brakes need queue delay above a quarter of the
-    /// latency target; queue, blocked-transport and zero-service brakes remain.
-    #[arg(long)]
+    /// Queue-gated loss pacing, now the default; hidden, kept for old
+    /// scripts. Together with --legacy-recovery it re-enables only this part.
+    #[arg(long, hide = true)]
     pub queue_gated_loss: bool,
-    /// Restore the earlier adaptive recovery: 100 ms brake debounce and
-    /// post-brake restoration only from a qualified 500 ms service window.
+    /// Restore the earlier adaptive controller: 100 ms brake debounce,
+    /// post-brake restoration only from a qualified 500 ms service window, and
+    /// loss-only brakes at any queue delay (no queue-gated loss pacing).
     #[arg(long)]
     pub legacy_recovery: bool,
     /// Experimental native-window service recovery; off by default. Adaptive
@@ -768,8 +767,10 @@ impl Metrics {
     pub fn random_loss_service(&self) -> bool {
         self.0.random_loss_service
     }
+    /// Default throughput pacing: loss-only brakes need a queue or a sustained
+    /// transport block. --legacy-recovery restores loss brakes at any queue.
     pub fn queue_gated_loss(&self) -> bool {
-        self.0.queue_gated_loss
+        self.0.queue_gated_loss || !self.0.legacy_recovery
     }
     /// Configure before the metrics are shared with any sender.
     fn with_legacy_recovery(mut self, legacy: bool) -> Self {
@@ -1322,6 +1323,26 @@ mod tests {
             },
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn queue_gated_loss_is_the_default_and_legacy_recovery_restores_loss_brakes() {
+        let metrics = |legacy: bool, gated: bool| {
+            Metrics::configured_repair(
+                "client",
+                trace::Trace::disabled(),
+                false,
+                false,
+                false,
+                false,
+                false,
+                gated,
+            )
+            .with_legacy_recovery(legacy)
+        };
+        assert!(metrics(false, false).queue_gated_loss());
+        assert!(!metrics(true, false).queue_gated_loss());
+        assert!(metrics(true, true).queue_gated_loss());
     }
 
     #[test]
