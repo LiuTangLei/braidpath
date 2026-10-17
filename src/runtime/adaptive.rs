@@ -2233,22 +2233,25 @@ impl PathController {
                     (self.rate_bps as f64 * 0.9).min(self.maximum_bps as f64) as u64,
                     |old| old.pace_cap_bps,
                 );
-                self.drain_return =
-                    (self.fast_recovery_enabled && measured_brake && observation.offered_backlog)
-                        .then(|| {
-                            fresh_service
-                                .filter(|rate| *rate > 0.0)
-                                .map(|rate| (rate * 0.9) as u64)
-                                .or(episode.map(|old| old.target_bps))
-                        })
-                        .flatten()
-                        .map(|target| DrainReturn {
-                            target_bps: target.min(pace_cap_bps),
-                            pace_cap_bps,
-                            braked_us: now,
-                            drain_start: episode.and_then(|old| old.drain_start),
-                            drain_bps: episode.and_then(|old| old.drain_bps),
-                        });
+                // The enclosing brake already requires actual demand. An
+                // exercised allowance or qualified deficit remains evidence
+                // when this instant happens to sample an empty local queue.
+                // Restoration below still requires current offered backlog.
+                self.drain_return = (self.fast_recovery_enabled && measured_brake)
+                    .then(|| {
+                        fresh_service
+                            .filter(|rate| *rate > 0.0)
+                            .map(|rate| (rate * 0.9) as u64)
+                            .or(episode.map(|old| old.target_bps))
+                    })
+                    .flatten()
+                    .map(|target| DrainReturn {
+                        target_bps: target.min(pace_cap_bps),
+                        pace_cap_bps,
+                        braked_us: now,
+                        drain_start: episode.and_then(|old| old.drain_start),
+                        drain_bps: episode.and_then(|old| old.drain_bps),
+                    });
                 self.rate_bps = reduced;
                 rate_reason = if fast_loss_actionable {
                     RateReason::FastLossBrake
@@ -7522,6 +7525,8 @@ mod tests {
         /// The transport admits only half of each allowance through step 6.
         TransportLimited,
         TransportLimitedLegacy,
+        /// Business exercised the allowance, but the queue is empty at the brake sample.
+        SampledEmpty,
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -7660,6 +7665,9 @@ mod tests {
             }
             if standing_queue && step == 6 {
                 controller.braked_queue_ms = Some(1_000.0);
+            }
+            if variant == DrainVariant::SampledEmpty && step == 6 {
+                sample.offered_backlog = false;
             }
             controller.observe(&sample);
             // The standing queue brakes only once a paired interval shows the
@@ -8658,6 +8666,34 @@ mod tests {
     }
 
     #[test]
+    fn sampled_empty_queue_brake_retains_measured_drain_return() {
+        // Actual admission exercised the pre-brake allowance. A single empty
+        // queue sample must not discard the service that built the network queue.
+        let (mut controller, sample) = draining_service_fixture(
+            100_000,
+            1_000_000,
+            10,
+            7,
+            3,
+            (100_000, 0),
+            (500, 500),
+            DrainVariant::SampledEmpty,
+        );
+        let target = controller
+            .drain_return
+            .expect("retain measured queue-brake service");
+        let before = controller.rate_bps;
+        assert_eq!(target.braked_us, 700_000);
+        assert!(target.target_bps > before && target.target_bps <= 900_000);
+        controller.observe(&sample);
+        assert!(matches!(
+            controller.rate_changes.back().unwrap().reason,
+            RateReason::DrainReturn
+        ));
+        assert!(controller.rate_bps > before && controller.rate_bps <= target.target_bps);
+    }
+
+    #[test]
     fn standing_queue_shortfall_brake_also_returns_to_its_measured_service() {
         // A collapse under an already braked queue brakes as a shortfall; its
         // backlogged delivery measures the bottleneck exactly like a new queue.
@@ -8716,7 +8752,7 @@ mod tests {
 
     #[test]
     fn drain_return_needs_a_post_brake_reply_and_a_clear_queue() {
-        for case in ["pre_brake_reply", "queue", "legacy"] {
+        for case in ["pre_brake_reply", "queue", "legacy", "idle"] {
             let (mut controller, mut sample) = early_clear_reply_after_queue_brake();
             let before = controller.rate_bps;
             match case {
@@ -8727,6 +8763,7 @@ mod tests {
                     sample.probe_latest_rtt_ms = Some(280.0);
                 }
                 "legacy" => controller.fast_recovery_enabled = false,
+                "idle" => sample.offered_backlog = false,
                 _ => unreachable!(),
             }
             controller.observe(&sample);
@@ -8737,7 +8774,13 @@ mod tests {
                     .any(|change| matches!(change.reason, RateReason::DrainReturn)),
                 "{case}"
             );
-            assert!(controller.rate_bps <= before, "{case}");
+            if case == "idle" {
+                // Other existing recovery paths can update the allowance from
+                // recent admissions; an idle sample must not spend this return.
+                assert!(controller.drain_return.is_some());
+            } else {
+                assert!(controller.rate_bps <= before, "{case}");
+            }
         }
     }
 
