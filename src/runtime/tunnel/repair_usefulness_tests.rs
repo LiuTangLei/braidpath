@@ -3,6 +3,7 @@ use std::collections::BTreeSet;
 
 fn policy() -> Policy {
     Policy {
+        streams: false,
         adaptive: false,
         capacity_probe_bps: 0,
         probe_guided_recovery: false,
@@ -36,6 +37,7 @@ fn fill_flow(queue: &mut outbound::Queue, now: Instant) {
                 flow: Some(1),
                 block: None,
                 small: false,
+                hold: None,
             })
             .unwrap_or_else(|_| panic!("fixture queue full"));
     }

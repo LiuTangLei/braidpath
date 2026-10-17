@@ -136,6 +136,7 @@ fn block_and_poll(
 
 fn policy() -> Policy {
     Policy {
+        streams: false,
         fec_repairs: 1,
         adaptive: false,
         capacity_probe_bps: 0,
@@ -226,6 +227,7 @@ async fn full_input_turn_services_old_records(expires: bool) {
     tx.try_send(QueuedRecord {
         record: record(64),
         created,
+        hold: None,
     })
     .unwrap();
     PRIME_FULL_INPUT.with(|prime| prime.set(true));
@@ -316,6 +318,7 @@ async fn full_input_turn_with_blocked_group(new_flow: u32) {
     tx.try_send(QueuedRecord {
         record: input,
         created: Instant::now(),
+        hold: None,
     })
     .unwrap();
     PRIME_FULL_INPUT.with(|prime| prime.set(true));
@@ -648,6 +651,7 @@ async fn small_sender_admissions(losses: [f64; 2], delays: [f64; 2]) -> [(u64, u
             payload: vec![7; 128],
         },
         created: Instant::now(),
+        hold: None,
     })
     .await
     .unwrap();
@@ -1581,6 +1585,7 @@ async fn sender_feedback_stats_publish_on_tick_and_final_not_each_input() {
         tx.try_send(QueuedRecord {
             record: record(id),
             created: Instant::now(),
+            hold: None,
         })
         .unwrap();
     }
@@ -1644,7 +1649,8 @@ async fn sender_actor_drains_multiple_flows_once_and_stops_cleanly() {
         assert!(
             tx.try_send(QueuedRecord {
                 record,
-                created: Instant::now()
+                created: Instant::now(),
+                hold: None,
             })
             .is_ok()
         );
@@ -1978,6 +1984,7 @@ async fn native_sender_records_bbr_startup_budget_and_delivers_the_original() {
     tx.try_send(QueuedRecord {
         record: record(1),
         created: Instant::now(),
+        hold: None,
     })
     .unwrap();
     let task = tokio::spawn(sender(rx, paths, policy.clone(), stopped, scope, None));

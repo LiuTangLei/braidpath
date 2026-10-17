@@ -66,7 +66,7 @@ enum Command {
         #[arg(long, default_value = "localhost")]
         name: String,
     },
-    /// Serve a website and authenticated datagrams to one configured UDP target.
+    /// Serve a website and authenticated sessions to configured UDP/TCP targets.
     Server {
         /// Experimental server-to-peer ACK request. Does not change native BBR,
         /// recovery, or the client's request policy; default remains unchanged.
@@ -80,8 +80,12 @@ enum Command {
         key: PathBuf,
         #[arg(long)]
         token_file: PathBuf,
+        /// UDP destination for datagram flows.
+        #[arg(long, required_unless_present = "tcp_target")]
+        target: Option<SocketAddr>,
+        /// TCP destination; each client TCP connection becomes one reliable stream.
         #[arg(long)]
-        target: SocketAddr,
+        tcp_target: Option<SocketAddr>,
         /// Session sender cap in bits/s; `auto` defers to the client's request.
         #[arg(long, default_value = "auto", value_parser = parse_rate_cap)]
         max_rate_bps: RateCap,
@@ -99,10 +103,14 @@ enum Command {
         #[command(flatten)]
         stats: stats::Options,
     },
-    /// Expose a local UDP port through independently encrypted entrances.
+    /// Expose local UDP and optional TCP ports through independently encrypted entrances.
     Client {
         #[arg(long, default_value = "127.0.0.1:7000")]
         listen: SocketAddr,
+        /// Accept local TCP connections and carry each as one reliable stream
+        /// over all paths. The server must configure --tcp-target.
+        #[arg(long)]
+        tcp_listen: Option<SocketAddr>,
         #[arg(long = "entrance", required = true)]
         entrances: Vec<SocketAddr>,
         #[arg(long = "interface")]
@@ -282,6 +290,7 @@ pub async fn run() -> Result<()> {
             key,
             token_file,
             target,
+            tcp_target,
             max_rate_bps,
             datagram_send_buffer_bytes,
             congestion,
@@ -298,6 +307,7 @@ pub async fn run() -> Result<()> {
                     key,
                     token: token_file,
                     target,
+                    tcp_target,
                     max_rate: max_rate_bps.bps(),
                     datagram_send_buffer_bytes: datagram_send_buffer_bytes as usize,
                     congestion,
@@ -309,6 +319,7 @@ pub async fn run() -> Result<()> {
         }
         Command::Client {
             listen,
+            tcp_listen,
             entrances,
             interfaces,
             path_binds,
@@ -329,6 +340,7 @@ pub async fn run() -> Result<()> {
                 stats: reporter.metrics.clone(),
                 adaptive_fec_retention,
                 listen,
+                tcp_listen,
                 entrances,
                 interfaces,
                 path_binds,
@@ -340,6 +352,7 @@ pub async fn run() -> Result<()> {
                 congestion,
                 rotate_source_port: policy.rotate_source_port,
                 policy: tunnel::Policy {
+                    streams: tcp_listen.is_some(),
                     adaptive: policy.adaptive,
                     capacity_probe_bps: policy.capacity_probe_bps,
                     probe_guided_recovery: policy.probe_guided_recovery,

@@ -229,6 +229,9 @@ pub struct Direction {
     /// Sender-owned preview counters; not packet losses or time-at-limit percentages.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sender_frontier: Option<super::sender_frontier::Snapshot>,
+    /// Reliable TCP stream counters, published by this endpoint's stream adapter.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tcp_streams: Option<super::stream::Snapshot>,
     #[serde(skip_serializing_if = "Ids::is_empty")]
     pub quinn_admitted_record_ids: Ids,
     #[serde(skip_serializing_if = "Ids::is_empty")]

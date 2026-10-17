@@ -3,8 +3,13 @@ use super::{MAX_PATHS, QUEUE};
 use bytes::Bytes;
 use std::{
     collections::{BTreeMap, VecDeque},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+    },
     time::{Duration, Instant},
 };
+use tokio::sync::Notify;
 
 /// A single bulk producer and its repair backlog cannot consume all admission slots.
 /// These are queue limits, not bandwidth reservations; unused service is work-conserving.
@@ -20,6 +25,84 @@ pub struct Pending {
     pub block: Option<u64>,
     /// Actual coding lane; only mixed sessions use this to classify symbols.
     pub small: bool,
+    /// Reliable-stream originals only; released when this original leaves.
+    pub hold: Option<Arc<Hold>>,
+}
+
+/// Locally queued reliable-stream bytes, shared with the stream producer.
+/// This is local backpressure, not delivery evidence or a rate estimate.
+#[derive(Default)]
+pub struct Gauge {
+    queued: AtomicUsize,
+    low_water: AtomicUsize,
+    admitted: AtomicU64,
+    dropped: Mutex<Vec<(u32, u64, u32)>>,
+    pub notify: Notify,
+}
+impl Gauge {
+    pub fn queued(&self) -> usize {
+        self.queued.load(Ordering::Acquire)
+    }
+    /// Total bytes admitted to Quinn.
+    pub fn admitted(&self) -> u64 {
+        self.admitted.load(Ordering::Acquire)
+    }
+    /// Wake the producer once occupancy falls to this level.
+    pub fn set_low_water(&self, bytes: usize) {
+        self.low_water.store(bytes, Ordering::Release);
+    }
+    /// Segments whose original left the queue without Quinn admission.
+    pub fn take_dropped(&self) -> Vec<(u32, u64, u32)> {
+        std::mem::take(&mut *self.dropped.lock().expect("gauge lock"))
+    }
+    pub fn hold(
+        self: &Arc<Self>,
+        stream: u32,
+        start: u64,
+        transmission: u32,
+        bytes: usize,
+    ) -> Arc<Hold> {
+        self.queued.fetch_add(bytes, Ordering::AcqRel);
+        Arc::new(Hold {
+            gauge: self.clone(),
+            identity: (stream, start, transmission),
+            bytes,
+            admitted: AtomicBool::new(false),
+        })
+    }
+}
+
+pub struct Hold {
+    gauge: Arc<Gauge>,
+    identity: (u32, u64, u32),
+    bytes: usize,
+    admitted: AtomicBool,
+}
+impl Hold {
+    pub fn admitted(&self) {
+        self.admitted.store(true, Ordering::Release);
+    }
+}
+impl Drop for Hold {
+    fn drop(&mut self) {
+        let gauge = &self.gauge;
+        let admitted = self.admitted.load(Ordering::Acquire);
+        if admitted {
+            gauge
+                .admitted
+                .fetch_add(self.bytes as u64, Ordering::AcqRel);
+        } else {
+            gauge
+                .dropped
+                .lock()
+                .expect("gauge lock")
+                .push(self.identity);
+        }
+        let before = gauge.queued.fetch_sub(self.bytes, Ordering::AcqRel);
+        if !admitted || before - self.bytes <= gauge.low_water.load(Ordering::Acquire) {
+            gauge.notify.notify_one();
+        }
+    }
 }
 
 #[derive(Default)]
@@ -741,6 +824,7 @@ mod tests {
             flow: Some(flow),
             block: Some(id / 4),
             small: false,
+            hold: None,
         }
     }
     #[test]
@@ -817,6 +901,7 @@ mod tests {
                 flow: None,
                 block: Some(id),
                 small: false,
+                hold: None,
             };
             if let Err(rejected) = q.push(repair) {
                 assert_eq!(rejected.block, Some(id));
@@ -867,5 +952,23 @@ mod tests {
         assert!(group.available(1200));
         group.spend(1200);
         assert!(!group.available(1));
+    }
+
+    #[test]
+    fn stream_holds_release_occupancy_and_report_only_unadmitted_originals() {
+        let gauge = Arc::new(Gauge::default());
+        gauge.set_low_water(1500);
+        let admitted = gauge.hold(3, 0, 1, 1000);
+        let dropped = gauge.hold(3, 1000, 2, 1000);
+        let clone = dropped.clone();
+        assert_eq!(gauge.queued(), 2000);
+        admitted.admitted();
+        drop(admitted);
+        drop(dropped);
+        assert_eq!(gauge.queued(), 1000, "a clone keeps the original queued");
+        assert!(gauge.take_dropped().is_empty());
+        drop(clone);
+        assert_eq!((gauge.queued(), gauge.admitted()), (0, 1000));
+        assert_eq!(gauge.take_dropped(), vec![(3, 1000, 2)]);
     }
 }

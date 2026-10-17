@@ -1,0 +1,1213 @@
+//! Reliable byte streams over the unreliable aggregate record service.
+//!
+//! A stream travels as ordinary records on two flows, one for data and one for
+//! acknowledgments, so multipath scheduling and FEC apply to it unchanged. The
+//! sender retains bytes until they are cumulatively acknowledged, repairs loss
+//! from selective acknowledgments, a send-time threshold and probe timeouts, and
+//! obeys the receiver's window. Per-path congestion control stays below this
+//! layer: it adds no rate controller and promises no delivery deadline.
+//!
+//! Sequence space equals byte offsets, plus one virtual byte at the final size
+//! for FIN. This module performs no I/O; callers supply the clock.
+use super::MAX_PAYLOAD;
+use serde::Serialize;
+use std::{
+    collections::{BTreeMap, BTreeSet, VecDeque},
+    time::{Duration, Instant},
+};
+
+pub const STREAM_FLAG: u32 = 1 << 30;
+pub const ACK_FLAG: u32 = 1 << 29;
+pub const MAX_STREAM_ID: u32 = ACK_FLAG - 1;
+const DATA_HEADER: usize = 10;
+pub const MAX_SEGMENT: usize = MAX_PAYLOAD - DATA_HEADER;
+/// Both peers assume this window before the first acknowledgment.
+pub const INITIAL_WINDOW: u64 = 256 * 1024;
+pub const MAX_WINDOW: u64 = 8 * 1024 * 1024;
+const MAX_OFFSET: u64 = 1 << 62;
+const ACK_HEADER: usize = 26;
+const MAX_RANGES: usize = 64;
+const ACK_EVERY: u32 = 16;
+const ACK_DELAY: Duration = Duration::from_millis(2);
+const INITIAL_RTT: Duration = Duration::from_millis(250);
+const RTT_WINDOW: Duration = Duration::from_secs(1);
+const REORDER_BASE: f64 = 1.25;
+const REORDER_MAX: f64 = 2.0;
+const MAX_PTO: Duration = Duration::from_secs(2);
+const DEAD_AFTER: Duration = Duration::from_secs(30);
+
+const DATA: u8 = 0;
+const ACK: u8 = 1;
+const RESET: u8 = 2;
+const FIN_BIT: u8 = 2;
+
+pub fn data_flow(id: u32) -> u32 {
+    STREAM_FLAG | id
+}
+pub fn ack_flow(id: u32) -> u32 {
+    STREAM_FLAG | ACK_FLAG | id
+}
+/// The stream identifier of a stream-lane record, if it is one.
+pub fn stream_id(flow: u32) -> Option<u32> {
+    (flow & STREAM_FLAG != 0).then_some(flow & MAX_STREAM_ID)
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Ack {
+    /// Every sequence number below this has been received.
+    pub cumulative: u64,
+    /// The sender may transmit data offsets below this.
+    pub limit: u64,
+    /// Total payload bytes received more than once; spurious-retransmit evidence.
+    pub duplicate_bytes: u64,
+    /// Received data above `cumulative`: ascending, disjoint `[start, end)`.
+    pub ranges: Vec<(u64, u64)>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Frame {
+    Data {
+        offset: u64,
+        fin: bool,
+        data: Vec<u8>,
+    },
+    Ack(Ack),
+    Reset,
+}
+impl Frame {
+    pub fn encode(&self) -> Vec<u8> {
+        match self {
+            Frame::Data { offset, fin, data } => {
+                let mut out = Vec::with_capacity(DATA_HEADER + data.len());
+                out.extend([DATA, if *fin { FIN_BIT } else { 0 }]);
+                out.extend(offset.to_be_bytes());
+                out.extend(data);
+                out
+            }
+            Frame::Ack(ack) => {
+                let mut out = Vec::with_capacity(ACK_HEADER + 8 * ack.ranges.len());
+                out.push(ACK);
+                out.extend(ack.cumulative.to_be_bytes());
+                out.extend(ack.limit.to_be_bytes());
+                out.extend(ack.duplicate_bytes.to_be_bytes());
+                out.push(ack.ranges.len() as u8);
+                for (start, end) in &ack.ranges {
+                    out.extend(((start - ack.cumulative) as u32).to_be_bytes());
+                    out.extend(((end - start) as u32).to_be_bytes());
+                }
+                out
+            }
+            Frame::Reset => vec![RESET],
+        }
+    }
+
+    pub fn decode(b: &[u8]) -> Option<Self> {
+        let u64_at = |i: usize| Some(u64::from_be_bytes(b.get(i..i + 8)?.try_into().ok()?));
+        let u32_at = |i: usize| {
+            Some(u64::from(u32::from_be_bytes(
+                b.get(i..i + 4)?.try_into().ok()?,
+            )))
+        };
+        match *b.first()? {
+            DATA if b.len() >= DATA_HEADER && b[1] & !FIN_BIT == 0 => {
+                let offset = u64_at(2)?;
+                let data = b[DATA_HEADER..].to_vec();
+                (offset.checked_add(data.len() as u64)? < MAX_OFFSET).then_some(Frame::Data {
+                    offset,
+                    fin: b[1] & FIN_BIT != 0,
+                    data,
+                })
+            }
+            ACK if b.len() >= ACK_HEADER => {
+                let count = usize::from(b[25]);
+                if count > MAX_RANGES || b.len() != ACK_HEADER + 8 * count {
+                    return None;
+                }
+                let cumulative = u64_at(1)?;
+                let mut ranges = Vec::with_capacity(count);
+                let mut floor = cumulative;
+                for i in 0..count {
+                    let at = ACK_HEADER + 8 * i;
+                    let start = cumulative.checked_add(u32_at(at)?)?;
+                    let end = start.checked_add(u32_at(at + 4)?)?;
+                    // A range must leave a gap below it, else it would be cumulative.
+                    if start <= floor || end <= start || end >= MAX_OFFSET {
+                        return None;
+                    }
+                    ranges.push((start, end));
+                    floor = end;
+                }
+                (cumulative < MAX_OFFSET).then_some(Frame::Ack(Ack {
+                    cumulative,
+                    limit: u64_at(9)?,
+                    duplicate_bytes: u64_at(17)?,
+                    ranges,
+                }))
+            }
+            RESET if b.len() == 1 => Some(Frame::Reset),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Default, Serialize)]
+pub struct Snapshot {
+    pub opened: u64,
+    pub completed: u64,
+    pub reset_local: u64,
+    pub reset_peer: u64,
+    pub rejected: u64,
+    pub active: u64,
+    pub bytes_from_application: u64,
+    pub bytes_to_application: u64,
+    pub segments_sent: u64,
+    pub retransmitted_segments: u64,
+    pub retransmitted_bytes: u64,
+    /// Retransmissions caused by an original leaving the local sender queue unsent.
+    pub local_drop_retransmits: u64,
+    pub probe_timeouts: u64,
+    pub spurious_retransmit_reports: u64,
+    pub duplicate_bytes_received: u64,
+    pub acks_sent: u64,
+    pub acks_received: u64,
+}
+
+#[derive(Clone, Copy)]
+struct Rtt {
+    smoothed: Option<Duration>,
+    variation: Duration,
+    minimum: Duration,
+    high: [Duration; 2],
+    window_start: Option<Instant>,
+    first_sample: Option<Instant>,
+}
+impl Default for Rtt {
+    fn default() -> Self {
+        Self {
+            smoothed: None,
+            variation: Duration::ZERO,
+            minimum: Duration::MAX,
+            high: [Duration::ZERO; 2],
+            window_start: None,
+            first_sample: None,
+        }
+    }
+}
+impl Rtt {
+    fn sample(&mut self, rtt: Duration, now: Instant) {
+        match self.smoothed {
+            None => {
+                self.smoothed = Some(rtt);
+                self.variation = rtt / 2;
+            }
+            Some(s) => {
+                let error = s.abs_diff(rtt);
+                self.variation = (self.variation * 3 + error) / 4;
+                self.smoothed = Some((s * 7 + rtt) / 8);
+            }
+        }
+        self.minimum = self.minimum.min(rtt);
+        self.first_sample.get_or_insert(now);
+        // Two adjacent windows keep the slowest active path visible: with
+        // multipath, segments routed over it are often the last to arrive.
+        if self
+            .window_start
+            .is_none_or(|start| now.saturating_duration_since(start) >= RTT_WINDOW)
+        {
+            self.high = [rtt, self.high[0]];
+            self.window_start = Some(now);
+        } else {
+            self.high[0] = self.high[0].max(rtt);
+        }
+    }
+    /// The windowed maximum, or the variance bound while few samples exist.
+    /// A slower path is unobserved until its first acknowledgment returns, so
+    /// the initial estimate remains a floor for one initial RTT of sampling.
+    fn high(&self, now: Instant) -> Duration {
+        let Some(smoothed) = self.smoothed else {
+            return INITIAL_RTT;
+        };
+        let observed = self.high[0]
+            .max(self.high[1])
+            .max(smoothed + 4 * self.variation);
+        if self
+            .first_sample
+            .is_some_and(|at| now.saturating_duration_since(at) < INITIAL_RTT)
+        {
+            observed.max(INITIAL_RTT)
+        } else {
+            observed
+        }
+    }
+}
+
+struct Segment {
+    end: u64,
+    sent_at: Instant,
+    transmissions: u32,
+    /// Consecutive retransmissions without any acknowledgment progress between them.
+    stalls: u32,
+    /// Backed-off deadline while stalled; otherwise timed from `sent_at`.
+    deadline: Option<Instant>,
+}
+
+/// One reliable sending half. Data offsets start at zero.
+///
+/// A transmission is lost once it is older than the reorder threshold and a
+/// later transmission was delivered, or older than 1.5 thresholds without that
+/// evidence. While acknowledgments still progress, random loss is repaired at
+/// that pace; only retransmissions with no progress since the previous attempt
+/// back off. Each segment has its own timer, so a tail loss never waits for an
+/// exponentially backed-off connection timer.
+pub struct Sender {
+    buffer: VecDeque<u8>,
+    base: u64,
+    written: u64,
+    next: u64,
+    fin: Option<u64>,
+    fin_sent: bool,
+    limit: u64,
+    acked: u64,
+    segments: BTreeMap<u64, Segment>,
+    fresh: BTreeSet<(Instant, u64)>,
+    repeated: BTreeSet<(Instant, u64)>,
+    lost: BTreeSet<u64>,
+    rack: Option<Instant>,
+    rtt: Rtt,
+    reorder: f64,
+    peer_duplicates: u64,
+    last_progress: Option<Instant>,
+    probe_at: Option<Instant>,
+    probe_count: u32,
+    probe_due: bool,
+    open_pending: bool,
+    open_sent: bool,
+}
+
+/// A frame chosen for transmission, with the identity a local drop reports.
+pub struct Transmit {
+    pub frame: Frame,
+    pub start: u64,
+    pub transmission: u32,
+    pub retransmission: bool,
+}
+
+impl Sender {
+    /// `open` makes an empty stream announce itself with a zero-length segment.
+    pub fn new(open: bool) -> Self {
+        Self {
+            buffer: VecDeque::new(),
+            base: 0,
+            written: 0,
+            next: 0,
+            fin: None,
+            fin_sent: false,
+            limit: INITIAL_WINDOW,
+            acked: 0,
+            segments: BTreeMap::new(),
+            fresh: BTreeSet::new(),
+            repeated: BTreeSet::new(),
+            lost: BTreeSet::new(),
+            rack: None,
+            rtt: Rtt::default(),
+            reorder: REORDER_BASE,
+            peer_duplicates: 0,
+            last_progress: None,
+            probe_at: None,
+            probe_count: 0,
+            probe_due: false,
+            open_pending: open,
+            open_sent: false,
+        }
+    }
+    pub fn push(&mut self, data: &[u8]) {
+        assert!(self.fin.is_none(), "data after local end of stream");
+        self.buffer.extend(data);
+        self.written += data.len() as u64;
+    }
+    pub fn finish(&mut self) {
+        self.fin.get_or_insert(self.written);
+    }
+    /// Highest data offset the application has supplied.
+    pub fn written(&self) -> u64 {
+        self.written
+    }
+    pub fn limit(&self) -> u64 {
+        self.limit
+    }
+    /// Lowest data offset still retained for retransmission.
+    pub fn retained_from(&self) -> u64 {
+        self.base
+    }
+    pub fn finished(&self) -> bool {
+        self.fin.is_some_and(|f| self.acked > f)
+    }
+    /// No acknowledgment progress while the peer owed one for too long.
+    pub fn failed(&self, now: Instant) -> bool {
+        self.awaiting_peer()
+            && self
+                .last_progress
+                .is_some_and(|at| now.saturating_duration_since(at) >= DEAD_AFTER)
+    }
+    pub fn has_transmit(&self) -> bool {
+        !self.lost.is_empty()
+            || (self.next < self.written && self.next < self.limit)
+            || (self.fin == Some(self.next) && !self.fin_sent)
+            || self.probe_due
+            || self.open_due()
+    }
+    fn open_due(&self) -> bool {
+        self.open_pending && !self.open_sent && self.written == 0
+    }
+    fn awaiting_peer(&self) -> bool {
+        !self.segments.is_empty() || self.needs_probe()
+    }
+    /// Nothing retained is in flight, yet the peer must still respond.
+    fn needs_probe(&self) -> bool {
+        self.segments.is_empty()
+            && ((self.open_pending && self.open_sent)
+                || (self.next < self.written && self.next >= self.limit))
+    }
+    fn threshold(&self, now: Instant) -> Duration {
+        self.rtt.high(now).mul_f64(self.reorder) + Duration::from_millis(2)
+    }
+    fn probe_interval(&self, now: Instant) -> Duration {
+        let base = self.rtt.high(now) * 2 + Duration::from_millis(20);
+        (base * 2u32.pow(self.probe_count.min(6))).min(MAX_PTO)
+    }
+    fn unschedule(&mut self, start: u64) {
+        let segment = &self.segments[&start];
+        match segment.deadline {
+            Some(at) => self.repeated.remove(&(at, start)),
+            None => self.fresh.remove(&(segment.sent_at, start)),
+        };
+    }
+    fn mark_lost(&mut self, start: u64) {
+        self.unschedule(start);
+        self.lost.insert(start);
+    }
+    fn send_segment(&mut self, start: u64, end: u64, now: Instant) -> Transmit {
+        let fin = self.fin.is_some_and(|f| end == f + 1);
+        let data_end = if fin { end - 1 } else { end };
+        let from = (start - self.base) as usize;
+        let to = (data_end - self.base) as usize;
+        let (head, tail) = self.buffer.as_slices();
+        let mut data = Vec::with_capacity(to - from);
+        if from < head.len() {
+            data.extend_from_slice(&head[from..to.min(head.len())]);
+        }
+        if to > head.len() {
+            data.extend_from_slice(&tail[from.saturating_sub(head.len())..to - head.len()]);
+        }
+        if self.segments.is_empty() {
+            // Failure detection measures from the first send into an empty flight.
+            self.last_progress = Some(now);
+        }
+        let threshold = self.threshold(now);
+        let progress = self.last_progress;
+        let segment = self.segments.entry(start).or_insert(Segment {
+            end,
+            sent_at: now,
+            transmissions: 0,
+            stalls: 0,
+            deadline: None,
+        });
+        if segment.transmissions > 0 {
+            let stalled = progress.is_none_or(|at| at <= segment.sent_at);
+            segment.stalls = if stalled { segment.stalls + 1 } else { 0 };
+        }
+        segment.sent_at = now;
+        segment.transmissions += 1;
+        let transmission = segment.transmissions;
+        if segment.stalls == 0 {
+            segment.deadline = None;
+            self.fresh.insert((now, start));
+        } else {
+            let backoff = 1.5f64.powi(segment.stalls as i32).min(16.0);
+            let at = now + threshold.mul_f64(backoff).min(MAX_PTO * 4);
+            segment.deadline = Some(at);
+            self.repeated.insert((at, start));
+        }
+        Transmit {
+            frame: Frame::Data {
+                offset: start,
+                fin,
+                data,
+            },
+            start,
+            transmission,
+            retransmission: transmission > 1,
+        }
+    }
+    pub fn poll_transmit(&mut self, now: Instant) -> Option<Transmit> {
+        if let Some(start) = self.lost.pop_first() {
+            let end = self.segments[&start].end;
+            return Some(self.send_segment(start, end, now));
+        }
+        if self.next < self.written && self.next < self.limit {
+            let len = (self.written - self.next)
+                .min(self.limit - self.next)
+                .min(MAX_SEGMENT as u64);
+            let start = self.next;
+            self.next += len;
+            let fin = self.fin == Some(self.next);
+            self.fin_sent |= fin;
+            self.open_sent = true;
+            return Some(self.send_segment(start, self.next + u64::from(fin), now));
+        }
+        if self.fin == Some(self.next) && !self.fin_sent {
+            self.fin_sent = true;
+            self.open_sent = true;
+            return Some(self.send_segment(self.next, self.next + 1, now));
+        }
+        if self.probe_due || self.open_due() {
+            // Zero-length data asks for an acknowledgment; it is not retained.
+            self.probe_due = false;
+            self.open_sent = true;
+            self.probe_at = Some(now);
+            self.last_progress.get_or_insert(now);
+            return Some(Transmit {
+                frame: Frame::Data {
+                    offset: self.next,
+                    fin: false,
+                    data: Vec::new(),
+                },
+                start: self.next,
+                transmission: 0,
+                retransmission: false,
+            });
+        }
+        None
+    }
+    /// A transmission left the local queue without admission. Retransmit it
+    /// unless a later transmission or an acknowledgment has superseded it.
+    pub fn locally_dropped(&mut self, start: u64, transmission: u32) -> bool {
+        if self
+            .segments
+            .get(&start)
+            .is_none_or(|s| s.transmissions != transmission)
+            || self.lost.contains(&start)
+        {
+            return false;
+        }
+        self.mark_lost(start);
+        true
+    }
+    /// Returns newly released retained bytes and whether the peer reported a
+    /// duplicate, or `None` for an acknowledgment of data never sent.
+    pub fn on_ack(&mut self, ack: &Ack, now: Instant) -> Option<(u64, bool)> {
+        let sent_end = self.next + u64::from(self.fin_sent && self.fin == Some(self.next));
+        if ack.cumulative > sent_end || ack.ranges.last().is_some_and(|r| r.1 > sent_end) {
+            return None;
+        }
+        self.open_pending = false;
+        self.probe_at = None;
+        let raised = ack.limit > self.limit;
+        self.limit = self.limit.max(ack.limit.min(MAX_OFFSET));
+        let cumulative = ack.cumulative.max(self.acked);
+        let mut delivered = Vec::new();
+        while let Some((&start, segment)) = self.segments.first_key_value() {
+            if start >= cumulative {
+                break;
+            }
+            if segment.end > cumulative {
+                // Boundaries are stable across retransmission, so a valid peer
+                // never acknowledges part of a segment. Keep the unacknowledged
+                // tail retransmittable rather than trust that.
+                let lost = self.lost.remove(&start);
+                if !lost {
+                    self.unschedule(start);
+                }
+                let segment = self.segments.remove(&start).expect("first segment");
+                self.segments.insert(cumulative, segment);
+                self.mark_lost(cumulative);
+                break;
+            }
+            self.unschedule_delivered(start);
+            delivered.push(self.segments.remove(&start).expect("first segment"));
+        }
+        for &(start, end) in &ack.ranges {
+            let covered: Vec<u64> = self
+                .segments
+                .range(start..end)
+                .filter(|(_, s)| s.end <= end)
+                .map(|(k, _)| *k)
+                .collect();
+            for key in covered {
+                self.unschedule_delivered(key);
+                delivered.push(self.segments.remove(&key).expect("covered segment"));
+            }
+        }
+        let progressed = !delivered.is_empty() || cumulative > self.acked || raised;
+        for segment in delivered {
+            if segment.transmissions == 1 {
+                self.rtt
+                    .sample(now.saturating_duration_since(segment.sent_at), now);
+            }
+            self.rack = Some(
+                self.rack
+                    .map_or(segment.sent_at, |r| r.max(segment.sent_at)),
+            );
+        }
+        let spurious = ack.duplicate_bytes > self.peer_duplicates;
+        if spurious {
+            self.peer_duplicates = ack.duplicate_bytes;
+            self.reorder = (self.reorder * 1.25).min(REORDER_MAX);
+        } else if progressed {
+            self.reorder = (self.reorder * 0.98).max(REORDER_BASE);
+        }
+        if progressed {
+            self.last_progress = Some(now);
+            self.probe_count = 0;
+        }
+        self.acked = cumulative;
+        let release_to = cumulative.min(self.written).max(self.base);
+        let released = release_to - self.base;
+        self.buffer.drain(..released as usize);
+        self.base = release_to;
+        if self.needs_probe() {
+            self.probe_at = Some(now);
+        }
+        self.detect_losses(now);
+        Some((released, spurious))
+    }
+    fn unschedule_delivered(&mut self, start: u64) {
+        if !self.lost.remove(&start) {
+            self.unschedule(start);
+        }
+    }
+    fn fresh_deadline(&self, sent_at: Instant, threshold: Duration) -> Instant {
+        if self.rack.is_some_and(|rack| sent_at < rack) {
+            sent_at + threshold
+        } else {
+            sent_at + threshold.mul_f64(1.5)
+        }
+    }
+    fn detect_losses(&mut self, now: Instant) {
+        let threshold = self.threshold(now);
+        // The oldest first transmission also has the earliest deadline.
+        while let Some(&(sent_at, start)) = self.fresh.first() {
+            if now < self.fresh_deadline(sent_at, threshold) {
+                break;
+            }
+            self.mark_lost(start);
+        }
+        while let Some(&(at, start)) = self.repeated.first() {
+            if now < at {
+                break;
+            }
+            self.mark_lost(start);
+        }
+    }
+    pub fn next_deadline(&self, now: Instant) -> Option<Instant> {
+        let threshold = self.threshold(now);
+        [
+            self.fresh
+                .first()
+                .map(|(sent_at, _)| self.fresh_deadline(*sent_at, threshold)),
+            self.repeated.first().map(|(at, _)| *at),
+            self.needs_probe()
+                .then(|| self.probe_at.map(|at| at + self.probe_interval(now)))
+                .flatten(),
+            self.awaiting_peer()
+                .then(|| self.last_progress.map(|at| at + DEAD_AFTER))
+                .flatten(),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
+    }
+    /// Returns true when a window or open probe became due.
+    pub fn on_timeout(&mut self, now: Instant) -> bool {
+        self.detect_losses(now);
+        if !self.needs_probe()
+            || self
+                .probe_at
+                .is_some_and(|at| now < at + self.probe_interval(now))
+        {
+            return false;
+        }
+        self.probe_due = true;
+        if self.open_pending {
+            self.open_sent = false;
+        }
+        self.probe_count += 1;
+        true
+    }
+}
+
+/// Why a receiving half rejected a frame. Either ends the stream with RESET.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Violation {
+    FlowControl,
+    FinalSize,
+}
+
+/// One reliable receiving half.
+pub struct Receiver {
+    cumulative: u64,
+    ranges: BTreeMap<u64, Vec<u8>>,
+    out_of_order: u64,
+    final_size: Option<u64>,
+    consumed: u64,
+    advertised: u64,
+    duplicates: u64,
+    unacknowledged: u32,
+    ack_due: Option<Instant>,
+    ack_now: bool,
+}
+impl Default for Receiver {
+    fn default() -> Self {
+        Self {
+            cumulative: 0,
+            ranges: BTreeMap::new(),
+            out_of_order: 0,
+            final_size: None,
+            consumed: 0,
+            advertised: INITIAL_WINDOW,
+            duplicates: 0,
+            unacknowledged: 0,
+            ack_due: None,
+            ack_now: false,
+        }
+    }
+}
+impl Receiver {
+    /// Accept a data frame; returns in-order bytes now ready for the application.
+    pub fn on_data(
+        &mut self,
+        offset: u64,
+        fin: bool,
+        data: Vec<u8>,
+        now: Instant,
+    ) -> Result<Vec<u8>, Violation> {
+        let end = offset + data.len() as u64;
+        if end > self.advertised {
+            return Err(Violation::FlowControl);
+        }
+        let highest = self
+            .ranges
+            .last_key_value()
+            .map_or(self.cumulative, |(k, v)| k + v.len() as u64);
+        if fin && (self.final_size.is_some_and(|f| f != end) || end < highest) {
+            return Err(Violation::FinalSize);
+        }
+        if self.final_size.is_some_and(|f| end > f) {
+            return Err(Violation::FinalSize);
+        }
+        if fin {
+            self.final_size = Some(end);
+        }
+        let mut ready = Vec::new();
+        let mut start = offset.max(self.cumulative);
+        let mut duplicate = start.min(end) - offset;
+        while start < end {
+            // Store only the gaps between existing ranges; overlaps are duplicates.
+            let covering = self
+                .ranges
+                .range(..=start)
+                .next_back()
+                .map(|(k, v)| (*k, k + v.len() as u64))
+                .filter(|(_, e)| *e > start);
+            if let Some((_, covered_end)) = covering {
+                let skip = covered_end.min(end) - start;
+                duplicate += skip;
+                start += skip;
+                continue;
+            }
+            let gap_end = self
+                .ranges
+                .range(start..)
+                .next()
+                .map_or(end, |(k, _)| (*k).min(end));
+            let piece = data[(start - offset) as usize..(gap_end - offset) as usize].to_vec();
+            if start == self.cumulative {
+                self.cumulative = gap_end;
+                ready.extend(piece);
+            } else {
+                self.out_of_order += piece.len() as u64;
+                self.ranges.insert(start, piece);
+            }
+            start = gap_end;
+        }
+        while let Some(entry) = self.ranges.first_entry() {
+            if *entry.key() != self.cumulative {
+                break;
+            }
+            let piece = entry.remove();
+            self.out_of_order -= piece.len() as u64;
+            self.cumulative += piece.len() as u64;
+            ready.extend(piece);
+        }
+        self.duplicates += duplicate;
+        self.unacknowledged += 1;
+        if data.is_empty() || fin || duplicate > 0 || self.unacknowledged >= ACK_EVERY {
+            self.ack_now = true;
+        } else {
+            self.ack_due.get_or_insert(now + ACK_DELAY);
+        }
+        Ok(ready)
+    }
+    /// The application consumed `bytes`; a larger window may be advertised.
+    pub fn consumed(&mut self, bytes: u64, window: u64) {
+        self.consumed += bytes;
+        if self.consumed + window >= self.advertised + window / 4 {
+            self.ack_now = true;
+        }
+    }
+    pub fn duplicates(&self) -> u64 {
+        self.duplicates
+    }
+    pub fn fin_received(&self) -> bool {
+        self.final_size == Some(self.cumulative)
+    }
+    pub fn finished(&self) -> bool {
+        self.final_size
+            .is_some_and(|f| self.consumed == f && self.cumulative == f)
+    }
+    /// Bytes held locally: delivered but unconsumed, plus out-of-order data.
+    pub fn buffered(&self) -> u64 {
+        self.cumulative - self.consumed + self.out_of_order
+    }
+    pub fn next_deadline(&self) -> Option<Instant> {
+        if self.ack_now { None } else { self.ack_due }
+    }
+    /// The acknowledgment could not be queued; send one at the next chance.
+    pub fn defer_ack(&mut self) {
+        self.ack_now = true;
+    }
+    pub fn ack_pending(&self, now: Instant) -> bool {
+        self.ack_now || self.ack_due.is_some_and(|at| now >= at)
+    }
+    pub fn take_ack(&mut self, now: Instant, window: u64) -> Option<Ack> {
+        if !self.ack_pending(now) {
+            return None;
+        }
+        self.ack_now = false;
+        self.ack_due = None;
+        self.unacknowledged = 0;
+        self.advertised = self.advertised.max(self.consumed + window.min(MAX_WINDOW));
+        let mut ranges: Vec<(u64, u64)> = Vec::new();
+        for (start, data) in &self.ranges {
+            let end = start + data.len() as u64;
+            if let Some(last) = ranges.last_mut()
+                && last.1 == *start
+            {
+                last.1 = end;
+            } else if ranges.len() == MAX_RANGES {
+                break;
+            } else {
+                ranges.push((*start, end));
+            }
+        }
+        Some(Ack {
+            cumulative: self.cumulative + u64::from(self.fin_received()),
+            limit: self.advertised,
+            duplicate_bytes: self.duplicates,
+            ranges,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn data(frame: &Frame) -> (u64, bool, Vec<u8>) {
+        match frame {
+            Frame::Data { offset, fin, data } => (*offset, *fin, data.clone()),
+            other => panic!("expected data, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn frames_round_trip_and_malformed_input_is_rejected() {
+        let frames = [
+            Frame::Data {
+                offset: 7,
+                fin: true,
+                data: vec![1, 2, 3],
+            },
+            Frame::Data {
+                offset: 0,
+                fin: false,
+                data: Vec::new(),
+            },
+            Frame::Ack(Ack {
+                cumulative: 10,
+                limit: 99,
+                duplicate_bytes: 4,
+                ranges: vec![(12, 15), (20, 21)],
+            }),
+            Frame::Reset,
+        ];
+        for frame in frames {
+            assert_eq!(Frame::decode(&frame.encode()), Some(frame));
+        }
+        let full = Frame::Data {
+            offset: 0,
+            fin: false,
+            data: vec![9; MAX_SEGMENT],
+        }
+        .encode();
+        assert_eq!(full.len(), MAX_PAYLOAD);
+        let ranges = (0..MAX_RANGES as u64)
+            .map(|i| (2 * i + 1, 2 * i + 2))
+            .collect();
+        let ack = Frame::Ack(Ack {
+            cumulative: 0,
+            limit: 1,
+            duplicate_bytes: 0,
+            ranges,
+        })
+        .encode();
+        assert!(ack.len() <= MAX_PAYLOAD);
+        // Adjacent or overlapping ranges, unknown bits and trailing bytes are invalid.
+        let mut adjacent = Frame::Ack(Ack {
+            cumulative: 10,
+            limit: 0,
+            duplicate_bytes: 0,
+            ranges: vec![(12, 15), (20, 21)],
+        })
+        .encode();
+        adjacent[ACK_HEADER + 8..ACK_HEADER + 12].copy_from_slice(&5u32.to_be_bytes());
+        assert_eq!(Frame::decode(&adjacent), None);
+        let mut touching = Frame::Ack(Ack {
+            cumulative: 10,
+            limit: 0,
+            duplicate_bytes: 0,
+            ranges: vec![(12, 15)],
+        })
+        .encode();
+        touching[ACK_HEADER..ACK_HEADER + 4].copy_from_slice(&0u32.to_be_bytes());
+        assert_eq!(Frame::decode(&touching), None);
+        assert_eq!(Frame::decode(&[DATA, 4, 0, 0, 0, 0, 0, 0, 0, 0]), None);
+        assert_eq!(Frame::decode(&[RESET, 0]), None);
+        assert_eq!(Frame::decode(&[9]), None);
+        assert_eq!(Frame::decode(&[]), None);
+        assert_eq!(stream_id(data_flow(5)), Some(5));
+        assert_eq!(stream_id(ack_flow(5)), Some(5));
+        assert_eq!(stream_id(5), None);
+    }
+
+    /// Lossy, reordering channel. Record deduplication happens below streams.
+    struct Link {
+        seed: u64,
+    }
+    impl Link {
+        fn next(&mut self) -> u64 {
+            self.seed ^= self.seed << 13;
+            self.seed ^= self.seed >> 7;
+            self.seed ^= self.seed << 17;
+            self.seed
+        }
+    }
+
+    fn transfer(size: usize, loss: u64, seed: u64) -> (Snapshot, Duration) {
+        let payload: Vec<u8> = (0..size).map(|i| (i * 31 % 251) as u8).collect();
+        let mut sender = Sender::new(false);
+        let mut receiver = Receiver::default();
+        let mut link = Link { seed };
+        let start = Instant::now();
+        let mut now = start;
+        let mut supplied = 0;
+        let mut output = Vec::new();
+        // (arrival, frame) in flight each way. Paths differ: 10 ms or 40 ms.
+        let mut forward: Vec<(Instant, Frame)> = Vec::new();
+        let mut backward: Vec<(Instant, Frame)> = Vec::new();
+        let mut stats = Snapshot::default();
+        let step = Duration::from_micros(250);
+        while !(sender.finished() && receiver.finished()) {
+            assert!(now - start < Duration::from_secs(120), "transfer stalled");
+            let window = 512 * 1024;
+            let room = (sender.limit() + 64 * 1024).saturating_sub(sender.written());
+            let n = (room as usize).min(payload.len() - supplied).min(64 * 1024);
+            if n > 0 {
+                sender.push(&payload[supplied..supplied + n]);
+                supplied += n;
+            }
+            if supplied == payload.len() {
+                sender.finish();
+            }
+            // At most four segments per 250 us, about 127 Mbit/s.
+            for _ in 0..4 {
+                let Some(t) = sender.poll_transmit(now) else {
+                    break;
+                };
+                stats.segments_sent += 1;
+                if t.retransmission {
+                    stats.retransmitted_segments += 1;
+                }
+                if link.next() % 100 < loss {
+                    continue;
+                }
+                let delay = if link.next().is_multiple_of(2) {
+                    10
+                } else {
+                    40
+                };
+                forward.push((now + Duration::from_millis(delay), t.frame.clone()));
+            }
+            if sender.next_deadline(now).is_some_and(|at| now >= at) && sender.on_timeout(now) {
+                stats.probe_timeouts += 1;
+            }
+            forward.sort_by_key(|(at, _)| *at);
+            while forward.first().is_some_and(|(at, _)| *at <= now) {
+                let (offset, fin, bytes) = data(&forward.remove(0).1);
+                let ready = receiver
+                    .on_data(offset, fin, bytes, now)
+                    .expect("valid data");
+                output.extend(ready);
+            }
+            let consumed = output.len() as u64 - (receiver.consumed);
+            receiver.consumed(consumed, window);
+            if let Some(ack) = receiver.take_ack(now, window)
+                && link.next() % 100 >= loss
+            {
+                backward.push((now + Duration::from_millis(10), Frame::Ack(ack)));
+            }
+            while backward.first().is_some_and(|(at, _)| *at <= now) {
+                let Frame::Ack(ack) = backward.remove(0).1 else {
+                    unreachable!()
+                };
+                let (_, spurious) = sender.on_ack(&ack, now).expect("valid ack");
+                stats.spurious_retransmit_reports += u64::from(spurious);
+            }
+            now += step;
+        }
+        assert_eq!(output, payload, "stream integrity");
+        assert!(sender.retained_from() == payload.len() as u64);
+        (stats, now - start)
+    }
+
+    #[test]
+    fn lossy_reordering_multipath_transfer_is_exact_and_bounded() {
+        // Bounds are about six times the deterministic results of this model.
+        for (loss, seed, bound) in [(0, 1, 200), (2, 2, 2_000), (10, 3, 3_500), (30, 4, 10_000)] {
+            let (stats, elapsed) = transfer(600_000, loss, seed);
+            if loss == 0 {
+                assert_eq!(stats.retransmitted_segments, 0, "no loss, no retransmit");
+            }
+            assert!(
+                stats.segments_sent <= 607 + 607 * loss / 10,
+                "loss {loss}: {}",
+                stats.segments_sent
+            );
+            assert!(
+                elapsed < Duration::from_millis(bound),
+                "loss {loss}: {elapsed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn empty_streams_announce_reliably_and_finish() {
+        let t0 = Instant::now();
+        let mut sender = Sender::new(true);
+        let first = sender.poll_transmit(t0).expect("open");
+        assert_eq!(data(&first.frame), (0, false, Vec::new()));
+        assert!(sender.poll_transmit(t0).is_none());
+        // The open was lost; the probe timeout repeats it.
+        let deadline = sender.next_deadline(t0).expect("open timer");
+        assert!(sender.on_timeout(deadline));
+        let again = sender.poll_transmit(deadline).expect("open repeated");
+        assert_eq!(data(&again.frame), (0, false, Vec::new()));
+        let mut receiver = Receiver::default();
+        assert!(
+            receiver
+                .on_data(0, false, Vec::new(), deadline)
+                .unwrap()
+                .is_empty()
+        );
+        let ack = receiver
+            .take_ack(deadline, INITIAL_WINDOW)
+            .expect("immediate ack");
+        sender.on_ack(&ack, deadline).unwrap();
+        assert!(
+            sender.next_deadline(deadline).is_none(),
+            "acknowledged open stops probing"
+        );
+        sender.finish();
+        let fin = sender.poll_transmit(deadline).unwrap();
+        assert_eq!(data(&fin.frame), (0, true, Vec::new()));
+        let (offset, fin_flag, bytes) = data(&fin.frame);
+        receiver.on_data(offset, fin_flag, bytes, deadline).unwrap();
+        assert!(receiver.fin_received() && receiver.finished());
+        let ack = receiver.take_ack(deadline, INITIAL_WINDOW).unwrap();
+        assert_eq!(ack.cumulative, 1);
+        sender.on_ack(&ack, deadline).unwrap();
+        assert!(sender.finished());
+    }
+
+    #[test]
+    fn window_limits_sending_and_closed_window_is_probed() {
+        let t0 = Instant::now();
+        let mut sender = Sender::new(false);
+        sender.push(&vec![1; INITIAL_WINDOW as usize + 5000]);
+        let mut receiver = Receiver::default();
+        let mut sent = 0;
+        while let Some(t) = sender.poll_transmit(t0) {
+            let (offset, fin, bytes) = data(&t.frame);
+            sent += bytes.len() as u64;
+            receiver.on_data(offset, fin, bytes, t0).unwrap();
+        }
+        assert_eq!(sent, INITIAL_WINDOW);
+        // Data past the advertised window is a violation.
+        assert_eq!(
+            receiver.on_data(INITIAL_WINDOW, false, vec![0], t0),
+            Err(Violation::FlowControl)
+        );
+        // Everything is acknowledged but the application consumed nothing.
+        let ack = receiver.take_ack(t0, 0).unwrap();
+        assert_eq!(ack.limit, INITIAL_WINDOW);
+        sender.on_ack(&ack, t0).unwrap();
+        assert!(!sender.has_transmit());
+        let deadline = sender.next_deadline(t0).expect("window probe timer");
+        assert!(sender.on_timeout(deadline));
+        let probe = sender.poll_transmit(deadline).unwrap();
+        assert_eq!(data(&probe.frame), (INITIAL_WINDOW, false, Vec::new()));
+        receiver.consumed(INITIAL_WINDOW, INITIAL_WINDOW);
+        let (offset, fin, bytes) = data(&probe.frame);
+        receiver.on_data(offset, fin, bytes, deadline).unwrap();
+        let ack = receiver.take_ack(deadline, INITIAL_WINDOW).unwrap();
+        assert_eq!(ack.limit, 2 * INITIAL_WINDOW);
+        sender.on_ack(&ack, deadline).unwrap();
+        assert!(sender.has_transmit());
+    }
+
+    #[test]
+    fn selective_ack_retransmits_only_the_gap_after_the_reorder_threshold() {
+        let t0 = Instant::now();
+        let mut sender = Sender::new(false);
+        sender.push(&vec![3; 4 * MAX_SEGMENT]);
+        let mut segments = Vec::new();
+        for i in 0..4 {
+            segments.push(sender.poll_transmit(t0 + Duration::from_millis(i)).unwrap());
+        }
+        let mut receiver = Receiver::default();
+        let at = t0 + Duration::from_millis(20);
+        for t in segments.iter().skip(1) {
+            let (offset, fin, bytes) = data(&t.frame);
+            receiver.on_data(offset, fin, bytes, at).unwrap();
+        }
+        let ack = receiver.take_ack(at + ACK_DELAY, INITIAL_WINDOW).unwrap();
+        assert_eq!(ack.cumulative, 0);
+        assert_eq!(
+            ack.ranges,
+            vec![(MAX_SEGMENT as u64, 4 * MAX_SEGMENT as u64)]
+        );
+        sender.on_ack(&ack, at).unwrap();
+        // Not yet: the first segment may still be on a slower path.
+        assert!(sender.poll_transmit(at).is_none());
+        let deadline = sender.next_deadline(at).unwrap();
+        assert!(deadline > at);
+        sender.on_timeout(deadline);
+        let repair = sender.poll_transmit(deadline).unwrap();
+        assert!(repair.retransmission);
+        assert_eq!(data(&repair.frame).0, 0);
+        assert!(
+            sender.poll_transmit(deadline).is_none(),
+            "acknowledged ranges stay acknowledged"
+        );
+        // A duplicate report widens the reorder threshold.
+        let (offset, fin, bytes) = data(&segments[0].frame);
+        receiver
+            .on_data(offset, fin, bytes.clone(), deadline)
+            .unwrap();
+        receiver.on_data(offset, fin, bytes, deadline).unwrap();
+        let before = sender.threshold(deadline);
+        let ack = receiver.take_ack(deadline, INITIAL_WINDOW).unwrap();
+        assert_eq!(ack.cumulative, 4 * MAX_SEGMENT as u64);
+        let (released, spurious) = sender.on_ack(&ack, deadline).unwrap();
+        assert_eq!((released, spurious), (4 * MAX_SEGMENT as u64, true));
+        assert!(sender.threshold(deadline) > before);
+    }
+
+    #[test]
+    fn local_drop_retransmits_only_the_current_transmission() {
+        let t0 = Instant::now();
+        let mut sender = Sender::new(false);
+        sender.push(&[5; 100]);
+        let first = sender.poll_transmit(t0).unwrap();
+        assert!(sender.locally_dropped(first.start, first.transmission));
+        assert!(
+            !sender.locally_dropped(first.start, first.transmission),
+            "already queued"
+        );
+        let second = sender.poll_transmit(t0).unwrap();
+        assert!(second.retransmission);
+        assert!(
+            !sender.locally_dropped(first.start, first.transmission),
+            "stale report"
+        );
+    }
+
+    #[test]
+    fn receiver_rejects_final_size_changes_and_counts_duplicates() {
+        let t0 = Instant::now();
+        let mut receiver = Receiver::default();
+        assert_eq!(
+            receiver.on_data(10, false, vec![1; 10], t0).unwrap(),
+            Vec::<u8>::new()
+        );
+        assert_eq!(
+            receiver.on_data(5, true, vec![1; 3], t0),
+            Err(Violation::FinalSize)
+        );
+        assert_eq!(
+            receiver.on_data(0, false, vec![2; 15], t0).unwrap().len(),
+            20
+        );
+        assert_eq!(receiver.duplicates(), 5);
+        assert_eq!(receiver.on_data(20, true, vec![3; 5], t0).unwrap().len(), 5);
+        assert_eq!(
+            receiver.on_data(26, false, vec![1], t0),
+            Err(Violation::FinalSize)
+        );
+        assert!(receiver.fin_received());
+        assert!(!receiver.finished(), "nothing consumed yet");
+        receiver.consumed(25, INITIAL_WINDOW);
+        assert!(receiver.finished());
+    }
+
+    #[test]
+    fn invalid_acknowledgments_are_rejected() {
+        let t0 = Instant::now();
+        let mut sender = Sender::new(false);
+        sender.push(&[1; 10]);
+        sender.poll_transmit(t0).unwrap();
+        let beyond = Ack {
+            cumulative: 11,
+            limit: 0,
+            duplicate_bytes: 0,
+            ranges: Vec::new(),
+        };
+        assert!(sender.on_ack(&beyond, t0).is_none());
+        let ranged = Ack {
+            cumulative: 0,
+            limit: 0,
+            duplicate_bytes: 0,
+            ranges: vec![(5, 12)],
+        };
+        assert!(sender.on_ack(&ranged, t0).is_none());
+    }
+
+    #[test]
+    fn unacknowledged_streams_fail_after_bounded_retransmission() {
+        let start = Instant::now();
+        let mut now = start;
+        let mut sender = Sender::new(false);
+        sender.push(&[1; 10]);
+        sender.poll_transmit(now).unwrap();
+        let mut transmissions = 1;
+        while !sender.failed(now) {
+            now = sender.next_deadline(now).expect("retransmission timer");
+            sender.on_timeout(now);
+            if sender.poll_transmit(now).is_some() {
+                transmissions += 1;
+            }
+        }
+        assert!(now - start >= DEAD_AFTER && now - start < DEAD_AFTER + MAX_PTO * 4);
+        assert!((5..20).contains(&transmissions), "{transmissions}");
+    }
+}

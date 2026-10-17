@@ -81,11 +81,12 @@ Current protocol, commands and limits: [experimental runtime](runtime.md). Check
 
 ## M4 — Reliable flows and application adapters
 
-- [ ] Selective application ACKs, bounded retransmission and receiver credit, without synthesizing QUIC ACKs for FEC recovery.
-- [ ] Per-flow offsets, reassembly bounds, FIN/final-offset acknowledgment, reset and half-close.
-- [ ] Preserve reliable-flow acknowledgment/reassembly state across path changes and define terminal delivery failure; the existing datagram reconnection lifecycle is not a reliable-flow implementation.
+- [x] Selective application ACKs, bounded retransmission and receiver credit, without synthesizing QUIC ACKs for FEC recovery.
+- [x] Per-flow offsets, reassembly bounds, FIN/final-offset acknowledgment, reset and half-close.
+- [x] Preserve reliable-flow acknowledgment/reassembly state across path changes and define terminal delivery failure (30 s without acknowledgment progress); a new session epoch still resets every stream.
 - [x] UDP forwarding to a fixed target with explicit 1,000-byte maximum messages.
-- [ ] TCP forwarding on the reliable-flow service.
+- [x] TCP forwarding to a fixed target on the reliable-flow service ([design](reliable-streams.md)).
+- [ ] SOCKS5 and HTTP CONNECT entrances with per-stream destinations and destination authorization.
 - [ ] Compare FEC with the no-FEC reliable baseline; verify bytes, completion, timeout rates and latency under bulk/interactive coexistence.
 
 **Exit gate:** reliable-stream correctness and the selected latency/goodput targets pass. A UDP delivery metric cannot substitute for this gate.

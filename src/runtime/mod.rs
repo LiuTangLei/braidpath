@@ -1,4 +1,4 @@
-//! Experimental authenticated HTTP/3 datagram transport. No reliable stream service.
+//! Experimental authenticated HTTP/3 datagram transport with optional reliable TCP streams.
 pub mod adaptive;
 pub mod capacity_probe;
 pub mod cli;
@@ -12,6 +12,7 @@ pub mod scheduler;
 pub mod sender_frontier;
 mod shutdown;
 pub mod stats;
+pub mod stream;
 pub mod trace;
 pub mod transport;
 pub mod tunnel;

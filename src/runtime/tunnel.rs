@@ -3,7 +3,7 @@ use super::{
     sender_frontier::{self, Gate},
     shutdown::Shutdown,
     stats::{self, Scope},
-    trace, transport,
+    stream, trace, transport,
     wire::{self, Receiver, Record},
 };
 #[cfg(test)]
@@ -26,7 +26,7 @@ use std::{
 };
 use subtle::ConstantTimeEq;
 use tokio::{
-    net::UdpSocket,
+    net::{TcpListener, UdpSocket},
     sync::{Notify, Semaphore, mpsc, watch},
     task::JoinSet,
     time::{MissedTickBehavior, interval, timeout},
@@ -46,11 +46,14 @@ mod mixed_fec_tests;
 #[cfg(test)]
 mod repair_usefulness_tests;
 mod small_delivery;
+mod tcp;
 
 const WEBSITE: &str = "<!doctype html><html lang=\"en\"><meta charset=\"utf-8\"><title>Welcome</title><h1>Welcome</h1><p>This service is online.</p></html>\n";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Policy {
+    /// Reliable TCP streams negotiated for this session.
+    pub streams: bool,
     pub adaptive: bool,
     pub capacity_probe_bps: u64,
     pub probe_guided_recovery: bool,
@@ -477,6 +480,8 @@ fn measured_payload(
 struct QueuedRecord {
     record: Record,
     created: Instant,
+    /// Reliable-stream backpressure; released with the queued original.
+    hold: Option<Arc<outbound::Hold>>,
 }
 
 #[derive(Clone)]
@@ -524,6 +529,7 @@ fn enqueue_symbol(
         blocks,
         None,
         metrics,
+        &mut None,
     );
 }
 
@@ -535,7 +541,15 @@ fn enqueue_encoded(
     policy: &Policy,
     metrics: &Scope,
 ) {
-    enqueue_coded_symbol(symbol, created, queue, blocks, Some(policy), metrics);
+    enqueue_coded_symbol(
+        symbol,
+        created,
+        queue,
+        blocks,
+        Some(policy),
+        metrics,
+        &mut None,
+    );
 }
 
 fn encode_input(
@@ -546,7 +560,11 @@ fn encode_input(
     blocks: &mut BTreeMap<u64, BlockSend>,
     metrics: &Scope,
 ) {
-    let QueuedRecord { record, created } = input;
+    let QueuedRecord {
+        record,
+        created,
+        mut hold,
+    } = input;
     if created.elapsed() >= policy.admission_lifetime() {
         metrics.trace_record(
             trace::Stage::RecordDropped,
@@ -564,7 +582,15 @@ fn encode_input(
     match encoder.encode(&record, Instant::now()) {
         Ok(symbols) => {
             for symbol in symbols {
-                enqueue_encoded(symbol, created, queue, blocks, policy, metrics);
+                enqueue_coded_symbol(
+                    symbol,
+                    created,
+                    queue,
+                    blocks,
+                    Some(policy),
+                    metrics,
+                    &mut hold,
+                );
             }
         }
         Err(_) => {
@@ -586,6 +612,7 @@ fn enqueue_coded_symbol(
     blocks: &mut BTreeMap<u64, BlockSend>,
     policy: Option<&Policy>,
     metrics: &Scope,
+    hold: &mut Option<Arc<outbound::Hold>>,
 ) {
     let coding::EncodedSymbol { data, small } = symbol;
     let mixed = policy.is_some_and(|p| p.mixed_fec);
@@ -689,6 +716,11 @@ fn enqueue_coded_symbol(
         flow,
         block,
         small,
+        hold: if record_id.is_some() {
+            hold.take()
+        } else {
+            None
+        },
     };
     let accepted = !skipped && queue.push(pending).is_ok();
     if !accepted
@@ -1189,6 +1221,9 @@ impl SendAccounting<'_> {
             at,
         } = admission;
         let sent = self.queue.pop(repair).expect("admitted front");
+        if let Some(hold) = &sent.hold {
+            hold.admitted();
+        }
         debug_assert_eq!(sent.created, front.created);
         debug_assert_eq!(sent.record_id, front.record_id);
         debug_assert_eq!(sent.block, front.block);
@@ -1530,16 +1565,29 @@ async fn sender(
                     &mut pacer,
                     &mut groups,
                 );
-                let Some(QueuedRecord { record, created }) = item else {
+                let Some(QueuedRecord {
+                    record,
+                    created,
+                    hold,
+                }) = item
+                else {
                     break;
                 };
                 metrics.update(|d| d.records.sender_input_consumed += 1);
                 metrics.trace_record(trace::Stage::SenderInput, &record, None, None);
                 if created.elapsed() < lifetime && queue.would_be_full(record.flow) {
-                    deferred_input = Some(QueuedRecord { record, created });
+                    deferred_input = Some(QueuedRecord {
+                        record,
+                        created,
+                        hold,
+                    });
                 } else {
                     encode_input(
-                        QueuedRecord { record, created },
+                        QueuedRecord {
+                            record,
+                            created,
+                            hold,
+                        },
                         &mut encoder,
                         &policy,
                         &mut queue,
@@ -2498,6 +2546,7 @@ fn enqueue_record(
     created: Instant,
     scope: &Scope,
     small_threshold: usize,
+    hold: Option<Arc<outbound::Hold>>,
 ) -> bool {
     let mut assigned_event = None;
     scope.trace_with(|context, capture| {
@@ -2514,7 +2563,11 @@ fn enqueue_record(
     let payload_bytes = record.payload.len();
     let result = ingress::try_send(
         tx,
-        QueuedRecord { record, created },
+        QueuedRecord {
+            record,
+            created,
+            hold,
+        },
         payload_bytes,
         small_threshold,
     );
@@ -2705,10 +2758,18 @@ struct Session {
 }
 type Sessions = Arc<Mutex<HashMap<String, Arc<Session>>>>;
 
+async fn stream_wake(streams: &mut Option<tcp::Mux>) -> tcp::Wake {
+    match streams {
+        Some(streams) => streams.wake().await,
+        None => std::future::pending().await,
+    }
+}
+
 async fn session_loop(
     session: Arc<Session>,
     mut events: mpsc::Receiver<Event>,
-    target: SocketAddr,
+    target: Option<SocketAddr>,
+    tcp_target: Option<SocketAddr>,
 ) {
     let (tx, rx) = mpsc::channel(QUEUE);
     let mut tasks = JoinSet::new();
@@ -2737,6 +2798,10 @@ async fn session_loop(
         ),
     );
     let mut flows: HashMap<u32, (Arc<UdpSocket>, Instant)> = HashMap::new();
+    let mut streams = tcp_target
+        .filter(|_| session.policy.streams)
+        .map(|target| tcp::Mux::server(target, &session.policy, session.returning.clone()));
+    let small_threshold = ingress::small_threshold(&session.policy);
     let mut next_id = 0u64;
     let mut tick = interval(Duration::from_secs(5));
     let mut dropped = 0u64;
@@ -2760,7 +2825,9 @@ async fn session_loop(
                     let records=receive_records(&mut decoder,&session.forward,pid,&data);
                     let decoded=Instant::now();
                     for r in records {
+                        if let Some(mux)=streams.as_mut() && stream::stream_id(r.flow).is_some() {mux.receive(r);continue}
                         if !flows.contains_key(&r.flow) {
+                            let Some(target)=target else{dropped+=delivery.socket_error(pid,&r);continue};
                             if flows.len()>=MAX_FLOWS{dropped+=1;session.forward.trace_record(trace::Stage::RecordDropped,&r,None,Some(trace::Reason::FlowLimit));session.forward.update(|d|d.records.udp_target_flow_dropped+=1);session.forward.path(pid,|p|p.udp_target_flow_dropped+=1);continue}
                             let bind=if target.is_ipv4(){"0.0.0.0:0"}else{"[::]:0"};
                             let Ok(socket)=UdpSocket::bind(bind).await else{dropped+=delivery.socket_error(pid,&r);continue};
@@ -2793,16 +2860,21 @@ async fn session_loop(
                             dropped+=delivery.send(socket,None,r,pid,decoded);
                         }
                     }
+                    if let Some(mux)=streams.as_mut() {mux.flush(&mut tcp::Out{tx:&tx,next_id:&mut next_id,scope:&session.returning,small_threshold});}
                 },
                 Some(Event::Reply(flow,payload,created))=>{
                     let Some((_,last))=flows.get_mut(&flow) else{trace_payload(&session.returning,trace::Stage::RecordDropped,&payload,Some(trace::Reason::FlowUnavailable));session.returning.update(|d|d.records.application_unavailable_dropped+=1);continue}; *last=Instant::now();
                     let Some(id)=next_id.checked_add(1) else{break}; next_id=id;
-                    if !enqueue_record(&tx,Record{flow,id,payload},created,&session.returning,ingress::small_threshold(&session.policy)){dropped+=1;}else{session.returning.update(|d|d.records.sender_queue_enqueued+=1);}
+                    if !enqueue_record(&tx,Record{flow,id,payload},created,&session.returning,ingress::small_threshold(&session.policy),None){dropped+=1;}else{session.returning.update(|d|d.records.sender_queue_enqueued+=1);}
                 },
                 None=>break,
-            }
+            },
+            wake=stream_wake(&mut streams)=>streams.as_mut().expect("stream adapter").handle(wake,&mut tcp::Out{tx:&tx,next_id:&mut next_id,scope:&session.returning,small_threshold}),
         }
         while tasks.try_join_next().is_some() {}
+    }
+    if let Some(mux) = streams.as_mut() {
+        mux.close_all();
     }
     dropped += delivery.close();
     decoder.close_retention();
@@ -2862,7 +2934,10 @@ pub struct ServerOptions {
     pub cert: std::path::PathBuf,
     pub key: std::path::PathBuf,
     pub token: std::path::PathBuf,
-    pub target: SocketAddr,
+    /// UDP destination for datagram flows.
+    pub target: Option<SocketAddr>,
+    /// TCP destination for reliable streams; enables stream negotiation.
+    pub tcp_target: Option<SocketAddr>,
     pub max_rate: u64,
     pub congestion: transport::Congestion,
     pub datagram_send_buffer_bytes: usize,
@@ -2881,6 +2956,10 @@ pub async fn serve_with_ack_request(
         (64_000..=1_000_000_000).contains(&options.max_rate),
         "invalid server rate"
     );
+    ensure!(
+        options.target.is_some() || options.tcp_target.is_some(),
+        "configure a UDP target, a TCP target, or both"
+    );
     let endpoint = transport::server_with_ack_request(
         options.bind,
         &options.cert,
@@ -2896,7 +2975,7 @@ pub async fn serve_with_ack_request(
     let mut maintenance = interval(Duration::from_secs(1));
     let mut shutdown = Shutdown::new();
     options.stats.readiness(true, 0);
-    info!(address=%endpoint.local_addr()?,target=%options.target,congestion=?options.congestion,?ack_request,"HTTP/3 server ready");
+    info!(address=%endpoint.local_addr()?,target=?options.target,tcp_target=?options.tcp_target,congestion=?options.congestion,?ack_request,"HTTP/3 server ready");
     loop {
         tokio::select! {
             _=shutdown.wait()=>break,
@@ -2914,7 +2993,7 @@ pub async fn serve_with_ack_request(
             incoming=endpoint.accept()=>{
                 let Some(incoming)=incoming else{break};
                 let Ok(permit)=limit.clone().try_acquire_owned() else{incoming.refuse();continue};
-                let sessions=sessions.clone(); let secret=secret.clone(); let target=options.target; let settings=ServerSessionSettings{max_rate:options.max_rate,adaptive_fec_retention:options.adaptive_fec_retention}; let metrics=options.stats.clone();
+                let sessions=sessions.clone(); let secret=secret.clone(); let target=options.target; let settings=ServerSessionSettings{max_rate:options.max_rate,adaptive_fec_retention:options.adaptive_fec_retention,tcp_target:options.tcp_target}; let metrics=options.stats.clone();
                 tasks.spawn(async move {
                     let _permit=permit;
                     let mut diagnostic=stats::ConnectionTrace::new(metrics.clone(),incoming.remote_address(),None,"incoming");
@@ -2977,13 +3056,14 @@ pub async fn serve_with_ack_request(
 struct ServerSessionSettings {
     max_rate: u64,
     adaptive_fec_retention: bool,
+    tcp_target: Option<SocketAddr>,
 }
 
 async fn server_connection(
     incoming: quinn::Incoming,
     sessions: Sessions,
     secret: Arc<String>,
-    target: SocketAddr,
+    target: Option<SocketAddr>,
     settings: ServerSessionSettings,
     metrics: stats::Metrics,
     diagnostic: &mut stats::ConnectionTrace,
@@ -2991,6 +3071,7 @@ async fn server_connection(
     let ServerSessionSettings {
         max_rate,
         adaptive_fec_retention,
+        tcp_target,
     } = settings;
     let conn = timeout(Duration::from_secs(5), incoming).await??;
     diagnostic.handshake_succeeded(&conn);
@@ -3081,7 +3162,11 @@ async fn server_connection(
                     let small_fec_bytes=req.headers().get("braidpath-small-fec-bytes").map(|v|v.to_str()).transpose()?.unwrap_or("0").parse::<u16>()?;
                     let mixed_fec=mixed_fec_header(req.headers())?;
                     let fec_repairs=fec_repairs_header(req.headers())?;
-                    let policy=Policy{fec_repairs,small_fec_bytes,mixed_fec,probe_guided_recovery,capacity_probe_bps,adaptive:quality_schedule==Some("adaptive"),latency_target_ms,group_rates,quality_schedule:quality_schedule.is_some(),receiver_feedback:feedback.is_some(),fec:header("braidpath-fec")?.parse()?,redundancy:header("braidpath-redundancy")?.parse()?,rate,block_ms:header("braidpath-block-ms")?.parse()?,queue_ms:header("braidpath-queue-ms")?.parse()?};policy.validate()?;
+                    let streams=req.headers().get("braidpath-streams").map(|v|v.to_str()).transpose()?;
+                    ensure!(streams.is_none() || streams==Some("1"),"unsupported stream version");
+                    ensure!(streams.is_none() || tcp_target.is_some(),"TCP streams are not enabled on this server");
+                    let streams=streams.is_some();
+                    let policy=Policy{streams,fec_repairs,small_fec_bytes,mixed_fec,probe_guided_recovery,capacity_probe_bps,adaptive:quality_schedule==Some("adaptive"),latency_target_ms,group_rates,quality_schedule:quality_schedule.is_some(),receiver_feedback:feedback.is_some(),fec:header("braidpath-fec")?.parse()?,redundancy:header("braidpath-redundancy")?.parse()?,rate,block_ms:header("braidpath-block-ms")?.parse()?,queue_ms:header("braidpath-queue-ms")?.parse()?};policy.validate()?;
                     let rejoin=req.headers().get("braidpath-rejoin").is_some_and(|v|v=="1");
                     let stream_id=stream.id().into_inner();
                     // Membership and idle expiry share one map -> paths -> generation lock order.
@@ -3100,7 +3185,7 @@ async fn server_connection(
                                 let observation_notify=policy.adaptive.then(||Arc::new(Notify::new()));
                                 let session=Arc::new(Session{adaptive_fec_retention,generations:Mutex::new([None;MAX_PATHS]),empty_since:Mutex::new(Some(Instant::now())),events:tx,paths:Arc::new(Mutex::new(Vec::new())),stop,policy,observation_notify,ingress_drops:Arc::new(AtomicU64::new(0)),forward:metrics.scope(&sid,stats::FORWARD),returning:metrics.scope(&sid,stats::RETURN),finished:tokio::sync::Notify::new(),done:std::sync::atomic::AtomicBool::new(false)});
                                 map.insert(sid.clone(),session.clone());
-                                tokio::spawn(session_loop(session.clone(),rx,target));
+                                tokio::spawn(session_loop(session.clone(),rx,target,tcp_target));
                                 session
                             };
                             {
@@ -3134,6 +3219,7 @@ async fn server_connection(
                     let mut response=Response::builder().status(200).header("braidpath-version","1").header("braidpath-max-payload",MAX_PAYLOAD);if feedback.is_some(){response=response.header("braidpath-feedback","2");}
                     if small_fec_bytes>0 {response=response.header("braidpath-small-fec-bytes",small_fec_bytes);}
                     if mixed_fec {response=response.header("braidpath-mixed-fec","1");}
+                    if streams {response=response.header("braidpath-streams","1");}
                     if fec_repairs==2 {response=response.header("braidpath-fec-repairs","2");}
                     if capacity_probe_bps>0 {response=response.header("braidpath-capacity-probe-bps",capacity_probe_bps).header("braidpath-capacity-probe-format",capacity_probe::FORMAT);}
                     if probe_guided_recovery {response=response.header("braidpath-probe-guided-recovery","1");}
@@ -3222,6 +3308,8 @@ pub struct ClientOptions {
     pub adaptive_fec_retention: bool,
     pub rotate_source_port: bool,
     pub listen: SocketAddr,
+    /// Local TCP listener; each connection becomes one reliable stream.
+    pub tcp_listen: Option<SocketAddr>,
     pub entrances: Vec<SocketAddr>,
     pub interfaces: Vec<String>,
     pub path_binds: Vec<SocketAddr>,
@@ -3281,10 +3369,22 @@ pub async fn client(options: ClientOptions) -> Result<()> {
             .all(|id| usize::from(*id) < MAX_PATHS),
         "invalid bottleneck group"
     );
+    ensure!(
+        options.policy.streams == options.tcp_listen.is_some(),
+        "TCP streams require a TCP listener"
+    );
     let socket = Arc::new(UdpSocket::bind(options.listen).await?);
+    let listener = match options.tcp_listen {
+        Some(address) => Some(Arc::new(TcpListener::bind(address).await?)),
+        None => None,
+    };
+    if let Some(listener) = &listener {
+        info!(listen=%listener.local_addr()?,"TCP listener bound");
+    }
     let mut shutdown = Shutdown::new();
     loop {
-        let result = client_session(&options, socket.clone(), &mut shutdown).await;
+        let result =
+            client_session(&options, socket.clone(), listener.clone(), &mut shutdown).await;
         if options.policy.adaptive
             && result
                 .as_ref()
@@ -3307,6 +3407,7 @@ pub async fn client(options: ClientOptions) -> Result<()> {
 async fn client_session(
     options: &ClientOptions,
     socket: Arc<UdpSocket>,
+    listener: Option<Arc<TcpListener>>,
     shutdown: &mut Shutdown,
 ) -> Result<()> {
     let token = transport::token(&options.token)?;
@@ -3360,6 +3461,10 @@ async fn client_session(
         forward.clone(),
         observation_notify.clone(),
     ));
+    // Streams do not survive a session epoch; a new epoch accepts new connections.
+    let mut streams =
+        listener.map(|listener| tcp::Mux::client(listener, &options.policy, forward.clone()));
+    let small_threshold = ingress::small_threshold(&options.policy);
     let mut input = vec![0; 65536];
     let mut peers: HashMap<SocketAddr, (u32, Instant)> = HashMap::new();
     let mut reverse = HashMap::new();
@@ -3522,12 +3627,12 @@ async fn client_session(
                 if n>MAX_PAYLOAD {drops+=1;trace_payload(&forward,trace::Stage::RecordDropped,&input[..n],Some(trace::Reason::Oversize));forward.update(|d|d.records.application_oversize_dropped+=1);continue;}
                 if !peers.contains_key(&peer) {
                     if peers.len()>=MAX_FLOWS {drops+=1;trace_payload(&forward,trace::Stage::RecordDropped,&input[..n],Some(trace::Reason::FlowLimit));forward.update(|d|d.records.application_flow_limit_dropped+=1);continue;}
-                    next_flow=next_flow.checked_add(1).context("flow id exhausted")?;
+                    next_flow=next_flow.checked_add(1).filter(|id|*id<stream::STREAM_FLAG).context("flow id exhausted")?;
                     peers.insert(peer,(next_flow,created));reverse.insert(next_flow,peer);
                 }
                 let (flow,last)=peers.get_mut(&peer).expect("inserted peer");*last=created;
                 next_id=next_id.checked_add(1).context("message id exhausted")?;
-                if !enqueue_record(&tx,Record{flow:*flow,id:next_id,payload:input[..n].to_vec()},created,&forward,ingress::small_threshold(&options.policy)) {
+                if !enqueue_record(&tx,Record{flow:*flow,id:next_id,payload:input[..n].to_vec()},created,&forward,ingress::small_threshold(&options.policy),None) {
                     drops+=1;
                 } else {forward.update(|d|{d.records.ingress_queue_enqueued+=1;d.records.sender_queue_enqueued+=1;});}
             },
@@ -3536,15 +3641,21 @@ async fn client_session(
                 let records=receive_records(&mut decoder,&returning,pid,&data);
                 let decoded=Instant::now();
                 for record in records {
+                    if let Some(mux)=streams.as_mut() && stream::stream_id(record.flow).is_some() {mux.receive(record);continue}
                     if let Some(peer)=reverse.get(&record.flow) {
                         if let Some((_,last))=peers.get_mut(peer) {*last=Instant::now();}
                         drops+=delivery.send(&socket,Some(*peer),record,pid,decoded);
                     } else {returning.trace_record(trace::Stage::RecordDropped,&record,None,Some(trace::Reason::FlowUnavailable));returning.update(|d|d.records.udp_target_flow_dropped+=1);returning.path(pid,|p|p.udp_target_flow_dropped+=1);}
                 }
-            }
+                if let Some(mux)=streams.as_mut() {mux.flush(&mut tcp::Out{tx:&tx,next_id:&mut next_id,scope:&forward,small_threshold});}
+            },
+            wake=stream_wake(&mut streams)=>streams.as_mut().expect("stream adapter").handle(wake,&mut tcp::Out{tx:&tx,next_id:&mut next_id,scope:&forward,small_threshold}),
         }
         while let Some(completion)=tasks.try_join_next() {completion.context("path task failed")?;}
     }Ok(())}.await;
+    if let Some(mux) = streams.as_mut() {
+        mux.close_all();
+    }
     delivery.close();
     decoder.close_retention();
     publish_retention(&decoder, &returning);
@@ -3708,6 +3819,9 @@ async fn connect_path(
     if policy.mixed_fec {
         req = req.header("braidpath-mixed-fec", "1");
     }
+    if policy.streams {
+        req = req.header("braidpath-streams", "1");
+    }
     if policy.fec_repairs == 2 {
         req = req.header("braidpath-fec-repairs", "2");
     }
@@ -3776,6 +3890,14 @@ async fn connect_path(
     ensure!(
         mixed_fec_header(response.headers())? == policy.mixed_fec,
         "mixed FEC not negotiated"
+    );
+    ensure!(
+        !policy.streams
+            || response
+                .headers()
+                .get("braidpath-streams")
+                .is_some_and(|v| v == "1"),
+        "TCP streams not negotiated"
     );
     validate_fec_repairs_echo(response.headers(), policy.fec_repairs)?;
     ensure!(

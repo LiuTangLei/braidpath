@@ -1,6 +1,6 @@
 # Experimental runtime
 
-BraidPath currently forwards unreliable UDP messages to one operator-configured destination. Each path uses real HTTP/3 over Quinn/rustls, with authenticated HTTP Datagrams. There is no Xray runtime, TCP adapter, TUN device or transparent IP tunnel.
+BraidPath forwards unreliable UDP messages to one operator-configured destination and, optionally, TCP connections to one operator-configured TCP destination as [reliable streams](reliable-streams.md). Each path uses real HTTP/3 over Quinn/rustls, with authenticated HTTP Datagrams. There is no Xray runtime, SOCKS/HTTP proxy entrance, TUN device or transparent IP tunnel.
 
 ## Local quick start
 
@@ -32,7 +32,7 @@ Build with `cargo build --release --locked` (Rust 1.88+). The following commands
 
 For separate hosts, bind the server to its intended address, use a certificate matching `--server-name`, and securely copy the public certificate and token to the client. Keep the private key only on the main server. `init` creates a self-signed test certificate; production identity provisioning and rotation are not automated. One server token defines one authorization domain. Unix identity permissions are restricted; operators must restrict credential ACLs on Windows.
 
-The local client listener should stay on loopback unless other local-network callers are deliberately authorized. Its callers share the tunnel credential. The main server permits only its configured UDP target; it is not an arbitrary destination proxy.
+The local client listener should stay on loopback unless other local-network callers are deliberately authorized. Its callers share the tunnel credential. The main server permits only its configured UDP and TCP targets; it is not an arbitrary destination proxy.
 
 ## Multiple entrances and interfaces
 
