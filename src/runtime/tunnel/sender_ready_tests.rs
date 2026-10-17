@@ -503,6 +503,95 @@ impl Accounting {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn plain_interactive_waits_for_fast_credit_instead_of_entering_a_slow_queue() {
+    let fast = Pair::connect().await;
+    let slow = Pair::connect().await;
+    let path0 = fast.path();
+    let mut path1 = slow.path();
+    path1.id = 1;
+    path1.quality.lock().unwrap().snapshot.sender_estimate = quality::Estimate {
+        updated_us: Some(0),
+        delay_variation_ms: 500.0,
+        ..Default::default()
+    };
+    let paths = [path0, path1];
+    let mut policy = policy();
+    policy.adaptive = true;
+    policy.fec = 0;
+    policy.redundancy = 0;
+    policy.small_fec_bytes = 0;
+    let mut controllers = std::array::from_fn(|_| adaptive::PathController::new(policy.rate, 20));
+    controllers[0].admitted(0, 2400);
+    let mut front = outbound::Pending {
+        data: Bytes::from(vec![7; 100]),
+        created: Instant::now(),
+        record_id: Some(1),
+        flow: Some(1),
+        block: None,
+        small: false,
+        hold: None,
+    };
+    let eligible = [(0, 1), (1, 1)];
+    let timely = latency_candidates(
+        eligible.to_vec(),
+        &paths,
+        &front,
+        false,
+        &policy,
+        Duration::ZERO,
+    );
+    assert!(
+        business_ready_candidates(&timely, &paths, &mut controllers, 0, 100, 0.0, None).is_empty(),
+        "a momentary fast-path pacing gap must not route an interactive record into 500 ms of queue"
+    );
+    assert_eq!(
+        business_ready_candidates(&timely, &paths, &mut controllers, 10_000, 100, 10.0, None),
+        vec![(0, 1)],
+        "the fast path admits the record after normal token refill"
+    );
+    assert_eq!(
+        latency_candidates(
+            eligible[1..].to_vec(),
+            &paths,
+            &front,
+            false,
+            &policy,
+            Duration::ZERO
+        ),
+        vec![(1, 1)],
+        "an ineligible fast path cannot suppress the remaining live route"
+    );
+    front.data = Bytes::from(vec![7; 1000]);
+    assert_eq!(
+        latency_candidates(
+            eligible.to_vec(),
+            &paths,
+            &front,
+            false,
+            &policy,
+            Duration::ZERO
+        ),
+        eligible,
+        "bulk keeps every eligible route"
+    );
+    front.data = Bytes::from(vec![7; 100]);
+    front.block = Some(1);
+    policy.small_fec_bytes = 128;
+    assert_eq!(
+        latency_candidates(
+            eligible.to_vec(),
+            &paths,
+            &front,
+            false,
+            &policy,
+            Duration::ZERO
+        ),
+        eligible,
+        "the opt-in small-record FEC policy keeps its separate loss and readiness rules"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn adaptive_small_readiness_ignores_fast_peer_without_current_packet_credit() {
     let fast = Pair::connect().await;
     let slow = Pair::connect().await;

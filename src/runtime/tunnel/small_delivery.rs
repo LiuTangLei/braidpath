@@ -103,14 +103,35 @@ pub(super) fn mask(paths: &[OutPath], eligible: u8, remaining: Duration, target_
     select_mask(&estimates, slack)
 }
 
-fn select_mask(estimates: &[Estimate], slack: f64) -> u8 {
+/// Ordinary interactive traffic chooses timing before transient pacing credit.
+/// The opt-in small-record policy retains its separate loss preference.
+pub(super) fn latency_mask(
+    paths: &[OutPath],
+    eligible: u8,
+    remaining: Duration,
+    target_ms: u64,
+) -> u8 {
+    let estimates: Vec<_> = paths
+        .iter()
+        .filter(|path| eligible & (1 << path.id) != 0 && path.conn.close_reason().is_none())
+        .map(estimate)
+        .collect();
+    let slack = (target_ms.min(20) as f64).min(remaining.as_secs_f64() * 1000.0);
+    timing_mask(&estimates, slack)
+}
+
+fn timing_mask(estimates: &[Estimate], slack: f64) -> u8 {
     let Some(best) = estimates.iter().map(|path| path.delay_ms).reduce(f64::min) else {
         return 0;
     };
-    let timely = estimates
+    estimates
         .iter()
         .filter(|path| path.delay_ms <= best + slack)
-        .fold(0, |mask, path| mask | (1 << path.id));
+        .fold(0, |mask, path| mask | (1 << path.id))
+}
+
+fn select_mask(estimates: &[Estimate], slack: f64) -> u8 {
+    let timely = timing_mask(estimates, slack);
     if timely == 0 {
         return 0;
     }

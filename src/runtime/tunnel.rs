@@ -1143,6 +1143,36 @@ fn update_business_pacer(
     }
 }
 
+fn latency_candidates(
+    mut candidates: Vec<(u8, i32)>,
+    paths: &[OutPath],
+    front: &outbound::Pending,
+    repair: bool,
+    policy: &Policy,
+    age: Duration,
+) -> Vec<(u8, i32)> {
+    if !policy.adaptive
+        || repair
+        || small_delivery::applies(policy, front)
+        || (front.data.len() > LATENCY_RECORD_BYTES
+            && !front.hold.as_ref().is_some_and(|hold| hold.interactive()))
+    {
+        return candidates;
+    }
+    // Rank healthy paths before checking transient packet credit. A token gap
+    // on an idle route must not send an interactive record into a long queue.
+    // An unready head rotates normally, so other flows keep making progress.
+    let eligible = candidates.iter().fold(0, |mask, (id, _)| mask | (1 << id));
+    let timely = small_delivery::latency_mask(
+        paths,
+        eligible,
+        policy.admission_lifetime().saturating_sub(age),
+        policy.latency_target_ms,
+    );
+    candidates.retain(|(id, _)| timely & (1 << id) != 0);
+    candidates
+}
+
 fn business_ready_candidates(
     candidates: &[(u8, i32)],
     paths: &[OutPath],
@@ -2150,6 +2180,7 @@ async fn sender(
             } else {
                 Vec::new()
             };
+            let candidates = latency_candidates(candidates, &paths, &front, repair, &policy, age);
             let before_allowance = candidates
                 .iter()
                 .fold(0u8, |mask, (id, _)| mask | (1 << id));
