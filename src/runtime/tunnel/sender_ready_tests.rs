@@ -562,6 +562,8 @@ async fn plain_interactive_waits_for_fast_credit_instead_of_entering_a_slow_queu
         "an ineligible fast path cannot suppress the remaining live route"
     );
     front.data = Bytes::from(vec![7; 1000]);
+    let gauge = Arc::new(outbound::Gauge::default());
+    front.hold = Some(gauge.hold(1, 0, 1, 1000, true));
     assert_eq!(
         latency_candidates(
             eligible.to_vec(),
@@ -572,8 +574,9 @@ async fn plain_interactive_waits_for_fast_credit_instead_of_entering_a_slow_queu
             Duration::ZERO
         ),
         eligible,
-        "bulk keeps every eligible route"
+        "large startup chunks keep every route even while their stream has little outstanding data"
     );
+    front.hold = None;
     front.data = Bytes::from(vec![7; 100]);
     front.flow = Some(1);
     assert_eq!(
