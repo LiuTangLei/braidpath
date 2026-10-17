@@ -392,10 +392,19 @@ fn http_connect(proxy: &str, authority: &str, early: &[u8]) -> (String, TcpStrea
     let head = String::from_utf8(head).unwrap();
     (head.lines().next().unwrap().to_owned(), conn)
 }
-fn assert_closed(conn: &mut TcpStream) {
-    let mut rest = Vec::new();
-    let _ = conn.read_to_end(&mut rest);
-    assert!(rest.is_empty(), "{} bytes after a refusal", rest.len());
+/// A refused destination resets the already-answered local connection.
+fn assert_reset(conn: &mut TcpStream) {
+    let mut buffer = [0; 16];
+    match conn.read(&mut buffer) {
+        Err(error) => assert!(
+            matches!(
+                error.kind(),
+                ErrorKind::ConnectionReset | ErrorKind::ConnectionAborted
+            ),
+            "{error}"
+        ),
+        Ok(n) => panic!("expected a reset, got {n} bytes"),
+    }
 }
 
 #[test]
@@ -438,13 +447,14 @@ fn proxy_entrances_reach_named_destinations_over_lossy_multipath() {
     let (line, mut conn) = http_connect(proxy, &target, b"early");
     assert!(line.starts_with("HTTP/1.1 200 "), "{line}");
     assert_eq!(read_exact_or_eof(&mut conn, 12), b"banner\nearly");
-    // Refused destinations map to each protocol's failure reply.
+    // Success is answered before the server connects (no tunnel round trip),
+    // so a refused destination resets the connection, never a clean end.
     let (status, mut conn) = socks(proxy, &socks_ipv4(&closed));
-    assert_eq!(status, 5);
-    assert_closed(&mut conn);
-    let (line, mut conn) = http_connect(proxy, &closed, b"");
-    assert!(line.starts_with("HTTP/1.1 502 "), "{line}");
-    assert_closed(&mut conn);
+    assert_eq!(status, 0);
+    assert_reset(&mut conn);
+    let (line, mut conn) = http_connect(proxy, &closed, b"request");
+    assert!(line.starts_with("HTTP/1.1 200 "), "{line}");
+    assert_reset(&mut conn);
     // Commands other than CONNECT are answered locally.
     let mut associate = socks_ipv4(&target);
     associate[1] = 3;
@@ -460,10 +470,10 @@ fn proxy_server_denies_private_destinations_by_default() {
     let proxy = topology.tcp_listen.as_str();
     for request in [socks_ipv4(&target), socks_domain("localhost", port)] {
         let (status, mut conn) = socks(proxy, &request);
-        assert_eq!(status, 2);
-        assert_closed(&mut conn);
+        assert_eq!(status, 0);
+        assert_reset(&mut conn);
     }
     let (line, mut conn) = http_connect(proxy, &target, b"");
-    assert!(line.starts_with("HTTP/1.1 403 "), "{line}");
-    assert_closed(&mut conn);
+    assert!(line.starts_with("HTTP/1.1 200 "), "{line}");
+    assert_reset(&mut conn);
 }

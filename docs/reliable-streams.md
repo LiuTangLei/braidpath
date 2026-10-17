@@ -38,11 +38,17 @@ curl -p -x http://127.0.0.1:1080 https://example.com/
 | SOCKS5 | RFC 1928 without authentication. CONNECT with IPv4, IPv6 or domain addresses. BIND and UDP ASSOCIATE are answered with `07` (command not supported). The reply's bound address is `0.0.0.0:0`. |
 | HTTP CONNECT | `CONNECT host:port` (bracketed IPv6 accepted); headers up to 8 KiB; other methods get `405`. Bytes sent after the request header are carried as early data. |
 | Destination | The first stream bytes are a SOCKS-style address header (type, address or name, port). Stream identifiers with bit 28 set carry one. Names resolve on the server. |
-| Status | The server's first stream byte is a status: success, or a SOCKS5 reply code. The client sends the local success reply only after it arrives, so a client sees connect failures. HTTP maps denial to `403`, unreachable to `504`, and other failures to `502`. |
+| Zero round trip | The client answers success (`00`, or `200 Connection established`) as soon as the local handshake completes, so the application's first bytes follow the destination header in the same flight instead of one tunnel round trip later. |
+| Status | The server's first stream byte is a status: success, or a SOCKS5 reply code. Because success was already answered, a failure status resets the local connection (RST), never a clean end, so a truncated exchange cannot look complete. Specific SOCKS reply codes and HTTP error statuses are therefore not reported for remote failures; local handshake errors still are. |
 | Authorization | Only globally routable unicast addresses are permitted: loopback, private, link-local, shared (100.64/10), benchmarking, reserved, multicast, unspecified, IPv6 unique-local, link-local and IPv4-mapped forms of these are denied, after name resolution. `--proxy-allow-private` permits all but unspecified and multicast. A denial is status `02`. |
-| Failure | Resolution or connection failure, or 10 s without connection, returns a status, then FIN; both sides then retire the stream. |
+| Failure | Resolution or connection failure, or 10 s without connection, returns a status, then FIN; both sides then retire the stream. Application bytes sent before the failure are discarded. |
 
 The proxy listener has no authentication, so it should stay on loopback.
+
+The session itself uses ordinary 1-RTT QUIC handshakes; QUIC 0-RTT early data is not
+enabled, because replayed early data could replay session admission. A session is
+long-lived, so the handshake cost applies at startup and reconnection, not per TCP
+connection.
 
 ## Design
 
@@ -103,8 +109,6 @@ result is not a WAN, independent-capacity or deployment acceptance result.
 
 - SOCKS5 UDP ASSOCIATE, SOCKS5 user/password authentication, and destination
   allow-lists beyond the public-address rule.
-- Optimistic proxy replies (sending application data before the server's status), which
-  would save one round trip per connection.
 - Path-aware loss detection: the stream layer does not know which path carried a
   segment, so a loss on a fast path waits for the slowest observed RTT.
 - Priority classes between interactive and bulk streams beyond the existing

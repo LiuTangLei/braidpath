@@ -136,8 +136,8 @@ struct Stream {
     undelivered: Vec<Vec<u8>>,
     write_finished: bool,
     tasks: Vec<AbortHandle>,
-    /// Client: the local proxy connection waits for the server's status byte.
-    awaiting: Option<(proxy::Kind, TcpStream)>,
+    /// Client: the server's status byte has not arrived yet.
+    status_pending: bool,
     /// Server: destination header bytes received so far.
     header: Option<Vec<u8>>,
     /// Server: the destination failed; only the status and FIN remain to send.
@@ -155,7 +155,7 @@ impl Stream {
             undelivered: Vec::new(),
             write_finished: false,
             tasks: Vec::new(),
-            awaiting: None,
+            status_pending: false,
             header: None,
             refused: false,
         }
@@ -197,9 +197,6 @@ impl Stream {
         }
         for task in self.tasks.drain(..) {
             task.abort();
-        }
-        if let Some((_, tcp)) = self.awaiting.take() {
-            let _ = socket2::SockRef::from(&tcp).set_linger(Some(Duration::ZERO));
         }
     }
 }
@@ -352,8 +349,11 @@ impl Mux {
 
     fn attach(&mut self, id: u32, tcp: TcpStream) {
         let Some(s) = self.streams.get_mut(&id) else {
+            // The stream already reset: close with RST, not FIN.
+            let _ = socket2::SockRef::from(&tcp).set_linger(Some(Duration::ZERO));
             return;
         };
+        let _ = socket2::SockRef::from(&tcp).set_linger(None);
         let _ = tcp.set_nodelay(true);
         let (read, write) = tcp.into_split();
         let reads = Arc::new(Semaphore::new(0));
@@ -498,7 +498,22 @@ impl Mux {
                 s.send.push(&request.destination.encode());
                 s.send.push(&request.early);
                 self.stats.bytes_from_application += request.early.len() as u64;
-                s.awaiting = Some((request.kind, tcp));
+                s.status_pending = true;
+                // Reply at once, so application data follows the destination
+                // header without waiting a tunnel round trip. A refused
+                // destination later resets the local connection.
+                let events = self.events_tx.clone();
+                self.tasks.spawn(async move {
+                    let mut tcp = tcp;
+                    // An abort before attach must not look like a clean end.
+                    let _ = socket2::SockRef::from(&tcp).set_linger(Some(Duration::ZERO));
+                    let _ = events.send(
+                        match tcp.write_all(&proxy::reply(request.kind, proxy::OK)).await {
+                            Ok(()) => Io::Connected(id, tcp),
+                            Err(_) => Io::Failed(id),
+                        },
+                    );
+                });
             }
         }
     }
@@ -586,7 +601,7 @@ impl Mux {
                 }
             }
         }
-        if s.awaiting.is_some() {
+        if s.status_pending {
             let status = if ready.is_empty() {
                 if !s.recv.fin_received() {
                     return;
@@ -596,19 +611,11 @@ impl Mux {
                 s.recv.consumed(1, window);
                 ready.remove(0)
             };
-            let (kind, tcp) = s.awaiting.take().expect("awaiting");
+            s.status_pending = false;
             if status != proxy::OK {
-                self.tasks.spawn(refuse(tcp, kind, status));
+                debug!(stream = id, status, "proxy destination refused");
                 return self.reset(id, "proxy destination refused");
             }
-            let events = self.events_tx.clone();
-            s.tasks.push(self.tasks.spawn(async move {
-                let mut tcp = tcp;
-                let _ = events.send(match tcp.write_all(&proxy::reply(kind, status)).await {
-                    Ok(()) => Io::Connected(id, tcp),
-                    Err(_) => Io::Failed(id),
-                });
-            }));
         }
         s.deliver(ready);
         s.finish_writes();
