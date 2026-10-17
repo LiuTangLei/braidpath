@@ -79,8 +79,15 @@ bidirectional delay and the authenticated-path readiness gate.
 `python3 -m bench.native_lab --binary HOST_BINARY --lab-binary LINK_LAB
 --output local/NEW_RUN` runs the same finite source/sink workload on the
 development host without containers, namespaces or privileges. Build the
-emulator with `cargo build --release --example link_lab`. It binds only
-loopback sockets and shapes every path in both directions: a virtual-clock
+emulator with `cargo build --release --example link_lab`. Freeze compared
+endpoint binaries with identical target selections and build flags; build each
+with `cargo build --release --locked --bin braidpath` in its own checkout and
+use a separate target directory for each checkout. Build the emulator
+separately: combining `--bin braidpath` with `--example link_lab` enables the
+example's dev-dependency features and produces a different endpoint binary in
+this repository. Do not treat a fast cached build in a shared target directory
+as proof that an archived source copy was rebuilt. Record source and binary
+hashes before measurements. The emulator binds only loopback sockets and shapes every path in both directions: a virtual-clock
 serializer over IPv4+UDP bytes, half the registered RTT as one-way delay, a
 packet limit that counts queued and propagating packets like netem, and seeded
 random loss. `--rtt-ms` takes one to eight paths and `--rate-mbps` one value
