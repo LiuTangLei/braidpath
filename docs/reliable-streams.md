@@ -158,7 +158,7 @@ Two scheduler rules serve TCP streams and fixed UDP alike:
 | Rule | Behavior |
 | --- | --- |
 | Path liveness | A path whose ack-eliciting QUIC frames (datagrams, stream data, pings) have gone unanswered by any ACK for `max(2·RTT + 25 ms, 100 ms)` is withheld from data scheduling until an ACK arrives; the controller's and Quinn's probes still elicit one. If every open path is silent, none is withheld. A queue delays ACKs without stopping them, so this is reachability evidence, not a congestion signal; it acts before the adaptive controller's receiver-report exclusion, which takes seconds. |
-| Latency class | A record of at most 320 encoded bytes, or a stream segment while that stream has at most 4 KiB outstanding, is offered to paths in order of expected delivery delay (half the base RTT plus network and local queueing) instead of the throughput order. Bulk transfers keep the throughput order. Where the opt-in small-record FEC policy (`--small-fec-bytes`) applies, its delay and loss ranking decides instead. |
+| Latency class | A record of at most 320 encoded bytes, or a stream segment while that stream has at most 64 KiB outstanding, is offered to paths in order of expected delivery delay (half the base RTT plus network and local queueing) instead of the throughput order. Bulk transfers keep the throughput order. Where the opt-in small-record FEC policy (`--small-fec-bytes`) applies, its delay and loss ranking decides instead. |
 
 The adaptive controller's queue brake cuts to a delivery sample only if that
 sample measured the bottleneck: most of its admission interval lies inside the
@@ -166,7 +166,10 @@ current backlog, or the queue was observed within one base RTT of the interval's
 end. A sample from an application-limited period before a burst meets neither and
 gets the ordinary 20% brake; it could otherwise cut a newly busy path to the
 minimum rate. At startup the transport window limits sends before a local backlog
-forms, so the queue condition keeps the immediate cut there.
+forms, so the queue condition keeps the immediate cut there. If the retained
+interval predates the backlog and measured sparse traffic, a fresh paired busy
+interval of at least 100 ms may size the queue reduction. The 500 ms capacity
+observation horizon is unchanged.
 
 ## Controlled measurement
 

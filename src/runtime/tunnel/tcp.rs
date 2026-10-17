@@ -59,7 +59,7 @@ const ADDRESSED: u32 = 1 << 28;
 /// A stream with at most this much unacknowledged data is latency-bound, not
 /// bandwidth-bound: its segments take the earliest path rather than a share
 /// of every path.
-const INTERACTIVE_BYTES: u64 = 4 * 1024;
+const INTERACTIVE_BYTES: u64 = 64 * 1024;
 /// Association datagrams waiting for the session queue; more are dropped.
 const DATAGRAM_QUEUE: usize = 256;
 

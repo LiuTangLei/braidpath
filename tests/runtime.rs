@@ -768,6 +768,12 @@ fn three_paths(mode: u8) {
             .unwrap();
         client_args[index + 1] = "13".into();
     }
+    // These are negotiation/integrity fixtures, not 20 ms latency benchmarks.
+    // Match the existing 100 ms non-adaptive queue age on debug CI runners;
+    // retain the same source, payloads, count, rate cap, queue slots and asserts.
+    if frontier_enabled || repair_guard {
+        client_args.extend(args(&["--latency-target-ms", "100"]));
+    }
     if frontier_enabled {
         client_args.extend(args(&["--frontier-scheduler", "--adaptive"]));
     }

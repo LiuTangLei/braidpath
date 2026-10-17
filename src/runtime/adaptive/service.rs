@@ -254,6 +254,29 @@ impl Window {
         minimum_symbols: u64,
         minimum_received_bytes: u64,
     ) -> Option<Sample> {
+        self.paired_sample(
+            now_us,
+            minimum_symbols,
+            minimum_received_bytes,
+            SAMPLE_US,
+            None,
+        )
+    }
+
+    /// A short busy interval can reduce a queued sender before the 500 ms
+    /// capacity horizon completes. Never use it as capacity or growth credit.
+    pub(super) fn queue_sample(&self, now_us: u64, backlog_since: u64) -> Option<Sample> {
+        self.paired_sample(now_us, 8, 1, super::FAST_PROBE_US, Some(backlog_since))
+    }
+
+    fn paired_sample(
+        &self,
+        now_us: u64,
+        minimum_symbols: u64,
+        minimum_received_bytes: u64,
+        minimum_span: u64,
+        since: Option<u64>,
+    ) -> Option<Sample> {
         let current = self.recent.back()?;
         if now_us.checked_sub(current.observed_us)? > FRESH_US {
             return None;
@@ -261,8 +284,9 @@ impl Window {
         self.recent.iter().rev().find_map(|previous| {
             let span_us = current.receiver_us.checked_sub(previous.receiver_us)?;
             let local_span = current.observed_us.checked_sub(previous.observed_us)?;
-            if !(SAMPLE_US..=FRESH_US).contains(&span_us)
-                || !(SAMPLE_US..=FRESH_US).contains(&local_span)
+            if !(minimum_span..=FRESH_US).contains(&span_us)
+                || !(minimum_span..=FRESH_US).contains(&local_span)
+                || since.is_some_and(|since| previous.observed_us < since)
             {
                 return None;
             }
@@ -394,6 +418,35 @@ mod tests {
                 "a fresh complete interval can recover after {invalid}"
             );
         }
+    }
+
+    #[test]
+    fn queue_sample_excludes_idle_history_without_shortening_capacity_memory() {
+        let mut window = Window::default();
+        for i in 0..=6 {
+            let bytes = if i <= 5 { i * 100 } else { 10_500 };
+            let admitted = if i <= 5 { i * 100 } else { 12_500 };
+            window.observe(
+                i + 1,
+                Some(i * 100_000 + 1),
+                bytes,
+                i * 100_000,
+                Some((admitted, i * 10)),
+            );
+        }
+        let sample = window.queue_sample(600_000, 500_000).unwrap();
+        assert_eq!(sample.bps, 800_000.0);
+        assert_eq!(sample.admission.unwrap().started_us, 500_000);
+        assert_eq!(sample.span_us, 100_000);
+        assert_eq!(window.latest(600_000).unwrap().span_us, 500_000);
+        assert!(
+            window.queue_sample(600_000, 500_001).is_none(),
+            "no complete busy interval yet"
+        );
+        assert!(
+            window.queue_sample(600_001 + FRESH_US, 500_000).is_none(),
+            "stale endpoint"
+        );
     }
 
     #[test]

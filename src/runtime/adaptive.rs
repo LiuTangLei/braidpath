@@ -2118,6 +2118,31 @@ impl PathController {
                         })
                 })
             });
+            let current_queue_service = current_queue_service.or_else(|| {
+                (new_delay
+                    && !new_loss
+                    && !delivery_shortfall
+                    && !blocked_pressure
+                    && positive_young
+                    && observation.offered_backlog
+                    && service_sample.is_some_and(|old| {
+                        old.admission.is_some_and(|a| {
+                            a.bps * self.wire_per_symbol < self.rate_bps as f64 * 0.85
+                                && self.backlog_since_us.is_some_and(|since| {
+                                    a.started_us.saturating_add(a.span_us) < since
+                                })
+                        })
+                    }))
+                .then(|| {
+                    self.backlog_since_us
+                        .and_then(|since| self.service_window.queue_sample(now, since))
+                })
+                .flatten()
+                .filter(|sample| {
+                    now.checked_sub(sample.observed_us)
+                        .is_some_and(|age| age <= CONTROL_US)
+                })
+            });
             let service_hint = current_queue_service
                 .map(|sample| sample.bps * self.wire_per_symbol)
                 .or_else(|| {
