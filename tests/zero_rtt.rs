@@ -180,6 +180,7 @@ async fn replay_succeeds_only_when_tickets_are_reusable() {
 
 /// A journal keeps unused tickets across a restart and the take of a used one,
 /// so the restarted server resumes the client but refuses the replay.
+#[cfg(unix)]
 #[tokio::test]
 async fn tickets_survive_a_restart_but_a_replay_of_a_used_one_does_not() {
     let (dir, cert, key) = identity();
@@ -214,4 +215,14 @@ async fn tickets_survive_a_restart_but_a_replay_of_a_used_one_does_not() {
     assert_eq!(exchange(&resumed, b"after restart").await, b"after restart");
     assert!(timeout(Duration::from_secs(2), accepted).await.unwrap());
     assert_eq!(*received.lock().unwrap(), [b"after restart".to_vec()]);
+}
+
+/// Elsewhere the journal is unavailable and the server keeps tickets in memory.
+#[cfg(not(unix))]
+#[test]
+fn ticket_journal_is_unix_only() {
+    let (dir, cert, key) = identity();
+    assert!(
+        transport::persistent_server_tls(&cert, &key, &dir.path().join("key.tickets")).is_err()
+    );
 }

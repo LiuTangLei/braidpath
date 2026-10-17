@@ -42,7 +42,8 @@ struct State {
     live: HashMap<Vec<u8>, (u64, Vec<u8>)>,
     /// Issue order for eviction; may name keys already taken.
     order: VecDeque<Vec<u8>>,
-    /// None after a failed rewrite: tickets are then refused, never reused.
+    /// None after a failed write or rewrite: tickets are then refused, never
+    /// reused, until a restart rewrites the journal from what it can read.
     file: Option<File>,
     records: usize,
 }
@@ -233,7 +234,10 @@ impl Journal {
             .write_all(record)
             .and_then(|()| if durable { file.sync_data() } else { Ok(()) });
         if let Err(error) = written {
-            warn!(%error, path = %self.path.display(), "ticket journal write failed");
+            // A partial record would end the replay there and hide every later
+            // take, reviving those tickets after a restart: stop appending.
+            warn!(%error, path = %self.path.display(), "ticket journal write failed; refusing tickets until restart");
+            state.file = None;
             return false;
         }
         state.records += 1;
@@ -317,6 +321,33 @@ mod tests {
         assert_eq!(store.take(b"b").as_deref(), Some(&b"two"[..]));
         drop(store);
         assert_eq!(journal(dir.path()).len(), 0);
+    }
+
+    #[test]
+    fn a_failed_write_refuses_tickets_and_never_hides_a_take() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tickets");
+        let store = journal(dir.path());
+        for key in [b"a", b"b", b"c"] {
+            store.put(key.to_vec(), key.to_vec());
+        }
+        assert_eq!(store.take(b"a").as_deref(), Some(&b"a"[..]));
+        // A handle that cannot write stands in for a full or failing disk.
+        store.state.lock().unwrap().file = Some(File::open(&path).unwrap());
+        assert_eq!(store.take(b"b"), None);
+        // Later records are not appended behind a possibly partial one, even
+        // if the disk recovers.
+        assert!(store.state.lock().unwrap().file.is_none());
+        store.put(b"d".to_vec(), b"d".to_vec());
+        assert_eq!(store.take(b"c"), None);
+        assert_eq!(store.take(b"d"), None);
+        drop(store);
+        // Only tickets that were never released come back.
+        let store = journal(dir.path());
+        assert_eq!(store.take(b"a"), None);
+        assert_eq!(store.take(b"b").as_deref(), Some(&b"b"[..]));
+        assert_eq!(store.get(b"c").as_deref(), Some(&b"c"[..]));
+        assert_eq!(store.get(b"d"), None);
     }
 
     #[test]
