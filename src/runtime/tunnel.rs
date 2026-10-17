@@ -1232,7 +1232,7 @@ impl SendAccounting<'_> {
         } = admission;
         let sent = self.queue.pop(repair).expect("admitted front");
         if let Some(hold) = &sent.hold {
-            hold.admitted();
+            hold.admitted(path.id, path.conn.rtt(), at);
         }
         debug_assert_eq!(sent.created, front.created);
         debug_assert_eq!(sent.record_id, front.record_id);

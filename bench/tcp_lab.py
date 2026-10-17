@@ -20,6 +20,7 @@ import contextlib
 import hashlib
 import json
 from pathlib import Path
+from datetime import datetime, timezone
 import random
 import socket
 import struct
@@ -266,7 +267,14 @@ def wait_log(path, text, process, limit=15):
 
 
 def run(args):
-    args.output.mkdir(parents=True, exist_ok=True)
+    args.output.mkdir(parents=True, exist_ok=False)
+    save(args.output / "registration.json", {
+        "utc": datetime.now(timezone.utc).isoformat(),
+        "binary_sha256": hashlib.sha256(args.binary.read_bytes()).hexdigest(),
+        "lab_sha256": hashlib.sha256(args.lab_binary.read_bytes()).hexdigest(),
+        "paths": args.path, "bytes_per_connection": args.bytes, "connections": args.connections,
+        "seed": args.seed, "events": args.event,
+    })
     processes = []
 
     def spawn(role, argv, **kwargs):
@@ -309,14 +317,18 @@ def run(args):
                                   "--key", key, "--token-file", token,
                                   *(["--tcp-target", target.address] if args.entrance == "fixed"
                                     else ["--proxy", "--proxy-allow-private"]),
-                                  "--stats-file", args.output / "server.json", *args.server_arg])
+                                  "--stats-file", args.output / "server.json",
+                                  "--stats-jsonl", args.output / "server.jsonl",
+                                  "--stats-interval-ms", "100", *args.server_arg])
         wait_log(args.output / "server.log", "HTTP/3 server ready", server)
         entrances = [ready["paths"][i]["entrance"] for i in args.use_path]
         client = spawn("client", [args.binary, "client", "--listen", udp_listen,
                                   "--tcp-listen" if args.entrance == "fixed" else "--proxy-listen", tcp_listen,
                                   *sum((["--entrance", e] for e in entrances), []),
                                   "--server-name", "localhost", "--ca", cert, "--token-file", token,
-                                  "--stats-file", args.output / "client.json", *args.client_arg])
+                                  "--stats-file", args.output / "client.json",
+                                  "--stats-jsonl", args.output / "client.jsonl",
+                                  "--stats-interval-ms", "100", *args.client_arg])
         wait_log(args.output / "client.log", "UDP client ready", client)
         time.sleep(0.5)
         stop = threading.Event()
@@ -362,6 +374,11 @@ def run(args):
                                          + [target.max_gap_seconds]),
                   "connections": results, "events_applied": applied}
         if probe:
+            save(args.output / "probe-samples.json", {
+                "unit": "seconds", "idle": probe.rtts[:idle_rtts],
+                "during_transfer": probe.rtts[idle_rtts:],
+                "timeouts": probe.timeouts, "error": probe.error,
+            })
             idle = rtt_summary(probe.rtts[:idle_rtts])
             busy = rtt_summary(probe.rtts[idle_rtts:], probe.timeouts, probe.error)
             result["probe"] = {"interval_ms": args.probe_interval_ms, "idle": idle, "during_transfer": busy}

@@ -329,14 +329,22 @@ fn adaptive_restart_preserves_listener_replaces_session_and_cancels_failed_recon
     );
     // The journal kept the first server's tickets, so the restarted server
     // admits the path with 0-RTT.
-    let resumed = client.wait_snapshot(Duration::from_secs(2), |v| {
-        v["stats"]["zero_rtt_accepted"].as_u64().unwrap_or(0) >= 1
+    #[cfg(unix)]
+    {
+        let resumed = client.wait_snapshot(Duration::from_secs(2), |v| {
+            v["stats"]["zero_rtt_accepted"].as_u64().unwrap_or(0) >= 1
+        });
+        assert_eq!(resumed["stats"]["zero_rtt_rejected"], 0, "{resumed}");
+    }
+    #[cfg(not(unix))]
+    client.wait_snapshot(Duration::from_secs(2), |v| {
+        v["stats"]["zero_rtt_rejected"].as_u64().unwrap_or(0) >= 1
     });
-    assert_eq!(resumed["stats"]["zero_rtt_rejected"], 0, "{resumed}");
 
     // Without the journal a restarted server holds no tickets: 0-RTT is
     // rejected and the path completes with a full handshake.
     second_server.finish();
+    #[cfg(unix)]
     fs::remove_file(identity.join("key.tickets")).unwrap();
     let mut third_server = server(
         &identity,

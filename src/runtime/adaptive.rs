@@ -2161,10 +2161,25 @@ impl PathController {
             let mut desired = service_hint
                 .filter(|rate| {
                     *rate > 0.0
-                        && (episode_exercised
-                            || delivery_shortfall
-                            || backlogged_queue_delivery
-                            || *rate >= self.rate_bps as f64)
+                        && (*rate >= self.rate_bps as f64
+                            || ((episode_exercised || delivery_shortfall || backlogged_queue_delivery)
+                                // Current utilization cannot qualify a sparse
+                                // interval from before this backlog/queue.
+                                && (!self.fast_feedback_seen
+                                    || !new_delay
+                                    || current_queue_service.is_some()
+                                    || backlogged_queue_delivery
+                                    || service_sample.is_some_and(|sample| {
+                                        sample.admission.is_some_and(|a| {
+                                            let end = a.started_us.saturating_add(a.span_us);
+                                            let active = end.saturating_sub(
+                                                a.started_us.max(activity_since_us.unwrap_or(a.started_us)),
+                                            );
+                                            active >= CONTROL_US
+                                                && a.bps * a.span_us as f64 / active as f64
+                                                    * self.wire_per_symbol >= self.rate_bps as f64 * 0.85
+                                        })
+                                    }))))
                 })
                 .map_or(self.rate_bps as f64 * 0.8, |rate| rate * drain_fraction);
             if delay_pressure
@@ -7550,6 +7565,7 @@ mod tests {
         /// As `TransportLimited`, but the backlog begins just before the brake
         /// report, after the interval it pairs with.
         TransportLimitedLateBacklog,
+        TransportLimitedLateBacklogExercised,
         /// As `TransportLimitedLateBacklog`, with the queue already observed
         /// during that interval.
         TransportLimitedLateBacklogQueued,
@@ -7574,11 +7590,13 @@ mod tests {
             DrainVariant::TransportLimited
                 | DrainVariant::TransportLimitedLegacy
                 | DrainVariant::TransportLimitedLateBacklog
+                | DrainVariant::TransportLimitedLateBacklogExercised
                 | DrainVariant::TransportLimitedLateBacklogQueued
         );
         let late_backlog = matches!(
             variant,
             DrainVariant::TransportLimitedLateBacklog
+                | DrainVariant::TransportLimitedLateBacklogExercised
                 | DrainVariant::TransportLimitedLateBacklogQueued
         );
         let (warmup_us, report_delay_us) = timing;
@@ -7707,6 +7725,9 @@ mod tests {
             }
             if late_backlog && step == 6 {
                 controller.backlog_since_us = Some(now - 10_000);
+                if variant == DrainVariant::TransportLimitedLateBacklogExercised {
+                    controller.pressure_episode_exercised = Some(true);
+                }
                 if variant == DrainVariant::TransportLimitedLateBacklogQueued {
                     controller.delay_since_us = Some(start_us + 400_000);
                 }
@@ -8726,7 +8747,12 @@ mod tests {
             .expect("retain measured queue-brake service");
         let before = controller.rate_bps;
         assert_eq!(target.braked_us, 700_000);
-        assert!(target.target_bps > before && target.target_bps <= 900_000);
+        assert!(
+            target.target_bps > before && target.target_bps <= 900_000,
+            "before={before}, target={} changes={}",
+            target.target_bps,
+            serde_json::to_string(&controller.rate_changes).unwrap()
+        );
         controller.observe(&sample);
         assert!(matches!(
             controller.rate_changes.back().unwrap().reason,
@@ -8752,7 +8778,12 @@ mod tests {
         let target = controller.drain_return.unwrap();
         assert_eq!(target.braked_us, 1_000_000);
         let before = controller.rate_bps;
-        assert!(target.target_bps > before && target.target_bps <= 900_000);
+        assert!(
+            target.target_bps > before && target.target_bps <= 900_000,
+            "before={before}, target={} changes={}",
+            target.target_bps,
+            serde_json::to_string(&controller.rate_changes).unwrap()
+        );
         controller.observe(&sample);
         let returned = controller.rate_changes.back().unwrap();
         assert!(matches!(returned.reason, RateReason::DrainReturn));
@@ -8793,6 +8824,10 @@ mod tests {
         // An interval before both the backlog and the queue measured the
         // application: an ordinary 20% brake, not a cut to its delivery.
         assert_eq!(brake(DrainVariant::TransportLimitedLateBacklog), 750_000);
+        assert_eq!(
+            brake(DrainVariant::TransportLimitedLateBacklogExercised),
+            750_000
+        );
         // A queue during that interval shows the bottleneck although the
         // backlog began later, as at startup.
         assert_eq!(

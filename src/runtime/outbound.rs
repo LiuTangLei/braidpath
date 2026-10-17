@@ -37,7 +37,15 @@ pub struct Gauge {
     low_water: AtomicUsize,
     admitted: AtomicU64,
     dropped: Mutex<Vec<(u32, u64, u32)>>,
+    sent: Mutex<Vec<StreamAdmission>>,
     pub notify: Notify,
+}
+/// Actual admission of one stream transmission, before its acknowledgment.
+pub struct StreamAdmission {
+    pub identity: (u32, u64, u32),
+    pub path: u8,
+    pub rtt: Duration,
+    pub at: Instant,
 }
 impl Gauge {
     pub fn queued(&self) -> usize {
@@ -54,6 +62,9 @@ impl Gauge {
     /// Segments whose original left the queue without Quinn admission.
     pub fn take_dropped(&self) -> Vec<(u32, u64, u32)> {
         std::mem::take(&mut *self.dropped.lock().expect("gauge lock"))
+    }
+    pub fn take_sent(&self) -> Vec<StreamAdmission> {
+        std::mem::take(&mut *self.sent.lock().expect("gauge lock"))
     }
     pub fn hold(
         self: &Arc<Self>,
@@ -86,8 +97,19 @@ impl Hold {
     pub fn interactive(&self) -> bool {
         self.interactive
     }
-    pub fn admitted(&self) {
-        self.admitted.store(true, Ordering::Release);
+    pub fn admitted(&self, path: u8, rtt: Duration, at: Instant) {
+        if !self.admitted.swap(true, Ordering::AcqRel) {
+            self.gauge
+                .sent
+                .lock()
+                .expect("gauge lock")
+                .push(StreamAdmission {
+                    identity: self.identity,
+                    path,
+                    rtt,
+                    at,
+                });
+        }
     }
 }
 impl Drop for Hold {
@@ -969,7 +991,16 @@ mod tests {
         let dropped = gauge.hold(3, 1000, 2, 1000, false);
         let clone = dropped.clone();
         assert_eq!(gauge.queued(), 2000);
-        admitted.admitted();
+        let at = Instant::now();
+        admitted.admitted(0, Duration::from_millis(20), at);
+        admitted.admitted(1, Duration::from_millis(100), at);
+        let sent = gauge.take_sent();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].identity, (3, 0, 1));
+        assert_eq!(
+            (sent[0].path, sent[0].rtt, sent[0].at),
+            (0, Duration::from_millis(20), at)
+        );
         drop(admitted);
         drop(dropped);
         assert_eq!(gauge.queued(), 1000, "a clone keeps the original queued");

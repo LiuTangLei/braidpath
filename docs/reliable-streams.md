@@ -126,7 +126,7 @@ target sees.
 | Flows | Data on flow `2^30 | id`, acknowledgments on `2^30 | 2^29 | id`, so acknowledgments take their own per-flow queue turn. UDP flows stay below `2^30`. |
 | Sequence space | Byte offsets, plus one virtual byte at the final size for FIN. Segments carry at most 990 bytes and keep their boundaries across retransmission. |
 | Acknowledgment | Cumulative point, receive limit, total duplicate bytes, and up to 64 selective ranges. Sent after 16 segments or 2 ms, and immediately for gaps, duplicates, FIN, zero-length probes, or a window opening by a quarter. |
-| Loss | A segment is lost when older than the reorder threshold and a later transmission was delivered, or older than 1.5 thresholds without that evidence. The threshold is the windowed maximum RTT (or `srtt + 4·rttvar`, whichever is larger) times a reorder factor of 1.25–2; for the first 250 ms of sampling it is at least 250 ms, since a slower path is unobserved until its first acknowledgment. |
+| Loss | A segment is lost when older than the reorder threshold and a later transmission was delivered, or older than 1.5 thresholds without that evidence. The threshold uses the actual admitting path's QUIC RTT and that path's stream RTT samples (including acknowledgment return delay), times a reorder factor of 1.25–2. Timing starts at admission, excluding the local queue. Before admission is known, the conservative aggregate RTT estimate remains in use. |
 | Backoff | Only a retransmission with no acknowledgment progress since its previous attempt backs off (1.5× per stall, bounded). Random loss with live acknowledgments is repaired at the threshold pace. |
 | Spurious repair | A rise in the peer's duplicate count raises the reorder factor by 25%, up to 2; progress decays it toward 1.25. |
 | Local drop | Each stream original carries a hold through the sender queue. If it leaves without Quinn admission (expiry, queue rejection, API error) the stream retransmits it at once instead of waiting for loss detection. |
@@ -197,8 +197,6 @@ result is not a WAN, independent-capacity or deployment acceptance result.
 - SOCKS5 user/password authentication, and destination allow-lists beyond the
   public-address rule.
 - UDP ASSOCIATE datagrams above the record payload, and SOCKS UDP fragmentation.
-- Path-aware loss detection: the stream layer does not know which path carried a
-  segment, so a loss on a fast path waits for the slowest observed RTT.
 - Priority classes between interactive and bulk streams beyond the latency class
   and the existing per-flow round robin.
 - Coordinated FEC strength for streams, and cross-host WAN acceptance.

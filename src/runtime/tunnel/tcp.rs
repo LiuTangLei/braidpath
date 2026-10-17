@@ -789,8 +789,20 @@ impl Mux {
         s.finish_writes();
     }
 
+    fn admissions(&mut self) {
+        for sent in self.gauge.take_sent() {
+            let (id, start, transmission) = sent.identity;
+            if let Some(s) = self.streams.get_mut(&id) {
+                s.send
+                    .admitted(start, transmission, sent.path, sent.rtt, sent.at);
+            }
+        }
+    }
+
     /// Apply one stream record. Call `flush` after a batch of records.
     pub(super) fn receive(&mut self, record: Record) {
+        // Admission metadata must arrive before an ACK samples the segment.
+        self.admissions();
         if associate::is_flow(record.flow) {
             return self.datagram(record);
         }
@@ -845,6 +857,7 @@ impl Mux {
     /// Run timers, retransmit, send acknowledgments and new data, retire streams.
     pub(super) fn flush(&mut self, out: &mut Out) {
         let now = Instant::now();
+        self.admissions();
         for (id, start, transmission) in self.gauge.take_dropped() {
             if let Some(s) = self.streams.get_mut(&id)
                 && s.send.locally_dropped(start, transmission)

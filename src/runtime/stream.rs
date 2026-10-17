@@ -9,7 +9,7 @@
 //!
 //! Sequence space equals byte offsets, plus one virtual byte at the final size
 //! for FIN. This module performs no I/O; callers supply the clock.
-use super::MAX_PAYLOAD;
+use super::{MAX_PATHS, MAX_PAYLOAD};
 use serde::Serialize;
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
@@ -35,6 +35,8 @@ const REORDER_BASE: f64 = 1.25;
 const REORDER_MAX: f64 = 2.0;
 const MAX_PTO: Duration = Duration::from_secs(2);
 const DEAD_AFTER: Duration = Duration::from_secs(30);
+
+const UNKNOWN_PATH: usize = MAX_PATHS;
 
 const DATA: u8 = 0;
 const ACK: u8 = 1;
@@ -225,6 +227,11 @@ impl Rtt {
             self.high[0] = self.high[0].max(rtt);
         }
     }
+    fn observed_high(&self) -> Option<Duration> {
+        self.smoothed
+            .map(|s| self.high[0].max(self.high[1]).max(s + 4 * self.variation))
+    }
+
     /// The windowed maximum, or the variance bound while few samples exist.
     /// A slower path is unobserved until its first acknowledgment returns, so
     /// the initial estimate remains a floor for one initial RTT of sampling.
@@ -232,9 +239,7 @@ impl Rtt {
         let Some(smoothed) = self.smoothed else {
             return INITIAL_RTT;
         };
-        let observed = self.high[0]
-            .max(self.high[1])
-            .max(smoothed + 4 * self.variation);
+        let observed = self.observed_high().unwrap_or(smoothed);
         if self
             .first_sample
             .is_some_and(|at| now.saturating_duration_since(at) < INITIAL_RTT)
@@ -248,6 +253,7 @@ impl Rtt {
 
 struct Segment {
     end: u64,
+    path: usize,
     sent_at: Instant,
     transmissions: u32,
     /// Consecutive retransmissions without any acknowledgment progress between them.
@@ -274,11 +280,13 @@ pub struct Sender {
     limit: u64,
     acked: u64,
     segments: BTreeMap<u64, Segment>,
-    fresh: BTreeSet<(Instant, u64)>,
+    fresh: [BTreeSet<(Instant, u64)>; MAX_PATHS + 1],
     repeated: BTreeSet<(Instant, u64)>,
     lost: BTreeSet<u64>,
     rack: Option<Instant>,
     rtt: Rtt,
+    path_rtt: [Rtt; MAX_PATHS],
+    transport_rtt: [Duration; MAX_PATHS],
     reorder: f64,
     peer_duplicates: u64,
     last_progress: Option<Instant>,
@@ -310,11 +318,13 @@ impl Sender {
             limit: INITIAL_WINDOW,
             acked: 0,
             segments: BTreeMap::new(),
-            fresh: BTreeSet::new(),
+            fresh: Default::default(),
             repeated: BTreeSet::new(),
             lost: BTreeSet::new(),
             rack: None,
             rtt: Rtt::default(),
+            path_rtt: [Rtt::default(); MAX_PATHS],
+            transport_rtt: [Duration::ZERO; MAX_PATHS],
             reorder: REORDER_BASE,
             peer_duplicates: 0,
             last_progress: None,
@@ -376,6 +386,18 @@ impl Sender {
     fn threshold(&self, now: Instant) -> Duration {
         self.rtt.high(now).mul_f64(self.reorder) + Duration::from_millis(2)
     }
+    fn path_threshold(&self, path: usize, now: Instant) -> Duration {
+        if path == UNKNOWN_PATH {
+            return self.threshold(now);
+        }
+        // QUIC already measured this route before stream admission. A slow
+        // unrelated route must not delay loss recovery here. Stream samples
+        // additionally cover the ACK's return route and receiver scheduling.
+        self.transport_rtt[path]
+            .max(self.path_rtt[path].observed_high().unwrap_or_default())
+            .mul_f64(self.reorder)
+            + Duration::from_millis(2)
+    }
     fn probe_interval(&self, now: Instant) -> Duration {
         let base = self.rtt.high(now) * 2 + Duration::from_millis(20);
         (base * 2u32.pow(self.probe_count.min(6))).min(MAX_PTO)
@@ -384,7 +406,7 @@ impl Sender {
         let segment = &self.segments[&start];
         match segment.deadline {
             Some(at) => self.repeated.remove(&(at, start)),
-            None => self.fresh.remove(&(segment.sent_at, start)),
+            None => self.fresh[segment.path].remove(&(segment.sent_at, start)),
         };
     }
     fn mark_lost(&mut self, start: u64) {
@@ -412,6 +434,7 @@ impl Sender {
         let progress = self.last_progress;
         let segment = self.segments.entry(start).or_insert(Segment {
             end,
+            path: UNKNOWN_PATH,
             sent_at: now,
             transmissions: 0,
             stalls: 0,
@@ -422,11 +445,12 @@ impl Sender {
             segment.stalls = if stalled { segment.stalls + 1 } else { 0 };
         }
         segment.sent_at = now;
+        segment.path = UNKNOWN_PATH;
         segment.transmissions += 1;
         let transmission = segment.transmissions;
         if segment.stalls == 0 {
             segment.deadline = None;
-            self.fresh.insert((now, start));
+            self.fresh[UNKNOWN_PATH].insert((now, start));
         } else {
             let backoff = 1.5f64.powi(segment.stalls as i32).min(16.0);
             let at = now + threshold.mul_f64(backoff).min(MAX_PTO * 4);
@@ -484,6 +508,44 @@ impl Sender {
         }
         None
     }
+    /// Start loss timing on the route that actually admitted this transmission.
+    /// Copies and stale callbacks cannot replace a newer transmission's clock.
+    pub fn admitted(
+        &mut self,
+        start: u64,
+        transmission: u32,
+        path: u8,
+        rtt: Duration,
+        at: Instant,
+    ) {
+        let path = usize::from(path);
+        if path >= MAX_PATHS
+            || self
+                .segments
+                .get(&start)
+                .is_none_or(|s| s.transmissions != transmission || s.path != UNKNOWN_PATH)
+        {
+            return;
+        }
+        if !self.lost.remove(&start) {
+            self.unschedule(start);
+        }
+        self.transport_rtt[path] = rtt.max(Duration::from_millis(1));
+        let threshold = self.path_threshold(path, at);
+        let segment = self.segments.get_mut(&start).expect("admitted segment");
+        segment.path = path;
+        segment.sent_at = at;
+        if segment.stalls == 0 {
+            segment.deadline = None;
+            self.fresh[path].insert((at, start));
+        } else {
+            let backoff = 1.5f64.powi(segment.stalls as i32).min(16.0);
+            let deadline = at + threshold.mul_f64(backoff).min(MAX_PTO * 4);
+            segment.deadline = Some(deadline);
+            self.repeated.insert((deadline, start));
+        }
+    }
+
     /// A transmission left the local queue without admission. Retransmit it
     /// unless a later transmission or an acknowledgment has superseded it.
     pub fn locally_dropped(&mut self, start: u64, transmission: u32) -> bool {
@@ -546,8 +608,11 @@ impl Sender {
         let progressed = !delivered.is_empty() || cumulative > self.acked || raised;
         for segment in delivered {
             if segment.transmissions == 1 {
-                self.rtt
-                    .sample(now.saturating_duration_since(segment.sent_at), now);
+                let sample = now.saturating_duration_since(segment.sent_at);
+                self.rtt.sample(sample, now);
+                if segment.path != UNKNOWN_PATH {
+                    self.path_rtt[segment.path].sample(sample, now);
+                }
             }
             self.rack = Some(
                 self.rack
@@ -589,13 +654,15 @@ impl Sender {
         }
     }
     fn detect_losses(&mut self, now: Instant) {
-        let threshold = self.threshold(now);
-        // The oldest first transmission also has the earliest deadline.
-        while let Some(&(sent_at, start)) = self.fresh.first() {
-            if now < self.fresh_deadline(sent_at, threshold) {
-                break;
+        // The oldest transmission has the earliest deadline within its route.
+        for path in 0..=MAX_PATHS {
+            let threshold = self.path_threshold(path, now);
+            while let Some(&(sent_at, start)) = self.fresh[path].first() {
+                if now < self.fresh_deadline(sent_at, threshold) {
+                    break;
+                }
+                self.mark_lost(start);
             }
-            self.mark_lost(start);
         }
         while let Some(&(at, start)) = self.repeated.first() {
             if now < at {
@@ -605,11 +672,16 @@ impl Sender {
         }
     }
     pub fn next_deadline(&self, now: Instant) -> Option<Instant> {
-        let threshold = self.threshold(now);
         [
             self.fresh
-                .first()
-                .map(|(sent_at, _)| self.fresh_deadline(*sent_at, threshold)),
+                .iter()
+                .enumerate()
+                .filter_map(|(path, fresh)| {
+                    fresh.first().map(|(sent_at, _)| {
+                        self.fresh_deadline(*sent_at, self.path_threshold(path, now))
+                    })
+                })
+                .min(),
             self.repeated.first().map(|(at, _)| *at),
             self.needs_probe()
                 .then(|| self.probe_at.map(|at| at + self.probe_interval(now)))
@@ -1150,6 +1222,86 @@ mod tests {
         let (released, spurious) = sender.on_ack(&ack, deadline).unwrap();
         assert_eq!((released, spurious), (4 * MAX_SEGMENT as u64, true));
         assert!(sender.threshold(deadline) > before);
+    }
+
+    #[test]
+    fn fast_path_loss_does_not_wait_for_an_unrelated_slow_path() {
+        let t0 = Instant::now();
+        let mut sender = Sender::new(false);
+        sender.push(&vec![1; MAX_SEGMENT * 3]);
+        for (i, path, rtt) in [(0, 0, 20), (1, 1, 200), (2, 0, 20)] {
+            let at = t0 + Duration::from_millis(i);
+            let t = sender.poll_transmit(at).unwrap();
+            sender.admitted(
+                t.start,
+                t.transmission,
+                path,
+                Duration::from_millis(rtt),
+                at,
+            );
+        }
+        let at = t0 + Duration::from_millis(22);
+        sender
+            .on_ack(
+                &Ack {
+                    cumulative: 0,
+                    limit: INITIAL_WINDOW,
+                    duplicate_bytes: 0,
+                    ranges: vec![(2 * MAX_SEGMENT as u64, 3 * MAX_SEGMENT as u64)],
+                },
+                at,
+            )
+            .unwrap();
+        let deadline = sender.next_deadline(at).unwrap();
+        assert!(deadline < t0 + Duration::from_millis(100));
+        sender.on_timeout(deadline);
+        let repair = sender.poll_transmit(deadline).unwrap();
+        assert_eq!(repair.start, 0);
+        assert!(repair.retransmission);
+        assert!(
+            sender.poll_transmit(deadline).is_none(),
+            "slow segment is still within its route RTT"
+        );
+    }
+
+    #[test]
+    fn admission_restarts_the_clock_and_stale_copies_cannot_move_it() {
+        let t0 = Instant::now();
+        let mut sender = Sender::new(false);
+        sender.push(&[1; 100]);
+        let t = sender.poll_transmit(t0).unwrap();
+        let at = t0 + Duration::from_millis(90);
+        sender.admitted(t.start, t.transmission, 0, Duration::from_millis(20), at);
+        let deadline = sender.next_deadline(at).unwrap();
+        assert!(deadline > at + Duration::from_millis(25));
+        sender.admitted(t.start, t.transmission, 1, Duration::from_secs(1), at);
+        assert_eq!(
+            sender.next_deadline(at),
+            Some(deadline),
+            "a copy cannot replace the first admission"
+        );
+        sender.on_timeout(deadline);
+        let repair = sender.poll_transmit(deadline).unwrap();
+        sender.admitted(
+            repair.start,
+            repair.transmission,
+            1,
+            Duration::from_millis(80),
+            deadline,
+        );
+        let retry_deadline = sender.next_deadline(deadline);
+        sender.admitted(
+            t.start,
+            t.transmission,
+            0,
+            Duration::from_millis(1),
+            deadline,
+        );
+        assert_eq!(
+            sender.next_deadline(deadline),
+            retry_deadline,
+            "a stale callback cannot retime a retransmission"
+        );
     }
 
     #[test]

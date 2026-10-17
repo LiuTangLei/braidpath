@@ -57,6 +57,26 @@ fn dual_fec_fixture_budget_covers_its_unchanged_source_and_encoded_frames() {
         "integrity fixture overloads its own sender budget: {cost} bytes demand, {supplied_bytes} supplied; source/count/codec are unchanged"
     );
 }
+/// Preserve the complete fixture when a socket/timing assertion fails.
+struct FailureEvidence(PathBuf);
+impl Drop for FailureEvidence {
+    fn drop(&mut self) {
+        if thread::panicking() {
+            let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("local/test-failures");
+            let stamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let destination = root.join(format!("runtime-{}-{stamp}", std::process::id()));
+            let _ = fs::create_dir_all(&root);
+            match fs::rename(&self.0, &destination) {
+                Ok(()) => eprintln!("fixture evidence retained at {}", destination.display()),
+                Err(error) => eprintln!("could not retain fixture evidence: {error}"),
+            }
+        }
+    }
+}
+
 struct Process {
     child: Child,
     log: PathBuf,
@@ -532,6 +552,7 @@ fn three_paths(mode: u8) {
     let frontier_enabled = matches!(mode, 7 | 8);
     let repair_guard = mode == 9;
     let dir = tempfile::tempdir().unwrap();
+    let _evidence = FailureEvidence(dir.path().to_owned());
     let identity = dir.path().join("identity");
     let ident = identity.to_str().unwrap();
     assert!(
