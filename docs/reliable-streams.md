@@ -171,6 +171,11 @@ interval predates the backlog and measured sparse traffic, a fresh paired busy
 interval of at least 100 ms may size the queue reduction. The 500 ms capacity
 observation horizon is unchanged. This busy interval can size the reduction even
 when startup's native sending allowance was too large to be fully exercised.
+Before such a busy interval exists, a rising native RTT reaching the queue target
+can trigger the startup brake. Its fallback allowance uses the initial native
+window divided by the current RTT, so an expanded BBR startup window cannot keep
+all paths overfilled while receiver feedback catches up. This is a sending
+allowance, not a capacity estimate; legacy recovery retains its original behavior.
 
 ## Controlled measurement
 

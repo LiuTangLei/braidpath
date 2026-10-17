@@ -795,6 +795,8 @@ pub struct PathController {
     admitted_symbol_bytes: u64,
     /// Bounded cumulative actual (native cost, symbol bytes, symbol count).
     native_admitted: Option<(u64, u64, u64)>,
+    /// The initial native sending window, before BBR's startup expansion.
+    native_startup_window_bytes: Option<u64>,
     /// Actual business measurement start, separate from the control owner clock.
     admission_started_us: Option<u64>,
     allowance_bytes: f64,
@@ -883,6 +885,7 @@ impl PathController {
             admitted_bytes: 0,
             admitted_symbol_bytes: 0,
             native_admitted: Some((0, 0, 0)),
+            native_startup_window_bytes: None,
             admission_started_us: None,
             allowance_bytes: 0.0,
             wire_per_symbol: 1.0,
@@ -1038,6 +1041,7 @@ impl PathController {
                 .min(u128::from(self.maximum_bps)) as u64;
             if native_bps > self.rate_bps {
                 let previous = self.rate_bps;
+                self.native_startup_window_bytes = Some(cwnd_bytes);
                 self.rate_bps = native_bps;
                 self.last_growth_us = observation.now_us;
                 self.last_control.native_startup_cwnd_bytes = Some(cwnd_bytes);
@@ -1504,9 +1508,13 @@ impl PathController {
             now.saturating_sub(since) >= BRAKE_US
                 || self.queue_delay_ms >= self.target_ms * 4.0
                 // A sub-target pulse still holds growth but must persist before
-                // braking. At the target, a rising startup probe brakes at once.
+                // braking. A rising startup probe or native RTT can act at the
+                // target, before a complete busy delivery interval exists.
                 || (fast_initial
-                    && new_probe
+                    && (new_probe
+                        || (self.fast_recovery_enabled
+                            && self.native_startup_window_bytes.is_some()
+                            && new_rtt))
                     && queue_rising
                     && self.queue_delay_ms >= self.target_ms)
         } else {
@@ -2183,6 +2191,21 @@ impl PathController {
                         })
                     })
                 });
+            // Without a qualified service interval, update the original native
+            // window's sending allowance with today's RTT. Keeping the original
+            // RTT (or adopting BBR's expanded startup window) can fill every path
+            // before the first busy receiver report arrives. This only lowers
+            // startup allowance; it grants no capacity memory or burst tokens.
+            let fallback = self.rate_bps as f64 * 0.8;
+            let fallback = if self.fast_recovery_enabled && fast_initial && new_delay {
+                self.native_startup_window_bytes
+                    .zip(local_rtt)
+                    .map_or(fallback, |(window, rtt_ms)| {
+                        fallback.min(window as f64 * 8000.0 / rtt_ms)
+                    })
+            } else {
+                fallback
+            };
             let mut desired = service_hint
                 .filter(|rate| {
                     // A complete, backlogged paired interval measures service
@@ -2210,7 +2233,7 @@ impl PathController {
                                         })
                                     }))))
                 })
-                .map_or(self.rate_bps as f64 * 0.8, |rate| rate * drain_fraction);
+                .map_or(fallback, |rate| rate * drain_fraction);
             if delay_pressure
                 && queue_rising
                 && (self.queue_delay_ms - previous_queue > self.target_ms * 0.5
@@ -8019,6 +8042,54 @@ mod tests {
         next.probe_rtt_ms = Some(98.0);
         next.probe_latest_rtt_ms = Some(98.0);
         (controller, next)
+    }
+
+    #[test]
+    fn native_startup_uses_current_rtt_to_brake_before_busy_service_is_measurable() {
+        for legacy in [false, true] {
+            let mut controller = PathController::new(400_000_000, 20).with_legacy_recovery(legacy);
+            let mut sample = short_observation_022(0, 20.0);
+            sample.offered_backlog = false;
+            sample.delivered_bytes = 0;
+            sample.admitted_symbols = Some(0);
+            sample.admitted_symbol_bytes = Some(0);
+            controller.observe_native(&sample, None, 240_000, 20_000);
+            for step in 1..=10 {
+                let now = step * 100_000;
+                controller.admitted_symbol(now, 1000, 1000);
+                sample = short_observation_022(now, 20.0);
+                sample.offered_backlog = false;
+                sample.admitted_symbols = Some(step);
+                sample.admitted_symbol_bytes = Some(step * 1000);
+                sample.delivered_bytes = step * 1000;
+                controller.observe_native(&sample, None, 240_000, 20_000);
+            }
+            let remembered = controller.remembered_bps;
+            controller.admitted_symbol(1_100_000, 40_000, 40_000);
+            sample = short_observation_022(1_100_000, 45.0);
+            sample.rtt_ms = 45.0;
+            sample.probe_age_us = None;
+            sample.probe_rtt_ms = None;
+            sample.probe_latest_rtt_ms = None;
+            sample.admitted_symbols = Some(50);
+            sample.admitted_symbol_bytes = Some(50_000);
+            sample.delivered_bytes = 30_000;
+            // BBR has already expanded its window, but no complete busy receiver
+            // interval exists. Reuse the original native window with today's RTT.
+            controller.observe_native(&sample, None, 1_000_000, 45_000);
+            if legacy {
+                assert_eq!(controller.last_brake_us, None);
+                assert_eq!(controller.rate_bps, 96_000_000);
+                continue;
+            }
+            assert_eq!(controller.last_brake_us, Some(1_100_000));
+            assert!(controller.rate_bps <= 240_000 * 8_000_000 / 45_000);
+            assert_eq!(
+                controller.last_control.queue_brake_symbol_delivery_bps,
+                None
+            );
+            assert_eq!(controller.remembered_bps, remembered);
+        }
     }
 
     #[test]
