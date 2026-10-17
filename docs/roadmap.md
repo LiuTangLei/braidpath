@@ -25,7 +25,7 @@ Current protocol, commands and limits: [experimental runtime](runtime.md). Check
 - [x] Prototype native HTTP/3 plus HTTP Datagrams with an ordinary website handler, authenticated request/context mapping and server identity verification; evaluate compatible Rust libraries without adding an Xray dependency.
 - [ ] Pass the carrier semantics/cost gate against plain QUIC; trace effective settings, queue ownership, PMTU, fingerprint limitations and independent-peer behavior before selecting the deployment candidate.
 - [ ] For intended filtered deployments, start the reachability comparison before selecting a default carrier; website behavior alone cannot establish reachability.
-- [x] Implement authenticated session admission with operator-managed credentials and 0-RTT disabled.
+- [x] Implement authenticated session admission with operator-managed credentials.
 - [x] Admit resumed paths with QUIC 0-RTT over single-use stateful tickets, with replay-refusal tests and full-handshake fallback.
 - [x] Keep server tickets across restarts in a journal that records each use durably before the ticket is released; client tickets remain in memory.
 - [x] Build minimal client/server CLI for QUIC DATAGRAM echo and load generation; FEC-off first, then XOR with canonical records.
