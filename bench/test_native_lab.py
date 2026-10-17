@@ -60,6 +60,13 @@ class Arguments(unittest.TestCase):
             parse_args(["--binary", str(self.binary), "--lab-binary", str(self.binary),
                         "--output", str(Path(self.directory.name) / "run")])
 
+    def test_policer_is_explicit_and_byte_bounded(self):
+        self.assertEqual(parse_args(self.common).policer_burst_bytes, 0)
+        for burst in (2048, 8192, 1048576):
+            self.assertEqual(parse_args(self.common + ["--policer-burst-bytes", str(burst)]).policer_burst_bytes, burst)
+        for burst in (-1, 2047, 1048577):
+            self.rejected(["--policer-burst-bytes", str(burst)])
+
     def test_modes_and_recovery_options_reach_the_client(self):
         args = parse_args(self.common + ["--legacy-recovery", "--client-extra-arg=--x"])
         argv = client_arguments(args, "cert", "token", "127.0.0.1:1", ["127.0.0.1:2", "127.0.0.1:3"], [])

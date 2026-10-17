@@ -84,8 +84,16 @@ loopback sockets and shapes every path in both directions: a virtual-clock
 serializer over IPv4+UDP bytes, half the registered RTT as one-way delay, a
 packet limit that counts queued and propagating packets like netem, and seeded
 random loss. `--rtt-ms` takes one to eight paths and `--rate-mbps` one value
-or one per path. `--loss-percent` applies after readiness, and
-`--step AT_SECONDS:PATH:RATE_MBPS` changes both directions of a path relative
+or one per path. `--loss-percent` accepts 0–90 and applies after readiness.
+Random erasures occur before rate accounting, so erased packets consume no
+serializer or policer credit. `--policer-burst-bytes` selects a direct-drop
+byte-token bucket (2048–1048576 IPv4+UDP bytes) in each direction; its default
+of zero preserves FIFO shaping. Accepted packets incur propagation and their
+own serialization time, without waiting behind earlier accepted packets.
+The existing packet limit still counts propagating packets: check separate
+`policer_drops` and `queue_full_drops` before interpreting a run as a policer
+case. Rate steps settle token credit at the old rate before applying the new
+rate. `--step AT_SECONDS:PATH:RATE_MBPS` changes both directions of a path relative
 to the source launch. `--mode` selects `native-service` (default) or `adaptive`;
 `--rate-bps` defaults to 400000000 and accepts `auto`. The summary adds the
 time-averaged forward capacity and per-second on-time goodput. Timer jitter

@@ -172,6 +172,8 @@ class Lab:
         lab_argv = [args.lab_binary, "--server", server_addr, "--queue-packets", args.queue_packets,
                     "--seed", args.seed, "--ready-file", self.output / "link-ready.json",
                     "--stats-jsonl", self.output / "link.jsonl", "--final-file", self.output / "link-final.json"]
+        if args.policer_burst_bytes:
+            lab_argv += ["--policer-burst-bytes", args.policer_burst_bytes]
         for rtt, rate in zip(args.rtt_ms, rates):
             lab_argv += ["--path", f"{rtt:g}:{rate:g}"]
         self.emulator, started = self.spawn("link", lab_argv, stdin=subprocess.PIPE, text=True)
@@ -232,6 +234,8 @@ class Lab:
         offered = args.pps * PAYLOAD_BYTES * 8 / 1e6
         summary.update({
             "path_rate_mbps": rates, "steps": args.step, "loss_percent_each_direction": args.loss_percent,
+            "policer_burst_bytes": args.policer_burst_bytes,
+            "link_model": "direct-drop policer" if args.policer_burst_bytes else "FIFO shaper",
             "time_average_forward_capacity_mbps": capacity, "offered_payload_mbps": offered,
             "goodput_to_capacity_ratio": summary["deadline_goodput_mbps"] / capacity,
             "per_second_on_time_goodput_mbps": per_second_goodput(
@@ -286,6 +290,8 @@ def parse_args(argv=None):
     parser.add_argument("--rtt-ms", type=float, nargs="+", default=[30, 45, 60, 80])
     parser.add_argument("--rate-mbps", type=float, nargs="+", default=[100])
     parser.add_argument("--queue-packets", type=int, default=1024)
+    parser.add_argument("--policer-burst-bytes", type=int, default=0,
+                        help="direct-drop IPv4+UDP byte-token bucket; zero uses FIFO shaping")
     parser.add_argument("--rate-bps", default="400000000",
                         help="client and server cap in bits per second, or auto")
     parser.add_argument("--mode", choices=["adaptive", "native-service"], default="native-service")
@@ -309,6 +315,8 @@ def parse_args(argv=None):
             or any(not math.isfinite(x) or not 1 <= x <= 1000 for x in args.rate_mbps)
             or not 8 <= args.queue_packets <= 16384):
         parser.error("invalid finite shaping settings")
+    if args.policer_burst_bytes != 0 and not 2048 <= args.policer_burst_bytes <= 1048576:
+        parser.error("policer burst must be zero or 2048..1048576 IPv4+UDP bytes")
     try:
         path_rates(args)
     except ValueError as error:
