@@ -68,8 +68,29 @@ python3 -m bench.proxy_interop --binary target/release/braidpath \
 | sing-box 1.14.3 | passed | passed |
 | Xray 26.3.27 | passed | passed |
 
-These are local protocol checks on macOS arm64, not performance or reachability
-results. Xray's fetches take about one second longer with either outbound: its
+The tested outbounds, for a BraidPath client with `--proxy-listen 127.0.0.1:1080`
+(names are examples; route the traffic you intend with each tool's own rules):
+
+```yaml
+# mihomo
+proxies:
+  - {name: braidpath, type: socks5, server: 127.0.0.1, port: 1080, udp: true}
+rules:
+  - MATCH,braidpath
+```
+
+```json
+{"type": "socks", "tag": "braidpath", "server": "127.0.0.1", "server_port": 1080, "version": "5"}
+```
+
+```json
+{"protocol": "socks", "settings": {"servers": [{"address": "127.0.0.1", "port": 1080}]}}
+```
+
+The second is a sing-box outbound, the third an Xray outbound; for HTTP CONNECT use
+`type: http` (mihomo, sing-box) or `"protocol": "http"` (Xray), which carries TCP
+only. These are local protocol checks on macOS arm64, not performance or
+reachability results. Xray's fetches take about one second longer with either outbound: its
 default one-second half-close policy, also seen with its direct outbound.
 
 ### UDP ASSOCIATE
