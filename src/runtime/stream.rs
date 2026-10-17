@@ -351,6 +351,16 @@ impl Sender {
     pub fn written(&self) -> u64 {
         self.written
     }
+    /// (next offset, retained segments, fresh timers, backed-off timers, ready losses).
+    pub(crate) fn recovery_state(&self) -> (u64, usize, usize, usize, usize) {
+        (
+            self.next,
+            self.segments.len(),
+            self.fresh.iter().map(BTreeSet::len).sum(),
+            self.repeated.len(),
+            self.lost.len(),
+        )
+    }
     pub fn limit(&self) -> u64 {
         self.limit
     }
@@ -651,11 +661,14 @@ impl Sender {
         }
     }
     fn fresh_deadline(&self, sent_at: Instant, threshold: Duration) -> Instant {
-        if self.rack.is_some_and(|rack| sent_at < rack) {
-            sent_at + threshold
+        let delay = if self.rack.is_some_and(|rack| sent_at < rack) {
+            threshold
         } else {
-            sent_at + threshold.mul_f64(1.5)
-        }
+            threshold.mul_f64(1.5)
+        };
+        // Delayed ACKs must not move the first repair beyond the peer's
+        // failure deadline. Repeated repairs retain their bounded backoff.
+        sent_at + delay.min(MAX_PTO)
     }
     fn detect_losses(&mut self, now: Instant) {
         // The oldest transmission has the earliest deadline within its route.
@@ -903,6 +916,43 @@ impl Receiver {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn delayed_ack_cannot_move_loss_recovery_past_the_peer_failure_deadline() {
+        let now = Instant::now();
+        let mut sender = Sender::new(false);
+        sender.push(&vec![7; MAX_SEGMENT * 2]);
+        for _ in 0..2 {
+            let sent = sender.poll_transmit(now).unwrap();
+            sender.admitted(
+                sent.start,
+                sent.transmission,
+                0,
+                Duration::from_millis(5),
+                now,
+            );
+        }
+        // A delayed first-transmission ACK can inflate the RTT variance bound.
+        // It cannot postpone repairing the preceding hole until after DEAD_AFTER.
+        let late = now + Duration::from_secs(10);
+        sender
+            .on_ack(
+                &Ack {
+                    cumulative: 0,
+                    limit: INITIAL_WINDOW,
+                    duplicate_bytes: 0,
+                    ranges: vec![(MAX_SEGMENT as u64, (MAX_SEGMENT * 2) as u64)],
+                },
+                late,
+            )
+            .unwrap();
+        let recovery = sender
+            .poll_transmit(late)
+            .expect("repair the old hole despite inflated RTT");
+        assert!(recovery.retransmission);
+        assert_eq!(recovery.start, 0);
+        assert!(!sender.failed(late));
+    }
 
     #[test]
     fn a_finished_receiver_keeps_an_acknowledgment_of_everything() {

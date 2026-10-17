@@ -1018,6 +1018,8 @@ impl Mux {
                     writer_finished = s.write_finished,
                     pending_io = self.events.len(),
                     local_queued_bytes = self.gauge.queued(),
+                    recovery = ?s.send.recovery_state(),
+                    next_deadline_ms = ?s.send.next_deadline(now).map(|at| at.saturating_duration_since(now).as_millis()),
                     "stream progress"
                 );
             }
