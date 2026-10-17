@@ -368,6 +368,14 @@ impl Mux {
         at
     }
 
+    /// Reserve one bounded local completion per actor turn, even when a
+    /// higher-priority network input is continuously ready.
+    pub(super) fn service_io(&mut self) {
+        if let Ok(event) = self.events.try_recv() {
+            self.io(event);
+        }
+    }
+
     pub(super) async fn wake(&mut self) -> Wake {
         let now = Instant::now();
         let deadline = tokio::time::Instant::from_std(self.deadline(now));
@@ -464,7 +472,7 @@ impl Mux {
         }
     }
 
-    pub(super) fn handle(&mut self, wake: Wake, out: &mut Out) {
+    pub(super) fn handle(&mut self, wake: Wake) {
         match wake {
             Wake::Io(event) => self.io(event),
             Wake::Accept(Ok((tcp, _))) => {
@@ -487,7 +495,6 @@ impl Mux {
             }
             Wake::Queue | Wake::Timer => {}
         }
-        self.flush(out);
     }
 
     fn io(&mut self, event: Io) {
@@ -988,6 +995,8 @@ impl Mux {
     fn publish(&mut self, now: Instant) {
         self.published = now;
         self.stats.active = self.streams.len() as u64;
+        self.stats.pending_io_events = self.events.len() as u64;
+        self.stats.local_sender_queued_bytes = self.gauge.queued() as u64;
         self.stats.duplicate_bytes_received = self.closed_duplicates
             + self
                 .streams
@@ -997,6 +1006,22 @@ impl Mux {
         let snapshot = self.stats.clone();
         self.scope
             .update(|d| d.tcp_streams = Some(snapshot.clone()));
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            for (id, s) in &self.streams {
+                debug!(
+                    stream = id,
+                    written = s.send.written(),
+                    retained_from = s.send.retained_from(),
+                    peer_limit = s.send.limit(),
+                    send_finished = s.send.finished(),
+                    receive_finished = s.recv.finished(),
+                    writer_finished = s.write_finished,
+                    pending_io = self.events.len(),
+                    local_queued_bytes = self.gauge.queued(),
+                    "stream progress"
+                );
+            }
+        }
     }
 
     pub(super) fn close_all(&mut self) {
@@ -1097,5 +1122,85 @@ async fn write_loop(
     if !finished {
         let _ = socket2::SockRef::from(write.as_ref()).set_linger(Some(Duration::ZERO));
         write.forget();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::runtime::{MAX_PATHS, stats};
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn socket_reads_and_eof_progress_while_wire_input_stays_ready() {
+        let policy = Policy {
+            streams: true,
+            proxy: false,
+            fec_repairs: 1,
+            adaptive: false,
+            capacity_probe_bps: 0,
+            probe_guided_recovery: false,
+            latency_target_ms: 20,
+            group_rates: [10_000_000; MAX_PATHS],
+            receiver_feedback: false,
+            quality_schedule: false,
+            fec: 0,
+            small_fec_bytes: 0,
+            mixed_fec: false,
+            redundancy: 0,
+            rate: 10_000_000,
+            block_ms: 25,
+            queue_ms: 100,
+        };
+        let metrics = stats::Metrics::new("client");
+        let scope = metrics.scope("io-progress", stats::FORWARD);
+        let mut mux = Mux::new(
+            Listeners::default(),
+            Targets::default(),
+            &policy,
+            scope.clone(),
+        );
+        mux.open(1, false);
+        mux.events_tx.send(Io::Read(1, vec![7; 64])).unwrap();
+        mux.events_tx.send(Io::ReadEnd(1)).unwrap();
+        let (wire_tx, wire_rx) = mpsc::channel::<()>(1);
+        wire_tx.try_send(()).unwrap();
+        let (tx, mut rx) = mpsc::channel(4);
+        let mut next_id = 0;
+        let mut out = Out {
+            tx: &tx,
+            next_id: &mut next_id,
+            scope: &scope,
+            small_threshold: 0,
+        };
+        for remaining in [1, 0] {
+            // The actor's higher-priority wire input never becomes Pending.
+            // Each turn must nevertheless service one local completion.
+            assert!(!wire_rx.is_empty());
+            mux.service_io();
+            assert_eq!(
+                mux.events.len(),
+                remaining,
+                "local I/O must progress one event per turn"
+            );
+            mux.flush(&mut out);
+        }
+        assert_eq!(
+            Frame::decode(&rx.try_recv().unwrap().record.payload),
+            Some(Frame::Data {
+                offset: 0,
+                fin: false,
+                data: vec![7; 64]
+            })
+        );
+        assert_eq!(
+            Frame::decode(&rx.try_recv().unwrap().record.payload),
+            Some(Frame::Data {
+                offset: 64,
+                fin: true,
+                data: Vec::new()
+            }),
+            "half-close must leave the application queue even during continuous wire traffic"
+        );
+        mux.service_io(); // An empty local queue is nonblocking.
     }
 }

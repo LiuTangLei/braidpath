@@ -564,7 +564,9 @@ fn three_paths(mode: u8) {
     let dual = matches!(mode, 6 | 8 | 9);
     let frontier_enabled = matches!(mode, 7 | 8);
     let repair_guard = mode == 9;
-    let dir = tempfile::tempdir().unwrap();
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("local/test-fixtures");
+    fs::create_dir_all(&root).unwrap();
+    let dir = tempfile::tempdir_in(root).unwrap();
     let _evidence = FailureEvidence(dir.path().to_owned());
     let identity = dir.path().join("identity");
     let ident = identity.to_str().unwrap();

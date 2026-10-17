@@ -179,6 +179,10 @@ allowance, not a capacity estimate; legacy recovery retains its original behavio
 
 ## Controlled measurement
 
+Each session actor services one queued local socket completion before selecting
+its next input and flushes stream state once per turn. Continuous incoming wire
+traffic therefore cannot indefinitely postpone local reads, writes, or EOF.
+
 `bench/tcp_lab.py` runs one TCP transfer through the native link emulator
 (`examples/link_lab.rs`) and verifies its SHA-256. `--use-path` selects a subset of
 emulated paths, giving a matched single-path baseline on the same topology:

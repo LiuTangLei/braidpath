@@ -2880,6 +2880,15 @@ async fn session_loop(
         if *stop.borrow() {
             break;
         }
+        if let Some(mux) = streams.as_mut() {
+            mux.service_io();
+            mux.flush(&mut tcp::Out {
+                tx: &tx,
+                next_id: &mut next_id,
+                scope: &session.returning,
+                small_threshold,
+            });
+        }
         tokio::select! {
             biased;
             _=stop.changed()=>break,
@@ -2932,7 +2941,6 @@ async fn session_loop(
                             dropped+=delivery.send(socket,None,r,pid,decoded);
                         }
                     }
-                    if let Some(mux)=streams.as_mut() {mux.flush(&mut tcp::Out{tx:&tx,next_id:&mut next_id,scope:&session.returning,small_threshold});}
                 },
                 Some(Event::Reply(flow,payload,created))=>{
                     let Some((_,last))=flows.get_mut(&flow) else{trace_payload(&session.returning,trace::Stage::RecordDropped,&payload,Some(trace::Reason::FlowUnavailable));session.returning.update(|d|d.records.application_unavailable_dropped+=1);continue}; *last=Instant::now();
@@ -2941,7 +2949,7 @@ async fn session_loop(
                 },
                 None=>break,
             },
-            wake=stream_wake(&mut streams)=>streams.as_mut().expect("stream adapter").handle(wake,&mut tcp::Out{tx:&tx,next_id:&mut next_id,scope:&session.returning,small_threshold}),
+            wake=stream_wake(&mut streams)=>streams.as_mut().expect("stream adapter").handle(wake),
         }
         while tasks.try_join_next().is_some() {}
     }
@@ -3602,6 +3610,10 @@ async fn client_session(
     let mut announced = false;
     let mut last_stats = 0u64;
     let result:Result<()>=async {loop {
+        if let Some(mux)=streams.as_mut() {
+            mux.service_io();
+            mux.flush(&mut tcp::Out{tx:&tx,next_id:&mut next_id,scope:&forward,small_threshold});
+        }
         tokio::select! {
             _=shutdown.wait()=>break,
             _=retention_deadline(&decoder)=>{decoder.expire_adaptive(Instant::now());publish_retention(&decoder,&returning);},
@@ -3757,9 +3769,8 @@ async fn client_session(
                         drops+=delivery.send(&socket,Some(*peer),record,pid,decoded);
                     } else {returning.trace_record(trace::Stage::RecordDropped,&record,None,Some(trace::Reason::FlowUnavailable));returning.update(|d|d.records.udp_target_flow_dropped+=1);returning.path(pid,|p|p.udp_target_flow_dropped+=1);}
                 }
-                if let Some(mux)=streams.as_mut() {mux.flush(&mut tcp::Out{tx:&tx,next_id:&mut next_id,scope:&forward,small_threshold});}
             },
-            wake=stream_wake(&mut streams)=>streams.as_mut().expect("stream adapter").handle(wake,&mut tcp::Out{tx:&tx,next_id:&mut next_id,scope:&forward,small_threshold}),
+            wake=stream_wake(&mut streams)=>streams.as_mut().expect("stream adapter").handle(wake),
         }
         while let Some(completion)=tasks.try_join_next() {completion.context("path task failed")?;}
     }Ok(())}.await;

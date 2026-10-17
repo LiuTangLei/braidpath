@@ -33,7 +33,10 @@ impl Drop for Process {
 fn launch(args: &[&str], dir: &Path, name: &str) -> Process {
     let log = dir.join(format!("{name}.log"));
     let child = Command::new(BIN)
-        .env("RUST_LOG", "braidpath=info")
+        .env(
+            "RUST_LOG",
+            "braidpath=info,braidpath::runtime::tunnel::tcp=debug",
+        )
         .args(args)
         .stdout(Stdio::null())
         .stderr(fs::File::create(&log).unwrap())
@@ -111,7 +114,7 @@ impl Drop for Topology {
     fn drop(&mut self) {
         // Close children before moving their open logs, including on Windows.
         self._processes.clear();
-        if thread::panicking() {
+        if thread::panicking() || std::env::var_os("CI").is_some() {
             let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("local/test-failures");
             let stamp = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -145,7 +148,15 @@ impl Topology {
 /// for the matching local listener.
 fn topology(server: &[&str], relays: &[&str], local: &str) -> Topology {
     let fixture = socket_fixture();
-    let dir = tempfile::tempdir().unwrap();
+    // Keep the live fixture and retained evidence on the same volume on Windows.
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("local/test-fixtures");
+    fs::create_dir_all(&root).unwrap();
+    let dir = tempfile::tempdir_in(root).unwrap();
+    fs::write(
+        dir.path().join("fixture.log"),
+        thread::current().name().unwrap_or("unnamed"),
+    )
+    .unwrap();
     let identity = dir.path().join("identity");
     assert!(
         Command::new(BIN)

@@ -160,6 +160,10 @@ pub struct Snapshot {
     pub reset_peer: u64,
     pub rejected: u64,
     pub active: u64,
+    /// Local socket events waiting for the stream actor.
+    pub pending_io_events: u64,
+    /// Reliable-stream bytes held in the local sender queue.
+    pub local_sender_queued_bytes: u64,
     pub bytes_from_application: u64,
     pub bytes_to_application: u64,
     pub segments_sent: u64,
