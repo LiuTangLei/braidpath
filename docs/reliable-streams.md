@@ -169,7 +169,8 @@ minimum rate. At startup the transport window limits sends before a local backlo
 forms, so the queue condition keeps the immediate cut there. If the retained
 interval predates the backlog and measured sparse traffic, a fresh paired busy
 interval of at least 100 ms may size the queue reduction. The 500 ms capacity
-observation horizon is unchanged.
+observation horizon is unchanged. This busy interval can size the reduction even
+when startup's native sending allowance was too large to be fully exercised.
 
 ## Controlled measurement
 

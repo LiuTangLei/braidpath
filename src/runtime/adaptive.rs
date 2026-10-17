@@ -2129,7 +2129,7 @@ impl PathController {
                         old.admission.is_some_and(|a| {
                             a.bps * self.wire_per_symbol < self.rate_bps as f64 * 0.85
                                 && self.backlog_since_us.is_some_and(|since| {
-                                    a.started_us.saturating_add(a.span_us) < since
+                                    a.started_us.saturating_add(a.span_us) <= since
                                 })
                         })
                     }))
@@ -2185,9 +2185,13 @@ impl PathController {
                 });
             let mut desired = service_hint
                 .filter(|rate| {
+                    // A complete, backlogged paired interval measures service
+                    // even when native startup seeded an unexercised allowance.
+                    // The sparse retained interval cannot grant this authority.
                     *rate > 0.0
                         && (*rate >= self.rate_bps as f64
-                            || ((episode_exercised || delivery_shortfall || backlogged_queue_delivery)
+                            || ((episode_exercised || delivery_shortfall || backlogged_queue_delivery
+                                || (self.fast_recovery_enabled && current_queue_service.is_some()))
                                 // Current utilization cannot qualify a sparse
                                 // interval from before this backlog/queue.
                                 && (!self.fast_feedback_seen
@@ -8015,6 +8019,50 @@ mod tests {
         next.probe_rtt_ms = Some(98.0);
         next.probe_latest_rtt_ms = Some(98.0);
         (controller, next)
+    }
+
+    #[test]
+    fn busy_queue_sample_brakes_an_unexercised_native_startup_allowance() {
+        let mut controller = PathController::new(400_000_000, 20);
+        let mut admitted = 0;
+        let mut received = 0;
+        let mut remembered = 0.0;
+        for step in 0..=12 {
+            let now = step * 100_000;
+            let busy = step >= 10;
+            let sent = if step > 10 { 400_000 } else { 1000 };
+            controller.admitted_symbol(now, sent, sent);
+            admitted += sent as u64;
+            received += if step > 10 { 250_000 } else { 1000 };
+            let mut sample = short_observation_022(now, 20.0);
+            sample.offered_backlog = busy;
+            sample.delivered_bytes = received;
+            sample.admitted_symbol_bytes = Some(admitted);
+            sample.admitted_symbols = Some(admitted / 1000);
+            sample.delivered_bps = Some(if step > 10 { 20_000_000.0 } else { 80_000.0 });
+            if step == 12 {
+                remembered = controller.remembered_bps;
+                sample.rtt_ms = 110.0;
+                sample.probe_rtt_ms = Some(110.0);
+                sample.probe_latest_rtt_ms = Some(110.0);
+            }
+            controller.observe_native(&sample, None, 240_000, 20_000);
+        }
+        assert_eq!(controller.last_brake_us, Some(1_200_000));
+        assert_eq!(controller.pressure_episode_exercised, Some(false));
+        assert_eq!(
+            controller.last_control.queue_brake_symbol_delivery_bps,
+            Some(20_000_000.0),
+            "the fresh busy interval measured service independently of startup allowance"
+        );
+        assert!(
+            controller.rate_bps < 20_000_000,
+            "drain the measured queue immediately instead of reducing 96 Mbit/s by only 20%"
+        );
+        assert_eq!(
+            controller.remembered_bps, remembered,
+            "short samples grant no capacity memory"
+        );
     }
 
     #[test]
