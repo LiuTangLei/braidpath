@@ -59,8 +59,9 @@ records and topology-specific results belong in ignored `local/`.
 Auto negotiates `braidpath-auto-small: 1` with an explicit response echo. Both
 endpoints must support it; fixed numeric FEC remains compatible with older peers.
 Records of at most 128 application bytes and all reliable-stream ACKs (including
-large selective ACKs) use immediate k=1 blocks, separate from bulk coding. A clean
-or weak-loss bulk target (0/32/16) permits one repair copy, 8+1 permits two, and
+large selective ACKs) use a separate protection lane. A cold,
+unknown target permits one repair copy; qualified clean target 0 permits none,
+32/16 permit one, 8+1 permits two, and
 4+1 permits three. The copies carry identical authenticated repair bytes and one
 block ID; the receiver delivers once. Delayed originals remain duplicates.
 
@@ -76,3 +77,10 @@ same-path copies until the previous datagram has left Quinn's outgoing queue.
 This avoids relying on multiple copies packed into the same native datagram.
 Independent packet loss remains an approximation; shared failures can lose every
 copy. These bounds prioritize interaction without promising a latency deadline.
+
+Qualified clean feedback removes proactive short-record copies even when the
+bulk k stays zero. Short reliable retries carry local transmission identity:
+second attempts authorize one copy, third/later attempts authorize three, within
+the same rate/credit/queue limits. This protects recovery before a finalized loss
+report arrives. With zero selected copies the control record is plain, keeps
+normal latency scheduling, and does not earn bulk repair credit.

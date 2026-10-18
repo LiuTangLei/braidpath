@@ -163,7 +163,17 @@ impl RecordEncoder {
         Ok(Self { mode })
     }
 
+    #[cfg(test)]
     pub(super) fn encode(&mut self, record: &Record, now: Instant) -> Result<Vec<EncodedSymbol>> {
+        self.encode_attempt(record, now, 1)
+    }
+
+    pub(super) fn encode_attempt(
+        &mut self,
+        record: &Record,
+        now: Instant,
+        attempt: u32,
+    ) -> Result<Vec<EncodedSymbol>> {
         match &mut self.mode {
             Mode::Automatic {
                 lane,
@@ -180,8 +190,23 @@ impl RecordEncoder {
                         & (super::super::stream::STREAM_FLAG | super::super::stream::ACK_FLAG)
                         == (super::super::stream::STREAM_FLAG | super::super::stream::ACK_FLAG);
                 if control {
+                    // Clean steady traffic carries no proactive repair. A
+                    // short stream retry is independent evidence of trouble,
+                    // so protect it before a finalized loss report arrives.
+                    let recovery = match attempt {
+                        0 | 1 => 0,
+                        2 => 1,
+                        _ => 3,
+                    };
+                    let copies = (*small_repairs).max(recovery);
+                    if copies == 0 {
+                        return Ok(vec![EncodedSymbol {
+                            data: wire::plain(record)?,
+                            small: true,
+                        }]);
+                    }
                     let mut out = small.push(&record.encode()?, now, next_block, true)?;
-                    for _ in 1..*small_repairs {
+                    for _ in 1..copies {
                         out.push(out.last().expect("k=1 repair").clone());
                     }
                     Ok(out)
@@ -284,6 +309,7 @@ impl RecordEncoder {
         *small_repairs = match next {
             4 => 3,
             8 => 2,
+            0 => 0,
             _ => 1,
         };
         if next == *k {
@@ -436,6 +462,24 @@ mod tests {
         for s in [&protected[2], &protected[3], &protected[0]] {
             assert!(receiver.receive(&s.data, now).unwrap().is_empty());
         }
+    }
+
+    #[test]
+    fn qualified_clean_feedback_removes_proactive_copies_but_short_retries_are_protected() {
+        let mut p = policy(super::super::super::automatic_fec::AUTO, 0, false);
+        p.receiver_feedback = true;
+        let now = Instant::now();
+        let mut e = RecordEncoder::new(&p).unwrap();
+        e.set_fec(0).unwrap();
+        let normal = e.encode(&record(1, 64), now).unwrap();
+        assert_eq!(normal.len(), 1);
+        assert_eq!(normal[0].data[3], 2);
+        assert!(normal[0].small, "plain control never funds bulk repair");
+        assert_eq!(e.encode_attempt(&record(2, 64), now, 2).unwrap().len(), 2);
+        assert_eq!(e.encode_attempt(&record(3, 64), now, 3).unwrap().len(), 4);
+        let bulk = e.encode_attempt(&record(4, 1000), now, 3).unwrap();
+        assert_eq!(bulk.len(), 1);
+        assert!(!bulk[0].small);
     }
 
     #[test]

@@ -94,6 +94,9 @@ pub struct Hold {
     admitted: AtomicBool,
 }
 impl Hold {
+    pub fn transmission(&self) -> u32 {
+        self.identity.2
+    }
     pub fn interactive(&self) -> bool {
         self.interactive
     }

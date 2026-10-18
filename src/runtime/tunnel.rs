@@ -614,7 +614,8 @@ fn encode_input(
         });
         return;
     }
-    match encoder.encode(&record, Instant::now()) {
+    let attempt = hold.as_ref().map_or(1, |h| h.transmission());
+    match encoder.encode_attempt(&record, Instant::now(), attempt) {
         Ok(symbols) => {
             for symbol in symbols {
                 enqueue_coded_symbol(
@@ -1864,10 +1865,12 @@ async fn sender(
                     )
                 })
                 .collect();
-            if let Some(k) = control.observe(
+            let changed = control.observe(
                 now_us,
                 feedback.iter().map(|(id, active, s)| (*id, *active, s)),
-            ) {
+            );
+            let snapshot = control.snapshot();
+            if let Some(k) = changed.or_else(|| snapshot.loss_rate.map(|_| snapshot.data_shards)) {
                 match encoder.set_fec(k) {
                     Ok(symbols) => {
                         for symbol in symbols {
@@ -1887,7 +1890,7 @@ async fn sender(
                     }
                 }
             }
-            metrics.publish_automatic_fec(control.snapshot());
+            metrics.publish_automatic_fec(snapshot);
         }
         update_business_pacer(&mut business, &paths, &controllers, now_us);
         if policy.capacity_probe_bps > 0 {
