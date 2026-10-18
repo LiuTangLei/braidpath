@@ -2545,7 +2545,10 @@ async fn sender(
             }
             let Some((index, frame_bytes, at)) = accepted else {
                 if repair {
-                    if policy.mixed_fec {
+                    // Split lanes recompute the blocked flag from this list on
+                    // every pass; without it the same unsendable repair would
+                    // be retried until it expired, starving every original.
+                    if policy.split_fec() {
                         stalled_repairs.push(front.block.expect("encoded repair block"));
                         if repair_wait.is_none() {
                             repair_wait = wait_candidate;

@@ -1809,6 +1809,72 @@ async fn sender_actor_drains_multiple_flows_once_and_stops_cleanly() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn automatic_blocked_copy_cannot_starve_later_originals() {
+    // A cold automatic small record carries one copy. On a single path the
+    // copy waits until the original leaves Quinn's queue, which cannot happen
+    // inside one drain pass; the bulk originals behind it must still be sent.
+    let pair = Pair::connect().await;
+    let paths = Arc::new(Mutex::new(vec![pair.path()]));
+    let mut policy = policy();
+    policy.fec = automatic_fec::AUTO;
+    policy.redundancy = 30;
+    policy.queue_ms = 300;
+    let metrics = stats::Metrics::new("client");
+    let scope = metrics.scope("blocked-copy", stats::FORWARD);
+    let (tx, rx) = mpsc::channel(QUEUE);
+    let (stop, stopped) = watch::channel(false);
+    let task = tokio::spawn(sender(rx, paths, policy, stopped, scope, None));
+    // Earn small-copy credit before the records arrive.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let mut small = record(0);
+    small.flow = 2;
+    small.payload.truncate(64);
+    let records: Vec<_> = std::iter::once(small).chain((1..=8).map(record)).collect();
+    for record in records {
+        tx.try_send(QueuedRecord {
+            record,
+            created: Instant::now(),
+            hold: None,
+        })
+        .unwrap();
+    }
+    let started = Instant::now();
+    let admitted = || {
+        let mut n = 0;
+        metrics.state(|s| {
+            n = s
+                .sessions
+                .get("blocked-copy")
+                .and_then(|d| d.get(stats::FORWARD))
+                .map_or(0, |d| d.symbols.originals_quinn_admitted);
+        });
+        n
+    };
+    timeout(Duration::from_secs(3), async {
+        while admitted() < 9 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(
+        started.elapsed() < Duration::from_millis(150),
+        "originals waited behind a blocked copy for {:?}",
+        started.elapsed()
+    );
+    stop.send(true).unwrap();
+    timeout(Duration::from_secs(1), task)
+        .await
+        .unwrap()
+        .unwrap();
+    metrics.state(|s| {
+        let d = &s.sessions["blocked-copy"][stats::FORWARD];
+        assert_eq!(d.symbols.originals_quinn_admitted, 9);
+        assert_eq!(d.symbols.originals_expired_dropped, 0);
+    });
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn event_observation_036_notifies_only_the_owner_on_accepted_wire_evidence() {
     fn notified(notify: &Notify) -> bool {
         let waker = Waker::from(Arc::new(Wakes::default()));
