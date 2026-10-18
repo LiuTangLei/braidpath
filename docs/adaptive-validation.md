@@ -10,7 +10,10 @@ every path for a capacity brake. Once paired service samples exist, moderate
 queue/positive-delivery pressure needs an exercised allowance or a fresh,
 same-pace wire-admission interval using at least half the path allowance.
 Lightly used paths retain their allowance while timing and loss still affect
-scheduling. Delivery collapse below half the admitted symbol rate, zero service,
+scheduling. Capacity samples need at least8000 admitted symbol bytes, including
+zero/positive delivery-collapse claims: a few small ACKs can disappear from one
+receiver bin without measuring a path's capacity. Current exercised allowance
+likewise needs8000 admitted bytes. Delivery collapse below half the admitted symbol rate, zero service,
 sustained transport blocking, fast loss, and severe queues retain their safety
 paths. Legacy recovery keeps its previous demand qualification. These rules do
 not create pacing tokens or change aggregate/group caps.

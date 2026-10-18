@@ -15,6 +15,9 @@ const BRAKE_US: u64 = 100_000;
 const RETRY_GROWTH_US: u64 = 500_000;
 const START_BPS: u64 = 256_000;
 const MIN_BPS: u64 = 64_000;
+// Match the existing eight-symbol floor at full-sized business records.
+// A few tiny ACKs cannot measure capacity, including an empty receiver bin.
+const CAPACITY_SAMPLE_BYTES: u64 = 8_000;
 const LOSS_WINDOW_US: u64 = 4_000_000;
 const LOSS_BATCHES: usize = 8;
 const WEIGHT_EVIDENCE_SYMBOLS: u64 = 16;
@@ -1902,6 +1905,7 @@ impl PathController {
                 && sample.admission.is_some_and(|admission| {
                     admission.started_us >= last_pace_change
                         && admission.span_us >= PROBE_US
+                        && admission.symbol_bytes >= CAPACITY_SAMPLE_BYTES
                         && admission
                             .wire_bytes
                             .map_or(admission.bps * self.wire_per_symbol, |bytes| {
@@ -1911,10 +1915,11 @@ impl PathController {
                 })
         });
         let service_collapse = service_sample.is_some_and(|sample| {
-            sample
-                .admission
-                .is_some_and(|admission| sample.bps < admission.bps * 0.5)
+            sample.admission.is_some_and(|admission| {
+                admission.symbol_bytes >= CAPACITY_SAMPLE_BYTES && sample.bps < admission.bps * 0.5
+            })
         });
+        let exercised_business = exercised && self.admitted_bytes >= CAPACITY_SAMPLE_BYTES;
         // Positive underdelivery is exactly what the bounded reprobe compares
         // at its baseline/trial pace. Braking it before that comparison can
         // invalidate every measurement. Zero service remains an immediate
@@ -1923,7 +1928,7 @@ impl PathController {
             && ((!protect_ordinary_loss && !probe_covered_loss && !loss_hold)
                 || service_bps == Some(0.0))
             && (!self.queue_gated_loss_enabled
-                || exercised
+                || exercised_business
                 || paired_busy
                 || service_collapse
                 || blocked_pressure
@@ -2097,13 +2102,16 @@ impl PathController {
         // echo/probe jitter must not turn its small delivery sample into a path
         // capacity estimate. Backlog, blocked transport or the separately
         // qualified actual-admission deficit still permits a safety brake.
-        let active_demand = if self.queue_gated_loss_enabled && service_sample.is_some() {
-            exercised
+        let active_demand = if self.queue_gated_loss_enabled {
+            exercised_business
                 || paired_busy
                 || blocked_pressure
-                || fast_loss_actionable
+                || (fast_loss_actionable && self.admitted_bytes >= CAPACITY_SAMPLE_BYTES)
                 || service_deficit_actionable
                 || (observation.offered_backlog && severe_pressure)
+                || (service_sample.is_none()
+                    && observation.offered_backlog
+                    && self.admitted_bytes >= CAPACITY_SAMPLE_BYTES)
         } else {
             observation.offered_backlog || exercised || blocked_pressure || service_deficit
         };
@@ -4656,6 +4664,37 @@ mod tests {
                 "backlog={backlog} jitter={jitter_ms}"
             );
             assert!(!controller.congestion_seen);
+        }
+    }
+
+    #[test]
+    fn small_ack_cohorts_are_not_path_capacity_evidence_even_at_zero_delivery() {
+        for delivered in [0, 300] {
+            let (mut controller, mut sample) = underused_jitter_fixture(false, 18.49);
+            controller.rate_bps = 7_423_456;
+            controller.allowance_bytes = 142_671.0;
+            controller.admitted_bytes = 3_988;
+            controller.admitted_symbol_bytes = 1_752;
+            controller.last_report = Some((83, 3_000_000, sample.now_us - 197_867));
+            sample.admitted_symbols = Some(3_319);
+            sample.admitted_symbol_bytes = Some(3_001_752);
+            sample.delivered_bytes = 3_000_000 + delivered;
+            sample.delivered_bps = Some(delivered as f64 * 16.0);
+            sample.finalized_expected = Some(3_028);
+            sample.finalized_lost = Some(243);
+            sample.feedback_sample_symbols = 28;
+            sample.loss_sample_rate = Some(3.0 / 28.0);
+            let before = controller.rate_bps;
+            controller.observe(&sample);
+            assert!(
+                controller
+                    .last_control
+                    .service_admission
+                    .as_ref()
+                    .unwrap()
+                    .deficit
+            );
+            assert_eq!(controller.rate_bps, before, "delivered={delivered}");
         }
     }
 
