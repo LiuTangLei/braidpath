@@ -72,6 +72,8 @@ def parse_args(argv=None):
     parser.add_argument("--event", type=parse_event, action="append", default=[])
     parser.add_argument("--tail-seconds", type=float, default=0.0)
     parser.add_argument("--loss-percent", type=float, default=0.0)
+    parser.add_argument("--loss-max-datagram-bytes", type=int, default=0,
+                        help="fault isolation: erase only short UDP payloads; 0 means all")
     parser.add_argument("--queue-packets", type=int, default=1024)
     parser.add_argument("--seed", type=int, default=20261017)
     parser.add_argument("--timeout-seconds", type=float, default=120)
@@ -85,6 +87,8 @@ def parse_args(argv=None):
         parser.error("bounded bytes/path count exceeded")
     if not 0 <= args.loss_percent <= 50:
         parser.error("loss must be 0..50 percent")
+    if not 0 <= args.loss_max_datagram_bytes <= 65_535:
+        parser.error("loss datagram cutoff must be 0..65535 bytes")
     if not 1 <= args.connections <= 32:
         parser.error("connections must be 1..32")
     if args.direction == "both" and (args.entrance != "socks5" or args.connections > 16):
@@ -107,7 +111,12 @@ def parse_args(argv=None):
 
 
 def payload(size, seed):
-    return random.Random(seed).randbytes(size)
+    # Python3.9 getrandbits takes a C int: one256MiB randbytes request
+    # overflows its bit count. Whole-word chunks preserve the seeded bytes.
+    rng = random.Random(seed)
+    chunk = 1024 * 1024
+    return b"".join(rng.randbytes(min(chunk, size - start))
+                    for start in range(0, size, chunk))
 
 
 class Target(threading.Thread):
@@ -469,6 +478,8 @@ def run(args):
         lab = [args.lab_binary, "--server", server_addr, "--queue-packets", args.queue_packets,
                "--seed", args.seed, "--ready-file", args.output / "link-ready.json",
                "--stats-jsonl", args.output / "link.jsonl", "--final-file", args.output / "link-final.json"]
+        if args.loss_max_datagram_bytes:
+            lab += ["--loss-max-datagram-bytes", args.loss_max_datagram_bytes]
         for rtt, rate in args.path:
             lab += ["--path", f"{rtt:g}:{rate:g}"]
         emulator = spawn("link", lab, stdin=subprocess.PIPE, text=True)

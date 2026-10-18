@@ -1,6 +1,7 @@
 import contextlib
 import hashlib
 import io
+import random
 import socket
 import threading
 import unittest
@@ -26,6 +27,7 @@ class Arguments(unittest.TestCase):
                               (("--loss-percent", "60"), "local/x"), ((), "results/x"),
                               (("--path", "20:0"), "local/x"), (("--tail-seconds", "5"), "local/x"),
                               (("--fresh-probe-interval-ms", "100"), "local/x"),
+                              (("--loss-max-datagram-bytes", "65536"), "local/x"),
                               (("--entrance", "socks5", "--fresh-probe-interval-ms", "10"),
                                "local/x")]:
             with self.subTest(extra=extra, output=output), contextlib.redirect_stderr(io.StringIO()):
@@ -130,6 +132,19 @@ class Transfer(unittest.TestCase):
     def test_payload_is_seeded(self):
         self.assertEqual(payload(1024, 7), payload(1024, 7))
         self.assertNotEqual(payload(1024, 7), payload(1024, 8))
+
+    def test_payload_keeps_seeded_bytes_across_chunks_and_partial_words(self):
+        for size in [0, 3, 1024 * 1024 + 7, 2 * 1024 * 1024 + 1]:
+            self.assertEqual(payload(size, 19), random.Random(19).randbytes(size))
+
+    def test_payload_256mib_does_not_overflow_python39_randbits_argument(self):
+        generator = MagicMock()
+        generator.randbytes.return_value = b""
+        with patch("bench.tcp_lab.random.Random", return_value=generator):
+            payload(256 * 1024 * 1024, 19)
+        requests = [call.args[0] for call in generator.randbytes.call_args_list]
+        self.assertEqual(sum(requests), 256 * 1024 * 1024)
+        self.assertTrue(all(n * 8 < 2 ** 31 for n in requests))
 
     def test_upload_and_download_verify_integrity_directly_against_the_target(self):
         data = payload(300_000, 3)

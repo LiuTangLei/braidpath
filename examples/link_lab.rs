@@ -59,6 +59,10 @@ struct Args {
     final_file: PathBuf,
     #[arg(long, default_value_t = 250)]
     interval_ms: u64,
+    /// Apply random erasure only to UDP payloads at most this size; zero is all.
+    /// Fault isolation only: not a model of size-dependent WAN loss.
+    #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u32).range(0..=65_535))]
+    loss_max_datagram_bytes: u32,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
@@ -90,6 +94,7 @@ struct Counters {
     received_packets: u64,
     received_ip_udp_bytes: u64,
     loss_drops: u64,
+    loss_eligible_packets: u64,
     queue_full_drops: u64,
     policer_drops: u64,
     forwarded_packets: u64,
@@ -139,6 +144,7 @@ impl Policer {
 
 struct Direction {
     shape: Shape,
+    loss_max_datagram_bytes: u32,
     policer: Option<Policer>,
     counters: Counters,
     in_flight: usize,
@@ -225,7 +231,10 @@ async fn shape_direction(
                     direction.counters.outage_drops += 1;
                     continue;
                 }
-                if shape.loss > 0.0 && random.random::<f64>() < shape.loss {
+                let loss_eligible = direction.loss_max_datagram_bytes == 0
+                    || length <= direction.loss_max_datagram_bytes as usize;
+                direction.counters.loss_eligible_packets += u64::from(loss_eligible);
+                if loss_eligible && shape.loss > 0.0 && random.random::<f64>() < shape.loss {
                     direction.counters.loss_drops += 1;
                     continue;
                 }
@@ -284,6 +293,7 @@ fn snapshot(paths: &[(Shared, Shared)]) -> serde_json::Value {
     let view = |shared: &Shared| {
         let direction = shared.lock().unwrap();
         json!({"shape": direction.shape, "counters": direction.counters,
+               "loss_max_datagram_bytes": direction.loss_max_datagram_bytes,
                "in_flight_packets": direction.in_flight, "changes": direction.changes,
                "policer_burst_bytes": direction.policer.as_ref().map(|p| p.burst_bytes)})
     };
@@ -357,6 +367,7 @@ async fn main() -> Result<()> {
         let make = || {
             Arc::new(Mutex::new(Direction {
                 shape,
+                loss_max_datagram_bytes: args.loss_max_datagram_bytes,
                 policer: (args.policer_burst_bytes > 0)
                     .then(|| Policer::new(args.policer_burst_bytes, Instant::now())),
                 counters: Counters::default(),
@@ -398,6 +409,7 @@ async fn main() -> Result<()> {
             "sample_unix_ms": unix_ms(), "server": args.server, "seed": args.seed,
             "rate_boundary": "IPv4+UDP bytes", "queue_limit": "packets queued or propagating",
             "policer_burst_bytes": args.policer_burst_bytes,
+            "loss_max_datagram_bytes": args.loss_max_datagram_bytes,
             "paths": ready}))?,
     )?;
     let mut stats = fs::File::create(&args.stats_jsonl)?;
