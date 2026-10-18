@@ -1,7 +1,7 @@
 # Runtime statistics
 
 With default `--fec auto`, sending session/direction snapshots include
-`automatic_fec`: current `data_shards` / `repair_shards` (both zero for no FEC),
+`automatic_fec`: current bulk `data_shards` / `repair_shards` (both zero for no bulk repair; short-record protection is separate),
 EWMA `loss_rate`, newest interval `sample_symbols` / `sample_lost` (a sparse
 window's running total until it reaches 64 symbols), eligible
 `feedback_paths`, `transitions`, `unknown_restores` (returns to 4+1 while

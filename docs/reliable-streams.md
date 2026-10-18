@@ -215,3 +215,19 @@ result is not a WAN, independent-capacity or deployment acceptance result.
 - Priority classes between interactive and bulk streams beyond the latency class
   and the existing per-flow round robin.
 - Coordinated FEC strength for streams, and cross-host WAN acceptance.
+
+### Bounded short-tail probe
+
+A sender with exactly one admitted, never-retransmitted segment of at most 128
+sequence bytes, and no unsent application bytes, can queue one additional copy.
+Its timer uses the actual route's native RTT and observed stream ACK RTT upper
+bound, a 12.5% timing margin and the 2 ms ACK delay (capped at 2 s). Unknown/local-queue routes cannot
+probe. This copy is not a loss declaration: it preserves the original loss
+clock, route, stall backoff and failure timer. A local drop of the probe does not
+mark the original lost. There is at most one probe per retained segment; a new
+acknowledged flight starts independently. Full loss recovery remains available
+at its original deadline, even if the probe is queued or lost. Large/multi-segment
+flights retain their existing recovery policy. Probes obey normal queue, pacing,
+receiver-window and native congestion constraints. `tcp_streams.tail_probes_queued`
+counts successful local queue entries, also included in retransmission totals;
+it does not claim native admission or prove which copy caused acknowledgment.

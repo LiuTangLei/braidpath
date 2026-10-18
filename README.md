@@ -94,7 +94,7 @@ Follow the [runtime guide](docs/runtime.md) for credentials, local forwarding, m
 | Startup/outage recovery and explicit session-epoch replacement | Implemented in adaptive mode; bounded backoff and server retention |
 | Receiver-local adaptive FEC retention | Implemented as an opt-in bounded policy |
 | Two independent bulk repair equations | Opt-in mixed 16+2 mode; single-repair defaults unchanged; WAN tradeoffs not yet verified |
-| Loss-adaptive FEC strength | Default `--fec auto`: no repair through 4+1; [policy and limits](docs/automatic-fec.md) |
+| Loss-adaptive FEC strength | Default `--fec auto`: bulk 0..4+1, separately bounded short-record/ACK copies; [policy and limits](docs/automatic-fec.md) |
 | Reliable TCP streams to a fixed target | Implemented experimental adapter; one connection uses every path; WAN acceptance pending |
 | SOCKS5 CONNECT, SOCKS5 UDP ASSOCIATE and HTTP CONNECT entrances | Implemented experimental adapter; CONNECT on the same streams, UDP as datagram records up to the record payload; public destinations only by default; WAN acceptance pending |
 | TUN, stream fallback, browser fingerprint shaping | Planned or deferred |

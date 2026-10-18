@@ -169,6 +169,8 @@ pub struct Snapshot {
     pub segments_sent: u64,
     pub retransmitted_segments: u64,
     pub retransmitted_bytes: u64,
+    /// Bounded additional short-tail copies queued, before native admission.
+    pub tail_probes_queued: u64,
     /// Retransmissions caused by an original leaving the local sender queue unsent.
     pub local_drop_retransmits: u64,
     pub probe_timeouts: u64,
@@ -264,6 +266,7 @@ struct Segment {
     stalls: u32,
     /// Backed-off deadline while stalled; otherwise timed from `sent_at`.
     deadline: Option<Instant>,
+    probe_transmission: Option<u32>,
 }
 
 /// One reliable sending half. Data offsets start at zero.
@@ -299,6 +302,7 @@ pub struct Sender {
     probe_due: bool,
     open_pending: bool,
     open_sent: bool,
+    tail_probe_due: bool,
 }
 
 /// A frame chosen for transmission, with the identity a local drop reports.
@@ -307,6 +311,7 @@ pub struct Transmit {
     pub start: u64,
     pub transmission: u32,
     pub retransmission: bool,
+    pub tail_probe: bool,
 }
 
 impl Sender {
@@ -337,6 +342,7 @@ impl Sender {
             probe_due: false,
             open_pending: open,
             open_sent: false,
+            tail_probe_due: false,
         }
     }
     pub fn push(&mut self, data: &[u8]) {
@@ -379,7 +385,8 @@ impl Sender {
                 .is_some_and(|at| now.saturating_duration_since(at) >= DEAD_AFTER)
     }
     pub fn has_transmit(&self) -> bool {
-        !self.lost.is_empty()
+        self.tail_probe_due
+            || !self.lost.is_empty()
             || (self.next < self.written && self.next < self.limit)
             || (self.fin == Some(self.next) && !self.fin_sent)
             || self.probe_due
@@ -427,7 +434,7 @@ impl Sender {
         self.unschedule(start);
         self.lost.insert(start);
     }
-    fn send_segment(&mut self, start: u64, end: u64, now: Instant) -> Transmit {
+    fn send_segment(&mut self, start: u64, end: u64, now: Instant, probe: bool) -> Transmit {
         let fin = self.fin.is_some_and(|f| end == f + 1);
         let data_end = if fin { end - 1 } else { end };
         let from = (start - self.base) as usize;
@@ -453,19 +460,26 @@ impl Sender {
             transmissions: 0,
             stalls: 0,
             deadline: None,
+            probe_transmission: None,
         });
-        if segment.transmissions > 0 {
+        if !probe && segment.transmissions > 0 {
             let stalled = progress.is_none_or(|at| at <= segment.sent_at);
             segment.stalls = if stalled { segment.stalls + 1 } else { 0 };
         }
-        segment.sent_at = now;
-        segment.path = UNKNOWN_PATH;
         segment.transmissions += 1;
         let transmission = segment.transmissions;
-        if segment.stalls == 0 {
+        if probe {
+            // A probe is a bounded additional copy, not a loss declaration.
+            // Preserve the original timer, route and failure/backoff evidence.
+            segment.probe_transmission = Some(transmission);
+        } else if segment.stalls == 0 {
+            segment.sent_at = now;
+            segment.path = UNKNOWN_PATH;
             segment.deadline = None;
             self.fresh[UNKNOWN_PATH].insert((now, start));
         } else {
+            segment.sent_at = now;
+            segment.path = UNKNOWN_PATH;
             let backoff = 1.5f64.powi(segment.stalls as i32).min(16.0);
             let at = now + threshold.mul_f64(backoff).min(MAX_PTO * 4);
             segment.deadline = Some(at);
@@ -480,12 +494,22 @@ impl Sender {
             start,
             transmission,
             retransmission: transmission > 1,
+            tail_probe: probe,
         }
     }
     pub fn poll_transmit(&mut self, now: Instant) -> Option<Transmit> {
         if let Some(start) = self.lost.pop_first() {
             let end = self.segments[&start].end;
-            return Some(self.send_segment(start, end, now));
+            return Some(self.send_segment(start, end, now, false));
+        }
+        if self.tail_probe_due {
+            self.tail_probe_due = false;
+            if let Some((at, start)) = self.tail_probe_deadline()
+                && now >= at
+            {
+                let end = self.segments[&start].end;
+                return Some(self.send_segment(start, end, now, true));
+            }
         }
         if self.next < self.written && self.next < self.limit {
             let len = (self.written - self.next)
@@ -496,12 +520,12 @@ impl Sender {
             let fin = self.fin == Some(self.next);
             self.fin_sent |= fin;
             self.open_sent = true;
-            return Some(self.send_segment(start, self.next + u64::from(fin), now));
+            return Some(self.send_segment(start, self.next + u64::from(fin), now, false));
         }
         if self.fin == Some(self.next) && !self.fin_sent {
             self.fin_sent = true;
             self.open_sent = true;
-            return Some(self.send_segment(self.next, self.next + 1, now));
+            return Some(self.send_segment(self.next, self.next + 1, now, false));
         }
         if self.probe_due || self.open_due() {
             // Zero-length data asks for an acknowledgment; it is not retained.
@@ -518,6 +542,7 @@ impl Sender {
                 start: self.next,
                 transmission: 0,
                 retransmission: false,
+                tail_probe: false,
             });
         }
         None
@@ -563,11 +588,9 @@ impl Sender {
     /// A transmission left the local queue without admission. Retransmit it
     /// unless a later transmission or an acknowledgment has superseded it.
     pub fn locally_dropped(&mut self, start: u64, transmission: u32) -> bool {
-        if self
-            .segments
-            .get(&start)
-            .is_none_or(|s| s.transmissions != transmission)
-            || self.lost.contains(&start)
+        if self.segments.get(&start).is_none_or(|s| {
+            s.transmissions != transmission || s.probe_transmission == Some(transmission)
+        }) || self.lost.contains(&start)
         {
             return false;
         }
@@ -643,6 +666,7 @@ impl Sender {
         if progressed {
             self.last_progress = Some(now);
             self.probe_count = 0;
+            self.tail_probe_due = false;
         }
         self.acked = cumulative;
         let release_to = cumulative.min(self.written).max(self.base);
@@ -670,6 +694,27 @@ impl Sender {
         // failure deadline. Repeated repairs retain their bounded backoff.
         sent_at + delay.min(MAX_PTO)
     }
+
+    fn tail_probe_deadline(&self) -> Option<(Instant, u64)> {
+        if self.segments.len() != 1 || !self.lost.is_empty() {
+            return None;
+        }
+        let (&start, s) = self.segments.first_key_value()?;
+        if s.path == UNKNOWN_PATH
+            || s.transmissions != 1
+            || s.probe_transmission.is_some()
+            || s.end - start > 128
+            || self.next < self.written
+        {
+            return None;
+        }
+        let rtt = self.transport_rtt[s.path]
+            .max(self.path_rtt[s.path].observed_high().unwrap_or_default());
+        Some((
+            s.sent_at + (rtt.mul_f64(1.125) + ACK_DELAY).min(MAX_PTO),
+            start,
+        ))
+    }
     fn detect_losses(&mut self, now: Instant) {
         // The oldest transmission has the earliest deadline within its route.
         for path in 0..=MAX_PATHS {
@@ -690,6 +735,7 @@ impl Sender {
     }
     pub fn next_deadline(&self, now: Instant) -> Option<Instant> {
         [
+            self.tail_probe_deadline().map(|(at, _)| at),
             self.fresh
                 .iter()
                 .enumerate()
@@ -714,12 +760,14 @@ impl Sender {
     /// Returns true when a window or open probe became due.
     pub fn on_timeout(&mut self, now: Instant) -> bool {
         self.detect_losses(now);
+        let tail = self.tail_probe_deadline().is_some_and(|(at, _)| now >= at);
+        self.tail_probe_due |= tail;
         if !self.needs_probe()
             || self
                 .probe_at
                 .is_some_and(|at| now < at + self.probe_interval(now))
         {
-            return false;
+            return tail;
         }
         self.probe_due = true;
         if self.open_pending {
@@ -916,6 +964,91 @@ impl Receiver {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn short_tail_probe_preserves_original_loss_timer_and_is_used_once() {
+        let now = Instant::now();
+        let mut s = Sender::new(false);
+        s.push(&[7; 64]);
+        let t = s.poll_transmit(now).unwrap();
+        assert!(
+            s.tail_probe_deadline().is_none(),
+            "no probe before actual admission"
+        );
+        s.admitted(t.start, t.transmission, 0, Duration::from_millis(50), now);
+        let loss = s.fresh_deadline(now, s.path_threshold(0, now));
+        let probe_at = s.next_deadline(now).unwrap();
+        assert!(probe_at >= now + Duration::from_millis(50) && probe_at < loss);
+        assert!(s.on_timeout(probe_at));
+        let probe = s.poll_transmit(probe_at).unwrap();
+        assert!(probe.tail_probe && probe.retransmission);
+        assert!(s.lost.is_empty());
+        assert_eq!(s.segments[&0].stalls, 0);
+        assert_eq!(s.segments[&0].sent_at, now);
+        assert_eq!(s.next_deadline(probe_at), Some(loss));
+        s.admitted(
+            probe.start,
+            probe.transmission,
+            1,
+            Duration::from_millis(10),
+            probe_at,
+        );
+        assert_eq!(
+            s.next_deadline(probe_at),
+            Some(loss),
+            "probe admission cannot retime the original"
+        );
+        assert!(!s.locally_dropped(probe.start, probe.transmission));
+        assert!(s.poll_transmit(probe_at).is_none());
+        s.on_timeout(loss);
+        let repair = s.poll_transmit(loss).unwrap();
+        assert!(repair.retransmission && !repair.tail_probe);
+        assert!(s.tail_probe_deadline().is_none());
+    }
+
+    #[test]
+    fn short_probe_ack_cancels_timers_and_a_new_flight_can_probe() {
+        let now = Instant::now();
+        let mut s = Sender::new(false);
+        s.push(&[1; 64]);
+        let t = s.poll_transmit(now).unwrap();
+        s.admitted(t.start, t.transmission, 0, Duration::from_millis(50), now);
+        let at = s.next_deadline(now).unwrap();
+        s.on_timeout(at);
+        assert!(s.poll_transmit(at).unwrap().tail_probe);
+        s.on_ack(
+            &Ack {
+                cumulative: 64,
+                limit: INITIAL_WINDOW,
+                ..Default::default()
+            },
+            at,
+        )
+        .unwrap();
+        assert!(s.next_deadline(at).is_none());
+        s.push(&[2; 64]);
+        let t = s.poll_transmit(at).unwrap();
+        s.admitted(t.start, t.transmission, 0, Duration::from_millis(50), at);
+        assert!(s.tail_probe_deadline().is_some());
+    }
+
+    #[test]
+    fn bulk_and_slow_return_path_do_not_get_an_early_short_probe() {
+        let now = Instant::now();
+        let mut bulk = Sender::new(false);
+        bulk.push(&vec![0; MAX_SEGMENT * 2]);
+        for _ in 0..2 {
+            let t = bulk.poll_transmit(now).unwrap();
+            bulk.admitted(t.start, t.transmission, 0, Duration::from_millis(10), now);
+        }
+        assert!(bulk.tail_probe_deadline().is_none());
+        let mut short = Sender::new(false);
+        short.push(&[0; 64]);
+        let t = short.poll_transmit(now).unwrap();
+        short.admitted(t.start, t.transmission, 0, Duration::from_millis(10), now);
+        short.path_rtt[0].sample(Duration::from_millis(200), now);
+        assert!(short.tail_probe_deadline().unwrap().0 >= now + Duration::from_millis(200));
+    }
 
     #[test]
     fn delayed_ack_cannot_move_loss_recovery_past_the_peer_failure_deadline() {
@@ -1322,7 +1455,7 @@ mod tests {
     fn admission_restarts_the_clock_and_stale_copies_cannot_move_it() {
         let t0 = Instant::now();
         let mut sender = Sender::new(false);
-        sender.push(&[1; 100]);
+        sender.push(&[1; 200]);
         let t = sender.poll_transmit(t0).unwrap();
         let at = t0 + Duration::from_millis(90);
         sender.admitted(t.start, t.transmission, 0, Duration::from_millis(20), at);

@@ -10,7 +10,7 @@ const LOWER_HOLD_US: u64 = 3_000_000;
 const MIN_SYMBOLS: u64 = 64;
 /// Qualified feedback below `MIN_SYMBOLS` accumulates for at most this long.
 const WINDOW_US: u64 = 2_000_000;
-/// The strength used before feedback qualifies, and again when it stops.
+/// Conservative bulk strength when admitted traffic loses feedback.
 const DEFAULT: u8 = 4;
 
 #[derive(Clone, Debug, Serialize)]
