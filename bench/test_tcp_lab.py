@@ -22,7 +22,7 @@ class Arguments(unittest.TestCase):
     def test_bounds_and_evidence_location_are_enforced(self):
         for extra, output in [(("--use-path", "2"), "local/x"), (("--bytes", "10"), "local/x"),
                               (("--loss-percent", "60"), "local/x"), ((), "results/x"),
-                              (("--path", "20:0"), "local/x")]:
+                              (("--path", "20:0"), "local/x"), (("--tail-seconds", "5"), "local/x")]:
             with self.subTest(extra=extra, output=output), contextlib.redirect_stderr(io.StringIO()):
                 with self.assertRaises(SystemExit):
                     args(*extra, output=output)

@@ -8,6 +8,10 @@ const PERIOD_US: u64 = 500_000;
 const FRESH_US: u64 = 3_000_000;
 const LOWER_HOLD_US: u64 = 3_000_000;
 const MIN_SYMBOLS: u64 = 64;
+/// Qualified feedback below `MIN_SYMBOLS` accumulates for at most this long.
+const WINDOW_US: u64 = 2_000_000;
+/// The strength used before feedback qualifies, and again when it stops.
+const DEFAULT: u8 = 4;
 
 #[derive(Clone, Debug, Serialize)]
 pub struct Snapshot {
@@ -18,6 +22,8 @@ pub struct Snapshot {
     pub sample_lost: u64,
     pub feedback_paths: u8,
     pub transitions: u64,
+    /// Returns to the default strength while sending without feedback.
+    pub unknown_restores: u64,
     pub updated_us: Option<u64>,
 }
 
@@ -26,12 +32,25 @@ struct Cursor {
     generation: u64,
     expected: u64,
     lost: u64,
+    sent: u64,
+}
+
+/// Qualified symbols not yet numerous enough for a full observation.
+#[derive(Clone, Copy)]
+struct Window {
+    started_us: u64,
+    expected: u64,
+    lost: u64,
 }
 
 pub struct Controller {
     paths: [Cursor; MAX_PATHS],
     next_us: u64,
     lower: Option<(u8, u64)>,
+    window: Option<Window>,
+    /// When symbols were first sent on active paths after the latest
+    /// qualified feedback, and how many have been sent since.
+    unconfirmed: Option<(u64, u64)>,
     snapshot: Snapshot,
 }
 
@@ -66,14 +85,17 @@ impl Default for Controller {
             paths: [Cursor::default(); MAX_PATHS],
             next_us: 0,
             lower: None,
+            window: None,
+            unconfirmed: None,
             snapshot: Snapshot {
-                data_shards: 4,
+                data_shards: DEFAULT,
                 repair_shards: 1,
                 loss_rate: None,
                 sample_symbols: 0,
                 sample_lost: 0,
                 feedback_paths: 0,
                 transitions: 0,
+                unknown_restores: 0,
                 updated_us: None,
             },
         }
@@ -100,7 +122,7 @@ impl Controller {
             return None;
         }
         self.next_us = now_us.saturating_add(PERIOD_US);
-        let (mut expected, mut lost, mut count) = (0u64, 0u64, 0u8);
+        let (mut expected, mut lost, mut count, mut sent) = (0u64, 0u64, 0u8, 0u64);
         for (id, active, path) in paths {
             let cursor = &mut self.paths[usize::from(id)];
             if cursor.generation != path.generation {
@@ -115,10 +137,14 @@ impl Controller {
             let estimate = &path.sender_estimate;
             let n = estimate.expected.saturating_sub(cursor.expected);
             let missing = estimate.lost.saturating_sub(cursor.lost);
+            if active {
+                sent = sent.saturating_add(path.sent_symbols.saturating_sub(cursor.sent));
+            }
             *cursor = Cursor {
                 generation: path.generation,
                 expected: estimate.expected,
                 lost: estimate.lost,
+                sent: path.sent_symbols,
             };
             if active
                 && n > 0
@@ -131,10 +157,54 @@ impl Controller {
                 count += 1;
             }
         }
+        if expected > 0 {
+            self.unconfirmed = None;
+        } else if sent > 0 {
+            let (since, n) = self.unconfirmed.unwrap_or((now_us, 0));
+            self.unconfirmed = Some((since, n.saturating_add(sent)));
+        }
+        if let Some((since, n)) = self.unconfirmed
+            && n >= MIN_SYMBOLS
+            && now_us.saturating_sub(since) >= FRESH_US
+            && strength(self.snapshot.data_shards) < strength(DEFAULT)
+        {
+            // Sending continues but its loss is unknown: protect as before
+            // the first qualified feedback, still within the repair budget.
+            self.window = None;
+            self.snapshot.loss_rate = None;
+            self.snapshot.unknown_restores += 1;
+            return self.switch(DEFAULT);
+        }
+        // Sparse feedback accumulates for a bounded time. Partial windows
+        // can add protection but never remove it.
+        let mut window = match self.window {
+            Some(window) if now_us.saturating_sub(window.started_us) <= WINDOW_US => window,
+            _ => Window {
+                started_us: now_us,
+                expected: 0,
+                lost: 0,
+            },
+        };
+        window.expected = window.expected.saturating_add(expected);
+        window.lost = window.lost.saturating_add(lost);
+        let (expected, lost) = (window.expected, window.lost);
+        self.window = (expected < MIN_SYMBOLS && expected > 0).then_some(window);
         self.snapshot.sample_symbols = expected;
         self.snapshot.sample_lost = lost;
         self.snapshot.feedback_paths = count;
         if expected < MIN_SYMBOLS {
+            // Counted against a full window, as if every symbol still to
+            // come arrived: no more protection than full evidence of the
+            // same losses would select.
+            let floor = lost as f64 / MIN_SYMBOLS as f64;
+            let higher = target(floor);
+            if strength(higher) > strength(self.snapshot.data_shards) {
+                self.window = None;
+                self.snapshot.loss_rate =
+                    Some(self.snapshot.loss_rate.map_or(floor, |old| old.max(floor)));
+                self.snapshot.updated_us = Some(now_us);
+                return self.switch(higher);
+            }
             // Feedback and observation clocks can straddle each other. One
             // empty tick must not perpetually restart a healthy path's hold;
             // it cannot complete the hold either. Longer gaps still cancel it.
@@ -193,6 +263,10 @@ impl Controller {
         if next == current {
             return None;
         }
+        self.switch(next)
+    }
+
+    fn switch(&mut self, next: u8) -> Option<u8> {
         self.snapshot.data_shards = next;
         self.snapshot.repair_shards = u8::from(next != 0);
         self.snapshot.transitions += 1;
@@ -210,6 +284,7 @@ mod tests {
             sampled_us: now,
             ..Default::default()
         };
+        s.sent_symbols = n;
         s.sender_estimate.expected = n;
         s.sender_estimate.lost = lost;
         s.sender_estimate.updated_us = Some(now);
@@ -290,6 +365,120 @@ mod tests {
         }
         assert_eq!(c.snapshot.data_shards, 4);
         assert_eq!(c.snapshot.loss_rate, None);
+    }
+
+    /// Clean bulk feedback that turns FEC off; returns the cumulative counts.
+    fn switch_off(c: &mut Controller) -> (u64, u64) {
+        for i in 0..=8 {
+            let s = sample(1, (i + 1) * 1000, 0, i * PERIOD_US);
+            c.observe(i * PERIOD_US, [(0, true, &s)]);
+        }
+        assert_eq!(c.snapshot.data_shards, 0);
+        (9000, 8 * PERIOD_US)
+    }
+
+    #[test]
+    fn sparse_heavy_loss_after_clean_bulk_restores_protection() {
+        for (per_tick, lost_per_tick, ticks) in [(10, 5, 1), (63, 31, 1), (2, 1, 4)] {
+            let mut c = Controller::default();
+            let (mut n, mut now) = switch_off(&mut c);
+            let mut lost = 0;
+            for _ in 0..ticks {
+                now += PERIOD_US;
+                n += per_tick;
+                lost += lost_per_tick;
+                let s = sample(1, n, lost, now);
+                c.observe(now, [(0, true, &s)]);
+            }
+            assert_eq!(c.snapshot.data_shards, 4, "{per_tick}/{lost_per_tick}");
+        }
+    }
+
+    #[test]
+    fn sparse_windows_are_bounded_and_cannot_remove_protection() {
+        let mut c = Controller::default();
+        let (mut n, mut now) = switch_off(&mut c);
+        // One loss every three seconds among sparse symbols never shares a
+        // window with the next one.
+        let mut lost = 0;
+        for i in 0..24 {
+            now += PERIOD_US;
+            n += 5;
+            if i % 6 == 0 {
+                lost += 1;
+            }
+            let s = sample(1, n, lost, now);
+            c.observe(now, [(0, true, &s)]);
+        }
+        assert_eq!(c.snapshot.data_shards, 8, "single sparse losses select 8+1");
+        // Sparse clean feedback keeps that protection.
+        for _ in 0..40 {
+            now += PERIOD_US;
+            n += 10;
+            let s = sample(1, n, lost, now);
+            c.observe(now, [(0, true, &s)]);
+        }
+        assert_eq!(c.snapshot.data_shards, 8);
+    }
+
+    #[test]
+    fn small_lossy_samples_after_a_new_generation_restore_protection() {
+        let mut c = Controller::default();
+        let (_, mut now) = switch_off(&mut c);
+        let (mut n, mut lost) = (0, 0);
+        for _ in 0..2 {
+            now += PERIOD_US;
+            n += 20;
+            lost += 4;
+            let s = sample(2, n, lost, now);
+            c.observe(now, [(0, true, &s)]);
+        }
+        assert_eq!(c.snapshot.data_shards, 4);
+    }
+
+    #[test]
+    fn sending_without_feedback_returns_to_the_default() {
+        let mut c = Controller::default();
+        let (n, mut now) = switch_off(&mut c);
+        let mut s = sample(1, n, 0, now);
+        // Feedback delayed for less than three seconds keeps the target.
+        for _ in 0..5 {
+            now += PERIOD_US;
+            s.sent_symbols += 100;
+            s.sampled_us = now;
+            c.observe(now, [(0, true, &s)]);
+        }
+        assert_eq!(c.snapshot.data_shards, 0);
+        s.sender_estimate.expected = s.sent_symbols - 100;
+        s.sender_estimate.updated_us = Some(now + PERIOD_US);
+        for _ in 0..5 {
+            now += PERIOD_US;
+            s.sent_symbols += 100;
+            s.sampled_us = now;
+            c.observe(now, [(0, true, &s)]);
+        }
+        assert_eq!(c.snapshot.data_shards, 0);
+        assert_eq!(c.snapshot.unknown_restores, 0);
+        // Three seconds of sending without feedback: unknown loss is protected.
+        for _ in 0..3 {
+            now += PERIOD_US;
+            s.sent_symbols += 100;
+            s.sampled_us = now;
+            c.observe(now, [(0, true, &s)]);
+        }
+        assert_eq!(c.snapshot.data_shards, 4);
+        assert_eq!(c.snapshot.unknown_restores, 1);
+        assert_eq!(c.snapshot.loss_rate, None);
+        // An idle session without feedback is not a reason to protect.
+        let mut idle = Controller::default();
+        let (n, mut now) = switch_off(&mut idle);
+        let mut s = sample(1, n, 0, now);
+        for _ in 0..20 {
+            now += PERIOD_US;
+            s.sampled_us = now;
+            idle.observe(now, [(0, true, &s)]);
+        }
+        assert_eq!(idle.snapshot.data_shards, 0);
     }
 
     #[test]

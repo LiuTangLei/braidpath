@@ -9,7 +9,9 @@ CONNECT stream to the target address instead of a fixed-target stream.
 `--connections` runs several such transfers at once; `--probe-interval-ms`
 adds an interactive echo stream beside them (SOCKS5 only) and reports its
 round-trip times; `--event T:JSON` sends one emulator control line T seconds
-after the transfer starts, for example a path outage. Loopback shares one CPU
+after the transfer starts, for example a path outage. `--tail-seconds` keeps
+the probe running after the transfer and reports those round trips separately,
+so events can impair interactive-only traffic. Loopback shares one CPU
 and kernel: this is a controlled diagnostic, not a WAN or independent-bandwidth
 acceptance result.
 """
@@ -64,6 +66,7 @@ def parse_args(argv=None):
     parser.add_argument("--connections", type=int, default=1)
     parser.add_argument("--probe-interval-ms", type=float, default=0.0)
     parser.add_argument("--event", type=parse_event, action="append", default=[])
+    parser.add_argument("--tail-seconds", type=float, default=0.0)
     parser.add_argument("--loss-percent", type=float, default=0.0)
     parser.add_argument("--queue-packets", type=int, default=1024)
     parser.add_argument("--seed", type=int, default=20261017)
@@ -82,6 +85,8 @@ def parse_args(argv=None):
         parser.error("connections must be 1..32")
     if args.probe_interval_ms and (args.entrance != "socks5" or not 5 <= args.probe_interval_ms <= 1000):
         parser.error("probes need --entrance socks5 and 5..1000 ms")
+    if args.tail_seconds and (not args.probe_interval_ms or not 0 < args.tail_seconds <= 120):
+        parser.error("a tail needs a probe and is at most 120 seconds")
     if any(event[1].get("path", -1) not in range(len(args.path)) for event in args.event):
         parser.error("event names an unknown path")
     args.use_path = args.use_path or list(range(len(args.path)))
@@ -362,6 +367,9 @@ def run(args):
         for worker in workers:
             worker.join()
         wall = time.monotonic() - started
+        busy_rtts = len(probe.rtts) if probe else 0
+        busy_timeouts, busy_error = (probe.timeouts, probe.error) if probe else (0, None)
+        stop.wait(args.tail_seconds)
         stop.set()
         if probe:
             probe.join(10)
@@ -376,12 +384,17 @@ def run(args):
         if probe:
             save(args.output / "probe-samples.json", {
                 "unit": "seconds", "idle": probe.rtts[:idle_rtts],
-                "during_transfer": probe.rtts[idle_rtts:],
+                "during_transfer": probe.rtts[idle_rtts:busy_rtts],
+                "after_transfer": probe.rtts[busy_rtts:],
                 "timeouts": probe.timeouts, "error": probe.error,
             })
             idle = rtt_summary(probe.rtts[:idle_rtts])
-            busy = rtt_summary(probe.rtts[idle_rtts:], probe.timeouts, probe.error)
+            busy = rtt_summary(probe.rtts[idle_rtts:busy_rtts], busy_timeouts, busy_error)
             result["probe"] = {"interval_ms": args.probe_interval_ms, "idle": idle, "during_transfer": busy}
+            if args.tail_seconds:
+                result["probe"]["after_transfer"] = rtt_summary(
+                    probe.rtts[busy_rtts:], probe.timeouts - busy_timeouts,
+                    probe.error if probe.error != busy_error else None)
         for process in (client, server):
             process.send_signal(2)
         for process in (client, server):

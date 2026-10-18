@@ -2,8 +2,10 @@
 
 With default `--fec auto`, sending session/direction snapshots include
 `automatic_fec`: current `data_shards` / `repair_shards` (both zero for no FEC),
-EWMA `loss_rate`, newest interval `sample_symbols` / `sample_lost`, eligible
-`feedback_paths`, `transitions`, and sender-local `updated_us`. These are
+EWMA `loss_rate`, newest interval `sample_symbols` / `sample_lost` (a sparse
+window's running total until it reaches 64 symbols), eligible
+`feedback_paths`, `transitions`, `unknown_restores` (returns to 4+1 while
+sending without feedback), and sender-local `updated_us`. These are
 session-local gauges, not process-wide aggregates. Empty or stale feedback
 does not imply zero loss; inspect the sample denominator and update age.
 
