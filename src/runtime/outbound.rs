@@ -272,6 +272,7 @@ pub struct RepairBudget {
     percent: u8,
     credit: u64,
     maximum: u64,
+    small: Option<Pacer>,
 }
 impl RepairBudget {
     pub fn new(percent: u8) -> Self {
@@ -279,6 +280,25 @@ impl RepairBudget {
             percent,
             credit: 0,
             maximum: 2 * 1200 * 100,
+            small: None,
+        }
+    }
+    pub fn enable_small_rate(&mut self, rate: u64) {
+        self.small = Some(Pacer::new(rate, 2400));
+    }
+    pub fn refill_small(&mut self, now_us: u64) {
+        if let Some(pacer) = &mut self.small {
+            pacer.refill(now_us);
+        }
+    }
+    pub fn small_can_repair(&self, bytes: usize) -> bool {
+        self.small
+            .as_ref()
+            .is_none_or(|pacer| pacer.available(bytes + 80))
+    }
+    pub fn small_repair_admitted(&mut self, bytes: usize) {
+        if let Some(pacer) = &mut self.small {
+            pacer.spend(bytes + 80);
         }
     }
     pub fn original_admitted(&mut self, bytes: usize) {
@@ -293,6 +313,33 @@ impl RepairBudget {
     pub fn repair_admitted(&mut self, bytes: usize) {
         assert!(self.can_repair(bytes));
         self.credit -= bytes as u64 * 100;
+    }
+}
+
+#[cfg(test)]
+mod small_budget_tests {
+    use super::*;
+    #[test]
+    fn small_copy_rate_is_independent_and_idle_credit_is_bounded() {
+        let mut budget = RepairBudget::new(30);
+        budget.enable_small_rate(8000);
+        assert!(!budget.small_can_repair(920));
+        budget.refill_small(1_000_000);
+        assert!(budget.small_can_repair(920));
+        budget.small_repair_admitted(920);
+        budget.original_admitted(100_000);
+        assert!(
+            !budget.small_can_repair(920),
+            "bulk credit cannot fund a small copy"
+        );
+        budget.refill_small(1_000_000_000);
+        for _ in 0..2 {
+            budget.small_repair_admitted(920);
+        }
+        assert!(
+            !budget.small_can_repair(920),
+            "idle cannot accumulate unbounded copies"
+        );
     }
 }
 

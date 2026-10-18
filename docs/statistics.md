@@ -81,8 +81,8 @@ Relay direction counters use UDP datagrams, with received/queued/forwarded count
 
 ## Mixed-mode repair accounts
 
-The `symbols.mixed_*` fields are additive and remain zero outside explicit mixed
-mode. `mixed_small_originals_generated`, `mixed_small_repairs_generated`,
+The `symbols.mixed_*` fields describe the two coding lanes in explicit mixed
+mode and automatic small-record protection (the field names are retained). `mixed_small_originals_generated`, `mixed_small_repairs_generated`,
 `mixed_bulk_originals_generated` and `mixed_bulk_repairs_generated` count actual
 generated symbols. They do not count successful FEC recoveries.
 

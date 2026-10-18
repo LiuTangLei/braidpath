@@ -15,7 +15,7 @@ policy; older servers reject it. Use a numeric value for older peers.
 | 1% to < 3% | 8+1 | 12.5% |
 | >= 3% | 4+1 | 25% |
 
-The sender starts at 4+1 until feedback qualifies. Every 500 ms it takes deltas
+Bulk traffic starts with no repair; short records and stream ACKs have independent protection from the first packet. Every 500 ms the sender takes deltas
 of finalized cumulative counts, weighting active paths by symbol exposure.
 Closed, silent (when another path is usable), or stale (>3 seconds) path
 feedback is excluded. A full observation needs at least 64 newly finalized
@@ -27,7 +27,7 @@ cannot trigger a downgrade. A connection generation starts a new counter
 baseline and discards pending sparse samples, unconfirmed counts, and any pending downgrade.
 
 If any symbols are sent on eligible paths and no qualified feedback
-arrives for three seconds, the sender returns to the starting 4+1 and forgets
+arrives for three seconds, the sender returns bulk protection to 4+1 and forgets
 its loss estimate. An idle session keeps its strength.
 
 Loss is smoothed with a 0.5 EWMA weight. Upgrades use the higher of the newest
@@ -53,3 +53,26 @@ This policy does not recover arbitrary burst loss or a whole failed path, and
 it does not guarantee a throughput gain. See [statistics](statistics.md) for
 the current target, loss denominator, and transition counters. Private run
 records and topology-specific results belong in ignored `local/`.
+
+## Independent short-record and ACK protection
+
+Auto negotiates `braidpath-auto-small: 1` with an explicit response echo. Both
+endpoints must support it; fixed numeric FEC remains compatible with older peers.
+Records of at most 128 application bytes and all reliable-stream ACKs (including
+large selective ACKs) use immediate k=1 blocks, separate from bulk coding. A clean
+or weak-loss bulk target (0/32/16) permits one repair copy, 8+1 permits two, and
+4+1 permits three. The copies carry identical authenticated repair bytes and one
+block ID; the receiver delivers once. Delayed originals remain duplicates.
+
+Only an actually admitted original authorizes its own generated/queued copies.
+They cannot borrow bulk credit or fund bulk repair. Auto additionally caps repair
+admission for this class at min(aggregate rate / 4, 1 Mbit/s), a 2400-byte maximum
+idle burst, and charges the datagram frame plus the existing 80-byte pacing cost.
+All originals, copies, feedback and probes still share aggregate/group caps and
+native congestion control. Budget or queue pressure can discard a repair.
+
+The existing small-record delivery policy ranks timely paths and separates
+same-path copies until the previous datagram has left Quinn's outgoing queue.
+This avoids relying on multiple copies packed into the same native datagram.
+Independent packet loss remains an approximation; shared failures can lose every
+copy. These bounds prioritize interaction without promising a latency deadline.

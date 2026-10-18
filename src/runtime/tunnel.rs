@@ -82,6 +82,10 @@ pub struct Policy {
     pub queue_ms: u64,
 }
 impl Policy {
+    fn split_fec(&self) -> bool {
+        self.mixed_fec || self.fec == automatic_fec::AUTO
+    }
+
     fn admission_lifetime(&self) -> Duration {
         Duration::from_millis(if self.adaptive {
             self.queue_ms.min(self.latency_target_ms)
@@ -646,7 +650,7 @@ fn enqueue_coded_symbol(
     hold: &mut Option<Arc<outbound::Hold>>,
 ) {
     let coding::EncodedSymbol { data, small } = symbol;
-    let mixed = policy.is_some_and(|p| p.mixed_fec);
+    let mixed = policy.is_some_and(Policy::split_fec);
     let small_repair_limit = if mixed && small && data[3] == 1 {
         // The repair can use another HTTP request stream. Reserve against the
         // largest legal mapping, not the original's actual stream-id width.
@@ -778,7 +782,7 @@ fn enqueue_coded_symbol(
         && small_repair_limit > 0
         && let Some(meta) = block.and_then(|block| blocks.get_mut(&block))
     {
-        meta.small_repair_limit = small_repair_limit;
+        meta.small_repair_limit += small_repair_limit;
     }
     metrics.update(|d| {
         if skipped {
@@ -851,14 +855,16 @@ fn repair_allowed(
     pending: &outbound::Pending,
     frame_bytes: usize,
 ) -> bool {
-    if policy.small_fec_bytes > 0 && (!policy.mixed_fec || pending.small) {
+    if small_delivery::applies(policy, pending) {
         // Independent k=1 blocks create exactly one queued copy. Its original
         // must have actually entered Quinn; expiry/generation grants no credit.
         pending
             .block
             .and_then(|block| blocks.get(&block))
             .is_some_and(|meta| {
-                meta.paths != 0 && (!policy.mixed_fec || meta.small_repair_reserved >= frame_bytes)
+                meta.paths != 0
+                    && (!policy.split_fec() || meta.small_repair_reserved >= frame_bytes)
+                    && budget.small_can_repair(frame_bytes)
             })
     } else {
         budget.can_repair(frame_bytes)
@@ -885,7 +891,7 @@ fn account_budget_skipped(policy: &Policy, pending: &outbound::Pending, metrics:
     );
     metrics.update(|d| {
         d.symbols.repairs_budget_skipped += 1;
-        if policy.mixed_fec && !pending.small {
+        if policy.split_fec() && !pending.small {
             d.symbols.mixed_bulk_repairs_budget_skipped += 1;
             // No path/HTTP stream was selected. This is encoded wire length,
             // not hypothetical HTTP framing or admitted traffic.
@@ -905,7 +911,7 @@ fn budget_admitted(
     metrics: &Scope,
 ) {
     let repair = pending.record_id.is_none();
-    if !policy.mixed_fec {
+    if !policy.split_fec() {
         if repair {
             if policy.small_fec_bytes == 0 {
                 budget.repair_admitted(frame_bytes);
@@ -920,7 +926,8 @@ fn budget_admitted(
         if repair {
             let meta = meta.expect("admitted small repair block");
             assert!(meta.paths != 0 && meta.small_repair_reserved >= frame_bytes);
-            meta.small_repair_reserved = 0;
+            meta.small_repair_reserved -= frame_bytes;
+            budget.small_repair_admitted(frame_bytes);
             metrics.update(|d| {
                 d.symbols.mixed_small_repair_admitted_bytes += frame_bytes as u64;
                 d.symbols.mixed_small_repairs_quinn_admitted += 1;
@@ -1464,6 +1471,9 @@ async fn sender(
     let mut queue = outbound::Queue::default();
     let mut blocks = BTreeMap::<u64, BlockSend>::new();
     let mut budget = outbound::RepairBudget::new(policy.redundancy);
+    if policy.fec == automatic_fec::AUTO {
+        budget.enable_small_rate((policy.rate / 4).min(1_000_000));
+    }
     let mut scheduler = scheduler::Scheduler::default();
     let mut controllers: [adaptive::PathController; MAX_PATHS] = std::array::from_fn(|_| {
         adaptive::PathController::new(policy.rate, policy.latency_target_ms)
@@ -1666,6 +1676,7 @@ async fn sender(
         let now = Instant::now();
         let now_us = epoch.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
         pacer.refill(now_us);
+        budget.refill_small(now_us);
         for group in &mut groups {
             group.refill(now_us);
         }
@@ -2167,7 +2178,7 @@ async fn sender(
             let affordable_repair = |p: &outbound::Pending| {
                 repair_allowed(&policy, &budget, &blocks, p, repair_frame_floor(&policy, p))
             };
-            let repair_ready = if policy.mixed_fec {
+            let repair_ready = if policy.split_fec() {
                 // At most REPAIR_LIMIT distinct heads are tried without an
                 // admission. A budget- or path-blocked lane cannot hide a
                 // separately authorized repair from the other coding lane.
@@ -3331,6 +3342,7 @@ async fn server_connection(
                     ensure!(proxy.is_none() || tcp.proxy.is_some(),"proxy streams are not enabled on this server");
                     let proxy=proxy.is_some();
                     let policy=Policy{streams,proxy,fec_repairs,small_fec_bytes,mixed_fec,probe_guided_recovery,capacity_probe_bps,adaptive:quality_schedule==Some("adaptive"),latency_target_ms,group_rates,quality_schedule:quality_schedule.is_some(),receiver_feedback:feedback.is_some(),fec:parse_fec(header("braidpath-fec")?).map_err(anyhow::Error::msg)?,redundancy:header("braidpath-redundancy")?.parse()?,rate,block_ms:header("braidpath-block-ms")?.parse()?,queue_ms:header("braidpath-queue-ms")?.parse()?};policy.validate()?;
+                    if policy.fec==automatic_fec::AUTO {ensure!(req.headers().get_all("braidpath-auto-small").iter().count()==1 && req.headers().get("braidpath-auto-small").is_some_and(|v|v=="1"),"automatic small protection not negotiated");}
                     let rejoin=req.headers().get("braidpath-rejoin").is_some_and(|v|v=="1");
                     let stream_id=stream.id().into_inner();
                     // Membership and idle expiry share one map -> paths -> generation lock order.
@@ -3383,6 +3395,7 @@ async fn server_connection(
                     let mut response=Response::builder().status(200).header("braidpath-version","1").header("braidpath-max-payload",MAX_PAYLOAD);if feedback.is_some(){response=response.header("braidpath-feedback","2");}
                     if small_fec_bytes>0 {response=response.header("braidpath-small-fec-bytes",small_fec_bytes);}
                     if mixed_fec {response=response.header("braidpath-mixed-fec","1");}
+                    if header("braidpath-fec")?=="auto" {response=response.header("braidpath-auto-small","1");}
                     if streams {response=response.header("braidpath-streams","1");}
                     if proxy {response=response.header("braidpath-proxy","1");}
                     if fec_repairs==2 {response=response.header("braidpath-fec-repairs","2");}
@@ -4053,6 +4066,9 @@ async fn admit_path(
         .header("braidpath-rate", policy.rate)
         .header("braidpath-block-ms", policy.block_ms)
         .header("braidpath-queue-ms", policy.queue_ms);
+    if policy.fec == automatic_fec::AUTO {
+        req = req.header("braidpath-auto-small", "1");
+    }
     if policy.small_fec_bytes > 0 {
         req = req.header("braidpath-small-fec-bytes", policy.small_fec_bytes);
     }
@@ -4128,6 +4144,20 @@ async fn admit_path(
             .and_then(|v| v.parse::<usize>().ok())
             == Some(MAX_PAYLOAD),
         "payload size mismatch"
+    );
+    ensure!(
+        policy.fec != automatic_fec::AUTO
+            || response
+                .headers()
+                .get_all("braidpath-auto-small")
+                .iter()
+                .count()
+                == 1
+                && response
+                    .headers()
+                    .get("braidpath-auto-small")
+                    .is_some_and(|v| v == "1"),
+        "automatic small protection not negotiated"
     );
     ensure!(
         policy.small_fec_bytes == 0

@@ -112,6 +112,8 @@ impl Lane {
 enum Mode {
     Automatic {
         lane: Lane,
+        small: Lane,
+        small_repairs: u8,
         k: u8,
         age: Duration,
         next_block: u64,
@@ -138,8 +140,10 @@ impl RecordEncoder {
         let age = Duration::from_millis(policy.block_ms);
         let mode = if policy.fec == super::super::automatic_fec::AUTO {
             Mode::Automatic {
-                lane: Lane::new(4, age, 1)?,
-                k: 4,
+                lane: Lane::new(1, age, 1)?,
+                small: Lane::new(1, age, 1)?,
+                small_repairs: 1,
+                k: 0,
                 age,
                 next_block: 0,
             }
@@ -163,11 +167,25 @@ impl RecordEncoder {
         match &mut self.mode {
             Mode::Automatic {
                 lane,
+                small,
+                small_repairs,
                 k,
                 next_block,
                 ..
             } => {
-                if *k == 0 {
+                // Stream ACKs are control even when selective ranges exceed a
+                // size cutoff. Short records get independent immediate blocks.
+                let control = record.payload.len() <= 128
+                    || record.flow
+                        & (super::super::stream::STREAM_FLAG | super::super::stream::ACK_FLAG)
+                        == (super::super::stream::STREAM_FLAG | super::super::stream::ACK_FLAG);
+                if control {
+                    let mut out = small.push(&record.encode()?, now, next_block, true)?;
+                    for _ in 1..*small_repairs {
+                        out.push(out.last().expect("k=1 repair").clone());
+                    }
+                    Ok(out)
+                } else if *k == 0 {
                     Ok(vec![EncodedSymbol {
                         data: wire::plain(record)?,
                         small: false,
@@ -253,6 +271,8 @@ impl RecordEncoder {
             k,
             age,
             next_block,
+            small_repairs,
+            ..
         } = &mut self.mode
         else {
             anyhow::bail!("fixed FEC encoder cannot change strength");
@@ -261,6 +281,11 @@ impl RecordEncoder {
             [0, 4, 8, 16, 32].contains(&next),
             "invalid automatic FEC strength"
         );
+        *small_repairs = match next {
+            4 => 3,
+            8 => 2,
+            _ => 1,
+        };
         if next == *k {
             return Ok(Vec::new());
         }
@@ -377,6 +402,106 @@ mod tests {
         assert!(invalid.validate().is_err());
         p.fec_repairs = 2;
         assert!(p.validate().is_err());
+    }
+
+    #[test]
+    fn automatic_small_lane_covers_large_acks_and_keeps_bulk_plain_when_clean() {
+        let mut p = policy(super::super::super::automatic_fec::AUTO, 0, false);
+        p.receiver_feedback = true;
+        let now = Instant::now();
+        let mut e = RecordEncoder::new(&p).unwrap();
+        let bulk = e.encode(&record(1, 1000), now).unwrap();
+        assert_eq!(bulk[0].data[3], 2);
+        assert!(!bulk[0].small);
+        let short = e.encode(&record(2, 64), now).unwrap();
+        assert_eq!(short.len(), 2);
+        assert!(short.iter().all(|s| s.small));
+        e.set_fec(4).unwrap();
+        let ack = Record {
+            flow: super::super::super::stream::ack_flow(3),
+            id: 3,
+            payload: vec![0; 538],
+        };
+        let protected = e.encode(&ack, now).unwrap();
+        assert_eq!(protected.len(), 4);
+        assert!(
+            protected
+                .iter()
+                .all(|s| s.small && block(s) != block(&short[0]))
+        );
+        let mut receiver = Receiver::with_repair_wait(Duration::from_millis(100));
+        // All three repair copies describe the same k=1 block. Any one works;
+        // the others and the delayed original remain harmless duplicates.
+        assert_eq!(receiver.receive(&protected[1].data, now).unwrap()[0].id, 3);
+        for s in [&protected[2], &protected[3], &protected[0]] {
+            assert!(receiver.receive(&s.data, now).unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn automatic_small_credit_is_per_admitted_original_and_limits_copy_count() {
+        let mut p = policy(super::super::super::automatic_fec::AUTO, 0, false);
+        p.receiver_feedback = true;
+        let now = Instant::now();
+        let mut e = RecordEncoder::new(&p).unwrap();
+        e.set_fec(4).unwrap();
+        let mut queue = outbound::Queue::default();
+        let mut blocks = BTreeMap::new();
+        let metrics = stats::Metrics::new("client").scope("auto-budget", stats::FORWARD);
+        let mut budget = outbound::RepairBudget::new(30);
+        budget.enable_small_rate(1_000_000);
+        budget.refill_small(1_000_000);
+        for s in e.encode(&record(1, 64), now).unwrap() {
+            enqueue_encoded(s, now, &mut queue, &mut blocks, &p, &metrics);
+        }
+        let copy = queue.front(true).unwrap().clone();
+        assert!(!repair_allowed(
+            &p,
+            &budget,
+            &blocks,
+            &copy,
+            copy.data.len() + 30
+        ));
+        let original = queue.pop(false).unwrap();
+        budget_admitted(
+            &p,
+            &mut budget,
+            &mut blocks,
+            &original,
+            original.data.len() + 30,
+            &metrics,
+        );
+        blocks.get_mut(&original.block.unwrap()).unwrap().paths = 1;
+        for _ in 0..3 {
+            let copy = queue.pop(true).unwrap();
+            assert!(small_delivery::applies(&p, &copy));
+            assert!(repair_allowed(
+                &p,
+                &budget,
+                &blocks,
+                &copy,
+                copy.data.len() + 30
+            ));
+            budget_admitted(
+                &p,
+                &mut budget,
+                &mut blocks,
+                &copy,
+                copy.data.len() + 30,
+                &metrics,
+            );
+        }
+        assert!(!repair_allowed(
+            &p,
+            &budget,
+            &blocks,
+            &copy,
+            copy.data.len() + 30
+        ));
+        assert!(
+            !budget.can_repair(1),
+            "small originals never fund bulk repair"
+        );
     }
 
     fn block(symbol: &EncodedSymbol) -> u64 {

@@ -88,8 +88,8 @@ impl Default for Controller {
             window: None,
             unconfirmed: None,
             snapshot: Snapshot {
-                data_shards: DEFAULT,
-                repair_shards: 1,
+                data_shards: 0,
+                repair_shards: 0,
                 loss_rate: None,
                 sample_symbols: 0,
                 sample_lost: 0,
@@ -304,7 +304,7 @@ mod tests {
             let s = sample(1, (i + 1) * 1000, lost, now);
             c.observe(now, [(0, true, &s)]);
             if i == 5 {
-                assert_eq!(c.snapshot.data_shards, 4);
+                assert_eq!(c.snapshot.data_shards, 0);
             }
             if i == 6 {
                 assert_eq!(c.snapshot.data_shards, 0);
@@ -314,7 +314,7 @@ mod tests {
             }
         }
         assert_eq!(c.snapshot.data_shards, 0);
-        assert_eq!(c.snapshot.transitions, 3);
+        assert_eq!(c.snapshot.transitions, 2);
     }
     #[test]
     fn stages_match_loss_and_ignore_duplicate_or_empty_reports() {
@@ -361,6 +361,7 @@ mod tests {
     #[test]
     fn sparse_or_missing_feedback_cannot_downgrade() {
         let mut c = Controller::default();
+        c.switch(4);
         for i in 0..20 {
             let s = sample(1, (i + 1) * 10, 0, i * PERIOD_US);
             c.observe(i * PERIOD_US, [(0, true, &s)]);
@@ -486,6 +487,7 @@ mod tests {
     #[test]
     fn an_idle_gap_breaks_the_downgrade_hold() {
         let mut c = Controller::default();
+        c.switch(4);
         let first = sample(1, 1000, 0, 0);
         c.observe(0, [(0, true, &first)]);
         let after_gap = sample(1, 2000, 0, 10_000_000);
@@ -533,6 +535,7 @@ mod tests {
     #[test]
     fn report_clock_jitter_does_not_prevent_clean_downgrade() {
         let mut c = Controller::default();
+        c.switch(4);
         for i in 0..=6 {
             let s = sample(1, (i / 2 + 1) * 1000, 0, i * PERIOD_US);
             c.observe(i * PERIOD_US, [(0, true, &s)]);
@@ -541,6 +544,6 @@ mod tests {
         // Repeating that same report never performs another transition.
         let s = sample(1, 4000, 0, 10_000_000);
         c.observe(10_000_000, [(0, true, &s)]);
-        assert_eq!(c.snapshot.transitions, 1);
+        assert_eq!(c.snapshot.transitions, 2);
     }
 }
