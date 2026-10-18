@@ -5,6 +5,16 @@ when genuinely independent links have spare capacity, and keep application delay
 bounded when capacity falls. A low delay number accompanied by mostly missing
 application operations does not satisfy the second condition.
 
+In default queue-gated recovery, a shared sender backlog alone does not qualify
+every path for a capacity brake. Once paired service samples exist, moderate
+queue/positive-delivery pressure needs an exercised allowance or a fresh,
+same-pace wire-admission interval using at least half the path allowance.
+Lightly used paths retain their allowance while timing and loss still affect
+scheduling. Delivery collapse below half the admitted symbol rate, zero service,
+sustained transport blocking, fast loss, and severe queues retain their safety
+paths. Legacy recovery keeps its previous demand qualification. These rules do
+not create pacing tokens or change aggregate/group caps.
+
 ## Bounded local packet experiment
 
 `bench/adaptive_scenario.py` runs the real BraidPath executable on loopback.

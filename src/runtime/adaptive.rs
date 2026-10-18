@@ -1891,13 +1891,43 @@ impl PathController {
             .as_ref()
             .is_some_and(|sample| sample.deficit);
         self.last_control.service_admission = service_admission;
+        // A shared sender backlog need not exercise this particular path.
+        // A lightly used paired interval can miss in-flight symbols when RTT
+        // jitters; its small delivery rate is not a capacity measurement.
+        // Use actual wire admissions over a fresh, same-pace interval as well
+        // as the current exercised allowance. Keep collapse/blocked/severe
+        // queue protections independent of this demand qualification.
+        let paired_busy = service_sample.is_some_and(|sample| {
+            now.saturating_sub(sample.observed_us) <= CONTROL_US
+                && sample.admission.is_some_and(|admission| {
+                    admission.started_us >= last_pace_change
+                        && admission.span_us >= PROBE_US
+                        && admission
+                            .wire_bytes
+                            .map_or(admission.bps * self.wire_per_symbol, |bytes| {
+                                bytes as f64 * 8_000_000.0 / admission.span_us as f64
+                            })
+                            >= self.rate_bps as f64 * 0.5
+                })
+        });
+        let service_collapse = service_sample.is_some_and(|sample| {
+            sample
+                .admission
+                .is_some_and(|admission| sample.bps < admission.bps * 0.5)
+        });
         // Positive underdelivery is exactly what the bounded reprobe compares
         // at its baseline/trial pace. Braking it before that comparison can
         // invalidate every measurement. Zero service remains an immediate
         // deficit; queue, fast-loss and blocked-transport protections still run.
         let service_deficit_actionable = service_deficit
             && ((!protect_ordinary_loss && !probe_covered_loss && !loss_hold)
-                || service_bps == Some(0.0));
+                || service_bps == Some(0.0))
+            && (!self.queue_gated_loss_enabled
+                || exercised
+                || paired_busy
+                || service_collapse
+                || blocked_pressure
+                || severe_pressure);
         let pressure = delay_pressure
             || (self.loss_pressure && !protect_ordinary_loss && !probe_covered_loss)
             || (fast_loss && !probe_covered_loss && !historic_fast_loss_deferred && !loss_hold)
@@ -2067,8 +2097,16 @@ impl PathController {
         // echo/probe jitter must not turn its small delivery sample into a path
         // capacity estimate. Backlog, blocked transport or the separately
         // qualified actual-admission deficit still permits a safety brake.
-        let active_demand =
-            observation.offered_backlog || exercised || blocked_pressure || service_deficit;
+        let active_demand = if self.queue_gated_loss_enabled && service_sample.is_some() {
+            exercised
+                || paired_busy
+                || blocked_pressure
+                || fast_loss_actionable
+                || service_deficit_actionable
+                || (observation.offered_backlog && severe_pressure)
+        } else {
+            observation.offered_backlog || exercised || blocked_pressure || service_deficit
+        };
         // Reduce at most once per current RTT (queue included): a queue reading
         // still rising from pre-brake traffic is not new pressure. Severe queues
         // and zero service keep the original short debounce.
@@ -4572,6 +4610,78 @@ mod tests {
         sample.delivered_bytes = 3_620_000;
         sample.delivered_bps = Some(9_920_000.0);
         (controller, sample)
+    }
+
+    fn underused_jitter_fixture(backlog: bool, jitter_ms: f64) -> (PathController, Observation) {
+        let (mut controller, mut sample) = random_loss_fixture(true);
+        controller.queue_gated_loss_enabled = true;
+        controller.target_ms = 20.0;
+        controller.rate_bps = 64_483_694;
+        controller.allowance_bytes = 820_538.0;
+        controller.admitted_bytes = 21_184;
+        controller.min_rtt_ms = Some(sample.rtt_ms - jitter_ms);
+        controller.last_report = Some((83, 3_020_000, sample.now_us - 197_867));
+        sample.offered_backlog = backlog;
+        if !backlog {
+            controller.backlog_since_us = None;
+        }
+        // 81 symbols in a complete ~0.5s interval do not exercise64Mbit/s.
+        sample.admitted_symbols = Some(3_372);
+        sample.admitted_symbol_bytes = Some(3_059_303);
+        sample.delivered_bytes = 3_040_000;
+        sample.delivered_bps = Some(1_697_351.0);
+        sample.finalized_expected = Some(3_081);
+        sample.finalized_lost = Some(254);
+        sample.feedback_sample_symbols = 81;
+        sample.loss_sample_rate = Some(14.0 / 81.0);
+        (controller, sample)
+    }
+
+    #[test]
+    fn underused_path_jitter_cannot_size_a_capacity_brake_from_sparse_delivery() {
+        for (backlog, jitter_ms) in [(false, 5.94), (false, 30.0), (true, 30.0)] {
+            let (mut controller, sample) = underused_jitter_fixture(backlog, jitter_ms);
+            let before = controller.rate_bps;
+            controller.observe(&sample);
+            assert!(
+                controller
+                    .last_control
+                    .service_admission
+                    .as_ref()
+                    .unwrap()
+                    .deficit
+            );
+            assert_eq!(
+                controller.rate_bps, before,
+                "backlog={backlog} jitter={jitter_ms}"
+            );
+            assert!(!controller.congestion_seen);
+        }
+    }
+
+    #[test]
+    fn underused_path_keeps_collapse_blocked_and_severe_queue_safety_brakes() {
+        for mode in ["collapse", "blocked", "severe_queue", "busy_queue"] {
+            let (mut controller, mut sample) = underused_jitter_fixture(true, 30.0);
+            match mode {
+                "collapse" => {
+                    sample.delivered_bytes = 3_025_000;
+                    sample.delivered_bps = Some(100_000.0);
+                }
+                "blocked" => {
+                    sample.transport_blocked = true;
+                    controller.blocked_since_us = Some(sample.now_us - 200_000);
+                }
+                "severe_queue" => controller.min_rtt_ms = Some(1.0),
+                "busy_queue" => {
+                    controller.allowance_bytes = 21_000.0;
+                }
+                _ => unreachable!(),
+            }
+            let before = controller.rate_bps;
+            controller.observe(&sample);
+            assert!(controller.rate_bps < before, "{mode}");
+        }
     }
 
     #[test]

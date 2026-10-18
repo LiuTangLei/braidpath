@@ -61,7 +61,8 @@ Auto negotiates `braidpath-auto-small: 1` with an explicit response echo. Both
 endpoints must support it; fixed numeric FEC remains compatible with older peers.
 Records of at most 128 application bytes and all reliable-stream ACKs (including
 large selective ACKs) use a separate protection lane. A cold,
-unknown target permits one repair copy; qualified clean target 0 permits none,
+unknown target permits one repair copy; qualified clean target 0 permits none
+for UDP records and ACKs, while short reliable-stream data retains one copy,
 32/16 permit one, 8+1 permits two, and
 4+1 permits three. The copies carry identical authenticated repair bytes and one
 block ID; the receiver delivers once. Delayed originals remain duplicates.
@@ -82,8 +83,10 @@ This avoids relying on multiple copies packed into the same native datagram.
 Independent packet loss remains an approximation; shared failures can lose every
 copy. These bounds prioritize interaction without promising a latency deadline.
 
-Qualified clean feedback removes proactive short-record copies even when the
-bulk k stays zero. Short reliable retries carry local transmission identity:
+Qualified clean feedback removes proactive UDP/ACK copies even when the
+bulk k stays zero. Short reliable-stream data keeps one immediate copy within
+the same independent budget: waiting for its next packet would add a full RTT
+to an isolated request. Short reliable retries carry local transmission identity:
 second attempts authorize one copy, third/later attempts authorize three, within
 the same rate/credit/queue limits. This protects recovery before a finalized loss
 report arrives. With zero selected copies the control record is plain, keeps

@@ -253,8 +253,10 @@ result is not a WAN, independent-capacity or deployment acceptance result.
 
 A sender with exactly one admitted, never-retransmitted segment of at most 128
 sequence bytes, and no unsent application bytes, can queue one additional copy.
-Its timer uses the actual route's native RTT and largest recent stream ACK RTT
-sample on that route, a 12.5% timing margin and the 2 ms ACK delay (capped at 2 s). Unknown/local-queue routes cannot
+Its timer uses the actual route's native RTT and smoothed stream ACK RTT on that
+route, a 12.5% timing margin and the 2 ms ACK delay (capped at 2 s). A single old
+delayed ACK does not pin this one-copy timer to the recent maximum; full loss
+recovery still keeps the conservative maximum. Unknown/local-queue routes cannot
 probe. This copy is not a loss declaration: it preserves the original loss
 clock, route, stall backoff and failure timer. A local drop of the probe does not
 mark the original lost. There is at most one probe per retained segment; a new

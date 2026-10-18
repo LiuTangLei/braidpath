@@ -190,15 +190,18 @@ impl RecordEncoder {
                         & (super::super::stream::STREAM_FLAG | super::super::stream::ACK_FLAG)
                         == (super::super::stream::STREAM_FLAG | super::super::stream::ACK_FLAG);
                 if control {
-                    // Clean steady traffic carries no proactive repair. A
-                    // short stream retry is independent evidence of trouble,
-                    // so protect it before a finalized loss report arrives.
+                    // A sparse interactive stream cannot amortize a lost tail
+                    // over the next packet. Keep one immediate copy even when
+                    // clean bulk and superseding ACKs need no proactive FEC.
+                    let interactive = super::super::stream::stream_id(record.flow).is_some()
+                        && !super::super::stream::is_ack_flow(record.flow)
+                        && record.payload.len() <= 128;
                     let recovery = match attempt {
                         0 | 1 => 0,
                         2 => 1,
                         _ => 3,
                     };
-                    let copies = (*small_repairs).max(recovery);
+                    let copies = (*small_repairs).max(recovery).max(u8::from(interactive));
                     if copies == 0 {
                         return Ok(vec![EncodedSymbol {
                             data: wire::plain(record)?,
@@ -462,6 +465,35 @@ mod tests {
         for s in [&protected[2], &protected[3], &protected[0]] {
             assert!(receiver.receive(&s.data, now).unwrap().is_empty());
         }
+    }
+
+    #[test]
+    fn clean_bulk_keeps_one_bounded_copy_for_interactive_stream_data() {
+        let mut p = policy(super::super::super::automatic_fec::AUTO, 0, false);
+        p.receiver_feedback = true;
+        let now = Instant::now();
+        let mut e = RecordEncoder::new(&p).unwrap();
+        e.set_fec(0).unwrap();
+        let data = Record {
+            flow: crate::runtime::stream::data_flow(5),
+            id: 1,
+            payload: vec![7; 77],
+        };
+        let encoded = e.encode(&data, now).unwrap();
+        assert_eq!(
+            encoded.len(),
+            2,
+            "a rare loss must not cost an interactive RTT"
+        );
+        let mut receiver = Receiver::with_repair_wait(Duration::from_millis(100));
+        // The original was lost: its immediate copy delivers the stream data.
+        assert_eq!(receiver.receive(&encoded[1].data, now).unwrap()[0].id, 1);
+        let ack = Record {
+            flow: crate::runtime::stream::ack_flow(5),
+            ..data
+        };
+        assert_eq!(e.encode(&ack, now).unwrap().len(), 1);
+        assert_eq!(e.encode(&record(3, 1000), now).unwrap().len(), 1);
     }
 
     #[test]

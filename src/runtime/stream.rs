@@ -722,8 +722,8 @@ impl Sender {
         {
             return None;
         }
-        let rtt = self.transport_rtt[s.path]
-            .max(self.path_rtt[s.path].observed_max().unwrap_or_default());
+        let rtt =
+            self.transport_rtt[s.path].max(self.path_rtt[s.path].smoothed.unwrap_or_default());
         Some((
             s.sent_at + (rtt.mul_f64(1.125) + ACK_DELAY).min(MAX_PTO),
             start,
@@ -1104,6 +1104,33 @@ mod tests {
         );
         let loss_at = s.next_deadline(at).unwrap();
         assert!(loss_at <= now + Duration::from_millis(90));
+    }
+
+    #[test]
+    fn short_tail_probe_does_not_inherit_an_old_ack_outlier() {
+        let now = Instant::now();
+        let mut s = Sender::new(false);
+        s.path_rtt[0].sample(Duration::from_millis(200), now - Duration::from_millis(250));
+        for i in 1..20 {
+            s.path_rtt[0].sample(
+                Duration::from_millis(70),
+                now - Duration::from_millis(250 - i * 10),
+            );
+        }
+        s.push(&[7; 64]);
+        let t = s.poll_transmit(now).unwrap();
+        s.admitted(t.start, t.transmission, 0, Duration::from_millis(70), now);
+        let full_repair = s.fresh_deadline(now, s.path_threshold(0, now));
+        let (probe, _) = s.tail_probe_deadline().unwrap();
+        assert!(
+            probe <= now + Duration::from_millis(110),
+            "{:?}",
+            probe - now
+        );
+        assert!(full_repair >= now + Duration::from_millis(200));
+        s.on_timeout(probe);
+        assert!(s.poll_transmit(probe).unwrap().tail_probe);
+        assert_eq!(s.next_deadline(probe), Some(full_repair));
     }
 
     #[test]
