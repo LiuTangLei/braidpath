@@ -5,19 +5,6 @@ when genuinely independent links have spare capacity, and keep application delay
 bounded when capacity falls. A low delay number accompanied by mostly missing
 application operations does not satisfy the second condition.
 
-In default queue-gated recovery, a shared sender backlog alone does not qualify
-every path for a capacity brake. Once paired service samples exist, moderate
-queue/positive-delivery pressure needs an exercised allowance or a fresh,
-same-pace wire-admission interval using at least half the path allowance.
-Lightly used paths retain their allowance while timing and loss still affect
-scheduling. Capacity samples need at least8000 admitted symbol bytes, including
-zero/positive delivery-collapse claims: a few small ACKs can disappear from one
-receiver bin without measuring a path's capacity. Current exercised allowance
-likewise needs8000 admitted bytes. Delivery collapse below half the admitted symbol rate, zero service,
-sustained transport blocking, fast loss, and severe queues retain their safety
-paths. Legacy recovery keeps its previous demand qualification. These rules do
-not create pacing tokens or change aggregate/group caps.
-
 ## Bounded local packet experiment
 
 `bench/adaptive_scenario.py` runs the real BraidPath executable on loopback.
@@ -192,11 +179,4 @@ real application latency and bounded resources are current gates. The local
 shaper's own timer/CPU limits must be checked from offered-load and queue
 measurements before interpreting a runtime result; nominal serializer capacity
 is not an observed WAN throughput measurement.
-
-Capacity evidence must cover the interval it qualifies. A short sender burst
-that consumes its current allowance cannot qualify an underfilled half-second
-receiver interval as a capacity measurement. In the default queue-gated mode,
-current admissions must cover at least one control interval; paired admissions
-must use at least 90% of the path pace. Small-ACK volume checks, genuine service
-collapse, blocked transport and severe queue protections remain independent.
 
