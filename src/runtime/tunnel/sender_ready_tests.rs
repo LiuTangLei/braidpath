@@ -904,7 +904,7 @@ async fn small_quality_guard_requires_fresh_loss_evidence_on_real_paths() {
             };
         }
         assert_eq!(
-            small_delivery::mask(&[path0.clone(), path1.clone()], 3, remaining, 100),
+            small_delivery::mask(&[path0.clone(), path1.clone()], 3, remaining, 100, 0),
             expected_mask,
             "{label}"
         );
@@ -920,7 +920,7 @@ async fn small_timing_recovers_from_stale_feedback_and_keeps_cold_paths_live() {
     path1.id = 1;
     let remaining = Duration::from_millis(100);
     assert_eq!(
-        small_delivery::mask(&[path0.clone(), path1.clone()], 3, remaining, 100),
+        small_delivery::mask(&[path0.clone(), path1.clone()], 3, remaining, 100, 0),
         3
     );
     path1.quality.lock().unwrap().snapshot.sender_estimate = quality::Estimate {
@@ -929,16 +929,19 @@ async fn small_timing_recovers_from_stale_feedback_and_keeps_cold_paths_live() {
         ..Default::default()
     };
     assert_eq!(
-        small_delivery::mask(&[path0.clone(), path1.clone()], 3, remaining, 100),
+        small_delivery::mask(&[path0.clone(), path1.clone()], 3, remaining, 100, 0),
         1
     );
     path1.epoch = Instant::now() - Duration::from_secs(4);
     assert_eq!(
-        small_delivery::mask(&[path0.clone(), path1.clone()], 3, remaining, 100),
+        small_delivery::mask(&[path0.clone(), path1.clone()], 3, remaining, 100, 0),
         3
     );
     // An unavailable best path cannot prevent the remaining live path serving.
-    assert_eq!(small_delivery::mask(&[path0, path1], 2, remaining, 100), 2);
+    assert_eq!(
+        small_delivery::mask(&[path0, path1], 2, remaining, 100, 0),
+        2
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]

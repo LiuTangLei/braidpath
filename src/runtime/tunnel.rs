@@ -1034,6 +1034,11 @@ impl PreparedSend {
             eligible,
             policy.admission_lifetime().saturating_sub(age),
             policy.latency_target_ms,
+            if self.repair && policy.fec == automatic_fec::AUTO {
+                self.used
+            } else {
+                0
+            },
         );
         timely & (1 << self.path.id) != 0
             && (!self.repair || small_delivery::copy_ready(&self.path, self.used))
@@ -2315,6 +2320,10 @@ async fn sender(
                     frontier.no_eligible_path_previews += 1;
                 }
             }
+            let used = front
+                .block
+                .and_then(|b| blocks.get(&b))
+                .map_or(0, |b| b.paths);
             let small_mask = if is_small {
                 let eligible = if policy.quality_schedule {
                     candidates.iter().fold(0, |mask, (id, _)| mask | (1 << id))
@@ -2326,6 +2335,11 @@ async fn sender(
                     eligible,
                     lifetime.saturating_sub(age),
                     policy.latency_target_ms,
+                    if repair && policy.fec == automatic_fec::AUTO {
+                        used
+                    } else {
+                        0
+                    },
                 )
             } else {
                 u8::MAX
@@ -2355,10 +2369,6 @@ async fn sender(
                     .map(|n| (cursor + n) % paths.len())
                     .collect()
             };
-            let used = front
-                .block
-                .and_then(|b| blocks.get(&b))
-                .map_or(0, |b| b.paths);
             if is_small {
                 order.retain(|i| small_mask & (1 << paths[*i].id) != 0);
             }

@@ -1,4 +1,4 @@
-//! Timing preference for the explicitly enabled one-copy small-record mode.
+//! Bounded timing preferences for independent small-record coding.
 //! These are relative delivery estimates, never a clock-synchronized one-way SLA.
 use super::{OutPath, Policy, outbound};
 use std::time::Duration;
@@ -95,7 +95,13 @@ pub(super) fn frontier_sample(
     })
 }
 
-pub(super) fn mask(paths: &[OutPath], eligible: u8, remaining: Duration, target_ms: u64) -> u8 {
+pub(super) fn mask(
+    paths: &[OutPath],
+    eligible: u8,
+    remaining: Duration,
+    target_ms: u64,
+    used: u8,
+) -> u8 {
     let estimates: Vec<_> = paths
         .iter()
         .filter(|path| eligible & (1 << path.id) != 0 && path.conn.close_reason().is_none())
@@ -105,7 +111,7 @@ pub(super) fn mask(paths: &[OutPath], eligible: u8, remaining: Duration, target_
     // near-equal paths, but never spend more than 20ms (or the smaller remaining
     // admission budget) solely to move a copy onto another path.
     let slack = (target_ms.min(20) as f64).min(remaining.as_secs_f64() * 1000.0);
-    select_mask(&estimates, slack)
+    select_copy_mask(&estimates, slack, used)
 }
 
 /// Ordinary interactive traffic chooses timing before transient pacing credit.
@@ -162,6 +168,38 @@ fn select_mask(estimates: &[Estimate], slack: f64) -> u8 {
         .fold(timely, |mask, path| mask | (1 << path.id))
 }
 
+// The original and first copy keep the existing timing choice. Later
+// already-budgeted copies may hedge on another route before one further RTT
+// of the fastest route (three times its relative one-way estimate). This is
+// a bounded ranking heuristic, not a delivery SLA or independent loss model.
+fn select_copy_mask(estimates: &[Estimate], slack: f64, used: u8) -> u8 {
+    let timely = select_mask(estimates, slack);
+    if used.count_ones() < 2 || timely == 0 || timely & !used != 0 {
+        return timely;
+    }
+    let mut earliest = f64::INFINITY;
+    let mut loss_ceiling = 1.0f64;
+    for anchor in estimates.iter().filter(|p| timely & (1 << p.id) != 0) {
+        let Some(quality) = anchor.quality else {
+            return timely;
+        };
+        if !quality.loss_rate.is_finite() || !(0.0..=1.0).contains(&quality.loss_rate) {
+            return timely;
+        }
+        earliest = earliest.min(anchor.delay_ms);
+        loss_ceiling = loss_ceiling.min(quality.loss_rate);
+    }
+    estimates
+        .iter()
+        .filter(|p| used & (1 << p.id) == 0 && p.delay_ms <= earliest * 3.0)
+        .filter(|p| {
+            p.quality.is_some_and(|q| {
+                q.loss_rate.is_finite() && (0.0..=loss_ceiling).contains(&q.loss_rate)
+            })
+        })
+        .fold(timely, |mask, p| mask | (1 << p.id))
+}
+
 pub(super) fn copy_ready(path: &OutPath, used: u8) -> bool {
     if used & (1 << path.id) == 0 {
         return true;
@@ -176,6 +214,47 @@ pub(super) fn copy_ready(path: &OutPath, used: u8) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn later_copies_can_hedge_on_unused_routes_before_another_fast_round_trip() {
+        let paths = [
+            path(0, 35.0, 0.5, 8),
+            path(1, 50.0, 0.5, 8),
+            path(2, 75.0, 0.5, 8),
+            path(3, 100.0, 0.5, 8),
+            path(4, 200.0, 0.5, 8),
+        ];
+        assert_eq!(select_copy_mask(&paths, 20.0, 0), 3);
+        assert_eq!(select_copy_mask(&paths, 20.0, 1), 3);
+        assert_eq!(
+            select_copy_mask(&paths, 20.0, 3),
+            15,
+            "after two fast distinct routes, remaining copies should reach useful unused routes rather than repeat both fast routes"
+        );
+        assert_eq!(
+            select_copy_mask(&paths, 20.0, 5),
+            3,
+            "an unused timely route keeps its ordinary preference"
+        );
+    }
+
+    #[test]
+    fn later_copy_hedges_require_fresh_no_worse_loss_and_bounded_arrival() {
+        let mut unknown = path(2, 75.0, 0.1, 8);
+        unknown.quality = None;
+        let paths = [
+            path(0, 35.0, 0.1, 8),
+            path(1, 50.0, 0.1, 8),
+            unknown,
+            path(3, 90.0, 0.2, 8),
+            path(4, 200.0, 0.1, 8),
+            path(5, 80.0, 0.05, 8),
+        ];
+        assert_eq!(select_copy_mask(&paths, 20.0, 3), 3 | (1 << 5));
+        let mut unknown_anchor = paths;
+        unknown_anchor[0].quality = None;
+        assert_eq!(select_copy_mask(&unknown_anchor, 20.0, 3), 3);
+    }
 
     #[test]
     fn receiver_queue_and_rtt_excess_are_not_double_counted() {
