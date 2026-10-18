@@ -197,7 +197,7 @@ enum Command {
 mod dual_cli_tests {
     use super::*;
     #[test]
-    fn repair_cli_defaults_are_legacy_and_invalid_counts_are_rejected() {
+    fn repair_cli_defaults_to_auto_and_invalid_counts_are_rejected() {
         let base = [
             "braidpath",
             "client",
@@ -215,6 +215,13 @@ mod dual_cli_tests {
             panic!("client")
         };
         assert_eq!(policy.fec_repairs, 1);
+        assert_eq!(policy.fec, super::super::automatic_fec::AUTO);
+        for value in ["auto", "0", "4", "16", "32"] {
+            assert!(Cli::try_parse_from(base.into_iter().chain(["--fec", value])).is_ok());
+        }
+        for value in ["33", "255", "-1", "unknown"] {
+            assert!(Cli::try_parse_from(base.into_iter().chain(["--fec", value])).is_err());
+        }
         for value in ["0", "3", "255"] {
             assert!(Cli::try_parse_from(base.into_iter().chain(["--fec-repairs", value])).is_err());
         }
@@ -261,7 +268,8 @@ struct PolicyArgs {
     /// Report per-path receiver quality; data scheduling remains round robin.
     #[arg(long)]
     receiver_feedback: bool,
-    #[arg(long, default_value_t = 4)]
+    /// Automatic pre-FEC loss adaptation from no repair to 4+1; a numeric value fixes k.
+    #[arg(long, default_value = "auto", value_parser = tunnel::parse_fec)]
     fec: u8,
     /// Independent bulk repair equations. Two requires --mixed-fec; small records still use one copy.
     #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u8).range(1..=2))]
@@ -385,7 +393,8 @@ pub async fn run() -> Result<()> {
                     mixed_fec: policy.mixed_fec,
                     receiver_feedback: policy.receiver_feedback
                         || policy.quality_schedule
-                        || policy.adaptive,
+                        || policy.adaptive
+                        || policy.fec == super::automatic_fec::AUTO,
                     quality_schedule: policy.quality_schedule || policy.adaptive,
                     redundancy: policy.redundancy_percent,
                     rate,
@@ -598,11 +607,13 @@ mod tests {
                 policy.small_fec_bytes,
                 policy.redundancy_percent
             ),
-            (4, 0, 30)
+            (super::super::automatic_fec::AUTO, 0, 30)
         );
         assert!(stats.trace.packet_trace.is_none());
         assert!(!stats.trace.packet_trace_probe_header);
         let extra = [
+            "--fec",
+            "4",
             "--mixed-fec",
             "--small-fec-bytes",
             "128",

@@ -1,5 +1,13 @@
 # Runtime statistics
 
+With default `--fec auto`, sending session/direction snapshots include
+`automatic_fec`: current `data_shards` / `repair_shards` (both zero for no FEC),
+EWMA `loss_rate`, newest interval `sample_symbols` / `sample_lost`, eligible
+`feedback_paths`, `transitions`, and sender-local `updated_us`. These are
+session-local gauges, not process-wide aggregates. Empty or stale feedback
+does not imply zero loss; inspect the sample denominator and update age.
+
+
 With `--adaptive-fec-retention`, receiving session/direction snapshots include
 `stats.sessions[session][direction].fec_retention`. Its current/minimum/maximum
 and peak values are milliseconds. It also records samples, distinct late samples,

@@ -2,7 +2,7 @@
 
 The throughput `main` branch also includes an opt-in [independent bulk FEC
 extension](docs/independent-fec.md): `--fec 16 --fec-repairs 2` with explicit
-mixed FEC. Existing single-repair defaults remain unchanged; this is not a
+mixed FEC. The default uses loss-adaptive single-repair FEC; this is not a
 public-network performance or reliable-delivery guarantee.
 
 **Weave paths. Repair loss. Keep latency in check.**
@@ -94,12 +94,12 @@ Follow the [runtime guide](docs/runtime.md) for credentials, local forwarding, m
 | Startup/outage recovery and explicit session-epoch replacement | Implemented in adaptive mode; bounded backoff and server retention |
 | Receiver-local adaptive FEC retention | Implemented as an opt-in bounded policy |
 | Two independent bulk repair equations | Opt-in mixed 16+2 mode; single-repair defaults unchanged; WAN tradeoffs not yet verified |
-| Rate-adaptive FEC strength and coupled congestion control | Deferred or separate research work |
+| Loss-adaptive FEC strength | Default `--fec auto`: no repair through 4+1; [policy and limits](docs/automatic-fec.md) |
 | Reliable TCP streams to a fixed target | Implemented experimental adapter; one connection uses every path; WAN acceptance pending |
 | SOCKS5 CONNECT, SOCKS5 UDP ASSOCIATE and HTTP CONNECT entrances | Implemented experimental adapter; CONNECT on the same streams, UDP as datagram records up to the record payload; public destinations only by default; WAN acceptance pending |
 | TUN, stream fallback, browser fingerprint shaping | Planned or deferred |
 
-XOR cannot generally recover an entire failed path. Sparse traffic may exhaust the repair budget; FEC does not guarantee delivery. `--fec 4`, `--block-ms 3` and the 30% repair budget are unchanged; the new mechanisms do not establish a new FEC default. Multiple connections can compete unfairly at a shared bottleneck even with explicit group caps. Multi-interface capacity, competition fairness, independent HTTP/3 interoperability and deployment reachability remain separate acceptance gates.
+XOR cannot generally recover an entire failed path. Sparse traffic may exhaust the repair budget; FEC does not guarantee delivery. FEC now defaults to `--fec auto`; explicit numeric values retain fixed coding. The 3 ms block deadline and 30% admission-based repair budget remain unchanged. Multiple connections can compete unfairly at a shared bottleneck even with explicit group caps. Multi-interface capacity, competition fairness, independent HTTP/3 interoperability and deployment reachability remain separate acceptance gates.
 
 An experimental `--fec 0 --redundancy-percent 0 --small-fec-bytes 128` gives each
 successfully admitted record with at most 128 application bytes one immediate

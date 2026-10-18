@@ -1,0 +1,318 @@
+//! Sender-local XOR strength from authenticated, finalized pre-FEC path counts.
+use super::{MAX_PATHS, quality};
+use serde::Serialize;
+
+/// Policy/wire sentinel; numeric CLI values remain fixed configurations.
+pub const AUTO: u8 = u8::MAX;
+const PERIOD_US: u64 = 500_000;
+const FRESH_US: u64 = 3_000_000;
+const LOWER_HOLD_US: u64 = 3_000_000;
+const MIN_SYMBOLS: u64 = 64;
+
+#[derive(Clone, Debug, Serialize)]
+pub struct Snapshot {
+    pub data_shards: u8,
+    pub repair_shards: u8,
+    pub loss_rate: Option<f64>,
+    pub sample_symbols: u64,
+    pub sample_lost: u64,
+    pub feedback_paths: u8,
+    pub transitions: u64,
+    pub updated_us: Option<u64>,
+}
+
+#[derive(Clone, Copy, Default)]
+struct Cursor {
+    generation: u64,
+    expected: u64,
+    lost: u64,
+}
+
+pub struct Controller {
+    paths: [Cursor; MAX_PATHS],
+    next_us: u64,
+    lower: Option<(u8, u64)>,
+    snapshot: Snapshot,
+}
+
+fn strength(k: u8) -> u8 {
+    match k {
+        0 => 0,
+        32 => 1,
+        16 => 2,
+        8 => 3,
+        4 => 4,
+        _ => unreachable!(),
+    }
+}
+
+fn target(loss: f64) -> u8 {
+    if loss < 0.001 {
+        0
+    } else if loss < 0.005 {
+        32
+    } else if loss < 0.01 {
+        16
+    } else if loss < 0.03 {
+        8
+    } else {
+        4
+    }
+}
+
+impl Default for Controller {
+    fn default() -> Self {
+        Self {
+            paths: [Cursor::default(); MAX_PATHS],
+            next_us: 0,
+            lower: None,
+            snapshot: Snapshot {
+                data_shards: 4,
+                repair_shards: 1,
+                loss_rate: None,
+                sample_symbols: 0,
+                sample_lost: 0,
+                feedback_paths: 0,
+                transitions: 0,
+                updated_us: None,
+            },
+        }
+    }
+}
+
+impl Controller {
+    pub fn due(&self, now_us: u64) -> bool {
+        now_us >= self.next_us
+    }
+    pub fn snapshot(&self) -> Snapshot {
+        self.snapshot.clone()
+    }
+
+    /// Every path clock belongs to its current connection generation. Call at
+    /// most once per observation period; counters span skipped delivery reports.
+    /// Inactive/stale paths advance their baseline but cannot steer live traffic.
+    pub fn observe<'a>(
+        &mut self,
+        now_us: u64,
+        paths: impl IntoIterator<Item = (u8, bool, &'a quality::Snapshot)>,
+    ) -> Option<u8> {
+        if now_us < self.next_us {
+            return None;
+        }
+        self.next_us = now_us.saturating_add(PERIOD_US);
+        let (mut expected, mut lost, mut count) = (0u64, 0u64, 0u8);
+        for (id, active, path) in paths {
+            let cursor = &mut self.paths[usize::from(id)];
+            if cursor.generation != path.generation {
+                if active {
+                    self.lower = None;
+                }
+                *cursor = Cursor {
+                    generation: path.generation,
+                    ..Default::default()
+                };
+            }
+            let estimate = &path.sender_estimate;
+            let n = estimate.expected.saturating_sub(cursor.expected);
+            let missing = estimate.lost.saturating_sub(cursor.lost);
+            *cursor = Cursor {
+                generation: path.generation,
+                expected: estimate.expected,
+                lost: estimate.lost,
+            };
+            if active
+                && n > 0
+                && estimate
+                    .updated_us
+                    .is_some_and(|at| path.sampled_us.saturating_sub(at) <= FRESH_US)
+            {
+                expected = expected.saturating_add(n);
+                lost = lost.saturating_add(missing.min(n));
+                count += 1;
+            }
+        }
+        self.snapshot.sample_symbols = expected;
+        self.snapshot.sample_lost = lost;
+        self.snapshot.feedback_paths = count;
+        if expected < MIN_SYMBOLS {
+            // Feedback and observation clocks can straddle each other. One
+            // empty tick must not perpetually restart a healthy path's hold;
+            // it cannot complete the hold either. Longer gaps still cancel it.
+            if self
+                .snapshot
+                .updated_us
+                .is_none_or(|at| now_us.saturating_sub(at) > PERIOD_US * 2)
+            {
+                self.lower = None;
+            }
+            return None;
+        }
+        let raw = lost as f64 / expected as f64;
+        if self
+            .snapshot
+            .updated_us
+            .is_some_and(|at| now_us.saturating_sub(at) > PERIOD_US * 2)
+        {
+            self.lower = None;
+        }
+        let smooth = self.snapshot.loss_rate.map_or(raw, |old| (old + raw) * 0.5);
+        self.snapshot.loss_rate = Some(smooth);
+        self.snapshot.updated_us = Some(now_us);
+        let current = self.snapshot.data_shards;
+        let higher = target(raw.max(smooth));
+        let next = if strength(higher) > strength(current) {
+            self.lower = None;
+            higher
+        } else {
+            // Require 20% clearance below the current entry threshold and three
+            // seconds of consecutive qualified samples before removing protection.
+            let boundary = match current {
+                4 => 0.03,
+                8 => 0.01,
+                16 => 0.005,
+                32 => 0.001,
+                _ => 0.0,
+            };
+            let lower = target(smooth);
+            if strength(lower) < strength(current) && raw.max(smooth) < boundary * 0.8 {
+                let since = match self.lower {
+                    Some((candidate, since)) if candidate == lower => since,
+                    _ => now_us,
+                };
+                self.lower = Some((lower, since));
+                if now_us.saturating_sub(since) >= LOWER_HOLD_US {
+                    lower
+                } else {
+                    current
+                }
+            } else {
+                self.lower = None;
+                current
+            }
+        };
+        if next == current {
+            return None;
+        }
+        self.snapshot.data_shards = next;
+        self.snapshot.repair_shards = u8::from(next != 0);
+        self.snapshot.transitions += 1;
+        self.lower = None;
+        Some(next)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn sample(generation: u64, n: u64, lost: u64, now: u64) -> quality::Snapshot {
+        let mut s = quality::Snapshot {
+            generation,
+            sampled_us: now,
+            ..Default::default()
+        };
+        s.sender_estimate.expected = n;
+        s.sender_estimate.lost = lost;
+        s.sender_estimate.updated_us = Some(now);
+        s
+    }
+    #[test]
+    fn clean_then_burst_then_clean_changes_both_ways() {
+        let mut c = Controller::default();
+        let mut lost = 0;
+        for i in 0..=40 {
+            let now = i * PERIOD_US;
+            if i == 9 {
+                lost += 100;
+            }
+            let s = sample(1, (i + 1) * 1000, lost, now);
+            c.observe(now, [(0, true, &s)]);
+            if i == 5 {
+                assert_eq!(c.snapshot.data_shards, 4);
+            }
+            if i == 6 {
+                assert_eq!(c.snapshot.data_shards, 0);
+            }
+            if i == 9 {
+                assert_eq!(c.snapshot.data_shards, 4);
+            }
+        }
+        assert_eq!(c.snapshot.data_shards, 0);
+        assert_eq!(c.snapshot.transitions, 3);
+    }
+    #[test]
+    fn stages_match_loss_and_ignore_duplicate_or_empty_reports() {
+        for (loss, k) in [(0, 0), (2, 32), (7, 16), (20, 8), (40, 4)] {
+            let mut c = Controller::default();
+            for i in 0..=8 {
+                let s = sample(1, (i + 1) * 1000, (i + 1) * loss, i * PERIOD_US);
+                c.observe(i * PERIOD_US, [(0, true, &s)]);
+            }
+            assert_eq!(c.snapshot.data_shards, k);
+            let before = c.snapshot.transitions;
+            let s = sample(1, 9000, 9 * loss, 10_000_000);
+            for i in 20..=40 {
+                c.observe(i * PERIOD_US, [(0, true, &s)]);
+            }
+            assert_eq!(c.snapshot.transitions, before);
+        }
+    }
+    #[test]
+    fn weighted_counts_exclude_inactive_and_stale_paths_and_reset_generations() {
+        let mut c = Controller::default();
+        let a = sample(1, 100_000, 0, 0);
+        let b = sample(1, 100, 100, 0);
+        let dead = sample(1, 1_000_000, 1_000_000, 0);
+        let mut stale = dead.clone();
+        stale.sampled_us = FRESH_US + 1;
+        c.observe(
+            0,
+            [
+                (0, true, &a),
+                (1, true, &b),
+                (2, false, &dead),
+                (3, true, &stale),
+            ],
+        );
+        assert_eq!(c.snapshot.sample_symbols, 100_100);
+        assert_eq!(c.snapshot.sample_lost, 100);
+        assert_eq!(c.snapshot.feedback_paths, 2);
+        let new = sample(2, 1000, 100, PERIOD_US);
+        c.observe(PERIOD_US, [(0, true, &new)]);
+        assert_eq!(c.snapshot.sample_symbols, 1000);
+        assert_eq!(c.snapshot.sample_lost, 100);
+    }
+    #[test]
+    fn sparse_or_missing_feedback_cannot_downgrade() {
+        let mut c = Controller::default();
+        for i in 0..20 {
+            let s = sample(1, (i + 1) * 10, 0, i * PERIOD_US);
+            c.observe(i * PERIOD_US, [(0, true, &s)]);
+        }
+        assert_eq!(c.snapshot.data_shards, 4);
+        assert_eq!(c.snapshot.loss_rate, None);
+    }
+
+    #[test]
+    fn an_idle_gap_breaks_the_downgrade_hold() {
+        let mut c = Controller::default();
+        let first = sample(1, 1000, 0, 0);
+        c.observe(0, [(0, true, &first)]);
+        let after_gap = sample(1, 2000, 0, 10_000_000);
+        c.observe(10_000_000, [(0, true, &after_gap)]);
+        assert_eq!(c.snapshot.data_shards, 4);
+    }
+
+    #[test]
+    fn report_clock_jitter_does_not_prevent_clean_downgrade() {
+        let mut c = Controller::default();
+        for i in 0..=6 {
+            let s = sample(1, (i / 2 + 1) * 1000, 0, i * PERIOD_US);
+            c.observe(i * PERIOD_US, [(0, true, &s)]);
+        }
+        assert_eq!(c.snapshot.data_shards, 0);
+        // Repeating that same report never performs another transition.
+        let s = sample(1, 4000, 0, 10_000_000);
+        c.observe(10_000_000, [(0, true, &s)]);
+        assert_eq!(c.snapshot.transitions, 1);
+    }
+}

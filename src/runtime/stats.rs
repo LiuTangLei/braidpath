@@ -226,6 +226,9 @@ pub struct Direction {
     /// Receiver-local gauges/counters, only in the owning session/direction.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fec_retention: Option<super::fec_retention::Snapshot>,
+    /// Sender-local automatic FEC strength and finalized pre-FEC loss basis.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub automatic_fec: Option<super::automatic_fec::Snapshot>,
     /// Sender-owned preview counters; not packet losses or time-at-limit percentages.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sender_frontier: Option<super::sender_frontier::Snapshot>,
@@ -1039,6 +1042,16 @@ impl Metrics {
     }
 }
 impl Scope {
+    pub fn publish_automatic_fec(&self, snapshot: super::automatic_fec::Snapshot) {
+        self.metrics.state(|s| {
+            if let Some(session) = s.sessions.get_mut(&self.session) {
+                session
+                    .entry(self.direction.to_owned())
+                    .or_default()
+                    .automatic_fec = Some(snapshot);
+            }
+        });
+    }
     pub fn publish_sender_frontier(&self, snapshot: super::sender_frontier::Snapshot) {
         self.metrics.state(|s| {
             if let Some(session) = s.sessions.get_mut(&self.session) {

@@ -1,5 +1,6 @@
 use super::{
-    MAX_PATHS, MAX_PAYLOAD, QUEUE, adaptive, capacity_probe, outbound, quality, scheduler,
+    MAX_PATHS, MAX_PAYLOAD, QUEUE, adaptive, automatic_fec, capacity_probe, outbound, quality,
+    scheduler,
     sender_frontier::{self, Gate},
     shutdown::Shutdown,
     stats::{self, Scope},
@@ -130,12 +131,21 @@ impl Policy {
             "quality scheduler requires receiver feedback"
         );
         ensure!(
-            self.fec <= 32 && self.redundancy <= 100,
+            (self.fec <= 32 || self.fec == automatic_fec::AUTO) && self.redundancy <= 100,
             "invalid FEC configuration"
         );
         ensure!(
             usize::from(self.small_fec_bytes) <= MAX_PAYLOAD,
             "small-record threshold must be at most 1000 bytes"
+        );
+        ensure!(
+            self.fec != automatic_fec::AUTO
+                || (self.receiver_feedback
+                    && !self.mixed_fec
+                    && self.small_fec_bytes == 0
+                    && self.fec_repairs == 1
+                    && self.redundancy > 0),
+            "automatic FEC requires feedback, positive redundancy budget, one repair, and no small/mixed FEC"
         );
         if self.mixed_fec {
             ensure!(
@@ -162,6 +172,17 @@ impl Policy {
         );
         Ok(())
     }
+}
+
+pub(super) fn parse_fec(value: &str) -> std::result::Result<u8, String> {
+    if value == "auto" {
+        return Ok(automatic_fec::AUTO);
+    }
+    value
+        .parse::<u8>()
+        .ok()
+        .filter(|n| *n <= 32)
+        .ok_or_else(|| "FEC must be auto or 0..32".to_owned())
 }
 
 fn mixed_fec_header(headers: &http::HeaderMap) -> Result<bool> {
@@ -1432,6 +1453,8 @@ async fn sender(
     observation_notify: Option<Arc<Notify>>,
 ) {
     let mut encoder = coding::RecordEncoder::new(&policy).expect("validated policy");
+    let mut fec_control =
+        (policy.fec == automatic_fec::AUTO).then(automatic_fec::Controller::default);
     let mut frontier = sender_frontier::Snapshot {
         enabled: metrics.metrics.frontier_scheduler()
             && policy.adaptive
@@ -1812,6 +1835,48 @@ async fn sender(
                 let snapshot = controllers[usize::from(path.id)].snapshot(now_us);
                 metrics.path(path.id, |p| p.adaptive = Some(snapshot));
             }
+        }
+        if publish_feedback_stats
+            && let Some(control) = fec_control.as_mut()
+            && control.due(now_us)
+        {
+            let feedback: Vec<_> = paths
+                .iter()
+                .map(|path| {
+                    (
+                        path.id,
+                        path.conn.close_reason().is_none() && silent & (1 << path.id) == 0,
+                        path.quality
+                            .lock()
+                            .expect("quality lock")
+                            .snapshot_at(quality_time(path)),
+                    )
+                })
+                .collect();
+            if let Some(k) = control.observe(
+                now_us,
+                feedback.iter().map(|(id, active, s)| (*id, *active, s)),
+            ) {
+                match encoder.set_fec(k) {
+                    Ok(symbols) => {
+                        for symbol in symbols {
+                            enqueue_encoded(
+                                symbol,
+                                now,
+                                &mut queue,
+                                &mut blocks,
+                                &policy,
+                                &metrics,
+                            );
+                        }
+                    }
+                    Err(_) => {
+                        metrics.update(|d| d.records.encoding_dropped += 1);
+                        break;
+                    }
+                }
+            }
+            metrics.publish_automatic_fec(control.snapshot());
         }
         update_business_pacer(&mut business, &paths, &controllers, now_us);
         if policy.capacity_probe_bps > 0 {
@@ -3265,7 +3330,7 @@ async fn server_connection(
                     ensure!(proxy.is_none() || proxy==Some("1"),"unsupported proxy version");
                     ensure!(proxy.is_none() || tcp.proxy.is_some(),"proxy streams are not enabled on this server");
                     let proxy=proxy.is_some();
-                    let policy=Policy{streams,proxy,fec_repairs,small_fec_bytes,mixed_fec,probe_guided_recovery,capacity_probe_bps,adaptive:quality_schedule==Some("adaptive"),latency_target_ms,group_rates,quality_schedule:quality_schedule.is_some(),receiver_feedback:feedback.is_some(),fec:header("braidpath-fec")?.parse()?,redundancy:header("braidpath-redundancy")?.parse()?,rate,block_ms:header("braidpath-block-ms")?.parse()?,queue_ms:header("braidpath-queue-ms")?.parse()?};policy.validate()?;
+                    let policy=Policy{streams,proxy,fec_repairs,small_fec_bytes,mixed_fec,probe_guided_recovery,capacity_probe_bps,adaptive:quality_schedule==Some("adaptive"),latency_target_ms,group_rates,quality_schedule:quality_schedule.is_some(),receiver_feedback:feedback.is_some(),fec:parse_fec(header("braidpath-fec")?).map_err(anyhow::Error::msg)?,redundancy:header("braidpath-redundancy")?.parse()?,rate,block_ms:header("braidpath-block-ms")?.parse()?,queue_ms:header("braidpath-queue-ms")?.parse()?};policy.validate()?;
                     let rejoin=req.headers().get("braidpath-rejoin").is_some_and(|v|v=="1");
                     let stream_id=stream.id().into_inner();
                     // Membership and idle expiry share one map -> paths -> generation lock order.
@@ -3976,7 +4041,14 @@ async fn admit_path(
                 .join(","),
         )
         .header("braidpath-latency-ms", policy.latency_target_ms)
-        .header("braidpath-fec", u16::from(policy.fec))
+        .header(
+            "braidpath-fec",
+            if policy.fec == automatic_fec::AUTO {
+                "auto".to_owned()
+            } else {
+                policy.fec.to_string()
+            },
+        )
         .header("braidpath-redundancy", u16::from(policy.redundancy))
         .header("braidpath-rate", policy.rate)
         .header("braidpath-block-ms", policy.block_ms)

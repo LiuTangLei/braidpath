@@ -747,6 +747,9 @@ fn three_paths(mode: u8) {
         client_args[index + 1] = "0".into();
     }
     if mode >= 5 {
+        if !dual {
+            client_args.extend(args(&["--fec", "4"]));
+        }
         client_args.extend(args(&[
             "--mixed-fec",
             "--small-fec-bytes",

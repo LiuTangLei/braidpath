@@ -51,7 +51,7 @@ On Linux, repeat `--interface eth0 --interface wlan0` to create the interface–
 
 | Option or bound | Meaning |
 | --- | --- |
-| `--fec 4` (default), `--fec 0` | One XOR repair per block of at most four originals, or FEC off; maximum block size 32 |
+| `--fec auto` (default), `--fec K` | [Automatic loss adaptation](automatic-fec.md) from no repair through 4+1; numeric K fixes K+1 (0 disables, maximum K=32) |
 | `--block-ms 3` | Maximum encoder block age, driven by a 1 ms timer; originals are emitted immediately |
 | `--redundancy-percent 30` | Repair HTTP-datagram byte budget credited only by successfully admitted originals; saved credit is bounded |
 | `--small-fec-bytes 0` | Optional immediate single-record XOR repair threshold, at most 1,000 application bytes; requires FEC0/redundancy0 unless mixed mode is explicit |
@@ -110,7 +110,7 @@ mode acknowledgement, for example:
 --mixed-fec --fec 4 --small-fec-bytes 128 --redundancy-percent 30 --block-ms 8
 ```
 
-This is a selected experimental policy; defaults remain FEC4, block age 3 ms,
+This is a selected experimental policy; defaults use automatic FEC, block age 3 ms,
 30% ordinary repair, no small threshold and no mixed mode. Mixed mode requires
 positive FEC, threshold and ordinary redundancy, and excludes independent
 capacity probes. A peer must explicitly acknowledge `braidpath-mixed-fec: 1`.

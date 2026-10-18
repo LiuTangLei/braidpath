@@ -1,5 +1,6 @@
 //! Experimental authenticated HTTP/3 datagram transport with optional reliable TCP streams.
 pub mod adaptive;
+pub mod automatic_fec;
 pub mod capacity_probe;
 pub mod cli;
 pub mod fec_retention;

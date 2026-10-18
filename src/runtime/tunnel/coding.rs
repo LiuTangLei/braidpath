@@ -110,6 +110,12 @@ impl Lane {
 }
 
 enum Mode {
+    Automatic {
+        lane: Lane,
+        k: u8,
+        age: Duration,
+        next_block: u64,
+    },
     Legacy {
         encoder: Encoder,
         policy: Policy,
@@ -130,7 +136,14 @@ impl RecordEncoder {
     pub(super) fn new(policy: &Policy) -> Result<Self> {
         policy.validate()?;
         let age = Duration::from_millis(policy.block_ms);
-        let mode = if policy.mixed_fec {
+        let mode = if policy.fec == super::super::automatic_fec::AUTO {
+            Mode::Automatic {
+                lane: Lane::new(4, age, 1)?,
+                k: 4,
+                age,
+                next_block: 0,
+            }
+        } else if policy.mixed_fec {
             Mode::Mixed {
                 bulk: Lane::new(policy.fec, age, policy.fec_repairs)?,
                 small: Lane::new(1, age, 1)?,
@@ -148,6 +161,21 @@ impl RecordEncoder {
 
     pub(super) fn encode(&mut self, record: &Record, now: Instant) -> Result<Vec<EncodedSymbol>> {
         match &mut self.mode {
+            Mode::Automatic {
+                lane,
+                k,
+                next_block,
+                ..
+            } => {
+                if *k == 0 {
+                    Ok(vec![EncodedSymbol {
+                        data: wire::plain(record)?,
+                        small: false,
+                    }])
+                } else {
+                    lane.push(&record.encode()?, now, next_block, false)
+                }
+            }
             Mode::Legacy { encoder, policy } => {
                 // Keep the legacy branch and one output collection. Wrapping a
                 // Vec<Bytes> afterwards would add an allocation to every record.
@@ -192,6 +220,9 @@ impl RecordEncoder {
 
     pub(super) fn flush_due(&mut self, now: Instant) -> Result<Vec<EncodedSymbol>> {
         match &mut self.mode {
+            Mode::Automatic {
+                lane, next_block, ..
+            } => lane.flush_due(now, next_block, false),
             Mode::Legacy { encoder, policy } => Ok(encoder
                 .flush_due(now)
                 .map(|shard| EncodedSymbol {
@@ -211,6 +242,36 @@ impl RecordEncoder {
                 Ok(out)
             }
         }
+    }
+
+    /// Finish the old block before replacing its codec. Global block IDs keep
+    /// increasing across plain intervals and changes of k; in-flight repairs
+    /// retain their original count and cannot collide with later blocks.
+    pub(super) fn set_fec(&mut self, next: u8) -> Result<Vec<EncodedSymbol>> {
+        let Mode::Automatic {
+            lane,
+            k,
+            age,
+            next_block,
+        } = &mut self.mode
+        else {
+            anyhow::bail!("fixed FEC encoder cannot change strength");
+        };
+        ensure!(
+            [0, 4, 8, 16, 32].contains(&next),
+            "invalid automatic FEC strength"
+        );
+        if next == *k {
+            return Ok(Vec::new());
+        }
+        let LaneEncoder::Single(encoder) = &mut lane.encoder else {
+            unreachable!()
+        };
+        let shards = encoder.flush().into_iter().collect();
+        let out = lane.remap(shards, next_block, false)?;
+        *lane = Lane::new(next.max(1), *age, 1)?;
+        *k = next;
+        Ok(out)
     }
 }
 
@@ -252,6 +313,70 @@ mod tests {
             id,
             payload: vec![id as u8; bytes],
         }
+    }
+
+    #[test]
+    fn automatic_switches_preserve_partial_blocks_and_delayed_repairs() {
+        let mut p = policy(super::super::super::automatic_fec::AUTO, 0, false);
+        p.receiver_feedback = true;
+        let now = Instant::now();
+        let mut encoder = RecordEncoder::new(&p).unwrap();
+        let mut symbols = Vec::new();
+        let mut id = 0;
+        for k in [4, 0, 32, 16, 8, 4, 0] {
+            symbols.extend(encoder.set_fec(k).unwrap());
+            // Both a complete and an unfinished block before the next switch.
+            for _ in 0..k.max(1) + 1 {
+                id += 1;
+                symbols.extend(encoder.encode(&record(id, 1000), now).unwrap());
+            }
+        }
+        let mut receiver = Receiver::with_repair_wait(Duration::from_millis(100));
+        let mut delivered = Vec::new();
+        let mut delayed = Vec::new();
+        let mut repair_ids = std::collections::BTreeSet::new();
+        // Reorder repairs ahead of originals, and lose one original per coded
+        // block, including the partial blocks closed during a mode change.
+        for symbol in symbols.iter().rev() {
+            if symbol.data[3] == 0 && symbol.data[12] == 0 {
+                delayed.push(symbol);
+                continue;
+            }
+            if symbol.data[3] == 1 {
+                assert!(repair_ids.insert(block(symbol)));
+            }
+            delivered.extend(receiver.receive(&symbol.data, now).unwrap());
+        }
+        let mut ids: Vec<_> = delivered.iter().map(|r| r.id).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, (1..=id).collect::<Vec<_>>());
+        assert_eq!(receiver.recovered as usize, delayed.len());
+        assert_eq!(
+            repair_ids.into_iter().collect::<Vec<_>>(),
+            (0..10).collect::<Vec<_>>()
+        );
+        for symbol in delayed {
+            assert!(receiver.receive(&symbol.data, now).unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn automatic_policy_requires_loss_feedback_and_rejects_fixed_lane_options() {
+        let mut p = policy(super::super::super::automatic_fec::AUTO, 0, false);
+        assert!(p.validate().is_err());
+        p.receiver_feedback = true;
+        assert!(p.validate().is_ok());
+        let mut invalid = p.clone();
+        invalid.redundancy = 0;
+        assert!(invalid.validate().is_err());
+        let mut invalid = p.clone();
+        invalid.small_fec_bytes = 128;
+        assert!(invalid.validate().is_err());
+        let mut invalid = p.clone();
+        invalid.mixed_fec = true;
+        assert!(invalid.validate().is_err());
+        p.fec_repairs = 2;
+        assert!(p.validate().is_err());
     }
 
     fn block(symbol: &EncodedSymbol) -> u64 {
