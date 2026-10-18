@@ -102,6 +102,11 @@ fn launch(args: &[String], dir: &Path, name: &str) -> Process {
     let file = fs::File::create(&log).unwrap();
     let child = Command::new(BIN)
         .env("RUST_LOG", "braidpath=info")
+        // Each fixture has several independent async runtimes. Giving every
+        // subprocess all runner cores oversubscribes the host and can fill the
+        // bounded UDP queue before QUIC gets CPU time. Keep the same packets,
+        // pacing, queue limits and assertions with one worker per test node.
+        .env("TOKIO_WORKER_THREADS", "1")
         .args(args)
         .stdout(Stdio::null())
         .stderr(file)
