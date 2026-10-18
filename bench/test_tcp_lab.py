@@ -6,8 +6,8 @@ import threading
 import unittest
 from unittest.mock import MagicMock, patch
 
-from bench.tcp_lab import (ROOT, Target, parse_args, paths_ready, payload, probe_phases,
-                           probe_summary, socks_connect, transfer)
+from bench.tcp_lab import (ROOT, Echo, FreshProbe, Target, parse_args, paths_ready, payload,
+                           probe_phases, probe_summary, socks_connect, transfer)
 
 
 def args(*extra, output="local/tcp-lab/test"):
@@ -24,7 +24,10 @@ class Arguments(unittest.TestCase):
     def test_bounds_and_evidence_location_are_enforced(self):
         for extra, output in [(("--use-path", "2"), "local/x"), (("--bytes", "10"), "local/x"),
                               (("--loss-percent", "60"), "local/x"), ((), "results/x"),
-                              (("--path", "20:0"), "local/x"), (("--tail-seconds", "5"), "local/x")]:
+                              (("--path", "20:0"), "local/x"), (("--tail-seconds", "5"), "local/x"),
+                              (("--fresh-probe-interval-ms", "100"), "local/x"),
+                              (("--entrance", "socks5", "--fresh-probe-interval-ms", "10"),
+                               "local/x")]:
             with self.subTest(extra=extra, output=output), contextlib.redirect_stderr(io.StringIO()):
                 with self.assertRaises(SystemExit):
                     args(*extra, output=output)
@@ -71,6 +74,40 @@ class ProbeOutcomes(unittest.TestCase):
         phases = probe_phases(attempts, 10, 20)
         self.assertEqual(phases, {"idle": attempts[:1], "during_transfer": attempts[1:2],
                                   "after_transfer": attempts[2:]})
+
+    def test_fresh_probe_uses_a_new_connection_per_attempt_and_keeps_failures(self):
+        echo = Echo()
+        echo.start()
+        proxy = socket.create_server(("127.0.0.1", 0))
+        accepted = []
+
+        def serve():
+            with contextlib.suppress(OSError):
+                while True:
+                    conn, _ = proxy.accept()
+                    accepted.append(conn)
+                    conn.recv(3)
+                    conn.sendall(b"\x05\x00")
+                    conn.recv(10)
+                    if len(accepted) == 2:
+                        conn.sendall(b"\x05\x05\x00\x01" + bytes(6))
+                        conn.close()
+                        continue
+                    conn.sendall(b"\x05\x00\x00\x01" + bytes(6))
+                    threading.Thread(target=Echo.serve, args=(conn,), daemon=True).start()
+        threading.Thread(target=serve, daemon=True).start()
+        stop = threading.Event()
+        probe = FreshProbe("127.0.0.1:%d" % proxy.getsockname()[1], echo.address, 0, stop)
+        probe.start()
+        while len(probe.attempts) < 3:
+            stop.wait(.01)
+        stop.set()
+        probe.join(5)
+        proxy.close()
+        echo.listener.close()
+        outcomes = [a["outcome"] for a in probe.attempts[:3]]
+        self.assertEqual(outcomes, ["ok", "error", "ok"])
+        self.assertGreaterEqual(len(accepted), 3)
 
     def test_empty_window_has_no_percentile(self):
         result = probe_summary([])

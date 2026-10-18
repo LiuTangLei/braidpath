@@ -11,7 +11,9 @@ adds an interactive echo stream beside them (SOCKS5 only) and reports its
 round-trip times; `--event T:JSON` sends one emulator control line T seconds
 after the transfer starts, for example a path outage. `--tail-seconds` keeps
 the probe running after the transfer and reports those round trips separately,
-so events can impair interactive-only traffic. Loopback shares one CPU
+so events can impair interactive-only traffic. `--fresh-probe-interval-ms` opens
+a new SOCKS5 connection per attempt and times connect, CONNECT and one 64-byte
+echo, as a new request beside the load would. Loopback shares one CPU
 and kernel: this is a controlled diagnostic, not a WAN or independent-bandwidth
 acceptance result.
 """
@@ -66,6 +68,7 @@ def parse_args(argv=None):
     parser.add_argument("--entrance", choices=("fixed", "socks5"), default="fixed")
     parser.add_argument("--connections", type=int, default=1)
     parser.add_argument("--probe-interval-ms", type=float, default=0.0)
+    parser.add_argument("--fresh-probe-interval-ms", type=float, default=0.0)
     parser.add_argument("--event", type=parse_event, action="append", default=[])
     parser.add_argument("--tail-seconds", type=float, default=0.0)
     parser.add_argument("--loss-percent", type=float, default=0.0)
@@ -90,6 +93,9 @@ def parse_args(argv=None):
         parser.error("timeout must be greater than zero and at most 600 seconds")
     if args.probe_interval_ms and (args.entrance != "socks5" or not 5 <= args.probe_interval_ms <= 1000):
         parser.error("probes need --entrance socks5 and 5..1000 ms")
+    if args.fresh_probe_interval_ms and (args.entrance != "socks5"
+                                         or not 50 <= args.fresh_probe_interval_ms <= 5000):
+        parser.error("fresh probes need --entrance socks5 and 50..5000 ms")
     if args.tail_seconds and (not args.probe_interval_ms or not 0 < args.tail_seconds <= 120):
         parser.error("a tail needs a probe and is at most 120 seconds")
     if any(event[1].get("path", -1) not in range(len(args.path)) for event in args.event):
@@ -157,19 +163,24 @@ class Target(threading.Thread):
 
 
 class Echo(threading.Thread):
-    """Echo every byte back, for the interactive probe."""
+    """Echo every byte back, for the interactive probes; one thread per connection."""
 
     def __init__(self):
         super().__init__(daemon=True)
-        self.listener = socket.create_server(("127.0.0.1", 0))
+        self.listener = socket.create_server(("127.0.0.1", 0), backlog=64)
         self.address = "127.0.0.1:%d" % self.listener.getsockname()[1]
+
+    @staticmethod
+    def serve(conn):
+        with contextlib.suppress(OSError), conn:
+            while chunk := conn.recv(4096):
+                conn.sendall(chunk)
 
     def run(self):
         with contextlib.suppress(OSError):
-            conn, _ = self.listener.accept()
-            with conn:
-                while chunk := conn.recv(4096):
-                    conn.sendall(chunk)
+            while True:
+                conn, _ = self.listener.accept()
+                threading.Thread(target=self.serve, args=(conn,), daemon=True).start()
 
 
 def rtt_summary(rtts, timeouts=0, error=None):
@@ -259,6 +270,51 @@ class Probe(threading.Thread):
             self.error = repr(error)
 
 
+
+
+class FreshProbe(threading.Thread):
+    """Each attempt: new TCP connection, SOCKS5 CONNECT, one 64-byte echo, close."""
+
+    def __init__(self, proxy, echo, interval, stop, limit=5.0):
+        super().__init__(daemon=True)
+        self.proxy, self.echo, self.interval, self.stop, self.limit = proxy, echo, interval, stop, limit
+        self.attempts = []
+
+    def run(self):
+        host, port = self.proxy.rsplit(":", 1)
+        sequence = 0
+        while not self.stop.is_set():
+            sent = time.monotonic()
+            deadline = sent + self.limit
+            outcome, error = "ok", None
+            try:
+                with socket.create_connection((host, int(port)), timeout=self.limit) as conn:
+                    conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                    socks_connect(conn, self.echo, deadline)
+                    message = struct.pack("!Q", sequence) + bytes(56)
+                    conn.sendall(message)
+                    reply = b""
+                    while len(reply) < len(message):
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            raise socket.timeout("fresh probe deadline")
+                        conn.settimeout(remaining)
+                        chunk = conn.recv(len(message) - len(reply))
+                        if not chunk:
+                            raise RuntimeError("echo closed")
+                        reply += chunk
+                    if reply != message:
+                        raise RuntimeError("echo mismatch")
+            except (OSError, RuntimeError) as failure:
+                outcome = "timeout" if isinstance(failure, socket.timeout) else "error"
+                error = repr(failure)
+            finished = time.monotonic()
+            self.attempts.append({"sequence": sequence, "started_monotonic": sent,
+                                  "finished_monotonic": finished,
+                                  "elapsed_seconds": finished - sent,
+                                  "outcome": outcome, "error": error})
+            sequence += 1
+            self.stop.wait(max(0.0, self.interval - (time.monotonic() - sent)))
 
 
 def socks_connect(conn, address, deadline=None):
@@ -406,7 +462,7 @@ def run(args):
         for target in targets.values():
             target.start()
         target = targets[directions[0]]
-        echo = Echo() if args.probe_interval_ms else None
+        echo = Echo() if args.probe_interval_ms or args.fresh_probe_interval_ms else None
         if echo:
             echo.start()
         server_addr, udp_listen, tcp_listen = free_address(), free_address(), free_address()
@@ -447,10 +503,14 @@ def run(args):
         wait_paths(args.output, len(entrances), client)
         time.sleep(0.5)
         stop = threading.Event()
-        probe = None
-        if echo:
+        probe = fresh = None
+        if args.probe_interval_ms:
             probe = Probe(tcp_listen, echo.address, args.probe_interval_ms / 1000, stop)
             probe.start()
+        if args.fresh_probe_interval_ms:
+            fresh = FreshProbe(tcp_listen, echo.address, args.fresh_probe_interval_ms / 1000, stop)
+            fresh.start()
+        if echo:
             time.sleep(1.0)  # idle baseline before the bulk transfer starts
         control = threading.Lock()
         applied = []
@@ -489,6 +549,8 @@ def run(args):
         stop.set()
         if probe:
             probe.join(10)
+        if fresh:
+            fresh.join(10)
         for target in targets.values():
             target.join(5)
         exact = all(r and r["exact"] for r in results)
@@ -523,6 +585,15 @@ def run(args):
                 "attempts": attempts, "error": probe.error})
             result["probe"] = {"interval_ms": args.probe_interval_ms, "error": probe.error,
                                **{phase: probe_summary(values) for phase, values in phases.items()}}
+        if fresh:
+            phases = probe_phases(fresh.attempts, started, finished)
+            save(args.output / "fresh-probe-attempts.json", {
+                "clock": "monotonic seconds; phase by request start, including boundary completions",
+                "transfer_started_monotonic": started, "transfer_finished_monotonic": finished,
+                "attempts": fresh.attempts})
+            result["fresh_probe"] = {"interval_ms": args.fresh_probe_interval_ms,
+                                     **{phase: probe_summary(values)
+                                        for phase, values in phases.items()}}
         for process in (client, server):
             process.send_signal(2)
         for process in (client, server):
