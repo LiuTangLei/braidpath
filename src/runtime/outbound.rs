@@ -392,17 +392,17 @@ impl ObservationSchedule {
     }
 }
 
-/// Retain one sender timer quantum plus at most one frame's fractional credit.
-/// A fixed two-
-/// datagram bucket otherwise caps a 1 ms wakeup cadence near 19 Mbit/s, even
-/// when the admitted rate is hundreds of Mbit/s. Low-rate/startup credit keeps
-/// its existing byte bound; a rate change never grants tokens by itself.
+/// Retain at most two milliseconds plus one frame's fractional credit.
+/// A nominal 1 ms timer can wake slightly late: retaining exactly 1 ms loses
+/// earned bytes at every such wakeup, even with continuous demand. This small
+/// bound serves up to 2 ms scheduling intervals without unbounded catch-up.
+/// Startup remains bounded; changing a rate never creates tokens.
 pub(super) fn pacing_burst_bytes(rate_bps: u64, minimum_bytes: usize) -> f64 {
     // Maximum repair symbol, feedback header, HTTP mapping and admission cost.
     // The remainder lets a packet that did not fit the previous quantum carry
     // its earned bytes forward instead of rounding every wakeup down to packets.
     let frame_remainder = super::wire::MAX_WIRE + super::quality::HEADER + 9 + 80;
-    (minimum_bytes as f64).max(rate_bps.div_ceil(8000) as f64 + frame_remainder as f64)
+    (minimum_bytes as f64).max(rate_bps.div_ceil(4000) as f64 + frame_remainder as f64)
 }
 
 pub struct Pacer {
@@ -585,18 +585,18 @@ mod tests {
     fn high_rate_credit_remains_bounded_and_rate_changes_grant_no_tokens() {
         let mut pacer = Pacer::for_sender(400_000_000, 2400);
         pacer.refill(1_000_000);
-        assert!(pacer.available(51_144));
+        assert!(pacer.available(101_144));
         assert!(
-            !pacer.available(51_145),
-            "one millisecond plus one frame survives idle"
+            !pacer.available(101_145),
+            "two milliseconds plus one frame is the hard idle bound"
         );
         pacer.set_rate(1_000_000, 8_000_000);
-        assert!(pacer.available(2400));
+        assert!(pacer.available(3144));
         assert!(
-            !pacer.available(2401),
-            "lower rate restores the small bound"
+            !pacer.available(3145),
+            "lower rate restores its two-millisecond bound"
         );
-        pacer.spend(2400);
+        pacer.spend(3144);
         pacer.set_rate(1_000_000, 400_000_000);
         assert!(!pacer.available(1), "raising a rate creates no credit");
         pacer.refill(1_001_000);
@@ -610,6 +610,42 @@ mod tests {
         probe.refill(2_000_000);
         assert!(probe.available(2178));
         assert!(!probe.available(2179));
+    }
+
+    #[test]
+    fn sender_pacers_keep_the_rate_when_a_one_ms_timer_wakes_slightly_late() {
+        const COST: usize = 1135;
+        for rate in [80_000_000, 8_000_000, 20_000_000, 400_000_000] {
+            for cadence in [1000, 1100, 1200, 1500, 2000] {
+                let mut aggregate = Pacer::for_sender(rate, 2400);
+                let mut group = Pacer::for_sender(rate, 2400);
+                let mut business = BusinessPacer::new(rate, [rate; MAX_PATHS], 2400);
+                business.update(0, [(0, rate)]);
+                business.spend(0, 2400);
+                let mut admitted = 0u64;
+                for tick in 1..=100 {
+                    let now = tick * cadence;
+                    aggregate.refill(now);
+                    group.refill(now);
+                    business.update(now, [(0, rate)]);
+                    while aggregate.available(COST)
+                        && group.available(COST)
+                        && business.available(0, COST)
+                    {
+                        aggregate.spend(COST);
+                        group.spend(COST);
+                        business.spend(0, COST);
+                        admitted += COST as u64;
+                    }
+                }
+                let earned = rate * (100 * cadence) / 8_000_000;
+                assert!(
+                    admitted >= earned * 95 / 100,
+                    "rate={rate}, cadence={cadence}: {admitted}/{earned}"
+                );
+                assert!(admitted <= earned, "timer lateness creates no extra credit");
+            }
+        }
     }
 
     #[test]

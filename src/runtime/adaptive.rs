@@ -4901,6 +4901,33 @@ mod tests {
         assert!(!controller.allow(1_001, 51, 0.0));
     }
 
+    #[test]
+    fn path_pacing_keeps_the_rate_when_a_one_ms_timer_wakes_slightly_late() {
+        const COST: usize = 1135;
+        for rate in [80_000_000, 8_000_000, 20_000_000, 400_000_000] {
+            for cadence in [1000, 1100, 1200, 1500, 2000] {
+                let mut controller = PathController::new(rate, 20);
+                controller.rate_bps = rate;
+                // The measured window starts after startup credit is spent.
+                controller.tokens = 0.0;
+                let mut admitted = 0u64;
+                for tick in 1..=100 {
+                    let now = tick * cadence;
+                    while controller.allow(now, COST, 0.0) {
+                        controller.admitted(now, COST);
+                        admitted += COST as u64;
+                    }
+                }
+                let earned = rate * (100 * cadence) / 8_000_000;
+                assert!(
+                    admitted >= earned * 95 / 100,
+                    "rate={rate}, cadence={cadence}: {admitted}/{earned}"
+                );
+                assert!(admitted <= earned);
+            }
+        }
+    }
+
     fn observation(now_us: u64, rtt_ms: f64) -> Observation {
         Observation {
             now_us,
