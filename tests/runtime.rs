@@ -105,8 +105,9 @@ fn launch(args: &[String], dir: &Path, name: &str) -> Process {
         // Each fixture has several independent async runtimes. Giving every
         // subprocess all runner cores oversubscribes the host and can fill the
         // bounded UDP queue before QUIC gets CPU time. Keep the same packets,
-        // pacing, queue limits and assertions with one worker per test node.
-        .env("TOKIO_WORKER_THREADS", "1")
+        // pacing, queue limits and assertions. Two workers also let QUIC's
+        // driver progress while the sender handles a ready ingress burst.
+        .env("TOKIO_WORKER_THREADS", "2")
         .args(args)
         .stdout(Stdio::null())
         .stderr(file)
