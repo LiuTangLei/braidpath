@@ -49,6 +49,10 @@ On Linux, repeat `--interface eth0 --interface wlan0` to create the interface–
 
 ## Policy and limits
 
+Normal use needs no FEC option: automatic protection is already enabled and can
+select zero bulk repair on a clean link. `--fec K` overrides that policy for fixed
+coding, older-peer compatibility or controlled diagnostics; `--fec 0` disables it.
+
 | Option or bound | Meaning |
 | --- | --- |
 | `--fec auto` (default), `--fec K` | [Automatic loss adaptation](automatic-fec.md) from no repair through 4+1; numeric K fixes K+1 (0 disables, maximum K=32) |
@@ -384,7 +388,7 @@ this applies to UDP records and streams alike, in every mode.
 
 Generation numbers increase within the authenticated session. The server keeps one highest admitted generation per path, rejecting replay or regression without an expanding history. Old-handler cleanup cannot remove its replacement. During a short all-path outage, session and record identity remain intact. If the server has expired its empty session or restarted, it rejects rejoin explicitly; the client then creates a fresh session ID and resets that epoch's flow/record state while retaining the local UDP listener. This is an explicit new epoch, not replay of already delivered records or reliable delivery across the outage.
 
-Paired fixed-load observations, availability failures, port histories and unconditional latency must be reported before considering a default change. Multi-interface capacity, shared-bottleneck competition, long-running field behavior and deployment reachability remain separate acceptance gates. Automatic bottleneck detection, coupled congestion control, adaptive FEC and multi-erasure coding remain deferred.
+Paired fixed-load observations, availability failures, port histories and unconditional latency must be reported before considering a default change. Multi-interface capacity, shared-bottleneck competition, long-running field behavior and deployment reachability remain separate acceptance gates. Automatic FEC is implemented and enabled by default; automatic bottleneck detection, coupled congestion control and Reed–Solomon/sliding-window coding remain deferred.
 
 A measured drain restoration requires both receiver and local admission intervals of at least 500 ms and at least eight actual admitted symbols. A fresh disjoint sample lacking either admission floor does not hide a newer qualifying paired interval. The existing post-brake, unchanged-pace, continuous-backlog and young unused reply checks apply to that interval too. Before a complete post-brake interval exists, fresh cross-brake drainage can hold the first speculative step for at most the existing three-second horizon. No average packet size substitutes for actual admissions.
 

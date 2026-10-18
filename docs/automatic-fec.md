@@ -1,6 +1,7 @@
 # Automatic sender FEC
 
-The client defaults to `--fec auto`. Both directions adapt independently using
+Automatic FEC is the normal client behavior; no enable switch or `--fec` argument
+is needed. `--fec auto` names that existing default. Both directions adapt independently using
 authenticated receiver reports of symbol loss **before** FEC reconstruction.
 Feedback is enabled automatically; adaptive path pacing still requires
 `--adaptive`. Explicit `--fec 0` disables ordinary FEC, and numeric `--fec K`
