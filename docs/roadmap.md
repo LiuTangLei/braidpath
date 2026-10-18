@@ -61,6 +61,7 @@ Current protocol, commands and limits: [experimental runtime](runtime.md). Check
 ## M3 — Budgeted recovery and measured scheduling
 
 - [x] Enforce bounded repair credit on actually admitted original HTTP-datagram bytes; pre-admission expiry cannot mint credit, and repairs prefer another eligible path when available.
+- [x] Adapt ordinary FEC from no repair through 32+1, 16+1 and 8+1 to 4+1 from authenticated finalized loss; separately bound short-record/ACK protection and short-tail probes.
 - [x] Preserve each original's local ingress deadline across input/symbol queues, use local age alone at adaptive admission, bound per-flow/repair queues, and separate receiver repair waiting from unseen-original validity.
 - [x] Add an opt-in per-path adaptive operational allowance with current local RTT, finalized interval loss, receiver byte rates and actual-admission accounting; growth requires an exercised allowance and application-limited samples do not become capacity ceilings.
 - [x] Keep fresh paths eligible during ordinary congestion, retain learned pace across same-generation stale intervals, and use bounded recovery trials followed by lower-gain exploration near retained delivery; a new generation resets its controller.
@@ -79,7 +80,7 @@ Current protocol, commands and limits: [experimental runtime](runtime.md). Check
 
 **Boundary:** lower mean RTT or a higher FEC recovery count alone does not establish lower application tail latency. The 20 ms local sender target is separate from the prospective mixed-flow 100 ms application round-trip screen: at least 95% on-time delivery in clean/recovered windows, 90% in the impaired window including transition, and 90% of matched-baseline target goodput in clean/recovered windows. This validation objective is not a hard cross-host SLA or an acceptance result.
 
-**Current increment:** adaptive mode is experimental and opt-in. Round robin, XOR block size 4, 3 ms block closing and the existing 30% repair setting remain unchanged defaults. The source implements the mechanisms above; no sustained WAN, capacity-aggregation or deployment result is implied by a checked implementation item.
+**Current increment:** adaptive mode is experimental and opt-in. Round robin, 3 ms block closing and the 30% ordinary repair budget remain defaults. Default `--fec auto` begins bulk traffic without repair and selects strength from qualified loss; short records and ACKs have independent bounded protection. Numeric FEC remains fixed. See [automatic FEC](automatic-fec.md). The source implements these mechanisms; no sustained WAN, capacity-aggregation or deployment result is implied by a checked implementation item.
 
 ## M4 — Reliable flows and application adapters
 
@@ -92,7 +93,10 @@ Current protocol, commands and limits: [experimental runtime](runtime.md). Check
 - [x] SOCKS5 UDP ASSOCIATE over datagram flows (datagrams up to the record payload; no fragmentation).
 - [x] Third-party client interoperability on loopback: mihomo, sing-box and Xray through SOCKS5 (TCP, names, UDP) and HTTP CONNECT outbounds ([method](reliable-streams.md#client-interoperability)).
 - [x] Faster path-outage exclusion from QUIC acknowledgment silence, and a latency class for small records and latency-bound streams ([scheduling](reliable-streams.md#scheduling)); emulated-link evidence only.
+- [x] Add upload/download and simultaneous duplex collection, all-requested-path readiness, per-direction integrity/goodput and timestamped probe outcomes, including failures and phase-boundary completions.
 - [ ] Compare FEC with the no-FEC reliable baseline; verify bytes, completion, timeout rates and latency under bulk/interactive coexistence.
+
+**Next increment:** complete matched upload, download and duplex comparisons with bulk/interactive coexistence before M5 operational integration. The collector is implemented; short loopback windows and sequential natural-loss downloads do not complete the bidirectional, sustained or deployment gates. Closed-loop echo percentiles cover attempted requests, not an independently offered fixed-rate population.
 
 **Exit gate:** reliable-stream correctness and the selected latency/goodput targets pass. A UDP delivery metric cannot substitute for this gate.
 

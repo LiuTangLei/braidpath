@@ -1,7 +1,7 @@
 # BraidPath
 
 大吞吐 `main` 已加入可选的[双独立修复](docs/independent-fec.md)：在显式混合 FEC
-模式下使用 `--fec 16 --fec-repairs 2`。原有单修复默认值不变；该能力不代表已经
+模式下使用 `--fec 16 --fec-repairs 2`。默认使用按丢包调整的单修复 FEC；该能力不代表已经
 通过公网性能或可靠交付验收。
 
 **Weave paths. Repair loss. Keep latency in check.**
@@ -15,7 +15,7 @@ BraidPath 是一个从零构建的 Rust 多路径传输项目，结合 **前向�
 
 “Braid” 是编织：把多条不完美的路径编成一条更稳定的连接。
 
-> **当前阶段：可运行的实验性 UDP 与 TCP 隧道。** 已实现客户端、主服务器、固定目标中继、真正的 HTTP/3 与 HTTP Datagrams。可选的 `--tcp-listen`/`--tcp-target` 把每条 TCP 连接作为一条可靠流，同时使用所有路径；`--proxy-listen`/`--proxy` 为 SOCKS5 与 HTTP CONNECT 客户端提供同样的承载（见[可靠流](docs/reliable-streams.md)）。可选的 `--adaptive` 增加逐路径调速、独立健康探测、按本地入口时间准入和有界故障重连。这些机制已实现，长期公网收益与部署验收尚未完成；默认仍使用轮询和原有 XOR 参数。
+> **当前阶段：可运行的实验性 UDP 与 TCP 隧道。** 已实现客户端、主服务器、固定目标中继、真正的 HTTP/3 与 HTTP Datagrams。可选的 `--tcp-listen`/`--tcp-target` 把每条 TCP 连接作为一条可靠流，同时使用所有路径；`--proxy-listen`/`--proxy` 为 SOCKS5 与 HTTP CONNECT 客户端提供同样的承载（见[可靠流](docs/reliable-streams.md)）。可选的 `--adaptive` 增加逐路径调速、独立健康探测、按本地入口时间准入和有界故障重连。这些机制已实现，长期公网收益与部署验收尚未完成；默认仍使用轮询，FEC 从关闭到 4+1 动态调整，小记录使用独立、有界的保护预算。
 
 ## 一张网卡可以用，多张网卡可以聚合
 

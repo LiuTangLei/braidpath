@@ -204,6 +204,37 @@ to the emulator, for example `--event '2:{"path":0,"down":true}'` to take a path
 (both queued and new packets are dropped). Each result reports the largest gap
 between received bytes.
 
+`--direction both --entrance socks5` starts N uploads and N downloads in the same
+session (at most 16 per direction), each against its own target. `--bytes` applies
+to each connection. `by_direction` verifies each direction separately and reports
+its goodput over the same complete workload wall interval; total goodput is their
+sum. `capacity_mbps_per_direction` is the emulated path sum, and
+`used_capacity_mbps` is twice that sum for duplex. Each direction still has its
+own runtime rate cap. Duplex totals must not be compared with a single-direction
+capacity denominator. Every requested path must authenticate in one session before
+the workload starts; `path-ready.json` retains that evidence.
+
+Probes are closed-loop, with one request outstanding and a minimum interval;
+they do not maintain a fixed offered request rate under delay. Each attempt's
+start, completion and outcome are retained in `probe-attempts.json`. A request
+belongs to the phase where it started, even when it completes after the bulk
+transfer or tail observation ends. `p99_ms` describes successful requests;
+`attempts`, `failed`, `timeouts` and `p99_all_outcomes_ms_lower_bound` also retain
+failed requests. `p99_is_censored` marks failures whose eventual successful
+completion time is unknown. A setup failure is retained as `probe.error` even
+when no echo request started. A failed stream remains a failed connection in the
+summary instead of disappearing as a worker-thread exception. Transfer progress
+cannot extend its configured deadline. The summary is diagnostic evidence, not
+full-population deadline or statistical performance acceptance.
+
+```bash
+python3 -m bench.tcp_lab --binary target/release/braidpath \
+  --lab-binary target/release/examples/link_lab --output local/tcp-lab/duplex \
+  --path 50:15 --path 50:15 --entrance socks5 --direction both \
+  --connections 1 --bytes 33554432 --probe-interval-ms 20 \
+  --client-arg=--adaptive --client-arg=--rate-bps --client-arg=30000000
+```
+
 Results stay under `local/`. Loopback shares one host, CPU and kernel; an emulated
 result is not a WAN, independent-capacity or deployment acceptance result.
 

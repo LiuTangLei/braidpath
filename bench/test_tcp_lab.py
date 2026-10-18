@@ -4,8 +4,10 @@ import io
 import socket
 import threading
 import unittest
+from unittest.mock import MagicMock, patch
 
-from bench.tcp_lab import ROOT, Target, parse_args, payload, socks_connect, transfer
+from bench.tcp_lab import (ROOT, Target, parse_args, paths_ready, payload, probe_phases,
+                           probe_summary, socks_connect, transfer)
 
 
 def args(*extra, output="local/tcp-lab/test"):
@@ -27,8 +29,67 @@ class Arguments(unittest.TestCase):
                 with self.assertRaises(SystemExit):
                     args(*extra, output=output)
 
+    def test_duplex_requires_addressed_streams_and_keeps_total_connections_bounded(self):
+        both = args("--direction", "both", "--entrance", "socks5", "--connections", "16")
+        self.assertEqual(both.direction, "both")
+        for extra in [("--direction", "both"),
+                      ("--direction", "both", "--entrance", "socks5", "--connections", "17"),
+                      ("--timeout-seconds", "0"), ("--timeout-seconds", "nan"),
+                      ("--timeout-seconds", "601")]:
+            with self.subTest(extra=extra), contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit):
+                    args(*extra)
+
+
+class ProbeOutcomes(unittest.TestCase):
+    def test_workload_requires_all_live_paths_in_one_session(self):
+        def path(number, session="one", closed=False):
+            return {"path_id": number, "session_id": session, "authenticated": True,
+                    "quinn": {"closed": closed}}
+        def snapshot(*paths):
+            return {"stats": {"paths": dict(enumerate(paths))}}
+        self.assertFalse(paths_ready(None, 2))
+        self.assertFalse(paths_ready(snapshot(path(0)), 2))
+        self.assertFalse(paths_ready(snapshot(path(0), path(1, closed=True)), 2))
+        self.assertFalse(paths_ready(snapshot(path(0), path(1, session="other")), 2))
+        self.assertTrue(paths_ready(snapshot(path(0), path(1)), 2))
+
+    def test_timeouts_remain_in_the_outcome_population(self):
+        attempts = [{"elapsed_seconds": .05, "outcome": "ok", "error": None},
+                    {"elapsed_seconds": 5, "outcome": "timeout", "error": "timed out"}]
+        result = probe_summary(attempts)
+        self.assertEqual(result["p99_ms"], 50)
+        self.assertEqual(result["p99_all_outcomes_ms_lower_bound"], 5000)
+        self.assertEqual((result["attempts"], result["count"], result["failed"], result["timeouts"]),
+                         (2, 1, 1, 1))
+        self.assertTrue(result["p99_is_censored"])
+
+    def test_cross_boundary_completion_belongs_to_request_start_phase(self):
+        attempts = [{"started_monotonic": 9, "finished_monotonic": 11},
+                    {"started_monotonic": 10, "finished_monotonic": 25},
+                    {"started_monotonic": 20, "finished_monotonic": 21}]
+        phases = probe_phases(attempts, 10, 20)
+        self.assertEqual(phases, {"idle": attempts[:1], "during_transfer": attempts[1:2],
+                                  "after_transfer": attempts[2:]})
+
+    def test_empty_window_has_no_percentile(self):
+        result = probe_summary([])
+        self.assertEqual(result["attempts"], 0)
+        self.assertIsNone(result["p99_ms"])
+        self.assertIsNone(result["p99_all_outcomes_ms_lower_bound"])
+
 
 class Transfer(unittest.TestCase):
+    def test_progress_does_not_extend_the_transfer_deadline(self):
+        conn = MagicMock()
+        conn.__enter__.return_value = conn
+        conn.recv.return_value = b"x"
+        with patch("bench.tcp_lab.socket.create_connection", return_value=conn), \
+             patch("bench.tcp_lab.time.monotonic", side_effect=[0, .25, .5, 1.25]):
+            with self.assertRaises(socket.timeout):
+                transfer("127.0.0.1:1", "down", b"xx", 1)
+        self.assertEqual(conn.recv.call_count, 1)
+
     def test_payload_is_seeded(self):
         self.assertEqual(payload(1024, 7), payload(1024, 7))
         self.assertNotEqual(payload(1024, 7), payload(1024, 8))
@@ -64,6 +125,34 @@ class Transfer(unittest.TestCase):
         thread.join()
         listener.close()
         self.assertEqual(seen, [b"\x05\x01\x00", b"\x05\x01\x00\x01\x0a\x01\x02\x03\x12\x34"])
+
+    def test_socks_replies_can_be_split_across_tcp_reads(self):
+        conn = MagicMock()
+        conn.recv.side_effect = [b"\x05", b"\x00", b"\x05\x00\x00\x01", bytes(6)]
+        socks_connect(conn, "127.0.0.1:8080")
+        self.assertEqual(conn.recv.call_count, 4)
+
+    def test_opposing_transfers_have_independent_targets_and_integrity(self):
+        data = payload(300_000, 13)
+        targets = {direction: Target(direction, data) for direction in ("up", "down")}
+        results = {}
+        for target in targets.values():
+            target.start()
+
+        def one(direction):
+            results[direction] = transfer(targets[direction].address, direction, data, 5)
+        workers = [threading.Thread(target=one, args=(direction,)) for direction in targets]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join(6)
+            self.assertFalse(worker.is_alive())
+        for direction, target in targets.items():
+            target.join(5)
+            target.listener.close()
+            self.assertIsNone(target.error)
+            self.assertTrue(results[direction]["exact"])
+            self.assertEqual(results[direction]["received_bytes"], len(data))
 
     def test_truncated_download_is_not_exact(self):
         data = payload(100_000, 4)

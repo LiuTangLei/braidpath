@@ -16,7 +16,7 @@ BraidPath is a Rust multipath transport project combining **forward error correc
 
 “Braid” means weaving several imperfect paths into a more resilient connection.
 
-> **Status: experimental UDP and TCP tunnel.** The client, main server and fixed-target relays run over real HTTP/3 and HTTP Datagrams. Opt-in `--tcp-listen`/`--tcp-target` carries each TCP connection as one reliable stream across every path, and `--proxy-listen`/`--proxy` does the same for SOCKS5 and HTTP CONNECT clients ([reliable streams](docs/reliable-streams.md)). Opt-in `--adaptive` adds per-path pacing, independent health probes, sender-age admission and bounded outage recovery. These mechanisms are implemented; sustained WAN benefit and deployment readiness are not established. Round robin and the existing XOR settings remain the defaults.
+> **Status: experimental UDP and TCP tunnel.** The client, main server and fixed-target relays run over real HTTP/3 and HTTP Datagrams. Opt-in `--tcp-listen`/`--tcp-target` carries each TCP connection as one reliable stream across every path, and `--proxy-listen`/`--proxy` does the same for SOCKS5 and HTTP CONNECT clients ([reliable streams](docs/reliable-streams.md)). Opt-in `--adaptive` adds per-path pacing, independent health probes, sender-age admission and bounded outage recovery. These mechanisms are implemented; sustained WAN benefit and deployment readiness are not established. Round robin remains the default scheduler; default FEC adapts from no repair to 4+1 with separate bounded short-record protection.
 
 ## One interface works. Several can contribute.
 
@@ -86,7 +86,7 @@ Follow the [runtime guide](docs/runtime.md) for credentials, local forwarding, m
 | HTTP/3 website, verified server identity, authenticated session joins | Implemented experimental profile |
 | Bidirectional FEC, session deduplication, UDP forwarding | Implemented; messages up to 1,000 bytes |
 | Fixed-target opaque relays with source allowlists | Implemented |
-| Interface × entrance paths | Linux interface binding; default-route sockets on other platforms |
+| Interface × entrance paths | Explicit Linux/macOS interface binding; default-route sockets on other platforms |
 | Round robin and optional quality-weighted scheduling | Implemented baselines; weighted service is charged on actual admitted bytes |
 | Per-flow queues, original-ingress deadlines, admission-based repair credit | Implemented bounded mechanisms |
 | Adaptive pacing, sender-age admission, idle health probes and feedback v2 | Implemented opt-in mode; performance acceptance pending |
