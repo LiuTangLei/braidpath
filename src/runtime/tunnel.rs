@@ -528,6 +528,8 @@ struct BlockSend {
     locally_rejected_originals: u32,
     small_repair_limit: usize,
     small_repair_reserved: usize,
+    /// The block's original is a reliable-stream acknowledgment.
+    acknowledgment: bool,
 }
 
 fn repair_locally_unrecoverable(
@@ -686,6 +688,7 @@ fn enqueue_coded_symbol(
                 locally_rejected_originals: 0,
                 small_repair_limit: 0,
                 small_repair_reserved: 0,
+                acknowledgment: false,
             })
             .created
             .min(created)
@@ -704,6 +707,14 @@ fn enqueue_coded_symbol(
         block_created
     };
     let flow = record.map(|(flow, _)| flow);
+    if let Some(block) = block
+        && flow.is_some_and(stream::is_ack_flow)
+    {
+        blocks
+            .get_mut(&block)
+            .expect("block inserted")
+            .acknowledgment = true;
+    }
     metrics.update(|d| {
         if let Some(id) = record_id {
             d.symbols.originals_generated += 1;
@@ -865,11 +876,19 @@ fn repair_allowed(
             .is_some_and(|meta| {
                 meta.paths != 0
                     && (!policy.split_fec() || meta.small_repair_reserved >= frame_bytes)
-                    && budget.small_can_repair(frame_bytes)
+                    && budget.small_can_repair(frame_bytes + small_copy_reserve(meta))
             })
     } else {
         budget.can_repair(frame_bytes)
     }
+}
+
+/// A bulk download acknowledges continuously: its acknowledgment copies alone
+/// can exhaust the small-copy rate, and each is superseded by the next one.
+/// They spend only credit above one datagram, which stays available for the
+/// first records of new and interactive streams.
+fn small_copy_reserve(meta: &BlockSend) -> usize {
+    if meta.acknowledgment { 1200 } else { 0 }
 }
 
 fn repair_frame_floor(policy: &Policy, pending: &outbound::Pending) -> usize {

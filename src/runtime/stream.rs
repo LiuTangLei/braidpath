@@ -27,6 +27,8 @@ pub const MAX_WINDOW: u64 = 8 * 1024 * 1024;
 const MAX_OFFSET: u64 = 1 << 62;
 const ACK_HEADER: usize = 26;
 const MAX_RANGES: usize = 64;
+/// Recently stored out-of-order offsets the next acknowledgments describe first.
+const RECENT_RANGES: usize = 2 * MAX_RANGES;
 const ACK_EVERY: u32 = 16;
 const ACK_DELAY: Duration = Duration::from_millis(2);
 const INITIAL_RTT: Duration = Duration::from_millis(250);
@@ -48,6 +50,10 @@ pub fn data_flow(id: u32) -> u32 {
 }
 pub fn ack_flow(id: u32) -> u32 {
     STREAM_FLAG | ACK_FLAG | id
+}
+/// Whether a stream-lane record carries acknowledgments.
+pub fn is_ack_flow(flow: u32) -> bool {
+    flow & (STREAM_FLAG | ACK_FLAG) == STREAM_FLAG | ACK_FLAG
 }
 /// The stream identifier of a stream-lane record, if it is one.
 pub fn stream_id(flow: u32) -> Option<u32> {
@@ -234,8 +240,15 @@ impl Rtt {
         }
     }
     fn observed_high(&self) -> Option<Duration> {
-        self.smoothed
-            .map(|s| self.high[0].max(self.high[1]).max(s + 4 * self.variation))
+        self.observed_max()
+            .zip(self.smoothed)
+            .map(|(high, s)| high.max(s + 4 * self.variation))
+    }
+    /// The largest sample of the two recent windows, without the variance
+    /// bound. The first sample's variance is half the RTT, so the bound
+    /// alone would make a new stream wait three RTTs.
+    fn observed_max(&self) -> Option<Duration> {
+        self.smoothed.map(|_| self.high[0].max(self.high[1]))
     }
 
     /// The windowed maximum, or the variance bound while few samples exist.
@@ -411,11 +424,12 @@ impl Sender {
         if path == UNKNOWN_PATH {
             return self.threshold(now);
         }
-        // QUIC already measured this route before stream admission. A slow
-        // unrelated route must not delay loss recovery here. Stream samples
-        // additionally cover the ACK's return route and receiver scheduling.
+        // QUIC already measured this route before stream admission, including
+        // its variance. A slow unrelated route must not delay loss recovery
+        // here. Stream samples additionally cover the ACK's return route and
+        // receiver scheduling.
         self.transport_rtt[path]
-            .max(self.path_rtt[path].observed_high().unwrap_or_default())
+            .max(self.path_rtt[path].observed_max().unwrap_or_default())
             .mul_f64(self.reorder)
             + Duration::from_millis(2)
     }
@@ -709,7 +723,7 @@ impl Sender {
             return None;
         }
         let rtt = self.transport_rtt[s.path]
-            .max(self.path_rtt[s.path].observed_high().unwrap_or_default());
+            .max(self.path_rtt[s.path].observed_max().unwrap_or_default());
         Some((
             s.sent_at + (rtt.mul_f64(1.125) + ACK_DELAY).min(MAX_PTO),
             start,
@@ -789,6 +803,7 @@ pub enum Violation {
 pub struct Receiver {
     cumulative: u64,
     ranges: BTreeMap<u64, Vec<u8>>,
+    recent: VecDeque<u64>,
     out_of_order: u64,
     final_size: Option<u64>,
     consumed: u64,
@@ -803,6 +818,7 @@ impl Default for Receiver {
         Self {
             cumulative: 0,
             ranges: BTreeMap::new(),
+            recent: VecDeque::new(),
             out_of_order: 0,
             final_size: None,
             consumed: 0,
@@ -869,6 +885,10 @@ impl Receiver {
             } else {
                 self.out_of_order += piece.len() as u64;
                 self.ranges.insert(start, piece);
+                if self.recent.len() == RECENT_RANGES {
+                    self.recent.pop_front();
+                }
+                self.recent.push_back(start);
             }
             start = gap_end;
         }
@@ -942,15 +962,37 @@ impl Receiver {
         let mut ranges: Vec<(u64, u64)> = Vec::new();
         for (start, data) in &self.ranges {
             let end = start + data.len() as u64;
-            if let Some(last) = ranges.last_mut()
-                && last.1 == *start
-            {
-                last.1 = end;
-            } else if ranges.len() == MAX_RANGES {
-                break;
-            } else {
-                ranges.push((*start, end));
+            match ranges.last_mut() {
+                Some(last) if last.1 == *start => last.1 = end,
+                _ => ranges.push((*start, end)),
             }
+        }
+        if ranges.len() > MAX_RANGES {
+            // Sustained loss can leave more holes than one frame describes.
+            // As with TCP SACK, describe the most recently received data
+            // first: a repair that fills an old hole, then the newest data.
+            // The sender forgets a range once acknowledged, so a range only
+            // needs to appear until one acknowledgment carrying it arrives.
+            let mut chosen = vec![false; ranges.len()];
+            let mut count = 0;
+            let recent = self.recent.iter().rev().filter_map(|offset| {
+                let i = ranges.partition_point(|r| r.0 <= *offset).checked_sub(1)?;
+                (*offset < ranges[i].1).then_some(i)
+            });
+            for i in recent.chain((0..ranges.len()).rev()) {
+                if count == MAX_RANGES {
+                    break;
+                }
+                if !chosen[i] {
+                    chosen[i] = true;
+                    count += 1;
+                }
+            }
+            let mut i = 0;
+            ranges.retain(|_| {
+                i += 1;
+                chosen[i - 1]
+            });
         }
         Some(Ack {
             cumulative: self.cumulative + u64::from(self.fin_received()),
@@ -1030,6 +1072,38 @@ mod tests {
         let t = s.poll_transmit(at).unwrap();
         s.admitted(t.start, t.transmission, 0, Duration::from_millis(50), at);
         assert!(s.tail_probe_deadline().is_some());
+    }
+
+    #[test]
+    fn a_new_stream_probes_its_lost_tail_after_one_measured_rtt() {
+        let now = Instant::now();
+        let mut s = Sender::new(false);
+        // A destination header, then the first request bytes.
+        s.push(&[1; 7]);
+        let header = s.poll_transmit(now).unwrap();
+        s.push(&[2; 64]);
+        let request = s.poll_transmit(now).unwrap();
+        for t in [&header, &request] {
+            s.admitted(t.start, t.transmission, 0, Duration::from_millis(70), now);
+        }
+        // Only the header arrives; its acknowledgment is the stream's first sample.
+        let at = now + Duration::from_millis(73);
+        let ack = Ack {
+            cumulative: 7,
+            limit: INITIAL_WINDOW,
+            duplicate_bytes: 0,
+            ranges: Vec::new(),
+        };
+        s.on_ack(&ack, at).unwrap();
+        let (probe_at, start) = s.tail_probe_deadline().unwrap();
+        assert_eq!(start, 7);
+        assert!(
+            probe_at <= now + Duration::from_millis(90),
+            "{:?}",
+            probe_at - now
+        );
+        let loss_at = s.next_deadline(at).unwrap();
+        assert!(loss_at <= now + Duration::from_millis(90));
     }
 
     #[test]
@@ -1409,6 +1483,68 @@ mod tests {
         let (released, spurious) = sender.on_ack(&ack, deadline).unwrap();
         assert_eq!((released, spurious), (4 * MAX_SEGMENT as u64, true));
         assert!(sender.threshold(deadline) > before);
+    }
+
+    #[test]
+    fn holes_beyond_one_frame_acknowledge_the_newest_data() {
+        let t0 = Instant::now();
+        let count = 2 * (MAX_RANGES + 10);
+        let mut sender = Sender::new(false);
+        sender.push(&vec![5; count * MAX_SEGMENT]);
+        let segments: Vec<_> = (0..count)
+            .map(|_| sender.poll_transmit(t0).unwrap())
+            .collect();
+        let mut receiver = Receiver::default();
+        let at = t0 + Duration::from_millis(20);
+        // Every even segment is lost: one hole below each received segment.
+        for t in segments.iter().skip(1).step_by(2) {
+            let (offset, fin, bytes) = data(&t.frame);
+            receiver.on_data(offset, fin, bytes, at).unwrap();
+        }
+        let ack = receiver.take_ack(at + ACK_DELAY, INITIAL_WINDOW).unwrap();
+        assert_eq!(ack.ranges.len(), MAX_RANGES);
+        assert_eq!(
+            ack.ranges.last().unwrap().1,
+            (count * MAX_SEGMENT) as u64,
+            "the newest range is reported"
+        );
+        assert_eq!(
+            Frame::decode(&Frame::Ack(ack.clone()).encode()),
+            Some(Frame::Ack(ack.clone()))
+        );
+        sender.on_ack(&ack, at).unwrap();
+        let deadline = sender.next_deadline(at).unwrap();
+        sender.on_timeout(deadline);
+        let mut repaired = Vec::new();
+        while let Some(t) = sender.poll_transmit(deadline) {
+            repaired.push(data(&t.frame).0 / MAX_SEGMENT as u64);
+        }
+        // The oldest received data was carried by earlier acknowledgments in a
+        // real flow; here it stays unreported and may repeat. Nothing in the
+        // reported ranges does.
+        let unreported = (count - 2 * MAX_RANGES) as u64;
+        assert!(
+            repaired.iter().all(|i| i % 2 == 0 || *i < unreported),
+            "{repaired:?}"
+        );
+        assert!(repaired.contains(&(count as u64 - 2)));
+
+        // A repair of an old hole is the most recent arrival and is described
+        // although more than one frame of newer ranges lies above it.
+        let (offset, fin, bytes) = data(&segments[2].frame);
+        receiver.on_data(offset, fin, bytes, deadline).unwrap();
+        let ack = receiver
+            .take_ack(deadline + ACK_DELAY, INITIAL_WINDOW)
+            .unwrap();
+        assert_eq!(ack.ranges.len(), MAX_RANGES);
+        let segment = MAX_SEGMENT as u64;
+        assert!(
+            ack.ranges.contains(&(segment, 4 * segment)),
+            "{:?}",
+            ack.ranges[0]
+        );
+        assert_eq!(ack.ranges.last().unwrap().1, count as u64 * segment);
+        assert!(ack.ranges.windows(2).all(|w| w[0].1 < w[1].0));
     }
 
     #[test]

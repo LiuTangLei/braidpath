@@ -548,6 +548,47 @@ mod tests {
         );
     }
 
+    #[test]
+    fn acknowledgment_copies_leave_small_copy_credit_for_stream_data() {
+        let mut p = policy(super::super::super::automatic_fec::AUTO, 0, false);
+        p.receiver_feedback = true;
+        let now = Instant::now();
+        let mut e = RecordEncoder::new(&p).unwrap();
+        e.set_fec(4).unwrap();
+        let mut queue = outbound::Queue::default();
+        let mut blocks = BTreeMap::new();
+        let metrics = stats::Metrics::new("client").scope("ack-reserve", stats::FORWARD);
+        let mut budget = outbound::RepairBudget::new(30);
+        budget.enable_small_rate(1_000_000);
+        budget.refill_small(1_000_000);
+        // Earlier acknowledgment copies spent most of the burst.
+        budget.small_repair_admitted(1320);
+        let mut copies = Vec::new();
+        for (id, flow) in [
+            (1, crate::runtime::stream::ack_flow(5)),
+            (2, crate::runtime::stream::data_flow(6)),
+        ] {
+            let record = Record {
+                flow,
+                id,
+                payload: vec![0; 64],
+            };
+            for s in e.encode(&record, now).unwrap() {
+                enqueue_encoded(s, now, &mut queue, &mut blocks, &p, &metrics);
+            }
+            let original = queue.pop(false).unwrap();
+            budget_admitted(&p, &mut budget, &mut blocks, &original, 94, &metrics);
+            blocks.get_mut(&original.block.unwrap()).unwrap().paths = 1;
+            copies.push(queue.pop(true).unwrap());
+            while queue.pop(true).is_some() {}
+        }
+        let [ack, data] = &copies[..] else {
+            unreachable!()
+        };
+        assert!(!repair_allowed(&p, &budget, &blocks, ack, 94));
+        assert!(repair_allowed(&p, &budget, &blocks, data, 94));
+    }
+
     fn block(symbol: &EncodedSymbol) -> u64 {
         u64::from_be_bytes(symbol.data[4..12].try_into().unwrap())
     }

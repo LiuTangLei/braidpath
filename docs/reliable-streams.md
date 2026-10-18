@@ -125,8 +125,8 @@ target sees.
 | --- | --- |
 | Flows | Data on flow `2^30 | id`, acknowledgments on `2^30 | 2^29 | id`, so acknowledgments take their own per-flow queue turn. UDP flows stay below `2^30`. |
 | Sequence space | Byte offsets, plus one virtual byte at the final size for FIN. Segments carry at most 990 bytes and keep their boundaries across retransmission. |
-| Acknowledgment | Cumulative point, receive limit, total duplicate bytes, and up to 64 selective ranges. Sent after 16 segments or 2 ms, and immediately for gaps, duplicates, FIN, zero-length probes, or a window opening by a quarter. |
-| Loss | A segment is lost when older than the reorder threshold and a later transmission was delivered, or older than 1.5 thresholds without that evidence. The threshold uses the actual admitting path's QUIC RTT and that path's stream RTT samples (including acknowledgment return delay), times a reorder factor of 1.25–2. Timing starts at admission, excluding the local queue. Before admission is known, the conservative aggregate RTT estimate remains in use. |
+| Acknowledgment | Cumulative point, receive limit, total duplicate bytes, and up to 64 selective ranges. Sent after 16 segments or 2 ms, and immediately for gaps, duplicates, FIN, zero-length probes, or a window opening by a quarter. When the window holds more ranges, as under sustained loss, the frame describes the ranges holding the most recently stored data first (a repair that filled an old hole, then the newest data), as TCP SACK does; describing only the lowest ranges let data above them reach its loss deadline although it had arrived. |
+| Loss | A segment is lost when older than the reorder threshold and a later transmission was delivered, or older than 1.5 thresholds without that evidence. The threshold uses the larger of the actual admitting path's QUIC RTT and the largest of that path's recent stream RTT samples (including acknowledgment return delay), times a reorder factor of 1.25–2. QUIC's estimate already carries the path's variance; the stream's own first-sample variance bound (three RTTs) is not applied per path, so a new stream does not wait three RTTs to repair its first loss. Timing starts at admission, excluding the local queue. Before admission is known, the conservative aggregate RTT estimate remains in use. |
 | Backoff | Only a retransmission with no acknowledgment progress since its previous attempt backs off (1.5× per stall, bounded). Random loss with live acknowledgments is repaired at the threshold pace. |
 | Spurious repair | A rise in the peer's duplicate count raises the reorder factor by 25%, up to 2; progress decays it toward 1.25. |
 | Local drop | Each stream original carries a hold through the sender queue. If it leaves without Quinn admission (expiry, queue rejection, API error) the stream retransmits it at once instead of waiting for loss detection. |
@@ -199,7 +199,9 @@ python3 -m bench.tcp_lab ... --output local/tcp-lab/single --use-path 0
 `--probe-interval-ms` sends 64-byte echo probes on a separate connection, reported as
 idle and during-transfer RTT percentiles; `--tail-seconds S` keeps probing for S
 seconds after the transfer and reports those separately, so an event can impair
-interactive-only traffic. `--event SECONDS:JSON` sends a control line
+interactive-only traffic. `--fresh-probe-interval-ms` (50–5000) opens a new SOCKS5
+connection per attempt and times connect, CONNECT and one 64-byte echo, as a new
+request beside the load would; failures stay in its outcome population. `--event SECONDS:JSON` sends a control line
 to the emulator, for example `--event '2:{"path":0,"down":true}'` to take a path down
 (both queued and new packets are dropped). Each result reports the largest gap
 between received bytes.
@@ -251,8 +253,8 @@ result is not a WAN, independent-capacity or deployment acceptance result.
 
 A sender with exactly one admitted, never-retransmitted segment of at most 128
 sequence bytes, and no unsent application bytes, can queue one additional copy.
-Its timer uses the actual route's native RTT and observed stream ACK RTT upper
-bound, a 12.5% timing margin and the 2 ms ACK delay (capped at 2 s). Unknown/local-queue routes cannot
+Its timer uses the actual route's native RTT and largest recent stream ACK RTT
+sample on that route, a 12.5% timing margin and the 2 ms ACK delay (capped at 2 s). Unknown/local-queue routes cannot
 probe. This copy is not a loss declaration: it preserves the original loss
 clock, route, stall backoff and failure timer. A local drop of the probe does not
 mark the original lost. There is at most one probe per retained segment; a new

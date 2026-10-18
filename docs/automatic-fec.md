@@ -70,6 +70,9 @@ Only an actually admitted original authorizes its own generated/queued copies.
 They cannot borrow bulk credit or fund bulk repair. Auto additionally caps repair
 admission for this class at min(aggregate rate / 4, 1 Mbit/s), a 2400-byte maximum
 idle burst, and charges the datagram frame plus the existing 80-byte pacing cost.
+A continuous download acknowledges continuously, and each ACK is superseded by
+the next, so ACK copies may spend only credit above 1200 bytes. That remainder
+stays available for the first records of new and interactive streams.
 All originals, copies, feedback and probes still share aggregate/group caps and
 native congestion control. Budget or queue pressure can discard a repair.
 
