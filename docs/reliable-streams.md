@@ -197,7 +197,9 @@ python3 -m bench.tcp_lab ... --output local/tcp-lab/single --use-path 0
 
 `--connections N` runs N concurrent transfers. With `--entrance socks5`,
 `--probe-interval-ms` sends 64-byte echo probes on a separate connection, reported as
-idle and during-transfer RTT percentiles. `--event SECONDS:JSON` sends a control line
+idle and during-transfer RTT percentiles; `--tail-seconds S` keeps probing for S
+seconds after the transfer and reports those separately, so an event can impair
+interactive-only traffic. `--event SECONDS:JSON` sends a control line
 to the emulator, for example `--event '2:{"path":0,"down":true}'` to take a path down
 (both queued and new packets are dropped). Each result reports the largest gap
 between received bytes.
