@@ -128,6 +128,8 @@ impl Controller {
             if cursor.generation != path.generation {
                 if active {
                     self.lower = None;
+                    self.window = None;
+                    self.unconfirmed = None;
                 }
                 *cursor = Cursor {
                     generation: path.generation,
@@ -164,7 +166,7 @@ impl Controller {
             self.unconfirmed = Some((since, n.saturating_add(sent)));
         }
         if let Some((since, n)) = self.unconfirmed
-            && n >= MIN_SYMBOLS
+            && n > 0
             && now_us.saturating_sub(since) >= FRESH_US
             && strength(self.snapshot.data_shards) < strength(DEFAULT)
         {
@@ -489,6 +491,43 @@ mod tests {
         let after_gap = sample(1, 2000, 0, 10_000_000);
         c.observe(10_000_000, [(0, true, &after_gap)]);
         assert_eq!(c.snapshot.data_shards, 4);
+    }
+
+    #[test]
+    fn generation_change_discards_pending_sparse_and_unknown_evidence() {
+        let mut c = Controller::default();
+        c.observe(0, [(0, true, &sample(1, 40, 0, 0))]);
+        c.observe(PERIOD_US, [(0, true, &sample(2, 24, 0, PERIOD_US))]);
+        assert_eq!(c.snapshot.sample_symbols, 24);
+        assert_eq!(c.snapshot.loss_rate, None);
+        let mut c = Controller::default();
+        let (n, now) = switch_off(&mut c);
+        let mut old = sample(1, n, 0, now);
+        old.sent_symbols += 10;
+        old.sampled_us += PERIOD_US;
+        c.observe(now + PERIOD_US, [(0, true, &old)]);
+        for i in 2..=12 {
+            let new = sample(2, 0, 0, now + i * PERIOD_US);
+            c.observe(now + i * PERIOD_US, [(0, true, &new)]);
+        }
+        assert_eq!(
+            c.snapshot.data_shards, 0,
+            "retired traffic cannot protect a new idle generation"
+        );
+    }
+
+    #[test]
+    fn sparse_sending_without_feedback_restores_protection_but_idle_does_not() {
+        let mut c = Controller::default();
+        let (n, now) = switch_off(&mut c);
+        let mut s = sample(1, n, 0, now);
+        s.sent_symbols += 10;
+        for i in 1..=20 {
+            s.sampled_us = now + i * PERIOD_US;
+            c.observe(now + i * PERIOD_US, [(0, true, &s)]);
+        }
+        assert_eq!(c.snapshot.data_shards, 4);
+        assert_eq!(c.snapshot.unknown_restores, 1);
     }
 
     #[test]

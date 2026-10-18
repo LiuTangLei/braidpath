@@ -24,9 +24,9 @@ below 64 symbols can raise protection, with its losses counted against 64
 symbols, so it never selects more than full evidence of the same losses would.
 It cannot lower protection. Duplicate, byte-only, empty, and sparse reports
 cannot trigger a downgrade. A connection generation starts a new counter
-baseline and cancels any pending downgrade.
+baseline and discards pending sparse samples, unconfirmed counts, and any pending downgrade.
 
-If at least 64 symbols are sent on eligible paths and no qualified feedback
+If any symbols are sent on eligible paths and no qualified feedback
 arrives for three seconds, the sender returns to the starting 4+1 and forgets
 its loss estimate. An idle session keeps its strength.
 
