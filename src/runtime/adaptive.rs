@@ -1911,7 +1911,7 @@ impl PathController {
                             .map_or(admission.bps * self.wire_per_symbol, |bytes| {
                                 bytes as f64 * 8_000_000.0 / admission.span_us as f64
                             })
-                            >= self.rate_bps as f64 * 0.5
+                            >= self.rate_bps as f64 * 0.9
                 })
         });
         let service_collapse = service_sample.is_some_and(|sample| {
@@ -1919,7 +1919,9 @@ impl PathController {
                 admission.symbol_bytes >= CAPACITY_SAMPLE_BYTES && sample.bps < admission.bps * 0.5
             })
         });
-        let exercised_business = exercised && self.admitted_bytes >= CAPACITY_SAMPLE_BYTES;
+        let exercised_business = exercised
+            && admission_span >= CONTROL_US
+            && self.admitted_bytes >= CAPACITY_SAMPLE_BYTES;
         // Positive underdelivery is exactly what the bounded reprobe compares
         // at its baseline/trial pace. Braking it before that comparison can
         // invalidate every measurement. Zero service remains an immediate
@@ -4699,6 +4701,40 @@ mod tests {
     }
 
     #[test]
+    fn a_short_exercised_burst_cannot_qualify_an_underfilled_capacity_interval() {
+        for interval_us in [6_624, 94_050] {
+            let (mut controller, mut sample) = underused_jitter_fixture(true, 23.9);
+            controller.rate_bps = 12_431_492;
+            controller.allowance_bytes = 10_294.8;
+            controller.admitted_bytes = 11_356;
+            controller.admission_started_us = Some(sample.now_us - interval_us);
+            controller.last_control_us = sample.now_us - interval_us;
+            // The entire paired half-second only used about a third of this
+            // path's pace. Its delivery tracks those actual admissions.
+            sample.admitted_symbol_bytes = Some(3_253_699);
+            sample.admitted_symbols = Some(3_544);
+            sample.delivered_bytes = 3_230_000;
+            sample.delivered_bps = Some(3_665_096.0);
+            let before = controller.rate_bps;
+            controller.observe(&sample);
+            assert_eq!(controller.rate_bps, before, "interval_us={interval_us}");
+        }
+    }
+
+    #[test]
+    fn a_shared_underfilled_paired_interval_cannot_size_a_queue_brake() {
+        let (mut controller, mut sample) = underused_jitter_fixture(true, 18.03);
+        controller.rate_bps = 7_000_000;
+        sample.admitted_symbol_bytes = Some(3_253_699);
+        sample.admitted_symbols = Some(3_544);
+        sample.delivered_bytes = 3_230_000;
+        sample.delivered_bps = Some(3_665_096.0);
+        let before = controller.rate_bps;
+        controller.observe(&sample);
+        assert_eq!(controller.rate_bps, before);
+    }
+
+    #[test]
     fn underused_path_keeps_collapse_blocked_and_severe_queue_safety_brakes() {
         for mode in ["collapse", "blocked", "severe_queue", "busy_queue"] {
             let (mut controller, mut sample) = underused_jitter_fixture(true, 30.0);
@@ -4714,6 +4750,7 @@ mod tests {
                 "severe_queue" => controller.min_rtt_ms = Some(1.0),
                 "busy_queue" => {
                     controller.allowance_bytes = 21_000.0;
+                    controller.admission_started_us = Some(sample.now_us - CONTROL_US);
                 }
                 _ => unreachable!(),
             }

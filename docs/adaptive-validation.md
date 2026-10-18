@@ -193,3 +193,10 @@ shaper's own timer/CPU limits must be checked from offered-load and queue
 measurements before interpreting a runtime result; nominal serializer capacity
 is not an observed WAN throughput measurement.
 
+Capacity evidence must cover the interval it qualifies. A short sender burst
+that consumes its current allowance cannot qualify an underfilled half-second
+receiver interval as a capacity measurement. In the default queue-gated mode,
+current admissions must cover at least one control interval; paired admissions
+must use at least 90% of the path pace. Small-ACK volume checks, genuine service
+collapse, blocked transport and severe queue protections remain independent.
+
