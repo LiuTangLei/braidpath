@@ -35,10 +35,13 @@ Loss is smoothed with a 0.5 EWMA weight. Upgrades use the higher of the newest
 raw sample and the EWMA, and happen on that observation. Loss is finalized
 before it is reported, so protection follows the onset of loss by roughly
 one to two seconds; a short burst during a no-FEC interval is repaired by
-retransmission. Downgrades
-require both rates to stay 20% below the current entry threshold with a stable
-lower target for three seconds of qualified observations. Empty ticks cannot
-complete the hold; gaps longer than one second cancel it. This is an engineering policy, not a calibrated optimum
+retransmission. Each weaker level has its own three-second qualification hold,
+requiring both rates to stay 20% below the entry threshold of the next stronger
+level. Changing between safe weaker targets does not restart every hold;
+a loss sample cancels only the levels it no longer supports. The weakest
+qualified level is selected, and an upgrade clears all pending holds. Empty
+ticks cannot complete a hold; gaps longer than one second cancel all holds.
+This is an engineering policy, not a calibrated optimum
 or an independent physical packet-loss estimator.
 
 Switching closes any partial old block and preserves monotonically increasing

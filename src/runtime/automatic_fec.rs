@@ -12,6 +12,9 @@ const MIN_SYMBOLS: u64 = 64;
 const WINDOW_US: u64 = 2_000_000;
 /// Conservative bulk strength when admitted traffic loses feedback.
 const DEFAULT: u8 = 4;
+// Each weaker level has its own continuous evidence window. A safe change
+// between weaker targets must not restart every level's downgrade clock.
+const LOWER_LEVELS: [(u8, f64); 4] = [(8, 0.03), (16, 0.01), (32, 0.005), (0, 0.001)];
 
 #[derive(Clone, Debug, Serialize)]
 pub struct Snapshot {
@@ -46,7 +49,7 @@ struct Window {
 pub struct Controller {
     paths: [Cursor; MAX_PATHS],
     next_us: u64,
-    lower: Option<(u8, u64)>,
+    lower: [Option<u64>; 4],
     window: Option<Window>,
     /// When symbols were first sent on active paths after the latest
     /// qualified feedback, and how many have been sent since.
@@ -84,7 +87,7 @@ impl Default for Controller {
         Self {
             paths: [Cursor::default(); MAX_PATHS],
             next_us: 0,
-            lower: None,
+            lower: [None; 4],
             window: None,
             unconfirmed: None,
             snapshot: Snapshot {
@@ -127,7 +130,7 @@ impl Controller {
             let cursor = &mut self.paths[usize::from(id)];
             if cursor.generation != path.generation {
                 if active {
-                    self.lower = None;
+                    self.lower = [None; 4];
                     self.window = None;
                     self.unconfirmed = None;
                 }
@@ -215,7 +218,7 @@ impl Controller {
                 .updated_us
                 .is_none_or(|at| now_us.saturating_sub(at) > PERIOD_US * 2)
             {
-                self.lower = None;
+                self.lower = [None; 4];
             }
             return None;
         }
@@ -225,7 +228,7 @@ impl Controller {
             .updated_us
             .is_some_and(|at| now_us.saturating_sub(at) > PERIOD_US * 2)
         {
-            self.lower = None;
+            self.lower = [None; 4];
         }
         let smooth = self.snapshot.loss_rate.map_or(raw, |old| (old + raw) * 0.5);
         self.snapshot.loss_rate = Some(smooth);
@@ -233,34 +236,26 @@ impl Controller {
         let current = self.snapshot.data_shards;
         let higher = target(raw.max(smooth));
         let next = if strength(higher) > strength(current) {
-            self.lower = None;
+            self.lower = [None; 4];
             higher
         } else {
-            // Require 20% clearance below the current entry threshold and three
-            // seconds of consecutive qualified samples before removing protection.
-            let boundary = match current {
-                4 => 0.03,
-                8 => 0.01,
-                16 => 0.005,
-                32 => 0.001,
-                _ => 0.0,
-            };
-            let lower = target(smooth);
-            if strength(lower) < strength(current) && raw.max(smooth) < boundary * 0.8 {
-                let since = match self.lower {
-                    Some((candidate, since)) if candidate == lower => since,
-                    _ => now_us,
-                };
-                self.lower = Some((lower, since));
-                if now_us.saturating_sub(since) >= LOWER_HOLD_US {
-                    lower
+            // Keep 20% clearance and three seconds of full, fresh samples for
+            // each level separately. Both raw and smoothed loss must qualify:
+            // averaging cannot authorize a level contradicted by recent loss.
+            let mut next = current;
+            for (hold, (level, boundary)) in self.lower.iter_mut().zip(LOWER_LEVELS) {
+                if raw.max(smooth) < boundary * 0.8 {
+                    let since = *hold.get_or_insert(now_us);
+                    if now_us.saturating_sub(since) >= LOWER_HOLD_US
+                        && strength(level) < strength(next)
+                    {
+                        next = level;
+                    }
                 } else {
-                    current
+                    *hold = None;
                 }
-            } else {
-                self.lower = None;
-                current
             }
+            next
         };
         if next == current {
             return None;
@@ -269,10 +264,12 @@ impl Controller {
     }
 
     fn switch(&mut self, next: u8) -> Option<u8> {
+        if strength(next) >= strength(self.snapshot.data_shards) {
+            self.lower = [None; 4];
+        }
         self.snapshot.data_shards = next;
         self.snapshot.repair_shards = u8::from(next != 0);
         self.snapshot.transitions += 1;
-        self.lower = None;
         Some(next)
     }
 }
@@ -312,9 +309,16 @@ mod tests {
             if i == 9 {
                 assert_eq!(c.snapshot.data_shards, 4);
             }
+            // Each lower level becomes eligible after its own full hold;
+            // taking an earlier safe step must not erase the others' evidence.
+            for (tick, k) in [(17, 8), (18, 16), (19, 32), (21, 0)] {
+                if i == tick {
+                    assert_eq!(c.snapshot.data_shards, k);
+                }
+            }
         }
         assert_eq!(c.snapshot.data_shards, 0);
-        assert_eq!(c.snapshot.transitions, 2);
+        assert_eq!(c.snapshot.transitions, 5);
     }
     #[test]
     fn stages_match_loss_and_ignore_duplicate_or_empty_reports() {
@@ -545,5 +549,74 @@ mod tests {
         let s = sample(1, 4000, 0, 10_000_000);
         c.observe(10_000_000, [(0, true, &s)]);
         assert_eq!(c.snapshot.transitions, 2);
+    }
+
+    #[test]
+    fn varying_safe_targets_cannot_pin_the_strongest_grade() {
+        let mut c = Controller::default();
+        c.switch(4);
+        c.snapshot.loss_rate = Some(0.008);
+        let mut lost = 0;
+        for i in 0..=6 {
+            lost += if i % 2 == 0 { 2 } else { 20 };
+            let now = i * PERIOD_US;
+            c.observe(now, [(0, true, &sample(1, (i + 1) * 1000, lost, now))]);
+            if i < 6 {
+                assert_eq!(c.snapshot.data_shards, 4, "the full hold still applies");
+            }
+        }
+        assert_eq!(c.snapshot.data_shards, 8);
+    }
+
+    #[test]
+    fn downgrade_uses_the_strongest_qualified_loss_not_only_smoothed_target() {
+        let mut c = Controller::default();
+        c.switch(4);
+        c.snapshot.loss_rate = Some(0.008);
+        let mut lost = 0;
+        for i in 0..=6 {
+            lost += if i % 2 == 0 { 2 } else { 14 };
+            let now = i * PERIOD_US;
+            c.observe(now, [(0, true, &sample(1, (i + 1) * 1000, lost, now))]);
+        }
+        // Every smoothed sample selected16, but the 1.4% raw intervals still
+        // need8+1. They must not count toward a weaker stage's clean hold.
+        assert_eq!(c.snapshot.data_shards, 8);
+    }
+
+    #[test]
+    fn strong_loss_breaks_a_pending_downgrade() {
+        let mut c = Controller::default();
+        c.switch(4);
+        c.snapshot.loss_rate = Some(0.008);
+        let mut lost = 0;
+        for i in 0..=10 {
+            lost += if i == 3 {
+                30
+            } else if i % 2 == 0 {
+                2
+            } else {
+                20
+            };
+            let now = i * PERIOD_US;
+            c.observe(now, [(0, true, &sample(1, (i + 1) * 1000, lost, now))]);
+            if i < 10 {
+                assert_eq!(c.snapshot.data_shards, 4, "dirty evidence resets the hold");
+            }
+        }
+        assert_eq!(c.snapshot.data_shards, 8);
+    }
+
+    #[test]
+    fn fifty_percent_loss_never_qualifies_a_weaker_level() {
+        let mut c = Controller::default();
+        for i in 0..=20 {
+            let now = i * PERIOD_US;
+            c.observe(
+                now,
+                [(0, true, &sample(1, (i + 1) * 1000, (i + 1) * 500, now))],
+            );
+            assert_eq!(c.snapshot.data_shards, 4);
+        }
     }
 }
