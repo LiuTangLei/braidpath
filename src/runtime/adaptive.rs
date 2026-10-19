@@ -17,8 +17,7 @@ const ONE_WAY_FRESH_US: u64 = 1_000_000;
 /// Absorbs the receiver's per-symbol smoothing of one-way transit.
 const ONE_WAY_SLACK_MS: f64 = 2.0;
 const RETRY_GROWTH_US: u64 = 500_000;
-/// A pace at or below this cannot hold a standing queue at a bottleneck that
-/// still serves it. Absolute: remembered service can be stale after a step.
+/// Maximum pace eligible for the light-load baseline heuristic.
 const LIGHT_BPS: u64 = 1_000_000;
 const LIGHT_WINDOW_US: u64 = 1_000_000;
 const START_BPS: u64 = 256_000;
@@ -768,6 +767,8 @@ struct StandingDelay {
 #[derive(Clone, Copy, Debug)]
 struct LightBaseline {
     started_us: u64,
+    window_us: u64,
+    last_sample_us: u64,
     early_ms: f64,
     late_ms: f64,
     early_samples: u32,
@@ -3661,13 +3662,9 @@ impl PathController {
         None
     }
 
-    /// A light pace cannot hold a queue at a bottleneck that still serves it,
-    /// so an excess that stays level across a window paced lightly throughout
-    /// is propagation or cross traffic this path cannot drain: a route that
-    /// lengthened after the minimum was sampled, or one that wanders. Without
-    /// this, an excess between the growth gate and the brake keeps a path at
-    /// the floor, and loss is never attributed to a clear queue. A queue that
-    /// this pace still fills rises, and one draining falls; neither is level.
+    /// Refresh a lightly paced path's reference only from continuous samples
+    /// whose half-window minima and deciding sample agree. Completed windows
+    /// without enough samples are discarded so later traffic can retry.
     fn light_baseline(
         &mut self,
         now: u64,
@@ -3688,14 +3685,24 @@ impl PathController {
         if !new_sample {
             return None;
         }
+        if self
+            .light_baseline
+            .is_some_and(|test| now.saturating_sub(test.last_sample_us) > test.window_us / 2)
+        {
+            self.light_baseline = None;
+        }
         let window = ((4.0 * rtt_ms * 1000.0) as u64).max(LIGHT_WINDOW_US);
         let test = self.light_baseline.get_or_insert(LightBaseline {
             started_us: now,
+            window_us: window,
+            last_sample_us: now,
             early_ms: f64::INFINITY,
             late_ms: f64::INFINITY,
             early_samples: 0,
             late_samples: 0,
         });
+        let window = test.window_us;
+        test.last_sample_us = now;
         if now < test.started_us + window / 2 {
             test.early_ms = test.early_ms.min(excess_ms);
             test.early_samples += 1;
@@ -3703,13 +3710,16 @@ impl PathController {
             test.late_ms = test.late_ms.min(excess_ms);
             test.late_samples += 1;
         }
-        if now < test.started_us + window || test.early_samples < 4 || test.late_samples < 4 {
+        if now < test.started_us + window {
             return None;
         }
         let test = self.light_baseline.take()?;
         let floor = test.early_ms.min(test.late_ms);
-        (floor > (self.target_ms * 0.05).max(2.0)
-            && (test.late_ms - test.early_ms).abs() <= (floor * 0.1).clamp(1.0, 5.0))
+        (test.early_samples >= 4
+            && test.late_samples >= 4
+            && floor > (self.target_ms * 0.05).max(2.0)
+            && (test.late_ms - test.early_ms).abs() <= (floor * 0.1).clamp(1.0, 5.0)
+            && excess_ms - floor <= (floor * 0.25).clamp(2.0, 5.0))
         .then_some(floor)
     }
 
@@ -14589,5 +14599,66 @@ mod tests {
         }
         assert!(controller.rate_bps >= 2_500_000);
         assert!(controller.rate_bps < 3_100_000);
+    }
+
+    #[test]
+    fn a_light_window_must_not_hide_a_currently_growing_queue() {
+        let mut c = PathController::new(20_000_000, 20);
+        c.rate_bps = MIN_BPS;
+        for now in [
+            100_000, 200_000, 300_000, 400_000, 600_000, 700_000, 800_000, 900_000,
+        ] {
+            let o = observation(now, 107.5);
+            assert_eq!(c.light_baseline(now, 107.5, 7.5, true, &o), None);
+        }
+        let o = observation(1_100_000, 120.0);
+        let shift = c.light_baseline(1_100_000, 120.0, 20.0, true, &o);
+        assert_eq!(
+            shift, None,
+            "current excess rose to 20 ms; old half minima must not refresh: {shift:?}"
+        );
+    }
+
+    #[test]
+    fn a_light_window_must_not_be_completed_after_a_long_pause() {
+        let mut c = PathController::new(20_000_000, 20);
+        c.rate_bps = MIN_BPS;
+        for now in [
+            100_000, 200_000, 300_000, 400_000, 600_000, 700_000, 800_000, 900_000,
+        ] {
+            let o = observation(now, 107.5);
+            assert_eq!(c.light_baseline(now, 107.5, 7.5, true, &o), None);
+        }
+        let mut o = observation(10_000_000, 107.5);
+        o.positive_delivery_age_us = None;
+        o.delivered_bytes = 45_000; // Same cumulative delivered count as the last 900 ms sample.
+        let shift = c.light_baseline(10_000_000, 107.5, 7.5, true, &o);
+        assert_eq!(
+            shift, None,
+            "nine-second gap cannot certify a continuous 1 s window: {shift:?}"
+        );
+    }
+
+    #[test]
+    fn a_sparse_first_half_must_not_poison_later_dense_light_windows() {
+        let mut c = PathController::new(20_000_000, 20);
+        c.rate_bps = MIN_BPS;
+        for now in [100_000, 500_000, 900_000, 1_300_000, 1_700_000] {
+            let o = observation(now, 107.5);
+            assert_eq!(c.light_baseline(now, 107.5, 7.5, true, &o), None);
+        }
+        let mut refreshed = false;
+        for now in (2_000_000..=10_000_000).step_by(100_000) {
+            let o = observation(now, 107.5);
+            if c.light_baseline(now, 107.5, 7.5, true, &o).is_some() {
+                refreshed = true;
+                break;
+            }
+        }
+        assert!(
+            refreshed,
+            "eight seconds of dense stable feedback must replace the underfilled initial half: {:?}",
+            c.light_baseline
+        );
     }
 }
