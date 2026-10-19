@@ -17,7 +17,8 @@ const ONE_WAY_FRESH_US: u64 = 1_000_000;
 /// Absorbs the receiver's per-symbol smoothing of one-way transit.
 const ONE_WAY_SLACK_MS: f64 = 2.0;
 const RETRY_GROWTH_US: u64 = 500_000;
-/// Maximum pace eligible for the light-load baseline heuristic.
+/// A pace at or below this cannot hold a standing queue at a bottleneck that
+/// still serves it. Absolute: remembered service can be stale after a step.
 const LIGHT_BPS: u64 = 1_000_000;
 const LIGHT_WINDOW_US: u64 = 1_000_000;
 const START_BPS: u64 = 256_000;
@@ -42,19 +43,30 @@ const CLEAN_GROWTH_STREAK_MAX: u32 = 3;
 /// Finalized loss observed while this path's own queue signal was clear.
 /// The floor is the smallest recent bucket, so a congestion episode can only
 /// lower it. It never describes capacity; it only discounts delivery deficit.
+/// Buckets age in clear-queue time: a queue, which cannot measure the floor,
+/// must not erase it either, or every later report of the same path loss
+/// reads as a delivery shortfall and brakes the path toward the floor pace.
 #[derive(Default)]
 struct LossFloor {
     previous: Option<(u64, u64)>,
     bucket: (u64, u64),
+    /// Clear-queue time at which each bucket closed, and its loss fraction.
     buckets: VecDeque<(u64, f64)>,
+    clear_us: u64,
+    observed_us: Option<u64>,
 }
 
 impl LossFloor {
     fn observe(&mut self, now_us: u64, finalized: Option<(u64, u64)>, clear_queue: bool) {
+        if let Some(previous) = self.observed_us.replace(now_us)
+            && clear_queue
+        {
+            self.clear_us += now_us.saturating_sub(previous);
+        }
         while self
             .buckets
             .front()
-            .is_some_and(|(at, _)| now_us.saturating_sub(*at) > LOSS_FLOOR_AGE_US)
+            .is_some_and(|(at, _)| self.clear_us.saturating_sub(*at) > LOSS_FLOOR_AGE_US)
         {
             self.buckets.pop_front();
         }
@@ -80,7 +92,7 @@ impl LossFloor {
                 self.buckets.pop_front();
             }
             self.buckets
-                .push_back((now_us, self.bucket.1 as f64 / self.bucket.0 as f64));
+                .push_back((self.clear_us, self.bucket.1 as f64 / self.bucket.0 as f64));
             self.bucket = (0, 0);
         }
     }
@@ -3662,9 +3674,15 @@ impl PathController {
         None
     }
 
-    /// Refresh a lightly paced path's reference only from continuous samples
-    /// whose half-window minima and deciding sample agree. Completed windows
-    /// without enough samples are discarded so later traffic can retry.
+    /// A light pace cannot hold a queue at a bottleneck that still serves it,
+    /// so an excess that stays level across a window paced lightly throughout
+    /// is propagation or cross traffic this path cannot drain: a route that
+    /// lengthened after the minimum was sampled, or one that wanders. Without
+    /// this, an excess between the growth gate and the brake keeps a path at
+    /// the floor, and loss is never attributed to a clear queue. A queue that
+    /// this pace still fills rises, and one draining falls; neither is level,
+    /// and the deciding sample must agree too. Evidence must be continuous;
+    /// an underfilled window is discarded so later traffic can retry.
     fn light_baseline(
         &mut self,
         now: u64,
@@ -4835,6 +4853,8 @@ mod tests {
                 (now - 800_000, 0.16),
                 (now - 600_000, 0.155),
             ]),
+            clear_us: now,
+            observed_us: Some(now),
         };
         // 15% of the new finalized interval and 81% of admitted symbol bytes.
         sample.finalized_lost = Some(353);
@@ -4914,6 +4934,35 @@ mod tests {
         assert_eq!(capped.floor(), LOSS_FLOOR_MAX);
         capped.observe(0, None, true);
         assert_eq!(capped.floor(), LOSS_FLOOR_MAX);
+    }
+
+    #[test]
+    fn a_queue_cannot_age_out_the_clear_queue_loss_floor() {
+        let mut floor = LossFloor::default();
+        floor.observe(0, Some((0, 0)), true);
+        for index in 1..=3u64 {
+            let (expected, lost) = floor.previous.unwrap();
+            floor.observe(index * 100_000, Some((expected + 512, lost + 51)), true);
+        }
+        assert_eq!(floor.median(), 51.0 / 512.0);
+        // A long queued stretch neither measures nor erases the floor.
+        for second in 1..=30u64 {
+            let (expected, lost) = floor.previous.unwrap();
+            floor.observe(
+                300_000 + second * 1_000_000,
+                Some((expected + 512, lost + 200)),
+                false,
+            );
+        }
+        assert_eq!(floor.median(), 51.0 / 512.0);
+        // Clear-queue time still retires it.
+        let (expected, lost) = floor.previous.unwrap();
+        floor.observe(
+            30_300_000 + LOSS_FLOOR_AGE_US + 1,
+            Some((expected, lost)),
+            true,
+        );
+        assert_eq!(floor.median(), 0.0);
     }
 
     #[test]
