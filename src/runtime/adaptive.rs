@@ -17,6 +17,10 @@ const ONE_WAY_FRESH_US: u64 = 1_000_000;
 /// Absorbs the receiver's per-symbol smoothing of one-way transit.
 const ONE_WAY_SLACK_MS: f64 = 2.0;
 const RETRY_GROWTH_US: u64 = 500_000;
+/// A pace at or below this cannot hold a standing queue at a bottleneck that
+/// still serves it. Absolute: remembered service can be stale after a step.
+const LIGHT_BPS: u64 = 1_000_000;
+const LIGHT_WINDOW_US: u64 = 1_000_000;
 const START_BPS: u64 = 256_000;
 const MIN_BPS: u64 = 64_000;
 const LOSS_WINDOW_US: u64 = 4_000_000;
@@ -760,6 +764,16 @@ struct StandingDelay {
     windows: u8,
 }
 
+/// Minimum RTT excess in two halves of a window paced lightly throughout.
+#[derive(Clone, Copy, Debug)]
+struct LightBaseline {
+    started_us: u64,
+    early_ms: f64,
+    late_ms: f64,
+    early_samples: u32,
+    late_samples: u32,
+}
+
 struct GrowthRetry {
     baseline_bps: u64,
     increment_bps: u64,
@@ -805,6 +819,7 @@ pub struct PathController {
     growth_retry: Option<GrowthRetry>,
     drain_return: Option<DrainReturn>,
     standing_delay: Option<StandingDelay>,
+    light_baseline: Option<LightBaseline>,
     baseline_refreshes: u64,
     /// Consecutive growth monitors that settled without a rising RTT or
     /// queue. Each doubles the cautious step; any brake resets it.
@@ -902,6 +917,7 @@ impl PathController {
             growth_retry: None,
             drain_return: None,
             standing_delay: None,
+            light_baseline: None,
             baseline_refreshes: 0,
             clean_growth_streak: 0,
             last_growth_probe: None,
@@ -1454,6 +1470,13 @@ impl PathController {
                 self.last_growth_us = now;
                 rate_reason = RateReason::BaselineRefresh;
             }
+        } else if fresh
+            && let Some(rtt) = rtt
+            && let Some(shift) =
+                self.light_baseline(now, rtt, rtt_excess, new_rtt || new_probe, observation)
+        {
+            self.refresh_baseline(shift);
+            rtt_excess = (rtt_excess - shift).max(0.0);
         }
         let service_sample = self
             .fast_feedback_seen
@@ -3636,6 +3659,58 @@ impl PathController {
             test.samples = 0;
         }
         None
+    }
+
+    /// A light pace cannot hold a queue at a bottleneck that still serves it,
+    /// so an excess that stays level across a window paced lightly throughout
+    /// is propagation or cross traffic this path cannot drain: a route that
+    /// lengthened after the minimum was sampled, or one that wanders. Without
+    /// this, an excess between the growth gate and the brake keeps a path at
+    /// the floor, and loss is never attributed to a clear queue. A queue that
+    /// this pace still fills rises, and one draining falls; neither is level.
+    fn light_baseline(
+        &mut self,
+        now: u64,
+        rtt_ms: f64,
+        excess_ms: f64,
+        new_sample: bool,
+        observation: &Observation,
+    ) -> Option<f64> {
+        if !self.fast_recovery_enabled
+            || self.rate_bps > LIGHT_BPS
+            || observation.transport_blocked
+            || observation.send_queue_bytes > 2400
+            || self.standing_delay.is_some()
+        {
+            self.light_baseline = None;
+            return None;
+        }
+        if !new_sample {
+            return None;
+        }
+        let window = ((4.0 * rtt_ms * 1000.0) as u64).max(LIGHT_WINDOW_US);
+        let test = self.light_baseline.get_or_insert(LightBaseline {
+            started_us: now,
+            early_ms: f64::INFINITY,
+            late_ms: f64::INFINITY,
+            early_samples: 0,
+            late_samples: 0,
+        });
+        if now < test.started_us + window / 2 {
+            test.early_ms = test.early_ms.min(excess_ms);
+            test.early_samples += 1;
+        } else {
+            test.late_ms = test.late_ms.min(excess_ms);
+            test.late_samples += 1;
+        }
+        if now < test.started_us + window || test.early_samples < 4 || test.late_samples < 4 {
+            return None;
+        }
+        let test = self.light_baseline.take()?;
+        let floor = test.early_ms.min(test.late_ms);
+        (floor > (self.target_ms * 0.05).max(2.0)
+            && (test.late_ms - test.early_ms).abs() <= (floor * 0.1).clamp(1.0, 5.0))
+        .then_some(floor)
     }
 
     /// Raise every queue reference by an excess that braking did not drain.
@@ -10386,6 +10461,37 @@ mod tests {
             shift = shift.or(decide(now, 25.0));
         }
         assert_eq!(shift, Some((25.0, 20_000_000)));
+    }
+
+    #[test]
+    fn a_level_excess_at_a_light_pace_becomes_the_baseline() {
+        let mut controller = PathController::new(20_000_000, 20);
+        controller.rate_bps = MIN_BPS;
+        let mut shift = None;
+        for (index, now) in (100_000..=1_200_000).step_by(100_000).enumerate() {
+            let excess = if index % 2 == 0 { 7.5 } else { 8.4 };
+            let sample = observation(now, 105.0);
+            shift = shift.or(controller.light_baseline(now, 105.0, excess, true, &sample));
+        }
+        assert_eq!(shift, Some(7.5));
+    }
+
+    #[test]
+    fn a_light_pace_keeps_the_baseline_for_a_moving_queue_or_a_heavier_pace() {
+        for (rate, slope) in [(MIN_BPS, 10.0), (MIN_BPS, -10.0), (2_000_000, 0.0)] {
+            let mut controller = PathController::new(20_000_000, 20);
+            controller.rate_bps = rate;
+            for now in (100_000..=3_000_000).step_by(100_000) {
+                let excess = 30.0 + slope * now as f64 / 1_000_000.0;
+                let sample = observation(now, 105.0);
+                assert!(
+                    controller
+                        .light_baseline(now, 105.0, excess, true, &sample)
+                        .is_none(),
+                    "rate={rate} slope={slope}"
+                );
+            }
+        }
     }
 
     #[test]
