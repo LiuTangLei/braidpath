@@ -185,27 +185,28 @@ fn latest_directions(file: &Path) -> Value {
     latest_stats(file)["directions"].clone()
 }
 // Quality scheduling may leave a joined path unused in one direction. Check
-// that every exercised direction was reported, and that even idle paths
-// exchanged feedback controls; do not require samples for unsent symbols.
+// that every exercised direction was reported and every path authenticated.
+// Feedback can be piggybacked on another route, so standalone control counts
+// do not establish whether this path's data was reported.
 fn path_feedback_covers_exercised_directions(path: &Value, require_all: bool) -> bool {
     let feedback = &path["receiver_feedback"];
     let sent = feedback["sent_symbols"].as_u64().unwrap();
     let received = path["original_packets_received"].as_u64().unwrap()
         + path["repair_symbols_received"].as_u64().unwrap();
-    (!require_all || (sent > 0 && received > 0))
-        && feedback["controls_sent"].as_u64().unwrap() > 0
-        && feedback["controls_received"].as_u64().unwrap() > 0
+    path["authenticated"] == true
+        && (!require_all || (sent > 0 && received > 0))
         && (sent == 0 || feedback["sender_estimate"]["expected"].as_u64().unwrap() > 0)
         && (received == 0 || feedback["received"]["expected"].as_u64().unwrap() > 0)
 }
 
 #[test]
-fn path_feedback_requires_reports_for_data_and_controls_for_idle_paths() {
+fn path_feedback_requires_reports_for_data_and_authentication_for_idle_paths() {
     let mut path = serde_json::json!({
+        "authenticated": true,
         "original_packets_received": 0,
         "repair_symbols_received": 0,
         "receiver_feedback": {
-            "sent_symbols": 0, "controls_sent": 1, "controls_received": 1,
+            "sent_symbols": 0,
             "sender_estimate": {"expected": 0}, "received": {"expected": 0}
         }
     });
@@ -218,7 +219,7 @@ fn path_feedback_requires_reports_for_data_and_controls_for_idle_paths() {
     assert!(!path_feedback_covers_exercised_directions(&path, false));
     path["receiver_feedback"]["received"]["expected"] = 1.into();
     assert!(path_feedback_covers_exercised_directions(&path, false));
-    path["receiver_feedback"]["controls_received"] = 0.into();
+    path["authenticated"] = false.into();
     assert!(!path_feedback_covers_exercised_directions(&path, false));
 }
 
