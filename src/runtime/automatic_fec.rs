@@ -68,7 +68,7 @@ fn strength(k: u8) -> u8 {
     }
 }
 
-fn target(loss: f64) -> u8 {
+pub(super) fn target(loss: f64) -> u8 {
     if loss < 0.001 {
         0
     } else if loss < 0.005 {

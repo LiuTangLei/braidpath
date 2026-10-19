@@ -186,6 +186,12 @@ fn select_copy_mask(estimates: &[Estimate], slack: f64, used: u8) -> u8 {
         if !quality.loss_rate.is_finite() || !(0.0..=1.0).contains(&quality.loss_rate) {
             return timely;
         }
+        // Match automatic FEC's strongest-loss tier; low-loss traffic keeps
+        // its original timing preference instead of spending copies on a
+        // slower backup. A later retry can still use the usual small lane.
+        if super::super::automatic_fec::target(quality.loss_rate) != 4 {
+            return timely;
+        }
         earliest = earliest.min(anchor.delay_ms);
         loss_ceiling = loss_ceiling.min(quality.loss_rate);
     }
@@ -236,6 +242,17 @@ mod tests {
             3,
             "an unused timely route keeps its ordinary preference"
         );
+    }
+
+    #[test]
+    fn low_loss_copies_keep_the_original_timing_preference() {
+        let paths = [
+            path(0, 35.0, 0.01, 8),
+            path(1, 50.0, 0.01, 8),
+            path(2, 75.0, 0.01, 8),
+            path(3, 100.0, 0.01, 8),
+        ];
+        assert_eq!(select_copy_mask(&paths, 20.0, 3), 3);
     }
 
     #[test]

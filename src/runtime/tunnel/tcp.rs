@@ -961,10 +961,18 @@ impl Mux {
         let limit = self.drain.limit(self.lifetime);
         self.gauge.set_low_water(limit / 2);
         let mut idle = 0;
-        while self.gauge.queued() < limit && idle < self.turns.len() {
+        // A bulk-filled admission watermark must not hide a tiny request
+        // before it reaches the sender's existing per-flow fair queue. The
+        // reserve is at most two maximum segments plus one tiny frame;
+        // bulk keeps the original limit and all wire budgets remain shared.
+        while self.gauge.queued() < limit + 2 * stream::MAX_SEGMENT && idle < self.turns.len() {
             let id = self.turns.pop_front().expect("turn");
             self.turns.push_back(id);
             let s = self.streams.get_mut(&id).expect("stream turn");
+            if self.gauge.queued() >= limit && s.send.written() - s.send.retained_from() > 128 {
+                idle += 1;
+                continue;
+            }
             let Some(t) = s.send.poll_transmit(now) else {
                 idle += 1;
                 continue;
@@ -1132,6 +1140,83 @@ async fn write_loop(
 mod tests {
     use super::*;
     use crate::runtime::{MAX_PATHS, stats};
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn bulk_local_backpressure_cannot_hide_a_tiny_interactive_record() {
+        let policy = Policy {
+            streams: true,
+            proxy: false,
+            fec_repairs: 1,
+            adaptive: true,
+            capacity_probe_bps: 0,
+            probe_guided_recovery: false,
+            latency_target_ms: 20,
+            group_rates: [80_000_000; MAX_PATHS],
+            receiver_feedback: true,
+            quality_schedule: true,
+            fec: super::super::super::automatic_fec::AUTO,
+            small_fec_bytes: 0,
+            mixed_fec: false,
+            redundancy: 30,
+            rate: 80_000_000,
+            block_ms: 25,
+            queue_ms: 100,
+        };
+        policy.validate().unwrap();
+        let metrics = stats::Metrics::new("client");
+        let scope = metrics.scope("interactive-ingress", stats::FORWARD);
+        let mut mux = Mux::new(
+            Listeners::default(),
+            Targets::default(),
+            &policy,
+            scope.clone(),
+        );
+        mux.open(1, false);
+        mux.open(2, false);
+        mux.streams
+            .get_mut(&1)
+            .unwrap()
+            .send
+            .push(&vec![7; READ_CHUNK]);
+        mux.streams.get_mut(&2).unwrap().send.push(&[9; 64]);
+        // These represent bulk records already waiting on actual admission.
+        let held = mux.gauge.hold(1, 0, 1, MIN_QUEUED, false);
+        let (tx, mut rx) = mpsc::channel(32);
+        let mut next_id = 0;
+        let mut out = Out {
+            tx: &tx,
+            next_id: &mut next_id,
+            scope: &scope,
+            small_threshold: 0,
+        };
+        mux.pump(&mut out, Instant::now());
+        let first = rx
+            .try_recv()
+            .expect("the tiny stream must enter while the bulk watermark is full");
+        assert_eq!(first.record.flow, stream::data_flow(2));
+        assert_eq!(
+            Frame::decode(&first.record.payload),
+            Some(Frame::Data {
+                offset: 0,
+                fin: false,
+                data: vec![9; 64]
+            })
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "bulk must retain its original bound"
+        );
+        assert_eq!(mux.streams[&1].send.retained_from(), 0);
+        // A burst of tiny streams remains globally bounded.
+        for id in 3..40 {
+            mux.open(id, false);
+            mux.streams.get_mut(&id).unwrap().send.push(&[9; 128]);
+        }
+        mux.pump(&mut out, Instant::now());
+        assert!(mux.gauge.queued() <= MIN_QUEUED + 3 * stream::MAX_SEGMENT);
+        drop(first);
+        drop(held);
+    }
 
     #[tokio::test(flavor = "current_thread")]
     async fn socket_reads_and_eof_progress_while_wire_input_stays_ready() {
