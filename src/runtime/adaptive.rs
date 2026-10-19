@@ -289,6 +289,7 @@ pub struct Snapshot {
     #[serde(flatten)]
     pub decision: Decision,
     pub native_service_recoveries: u64,
+    pub baseline_refreshes: u64,
     pub reprobe: reprobe::Snapshot,
     pub probe_service: Option<probe_service::Reference>,
     pub rate_changes: VecDeque<RateChange>,
@@ -317,6 +318,8 @@ pub enum RateReason {
     TransportBlockedBrake,
     ReprobeStart,
     ReprobeRollback,
+    /// Braking did not drain an RTT elevation: it is propagation, not queue.
+    BaselineRefresh,
 }
 
 /// Diagnostic identity of the original selected absolute RTT. Exact numeric
@@ -731,6 +734,21 @@ struct DrainReturn {
     drain_bps: Option<f64>,
 }
 
+/// RTT elevation under test after a queue brake. A self-inflicted queue
+/// drains once the pace is below the service it measured; a longer path
+/// does not, and then becomes the new queue reference.
+#[derive(Clone, Copy, Debug)]
+struct StandingDelay {
+    braked_us: u64,
+    /// Pace before the first brake of this episode.
+    pace_before_bps: u64,
+    /// Lowest pace since the brake; any increase ends the test.
+    rate_bps: u64,
+    early_ms: f64,
+    late_ms: f64,
+    samples: u32,
+}
+
 struct GrowthRetry {
     baseline_bps: u64,
     increment_bps: u64,
@@ -775,6 +793,8 @@ pub struct PathController {
     growth_monitor: Option<GrowthMonitor>,
     growth_retry: Option<GrowthRetry>,
     drain_return: Option<DrainReturn>,
+    standing_delay: Option<StandingDelay>,
+    baseline_refreshes: u64,
     /// Consecutive growth monitors that settled without a rising RTT or
     /// queue. Each doubles the cautious step; any brake resets it.
     clean_growth_streak: u32,
@@ -870,6 +890,8 @@ impl PathController {
             growth_monitor: None,
             growth_retry: None,
             drain_return: None,
+            standing_delay: None,
+            baseline_refreshes: 0,
             clean_growth_streak: 0,
             last_growth_probe: None,
             fast_feedback_seen: false,
@@ -1393,6 +1415,20 @@ impl PathController {
                 }
             }
         }
+        if fresh
+            && let Some(rtt) = rtt
+            && let Some((shift, pace_before)) =
+                self.standing_delay(now, rtt, rtt_excess, new_rtt || new_probe, observation)
+        {
+            self.refresh_baseline(shift);
+            rtt_excess = (rtt_excess - shift).max(0.0);
+            let restored = ((pace_before as f64 * 0.9) as u64).min(self.maximum_bps);
+            if restored > self.rate_bps {
+                self.rate_bps = restored;
+                self.last_growth_us = now;
+                rate_reason = RateReason::BaselineRefresh;
+            }
+        }
         let service_sample = self
             .fast_feedback_seen
             .then(|| self.service_window.latest(now))
@@ -1880,6 +1916,18 @@ impl PathController {
                         || positive_settlement_since_us.is_some_and(|since| {
                             admission.started_us.saturating_sub(since) >= service_settle_us
                         }))
+                    // A sparse, application-limited cohort loses a few symbols
+                    // to random path loss; that delivery is not a capacity.
+                    // Without sustained demand only a collapse is a deficit.
+                    && (!self.fast_recovery_enabled
+                        || sample.bps < admission.bps * 0.5
+                        || self
+                            .backlog_since_us
+                            .is_some_and(|since| since <= admission.started_us)
+                        || admission.wire_bytes.is_some_and(|bytes| {
+                            bytes as f64 * 8_000_000.0 / admission.span_us as f64
+                                >= self.rate_bps as f64 * 0.9
+                        }))
                     && sample.bps < admission.bps * 0.85
                     && wire_delivery_bps
                         .is_some_and(|rate| rate < self.rate_bps as f64 * 0.85)
@@ -2287,6 +2335,17 @@ impl PathController {
                 if new_delay {
                     self.braked_queue_ms = Some(self.queue_delay_ms);
                     self.drain_restore_pending = true;
+                    if self.fast_recovery_enabled {
+                        let test = self.standing_delay.get_or_insert(StandingDelay {
+                            braked_us: now,
+                            pace_before_bps: self.rate_bps,
+                            rate_bps: reduced,
+                            early_ms: f64::INFINITY,
+                            late_ms: f64::INFINITY,
+                            samples: 0,
+                        });
+                        test.rate_bps = test.rate_bps.min(reduced);
+                    }
                 }
                 // Only a queue brake measures the bottleneck: its fresh,
                 // backlogged delivery is the drain rate. A positive shortfall
@@ -3339,6 +3398,7 @@ impl PathController {
     pub fn snapshot(&self, now_us: u64) -> Snapshot {
         Snapshot {
             native_service_recoveries: self.native_service_recoveries,
+            baseline_refreshes: self.baseline_refreshes,
             decision: self.decision(now_us),
             reprobe: self.reprobe.snapshot(),
             probe_service: self.probe_service.reference(now_us),
@@ -3469,6 +3529,70 @@ impl PathController {
 
     pub fn reprobe_active(&self) -> bool {
         self.reprobe.active()
+    }
+
+    /// After a queue brake, wait one RTT for the lower pace to reach the path
+    /// and long enough to drain the excess it measured, then compare two
+    /// halves of a further window. An excess that stayed elevated and stable
+    /// is not a queue this sender can drain. Returns that excess.
+    fn standing_delay(
+        &mut self,
+        now: u64,
+        rtt_ms: f64,
+        excess_ms: f64,
+        new_sample: bool,
+        observation: &Observation,
+    ) -> Option<(f64, u64)> {
+        let test = self.standing_delay.as_mut()?;
+        if self.rate_bps > test.rate_bps
+            || observation.transport_blocked
+            || excess_ms <= self.target_ms * 0.25
+        {
+            self.standing_delay = None;
+            return None;
+        }
+        test.rate_bps = self.rate_bps;
+        if !new_sample || observation.send_queue_bytes > 2400 {
+            return None;
+        }
+        let rtt_us = (rtt_ms * 1000.0) as u64;
+        let settled = test.braked_us + 2 * rtt_us + 400_000;
+        let window = (2 * rtt_us).max(400_000);
+        if now < settled {
+            return None;
+        }
+        if now < settled + window / 2 {
+            test.early_ms = test.early_ms.min(excess_ms);
+        } else {
+            test.late_ms = test.late_ms.min(excess_ms);
+        }
+        test.samples += 1;
+        if now < settled + window || test.samples < 4 || !test.early_ms.is_finite() {
+            return None;
+        }
+        let test = self.standing_delay.take()?;
+        let floor = test.early_ms.min(test.late_ms);
+        // A draining queue falls and a growing one rises; neither is stable.
+        (floor >= self.target_ms * 0.5
+            && (test.late_ms - test.early_ms).abs() <= (floor * 0.1).max(1.0))
+        .then_some((floor, test.pace_before_bps))
+    }
+
+    /// Raise every queue reference by an excess that braking did not drain.
+    fn refresh_baseline(&mut self, shift_ms: f64) {
+        for minimum in [
+            &mut self.min_rtt_ms,
+            &mut self.source_local_min_rtt_ms,
+            &mut self.source_probe_min_rtt_ms,
+            &mut self.fast_probe_min_rtt_ms,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            *minimum += shift_ms;
+        }
+        self.startup_probe_pressure = None;
+        self.baseline_refreshes += 1;
     }
 
     fn record_brake(&mut self, observation: &Observation) {
@@ -9660,6 +9784,8 @@ mod tests {
                 10_000
             } else if mode == "zero" || sparse || inactive {
                 0
+            } else if mode == "lossy_active" {
+                7_000
             } else {
                 1_000
             };
@@ -9678,7 +9804,7 @@ mod tests {
             sample.positive_delivery_age_us = Some(if delivered == 0 { now - 500_000 } else { 0 });
             sample.offered_backlog = mode != "idle"
                 && !(mode == "interrupted" && (6..=7).contains(&step))
-                && !(mode == "empty_active" && step % 2 == 0);
+                && !(matches!(mode, "empty_active" | "lossy_active") && step % 2 == 0);
             if step == 10 {
                 controller.draining_bps = Some((5_000_000.0, now - 100_000));
             }
@@ -9736,6 +9862,18 @@ mod tests {
                 .unwrap()
                 .deficit
         );
+    }
+
+    #[test]
+    fn random_loss_on_application_limited_traffic_is_not_a_service_deficit() {
+        // The same intermittent demand as above, but 70% of the admitted
+        // symbols arrive: loss on a lightly used path, not a lower capacity.
+        let (controller, _) = paired_controller_023("lossy_active");
+        let paired = controller.last_control.service_admission.as_ref().unwrap();
+        assert_eq!(paired.backlog_since_us, None);
+        assert!(!paired.deficit);
+        assert_eq!(controller.rate_bps, 2_000_000);
+        assert!(controller.last_brake_us.is_none());
     }
 
     #[test]
@@ -10069,6 +10207,74 @@ mod tests {
             admitted_symbols: Some(0),
             ..observation(now, 80.0)
         }
+    }
+
+    /// A queue brake at 200 ms, then RTT samples from `rtt(elapsed since the
+    /// brake)` while the sender keeps using its lower allowance.
+    fn after_queue_brake(rtt: impl Fn(u64) -> f64) -> (PathController, u64) {
+        let mut controller = PathController::new(20_000_000, 20);
+        controller.observe(&short_observation_022(0, 80.0));
+        exercise_budget(&mut controller, 0, CONTROL_US);
+        controller.observe(&short_observation_022(200_000, 105.0));
+        assert_eq!(controller.last_brake_us, Some(200_000));
+        let pace_before = controller.rate_changes.back().unwrap().previous_bps;
+        for now in (250_000..=3_000_000).step_by(50_000) {
+            exercise_budget(&mut controller, now - 50_000, 50_000);
+            let ms = rtt(now - 200_000);
+            let mut sample = short_observation_022(now, ms);
+            sample.rtt_ms = ms;
+            controller.observe(&sample);
+        }
+        (controller, pace_before)
+    }
+
+    #[test]
+    fn a_longer_path_that_braking_cannot_drain_becomes_the_queue_reference() {
+        let (controller, pace_before) = after_queue_brake(|_| 105.0);
+        assert_eq!(controller.min_rtt_ms, Some(105.0));
+        assert_eq!(controller.baseline_refreshes, 1);
+        assert!(controller.queue_delay_ms < 1.0);
+        let refresh = controller
+            .rate_changes
+            .iter()
+            .find(|change| matches!(change.reason, RateReason::BaselineRefresh))
+            .expect("the false brake is undone");
+        assert!(refresh.at_us <= 1_500_000, "{}", refresh.at_us);
+        assert_eq!(refresh.pacing_bps, (pace_before as f64 * 0.9) as u64);
+    }
+
+    #[test]
+    fn a_draining_or_growing_queue_keeps_the_original_reference() {
+        // Falling 10 ms per 100 ms: the brake is draining a real queue.
+        let (draining, _) = after_queue_brake(|t| (105.0 - t as f64 / 10_000.0).max(80.0));
+        // Still rising after the brake: the path is losing capacity.
+        let (growing, _) = after_queue_brake(|t| 105.0 + t as f64 / 20_000.0);
+        for controller in [draining, growing] {
+            assert_eq!(controller.min_rtt_ms, Some(80.0));
+            assert_eq!(controller.baseline_refreshes, 0);
+            assert!(
+                !controller
+                    .rate_changes
+                    .iter()
+                    .any(|change| matches!(change.reason, RateReason::BaselineRefresh))
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_recovery_never_refreshes_the_queue_reference() {
+        let mut controller = PathController::new(20_000_000, 20).with_legacy_recovery(true);
+        controller.observe(&short_observation_022(0, 80.0));
+        exercise_budget(&mut controller, 0, CONTROL_US);
+        controller.observe(&short_observation_022(200_000, 105.0));
+        for now in (250_000..=3_000_000).step_by(50_000) {
+            exercise_budget(&mut controller, now - 50_000, 50_000);
+            let mut sample = short_observation_022(now, 105.0);
+            sample.rtt_ms = 105.0;
+            controller.observe(&sample);
+        }
+        assert_eq!(controller.min_rtt_ms, Some(80.0));
+        assert_eq!(controller.baseline_refreshes, 0);
     }
 
     #[test]
