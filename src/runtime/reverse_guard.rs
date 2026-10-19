@@ -10,8 +10,10 @@
 //!
 //! Reverse loss alone is not evidence of a shared uplink: a lossy route loses
 //! symbols at any rate. Every decision therefore uses the loss that at least
-//! two thirds of the measured routes reach, so one or two lossy routes cannot
-//! move it while a shared uplink, which drops on all of them, does. A trial lowers this direction's aggregate
+//! two thirds of the connected routes reach, so one or two lossy routes cannot
+//! move it while a shared uplink, which drops on all of them, does. A route
+//! with too few symbols to measure that loss does not count toward the two
+//! thirds. A trial lowers this direction's aggregate
 //! rate and keeps the cap only when reverse loss falls by at least half. A
 //! rejected trial records that loss as a rate-independent floor, which follows
 //! steady loss and decays once it goes away. The cap then
@@ -23,9 +25,9 @@ use serde::Serialize;
 
 /// Each decision spans one window of finalized reverse symbols.
 const WINDOW_US: u64 = 500_000;
-/// A window below this many reverse symbols is no evidence either way.
-const MIN_SYMBOLS: u64 = 64;
-const MIN_PATH_SYMBOLS: u64 = 16;
+/// A path's window is evidence only with this many reverse symbols: five
+/// expected losses at the onset loss, so a single lost symbol is no onset.
+const MIN_PATH_SYMBOLS: u64 = 100;
 /// Below this rate the reverse load a sender induces is negligible.
 const MIN_TRIGGER_BPS: f64 = 2_000_000.0;
 const MIN_CAP_BPS: f64 = 1_000_000.0;
@@ -89,6 +91,8 @@ pub struct Guard {
     last: [Option<Counts>; MAX_PATHS],
     expected: [u64; MAX_PATHS],
     lost: [u64; MAX_PATHS],
+    /// Paths reported in the latest call.
+    connected: usize,
     window_start_us: Option<u64>,
     sent_at_start: u64,
     onset_windows: u8,
@@ -103,6 +107,7 @@ impl Default for Guard {
             last: [None; MAX_PATHS],
             expected: [0; MAX_PATHS],
             lost: [0; MAX_PATHS],
+            connected: 0,
             window_start_us: None,
             sent_at_start: 0,
             onset_windows: 0,
@@ -126,6 +131,7 @@ impl Guard {
     /// direction's cumulative transmitted symbol bytes over all paths.
     /// Returns whether the cap changed.
     pub fn observe(&mut self, now_us: u64, paths: &[(usize, Counts)], sent_bytes: u64) -> bool {
+        self.connected = paths.iter().filter(|(id, _)| *id < MAX_PATHS).count();
         for &(id, counts) in paths {
             let Some(slot) = self.last.get_mut(id) else {
                 continue;
@@ -167,11 +173,9 @@ impl Guard {
         self.snapshot.cap_bps != before
     }
 
-    /// The loss that at least two thirds of the measured paths reach.
+    /// The loss that at least two thirds of the connected paths reach.
     fn window_loss(&self) -> Option<f64> {
-        if self.expected.iter().sum::<u64>() < MIN_SYMBOLS {
-            return None;
-        }
+        let needed = (self.connected * 2).div_ceil(3).max(1);
         let mut losses: Vec<f64> = self
             .expected
             .iter()
@@ -179,11 +183,11 @@ impl Guard {
             .filter(|(expected, _)| **expected >= MIN_PATH_SYMBOLS)
             .map(|(expected, lost)| lost as f64 / *expected as f64)
             .collect();
-        if losses.is_empty() {
+        if losses.len() < needed {
             return None;
         }
         losses.sort_by(|a, b| b.total_cmp(a));
-        Some(losses[(losses.len() * 2).div_ceil(3) - 1])
+        Some(losses[needed - 1])
     }
 
     fn decide(&mut self, now_us: u64, loss: Option<f64>, rate: f64) {
@@ -463,6 +467,39 @@ mod tests {
             "30 symbols cannot continue an onset"
         );
         assert_eq!(d.guard.snapshot().reverse_loss, Some(0.2));
+    }
+
+    #[test]
+    fn unmeasured_or_thinly_measured_routes_cannot_form_the_majority() {
+        let mut d = Drive::new();
+        // Two lossy routes and one clean one measured; the fourth carried too
+        // little to measure. Two of four routes are not two thirds.
+        for _ in 0..10 {
+            for (counts, (expected, lost)) in
+                d.counts
+                    .iter_mut()
+                    .zip([(200, 24), (40, 0), (200, 24), (200, 0)])
+            {
+                counts.expected += expected;
+                counts.received += expected - lost;
+            }
+            d.now_us += WINDOW_US;
+            d.sent += 6_250_000;
+            d.call();
+        }
+        assert_eq!(d.guard.snapshot().reverse_loss, Some(0.0));
+        // Twenty symbols a route: one lost symbol is 5% but no evidence.
+        for _ in 0..10 {
+            for counts in &mut d.counts {
+                counts.expected += 20;
+                counts.received += 19;
+            }
+            d.now_us += WINDOW_US;
+            d.sent += 6_250_000;
+            d.call();
+        }
+        assert_eq!(d.guard.snapshot().trials, 0);
+        assert_eq!(d.guard.snapshot().reverse_loss, Some(0.0));
     }
 
     #[test]
