@@ -2391,8 +2391,9 @@ async fn sender(
                 ranked.sort_by(|a, b| a.0.total_cmp(&b.0));
                 order = ranked.into_iter().map(|(_, i)| i).collect();
             }
-            // Shadow evaluates identical evidence in both arms. Only the local
-            // opt-in changes order; all original gates below remain authoritative.
+            // AUTO originals prefer a ready faster route in the same protection
+            // tier. Repairs/fixed policies retain the opt-in frontier treatment.
+            // Reordering never removes a fallback or bypasses any gate below.
             if is_small && policy.adaptive && order.len() > 1 {
                 frontier.small_rank_evaluations += 1;
                 let ids: Vec<_> = order.iter().map(|i| paths[*i].id).collect();
@@ -2425,16 +2426,26 @@ async fn sender(
                         Some(sample)
                     })
                     .collect();
-                if let Some(id) = sender_frontier::preferred(&ids, &samples) {
+                let auto_original = !repair && policy.fec == automatic_fec::AUTO;
+                let preferred = if auto_original {
+                    sender_frontier::preferred_original(&ids, &samples)
+                } else {
+                    sender_frontier::preferred(&ids, &samples)
+                };
+                if let Some(id) = preferred {
                     frontier.small_rank_opportunities += 1;
-                    if frontier.enabled {
+                    if frontier.enabled || auto_original {
                         let at = order
                             .iter()
                             .position(|i| paths[*i].id == id)
                             .expect("existing ranked path");
                         let selected = order.remove(at);
                         order.insert(0, selected);
-                        frontier.small_rank_changes += 1;
+                        if auto_original {
+                            frontier.automatic_original_rank_changes += 1;
+                        } else {
+                            frontier.small_rank_changes += 1;
+                        }
                     }
                 }
             }
