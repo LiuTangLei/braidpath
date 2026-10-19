@@ -20,7 +20,7 @@ pub struct Cli {
 mod ack_request_tests {
     use super::*;
     #[test]
-    fn server_ack_request_preserves_default_and_rejects_unregistered_profiles() {
+    fn server_ack_request_defaults_to_every_eight_and_rejects_unregistered_profiles() {
         let base = [
             "braidpath",
             "server",
@@ -39,11 +39,12 @@ mod ack_request_tests {
         assert!(matches!(
             parsed.command,
             Command::Server {
-                ack_request: transport::AckRequest::Unchanged,
+                ack_request: transport::AckRequest::EveryEight,
                 ..
             }
         ));
         for (name, expected) in [
+            ("unchanged", transport::AckRequest::Unchanged),
             ("every-two", transport::AckRequest::EveryTwo),
             ("every-eight", transport::AckRequest::EveryEight),
         ] {
@@ -70,7 +71,7 @@ enum Command {
     Server {
         /// Experimental server-to-peer ACK request. Does not change native BBR,
         /// recovery, or the client's request policy; default remains unchanged.
-        #[arg(long, value_enum, default_value_t = transport::AckRequest::Unchanged)]
+        #[arg(long, value_enum, default_value_t = transport::AckRequest::EveryEight)]
         ack_request: transport::AckRequest,
         #[arg(long)]
         listen: SocketAddr,

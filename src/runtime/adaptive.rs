@@ -12,6 +12,10 @@ const CONTROL_US: u64 = 200_000;
 const PROBE_US: u64 = 500_000;
 const FAST_PROBE_US: u64 = 100_000;
 const BRAKE_US: u64 = 100_000;
+/// One-way transit reports bound the RTT queue signal while this recent.
+const ONE_WAY_FRESH_US: u64 = 1_000_000;
+/// Absorbs the receiver's per-symbol smoothing of one-way transit.
+const ONE_WAY_SLACK_MS: f64 = 2.0;
 const RETRY_GROWTH_US: u64 = 500_000;
 const START_BPS: u64 = 256_000;
 const MIN_BPS: u64 = 64_000;
@@ -714,8 +718,10 @@ pub struct Observation {
     pub probe_latest_rtt_ms: Option<f64>,
     pub probe_sample_id: u64,
     pub probe_age_us: Option<u64>,
-    /// Independent clocks make this unsafe as a lone congestion trigger.
-    pub transit_excess_ms: f64,
+    /// Receiver-measured one-way transit of this direction above its own
+    /// minimum, when reported. Independent clocks make this unsafe as a lone
+    /// congestion trigger; it only bounds how much RTT excess is this direction's.
+    pub transit_excess_ms: Option<f64>,
     pub send_queue_bytes: usize,
     pub offered_backlog: bool,
     pub transport_blocked: bool,
@@ -1419,6 +1425,21 @@ impl PathController {
                         self.rtt_source_baseline_corrections.saturating_add(1);
                 }
             }
+        }
+        // RTT excess beyond this direction's one-way excess sits in the reverse
+        // direction: typically replies and ACKs waiting behind the peer's own
+        // bulk queue. Braking this direction cannot drain it, and an ACK
+        // direction braked for it starves the requests that share it. The bound
+        // only lowers the RTT signal, so clock drift cannot create congestion.
+        if self.fast_recovery_enabled
+            && observation
+                .feedback_age_us
+                .is_some_and(|age| age <= ONE_WAY_FRESH_US)
+            && let Some(transit) = observation
+                .transit_excess_ms
+                .filter(|transit| transit.is_finite() && *transit >= 0.0)
+        {
+            rtt_excess = rtt_excess.min(transit + ONE_WAY_SLACK_MS);
         }
         if fresh
             && let Some(rtt) = rtt
@@ -13536,13 +13557,50 @@ mod tests {
     }
 
     #[test]
+    fn reverse_direction_delay_is_not_this_directions_queue() {
+        // An acknowledgement direction whose replies wait behind the peer's
+        // bulk queue: RTT rises 40 ms while its own one-way transit stays flat.
+        for (transit, braked) in [(Some(0.5), false), (None, true), (Some(40.0), true)] {
+            let mut controller = PathController::new(10_000_000, 20);
+            controller.observe(&observation(0, 80.0));
+            let before = controller.decision(0).pacing_bps;
+            for step in 1..=10 {
+                let now = step * 100_000;
+                let mut sample = observation(now, 120.0);
+                sample.transit_excess_ms = transit;
+                controller.observe(&sample);
+            }
+            let decision = controller.decision(1_000_000);
+            assert_eq!(decision.pacing_bps < before, braked, "{transit:?}");
+            if !braked {
+                assert!(decision.queue_delay_ms <= 0.5 + ONE_WAY_SLACK_MS);
+            }
+        }
+        // A stale one-way report cannot hide the RTT signal.
+        let mut controller = PathController::new(10_000_000, 20);
+        controller.observe(&observation(0, 80.0));
+        let mut sample = observation(100_000, 120.0);
+        sample.transit_excess_ms = Some(0.5);
+        sample.feedback_age_us = Some(ONE_WAY_FRESH_US + 1);
+        controller.observe(&sample);
+        assert!(controller.decision(100_000).queue_delay_ms > 30.0);
+        // The legacy recovery mode keeps the RTT signal.
+        let mut legacy = PathController::new(10_000_000, 20).with_legacy_recovery(true);
+        legacy.observe(&observation(0, 80.0));
+        let mut sample = observation(100_000, 120.0);
+        sample.transit_excess_ms = Some(0.5);
+        legacy.observe(&sample);
+        assert!(legacy.decision(100_000).queue_delay_ms > 30.0);
+    }
+
+    #[test]
     fn clock_drift_diagnostic_cannot_create_congestion_without_rtt_evidence() {
         let mut controller = PathController::new(10_000_000, 20);
         controller.observe(&observation(0, 20.0));
         for seconds in (1..36_000).step_by(100) {
             let now = seconds * 1_000_000;
             let mut sample = observation(now, 20.0);
-            sample.transit_excess_ms = seconds as f64 * 0.05;
+            sample.transit_excess_ms = Some(seconds as f64 * 0.05);
             sample.offered_backlog = false;
             controller.observe(&sample);
             assert!(controller.decision(now).eligible);

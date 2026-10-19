@@ -1,6 +1,6 @@
 use super::{
     MAX_PATHS, MAX_PAYLOAD, QUEUE, adaptive, automatic_fec, capacity_probe, outbound, quality,
-    scheduler,
+    reverse_guard, scheduler,
     sender_frontier::{self, Gate},
     shutdown::Shutdown,
     stats::{self, Scope},
@@ -1526,6 +1526,8 @@ async fn sender(
     let mut feedback_schedule = quality::FeedbackSchedule::default();
     let mut pending_feedback: Option<(Bytes, quality::ReportKind)> = None;
     let mut observation_schedule = policy.adaptive.then(outbound::ObservationSchedule::default);
+    let mut reverse_guard =
+        (policy.adaptive && !metrics.metrics.legacy_recovery()).then(reverse_guard::Guard::default);
     let mut repair_turn = false;
     let mut tick = interval(Duration::from_millis(1));
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -1773,7 +1775,8 @@ async fn sender(
                         .map(|_| snapshot.probe_rtt_latest_ms),
                     probe_sample_id: snapshot.replies_received,
                     probe_age_us: snapshot.probe_updated_us.map(|t| at.saturating_sub(t)),
-                    transit_excess_ms: estimate.delay_variation_ms,
+                    transit_excess_ms: (estimate.report_number > 0)
+                        .then_some(estimate.delay_variation_ms),
                     send_queue_bytes,
                     offered_backlog: !queue.is_empty(),
                     transport_blocked,
@@ -1867,6 +1870,31 @@ async fn sender(
                 &mut reprobe_cursor,
                 now_us,
             );
+            if let Some(guard) = reverse_guard.as_mut() {
+                let mut sent_bytes = 0u64;
+                let counts: Vec<_> = paths
+                    .iter()
+                    .map(|path| {
+                        let q = path.quality.lock().expect("quality lock");
+                        sent_bytes = sent_bytes.saturating_add(q.snapshot.sent_bytes);
+                        (
+                            usize::from(path.id),
+                            reverse_guard::Counts {
+                                generation: q.snapshot.generation,
+                                expected: q.snapshot.received.expected,
+                                received: q.snapshot.received.received,
+                            },
+                        )
+                    })
+                    .collect();
+                if guard.observe(now_us, &counts, sent_bytes) {
+                    let cap = guard
+                        .cap_bps()
+                        .map_or(policy.rate, |cap| cap.min(policy.rate));
+                    pacer.set_rate(now_us, cap);
+                    metrics.publish_reverse_guard(guard.snapshot());
+                }
+            }
             for path in paths.iter() {
                 let snapshot = controllers[usize::from(path.id)].snapshot(now_us);
                 metrics.path(path.id, |p| p.adaptive = Some(snapshot));
@@ -3780,6 +3808,7 @@ async fn client_session(
                     let config=config.clone();
                     let ca=options.ca.clone();let name=options.name.clone();let token=token.clone();let sid=sid.clone();
                     let policy=options.policy.clone();let metrics=options.stats.clone();let tx=rejoin_tx.clone();
+                    let ack_request=if metrics.legacy_recovery(){transport::AckRequest::Unchanged}else{transport::AckRequest::EveryEight};
                     let congestion=options.congestion;let rejoin=has_session;
                     let datagram_send_buffer_bytes=options.datagram_send_buffer_bytes;
                     let mut cancelled=stop.subscribe();
@@ -3789,7 +3818,7 @@ async fn client_session(
                     tasks.spawn(async move {
                         let mut diagnostic=stats::ConnectionTrace::new(metrics,config.remote,Some(id as u8),"quic_connect");
                         let attempt:Result<Option<Rejoined>>=async {
-                            let endpoint=transport::client_bound_with_datagram_buffer(config.remote,&ca,config.interface.as_deref(),congestion,bind,datagram_send_buffer_bytes)?;
+                            let endpoint=transport::client_bound_with_ack_request(config.remote,&ca,config.interface.as_deref(),congestion,bind,datagram_send_buffer_bytes,ack_request)?;
                             info!(path=id,generation,local=%endpoint.local_addr()?,remote=%config.remote,"path attempt source socket");
                             let connected=tokio::select! {
                                 biased;

@@ -201,7 +201,16 @@ impl RecordEncoder {
                         2 => 1,
                         _ => 3,
                     };
-                    let copies = (*small_repairs).max(recovery).max(u8::from(interactive));
+                    // A continuous transfer supersedes each acknowledgement with
+                    // the next. More copies only add reverse load, which on an
+                    // asymmetric uplink is itself the cause of the loss.
+                    let ack = super::super::stream::is_ack_flow(record.flow);
+                    let protection = if ack {
+                        (*small_repairs).min(1)
+                    } else {
+                        *small_repairs
+                    };
+                    let copies = protection.max(recovery).max(u8::from(interactive));
                     if copies == 0 {
                         return Ok(vec![EncodedSymbol {
                             data: wire::plain(record)?,
@@ -452,12 +461,14 @@ mod tests {
             payload: vec![0; 538],
         };
         let protected = e.encode(&ack, now).unwrap();
-        assert_eq!(protected.len(), 4);
+        assert_eq!(protected.len(), 2, "a large ACK is control with one copy");
         assert!(
             protected
                 .iter()
                 .all(|s| s.small && block(s) != block(&short[0]))
         );
+        let protected = e.encode(&record(3, 64), now).unwrap();
+        assert_eq!(protected.len(), 4);
         let mut receiver = Receiver::with_repair_wait(Duration::from_millis(100));
         // All three repair copies describe the same k=1 block. Any one works;
         // the others and the delayed original remain harmless duplicates.
@@ -512,6 +523,23 @@ mod tests {
         let bulk = e.encode_attempt(&record(4, 1000), now, 3).unwrap();
         assert_eq!(bulk.len(), 1);
         assert!(!bulk[0].small);
+    }
+
+    #[test]
+    fn acknowledgements_never_take_more_than_one_copy() {
+        let mut p = policy(super::super::super::automatic_fec::AUTO, 0, false);
+        p.receiver_feedback = true;
+        let now = Instant::now();
+        let mut e = RecordEncoder::new(&p).unwrap();
+        for (k, copies) in [(0, 0), (32, 1), (16, 1), (8, 1), (4, 1)] {
+            e.set_fec(k).unwrap();
+            let ack = Record {
+                flow: crate::runtime::stream::ack_flow(3),
+                id: u64::from(k) + 100,
+                payload: vec![0; 400],
+            };
+            assert_eq!(e.encode(&ack, now).unwrap().len(), 1 + copies, "{k}+1");
+        }
     }
 
     #[test]

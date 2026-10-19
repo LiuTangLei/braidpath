@@ -232,6 +232,9 @@ pub struct Direction {
     /// Sender-local automatic FEC strength and finalized pre-FEC loss basis.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub automatic_fec: Option<super::automatic_fec::Snapshot>,
+    /// Sender-local cap from reverse loss on the peer's shared uplink.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reverse_guard: Option<super::reverse_guard::Snapshot>,
     /// Sender-owned preview counters; not packet losses or time-at-limit percentages.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sender_frontier: Option<super::sender_frontier::Snapshot>,
@@ -1054,6 +1057,16 @@ impl Scope {
                     .entry(self.direction.to_owned())
                     .or_default()
                     .automatic_fec = Some(snapshot);
+            }
+        });
+    }
+    pub fn publish_reverse_guard(&self, snapshot: super::reverse_guard::Snapshot) {
+        self.metrics.state(|s| {
+            if let Some(session) = s.sessions.get_mut(&self.session) {
+                session
+                    .entry(self.direction.to_owned())
+                    .or_default()
+                    .reverse_guard = Some(snapshot);
             }
         });
     }

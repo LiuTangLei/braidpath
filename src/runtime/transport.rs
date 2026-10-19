@@ -70,9 +70,11 @@ pub enum Congestion {
     Bbr,
 }
 
-/// Explicit peer ACK-frequency requests for controlled directional comparisons.
-/// The default preserves Quinn's existing behavior. Native recovery and BBR are
-/// unchanged, and the peer can clamp or decline an extension request.
+/// Peer ACK-frequency requests. Runtime endpoints ask for `EveryEight` by
+/// default: native ACKs otherwise follow every second packet, and at a high
+/// download rate those alone can fill an asymmetric client uplink. The library
+/// constructors keep Quinn's behavior (`Unchanged`). Native recovery and BBR
+/// are unchanged, and the peer can clamp or decline an extension request.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
 pub enum AckRequest {
     #[default]
@@ -252,6 +254,28 @@ pub fn client_bound_with_datagram_buffer(
     bind: Option<SocketAddr>,
     datagram_send_buffer_bytes: usize,
 ) -> Result<Endpoint> {
+    client_bound_with_ack_request(
+        remote,
+        ca,
+        interface,
+        congestion,
+        bind,
+        datagram_send_buffer_bytes,
+        AckRequest::Unchanged,
+    )
+}
+
+/// A client endpoint that asks the server to acknowledge this client's
+/// upstream packets per `ack_request`.
+pub fn client_bound_with_ack_request(
+    remote: SocketAddr,
+    ca: &Path,
+    interface: Option<&str>,
+    congestion: Congestion,
+    bind: Option<SocketAddr>,
+    datagram_send_buffer_bytes: usize,
+    ack_request: AckRequest,
+) -> Result<Endpoint> {
     ensure!(
         (DEFAULT_DATAGRAM_SEND_BUFFER_BYTES..=MAX_DATAGRAM_SEND_BUFFER_BYTES)
             .contains(&datagram_send_buffer_bytes),
@@ -260,6 +284,7 @@ pub fn client_bound_with_datagram_buffer(
     let mut conf = ClientConfig::new(client_crypto(ca)?);
     let mut transport = config(congestion);
     transport.datagram_send_buffer_size(datagram_send_buffer_bytes);
+    ack_request.apply(&mut transport);
     conf.transport_config(Arc::new(transport));
     let s = Socket::new(
         if remote.is_ipv4() {

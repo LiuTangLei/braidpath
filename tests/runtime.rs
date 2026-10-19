@@ -190,7 +190,7 @@ fn authenticated_http3_three_paths_and_udp_integrity() {
 }
 
 #[test]
-fn server_ack_request_is_opt_in_and_directional_on_real_http3() {
+fn ack_requests_are_directional_on_real_http3() {
     let _fixture = socket_fixture();
     let directory = tempfile::tempdir().unwrap();
     let identity = directory.path().join("identity");
@@ -313,14 +313,17 @@ fn server_ack_request_is_opt_in_and_directional_on_real_http3() {
                 .values()
                 .next()
                 .unwrap()["quinn"];
-            assert_eq!(c["ack_frequency_frames_tx"], 0);
-            assert_eq!(s["ack_frequency_frames_rx"], 0);
+            // The client asks for every-eight by default, whatever the server asks.
+            let upstream = c["ack_frequency_frames_tx"].as_u64().unwrap() > 0
+                && s["ack_frequency_frames_rx"].as_u64().unwrap() > 0;
             if profile == "unchanged" {
                 assert_eq!(s["ack_frequency_frames_tx"], 0);
                 assert_eq!(c["ack_frequency_frames_rx"], 0);
-                break;
-            }
-            if s["ack_frequency_frames_tx"].as_u64().unwrap() > 0
+                if upstream {
+                    break;
+                }
+            } else if upstream
+                && s["ack_frequency_frames_tx"].as_u64().unwrap() > 0
                 && c["ack_frequency_frames_rx"].as_u64().unwrap() > 0
             {
                 break;

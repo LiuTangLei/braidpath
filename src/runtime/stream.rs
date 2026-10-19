@@ -31,6 +31,11 @@ const MAX_RANGES: usize = 64;
 const RECENT_RANGES: usize = 2 * MAX_RANGES;
 const ACK_EVERY: u32 = 16;
 const ACK_DELAY: Duration = Duration::from_millis(2);
+/// A bulk receiver acknowledges by segment count at most this often. Every
+/// acknowledgement repeats its ranges, so at hundreds of Mbit/s count-driven
+/// acknowledgements alone can fill an asymmetric uplink; a few milliseconds is
+/// small against loss detection that waits for reordering of a whole RTT.
+const ACK_SPACING: Duration = Duration::from_millis(4);
 const INITIAL_RTT: Duration = Duration::from_millis(250);
 const RTT_WINDOW: Duration = Duration::from_secs(1);
 const REORDER_BASE: f64 = 1.25;
@@ -812,6 +817,7 @@ pub struct Receiver {
     unacknowledged: u32,
     ack_due: Option<Instant>,
     ack_now: bool,
+    last_ack: Option<Instant>,
 }
 impl Default for Receiver {
     fn default() -> Self {
@@ -827,6 +833,7 @@ impl Default for Receiver {
             unacknowledged: 0,
             ack_due: None,
             ack_now: false,
+            last_ack: None,
         }
     }
 }
@@ -903,10 +910,21 @@ impl Receiver {
         }
         self.duplicates += duplicate;
         self.unacknowledged += 1;
-        if data.is_empty() || fin || duplicate > 0 || self.unacknowledged >= ACK_EVERY {
+        if data.is_empty() || fin || duplicate > 0 {
             self.ack_now = true;
+        } else if self.unacknowledged >= ACK_EVERY {
+            match self.last_ack.map(|at| at + ACK_SPACING) {
+                Some(spaced) if now < spaced => {
+                    self.ack_due = Some(self.ack_due.map_or(spaced, |due| due.min(spaced)));
+                }
+                _ => self.ack_now = true,
+            }
         } else {
-            self.ack_due.get_or_insert(now + ACK_DELAY);
+            // While acknowledgements flow, the delay timer keeps the same spacing.
+            let delayed = self.last_ack.map_or(now + ACK_DELAY, |at| {
+                (now + ACK_DELAY).max(at + ACK_SPACING)
+            });
+            self.ack_due.get_or_insert(delayed);
         }
         Ok(ready)
     }
@@ -957,6 +975,7 @@ impl Receiver {
         }
         self.ack_now = false;
         self.ack_due = None;
+        self.last_ack = Some(now);
         self.unacknowledged = 0;
         self.advertised = self.advertised.max(self.consumed + window.min(MAX_WINDOW));
         let mut ranges: Vec<(u64, u64)> = Vec::new();
@@ -1510,6 +1529,39 @@ mod tests {
         let (released, spurious) = sender.on_ack(&ack, deadline).unwrap();
         assert_eq!((released, spurious), (4 * MAX_SEGMENT as u64, true));
         assert!(sender.threshold(deadline) > before);
+    }
+
+    #[test]
+    fn count_driven_acknowledgements_are_spaced_but_signals_are_not() {
+        let t0 = Instant::now();
+        let mut receiver = Receiver::default();
+        let segment = vec![1; MAX_SEGMENT];
+        let mut offset = 0;
+        let mut take = |receiver: &mut Receiver, at: Instant, n: u32| {
+            for _ in 0..n {
+                receiver
+                    .on_data(offset, false, segment.clone(), at)
+                    .unwrap();
+                offset += MAX_SEGMENT as u64;
+            }
+            receiver.take_ack(at, MAX_WINDOW)
+        };
+        assert!(
+            take(&mut receiver, t0, ACK_EVERY).is_some(),
+            "first count ACK is immediate"
+        );
+        let soon = t0 + Duration::from_millis(1);
+        assert!(take(&mut receiver, soon, 3 * ACK_EVERY).is_none(), "spaced");
+        assert_eq!(receiver.next_deadline(), Some(t0 + ACK_SPACING));
+        let ack = receiver.take_ack(t0 + ACK_SPACING, MAX_WINDOW).unwrap();
+        assert_eq!(
+            ack.cumulative,
+            4 * u64::from(ACK_EVERY) * MAX_SEGMENT as u64
+        );
+        // A duplicate is a loss-recovery signal and is acknowledged at once.
+        let again = t0 + ACK_SPACING + Duration::from_millis(1);
+        receiver.on_data(0, false, segment.clone(), again).unwrap();
+        assert!(receiver.take_ack(again, MAX_WINDOW).is_some());
     }
 
     #[test]

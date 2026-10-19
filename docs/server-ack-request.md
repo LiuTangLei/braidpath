@@ -1,19 +1,20 @@
 # Server-only ACK-frequency requests
 
-The server exposes `--ack-request unchanged|every-two|every-eight` for explicit,
-controlled field pilots. The default is `unchanged`; the ordinary library entry
-points preserve the same default as well. No policy is automatically activated
-by traffic, a remembered path score, or a benchmark result.
+The server exposes `--ack-request unchanged|every-two|every-eight`. The runtime
+default is `every-eight`, and the client makes the same request of the server
+unless `--legacy-recovery` is set (see "Reverse load on an asymmetric uplink" in
+[runtime](runtime.md)). The library entry points keep `unchanged`. No policy is
+activated by traffic, a remembered path score, or a benchmark result.
 
 The two experimental modes ask a supporting peer to acknowledge by the second
 or eighth ack-eliciting packet. They use the same requested maximum delay of
 10 ms and the same reordering threshold of two. The only difference in their
 request tuple is the ack-eliciting threshold (one versus seven).
 
-Only the server transport is configured. The client has no corresponding new
-flag and makes no ACK-frequency request. Real authenticated HTTP/3 regressions
-check received payloads, server-to-client extension negotiation, absence of
-client-to-server requests, and the unchanged mode's absence of negotiation.
+The server flag configures the server transport; the client's request follows
+its own `--legacy-recovery` choice. Real authenticated HTTP/3 regressions check
+received payloads, extension negotiation, and the unchanged mode's absence of
+negotiation.
 
 These are negotiated peer requests, not a command to discard ACKs or to ignore
 loss. Pinned Quinn can clamp requests; its wire implementation follows the draft

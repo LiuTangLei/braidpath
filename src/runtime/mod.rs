@@ -9,6 +9,7 @@ pub mod probe;
 pub mod quality;
 pub mod receiver_budget;
 pub mod relay;
+pub mod reverse_guard;
 pub mod scheduler;
 pub mod sender_frontier;
 mod shutdown;
