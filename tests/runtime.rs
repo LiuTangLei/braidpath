@@ -184,6 +184,44 @@ fn latest_stats(file: &Path) -> Value {
 fn latest_directions(file: &Path) -> Value {
     latest_stats(file)["directions"].clone()
 }
+// Quality scheduling may leave a joined path unused in one direction. Check
+// that every exercised direction was reported, and that even idle paths
+// exchanged feedback controls; do not require samples for unsent symbols.
+fn path_feedback_covers_exercised_directions(path: &Value, require_all: bool) -> bool {
+    let feedback = &path["receiver_feedback"];
+    let sent = feedback["sent_symbols"].as_u64().unwrap();
+    let received = path["original_packets_received"].as_u64().unwrap()
+        + path["repair_symbols_received"].as_u64().unwrap();
+    (!require_all || (sent > 0 && received > 0))
+        && feedback["controls_sent"].as_u64().unwrap() > 0
+        && feedback["controls_received"].as_u64().unwrap() > 0
+        && (sent == 0 || feedback["sender_estimate"]["expected"].as_u64().unwrap() > 0)
+        && (received == 0 || feedback["received"]["expected"].as_u64().unwrap() > 0)
+}
+
+#[test]
+fn path_feedback_requires_reports_for_data_and_controls_for_idle_paths() {
+    let mut path = serde_json::json!({
+        "original_packets_received": 0,
+        "repair_symbols_received": 0,
+        "receiver_feedback": {
+            "sent_symbols": 0, "controls_sent": 1, "controls_received": 1,
+            "sender_estimate": {"expected": 0}, "received": {"expected": 0}
+        }
+    });
+    assert!(path_feedback_covers_exercised_directions(&path, false));
+    assert!(!path_feedback_covers_exercised_directions(&path, true));
+    path["receiver_feedback"]["sent_symbols"] = 1.into();
+    assert!(!path_feedback_covers_exercised_directions(&path, false));
+    path["receiver_feedback"]["sender_estimate"]["expected"] = 1.into();
+    path["repair_symbols_received"] = 1.into();
+    assert!(!path_feedback_covers_exercised_directions(&path, false));
+    path["receiver_feedback"]["received"]["expected"] = 1.into();
+    assert!(path_feedback_covers_exercised_directions(&path, false));
+    path["receiver_feedback"]["controls_received"] = 0.into();
+    assert!(!path_feedback_covers_exercised_directions(&path, false));
+}
+
 #[test]
 fn authenticated_http3_three_paths_and_udp_integrity() {
     three_paths(0);
@@ -870,16 +908,9 @@ fn three_paths(mode: u8) {
                             .as_u64()
                             .unwrap_or(0)
                             > 0)
-                    && paths.values().all(|p| {
-                        p["receiver_feedback"]["sender_estimate"]["expected"]
-                            .as_u64()
-                            .unwrap_or(0)
-                            > 0
-                            && p["receiver_feedback"]["received"]["expected"]
-                                .as_u64()
-                                .unwrap_or(0)
-                                > 0
-                    })
+                    && paths
+                        .values()
+                        .all(|p| path_feedback_covers_exercised_directions(p, mode < 2))
             });
             if enough {
                 break;
