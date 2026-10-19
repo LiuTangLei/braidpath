@@ -3703,14 +3703,14 @@ impl PathController {
         });
         let window = test.window_us;
         test.last_sample_us = now;
-        if now < test.started_us + window / 2 {
+        if now.saturating_sub(test.started_us) < window / 2 {
             test.early_ms = test.early_ms.min(excess_ms);
             test.early_samples += 1;
         } else {
             test.late_ms = test.late_ms.min(excess_ms);
             test.late_samples += 1;
         }
-        if now < test.started_us + window {
+        if now.saturating_sub(test.started_us) < window {
             return None;
         }
         let test = self.light_baseline.take()?;
@@ -10471,6 +10471,16 @@ mod tests {
             shift = shift.or(decide(now, 25.0));
         }
         assert_eq!(shift, Some((25.0, 20_000_000)));
+    }
+
+    #[test]
+    fn a_light_window_handles_saturated_rtt_without_deadline_overflow() {
+        let mut c = PathController::new(20_000_000, 20);
+        c.rate_bps = MIN_BPS;
+        for now in [100_000, 600_000, 1_100_000] {
+            let o = observation(now, f64::MAX);
+            assert_eq!(c.light_baseline(now, f64::MAX, 7.5, true, &o), None);
+        }
     }
 
     #[test]
