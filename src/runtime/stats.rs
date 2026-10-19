@@ -30,9 +30,9 @@ pub struct Options {
     /// were permanently rejected locally. Off by default; no added credit.
     #[arg(long)]
     pub repair_usefulness_guard: bool,
-    /// Experimental per-RTT-source queue baselines; off by default. No new
-    /// queue, pacing credit, loss exemption or altered absolute RTT sample.
-    #[arg(long)]
+    /// Per-RTT-source queue baselines, now the default; hidden, kept for old
+    /// scripts. Together with --legacy-recovery it re-enables only this part.
+    #[arg(long, hide = true)]
     pub rtt_source_baselines: bool,
     /// Random-loss service accounting with the minimum floor (at most 25%).
     /// Only meaningful with --legacy-recovery; hidden, kept for old scripts.
@@ -842,8 +842,10 @@ impl Metrics {
     pub fn native_service_guard(&self) -> bool {
         self.0.native_service_guard
     }
+    /// Default: a selected RTT is compared with the minimum of its own source,
+    /// so a stable Quinn/probe offset is not queue delay.
     pub fn rtt_source_baselines(&self) -> bool {
-        self.0.rtt_source_baselines
+        self.0.rtt_source_baselines || !self.0.legacy_recovery
     }
     pub fn random_loss_service(&self) -> bool {
         self.0.random_loss_service

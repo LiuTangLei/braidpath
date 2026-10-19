@@ -1,6 +1,10 @@
-# Experimental source-specific RTT baselines
+# Source-specific RTT baselines
 
-`--rtt-source-baselines` is a default-off, local client/server experiment. It
+Source-specific baselines are the default adaptive behavior. The hidden
+`--rtt-source-baselines` flag is still accepted; together with
+`--legacy-recovery` it re-enables only this part. Public sender statistics
+showed a stable Quinn/probe offset of about 18 ms on one path, which the shared
+minimum reported as a permanent queue and braked on. The mechanism
 keeps separate minimum observations for Quinn RTT and authenticated RTT probes
 within each path generation. The existing selector still chooses an absolute
 RTT; its queue excess is compared to the minimum from that same source instead
@@ -29,7 +33,7 @@ minima, `mixed_rtt_excess_ms`, and `rtt_source_baseline_corrections`. The last i
 an observation count, not saved requests, prevented brakes or bandwidth gain.
 Existing absolute RTTs, mixed minimum and diagnostic minima remain visible.
 
-Validate identical binaries with the option off/on, unchanged workload and
+Validate identical binaries with the default and `--legacy-recovery`, unchanged workload and
 limits, complete request populations, source qualification and independent
 cleanup. Keep run-specific topology and results in ignored `local/`. Local
 regressions do not establish public-network speed or latency improvement.

@@ -513,8 +513,10 @@ fn four_connection_profile(native_service_guard: bool, rtt_source_baselines: boo
                         path["sending_direction"] == direction
                             && path["adaptive"]["last_control"]["native_service_guard_enabled"]
                                 == native_service_guard
+                            // Source baselines are the default; the old
+                            // flag remains accepted and changes nothing.
                             && path["adaptive"]["last_control"]["rtt_source_baselines_enabled"]
-                                == rtt_source_baselines
+                                == true
                     })
             });
             if observed {
