@@ -311,7 +311,7 @@ impl RecordEncoder {
         );
         *small_repairs = match next {
             4 => 3,
-            8 => 2,
+            8 | 16 => 2,
             0 => 0,
             _ => 1,
         };
@@ -512,6 +512,22 @@ mod tests {
         let bulk = e.encode_attempt(&record(4, 1000), now, 3).unwrap();
         assert_eq!(bulk.len(), 1);
         assert!(!bulk[0].small);
+    }
+
+    #[test]
+    fn interactive_records_keep_two_copies_from_one_percent_loss() {
+        let mut p = policy(super::super::super::automatic_fec::AUTO, 0, false);
+        p.receiver_feedback = true;
+        let now = Instant::now();
+        let mut e = RecordEncoder::new(&p).unwrap();
+        for (k, copies) in [(32, 1), (16, 2), (8, 2), (4, 3)] {
+            e.set_fec(k).unwrap();
+            assert_eq!(
+                e.encode(&record(u64::from(k), 64), now).unwrap().len(),
+                1 + copies,
+                "{k}+1"
+            );
+        }
     }
 
     #[test]

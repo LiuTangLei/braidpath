@@ -71,8 +71,10 @@ Records of at most 128 application bytes and all reliable-stream ACKs (including
 large selective ACKs) use a separate protection lane. A cold,
 unknown target permits one repair copy; qualified clean target 0 permits none
 for UDP records and ACKs, while short reliable-stream data retains one copy,
-32/16 permit one, 8+1 permits two, and
-4+1 permits three. The copies carry identical authenticated repair bytes and one
+32+1 permits one, 16+1 and 8+1 permit two, and
+4+1 permits three. From 1% loss interactive records keep two copies although
+bulk repair stays at 16+1: copies are cheap, and an acknowledgement direction
+paced near its own demand may not have budget for a retransmission. The copies carry identical authenticated repair bytes and one
 block ID; the receiver delivers once. Delayed originals remain duplicates.
 
 Only an actually admitted original authorizes its own generated/queued copies.
