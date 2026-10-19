@@ -5,7 +5,9 @@
 //! a virtual-clock serializer (IPv4+UDP bytes), one-way propagation delay,
 //! seeded random erasure at enqueue and a netem-style packet limit that counts
 //! queued and propagating packets. An optional byte-token policer drops excess
-//! arrivals without a serialization backlog. JSON lines on stdin change a direction's
+//! arrivals without a serialization backlog. An optional shared forward policer
+//! drops client-to-server arrivals of every path against one token bucket, like
+//! an access uplink that all routes leave through. JSON lines on stdin change a direction's
 //! shape or take it down; stdin EOF stops the emulator. Not a WAN model or production relay.
 use anyhow::{Context, Result, ensure};
 use clap::Parser;
@@ -49,6 +51,12 @@ struct Args {
     /// Direct-drop token bucket; zero keeps the original FIFO shaper.
     #[arg(long, default_value_t = 0)]
     policer_burst_bytes: usize,
+    /// One direct-drop token bucket for the forward (client-to-server)
+    /// direction of every path; zero disables it.
+    #[arg(long, default_value_t = 0.0)]
+    shared_forward_mbps: f64,
+    #[arg(long, default_value_t = 32_768)]
+    shared_forward_burst_bytes: usize,
     #[arg(long, default_value_t = 20261016)]
     seed: u64,
     #[arg(long)]
@@ -97,6 +105,7 @@ struct Counters {
     loss_eligible_packets: u64,
     queue_full_drops: u64,
     policer_drops: u64,
+    shared_policer_drops: u64,
     forwarded_packets: u64,
     forwarded_ip_udp_bytes: u64,
     send_errors: u64,
@@ -146,12 +155,20 @@ struct Direction {
     shape: Shape,
     loss_max_datagram_bytes: u32,
     policer: Option<Policer>,
+    /// Forward directions only: the shared access uplink.
+    uplink: Option<Arc<Mutex<Uplink>>>,
     counters: Counters,
     in_flight: usize,
     changes: u64,
 }
 
 type Shared = Arc<Mutex<Direction>>;
+
+/// The bucket and its rate, shared by the forward direction of every path.
+struct Uplink {
+    policer: Policer,
+    rate_bps: u64,
+}
 
 #[derive(Deserialize)]
 struct Change {
@@ -240,6 +257,16 @@ async fn shape_direction(
                 }
                 if queue.len() >= shape.queue_packets {
                     direction.counters.queue_full_drops += 1;
+                    continue;
+                }
+                // Lock order: path direction, then the shared uplink.
+                let uplink = direction.uplink.clone();
+                if uplink.is_some_and(|uplink| {
+                    let mut uplink = uplink.lock().unwrap();
+                    let rate = uplink.rate_bps;
+                    !uplink.policer.admit(now, size, rate)
+                }) {
+                    direction.counters.shared_policer_drops += 1;
                     continue;
                 }
                 let policed = direction.policer.is_some();
@@ -357,6 +384,18 @@ async fn main() -> Result<()> {
         args.policer_burst_bytes == 0 || (2048..=1_048_576).contains(&args.policer_burst_bytes),
         "policer burst must be zero or 2048..1048576 IPv4+UDP bytes"
     );
+    ensure!(
+        args.shared_forward_mbps == 0.0
+            || ((0.1..=2000.0).contains(&args.shared_forward_mbps)
+                && (2048..=1_048_576).contains(&args.shared_forward_burst_bytes)),
+        "shared forward policer must be zero or 0.1..2000 Mbit/s with a 2048..1048576 byte burst"
+    );
+    let uplink = (args.shared_forward_mbps > 0.0).then(|| {
+        Arc::new(Mutex::new(Uplink {
+            policer: Policer::new(args.shared_forward_burst_bytes, Instant::now()),
+            rate_bps: (args.shared_forward_mbps * 1e6).round() as u64,
+        }))
+    });
     let mut tasks = JoinSet::new();
     let mut paths = Vec::new();
     let mut ready = Vec::new();
@@ -364,18 +403,19 @@ async fn main() -> Result<()> {
         let shape = parse_path(text, args.queue_packets)?;
         let (entrance, entrance_evidence) = tokio_socket(&format!("path_{index}_entrance"))?;
         let (upstream, upstream_evidence) = tokio_socket(&format!("path_{index}_upstream"))?;
-        let make = || {
+        let make = |uplink: Option<Arc<Mutex<Uplink>>>| {
             Arc::new(Mutex::new(Direction {
                 shape,
                 loss_max_datagram_bytes: args.loss_max_datagram_bytes,
                 policer: (args.policer_burst_bytes > 0)
                     .then(|| Policer::new(args.policer_burst_bytes, Instant::now())),
+                uplink,
                 counters: Counters::default(),
                 in_flight: 0,
                 changes: 0,
             }))
         };
-        let (forward, back) = (make(), make());
+        let (forward, back) = (make(uplink.clone()), make(None));
         let peer = Arc::new(Mutex::new(None));
         let seed = args.seed.wrapping_add(index as u64 * 2);
         tasks.spawn(shape_direction(
@@ -409,6 +449,8 @@ async fn main() -> Result<()> {
             "sample_unix_ms": unix_ms(), "server": args.server, "seed": args.seed,
             "rate_boundary": "IPv4+UDP bytes", "queue_limit": "packets queued or propagating",
             "policer_burst_bytes": args.policer_burst_bytes,
+            "shared_forward_mbps": args.shared_forward_mbps,
+            "shared_forward_burst_bytes": args.shared_forward_burst_bytes,
             "loss_max_datagram_bytes": args.loss_max_datagram_bytes,
             "paths": ready}))?,
     )?;

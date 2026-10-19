@@ -100,7 +100,11 @@ own serialization time, without waiting behind earlier accepted packets.
 The existing packet limit still counts propagating packets: check separate
 `policer_drops` and `queue_full_drops` before interpreting a run as a policer
 case. Rate steps settle token credit at the old rate before applying the new
-rate. `--step AT_SECONDS:PATH:RATE_MBPS` changes both directions of a path relative
+rate. `examples/link_lab.rs --shared-forward-mbps R` (and `bench/tcp_lab.py
+--shared-forward-mbps`) additionally drops client-to-server arrivals of every
+path against one direct-drop bucket (`--shared-forward-burst-bytes`, default
+32768), like an access uplink all routes leave through; drops are counted as
+`shared_policer_drops`. This models reverse-load saturation, not a specific network. `--step AT_SECONDS:PATH:RATE_MBPS` changes both directions of a path relative
 to the source launch. `--mode` selects `native-service` (default) or `adaptive`;
 `--rate-bps` defaults to 400000000 and accepts `auto`. The summary adds the
 time-averaged forward capacity and per-second on-time goodput. Timer jitter

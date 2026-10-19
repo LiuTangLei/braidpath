@@ -75,6 +75,9 @@ def parse_args(argv=None):
     parser.add_argument("--loss-max-datagram-bytes", type=int, default=0,
                         help="fault isolation: erase only short UDP payloads; 0 means all")
     parser.add_argument("--queue-packets", type=int, default=1024)
+    parser.add_argument("--shared-forward-mbps", type=float, default=0.0,
+                        help="one direct-drop client-to-server bucket shared by every path; 0 disables")
+    parser.add_argument("--shared-forward-burst-bytes", type=int, default=32768)
     parser.add_argument("--seed", type=int, default=20261017)
     parser.add_argument("--timeout-seconds", type=float, default=120)
     parser.add_argument("--client-arg", action="append", default=[])
@@ -447,6 +450,8 @@ def run(args):
         "lab_sha256": hashlib.sha256(args.lab_binary.read_bytes()).hexdigest(),
         "paths": args.path, "bytes_per_connection": args.bytes, "connections": args.connections,
         "direction": args.direction, "seed": args.seed, "events": args.event,
+        "shared_forward_mbps": args.shared_forward_mbps,
+        "shared_forward_burst_bytes": args.shared_forward_burst_bytes,
     })
     processes = []
     targets = {}
@@ -480,6 +485,9 @@ def run(args):
                "--stats-jsonl", args.output / "link.jsonl", "--final-file", args.output / "link-final.json"]
         if args.loss_max_datagram_bytes:
             lab += ["--loss-max-datagram-bytes", args.loss_max_datagram_bytes]
+        if args.shared_forward_mbps:
+            lab += ["--shared-forward-mbps", args.shared_forward_mbps,
+                    "--shared-forward-burst-bytes", args.shared_forward_burst_bytes]
         for rtt, rate in args.path:
             lab += ["--path", f"{rtt:g}:{rate:g}"]
         emulator = spawn("link", lab, stdin=subprocess.PIPE, text=True)
