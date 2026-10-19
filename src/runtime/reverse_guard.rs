@@ -9,7 +9,9 @@
 //! the symbols it receives from the peer.
 //!
 //! Reverse loss alone is not evidence of a shared uplink: a lossy route loses
-//! symbols at any rate. A trial therefore lowers this direction's aggregate
+//! symbols at any rate. Every decision therefore uses the loss that at least
+//! two thirds of the measured routes reach, so one or two lossy routes cannot
+//! move it while a shared uplink, which drops on all of them, does. A trial lowers this direction's aggregate
 //! rate and keeps the cap only when reverse loss falls by at least half. A
 //! rejected trial records that loss as a rate-independent floor, which follows
 //! steady loss and decays once it goes away. The cap then
@@ -63,6 +65,8 @@ enum State {
     Limited {
         cap: f64,
         slack_windows: u32,
+        /// The window after a decrease still carries the old reverse load.
+        cooling: bool,
     },
 }
 
@@ -75,7 +79,7 @@ pub struct Snapshot {
     pub rejected: u64,
     pub decreases: u64,
     pub releases: u64,
-    /// Reverse loss of the last decided window, before FEC.
+    /// Reverse loss of the last decided window that most routes reach, before FEC.
     pub reverse_loss: Option<f64>,
     /// Rate-independent reverse loss learned from a rejected trial.
     pub floor: f64,
@@ -149,13 +153,13 @@ impl Guard {
             return false;
         }
         let rate = sent_bytes.saturating_sub(self.sent_at_start) as f64 * 8e6 / elapsed as f64;
-        let (loss, shared) = self.window_loss();
+        let loss = self.window_loss();
         self.expected = [0; MAX_PATHS];
         self.lost = [0; MAX_PATHS];
         self.window_start_us = Some(now_us);
         self.sent_at_start = sent_bytes;
         let before = self.snapshot.cap_bps;
-        self.decide(now_us, loss, shared, rate);
+        self.decide(now_us, loss, rate);
         self.snapshot.cap_bps = match self.state {
             State::Open => None,
             State::Trial { cap, .. } | State::Limited { cap, .. } => Some(cap as u64),
@@ -163,24 +167,26 @@ impl Guard {
         self.snapshot.cap_bps != before
     }
 
-    /// Weighted loss, and whether most measured paths share it.
-    fn window_loss(&self) -> (Option<f64>, bool) {
-        let expected: u64 = self.expected.iter().sum();
-        if expected < MIN_SYMBOLS {
-            return (None, false);
+    /// The loss that at least two thirds of the measured paths reach.
+    fn window_loss(&self) -> Option<f64> {
+        if self.expected.iter().sum::<u64>() < MIN_SYMBOLS {
+            return None;
         }
-        let loss = self.lost.iter().sum::<u64>() as f64 / expected as f64;
-        let (mut measured, mut elevated) = (0, 0);
-        for (expected, lost) in self.expected.iter().zip(self.lost) {
-            if *expected >= MIN_PATH_SYMBOLS {
-                measured += 1;
-                elevated += usize::from(lost as f64 / *expected as f64 >= loss * 0.5);
-            }
+        let mut losses: Vec<f64> = self
+            .expected
+            .iter()
+            .zip(self.lost)
+            .filter(|(expected, _)| **expected >= MIN_PATH_SYMBOLS)
+            .map(|(expected, lost)| lost as f64 / *expected as f64)
+            .collect();
+        if losses.is_empty() {
+            return None;
         }
-        (Some(loss), measured > 0 && elevated * 3 >= measured * 2)
+        losses.sort_by(|a, b| b.total_cmp(a));
+        Some(losses[(losses.len() * 2).div_ceil(3) - 1])
     }
 
-    fn decide(&mut self, now_us: u64, loss: Option<f64>, shared: bool, rate: f64) {
+    fn decide(&mut self, now_us: u64, loss: Option<f64>, rate: f64) {
         self.snapshot.floor *= FLOOR_DECAY;
         if loss.is_some() {
             self.snapshot.reverse_loss = loss;
@@ -199,7 +205,6 @@ impl Guard {
         self.state = match self.state {
             State::Open => {
                 let onset = loss.is_some_and(congested)
-                    && shared
                     && rate >= MIN_TRIGGER_BPS
                     && now_us >= self.retest_after_us;
                 self.onset_windows = if onset { self.onset_windows + 1 } else { 0 };
@@ -231,6 +236,7 @@ impl Guard {
                     State::Limited {
                         cap,
                         slack_windows: 0,
+                        cooling: false,
                     }
                 }
                 Some(_) => {
@@ -247,9 +253,15 @@ impl Guard {
                 // The peer stopped sending: no answer, and no reverse load.
                 None => State::Open,
             },
-            State::Limited { cap, slack_windows } => {
+            State::Limited {
+                cap,
+                slack_windows,
+                cooling,
+            } => {
+                let decrease = !cooling && loss.is_some_and(congested);
                 let cap = match loss {
-                    Some(loss) if congested(loss) => {
+                    _ if cooling => cap,
+                    Some(_) if decrease => {
                         self.snapshot.decreases += 1;
                         (cap.min(rate) * DECREASE).max(MIN_CAP_BPS)
                     }
@@ -268,7 +280,11 @@ impl Guard {
                     self.snapshot.releases += 1;
                     State::Open
                 } else {
-                    State::Limited { cap, slack_windows }
+                    State::Limited {
+                        cap,
+                        slack_windows,
+                        cooling: decrease,
+                    }
                 }
             }
         };
@@ -356,6 +372,33 @@ mod tests {
         // Loss under a non-binding cap decreases from the rate actually sent.
         let rate = reduced as f64 * 0.6;
         assert_eq!(d.window([0.12; 4], rate), Some((rate * DECREASE) as u64));
+    }
+
+    #[test]
+    fn steady_loss_on_a_minority_of_routes_cannot_hold_a_confirmed_cap_down() {
+        let mut d = Drive::new();
+        // A shared uplink overrun at startup drops on every route.
+        d.window([0.10, 0.28, 0.22, 0.06], 146e6);
+        let cap = d.window([0.10, 0.28, 0.22, 0.06], 146e6).expect("trial");
+        d.window([0.10, 0.28, 0.22, 0.06], cap as f64);
+        d.window([0.0, 0.12, 0.13, 0.0], cap as f64);
+        assert_eq!(d.guard.snapshot().confirmed, 1);
+        // Two routes keep losing 12-14% at every rate; the others are clean.
+        let mut cap = d.guard.cap_bps().unwrap();
+        for _ in 0..40 {
+            let next = d.window([0.0, 0.12, 0.14, 0.0], cap as f64).unwrap();
+            assert!(next >= cap, "{next} < {cap}");
+            cap = next;
+        }
+        assert_eq!(d.guard.snapshot().decreases, 0);
+        // Loss on the clean routes too is the shared uplink again.
+        let reduced = d.window([0.06, 0.22, 0.24, 0.06], cap as f64).unwrap();
+        assert!((reduced as f64 / (cap as f64 * DECREASE) - 1.0).abs() < 1e-6);
+        assert_eq!(
+            d.window([0.06, 0.22, 0.24, 0.06], reduced as f64),
+            Some(reduced),
+            "the next window still carries the load before the decrease"
+        );
     }
 
     #[test]
