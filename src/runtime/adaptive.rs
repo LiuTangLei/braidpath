@@ -748,6 +748,10 @@ struct StandingDelay {
     late_ms: f64,
     samples: u32,
     last_sample_us: u64,
+    /// Start of a repeated window after an unstable one; the first waits
+    /// for the lower pace to settle.
+    window_start_us: Option<u64>,
+    windows: u8,
 }
 
 struct GrowthRetry {
@@ -2345,6 +2349,8 @@ impl PathController {
                             late_ms: f64::INFINITY,
                             samples: 0,
                             last_sample_us: 0,
+                            window_start_us: None,
+                            windows: 0,
                         });
                         test.rate_bps = test.rate_bps.min(reduced);
                     }
@@ -3555,7 +3561,9 @@ impl PathController {
         }
         test.rate_bps = self.rate_bps;
         let rtt_us = (rtt_ms * 1000.0) as u64;
-        let settled = test.braked_us + 2 * rtt_us + 400_000;
+        let settled = test
+            .window_start_us
+            .unwrap_or(test.braked_us + 2 * rtt_us + 400_000);
         let window = (2 * rtt_us).max(400_000);
         // Only RTT of traffic delivered at the lower pace counts, and the
         // evidence must be continuous: a fresh reply after a pause cannot
@@ -3583,15 +3591,30 @@ impl PathController {
         if now < settled + window || test.samples < 4 || !test.early_ms.is_finite() {
             return None;
         }
-        let test = self.standing_delay.take()?;
         let floor = test.early_ms.min(test.late_ms);
         // A draining queue falls and a growing one rises; neither is stable.
         // The half minima tolerate jitter, so the current sample must also
         // sit near the floor: a queue rising now is not propagation.
-        (floor >= self.target_ms * 0.5
-            && (test.late_ms - test.early_ms).abs() <= (floor * 0.1).max(1.0)
-            && excess_ms - floor <= (floor * 0.25).max(2.0))
-        .then_some((floor, test.pace_before_bps))
+        if floor >= self.target_ms * 0.5
+            && (test.late_ms - test.early_ms).abs() <= (floor * 0.1).clamp(1.0, 5.0)
+            && excess_ms - floor <= (floor * 0.25).max(5.0)
+        {
+            let pace_before = test.pace_before_bps;
+            self.standing_delay = None;
+            return Some((floor, pace_before));
+        }
+        // One unstable window, often a jitter spike, measures again from
+        // now instead of forgetting the pace before the episode's brake.
+        test.windows += 1;
+        if test.windows >= 3 {
+            self.standing_delay = None;
+        } else {
+            test.window_start_us = Some(now);
+            test.early_ms = f64::INFINITY;
+            test.late_ms = f64::INFINITY;
+            test.samples = 0;
+        }
+        None
     }
 
     /// Raise every queue reference by an excess that braking did not drain.
@@ -10304,6 +10327,8 @@ mod tests {
             late_ms: f64::INFINITY,
             samples: 0,
             last_sample_us: 0,
+            window_start_us: None,
+            windows: 0,
         });
         controller
     }
@@ -10322,6 +10347,24 @@ mod tests {
         let sample = observation(1_400_000, 185.0);
         let shift = controller.standing_delay(1_400_000, 185.0, 105.0, true, &sample);
         assert!(shift.is_none(), "{shift:?}");
+    }
+
+    #[test]
+    fn a_jitter_spike_at_the_decision_measures_again_with_the_original_pace() {
+        let mut controller = standing_delay_under_test();
+        let mut decide = |now, excess| {
+            let sample = observation(now, 105.0);
+            controller.standing_delay(now, 105.0, excess, true, &sample)
+        };
+        for now in [850_000, 900_000, 1_050_000] {
+            assert!(decide(now, 25.0).is_none());
+        }
+        assert!(decide(1_250_000, 35.0).is_none(), "the spike is not stable");
+        let mut shift = None;
+        for now in (1_300_000..=1_700_000).step_by(50_000) {
+            shift = shift.or(decide(now, 25.0));
+        }
+        assert_eq!(shift, Some((25.0, 20_000_000)));
     }
 
     #[test]
