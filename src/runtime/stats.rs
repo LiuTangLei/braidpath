@@ -9,7 +9,10 @@ use std::{
     fs::{File, OpenOptions},
     io::Write,
     path::{Path as FsPath, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -1205,11 +1208,37 @@ fn write_snapshot(writer: &mut impl Write, snapshot: &impl Serialize, pretty: bo
     Ok(())
 }
 
+async fn write_periodic<W, F>(
+    snapshot: F,
+    file: Arc<Mutex<W>>,
+    stopping: Arc<AtomicBool>,
+) -> Result<()>
+where
+    W: Write + Send + 'static,
+    F: FnOnce() -> Result<serde_json::Value> + Send + 'static,
+{
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        if stopping.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let value = snapshot()?;
+        let mut file = file.lock().expect("stats file lock");
+        if !stopping.load(Ordering::Acquire) {
+            write_snapshot(&mut *file, &value, false)?;
+            file.flush()?;
+        }
+        Ok(())
+    })
+    .await
+    .context("periodic statistics writer task")?
+}
+
 /// Must outlive runtime cleanup. Periodic output is stopped before the final JSON.
 pub struct Reporter {
     pub metrics: Metrics,
     options: Options,
     periodic: Option<tokio::task::JoinHandle<Result<()>>>,
+    stopping: Arc<AtomicBool>,
     jsonl: Option<Arc<Mutex<File>>>,
     trace_guard: Option<trace::Guard>,
 }
@@ -1319,18 +1348,26 @@ impl Reporter {
             options.queue_gated_loss,
         )
         .with_legacy_recovery(options.legacy_recovery);
+        let stopping = Arc::new(AtomicBool::new(false));
         let periodic = jsonl.clone().map(|file| {
             let metrics = metrics.clone();
+            let stopping = stopping.clone();
             let ms = options.stats_interval_ms;
             tokio::spawn(async move {
                 let mut tick = tokio::time::interval(Duration::from_millis(ms));
                 tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 loop {
                     tokio::select! {_=tick.tick()=>{},_=metrics.0.changed.notified()=>{}}
-                    let value = metrics.snapshot(false, "running", None)?;
-                    let mut file = file.lock().expect("stats file lock");
-                    write_snapshot(&mut *file, &value, false)?;
-                    file.flush()?;
+                    // At most one report is in flight. JSON allocation,
+                    // encoding and blocking filesystem I/O must not occupy a
+                    // network worker; skipped ticks never queue more writers.
+                    let snapshot_metrics = metrics.clone();
+                    write_periodic(
+                        move || snapshot_metrics.snapshot(false, "running", None),
+                        file.clone(),
+                        stopping.clone(),
+                    )
+                    .await?;
                 }
             })
         });
@@ -1338,12 +1375,14 @@ impl Reporter {
             metrics,
             options,
             periodic,
+            stopping,
             jsonl,
             trace_guard: Some(trace_guard),
         })
     }
     pub async fn finish(mut self, result: Result<()>) -> Result<()> {
         let mut report_error = None;
+        self.stopping.store(true, Ordering::Release);
         if let Some(task) = self.periodic.take() {
             task.abort();
             if let Ok(Err(e)) = task.await {
@@ -1386,6 +1425,7 @@ impl Reporter {
 }
 impl Drop for Reporter {
     fn drop(&mut self) {
+        self.stopping.store(true, Ordering::Release);
         if let Some(task) = self.periodic.take() {
             task.abort();
         }
@@ -1635,6 +1675,60 @@ mod tests {
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_blocked_periodic_snapshot_cannot_stop_io_or_follow_the_final_row() {
+        let stopping = Arc::new(AtomicBool::new(false));
+        let writer = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let release = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (progress_tx, progress_rx) = std::sync::mpsc::channel();
+        let released = release.clone();
+        let guard = std::thread::spawn(move || {
+            let progressed = progress_rx.recv_timeout(Duration::from_secs(2)).is_ok();
+            let (lock, wake) = &*released;
+            *lock.lock().unwrap() = true;
+            wake.notify_all();
+            progressed
+        });
+        let job = tokio::spawn(write_periodic(
+            move || {
+                let _ = entered_tx.send(());
+                let (lock, wake) = &*release;
+                let mut ready = lock.lock().unwrap();
+                while !*ready {
+                    ready = wake.wait(ready).unwrap();
+                }
+                Ok(serde_json::json!({"final":false}))
+            },
+            writer.clone(),
+            stopping.clone(),
+        ));
+        entered_rx.await.unwrap();
+        stopping.store(true, Ordering::Release);
+        write_snapshot(
+            &mut *writer.lock().unwrap(),
+            &serde_json::json!({"final":true}),
+            false,
+        )
+        .unwrap();
+        let _ = progress_tx.send(());
+        job.await.unwrap().unwrap();
+        assert!(
+            guard.join().unwrap(),
+            "the runtime must progress while serialization/diskwork blocks"
+        );
+        let text = String::from_utf8(writer.lock().unwrap().clone()).unwrap();
+        let rows: Vec<serde_json::Value> = text
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(
+            rows,
+            vec![serde_json::json!({"final":true})],
+            "a stopped in-flight report cannot append after final"
+        );
     }
 
     #[test]
