@@ -21,6 +21,18 @@ const RETRY_GROWTH_US: u64 = 500_000;
 /// still serves it. Absolute: remembered service can be stale after a step.
 const LIGHT_BPS: u64 = 1_000_000;
 const LIGHT_WINDOW_US: u64 = 1_000_000;
+/// RTT excess sampled at this pace or lighter is the path's own wander: no
+/// bottleneck worth using queues a path paced like a new one. Its upper
+/// decile over this window, from at least this many samples and at most
+/// this many latency targets, is discounted from queue readings; without new
+/// light samples the discount halves every half-life.
+const WANDER_BPS: u64 = START_BPS;
+const WANDER_WINDOW_US: u64 = 20_000_000;
+const WANDER_SAMPLES: usize = 16;
+const WANDER_CAPACITY: usize = 64;
+const WANDER_QUANTILE: f64 = 0.9;
+const WANDER_TARGETS: f64 = 4.0;
+const WANDER_HALF_LIFE_US: u64 = 60_000_000;
 const START_BPS: u64 = 256_000;
 const MIN_BPS: u64 = 64_000;
 const LOSS_WINDOW_US: u64 = 4_000_000;
@@ -615,6 +627,8 @@ pub struct ControlSample {
     pub rtt_source: RttSource,
     pub mixed_min_rtt_ms: Option<f64>,
     pub rtt_excess_ms: f64,
+    /// RTT wander already discounted from `rtt_excess_ms`.
+    pub rtt_wander_ms: f64,
     pub transport_wait_ms: f64,
     pub rtt_fresh: bool,
     pub probe_fresh: bool,
@@ -833,6 +847,15 @@ pub struct PathController {
     drain_return: Option<DrainReturn>,
     standing_delay: Option<StandingDelay>,
     light_baseline: Option<LightBaseline>,
+    /// Recent light-pace RTT excess samples, oldest first.
+    wander_samples: VecDeque<(u64, f64)>,
+    light_since_us: Option<u64>,
+    /// The light pace has shown an excess below the brake threshold, so an
+    /// earlier queue of this path has drained.
+    light_drained: bool,
+    /// Wander learned from the samples, and when.
+    wander_ms: f64,
+    wander_us: u64,
     baseline_refreshes: u64,
     /// Consecutive growth monitors that settled without a rising RTT or
     /// queue. Each doubles the cautious step; any brake resets it.
@@ -931,6 +954,11 @@ impl PathController {
             drain_return: None,
             standing_delay: None,
             light_baseline: None,
+            wander_samples: VecDeque::new(),
+            light_since_us: None,
+            light_drained: false,
+            wander_ms: 0.0,
+            wander_us: 0,
             baseline_refreshes: 0,
             clean_growth_streak: 0,
             last_growth_probe: None,
@@ -1491,6 +1519,15 @@ impl PathController {
             self.refresh_baseline(shift);
             rtt_excess = (rtt_excess - shift).max(0.0);
         }
+        let wander = if self.fast_recovery_enabled
+            && fresh
+            && let Some(rtt) = rtt
+        {
+            self.observe_wander(now, rtt, rtt_excess, new_rtt || new_probe, observation)
+        } else {
+            0.0
+        };
+        rtt_excess = (rtt_excess - wander).max(0.0);
         let service_sample = self
             .fast_feedback_seen
             .then(|| self.service_window.latest(now))
@@ -1853,6 +1890,7 @@ impl PathController {
             rtt_source,
             mixed_min_rtt_ms: self.min_rtt_ms,
             rtt_excess_ms: rtt_excess,
+            rtt_wander_ms: wander,
             transport_wait_ms: transport_wait,
             rtt_fresh: fresh,
             probe_fresh,
@@ -3741,8 +3779,70 @@ impl PathController {
         .then_some(floor)
     }
 
+    /// A light pace cannot hold a queue at a bottleneck that still serves it,
+    /// so once the path has been paced lightly long enough to drain an earlier
+    /// queue, and its excess has fallen below the brake threshold since (a
+    /// queue left by a heavier pace or a capacity drop drains without
+    /// wandering back), its RTT excess is wander: cross traffic or route jitter that
+    /// braking cannot reduce. A level excess is a baseline (`light_baseline`);
+    /// one that moves is not, and without a discount every rise past the brake
+    /// threshold keeps a wandering path at the floor, where braking buys no
+    /// latency. The discount is the upper decile of recent light samples, so
+    /// the latency target still bounds the queue this path adds on top of most
+    /// of its wander; a lower quantile undercounts it, because a light pace
+    /// takes few RTT samples and its smoothed RTT follows the wander less. A heavier pace holds the discount, decaying, because its
+    /// excess includes its own queue. Returns the discount now in force.
+    fn observe_wander(
+        &mut self,
+        now: u64,
+        rtt_ms: f64,
+        excess_ms: f64,
+        new_sample: bool,
+        observation: &Observation,
+    ) -> f64 {
+        let light = self.rate_bps <= WANDER_BPS
+            && !observation.transport_blocked
+            && observation.send_queue_bytes <= 2400;
+        if !light {
+            self.light_since_us = None;
+            self.light_drained = false;
+        }
+        let since = light.then(|| *self.light_since_us.get_or_insert(now));
+        self.light_drained |= light && new_sample && excess_ms <= self.target_ms * 0.5;
+        let settle = ((2.0 * rtt_ms * 1000.0) as u64).max(400_000);
+        while self
+            .wander_samples
+            .front()
+            .is_some_and(|(at, _)| now.saturating_sub(*at) > WANDER_WINDOW_US)
+        {
+            self.wander_samples.pop_front();
+        }
+        if new_sample
+            && self.light_drained
+            && since.is_some_and(|since| now.saturating_sub(since) >= settle)
+        {
+            if self.wander_samples.len() == WANDER_CAPACITY {
+                self.wander_samples.pop_front();
+            }
+            self.wander_samples.push_back((now, excess_ms.max(0.0)));
+            if self.wander_samples.len() >= WANDER_SAMPLES {
+                let mut excess: Vec<f64> = self.wander_samples.iter().map(|(_, ms)| *ms).collect();
+                excess.sort_by(f64::total_cmp);
+                let rank = ((excess.len() as f64 * WANDER_QUANTILE).ceil() as usize).max(1);
+                self.wander_ms = excess[rank - 1].min(self.target_ms * WANDER_TARGETS);
+                self.wander_us = now;
+            }
+        }
+        let halvings = now.saturating_sub(self.wander_us) as f64 / WANDER_HALF_LIFE_US as f64;
+        self.wander_ms * 0.5_f64.powf(halvings)
+    }
+
     /// Raise every queue reference by an excess that braking did not drain.
     fn refresh_baseline(&mut self, shift_ms: f64) {
+        self.wander_ms = (self.wander_ms - shift_ms).max(0.0);
+        for (_, excess) in &mut self.wander_samples {
+            *excess = (*excess - shift_ms).max(0.0);
+        }
         for minimum in [
             &mut self.min_rtt_ms,
             &mut self.source_local_min_rtt_ms,
@@ -10545,6 +10645,60 @@ mod tests {
         assert_eq!(shift, Some(7.5));
     }
 
+    fn wander_for(controller: &mut PathController, start: u64, end: u64, excess: &[f64]) -> f64 {
+        let mut wander = 0.0;
+        for (index, now) in (start..end).step_by(100_000).enumerate() {
+            let sample = observation(now, 105.0);
+            wander =
+                controller.observe_wander(now, 105.0, excess[index % excess.len()], true, &sample);
+        }
+        wander
+    }
+
+    #[test]
+    fn a_light_pace_discounts_the_upper_decile_of_its_rtt_wander() {
+        let wander = [0.0, 10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0];
+        let mut controller = PathController::new(20_000_000, 20);
+        controller.rate_bps = MIN_BPS;
+        assert_eq!(
+            wander_for(&mut controller, 100_000, 500_000, &wander),
+            0.0,
+            "an earlier queue may still drain"
+        );
+        let learned = wander_for(&mut controller, 500_000, 4_000_000, &wander);
+        assert!((60.0..=70.0).contains(&learned), "{learned}");
+
+        // A heavier pace adds its own queue: it learns nothing and the
+        // discount decays, halving every half-life.
+        controller.rate_bps = 20_000_000;
+        let held = wander_for(
+            &mut controller,
+            4_000_000,
+            4_000_000 + WANDER_HALF_LIFE_US,
+            &[0.0],
+        );
+        assert!((held - learned / 2.0).abs() < 1.5, "{held} {learned}");
+
+        // A level shift already taken as baseline is not discounted twice.
+        controller.refresh_baseline(10.0);
+        assert!(controller.wander_samples.iter().all(|(_, ms)| *ms <= 60.0));
+
+        let mut wide = PathController::new(20_000_000, 20);
+        wide.rate_bps = MIN_BPS;
+        let capped = wander_for(&mut wide, 100_000, 4_000_000, &[5.0, 100.0, 200.0, 200.0]);
+        assert_eq!(capped, 80.0, "at most four latency targets");
+    }
+
+    #[test]
+    fn a_heavy_pace_never_learns_rtt_wander() {
+        let mut controller = PathController::new(20_000_000, 20);
+        controller.rate_bps = 2 * WANDER_BPS;
+        assert_eq!(
+            wander_for(&mut controller, 100_000, 10_000_000, &[0.0, 30.0, 60.0]),
+            0.0
+        );
+    }
+
     #[test]
     fn a_light_pace_keeps_the_baseline_for_a_moving_queue_or_a_heavier_pace() {
         for (rate, slope) in [(MIN_BPS, 10.0), (MIN_BPS, -10.0), (2_000_000, 0.0)] {
@@ -13525,7 +13679,7 @@ mod tests {
     }
 
     #[test]
-    fn persistent_idle_rtt_offset_still_blocks_capacity_growth() {
+    fn persistent_idle_rtt_offset_is_discounted_at_the_start_pace() {
         let mut controller = PathController::new(3_000_000, 20);
         controller.observe(&observation(0, 80.0));
         let mut idle = observation(500_000, 140.0);
@@ -13540,11 +13694,12 @@ mod tests {
             active.delivered_bps = Some(bytes as f64 * 16.0);
             controller.observe(&active);
         }
-        // Explicit remaining limitation: this patch does not classify a lasting
-        // RTT offset as propagation or permit discovery through standing delay.
-        assert!(controller.rate_bps <= START_BPS);
+        // The start pace cannot hold a 60 ms queue at a bottleneck that serves
+        // it, so the offset is discounted as this path's own RTT and growth
+        // resumes; the discount never exceeds the offset.
+        assert!(controller.rate_bps > START_BPS);
+        assert!(controller.last_control.rtt_wander_ms <= 60.0);
         assert!(controller.decision(10_500_000).eligible);
-        assert_eq!(controller.health, Health::Degraded);
     }
 
     #[test]
