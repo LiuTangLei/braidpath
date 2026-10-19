@@ -10,19 +10,24 @@ policy; older servers reject it. Use a numeric value for older peers.
 
 | Finalized loss rate | Full-block target | Repair/source symbol ratio |
 | --- | --- | --- |
-| < 0.1% | No FEC | 0 |
-| 0.1% to < 0.5% | 32+1 | 3.125% |
-| 0.5% to < 1% | 16+1 | 6.25% |
-| 1% to < 3% | 8+1 | 12.5% |
-| >= 3% | 4+1 | 25% |
+| < 0.2% | No FEC | 0 |
+| 0.2% to < 1% | 32+1 | 3.125% |
+| 1% to < 3% | 16+1 | 6.25% |
+| 3% to < 8% | 8+1 | 12.5% |
+| >= 8% | 4+1 | 25% |
+
+Repair stays near four to twelve times the loss rate. Reliable streams
+retransmit the residual loss that one repair per block cannot recover, and
+short records and ACKs keep their own copies, so bulk protection does not try
+to remove every loss at the cost of goodput.
 
 Bulk traffic starts with no repair; short records and stream ACKs have independent protection from the first packet. Every 500 ms the sender takes deltas
 of finalized cumulative counts, weighting active paths by symbol exposure.
 Closed, silent (when another path is usable), or stale (>3 seconds) path
 feedback is excluded. A full observation needs at least 64 newly finalized
 symbols; sparser feedback accumulates for up to two seconds. A window still
-below 64 symbols can raise protection, with its losses counted against 64
-symbols, so it never selects more than full evidence of the same losses would.
+below 64 symbols can raise protection, with its losses counted against at
+least 32 symbols, so one sparse loss selects at most 8+1.
 It cannot lower protection. Duplicate, byte-only, empty, and sparse reports
 cannot trigger a downgrade. A connection generation starts a new counter
 baseline and discards pending sparse samples, unconfirmed counts, and any pending downgrade.

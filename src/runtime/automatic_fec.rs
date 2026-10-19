@@ -8,13 +8,16 @@ const PERIOD_US: u64 = 500_000;
 const FRESH_US: u64 = 3_000_000;
 const LOWER_HOLD_US: u64 = 3_000_000;
 const MIN_SYMBOLS: u64 = 64;
+/// A sparse window's losses count against this many symbols. With strength
+/// rising near eight times the loss rate, one loss raises protection to 8+1.
+const SPARSE_SYMBOLS: u64 = 32;
 /// Qualified feedback below `MIN_SYMBOLS` accumulates for at most this long.
 const WINDOW_US: u64 = 2_000_000;
 /// Conservative bulk strength when admitted traffic loses feedback.
 const DEFAULT: u8 = 4;
 // Each weaker level has its own continuous evidence window. A safe change
 // between weaker targets must not restart every level's downgrade clock.
-const LOWER_LEVELS: [(u8, f64); 4] = [(8, 0.03), (16, 0.01), (32, 0.005), (0, 0.001)];
+const LOWER_LEVELS: [(u8, f64); 4] = [(8, 0.08), (16, 0.03), (32, 0.01), (0, 0.002)];
 
 #[derive(Clone, Debug, Serialize)]
 pub struct Snapshot {
@@ -68,14 +71,17 @@ fn strength(k: u8) -> u8 {
     }
 }
 
+/// Reliable streams retransmit what a block cannot recover, and short records
+/// have their own copies, so bulk repair stays near four to twelve times the
+/// loss rate instead of eliminating every residual loss.
 pub(super) fn target(loss: f64) -> u8 {
-    if loss < 0.001 {
+    if loss < 0.002 {
         0
-    } else if loss < 0.005 {
-        32
     } else if loss < 0.01 {
-        16
+        32
     } else if loss < 0.03 {
+        16
+    } else if loss < 0.08 {
         8
     } else {
         4
@@ -198,10 +204,9 @@ impl Controller {
         self.snapshot.sample_lost = lost;
         self.snapshot.feedback_paths = count;
         if expected < MIN_SYMBOLS {
-            // Counted against a full window, as if every symbol still to
-            // come arrived: no more protection than full evidence of the
-            // same losses would select.
-            let floor = lost as f64 / MIN_SYMBOLS as f64;
+            // Counted against a fixed floor, as if more symbols still to
+            // come arrived: a few losses cannot select the strongest level.
+            let floor = lost as f64 / expected.max(SPARSE_SYMBOLS) as f64;
             let higher = target(floor);
             if strength(higher) > strength(self.snapshot.data_shards) {
                 self.window = None;
@@ -311,7 +316,7 @@ mod tests {
             }
             // Each lower level becomes eligible after its own full hold;
             // taking an earlier safe step must not erase the others' evidence.
-            for (tick, k) in [(17, 8), (18, 16), (19, 32), (21, 0)] {
+            for (tick, k) in [(16, 8), (17, 16), (18, 32), (20, 0)] {
                 if i == tick {
                     assert_eq!(c.snapshot.data_shards, k);
                 }
@@ -322,7 +327,7 @@ mod tests {
     }
     #[test]
     fn stages_match_loss_and_ignore_duplicate_or_empty_reports() {
-        for (loss, k) in [(0, 0), (2, 32), (7, 16), (20, 8), (40, 4)] {
+        for (loss, k) in [(0, 0), (5, 32), (20, 16), (50, 8), (100, 4)] {
             let mut c = Controller::default();
             for i in 0..=8 {
                 let s = sample(1, (i + 1) * 1000, (i + 1) * loss, i * PERIOD_US);
@@ -555,10 +560,10 @@ mod tests {
     fn varying_safe_targets_cannot_pin_the_strongest_grade() {
         let mut c = Controller::default();
         c.switch(4);
-        c.snapshot.loss_rate = Some(0.008);
+        c.snapshot.loss_rate = Some(0.02);
         let mut lost = 0;
         for i in 0..=6 {
-            lost += if i % 2 == 0 { 2 } else { 20 };
+            lost += if i % 2 == 0 { 5 } else { 60 };
             let now = i * PERIOD_US;
             c.observe(now, [(0, true, &sample(1, (i + 1) * 1000, lost, now))]);
             if i < 6 {
@@ -572,14 +577,14 @@ mod tests {
     fn downgrade_uses_the_strongest_qualified_loss_not_only_smoothed_target() {
         let mut c = Controller::default();
         c.switch(4);
-        c.snapshot.loss_rate = Some(0.008);
+        c.snapshot.loss_rate = Some(0.02);
         let mut lost = 0;
         for i in 0..=6 {
-            lost += if i % 2 == 0 { 2 } else { 14 };
+            lost += if i % 2 == 0 { 5 } else { 40 };
             let now = i * PERIOD_US;
             c.observe(now, [(0, true, &sample(1, (i + 1) * 1000, lost, now))]);
         }
-        // Every smoothed sample selected16, but the 1.4% raw intervals still
+        // Every smoothed sample selected16, but the 4% raw intervals still
         // need8+1. They must not count toward a weaker stage's clean hold.
         assert_eq!(c.snapshot.data_shards, 8);
     }
@@ -588,15 +593,15 @@ mod tests {
     fn strong_loss_breaks_a_pending_downgrade() {
         let mut c = Controller::default();
         c.switch(4);
-        c.snapshot.loss_rate = Some(0.008);
+        c.snapshot.loss_rate = Some(0.02);
         let mut lost = 0;
         for i in 0..=10 {
             lost += if i == 3 {
-                30
+                80
             } else if i % 2 == 0 {
-                2
+                5
             } else {
-                20
+                60
             };
             let now = i * PERIOD_US;
             c.observe(now, [(0, true, &sample(1, (i + 1) * 1000, lost, now))]);
