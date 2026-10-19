@@ -747,6 +747,7 @@ struct StandingDelay {
     early_ms: f64,
     late_ms: f64,
     samples: u32,
+    last_sample_us: u64,
 }
 
 struct GrowthRetry {
@@ -2343,6 +2344,7 @@ impl PathController {
                             early_ms: f64::INFINITY,
                             late_ms: f64::INFINITY,
                             samples: 0,
+                            last_sample_us: 0,
                         });
                         test.rate_bps = test.rate_bps.min(reduced);
                     }
@@ -3552,15 +3554,26 @@ impl PathController {
             return None;
         }
         test.rate_bps = self.rate_bps;
-        if !new_sample || observation.send_queue_bytes > 2400 {
-            return None;
-        }
         let rtt_us = (rtt_ms * 1000.0) as u64;
         let settled = test.braked_us + 2 * rtt_us + 400_000;
         let window = (2 * rtt_us).max(400_000);
+        // Only RTT of traffic delivered at the lower pace counts, and the
+        // evidence must be continuous: a fresh reply after a pause cannot
+        // complete a window measured before it.
+        let delivered_since_brake = observation.positive_delivery_age_us.is_some_and(|age| {
+            age <= window / 2 && now.checked_sub(age).is_some_and(|at| at > test.braked_us)
+        });
+        if !new_sample || observation.send_queue_bytes > 2400 || !delivered_since_brake {
+            return None;
+        }
         if now < settled {
             return None;
         }
+        if test.samples > 0 && now.saturating_sub(test.last_sample_us) > window / 2 {
+            self.standing_delay = None;
+            return None;
+        }
+        test.last_sample_us = now;
         if now < settled + window / 2 {
             test.early_ms = test.early_ms.min(excess_ms);
         } else {
@@ -3573,8 +3586,11 @@ impl PathController {
         let test = self.standing_delay.take()?;
         let floor = test.early_ms.min(test.late_ms);
         // A draining queue falls and a growing one rises; neither is stable.
+        // The half minima tolerate jitter, so the current sample must also
+        // sit near the floor: a queue rising now is not propagation.
         (floor >= self.target_ms * 0.5
-            && (test.late_ms - test.early_ms).abs() <= (floor * 0.1).max(1.0))
+            && (test.late_ms - test.early_ms).abs() <= (floor * 0.1).max(1.0)
+            && excess_ms - floor <= (floor * 0.25).max(2.0))
         .then_some((floor, test.pace_before_bps))
     }
 
@@ -10275,6 +10291,96 @@ mod tests {
         }
         assert_eq!(controller.min_rtt_ms, Some(80.0));
         assert_eq!(controller.baseline_refreshes, 0);
+    }
+
+    fn standing_delay_under_test() -> PathController {
+        let mut controller = PathController::new(20_000_000, 20);
+        controller.rate_bps = 5_000_000;
+        controller.standing_delay = Some(StandingDelay {
+            braked_us: 200_000,
+            pace_before_bps: 20_000_000,
+            rate_bps: 5_000_000,
+            early_ms: f64::INFINITY,
+            late_ms: f64::INFINITY,
+            samples: 0,
+            last_sample_us: 0,
+        });
+        controller
+    }
+
+    #[test]
+    fn a_queue_rising_at_the_decision_is_not_a_longer_path() {
+        let mut controller = standing_delay_under_test();
+        for now in [850_000, 900_000, 1_050_000] {
+            let sample = observation(now, 105.0);
+            assert!(
+                controller
+                    .standing_delay(now, 105.0, 25.0, true, &sample)
+                    .is_none()
+            );
+        }
+        let sample = observation(1_400_000, 185.0);
+        let shift = controller.standing_delay(1_400_000, 185.0, 105.0, true, &sample);
+        assert!(shift.is_none(), "{shift:?}");
+    }
+
+    #[test]
+    fn samples_before_a_pause_cannot_complete_the_window() {
+        let mut controller = standing_delay_under_test();
+        for now in [850_000, 900_000, 950_000, 10_000_000] {
+            let sample = observation(now, 105.0);
+            assert!(
+                controller
+                    .standing_delay(now, 105.0, 25.0, true, &sample)
+                    .is_none()
+            );
+        }
+        assert!(controller.standing_delay.is_none());
+    }
+
+    #[test]
+    fn probe_replies_without_delivery_never_restore_the_pre_brake_pace() {
+        for (rising, steps) in [
+            (
+                false,
+                [
+                    (850_000, 105.0),
+                    (900_000, 105.0),
+                    (950_000, 105.0),
+                    (10_000_000, 105.0),
+                ],
+            ),
+            (
+                true,
+                [
+                    (850_000, 105.0),
+                    (900_000, 105.0),
+                    (1_050_000, 105.0),
+                    (1_400_000, 185.0),
+                ],
+            ),
+        ] {
+            let mut controller =
+                PathController::new(20_000_000, 20).with_rtt_source_baselines(true);
+            controller.observe(&short_observation_022(0, 80.0));
+            let mut standing = standing_delay_under_test();
+            controller.rate_bps = standing.rate_bps;
+            controller.standing_delay = standing.standing_delay.take();
+            for (now, ms) in steps {
+                let mut sample = short_observation_022(now, ms);
+                sample.rtt_ms = ms;
+                sample.probe_sample_id = now;
+                sample.offered_backlog = false;
+                sample.delivered_bytes = 0;
+                sample.delivered_bps = Some(0.0);
+                sample.feedback_age_us = None;
+                sample.positive_delivery_age_us = None;
+                controller.observe(&sample);
+            }
+            assert_eq!(controller.baseline_refreshes, 0, "rising={rising}");
+            assert_eq!(controller.min_rtt_ms, Some(80.0), "rising={rising}");
+            assert_eq!(controller.rate_bps, 5_000_000, "rising={rising}");
+        }
     }
 
     #[test]
