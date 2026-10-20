@@ -249,6 +249,30 @@ async fn full_input_turn_services_old_records(expires: bool) {
             assert!(received.insert(record.id));
         }
     }
+    if expires {
+        // Receiving the old heads does not imply the actor has classified the
+        // deferred Input yet. Wait for that outcome before requesting shutdown;
+        // otherwise the stop signal can turn the pending expiry into a shutdown
+        // drop, depending on executor scheduling.
+        timeout(Duration::from_secs(3), async {
+            loop {
+                let mut completed = false;
+                metrics.state(|s| {
+                    let d = &s.sessions["full-input"][stats::FORWARD].symbols;
+                    completed = d.originals_quinn_admitted
+                        + d.originals_expired_dropped
+                        + d.originals_queue_full_dropped
+                        >= 65;
+                });
+                if completed {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("deferred Input must reach an admission/expiry outcome before shutdown");
+    }
     stop.send(true).unwrap();
     task.await.unwrap();
     ADMISSION_CLOCK_FIXED.with(|clock| clock.set(None));
