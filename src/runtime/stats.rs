@@ -235,6 +235,9 @@ pub struct Direction {
     /// Sender-local cap from reverse loss on the peer's shared uplink.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reverse_guard: Option<super::reverse_guard::Snapshot>,
+    /// Sender-local cap from forward loss on a bottleneck all paths share.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub forward_guard: Option<super::forward_guard::Snapshot>,
     /// Sender-owned preview counters; not packet losses or time-at-limit percentages.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sender_frontier: Option<super::sender_frontier::Snapshot>,
@@ -1067,6 +1070,16 @@ impl Scope {
                     .entry(self.direction.to_owned())
                     .or_default()
                     .reverse_guard = Some(snapshot);
+            }
+        });
+    }
+    pub fn publish_forward_guard(&self, snapshot: super::forward_guard::Snapshot) {
+        self.metrics.state(|s| {
+            if let Some(session) = s.sessions.get_mut(&self.session) {
+                session
+                    .entry(self.direction.to_owned())
+                    .or_default()
+                    .forward_guard = Some(snapshot);
             }
         });
     }

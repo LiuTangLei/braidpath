@@ -1,6 +1,6 @@
 use super::{
-    MAX_PATHS, MAX_PAYLOAD, QUEUE, adaptive, automatic_fec, capacity_probe, outbound, quality,
-    reverse_guard, scheduler,
+    MAX_PATHS, MAX_PAYLOAD, QUEUE, adaptive, automatic_fec, capacity_probe, forward_guard,
+    outbound, quality, reverse_guard, scheduler,
     sender_frontier::{self, Gate},
     shutdown::Shutdown,
     stats::{self, Scope},
@@ -1535,6 +1535,8 @@ async fn sender(
     let mut observation_schedule = policy.adaptive.then(outbound::ObservationSchedule::default);
     let mut reverse_guard =
         (policy.adaptive && !metrics.metrics.legacy_recovery()).then(reverse_guard::Guard::default);
+    let mut forward_guard =
+        (policy.adaptive && !metrics.metrics.legacy_recovery()).then(forward_guard::Guard::default);
     let mut repair_turn = false;
     let mut tick = interval(Duration::from_millis(1));
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -1883,6 +1885,7 @@ async fn sender(
                 &mut reprobe_cursor,
                 now_us,
             );
+            let mut cap_changed = false;
             if let Some(guard) = reverse_guard.as_mut() {
                 let mut sent_bytes = 0u64;
                 let counts: Vec<_> = paths
@@ -1901,12 +1904,47 @@ async fn sender(
                     })
                     .collect();
                 if guard.observe(now_us, &counts, sent_bytes) {
-                    let cap = guard
-                        .cap_bps()
-                        .map_or(policy.rate, |cap| cap.min(policy.rate));
-                    pacer.set_rate(now_us, cap);
+                    cap_changed = true;
                     metrics.publish_reverse_guard(guard.snapshot());
                 }
+            }
+            if let Some(guard) = forward_guard.as_mut() {
+                let mut sent_bytes = 0u64;
+                let counts: Vec<_> = paths
+                    .iter()
+                    .map(|path| {
+                        let q = path.quality.lock().expect("quality lock");
+                        sent_bytes = sent_bytes.saturating_add(q.snapshot.sent_bytes);
+                        let estimate = &q.snapshot.sender_estimate;
+                        (
+                            usize::from(path.id),
+                            forward_guard::Counts {
+                                generation: q.snapshot.generation,
+                                expected: estimate.expected,
+                                lost: estimate.lost,
+                            },
+                        )
+                    })
+                    .collect();
+                cap_changed |= guard.observe(now_us, &counts, sent_bytes);
+                metrics.publish_forward_guard(guard.snapshot());
+                for controller in &mut controllers {
+                    controller.set_shared_loss(guard.shared_loss());
+                }
+            }
+            if cap_changed {
+                let cap = [
+                    reverse_guard
+                        .as_ref()
+                        .and_then(reverse_guard::Guard::cap_bps),
+                    forward_guard
+                        .as_ref()
+                        .and_then(forward_guard::Guard::cap_bps),
+                ]
+                .into_iter()
+                .flatten()
+                .fold(policy.rate, u64::min);
+                pacer.set_rate(now_us, cap);
             }
             for path in paths.iter() {
                 let snapshot = controllers[usize::from(path.id)].snapshot(now_us);

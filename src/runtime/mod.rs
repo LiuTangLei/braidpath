@@ -4,6 +4,7 @@ pub mod automatic_fec;
 pub mod capacity_probe;
 pub mod cli;
 pub mod fec_retention;
+pub mod forward_guard;
 pub mod outbound;
 pub mod probe;
 pub mod quality;
