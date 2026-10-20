@@ -53,6 +53,25 @@ const QUEUE_GATED_LOSS_FRACTION: f64 = 0.25;
 /// Queue-gated pacing already treats clear-queue loss as path loss, so its
 /// typical floor may discount up to half of the admitted bytes.
 const QUEUE_GATED_LOSS_FLOOR_MAX: f64 = 0.5;
+/// Random loss is the same at any pace; a policer or a shallow buffer drops
+/// more the faster a path is sent, without building a queue. Queue-gated
+/// pacing tests clear-queue loss this far beyond what the path has shown to
+/// be random: one brake to `LOSS_TEST_SCALE`, then the loss is measured again.
+const LOSS_TEST_EXCESS: f64 = 0.02;
+const LOSS_TEST_SCALE: f64 = 0.75;
+/// Symbols a test measures after its brake reaches the receiver.
+const LOSS_TEST_SYMBOLS: u64 = 512;
+const LOSS_TEST_US: u64 = 3_000_000;
+/// A path's own drops cap its pace below where they appeared this long.
+const LOSS_CEILING_US: u64 = 10_000_000;
+/// An expired cap rises by `LOSS_CEILING_STEP` this often while the pace
+/// presses against it, so loss reports keep up with each step.
+const LOSS_CEILING_STEP_US: u64 = 2_000_000;
+const LOSS_CEILING_STEP: f64 = 1.1;
+/// A test that found random loss forgives that loss this long.
+const RANDOM_LOSS_US: u64 = 30_000_000;
+/// Paces too slow to matter are not tested.
+const LOSS_TEST_MIN_BPS: u64 = 2_000_000;
 /// Three clean monitored increases raise the cautious step from 3% to 24%.
 const CLEAN_GROWTH_STREAK_MAX: u32 = 3;
 
@@ -133,6 +152,17 @@ impl LossFloor {
         fractions.sort_by(f64::total_cmp);
         fractions[(fractions.len() - 1) / 2].min(QUEUE_GATED_LOSS_FLOOR_MAX)
     }
+}
+
+/// One rate-dependence test of clear-queue loss.
+struct LossTest {
+    from_bps: u64,
+    /// Loss measured while the pace held; then the brake is measured.
+    held_loss: Option<f64>,
+    /// Start of the current phase.
+    started_us: u64,
+    measure_from_us: u64,
+    counts: (u64, u64),
 }
 
 #[derive(Default)]
@@ -351,6 +381,8 @@ pub enum RateReason {
     FastLossBrake,
     LossBrake,
     TransportBlockedBrake,
+    /// Clear-queue loss beyond the path's random loss: is it the pace's own?
+    LossTestBrake,
     ReprobeStart,
     ReprobeRollback,
     /// Braking did not drain an RTT elevation: it is propagation, not queue.
@@ -606,6 +638,12 @@ pub struct ControlSample {
     /// Queue-gated loss experiment: loss-only brakes were held this sample.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub queue_gated_loss_hold: Option<bool>,
+    /// Pace cap after a loss test found the path dropping at a higher pace.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub loss_ceiling_bps: Option<u64>,
+    /// The last loss test: tested pace, loss before and at 3/4 of it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub loss_test: Option<(u64, f64, f64)>,
     /// Local opt-in, never negotiated from an untrusted peer. A native window
     /// is a sending allowance, not measured path capacity.
     pub native_service_guard_enabled: bool,
@@ -819,6 +857,14 @@ pub struct PathController {
     random_loss_service_enabled: bool,
     queue_gated_loss_enabled: bool,
     loss_floor: LossFloor,
+    loss_test: Option<LossTest>,
+    /// When the last test ended: later evidence must not predate it.
+    loss_tested_us: u64,
+    last_loss_test: Option<(u64, f64, f64)>,
+    /// Loss a test found unchanged at a lower pace, and when.
+    random_loss: Option<(f64, u64)>,
+    /// Pace below which a test found the path's own drops, and its expiry.
+    loss_ceiling: Option<(u64, u64)>,
     /// Raw and compensated cumulative delivered symbol bytes in this generation.
     compensated_delivery: Option<(u64, u64)>,
     source_local_min_rtt_ms: Option<f64>,
@@ -933,6 +979,11 @@ impl PathController {
             random_loss_service_enabled: false,
             queue_gated_loss_enabled: false,
             loss_floor: LossFloor::default(),
+            loss_test: None,
+            loss_tested_us: 0,
+            last_loss_test: None,
+            random_loss: None,
+            loss_ceiling: None,
             compensated_delivery: None,
             source_local_min_rtt_ms: None,
             source_probe_min_rtt_ms: None,
@@ -1877,6 +1928,8 @@ impl PathController {
             rtt_source_baseline_corrections: self.rtt_source_baseline_corrections,
             random_loss_floor,
             queue_gated_loss_hold: self.queue_gated_loss_enabled.then_some(loss_hold),
+            loss_ceiling_bps: self.loss_ceiling.map(|(bps, _)| bps),
+            loss_test: self.last_loss_test,
             native_service_guard_enabled: false,
             native_service_hint_bps: None,
             at_us: now,
@@ -3187,6 +3240,12 @@ impl PathController {
             // credit. A new control tick cannot reuse a previous clear reply.
             self.last_growth_probe = Some(observation.probe_sample_id);
         }
+        if self.queue_gated_loss_enabled
+            && self.test_clear_queue_loss(now, loss_batch, loss_hold, rtt)
+            && self.rate_bps < previous_rate
+        {
+            rate_reason = RateReason::LossTestBrake;
+        }
         self.rate_bps = self.rate_bps.min(self.maximum_bps).max(1);
         if ordinary_growth
             && self.rate_bps > previous_rate
@@ -3221,6 +3280,122 @@ impl PathController {
 
     /// 3% per step, doubled for each consecutive clean monitored increase up
     /// to 24%. The RTT headroom gain limit still applies to the result.
+    /// Held clear-queue loss beyond the path's random loss starts one test.
+    /// The pace first holds, so the reports describe it, then brakes to
+    /// `LOSS_TEST_SCALE`. Loss that falls with the pace was its own and caps
+    /// the pace below where it appeared; loss that stays is random and is
+    /// forgiven. Returns whether this observation lowered the pace.
+    fn test_clear_queue_loss(
+        &mut self,
+        now: u64,
+        batch: Option<(u64, u64)>,
+        loss_hold: bool,
+        rtt_ms: Option<f64>,
+    ) -> bool {
+        if let Some((ceiling, until)) = self.loss_ceiling
+            && now >= until
+        {
+            self.loss_ceiling = (self.rate_bps >= ceiling).then(|| {
+                (
+                    (ceiling as f64 * LOSS_CEILING_STEP) as u64,
+                    now + LOSS_CEILING_STEP_US,
+                )
+            });
+        }
+        self.random_loss = self
+            .random_loss
+            .filter(|(_, at)| now.saturating_sub(*at) < RANDOM_LOSS_US);
+        let random = self.random_loss.map_or(0.0, |(loss, _)| loss);
+        let excessive = |loss: f64| loss > random * 1.5 + LOSS_TEST_EXCESS;
+        // Receiver reports finalize loss after the data's own RTT.
+        let settle_us = rtt_ms
+            .map_or(PROBE_US, |ms| (ms * 3000.0) as u64)
+            .max(300_000);
+        let measure_us = rtt_ms
+            .map_or(PROBE_US, |ms| (ms * 2000.0) as u64)
+            .max(200_000);
+        let before = self.rate_bps;
+        if let Some(test) = self.loss_test.as_mut() {
+            if now >= test.measure_from_us
+                && let Some((expected, lost)) = batch
+            {
+                test.counts.0 += expected;
+                test.counts.1 += lost;
+            }
+            let (expected, lost) = test.counts;
+            let tested_bps = (test.from_bps as f64 * LOSS_TEST_SCALE) as u64;
+            let measured = expected >= LOSS_TEST_SYMBOLS
+                && now.saturating_sub(test.measure_from_us) >= measure_us;
+            let loss = lost as f64 / expected.max(1) as f64;
+            match (measured, test.held_loss) {
+                (true, None) if excessive(loss) => {
+                    test.held_loss = Some(loss);
+                    test.started_us = now;
+                    test.measure_from_us = now + settle_us;
+                    test.counts = (0, 0);
+                    self.rate_bps = self.rate_bps.min(tested_bps);
+                }
+                (true, held) => {
+                    let test = self.loss_test.take().expect("loss test");
+                    self.loss_tested_us = now;
+                    if let Some(held) = held {
+                        self.last_loss_test = Some((test.from_bps, held, loss));
+                        if loss > held * 0.7 && loss <= held * 1.2 {
+                            // Unchanged at a lower pace: the path's own loss.
+                            self.random_loss = Some((loss.min(held), now));
+                        } else if excessive(loss) {
+                            // Fewer drops but still too many, or more than
+                            // the held pace showed: stay at the tested pace;
+                            // the next test goes lower.
+                            self.loss_ceiling = Some((tested_bps, now + LOSS_CEILING_US));
+                        } else {
+                            self.loss_ceiling =
+                                Some(((test.from_bps as f64 * 0.9) as u64, now + LOSS_CEILING_US));
+                        }
+                    }
+                }
+                (false, _) if now.saturating_sub(test.started_us) >= LOSS_TEST_US => {
+                    self.loss_test = None;
+                    self.loss_tested_us = now;
+                }
+                (false, held) => {
+                    let pace = if held.is_some() {
+                        tested_bps
+                    } else {
+                        test.from_bps
+                    };
+                    self.rate_bps = self.rate_bps.min(pace);
+                }
+            }
+        } else if loss_hold
+            && self.rate_bps >= LOSS_TEST_MIN_BPS
+            && batch.is_some()
+            && self
+                .loss_evidence
+                .batches
+                .front()
+                .is_some_and(|(at, _, _)| *at > self.loss_tested_us)
+        {
+            let (expected, lost) = self.loss_evidence.counts();
+            if self.loss_evidence.batches.len() >= 2
+                && expected >= 128
+                && excessive(lost as f64 / expected as f64)
+            {
+                self.loss_test = Some(LossTest {
+                    from_bps: self.rate_bps,
+                    held_loss: None,
+                    started_us: now,
+                    measure_from_us: now + settle_us,
+                    counts: (0, 0),
+                });
+            }
+        }
+        if let Some((ceiling, _)) = self.loss_ceiling {
+            self.rate_bps = self.rate_bps.min(ceiling.max(MIN_BPS));
+        }
+        self.rate_bps < before
+    }
+
     fn cautious_gain(&self) -> f64 {
         let streak = if self.fast_recovery_enabled {
             self.clean_growth_streak
@@ -5136,9 +5311,74 @@ mod tests {
         // Loss beyond the learned floor: random-loss service alone still brakes.
         let (mut controller, mut sample) = random_loss_fixture(true);
         controller.queue_gated_loss_enabled = true;
+        // A test already found this loss unchanged at a lower pace.
+        controller.random_loss = Some((0.1, sample.now_us));
         sample.delivered_bytes = 3_420_000;
         sample.delivered_bps = Some(6_700_000.0);
         (controller, sample)
+    }
+
+    #[test]
+    fn clear_queue_loss_that_falls_with_the_pace_caps_it_and_random_loss_is_forgiven() {
+        let tested = |after: (u64, u64)| {
+            let mut controller = PathController::new(1_000_000_000, 20).with_queue_gated_loss(true);
+            controller.rate_bps = 100_000_000;
+            let now = 10_000_000;
+            let rtt = Some(100.0);
+            controller.loss_evidence.batches =
+                VecDeque::from([(now - 100_000, 1_000, 50), (now, 1_000, 50)]);
+            // The pace holds until reports describe it.
+            assert!(!controller.test_clear_queue_loss(now, Some((1_000, 50)), true, rtt));
+            controller.rate_bps = 120_000_000;
+            controller.test_clear_queue_loss(now + 300_000, Some((1_000, 50)), true, rtt);
+            assert_eq!(controller.rate_bps, 100_000_000);
+            assert!(controller.test_clear_queue_loss(now + 500_000, Some((0, 0)), true, rtt));
+            assert_eq!(controller.rate_bps, 75_000_000);
+            // The brake has not reached the receiver yet.
+            controller.rate_bps = 100_000_000;
+            controller.test_clear_queue_loss(now + 600_000, Some((1_000, 50)), true, rtt);
+            assert_eq!(controller.rate_bps, 75_000_000);
+            controller.test_clear_queue_loss(now + 800_000, Some(after), true, rtt);
+            assert!(
+                controller.loss_test.is_some(),
+                "two RTTs of reports at the tested pace"
+            );
+            controller.test_clear_queue_loss(now + 1_000_000, Some((0, 0)), true, rtt);
+            assert!(controller.loss_test.is_none());
+            controller.rate_bps = 200_000_000;
+            controller.test_clear_queue_loss(now + 1_100_000, None, true, rtt);
+            controller
+        };
+        let policed = tested((600, 3));
+        assert_eq!(
+            policed.rate_bps, 90_000_000,
+            "capped below the dropping pace"
+        );
+        assert!(policed.random_loss.is_none());
+        let reduced = tested((600, 18));
+        assert_eq!(reduced.rate_bps, 75_000_000, "fewer but still excess drops");
+        let random = tested((600, 30));
+        assert_eq!(random.rate_bps, 200_000_000);
+        assert_eq!(random.random_loss.map(|(loss, _)| loss), Some(0.05));
+        // The same loss later does not test again.
+        let mut random = random;
+        let now = 12_000_000;
+        random.loss_evidence.batches =
+            VecDeque::from([(now - 100_000, 1_000, 50), (now, 1_000, 50)]);
+        random.test_clear_queue_loss(now, Some((1_000, 50)), true, Some(100.0));
+        assert!(random.loss_test.is_none());
+
+        // A held pace whose reports show tolerable loss is not braked.
+        let mut controller = PathController::new(1_000_000_000, 20).with_queue_gated_loss(true);
+        controller.rate_bps = 100_000_000;
+        let now = 10_000_000;
+        controller.loss_evidence.batches =
+            VecDeque::from([(now - 100_000, 1_000, 50), (now, 1_000, 50)]);
+        controller.test_clear_queue_loss(now, Some((1_000, 50)), true, Some(100.0));
+        controller.test_clear_queue_loss(now + 300_000, Some((1_000, 5)), true, Some(100.0));
+        assert!(!controller.test_clear_queue_loss(now + 500_000, Some((0, 0)), true, Some(100.0)));
+        assert!(controller.loss_test.is_none());
+        assert_eq!(controller.rate_bps, 100_000_000);
     }
 
     #[test]
