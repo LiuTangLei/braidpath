@@ -1116,6 +1116,15 @@ impl PathController {
         self.shared_loss = shared;
     }
 
+    /// Reuse this path's qualified evidence from a rejected aggregate trial.
+    /// This seeds only the existing finite loss-test cache, not queue/service
+    /// protections, and must never cross a path generation.
+    pub(crate) fn inherit_random_loss(&mut self, generation: u64, fraction: f64, now_us: u64) {
+        if self.queue_gated_loss_enabled && self.generation == Some(generation) {
+            self.random_loss = Some((fraction, now_us));
+        }
+    }
+
     /// Queue delay below which loss-only brakes are held (queue-gated mode).
     fn queue_gated_loss_limit_ms(&self) -> f64 {
         self.target_ms * QUEUE_GATED_LOSS_FRACTION
@@ -5345,6 +5354,46 @@ mod tests {
         sample.delivered_bytes = 3_420_000;
         sample.delivered_bps = Some(6_700_000.0);
         (controller, sample)
+    }
+
+    #[test]
+    fn shared_random_loss_avoids_a_duplicate_test_but_extra_loss_still_tests() {
+        let mut c = PathController::new(1_000_000_000, 20).with_queue_gated_loss(true);
+        c.generation = Some(7);
+        c.rate_bps = 100_000_000;
+        let now = 10_000_000;
+        c.inherit_random_loss(7, 0.11, now);
+        c.loss_evidence.batches = VecDeque::from([(now - 100_000, 1_000, 110), (now, 1_000, 110)]);
+        c.test_clear_queue_loss(now, Some((1_000, 110)), true, Some(100.0));
+        assert!(c.loss_test.is_none());
+        assert_eq!(c.rate_bps, 100_000_000);
+        c.loss_evidence.batches =
+            VecDeque::from([(now + 100_000, 1_000, 300), (now + 200_000, 1_000, 300)]);
+        c.test_clear_queue_loss(now + 200_000, Some((1_000, 300)), true, Some(100.0));
+        assert!(c.loss_test.is_some(), "new excess is still investigated");
+    }
+
+    #[test]
+    fn shared_random_loss_expires_and_cannot_cross_generation_or_legacy_mode() {
+        let mut c = PathController::new(1_000_000_000, 20).with_queue_gated_loss(true);
+        c.generation = Some(7);
+        c.inherit_random_loss(8, 0.11, 1_000_000);
+        assert!(c.random_loss.is_none());
+        c.inherit_random_loss(7, 0.11, 1_000_000);
+        assert_eq!(c.random_loss, Some((0.11, 1_000_000)));
+        c.test_clear_queue_loss(1_000_000 + RANDOM_LOSS_US, None, true, Some(100.0));
+        assert!(c.random_loss.is_none());
+        c.queue_gated_loss_enabled = false;
+        c.inherit_random_loss(7, 0.11, 40_000_000);
+        assert!(c.random_loss.is_none());
+        let (mut active, mut sample) = queue_gated_fixture();
+        active.inherit_random_loss(sample.generation, 0.11, sample.now_us);
+        sample.generation += 1;
+        active.observe(&sample);
+        assert!(
+            active.random_loss.is_none(),
+            "a new generation discards the cache"
+        );
     }
 
     #[test]

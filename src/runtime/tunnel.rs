@@ -1929,8 +1929,12 @@ async fn sender(
                     .collect();
                 cap_changed |= guard.observe(now_us, &counts, sent_bytes);
                 metrics.publish_forward_guard(guard.snapshot());
-                for controller in &mut controllers {
+                let learned = guard.take_random_loss();
+                for (id, controller) in controllers.iter_mut().enumerate() {
                     controller.set_shared_loss(guard.shared_loss());
+                    if let Some(loss) = learned[id] {
+                        controller.inherit_random_loss(loss.generation, loss.fraction, now_us);
+                    }
                 }
             }
             if cap_changed {

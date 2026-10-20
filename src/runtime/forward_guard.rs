@@ -19,7 +19,10 @@
 //! long as the cut does not go far below it, which is why the cut follows the
 //! excess. A trial whose delivery falls by less than half of the cut keeps the
 //! cap. A rejected trial records the loss as a rate-independent floor, as the
-//! reverse guard does.
+//! reverse guard does. If actual sending exercised the cut, each qualified
+//! same-generation path can reuse its smaller before/after loss once through
+//! the per-path controller's existing finite cache; queues and new loss remain
+//! independently protected.
 //!
 //! A kept cap follows loss above its learned floor. Below the most recent
 //! overrun rate it grows by 5%; at or above 95% of that rate it only probes by
@@ -86,6 +89,13 @@ pub struct Counts {
     pub lost: u64,
 }
 
+/// A same-generation loss observation under a rejected aggregate trial.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct RandomLoss {
+    pub generation: u64,
+    pub fraction: f64,
+}
+
 /// One window: the measured send rate and the aggregate loss reported for it.
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct Window {
@@ -106,6 +116,7 @@ enum State {
         cap: f64,
         before: Window,
         loss_before: f64,
+        paths_before: [Option<RandomLoss>; MAX_PATHS],
         windows: u8,
         /// Sums of sent and delivered rates over the measured windows.
         sent: f64,
@@ -154,6 +165,8 @@ pub struct Snapshot {
 pub struct Guard {
     last: [Option<Counts>; MAX_PATHS],
     settlement: Option<Settlement>,
+    window_losses: [Option<RandomLoss>; MAX_PATHS],
+    learned_losses: [Option<RandomLoss>; MAX_PATHS],
     expected: [u64; MAX_PATHS],
     lost: [u64; MAX_PATHS],
     connected: usize,
@@ -172,6 +185,8 @@ impl Default for Guard {
         Self {
             last: [None; MAX_PATHS],
             settlement: None,
+            window_losses: [None; MAX_PATHS],
+            learned_losses: [None; MAX_PATHS],
             expected: [0; MAX_PATHS],
             lost: [0; MAX_PATHS],
             connected: 0,
@@ -197,6 +212,11 @@ impl Guard {
         self.snapshot.clone()
     }
 
+    /// Consumed once so periodic observations cannot renew a path's cache.
+    pub(crate) fn take_random_loss(&mut self) -> [Option<RandomLoss>; MAX_PATHS] {
+        std::mem::replace(&mut self.learned_losses, [None; MAX_PATHS])
+    }
+
     pub fn cap_bps(&self) -> Option<u64> {
         self.snapshot.cap_bps
     }
@@ -211,6 +231,7 @@ impl Guard {
     /// direction's cumulative transmitted symbol bytes over all paths.
     /// Returns whether the cap changed.
     pub fn observe(&mut self, now_us: u64, paths: &[(usize, Counts)], sent_bytes: u64) -> bool {
+        self.learned_losses = [None; MAX_PATHS];
         self.connected = paths.iter().filter(|(id, _)| *id < MAX_PATHS).count();
         let mut present = [false; MAX_PATHS];
         for &(id, counts) in paths {
@@ -291,6 +312,16 @@ impl Guard {
         let window = common.map(|_| Window {
             sent,
             loss: lost as f64 / expected.max(1) as f64,
+        });
+        self.window_losses = std::array::from_fn(|id| {
+            (self.expected[id] >= MIN_PATH_SYMBOLS)
+                .then(|| {
+                    self.last[id].map(|counts| RandomLoss {
+                        generation: counts.generation,
+                        fraction: self.lost[id] as f64 / self.expected[id] as f64,
+                    })
+                })
+                .flatten()
         });
         self.expected = [0; MAX_PATHS];
         self.lost = [0; MAX_PATHS];
@@ -392,6 +423,7 @@ impl Guard {
                             cap: (before.sent * fraction).max(MIN_CAP_BPS),
                             before,
                             loss_before: loss,
+                            paths_before: self.window_losses,
                             windows: 0,
                             sent: 0.0,
                             delivered: 0.0,
@@ -406,6 +438,7 @@ impl Guard {
                 cap,
                 before,
                 loss_before,
+                paths_before,
                 windows,
                 mut sent,
                 mut delivered,
@@ -442,6 +475,24 @@ impl Guard {
                         }
                     } else {
                         self.snapshot.rejected += 1;
+                        if cut <= MIN_CUT && sent / n >= cap * BINDING {
+                            // Do not repeat the same rate test per path. Use
+                            // only that path's smaller qualified before/after
+                            // loss; a clean route cannot inherit a noisy one's.
+                            self.learned_losses = std::array::from_fn(|id| {
+                                match (paths_before[id], self.window_losses[id]) {
+                                    (Some(before), Some(after))
+                                        if before.generation == after.generation =>
+                                    {
+                                        Some(RandomLoss {
+                                            generation: after.generation,
+                                            fraction: before.fraction.min(after.fraction),
+                                        })
+                                    }
+                                    _ => None,
+                                }
+                            });
+                        }
                         self.snapshot.floor = self.snapshot.floor.max(loss_before);
                         self.retest_after_us = now_us.saturating_add(RETEST_US);
                         State::Open
@@ -456,6 +507,7 @@ impl Guard {
                         cap,
                         before,
                         loss_before,
+                        paths_before,
                         windows: windows + 1,
                         sent,
                         delivered,
@@ -946,5 +998,43 @@ mod tests {
             (0, 0)
         );
         assert_eq!(d.guard.snapshot().floor, 0.0);
+    }
+    #[test]
+    fn rejected_shared_trial_exports_only_each_paths_conservative_loss() {
+        let mut d = Drive::new();
+        let before = [0.0, 0.10, 0.12, 0.14];
+        let after = [0.20, 0.11, 0.11, 0.13];
+        d.window(before, 100e6);
+        let cap = d.window(before, 100e6).unwrap() as f64;
+        for _ in 0..2 {
+            d.window(after, cap);
+        }
+        assert_eq!(d.guard.snapshot().rejected, 1);
+        let floors = d.guard.take_random_loss();
+        for (id, loss) in [0.0, 0.10, 0.11, 0.13].into_iter().enumerate() {
+            assert_eq!(
+                floors[id],
+                Some(RandomLoss {
+                    generation: 7,
+                    fraction: loss
+                })
+            );
+        }
+        assert!(
+            d.guard.take_random_loss().iter().all(Option::is_none),
+            "one-shot proof"
+        );
+    }
+
+    #[test]
+    fn idle_sender_cannot_export_a_random_loss_baseline() {
+        let mut d = Drive::new();
+        d.window([0.11; 4], 100e6);
+        d.window([0.11; 4], 100e6).unwrap();
+        for _ in 0..2 {
+            d.window([0.11; 4], 1e6);
+        }
+        assert_eq!(d.guard.snapshot().rejected, 1);
+        assert!(d.guard.take_random_loss().iter().all(Option::is_none));
     }
 }
