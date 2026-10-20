@@ -39,6 +39,7 @@ struct Shared {
     queued: AtomicUsize,
     budget: AtomicUsize,
     wake: Notify,
+    admission: Notify,
     stopped: AtomicBool,
 }
 
@@ -118,10 +119,16 @@ impl Writer {
             let drained = self.conn.datagrams_drained();
             tokio::pin!(drained);
             drained.as_mut().enable();
+            let admitted = self.shared.admission.notified();
+            tokio::pin!(admitted);
+            admitted.as_mut().enable();
             if self.admits(bytes) || self.conn.is_closed() {
                 return;
             }
-            drained.await;
+            tokio::select! {
+                () = &mut drained => {},
+                () = &mut admitted => {},
+            }
         }
     }
 }
@@ -143,29 +150,37 @@ async fn run(conn: quinn::Connection, shared: Arc<Shared>, capacity: usize) {
         }
         let budget = shared.budget.load(Ordering::Relaxed);
         loop {
-            let Some(len) = shared
-                .queue
-                .lock()
-                .expect("writer queue")
-                .front()
-                .map(Bytes::len)
-            else {
-                break;
+            #[cfg(test)]
+            TEST_BEFORE_POP.with(|hook| {
+                let f = hook.borrow_mut().take();
+                if let Some(f) = f {
+                    f();
+                }
+            });
+            let (data, len) = {
+                let mut queue = shared.queue.lock().expect("writer queue");
+                let Some(len) = queue.front().map(Bytes::len) else {
+                    break;
+                };
+                let in_quinn = capacity.saturating_sub(conn.datagram_send_buffer_space_hint());
+                if in_quinn > 0 && in_quinn + len > budget {
+                    break;
+                }
+                (queue.pop_front().expect("front datagram"), len)
             };
-            let in_quinn = capacity.saturating_sub(conn.datagram_send_buffer_space_hint());
-            if in_quinn > 0 && in_quinn + len > budget {
-                break;
-            }
-            let data = shared
-                .queue
-                .lock()
-                .expect("writer queue")
-                .pop_front()
-                .expect("front datagram");
             // Quinn's space shrinks before the queue does, so `held` never
             // understates. A refused datagram is a closed or resized path.
             let _ = conn.send_datagram(data);
+            #[cfg(test)]
+            {
+                let pause = TEST_AFTER_SEND.with(|hook| hook.borrow_mut().take());
+                if let Some((ready, proceed)) = pause {
+                    let _ = ready.send(());
+                    let _ = proceed.await;
+                }
+            }
             shared.queued.fetch_sub(len, Ordering::AcqRel);
+            shared.admission.notify_waiters();
         }
         // Space and closure both arrive as drain notifications.
         tokio::select! {
@@ -178,4 +193,26 @@ async fn run(conn: quinn::Connection, shared: Arc<Shared>, capacity: usize) {
         queue.drain(..).map(|data| data.len()).sum(),
         Ordering::AcqRel,
     );
+}
+
+// Deterministic tests model preemption on the unlocked queue and after Quinn
+// accepts a datagram, before local accounting releases it.
+#[cfg(test)]
+thread_local! {
+    static TEST_BEFORE_POP: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+    static TEST_AFTER_SEND: std::cell::RefCell<Option<(tokio::sync::oneshot::Sender<()>, tokio::sync::oneshot::Receiver<()>)>> = const { std::cell::RefCell::new(None) };
+}
+#[cfg(test)]
+pub(super) fn test_before_pop(f: impl FnOnce() + 'static) {
+    TEST_BEFORE_POP.with(|hook| *hook.borrow_mut() = Some(Box::new(f)));
+}
+#[cfg(test)]
+pub(super) fn test_after_send() -> (
+    tokio::sync::oneshot::Receiver<()>,
+    tokio::sync::oneshot::Sender<()>,
+) {
+    let (ready, entered) = tokio::sync::oneshot::channel();
+    let (release, proceed) = tokio::sync::oneshot::channel();
+    TEST_AFTER_SEND.with(|hook| *hook.borrow_mut() = Some((ready, proceed)));
+    (entered, release)
 }

@@ -2198,3 +2198,52 @@ async fn native_sender_records_bbr_startup_budget_and_delivers_the_original() {
         );
     });
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn writer_control_prepend_preserves_byte_accounting() {
+    let pair = Pair::connect().await;
+    let path = pair.path();
+    path.writer.set_pace(80_000_000);
+    let writer = path.writer.clone();
+    writer::test_before_pop(move || {
+        assert!(writer.send_first(Bytes::from_static(b"ctl")));
+    });
+    assert!(path.writer.send(Bytes::from(vec![0xa5; 900])));
+    assert_eq!(pair.receive().await.as_ref(), b"ctl");
+    assert_eq!(pair.receive().await.len(), 900);
+    assert_eq!(
+        path.writer.held(),
+        0,
+        "drained writer byte count must not wrap"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn writer_queue_accounting_release_wakes_admission() {
+    let pair = Pair::connect().await;
+    let path = pair.path();
+    let (entered, release) = writer::test_after_send();
+    assert!(path.writer.send(Bytes::from(vec![0xa5; 900])));
+    entered.await.unwrap();
+    assert_eq!(pair.receive().await.len(), 900);
+    // Quinn is empty, but the transferring item is still counted by Writer.
+    assert!(!path.writer.admits(900));
+    let mut admitted = Box::pin(path.writer.admitted(900));
+    let wakes = Arc::new(Wakes::default());
+    let waker = Waker::from(wakes.clone());
+    let mut cx = std::task::Context::from_waker(&waker);
+    assert!(admitted.as_mut().poll(&mut cx).is_pending());
+    release.send(()).unwrap();
+    timeout(Duration::from_secs(1), async {
+        while !path.writer.admits(900) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(path.writer.admits(900));
+    assert!(
+        admitted.as_mut().poll(&mut cx).is_ready(),
+        "writer freed its last queued bytes after Quinn's drain notification; the waiter must wake and finish"
+    );
+}
