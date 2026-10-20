@@ -33,6 +33,10 @@ const WANDER_CAPACITY: usize = 64;
 const WANDER_QUANTILE: f64 = 0.9;
 const WANDER_TARGETS: f64 = 4.0;
 const WANDER_HALF_LIFE_US: u64 = 60_000_000;
+/// Above the start pace, a pace up to `LIGHT_BPS` also learns wander while its
+/// delivery keeps up with its admission: a bottleneck slower than the pace
+/// queues and underdelivers instead. Such samples discount at most one target.
+const WANDER_KEEP_UP: f64 = 0.85;
 const START_BPS: u64 = 256_000;
 const MIN_BPS: u64 = 64_000;
 const LOSS_WINDOW_US: u64 = 4_000_000;
@@ -849,6 +853,8 @@ pub struct PathController {
     light_baseline: Option<LightBaseline>,
     /// Recent light-pace RTT excess samples, oldest first.
     wander_samples: VecDeque<(u64, f64)>,
+    /// The same above the start pace, each at most one latency target.
+    served_wander_samples: VecDeque<(u64, f64)>,
     light_since_us: Option<u64>,
     /// The light pace has shown an excess below the brake threshold, so an
     /// earlier queue of this path has drained.
@@ -955,6 +961,7 @@ impl PathController {
             standing_delay: None,
             light_baseline: None,
             wander_samples: VecDeque::new(),
+            served_wander_samples: VecDeque::new(),
             light_since_us: None,
             light_drained: false,
             wander_ms: 0.0,
@@ -3803,8 +3810,11 @@ impl PathController {
     /// latency. The discount is the upper decile of recent light samples, so
     /// the latency target still bounds the queue this path adds on top of most
     /// of its wander; a lower quantile undercounts it, because a light pace
-    /// takes few RTT samples and its smoothed RTT follows the wander less. A heavier pace holds the discount, decaying, because its
-    /// excess includes its own queue. Returns the discount now in force.
+    /// takes few RTT samples and its smoothed RTT follows the wander less.
+    /// Up to `LIGHT_BPS`, a pace whose delivery keeps up with its admission
+    /// also learns, each sample capped at one target. A heavier pace holds the
+    /// discount, decaying, because its excess includes its own queue. Returns
+    /// the discount now in force.
     fn observe_wander(
         &mut self,
         now: u64,
@@ -3813,7 +3823,15 @@ impl PathController {
         new_sample: bool,
         observation: &Observation,
     ) -> f64 {
-        let light = self.rate_bps <= WANDER_BPS
+        let start_pace = self.rate_bps <= WANDER_BPS;
+        let served = self.rate_bps <= LIGHT_BPS
+            && self.service_window.latest(now).is_some_and(|sample| {
+                now.saturating_sub(sample.observed_us) <= LIGHT_WINDOW_US
+                    && sample.admission.is_some_and(|admission| {
+                        admission.bps > 0.0 && sample.bps >= admission.bps * WANDER_KEEP_UP
+                    })
+            });
+        let light = (start_pace || served)
             && !observation.transport_blocked
             && observation.send_queue_bytes <= 2400;
         if !light {
@@ -3823,26 +3841,46 @@ impl PathController {
         let since = light.then(|| *self.light_since_us.get_or_insert(now));
         self.light_drained |= light && new_sample && excess_ms <= self.target_ms * 0.5;
         let settle = ((2.0 * rtt_ms * 1000.0) as u64).max(400_000);
-        while self
-            .wander_samples
-            .front()
-            .is_some_and(|(at, _)| now.saturating_sub(*at) > WANDER_WINDOW_US)
-        {
-            self.wander_samples.pop_front();
+        for samples in [&mut self.wander_samples, &mut self.served_wander_samples] {
+            while samples
+                .front()
+                .is_some_and(|(at, _)| now.saturating_sub(*at) > WANDER_WINDOW_US)
+            {
+                samples.pop_front();
+            }
         }
         if new_sample
             && self.light_drained
             && since.is_some_and(|since| now.saturating_sub(since) >= settle)
         {
-            if self.wander_samples.len() == WANDER_CAPACITY {
-                self.wander_samples.pop_front();
+            let (samples, sample) = if start_pace {
+                (&mut self.wander_samples, excess_ms.max(0.0))
+            } else {
+                (
+                    &mut self.served_wander_samples,
+                    excess_ms.clamp(0.0, self.target_ms),
+                )
+            };
+            if samples.len() == WANDER_CAPACITY {
+                samples.pop_front();
             }
-            self.wander_samples.push_back((now, excess_ms.max(0.0)));
-            if self.wander_samples.len() >= WANDER_SAMPLES {
-                let mut excess: Vec<f64> = self.wander_samples.iter().map(|(_, ms)| *ms).collect();
-                excess.sort_by(f64::total_cmp);
-                let rank = ((excess.len() as f64 * WANDER_QUANTILE).ceil() as usize).max(1);
-                self.wander_ms = excess[rank - 1].min(self.target_ms * WANDER_TARGETS);
+            samples.push_back((now, sample));
+            let decile = |samples: &VecDeque<(u64, f64)>| {
+                (samples.len() >= WANDER_SAMPLES).then(|| {
+                    let mut excess: Vec<f64> = samples.iter().map(|(_, ms)| *ms).collect();
+                    excess.sort_by(f64::total_cmp);
+                    let rank = ((excess.len() as f64 * WANDER_QUANTILE).ceil() as usize).max(1);
+                    excess[rank - 1]
+                })
+            };
+            let start =
+                decile(&self.wander_samples).map(|ms| ms.min(self.target_ms * WANDER_TARGETS));
+            let wander = start
+                .into_iter()
+                .chain(decile(&self.served_wander_samples))
+                .reduce(f64::max);
+            if let Some(wander) = wander {
+                self.wander_ms = wander;
                 self.wander_us = now;
             }
         }
@@ -3853,7 +3891,11 @@ impl PathController {
     /// Raise every queue reference by an excess that braking did not drain.
     fn refresh_baseline(&mut self, shift_ms: f64) {
         self.wander_ms = (self.wander_ms - shift_ms).max(0.0);
-        for (_, excess) in &mut self.wander_samples {
+        for (_, excess) in self
+            .wander_samples
+            .iter_mut()
+            .chain(self.served_wander_samples.iter_mut())
+        {
             *excess = (*excess - shift_ms).max(0.0);
         }
         for minimum in [
@@ -10702,10 +10744,48 @@ mod tests {
         assert_eq!(capped, 80.0, "at most four latency targets");
     }
 
+    /// Wander at a pace above the start pace, with receiver reports every
+    /// 100 ms delivering `delivered` of each admitted byte.
+    fn served_wander(delivered: f64, excess: &[f64]) -> f64 {
+        let mut controller = PathController::new(20_000_000, 20);
+        controller.rate_bps = 512_000;
+        let mut wander = 0.0;
+        for (index, now) in (100_000..6_000_000u64).step_by(100_000).enumerate() {
+            let admitted = now * 64 / 1_000;
+            controller.service_window.observe(
+                index as u64,
+                Some(now),
+                (admitted as f64 * delivered) as u64,
+                now,
+                Some((admitted, admitted / 1_000)),
+            );
+            let sample = observation(now, 105.0);
+            wander =
+                controller.observe_wander(now, 105.0, excess[index % excess.len()], true, &sample);
+        }
+        wander
+    }
+
+    #[test]
+    fn a_served_light_pace_discounts_wander_up_to_one_target() {
+        let wander = served_wander(0.95, &[2.0, 6.0, 10.0, 14.0]);
+        assert!((10.0..=14.0).contains(&wander), "{wander}");
+        assert_eq!(
+            served_wander(0.95, &[5.0, 40.0, 60.0]),
+            20.0,
+            "above the start pace at most one target"
+        );
+        assert_eq!(
+            served_wander(0.7, &[2.0, 6.0, 10.0, 14.0]),
+            0.0,
+            "an underdelivering pace may be building its own queue"
+        );
+    }
+
     #[test]
     fn a_heavy_pace_never_learns_rtt_wander() {
         let mut controller = PathController::new(20_000_000, 20);
-        controller.rate_bps = 2 * WANDER_BPS;
+        controller.rate_bps = 2 * LIGHT_BPS;
         assert_eq!(
             wander_for(&mut controller, 100_000, 10_000_000, &[0.0, 30.0, 60.0]),
             0.0
