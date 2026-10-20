@@ -21,15 +21,14 @@
 //! cap. A rejected trial records the loss as a rate-independent floor, as the
 //! reverse guard does.
 //!
-//! A kept cap follows the loss above the floor it learned under the cap: loss
-//! beyond the floor in two windows, or twice as far in one, sets the cap to
-//! the rate that delivers the measured delivery at the floor loss, and a clean
-//! binding window grows it by 5%, or by 1% within 5% of the rate the last
-//! decrease cut from. Reports of the old load arrive for two more windows,
-//! which decide nothing. A decrease that leaves the loss unchanged shows that
-//! the loss no longer depends on the rate there, and raises the floor instead
-//! of falling further. It bounds the aggregate pacer only. This is a
-//! heuristic, not a capacity measurement.
+//! A kept cap follows loss above its learned floor. Below the most recent
+//! overrun rate it grows by 5%; at or above 95% of that rate it only probes by
+//! 1%, including after crossing that rate. Every cut waits at least two seconds
+//! and for every connected path's finalized prefix to pass the symbol admitted
+//! at the cut. Only subsequent report intervals enter decisions. An unchanged
+//! loss raises the floor only if the actual sending rate also fell by 5%.
+//! This bounds the aggregate pacer, not individual path clocks or native
+//! congestion control, and remains a heuristic rather than a capacity proof.
 use super::MAX_PATHS;
 use serde::Serialize;
 
@@ -52,11 +51,12 @@ const HELD: f64 = 0.5;
 /// A trial whose rate stayed this far above its cap did not bind.
 const UNBOUND: f64 = 0.07;
 const INCREASE: f64 = 1.05;
-/// Growth within `PLATEAU` of the rate the last decrease cut from.
+/// Slow growth at and above this neighborhood of the last overrun rate.
 const PLATEAU_INCREASE: f64 = 1.01;
 const PLATEAU: f64 = 0.05;
-/// Windows after a decrease that still carry reports of the old load.
-const COOLING_WINDOWS: u8 = 2;
+/// Minimum settling time; finalized sequence watermarks must also pass the cut.
+const SETTLE_US: u64 = 2_000_000;
+const TRIAL_WINDOWS: u8 = 20;
 /// A decrease cuts at most to this fraction of the lower of cap and rate.
 const MAX_CUT: f64 = 0.7;
 const MIN_CUT: f64 = 0.95;
@@ -78,6 +78,8 @@ const RELEASE_WINDOWS: u32 = 20;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Counts {
     pub generation: u64,
+    /// Cumulative local admission, used to identify pre-cut feedback.
+    pub sent_symbols: u64,
     pub expected: u64,
     pub lost: u64,
 }
@@ -115,11 +117,10 @@ enum State {
         slack_windows: u32,
         /// Rate the latest decrease cut from.
         peak: f64,
-        cooling: u8,
         /// The previous window's loss was beyond the floor.
         excess: bool,
         /// Loss before the latest decrease, to check that it fell.
-        decreased_from: Option<f64>,
+        decreased_from: Option<(f64, f64)>,
     },
 }
 
@@ -132,6 +133,9 @@ pub struct Snapshot {
     pub rejected: u64,
     pub inconclusive: u64,
     pub decreases: u64,
+    /// A post-cut decision requires both a grace period and post-cut symbols.
+    pub settling: bool,
+    pub growth_threshold_bps: Option<u64>,
     pub releases: u64,
     /// Forward loss of the last decided window that most routes reach, before FEC.
     pub forward_loss: Option<f64>,
@@ -147,6 +151,7 @@ pub struct Snapshot {
 
 pub struct Guard {
     last: [Option<Counts>; MAX_PATHS],
+    settlement: Option<Settlement>,
     expected: [u64; MAX_PATHS],
     lost: [u64; MAX_PATHS],
     connected: usize,
@@ -164,6 +169,7 @@ impl Default for Guard {
     fn default() -> Self {
         Self {
             last: [None; MAX_PATHS],
+            settlement: None,
             expected: [0; MAX_PATHS],
             lost: [0; MAX_PATHS],
             connected: 0,
@@ -176,6 +182,12 @@ impl Default for Guard {
             snapshot: Snapshot::default(),
         }
     }
+}
+
+/// Local admission watermarks avoid comparing sender and receiver clocks.
+struct Settlement {
+    started_us: u64,
+    marks: [Option<Counts>; MAX_PATHS],
 }
 
 impl Guard {
@@ -198,12 +210,49 @@ impl Guard {
     /// Returns whether the cap changed.
     pub fn observe(&mut self, now_us: u64, paths: &[(usize, Counts)], sent_bytes: u64) -> bool {
         self.connected = paths.iter().filter(|(id, _)| *id < MAX_PATHS).count();
+        let mut present = [false; MAX_PATHS];
+        for &(id, counts) in paths {
+            if id >= MAX_PATHS {
+                continue;
+            }
+            present[id] = true;
+            if let Some(wait) = self.settlement.as_mut()
+                && wait.marks[id].is_none_or(|mark| mark.generation != counts.generation)
+            {
+                // A replacement cannot prove delivery of the previous generation.
+                wait.marks[id] = Some(counts);
+                wait.started_us = now_us;
+            }
+        }
+        for (id, present) in present.iter().enumerate() {
+            if !present {
+                self.last[id] = None;
+                self.expected[id] = 0;
+                self.lost[id] = 0;
+            }
+        }
+        let ready = self.settlement.as_ref().is_none_or(|wait| {
+            now_us.saturating_sub(wait.started_us) >= SETTLE_US
+                && paths
+                    .iter()
+                    .filter(|(id, _)| *id < MAX_PATHS)
+                    .all(|(id, _)| match (wait.marks[*id], self.last[*id]) {
+                        (Some(mark), Some(old)) => {
+                            old.generation == mark.generation && old.expected >= mark.sent_symbols
+                        }
+                        _ => false,
+                    })
+        });
+        if ready {
+            self.settlement = None;
+        }
         for &(id, counts) in paths {
             let Some(slot) = self.last.get_mut(id) else {
                 continue;
             };
             // A new generation restarts its own baseline; counts never go back.
-            if let Some(old) = *slot
+            if ready
+                && let Some(old) = *slot
                 && old.generation == counts.generation
                 && counts.expected >= old.expected
                 && counts.lost >= old.lost
@@ -248,6 +297,23 @@ impl Guard {
             State::Open => (None, None),
             State::Trial { cap, .. } => (Some(cap as u64), None),
             State::Limited { cap, floor, .. } => (Some(cap as u64), Some(floor)),
+        };
+        if self
+            .snapshot
+            .cap_bps
+            .is_some_and(|cap| before.is_none_or(|old| cap < old))
+        {
+            // Discard every report interval that may straddle this rate change.
+            self.settlement = Some(Settlement {
+                started_us: now_us,
+                marks: self.last,
+            });
+            self.previous = None;
+        }
+        self.snapshot.settling = self.settlement.is_some();
+        self.snapshot.growth_threshold_bps = match self.state {
+            State::Limited { peak, .. } => Some((peak * (1.0 - PLATEAU)) as u64),
+            _ => None,
         };
         self.snapshot.cap_bps != before
     }
@@ -336,10 +402,8 @@ impl Guard {
                 mut measured,
                 mut loss_under,
             } => {
-                // The first window still carries the old rate's reports.
-                if windows > 0
-                    && let Some((loss, window)) = report
-                {
+                // observe() admits only post-cut finalized intervals after settlement.
+                if let Some((loss, window)) = report {
                     sent += window.sent;
                     delivered += window.delivered();
                     loss_under = loss_under.max(loss);
@@ -363,7 +427,6 @@ impl Guard {
                             floor: loss_under.min(floor),
                             slack_windows: 0,
                             peak: before.sent,
-                            cooling: 0,
                             excess: false,
                             decreased_from: None,
                         }
@@ -373,8 +436,10 @@ impl Guard {
                         self.retest_after_us = now_us.saturating_add(RETEST_US);
                         State::Open
                     }
-                } else if windows >= 5 {
-                    // The sender stopped: no answer, and no load.
+                } else if windows >= TRIAL_WINDOWS {
+                    // Missing post-cut reports cannot establish random loss.
+                    self.snapshot.inconclusive += 1;
+                    self.retest_after_us = now_us.saturating_add(INCONCLUSIVE_RETEST_US);
                     State::Open
                 } else {
                     State::Trial {
@@ -394,14 +459,12 @@ impl Guard {
                 mut floor,
                 slack_windows,
                 mut peak,
-                mut cooling,
                 mut excess,
                 mut decreased_from,
             } => {
-                if cooling > 0 {
-                    cooling -= 1;
-                } else if let Some((loss, window)) = report {
-                    if let Some(from) = decreased_from.take()
+                if let Some((loss, window)) = report {
+                    if let Some((from, previous_sent)) = decreased_from.take()
+                        && window.sent <= previous_sent * MIN_CUT
                         && loss >= from - EXCESS / 2.0
                     {
                         // A lower rate lost as much: this loss is the path's.
@@ -419,8 +482,7 @@ impl Guard {
                     let base = cap.min(sent);
                     if beyond && (excess || loss > floor + 2.0 * EXCESS) {
                         self.snapshot.decreases += 1;
-                        cooling = COOLING_WINDOWS;
-                        decreased_from = Some(loss);
+                        decreased_from = Some((loss, sent));
                         peak = base;
                         cap = (sent * (1.0 - loss) / (1.0 - floor).max(0.05))
                             .clamp(base * MAX_CUT, base * MIN_CUT)
@@ -429,13 +491,13 @@ impl Guard {
                         // Grow only a cap that binds; one far above the rate
                         // the sender reaches would no longer describe the link.
                         // Near the rate that overran last, grow slowly.
-                        cap *= if (cap / peak - 1.0).abs() < PLATEAU {
+                        cap *= if cap >= peak * (1.0 - PLATEAU) {
                             PLATEAU_INCREASE
                         } else {
                             INCREASE
                         };
                     }
-                    excess = beyond && cooling == 0;
+                    excess = beyond;
                 }
                 let slack_windows = if sent * 2.0 < cap {
                     slack_windows + 1
@@ -451,7 +513,6 @@ impl Guard {
                         floor,
                         slack_windows,
                         peak,
-                        cooling,
                         excess,
                         decreased_from,
                     }
@@ -482,6 +543,7 @@ mod tests {
                 sent: 0,
                 counts: [Counts {
                     generation: 7,
+                    sent_symbols: 0,
                     expected: 0,
                     lost: 0,
                 }; 4],
@@ -497,6 +559,7 @@ mod tests {
 
         fn window(&mut self, losses: [f64; 4], sent_bps: f64) -> Option<u64> {
             for (counts, loss) in self.counts.iter_mut().zip(losses) {
+                counts.sent_symbols += 1000;
                 counts.expected += 1000;
                 counts.lost += (1000.0 * loss).round() as u64;
             }
@@ -520,7 +583,7 @@ mod tests {
         d.policed(80e6, 1e9, 0.11);
         let trial = d.policed(80e6, 1e9, 0.11).expect("trial") as f64;
         assert!(d.guard.shared_loss(), "a trial defers per-path tests");
-        for _ in 0..3 {
+        for _ in 0..6 {
             d.policed(trial, 1e9, 0.11);
         }
         assert_eq!(d.guard.cap_bps(), None);
@@ -530,7 +593,7 @@ mod tests {
         assert_eq!(d.policed(200e6, 90e6, 0.11), None);
         let trial = d.policed(200e6, 90e6, 0.11).expect("trial") as f64;
         assert!((110e6..=130e6).contains(&trial), "{trial}");
-        for _ in 0..3 {
+        for _ in 0..6 {
             d.policed(trial, 90e6, 0.11);
         }
         let snapshot = d.guard.snapshot();
@@ -552,7 +615,7 @@ mod tests {
         d.policed(107e6, 86e6, 0.05);
         let trial = d.policed(107e6, 86e6, 0.05).expect("trial") as f64;
         assert!(trial > 86e6, "the cut stays above the bottleneck: {trial}");
-        for _ in 0..3 {
+        for _ in 0..6 {
             d.policed(trial, 86e6, 0.05);
         }
         assert_eq!(d.guard.snapshot().confirmed, 1);
@@ -563,7 +626,7 @@ mod tests {
         let mut d = Drive::new();
         d.window([0.3; 4], 100e6);
         let trial = d.window([0.3; 4], 100e6).expect("trial") as f64;
-        for _ in 0..3 {
+        for _ in 0..6 {
             d.window([0.3; 4], trial);
         }
         assert_eq!(d.guard.cap_bps(), None);
@@ -582,7 +645,7 @@ mod tests {
         let mut d = Drive::new();
         d.window([0.3; 4], 100e6);
         d.window([0.3; 4], 100e6).expect("trial");
-        for _ in 0..3 {
+        for _ in 0..6 {
             d.window([0.3; 4], 95e6);
         }
         let snapshot = d.guard.snapshot();
@@ -595,7 +658,7 @@ mod tests {
         let mut d = Drive::new();
         d.policed(200e6, 90e6, 0.0);
         let trial = d.policed(200e6, 90e6, 0.0).unwrap() as f64;
-        for _ in 0..3 {
+        for _ in 0..6 {
             d.policed(trial, 90e6, 0.0);
         }
         assert_eq!(d.guard.snapshot().cap_floor, Some(0.0));
@@ -620,7 +683,7 @@ mod tests {
         assert_eq!(d.guard.snapshot().trials, 0);
         d.policed(200e6, 90e6, 0.0);
         let trial = d.policed(200e6, 90e6, 0.0).unwrap();
-        for _ in 0..3 {
+        for _ in 0..6 {
             d.policed(trial as f64, 90e6, 0.0);
         }
         let mut cap = d.guard.cap_bps().unwrap() as f64;
@@ -651,7 +714,7 @@ mod tests {
         let mut d = Drive::new();
         d.policed(200e6, 90e6, 0.0);
         let trial = d.policed(200e6, 90e6, 0.0).unwrap() as f64;
-        for _ in 0..3 {
+        for _ in 0..6 {
             d.policed(trial, 90e6, 0.0);
         }
         assert!(d.guard.cap_bps().is_some());
@@ -660,5 +723,154 @@ mod tests {
         }
         assert_eq!(d.guard.cap_bps(), None);
         assert_eq!(d.guard.snapshot().releases, 1);
+    }
+    #[test]
+    fn growth_above_the_last_overrun_rate_stays_slow() {
+        let mut d = Drive::new();
+        d.guard.state = State::Limited {
+            cap: 120e6,
+            floor: 0.11,
+            slack_windows: 0,
+            peak: 100e6,
+            excess: false,
+            decreased_from: None,
+        };
+        let cap = d.window([0.11; 4], 120e6).unwrap();
+        assert!(
+            cap <= 121_200_001,
+            "must not resume 5% growth above the peak: {cap}"
+        );
+    }
+
+    #[test]
+    fn delayed_old_loss_cannot_raise_a_kept_caps_floor() {
+        let mut d = Drive::new();
+        d.guard.state = State::Limited {
+            cap: 100e6,
+            floor: 0.11,
+            slack_windows: 0,
+            peak: 150e6,
+            excess: false,
+            decreased_from: None,
+        };
+        let cap = d.window([0.30; 4], 100e6).unwrap() as f64;
+        assert!(cap < 100e6);
+        for _ in 0..3 {
+            d.window([0.30; 4], cap);
+        }
+        let floor = d.guard.snapshot().cap_floor.unwrap();
+        assert!(
+            floor <= 0.12,
+            "old pre-cut loss must not become the floor: {floor}"
+        );
+    }
+    #[test]
+    fn old_prefix_is_rejected_even_after_the_minimum_wait() {
+        let mut d = Drive::new();
+        d.guard.state = State::Limited {
+            cap: 100e6,
+            floor: 0.11,
+            slack_windows: 0,
+            peak: 150e6,
+            excess: false,
+            decreased_from: None,
+        };
+        // A large outstanding prefix takes more than two seconds to finalize.
+        for c in &mut d.counts {
+            c.sent_symbols = 20_000;
+        }
+        let cap = d.window([0.30; 4], 100e6).unwrap();
+        for _ in 0..8 {
+            d.window([0.30; 4], cap as f64);
+        }
+        assert!(d.guard.snapshot().settling);
+        assert_eq!(d.guard.snapshot().decreases, 1);
+        assert_eq!(d.guard.snapshot().cap_floor, Some(0.11));
+        // Only reports past the admission watermark can end the wait.
+        for c in &mut d.counts {
+            c.expected = 22_000;
+            c.lost = 6_600;
+        }
+        d.call();
+        d.window([0.11; 4], cap as f64);
+        assert!(!d.guard.snapshot().settling);
+        assert!(d.guard.snapshot().cap_floor.unwrap() < 0.12);
+    }
+
+    #[test]
+    fn a_replaced_path_restarts_settlement_without_using_its_old_prefix() {
+        let mut d = Drive::new();
+        d.window([0.3; 4], 100e6);
+        let cap = d.window([0.3; 4], 100e6).unwrap();
+        for _ in 0..3 {
+            d.window([0.3; 4], cap as f64);
+        }
+        d.counts[0] = Counts {
+            generation: 8,
+            sent_symbols: 10_000,
+            expected: 0,
+            lost: 0,
+        };
+        for _ in 0..5 {
+            d.window([0.3; 4], cap as f64);
+        }
+        assert!(d.guard.snapshot().settling);
+        assert_eq!(d.guard.snapshot().rejected, 0);
+        assert_eq!(d.guard.snapshot().confirmed, 0);
+        // Disconnection removes that generation's evidence and wait mark.
+        let paths: Vec<_> = d.counts.iter().copied().enumerate().skip(1).collect();
+        d.now_us += WINDOW_US;
+        d.guard.observe(d.now_us, &paths, d.sent);
+        assert!(!d.guard.snapshot().settling);
+    }
+
+    #[test]
+    fn lowering_a_cap_without_lowering_actual_send_cannot_teach_random_loss() {
+        let mut d = Drive::new();
+        d.guard.state = State::Limited {
+            cap: 100e6,
+            floor: 0.11,
+            slack_windows: 0,
+            peak: 150e6,
+            excess: false,
+            decreased_from: None,
+        };
+        d.window([0.30; 4], 100e6);
+        for _ in 0..8 {
+            d.window([0.30; 4], 100e6);
+        }
+        assert_eq!(d.guard.snapshot().cap_floor, Some(0.11));
+    }
+
+    #[test]
+    fn delayed_shared_loss_does_not_create_a_high_random_floor() {
+        use std::collections::VecDeque;
+        let mut d = Drive::new();
+        // Four windows of delayed loss: more than the former one-second cooling.
+        let mut pending = VecDeque::from([0.0; 4]);
+        let mut cap = 180e6_f64;
+        let mut measured_loss = 0.0;
+        for i in 0..240 {
+            let rate = d.guard.cap_bps().map_or(cap, |v| v as f64);
+            let loss = 1.0 - rate.min(90e6) * 0.89 / rate;
+            pending.push_back(loss);
+            measured_loss = pending.pop_front().unwrap();
+            // Admission runs four finalized windows ahead, as on a delayed peer.
+            for c in &mut d.counts {
+                c.sent_symbols = c.expected + 4_000;
+            }
+            d.window([measured_loss; 4], rate);
+            cap = rate;
+            if i > 60 {
+                assert!(rate < 115e6, "sawtooth escaped: {rate}");
+                assert!(
+                    d.guard.snapshot().cap_floor.unwrap_or(0.0) < 0.17,
+                    "old overload was learned as random loss"
+                );
+            }
+        }
+        assert!(d.guard.snapshot().confirmed > 0);
+        assert!(measured_loss < 0.25);
+        assert!(cap > 75e6, "must keep useful throughput: {cap}");
     }
 }

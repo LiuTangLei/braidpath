@@ -1920,6 +1920,7 @@ async fn sender(
                             usize::from(path.id),
                             forward_guard::Counts {
                                 generation: q.snapshot.generation,
+                                sent_symbols: q.snapshot.sent_symbols,
                                 expected: estimate.expected,
                                 lost: estimate.lost,
                             },
