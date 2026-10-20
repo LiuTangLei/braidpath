@@ -18,6 +18,27 @@ const SERVER_TICKETS: usize = 4096;
 /// Tickets per handshake. Every attempt spends one, including attempts that
 /// fail during an outage, and a client keeps at most eight per server.
 const TICKETS_PER_HANDSHAKE: usize = 4;
+/// Kernel receive buffer requested for endpoint sockets. A bulk path arrives
+/// in paced bursts near line rate; the platform default (768 KiB on macOS)
+/// holds a few milliseconds of them, so a short scheduling gap drops
+/// datagrams that the peer then counts as path loss.
+const SOCKET_RECEIVE_BUFFER_BYTES: usize = 8 * 1024 * 1024;
+/// Smallest request worth making when the platform refuses a larger one.
+const MIN_SOCKET_RECEIVE_BUFFER_BYTES: usize = 1024 * 1024;
+
+/// Ask for the largest receive buffer the platform grants. macOS refuses a
+/// request above its socket limit; Linux caps it at `net.core.rmem_max`.
+fn enlarge_receive_buffer(socket: socket2::SockRef<'_>) {
+    let mut bytes = SOCKET_RECEIVE_BUFFER_BYTES;
+    while socket.set_recv_buffer_size(bytes).is_err() && bytes > MIN_SOCKET_RECEIVE_BUFFER_BYTES {
+        bytes /= 2;
+    }
+    tracing::debug!(
+        requested = bytes,
+        granted = socket.recv_buffer_size().ok(),
+        "endpoint receive buffer"
+    );
+}
 
 /// One TLS client configuration per trusted CA set. rustls binds resumption
 /// tickets to the verifier that checked the original handshake, so every
@@ -216,7 +237,14 @@ pub fn server_with_ack_request(
     transport.datagram_send_buffer_size(datagram_send_buffer_bytes);
     ack_request.apply(&mut transport);
     conf.transport_config(Arc::new(transport));
-    Ok(Endpoint::server(conf, bind)?)
+    let socket = std::net::UdpSocket::bind(bind)?;
+    enlarge_receive_buffer(socket2::SockRef::from(&socket));
+    Ok(Endpoint::new(
+        quinn::EndpointConfig::default(),
+        Some(conf),
+        socket,
+        Arc::new(quinn::TokioRuntime),
+    )?)
 }
 pub fn client(
     remote: SocketAddr,
@@ -347,6 +375,7 @@ pub fn client_bound_with_ack_request(
     );
     s.bind(&bind.into())?;
     s.set_nonblocking(true)?;
+    enlarge_receive_buffer(socket2::SockRef::from(&s));
     let mut endpoint = Endpoint::new(
         quinn::EndpointConfig::default(),
         None,

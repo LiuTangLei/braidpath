@@ -35,6 +35,11 @@ use tokio::{
 use tracing::{info, warn};
 
 const MAX_FLOWS: usize = 64;
+/// Datagrams the client's paths may hand its session before it reads them:
+/// about 50 ms of a bulk download. One session task decodes every path, and a
+/// shallower queue overflows during a brief stall of that task, turning a
+/// local delay into stream retransmissions an RTT later.
+const WIRE_QUEUE: usize = 4096;
 const SESSION_IDLE_GRACE: Duration = Duration::from_secs(120);
 const SESSION_PATH: &str = "/session";
 mod associate;
@@ -3694,7 +3699,7 @@ async fn client_session(
     let paths: Paths = Arc::new(Mutex::new(Vec::new()));
     let forward = options.stats.scope(&sid, stats::FORWARD);
     let returning = options.stats.scope(&sid, stats::RETURN);
-    let (wire_tx, mut wire_rx) = mpsc::channel::<(u8, Bytes)>(QUEUE);
+    let (wire_tx, mut wire_rx) = mpsc::channel::<(u8, Bytes)>(WIRE_QUEUE);
     let mut tasks = JoinSet::new();
     let mut endpoints: [Option<quinn::Endpoint>; MAX_PATHS] = std::array::from_fn(|_| None);
     let mut configs = Vec::<PathConfig>::new();

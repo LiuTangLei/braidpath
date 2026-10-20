@@ -23,7 +23,10 @@ const DATA_HEADER: usize = 10;
 pub const MAX_SEGMENT: usize = MAX_PAYLOAD - DATA_HEADER;
 /// Both peers assume this window before the first acknowledgment.
 pub const INITIAL_WINDOW: u64 = 256 * 1024;
-pub const MAX_WINDOW: u64 = 8 * 1024 * 1024;
+/// A stream's flight plus the data held behind one hole while it is repaired,
+/// about two RTTs: at 110 ms, 8 MiB capped a stream near 600 Mbit/s without
+/// loss and far lower after each one.
+pub const MAX_WINDOW: u64 = 32 * 1024 * 1024;
 const MAX_OFFSET: u64 = 1 << 62;
 const ACK_HEADER: usize = 26;
 const MAX_RANGES: usize = 64;
@@ -891,7 +894,19 @@ impl Receiver {
                 ready.extend(piece);
             } else {
                 self.out_of_order += piece.len() as u64;
-                self.ranges.insert(start, piece);
+                // Data arriving after a hole extends the range before it, so
+                // acknowledgments walk the holes rather than every segment.
+                match self
+                    .ranges
+                    .range_mut(..start)
+                    .next_back()
+                    .filter(|(k, v)| **k + v.len() as u64 == start)
+                {
+                    Some((_, before)) => before.extend_from_slice(&piece),
+                    None => {
+                        self.ranges.insert(start, piece);
+                    }
+                }
                 if self.recent.len() == RECENT_RANGES {
                     self.recent.pop_front();
                 }
@@ -1624,6 +1639,31 @@ mod tests {
         );
         assert_eq!(ack.ranges.last().unwrap().1, count as u64 * segment);
         assert!(ack.ranges.windows(2).all(|w| w[0].1 < w[1].0));
+    }
+
+    #[test]
+    fn data_after_one_hole_is_held_as_one_range() {
+        let now = Instant::now();
+        let mut receiver = Receiver::default();
+        let segment = MAX_SEGMENT as u64;
+        for i in 1..100u64 {
+            let ready = receiver
+                .on_data(i * segment, false, vec![i as u8; MAX_SEGMENT], now)
+                .unwrap();
+            assert!(ready.is_empty());
+        }
+        assert_eq!(receiver.ranges.len(), 1);
+        let ack = receiver.take_ack(now, INITIAL_WINDOW).unwrap();
+        assert_eq!(ack.ranges, vec![(segment, 100 * segment)]);
+        let ready = receiver
+            .on_data(0, false, vec![0; MAX_SEGMENT], now)
+            .unwrap();
+        let expected: Vec<u8> = (0..100u8)
+            .flat_map(|i| std::iter::repeat_n(i, MAX_SEGMENT))
+            .collect();
+        assert_eq!(ready, expected);
+        assert_eq!(receiver.buffered(), 100 * segment);
+        assert!(receiver.ranges.is_empty());
     }
 
     #[test]
