@@ -253,8 +253,13 @@ impl State {
         if end <= self.snapshot.received.expected {
             return;
         }
-        let received = self.seen.range(..end).count() as u64;
-        self.seen.retain(|seq| *seq >= end);
+        // At a busy receiver the 512-symbol window advances on each packet.
+        // Remove only that prefix rather than walking every retained symbol.
+        let mut received = 0;
+        while self.seen.first().is_some_and(|seq| *seq < end) {
+            self.seen.pop_first();
+            received += 1;
+        }
         let r = &mut self.snapshot.received;
         r.expected = end;
         r.received += received;
@@ -517,6 +522,26 @@ pub fn parse_control(b: &[u8]) -> Result<Vec<Report>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn finalized_prefix_keeps_the_boundary_and_later_received_symbols() {
+        let mut state = State::new(1);
+        state.snapshot.received.expected = 98;
+        state.snapshot.received.received = 97;
+        state.seen.extend([98, 99, 100, 105]);
+        for (end, received, lost, remaining) in [
+            (100, 99, 1, vec![100, 105]),
+            (105, 100, 5, vec![105]),
+            (105, 100, 5, vec![105]),
+            (106, 101, 5, vec![]),
+        ] {
+            state.finalize(end);
+            assert_eq!(state.snapshot.received.expected, end);
+            assert_eq!(state.snapshot.received.received, received);
+            assert_eq!(state.snapshot.received.lost, lost);
+            assert_eq!(state.seen.iter().copied().collect::<Vec<_>>(), remaining);
+        }
+    }
     fn payload() -> Bytes {
         wire::plain(&wire::Record {
             flow: 0,

@@ -393,7 +393,7 @@ fn grant_reprobes(
         if ceiling <= rates[id] || !controllers[id].start_reprobe(now_us, ceiling) {
             continue;
         }
-        let admitted_rate = controllers[id].decision(now_us).pacing_bps;
+        let admitted_rate = controllers[id].pacing_bps();
         let increase = admitted_rate.saturating_sub(rates[id]);
         total = total.saturating_add(increase);
         grouped[group] = grouped[group].saturating_add(increase);
@@ -1003,8 +1003,7 @@ impl PreparedSend {
             .iter()
             .filter(|path| {
                 path.conn.close_reason().is_none()
-                    && (!policy.adaptive
-                        || controllers[usize::from(path.id)].decision(now_us).eligible)
+                    && (!policy.adaptive || controllers[usize::from(path.id)].eligible(now_us))
             })
             .map(|path| (path.id, 1))
             .collect();
@@ -1187,10 +1186,10 @@ fn update_business_pacer(
                 if path.conn.close_reason().is_some() {
                     return None;
                 }
-                let decision = controllers[usize::from(path.id)].decision(now_us);
-                decision
-                    .eligible
-                    .then_some((path.group, decision.pacing_bps))
+                let controller = &controllers[usize::from(path.id)];
+                controller
+                    .eligible(now_us)
+                    .then_some((path.group, controller.pacing_bps()))
             }),
         );
     }
@@ -2286,7 +2285,7 @@ async fn sender(
                         let eligible = p.conn.close_reason().is_none()
                             && silent & (1 << p.id) == 0
                             && (!policy.adaptive
-                                || controllers[usize::from(p.id)].decision(now_us).eligible);
+                                || controllers[usize::from(p.id)].eligible(now_us));
                         if !eligible {
                             frontier.add(p.id, is_small, Gate::PathIneligible);
                         }

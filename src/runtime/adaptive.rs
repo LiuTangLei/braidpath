@@ -3319,11 +3319,24 @@ impl PathController {
         (young && fast_opportunity) || service_request || phase_repair || monitor_request
     }
 
-    pub fn decision(&self, now_us: u64) -> Decision {
-        let stale = now_us.saturating_sub(self.born_us) >= FRESH_US
+    fn stale(&self, now_us: u64) -> bool {
+        now_us.saturating_sub(self.born_us) >= FRESH_US
             && self
                 .last_evidence_us
-                .is_none_or(|time| now_us.saturating_sub(time) > FRESH_US);
+                .is_none_or(|time| now_us.saturating_sub(time) > FRESH_US)
+    }
+
+    /// Admission checks do not need scheduling weights or diagnostic counters.
+    pub(crate) fn eligible(&self, now_us: u64) -> bool {
+        self.eligible && !self.stale(now_us)
+    }
+
+    pub(crate) fn pacing_bps(&self) -> u64 {
+        self.rate_bps
+    }
+
+    pub fn decision(&self, now_us: u64) -> Decision {
+        let stale = self.stale(now_us);
         let weight_loss = self.weight_loss.and_then(|sample| {
             let age = sample
                 .age_us
@@ -3516,7 +3529,7 @@ impl PathController {
 
     pub fn allow(&mut self, now_us: u64, bytes: usize, queue_age_ms: f64) -> bool {
         self.refill(now_us);
-        self.decision(now_us).eligible
+        self.eligible(now_us)
             && queue_age_ms.is_finite()
             && queue_age_ms >= 0.0
             && queue_age_ms <= self.target_ms
