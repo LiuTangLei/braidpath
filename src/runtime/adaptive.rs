@@ -72,8 +72,10 @@ const LOSS_CEILING_STEP: f64 = 1.1;
 const RANDOM_LOSS_US: u64 = 30_000_000;
 /// Paces too slow to matter are not tested.
 const LOSS_TEST_MIN_BPS: u64 = 2_000_000;
-/// Three clean monitored increases raise the cautious step from 3% to 24%.
-const CLEAN_GROWTH_STREAK_MAX: u32 = 3;
+/// Four clean monitored increases raise the cautious step from 3% to 48%,
+/// no faster than the initial search: one false brake early in a transfer
+/// must not leave it seconds below a path it never measured.
+const CLEAN_GROWTH_STREAK_MAX: u32 = 4;
 
 /// Finalized loss observed while this path's own queue signal was clear.
 /// The floor is the smallest recent bucket, so a congestion episode can only
@@ -3279,7 +3281,7 @@ impl PathController {
     }
 
     /// 3% per step, doubled for each consecutive clean monitored increase up
-    /// to 24%. The RTT headroom gain limit still applies to the result.
+    /// to 48%. The RTT headroom gain limit still applies to the result.
     /// Held clear-queue loss beyond the path's random loss starts one test.
     /// The pace first holds, so the reports describe it, then brakes to
     /// `LOSS_TEST_SCALE`. Loss that falls with the pace was its own and caps
@@ -7173,7 +7175,7 @@ mod tests {
         assert_eq!(controller.clean_growth_streak, 1);
         assert!((controller.cautious_gain() - 1.06).abs() < 1e-12);
         controller.clean_growth_streak = CLEAN_GROWTH_STREAK_MAX;
-        assert!((controller.cautious_gain() - 1.24).abs() < 1e-12);
+        assert!((controller.cautious_gain() - 1.48).abs() < 1e-12);
         controller.fast_recovery_enabled = false;
         assert_eq!(controller.cautious_gain(), 1.03, "legacy keeps 3%");
 
