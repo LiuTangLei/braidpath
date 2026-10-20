@@ -10,7 +10,8 @@ use tracing::{info, warn};
 
 mod tickets;
 
-pub const DEFAULT_DATAGRAM_SEND_BUFFER_BYTES: usize = 1200;
+pub const MIN_DATAGRAM_SEND_BUFFER_BYTES: usize = 1200;
+pub const DEFAULT_DATAGRAM_SEND_BUFFER_BYTES: usize = MAX_DATAGRAM_SEND_BUFFER_BYTES;
 pub const MAX_DATAGRAM_SEND_BUFFER_BYTES: usize = 76_800;
 /// Server resumption tickets held for 0-RTT; each is single use.
 const SERVER_TICKETS: usize = 4096;
@@ -108,9 +109,8 @@ pub fn config(_congestion: Congestion) -> TransportConfig {
     t.max_concurrent_bidi_streams(16u32.into());
     t.max_concurrent_uni_streams(8u32.into());
     t.datagram_receive_buffer_size(Some(256 * 1200));
-    // Quinn cannot expire individual queued datagrams. Keep at most one maximum-
-    // size BraidPath record (or a few small ones) beyond the application deadline
-    // queue. This bounds hidden bytes, not residence time on a stalled path.
+    // Quinn cannot expire individual queued datagrams. This is only a ceiling:
+    // each path's writer keeps at most 1 ms of its pace (or one datagram) here.
     t.datagram_send_buffer_size(DEFAULT_DATAGRAM_SEND_BUFFER_BYTES);
     t.max_idle_timeout(Some(
         Duration::from_secs(15)
@@ -200,7 +200,7 @@ pub fn server_with_ack_request(
     tickets: Option<&Path>,
 ) -> Result<Endpoint> {
     ensure!(
-        (DEFAULT_DATAGRAM_SEND_BUFFER_BYTES..=MAX_DATAGRAM_SEND_BUFFER_BYTES)
+        (MIN_DATAGRAM_SEND_BUFFER_BYTES..=MAX_DATAGRAM_SEND_BUFFER_BYTES)
             .contains(&datagram_send_buffer_bytes),
         "datagram send buffer must be 1200..76800 bytes"
     );
@@ -277,7 +277,7 @@ pub fn client_bound_with_ack_request(
     ack_request: AckRequest,
 ) -> Result<Endpoint> {
     ensure!(
-        (DEFAULT_DATAGRAM_SEND_BUFFER_BYTES..=MAX_DATAGRAM_SEND_BUFFER_BYTES)
+        (MIN_DATAGRAM_SEND_BUFFER_BYTES..=MAX_DATAGRAM_SEND_BUFFER_BYTES)
             .contains(&datagram_send_buffer_bytes),
         "datagram send buffer must be 1200..76800 bytes"
     );

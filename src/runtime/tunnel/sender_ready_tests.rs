@@ -1,13 +1,4 @@
 use super::*;
-#[test]
-fn adaptive_pressure_uses_actual_configured_buffer_and_full_framed_size() {
-    assert_eq!(transport_pressure(9568, 4000, 1057), (5568, false));
-    assert_eq!(transport_pressure(9568, 1030, 1057), (8538, true));
-    assert_eq!(transport_pressure(1168, 1168, 1057), (0, false));
-    assert_eq!(transport_pressure(9568, 9568, 1057), (0, false));
-    assert_eq!(transport_pressure(9568, 1057, 1057), (8511, false));
-    assert_eq!(transport_pressure(9568, 9999, 1057), (0, false));
-}
 use std::{
     collections::BTreeSet,
     sync::atomic::AtomicUsize,
@@ -64,7 +55,7 @@ impl Pair {
             id: 0,
             group: 2,
             conn: self.outgoing.clone(),
-            empty_datagram_space: self.outgoing.datagram_send_buffer_space(),
+            writer: writer::Writer::spawn(&self.outgoing),
             stream: 0,
             quality: Arc::new(Mutex::new(quality::State::new(7))),
             capacity_probe: Arc::new(Mutex::new(capacity_probe::State::new(7))),
@@ -104,17 +95,11 @@ impl Wake for Wakes {
 
 const FILLER: &[u8; 1100] = &[0xa5; 1100];
 
-fn block_and_poll(
-    pair: &Pair,
-    wait: &mut WaitingSend,
-    paths: &Paths,
-    lifetime: Duration,
-) -> Arc<Wakes> {
-    // This current-thread runtime cannot drive QUIC between the fill and poll.
-    pair.outgoing
-        .send_datagram(Bytes::from_static(FILLER))
-        .unwrap();
-    assert!(pair.outgoing.datagram_send_buffer_space() < wait.prepared.data.len());
+fn block_and_poll(wait: &mut WaitingSend, paths: &Paths, lifetime: Duration) -> Arc<Wakes> {
+    // This current-thread runtime cannot run the writer or drive QUIC between
+    // the fill and poll.
+    assert!(wait.prepared.path.writer.send(Bytes::from_static(FILLER)));
+    assert!(!wait.prepared.path.writer.admits(wait.prepared.data.len()));
     let wakes = Arc::new(Wakes::default());
     let waker = Waker::from(wakes.clone());
     assert!(
@@ -660,7 +645,7 @@ async fn adaptive_small_readiness_ignores_fast_peer_without_current_packet_credi
     );
     let lifetime = accounting.policy.admission_lifetime();
     let mut wait = WaitingSend::new(prepared);
-    let wakes = block_and_poll(&slow, &mut wait, &paths, lifetime);
+    let wakes = block_and_poll(&mut wait, &paths, lifetime);
     let waker = Waker::from(wakes.clone());
     let mut allowed = |attempt: &PreparedSend, now: Instant, paths: &[OutPath]| {
         attempt.small_delivery_allowed(
@@ -799,7 +784,7 @@ async fn same_path_small_copy_waits_for_quinn_packetization() {
     let before = pair.outgoing.stats();
     let original = Bytes::from_static(b"small-original");
     let copy = Bytes::from_static(b"small-copy");
-    pair.outgoing.send_datagram(original.clone()).unwrap();
+    assert!(path.writer.send(original.clone()));
     // Without a yield, both frames would still fit the same QUIC/UDP packet.
     assert!(!small_delivery::copy_ready(&path, 1));
     assert!(
@@ -812,7 +797,7 @@ async fn same_path_small_copy_waits_for_quinn_packetization() {
     );
     assert_eq!(pair.receive().await, original);
     assert!(small_delivery::copy_ready(&path, 1));
-    pair.outgoing.send_datagram(copy.clone()).unwrap();
+    assert!(path.writer.send(copy.clone()));
     assert_eq!(pair.receive().await, copy);
     let after = pair.outgoing.stats();
     assert_eq!(after.frame_tx.datagram - before.frame_tx.datagram, 2);
@@ -954,6 +939,20 @@ async fn adaptive_bulk_unready_path_cannot_steal_later_small_requests() {
     bulk_unready_path_cannot_steal_later_small_requests(true).await;
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn writer_backlog_excludes_the_pace_budget() {
+    let pair = Pair::connect().await;
+    let path = pair.path();
+    // No await: the current-thread runtime cannot drain the writer.
+    path.writer.set_pace(8_800_000);
+    assert!(path.writer.send(Bytes::from(vec![0xa5; 900])));
+    assert!(path.writer.send(Bytes::from(vec![0xa5; 900])));
+    assert_eq!(path.writer.held(), 1800);
+    assert_eq!(path.writer.backlog(), 700, "beyond the 1100-byte budget");
+    path.writer.set_pace(80_000_000);
+    assert_eq!(path.writer.backlog(), 0, "within 1 ms of the faster pace");
+}
+
 async fn bulk_unready_path_cannot_steal_later_small_requests(adaptive: bool) {
     let fast = Pair::connect().await;
     let blocked = Pair::connect().await;
@@ -975,15 +974,14 @@ async fn bulk_unready_path_cannot_steal_later_small_requests(adaptive: bool) {
     accounting.enqueue(wire::plain(&record(1)).unwrap(), created);
     let mut prepared = accounting.prepare(&path0, false);
     prepared.candidates = vec![(0, 4), (1, 1)];
-    // No await between filling Quinn and committing: the current-thread driver
-    // cannot drain either buffer. Path 1 can accept a small symbol but no bulk.
-    blocked
-        .outgoing
-        .send_datagram(Bytes::from(vec![0xa5; 900]))
-        .unwrap();
+    // No await between filling path 1 and committing: the current-thread
+    // runtime cannot drain either path. Its 1100-byte budget still takes a
+    // small symbol but no bulk.
+    path1.writer.set_pace(8_800_000);
+    assert!(path1.writer.send(Bytes::from(vec![0xa5; 900])));
     let small_bytes = 183;
-    assert!(path1.conn.datagram_send_buffer_space() >= small_bytes);
-    assert!(path1.conn.datagram_send_buffer_space() < prepared.data.len());
+    assert!(path1.writer.admits(small_bytes));
+    assert!(!path1.writer.admits(prepared.data.len()));
     if adaptive {
         assert_eq!(
             business_ready_candidates(
@@ -1000,14 +998,14 @@ async fn bulk_unready_path_cannot_steal_later_small_requests(adaptive: bool) {
         );
     }
     let at = send_datagram_before_deadline(
-        &path0.conn,
+        &path0,
         prepared.data.clone(),
         created,
         Duration::from_secs(1),
     )
     .unwrap()
     .unwrap();
-    assert!(path0.conn.datagram_send_buffer_space() < prepared.data.len());
+    assert!(!path0.writer.admits(prepared.data.len()));
     accounting.commit_on_paths(&prepared, at, 1, &paths);
     // The actual admitted path still pays its share after filling its buffer;
     // the blocked peer must not acquire phantom bulk debt against small work.
@@ -1184,7 +1182,7 @@ async fn mixed_small_copy_uses_its_own_bounded_admission_credit_on_wider_http_st
         0
     );
     let at = send_datagram_before_deadline(
-        &path.conn,
+        &path,
         original.data.clone(),
         created,
         Duration::from_secs(1),
@@ -1220,7 +1218,7 @@ async fn mixed_small_copy_uses_its_own_bounded_admission_credit_on_wider_http_st
     );
     let shared = Arc::new(Mutex::new(vec![repair_path.clone()]));
     let mut wait = WaitingSend::new(accounting.prepare(&repair_path, true));
-    block_and_poll(&pair, &mut wait, &shared, Duration::from_secs(1));
+    block_and_poll(&mut wait, &shared, Duration::from_secs(1));
     assert_eq!(pair.receive().await.as_ref(), FILLER);
     let ready = timeout(
         Duration::from_secs(1),
@@ -1294,7 +1292,7 @@ async fn cold_small_copy_is_authorized_only_by_its_actual_original_admission() {
     ));
     let original = accounting.prepare(&path, false);
     let at = send_datagram_before_deadline(
-        &path.conn,
+        &path,
         original.data.clone(),
         created,
         Duration::from_secs(1),
@@ -1319,7 +1317,7 @@ async fn cold_small_copy_is_authorized_only_by_its_actual_original_admission() {
     assert_eq!(pair.receive().await, original.data);
     let shared = Arc::new(Mutex::new(vec![path.clone()]));
     let mut wait = WaitingSend::new(accounting.prepare(&path, true));
-    block_and_poll(&pair, &mut wait, &shared, Duration::from_secs(1));
+    block_and_poll(&mut wait, &shared, Duration::from_secs(1));
     assert_eq!(pair.receive().await.as_ref(), FILLER);
     let ready = timeout(
         Duration::from_secs(1),
@@ -1384,18 +1382,13 @@ async fn direct_admission_rechecks_ingress_deadline_after_preparation() {
     let cached_preflight = created;
     assert!(cached_preflight.saturating_duration_since(created) < lifetime);
     for attempt in prepared {
-        assert!(pair.outgoing.datagram_send_buffer_space() >= attempt.data.len());
+        assert!(path.writer.admits(attempt.data.len()));
         // Advance only the final admission clock, simulating time spent preparing
         // or waiting for locks after the cached preflight, without wall-clock sleep.
         ADMISSION_CLOCK_OVERRIDE.with(|clock| clock.set(Some(created + lifetime)));
         assert!(
-            send_datagram_before_deadline(
-                &pair.outgoing,
-                attempt.data,
-                attempt.front.created,
-                lifetime,
-            )
-            .is_none(),
+            send_datagram_before_deadline(&path, attempt.data, attempt.front.created, lifetime,)
+                .is_none(),
             "an expired prepared frame must never enter a ready Quinn buffer"
         );
         let expired = accounting.queue.pop(attempt.repair).unwrap();
@@ -1409,7 +1402,7 @@ async fn direct_admission_rechecks_ingress_deadline_after_preparation() {
     let fresh = wire::http_datagram(0, &wire::plain(&record(3)).unwrap()).unwrap();
     assert!(
         send_datagram_before_deadline(
-            &pair.outgoing,
+            &path,
             fresh.clone(),
             Instant::now(),
             Duration::from_secs(1),
@@ -1432,7 +1425,7 @@ async fn ready_admission_rechecks_deadline_after_control_gate() {
     prepared.front.created = Instant::now();
     let lifetime = Duration::from_millis(100);
     let expired_at = prepared.front.created + lifetime;
-    assert!(pair.outgoing.datagram_send_buffer_space() >= prepared.data.len());
+    assert!(path.writer.admits(prepared.data.len()));
     let mut wait = WaitingSend::new(prepared);
     let mut gate_checked = false;
     let readiness = poll_fn(|cx| {
@@ -1471,7 +1464,7 @@ async fn quinn_readiness_wakes_without_input_or_timer_and_commits_each_symbol_on
     let mut admitted_symbol_bytes = 0;
     for (number, repair) in [false, false, true].into_iter().enumerate() {
         let mut wait = WaitingSend::new(accounting.prepare(&path, repair));
-        let wakes = block_and_poll(&pair, &mut wait, &paths, Duration::from_secs(1));
+        let wakes = block_and_poll(&mut wait, &paths, Duration::from_secs(1));
         if number == 0 {
             accounting.assert_no_admission(&path, 3);
         }
@@ -1551,7 +1544,7 @@ async fn cancelling_a_pending_wait_does_not_send_or_mint_credit_and_can_be_resel
     let mut accounting = Accounting::new();
     accounting.enqueue(wire::plain(&record(1)).unwrap(), Instant::now());
     let mut wait = WaitingSend::new(accounting.prepare(&path, false));
-    block_and_poll(&pair, &mut wait, &paths, Duration::from_secs(1));
+    block_and_poll(&mut wait, &paths, Duration::from_secs(1));
     let prepared = wait.cancel();
     accounting.assert_no_admission(&path, 1);
     assert_eq!(pair.receive().await.as_ref(), FILLER);
@@ -1584,10 +1577,10 @@ async fn a_ready_buffer_cannot_send_past_the_adaptive_20ms_limit_with_a_100ms_qu
     let created = Instant::now();
     accounting.enqueue(wire::plain(&record(1)).unwrap(), created);
     let mut wait = WaitingSend::new(accounting.prepare(&path, false));
-    block_and_poll(&pair, &mut wait, &paths, lifetime);
+    block_and_poll(&mut wait, &paths, lifetime);
     assert_eq!(pair.receive().await.as_ref(), FILLER);
     tokio::time::sleep_until((created + Duration::from_millis(25)).into()).await;
-    assert!(pair.outgoing.datagram_send_buffer_space() >= wait.prepared.data.len());
+    assert!(wait.prepared.path.writer.admits(wait.prepared.data.len()));
     let ready = poll_fn(|cx| wait.poll(cx, &paths, lifetime, |_, _, _| true)).await;
     assert!(matches!(ready, SendReadiness::Expired));
     wait.cancel();
@@ -1613,14 +1606,14 @@ async fn removal_or_generation_change_invalidates_a_pending_wait_before_ready_se
         let mut accounting = Accounting::new();
         accounting.enqueue(wire::plain(&record(1)).unwrap(), Instant::now());
         let mut wait = WaitingSend::new(accounting.prepare(&path, false));
-        block_and_poll(&pair, &mut wait, &paths, Duration::from_secs(1));
+        block_and_poll(&mut wait, &paths, Duration::from_secs(1));
         if removed {
             paths.lock().unwrap().clear();
         } else {
             path.quality.lock().unwrap().snapshot.generation += 1;
         }
         assert_eq!(pair.receive().await.as_ref(), FILLER);
-        assert!(pair.outgoing.datagram_send_buffer_space() >= wait.prepared.data.len());
+        assert!(wait.prepared.path.writer.admits(wait.prepared.data.len()));
         let ready =
             poll_fn(|cx| wait.poll(cx, &paths, Duration::from_secs(1), |_, _, _| true)).await;
         assert!(matches!(ready, SendReadiness::PathChanged));
@@ -1638,7 +1631,7 @@ async fn ready_poll_rechecks_current_group_budget_before_entering_quinn() {
     let mut accounting = Accounting::new();
     accounting.enqueue(wire::plain(&record(1)).unwrap(), Instant::now());
     let mut wait = WaitingSend::new(accounting.prepare(&path, false));
-    block_and_poll(&pair, &mut wait, &paths, Duration::from_secs(1));
+    block_and_poll(&mut wait, &paths, Duration::from_secs(1));
     assert_eq!(pair.receive().await.as_ref(), FILLER);
     let exhausted_group = outbound::Pacer::new(64_000, 2400);
     let ready = poll_fn(|cx| {

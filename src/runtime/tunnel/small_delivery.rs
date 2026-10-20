@@ -42,8 +42,7 @@ struct Estimate {
 }
 
 fn estimate(path: &OutPath) -> Estimate {
-    let native = path.conn.stats();
-    let rtt_ms = path.conn.rtt().as_secs_f64() * 1000.0;
+    let rtt_ms = path.conn.rtt_hint().as_secs_f64() * 1000.0;
     let feedback = path.quality.lock().expect("quality lock");
     let received = &feedback.snapshot.sender_estimate;
     let now_us = super::quality_time(path);
@@ -58,12 +57,11 @@ fn estimate(path: &OutPath) -> Estimate {
     Estimate {
         id: path.id,
         delay_ms: delay_estimate(
-            native.path.min_rtt.as_secs_f64() * 1000.0,
+            path.conn.min_rtt_hint().as_secs_f64() * 1000.0,
             rtt_ms,
             transit_ms,
-            path.empty_datagram_space
-                .saturating_sub(path.conn.datagram_send_buffer_space()),
-            native.path.cwnd,
+            path.writer.held(),
+            path.conn.cwnd_hint(),
         ),
         quality: (fresh && received.expected >= 16).then(|| Quality {
             loss_rate: received.loss_rate,
@@ -85,11 +83,11 @@ pub(super) fn frontier_sample(
         id: path.id,
         finish_ms: e.delay_ms,
         loss: quality.loss_rate,
-        immediately_ready: path.conn.close_reason().is_none()
-            && path.conn.datagram_send_buffer_space() >= frame_bytes
+        immediately_ready: path.open()
+            && path.writer.admits(frame_bytes)
             && path
                 .conn
-                .max_datagram_size()
+                .max_datagram_size_hint()
                 .is_some_and(|m| m >= frame_bytes),
         already_used: used & (1 << path.id) != 0,
     })
@@ -104,7 +102,7 @@ pub(super) fn mask(
 ) -> u8 {
     let estimates: Vec<_> = paths
         .iter()
-        .filter(|path| eligible & (1 << path.id) != 0 && path.conn.close_reason().is_none())
+        .filter(|path| eligible & (1 << path.id) != 0 && path.open())
         .map(estimate)
         .collect();
     // Small records trade bulk shares for timeliness. Keep diversity among
@@ -124,7 +122,7 @@ pub(super) fn latency_mask(
 ) -> u8 {
     let estimates: Vec<_> = paths
         .iter()
-        .filter(|path| eligible & (1 << path.id) != 0 && path.conn.close_reason().is_none())
+        .filter(|path| eligible & (1 << path.id) != 0 && path.open())
         .map(estimate)
         .collect();
     let slack = (target_ms.min(20) as f64).min(remaining.as_secs_f64() * 1000.0);
@@ -210,11 +208,11 @@ pub(super) fn copy_ready(path: &OutPath, used: u8) -> bool {
     if used & (1 << path.id) == 0 {
         return true;
     }
-    // Quinn removes outgoing DATAGRAM frames while constructing a packet under
-    // its connection lock. An empty queue means the admitted original can no
-    // longer be co-packed with a newly admitted same-path copy. No ACK or fixed
-    // sleep is required; the sender's existing 1ms tick rechecks this gate.
-    path.conn.datagram_send_buffer_space() >= path.empty_datagram_space
+    // Quinn removes outgoing DATAGRAM frames while constructing a packet. An
+    // empty writer and Quinn buffer mean the admitted original can no longer
+    // be co-packed with a newly admitted same-path copy. No ACK or fixed sleep
+    // is required; the sender's existing 1ms tick rechecks this gate.
+    path.writer.held() == 0
 }
 
 #[cfg(test)]

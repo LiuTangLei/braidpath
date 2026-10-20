@@ -51,6 +51,7 @@ mod proxy;
 mod repair_usefulness_tests;
 mod small_delivery;
 mod tcp;
+mod writer;
 pub use proxy::Access as ProxyAccess;
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -230,8 +231,9 @@ struct OutPath {
     id: u8,
     group: u8,
     conn: quinn::Connection,
-    /// Exact empty-buffer payload allowance, captured before this sender owns it.
-    empty_datagram_space: usize,
+    /// Moves this path's datagrams into Quinn; the sender never takes the
+    /// connection lock itself.
+    writer: Arc<writer::Writer>,
     stream: u64,
     quality: Arc<Mutex<quality::State>>,
     capacity_probe: Arc<Mutex<capacity_probe::State>>,
@@ -240,11 +242,10 @@ struct OutPath {
     probe_reply: Arc<Mutex<Option<quality::Probe>>>,
 }
 
-fn transport_pressure(empty_space: usize, available: usize, frame_bytes: usize) -> (usize, bool) {
-    (
-        empty_space.saturating_sub(available),
-        available < frame_bytes,
-    )
+impl OutPath {
+    fn open(&self) -> bool {
+        !self.conn.is_closed()
+    }
 }
 type Paths = Arc<Mutex<Vec<OutPath>>>;
 
@@ -1002,7 +1003,7 @@ impl PreparedSend {
         let candidates: Vec<_> = paths
             .iter()
             .filter(|path| {
-                path.conn.close_reason().is_none()
+                path.open()
                     && (!policy.adaptive || controllers[usize::from(path.id)].eligible(now_us))
             })
             .map(|path| (path.id, 1))
@@ -1046,7 +1047,7 @@ impl PreparedSend {
 
 struct WaitingSend {
     prepared: PreparedSend,
-    send: Pin<Box<dyn Future<Output = Result<(), quinn::SendDatagramError>> + Send>>,
+    admitted: Pin<Box<dyn Future<Output = ()> + Send>>,
 }
 
 #[derive(Debug)]
@@ -1060,13 +1061,12 @@ enum SendReadiness {
 
 impl WaitingSend {
     fn new(prepared: PreparedSend) -> Self {
-        let conn = prepared.path.conn.clone();
-        let data = prepared.data.clone();
+        let writer = prepared.path.writer.clone();
+        let bytes = prepared.data.len();
         Self {
             prepared,
-            // A pending Quinn future has not queued this datagram. Dropping it
-            // before a successful poll cancels the attempt without any debit.
-            send: Box::pin(async move { conn.send_datagram_wait(data).await }),
+            // Waiting queues nothing: dropping it cancels without any debit.
+            admitted: Box::pin(async move { writer.admitted(bytes).await }),
         }
     }
 
@@ -1093,7 +1093,7 @@ impl WaitingSend {
         }) else {
             return Poll::Ready(SendReadiness::PathChanged);
         };
-        if paths[index].conn.close_reason().is_some() {
+        if !paths[index].open() {
             return Poll::Ready(SendReadiness::PathChanged);
         }
         // Take the clock after acquiring the membership locks, immediately
@@ -1105,26 +1105,29 @@ impl WaitingSend {
         if !allowed(&self.prepared, now, &paths) {
             return Poll::Ready(SendReadiness::GateChanged);
         }
-        // Control checks can take time or acquire contended locks. Refresh after
-        // them, immediately before Quinn gets ownership of this datagram.
+        // Control checks can take time. Refresh after them, immediately
+        // before the path's writer gets ownership of this datagram.
         if admission_now().saturating_duration_since(self.prepared.front.created) >= lifetime {
             return Poll::Ready(SendReadiness::Expired);
         }
-        match self.send.as_mut().poll(cx) {
-            Poll::Pending => Poll::Pending,
-            Poll::Ready(Ok(())) => Poll::Ready(SendReadiness::Admitted {
+        if self.admitted.as_mut().poll(cx).is_pending() {
+            return Poll::Pending;
+        }
+        if self.prepared.path.writer.send(self.prepared.data.clone()) {
+            Poll::Ready(SendReadiness::Admitted {
                 at: Instant::now(),
                 next_cursor: (index + 1) % paths.len(),
-            }),
-            Poll::Ready(Err(_)) => Poll::Ready(SendReadiness::Failed),
+            })
+        } else {
+            Poll::Ready(SendReadiness::Failed)
         }
         // The membership guard is local to this synchronous poll. No mutex
         // guard survives Pending or is held while the sender awaits a wakeup.
     }
 
     fn cancel(self) -> PreparedSend {
-        let Self { prepared, send } = self;
-        drop(send);
+        let Self { prepared, admitted } = self;
+        drop(admitted);
         prepared
     }
 }
@@ -1138,16 +1141,16 @@ enum SenderEvent {
 }
 
 fn send_datagram_before_deadline(
-    conn: &quinn::Connection,
+    path: &OutPath,
     data: Bytes,
     created: Instant,
     lifetime: Duration,
-) -> Option<std::result::Result<Instant, quinn::SendDatagramError>> {
-    // Preparation and lock contention can outlive the queue-head preflight.
+) -> Option<std::result::Result<Instant, ()>> {
+    // Preparation can outlive the queue-head preflight.
     if admission_now().saturating_duration_since(created) >= lifetime {
         return None;
     }
-    Some(conn.send_datagram(data).map(|()| Instant::now()))
+    Some(path.writer.send(data).then(Instant::now).ok_or(()))
 }
 
 fn admission_now() -> Instant {
@@ -1183,7 +1186,7 @@ fn update_business_pacer(
         business.update(
             now_us,
             paths.iter().filter_map(|path| {
-                if path.conn.close_reason().is_some() {
+                if !path.open() {
                     return None;
                 }
                 let controller = &controllers[usize::from(path.id)];
@@ -1274,12 +1277,12 @@ fn transport_ready_candidates(
             return false;
         };
         let bytes = measured_payload_bytes + mapping_bytes;
-        path.conn.close_reason().is_none()
+        path.open()
             && path
                 .conn
-                .max_datagram_size()
+                .max_datagram_size_hint()
                 .is_some_and(|max| bytes <= max)
-            && path.conn.datagram_send_buffer_space() >= bytes
+            && path.writer.admits(bytes)
     })
 }
 
@@ -1316,7 +1319,7 @@ impl SendAccounting<'_> {
         } = admission;
         let sent = self.queue.pop(repair).expect("admitted front");
         if let Some(hold) = &sent.hold {
-            hold.admitted(path.id, path.conn.rtt(), at);
+            hold.admitted(path.id, path.conn.rtt_hint(), at);
         }
         debug_assert_eq!(sent.created, front.created);
         debug_assert_eq!(sent.record_id, front.record_id);
@@ -1714,7 +1717,7 @@ async fn sender(
         // path has: then nothing is gained by withholding it.
         let silent = {
             let (mut open, mut silent) = (0u8, 0u8);
-            for path in paths.iter().filter(|p| p.conn.close_reason().is_none()) {
+            for path in paths.iter().filter(|p| p.open()) {
                 let id = usize::from(path.id);
                 liveness[id].observe(&path.conn, now);
                 open |= 1 << id;
@@ -1722,6 +1725,13 @@ async fn sender(
             }
             if silent == open { 0 } else { silent }
         };
+        for path in paths.iter() {
+            path.writer.set_pace(if policy.adaptive {
+                controllers[usize::from(path.id)].pacing_bps()
+            } else {
+                policy.rate
+            });
+        }
         if observation_schedule
             .as_mut()
             .and_then(|schedule| schedule.take_due(now_us))
@@ -1732,8 +1742,7 @@ async fn sender(
                 let snapshot = &q.snapshot;
                 let estimate = &snapshot.sender_estimate;
                 let at = quality_time(path);
-                let native_rtt = path.conn.rtt();
-                let space = path.conn.datagram_send_buffer_space();
+                let native_rtt = path.conn.rtt_hint();
                 let frame_bytes = wire::MAX_WIRE
                     + if policy.receiver_feedback {
                         quality::HEADER
@@ -1741,8 +1750,8 @@ async fn sender(
                         0
                     }
                     + wire::http_datagram_overhead(path.stream).expect("admitted stream");
-                let (send_queue_bytes, transport_blocked) =
-                    transport_pressure(path.empty_datagram_space, space, frame_bytes);
+                let send_queue_bytes = path.writer.backlog();
+                let transport_blocked = !path.writer.admits(frame_bytes);
                 let observation = adaptive::Observation {
                     now_us,
                     generation: snapshot.generation,
@@ -1758,7 +1767,7 @@ async fn sender(
                     reprobe_enabled: !policy.probe_guided_recovery
                         && policy.fec == 0
                         && policy.redundancy == 0
-                        && path.conn.close_reason().is_none(),
+                        && path.open(),
                     feedback_sample_symbols: estimate.sample_symbols,
                     finalized_expected: Some(estimate.expected),
                     finalized_lost: Some(estimate.lost),
@@ -1785,7 +1794,7 @@ async fn sender(
                     .lock()
                     .expect("capacity probe lock")
                     .snapshot(at);
-                let cwnd = path.conn.stats().path.cwnd;
+                let cwnd = path.conn.cwnd_hint();
                 let rtt_us = native_rtt.as_micros().min(u128::from(u64::MAX)) as u64;
                 if metrics.metrics.native_service_guard()
                     && policy.fec == 0
@@ -1855,7 +1864,7 @@ async fn sender(
             }
             let live: Vec<_> = paths
                 .iter()
-                .filter(|path| path.conn.close_reason().is_none())
+                .filter(|path| path.open())
                 .map(|path| ReprobePath {
                     id: path.id,
                     group: path.group,
@@ -1908,7 +1917,7 @@ async fn sender(
                 .map(|path| {
                     (
                         path.id,
-                        path.conn.close_reason().is_none() && silent & (1 << path.id) == 0,
+                        path.open() && silent & (1 << path.id) == 0,
                         path.quality
                             .lock()
                             .expect("quality lock")
@@ -2031,15 +2040,15 @@ async fn sender(
                 let data = wire::http_datagram(path.stream, frame).expect("admitted stream");
                 let cost = data.len() + 80;
                 let group = &mut groups[usize::from(path.group)];
-                if path.conn.close_reason().is_none()
+                if path.open()
                     && pacer.available(cost)
                     && group.available(cost)
                     && path
                         .conn
-                        .max_datagram_size()
+                        .max_datagram_size_hint()
                         .is_some_and(|m| m >= data.len())
-                    && path.conn.datagram_send_buffer_space() >= data.len()
-                    && path.conn.send_datagram(data).is_ok()
+                    && path.writer.admits(data.len())
+                    && path.writer.send_first(data)
                 {
                     pacer.spend(cost);
                     group.spend(cost);
@@ -2075,14 +2084,14 @@ async fn sender(
         let reserved_group = if feedback_reserve > 0 {
             paths
                 .iter()
-                .filter(|p| p.conn.close_reason().is_none())
+                .filter(|p| p.open())
                 .min_by_key(|p| control_priority(p))
                 .map(|p| p.group)
         } else {
             None
         };
         if policy.adaptive {
-            for path in paths.iter().filter(|p| p.conn.close_reason().is_none()) {
+            for path in paths.iter().filter(|p| p.open()) {
                 let id = usize::from(path.id);
                 let reply = path.probe_reply.lock().expect("probe reply lock").clone();
                 let frame = if let Some(reply) = reply {
@@ -2116,12 +2125,12 @@ async fn sender(
                 };
                 if pacer.available(cost + feedback_reserve)
                     && group.available(cost + group_reserve)
-                    && path.conn.datagram_send_buffer_space() >= data.len()
+                    && path.writer.admits(data.len())
                     && path
                         .conn
-                        .max_datagram_size()
+                        .max_datagram_size_hint()
                         .is_some_and(|m| m >= data.len())
-                    && path.conn.send_datagram(data).is_ok()
+                    && path.writer.send_first(data)
                 {
                     pacer.spend(cost);
                     group.spend(cost);
@@ -2144,7 +2153,7 @@ async fn sender(
         if policy.capacity_probe_bps > 0 && !paths.is_empty() {
             let mut probe_rates = [0u64; MAX_PATHS];
             for path in paths.iter() {
-                if path.conn.close_reason().is_none() {
+                if path.open() {
                     let rate = capacity_pacing[usize::from(path.id)].snapshot().pacing_bps;
                     probe_rates[usize::from(path.group)] =
                         probe_rates[usize::from(path.group)].saturating_add(rate);
@@ -2155,7 +2164,7 @@ async fn sender(
             for offset in 0..paths.len() {
                 let index = (first + offset) % paths.len();
                 let path = &paths[index];
-                if path.conn.close_reason().is_some() {
+                if !path.open() {
                     continue;
                 }
                 if !capacity_pacing[usize::from(path.id)]
@@ -2186,12 +2195,12 @@ async fn sender(
                     && capacity_budget.available(now_us, path.group, cost)
                     && pacer.available(cost + feedback_reserve)
                     && group.available(cost + reserve)
-                    && path.conn.datagram_send_buffer_space() >= data.len()
+                    && path.writer.admits(data.len())
                     && path
                         .conn
-                        .max_datagram_size()
+                        .max_datagram_size_hint()
                         .is_some_and(|size| size >= data.len())
-                    && path.conn.send_datagram(data).is_ok()
+                    && path.writer.send(data)
                 {
                     pacer.spend(cost);
                     group.spend(cost);
@@ -2282,7 +2291,7 @@ async fn sender(
                 paths
                     .iter()
                     .filter(|p| {
-                        let eligible = p.conn.close_reason().is_none()
+                        let eligible = p.open()
                             && silent & (1 << p.id) == 0
                             && (!policy.adaptive
                                 || controllers[usize::from(p.id)].eligible(now_us));
@@ -2303,7 +2312,7 @@ async fn sender(
                                     .snapshot
                                     .sender_estimate,
                                 quality_time(path),
-                                path.conn.rtt().as_secs_f64() * 1000.0,
+                                path.conn.rtt_hint().as_secs_f64() * 1000.0,
                             )
                         };
                         (path.id, weight)
@@ -2481,7 +2490,7 @@ async fn sender(
             for i in order {
                 let path = &paths[i];
                 let id = usize::from(path.id);
-                if path.conn.close_reason().is_some() || silent & (1 << path.id) != 0 {
+                if !path.open() || silent & (1 << path.id) != 0 {
                     frontier.add(path.id, is_small, Gate::PathIneligible);
                     continue;
                 }
@@ -2536,13 +2545,13 @@ async fn sender(
                 }
                 if path
                     .conn
-                    .max_datagram_size()
+                    .max_datagram_size_hint()
                     .is_none_or(|m| frame_bytes > m)
                 {
                     frontier.add(path.id, is_small, Gate::DatagramSize);
                     continue;
                 }
-                let blocked = path.conn.datagram_send_buffer_space() < frame_bytes;
+                let blocked = !path.writer.admits(frame_bytes);
                 if blocked {
                     frontier.add(path.id, is_small, Gate::ApiBuffer);
                     metrics.path(path.id, |p| p.send_buffer_full_attempts += 1);
@@ -2583,7 +2592,7 @@ async fn sender(
                     });
                     continue;
                 }
-                match send_datagram_before_deadline(&path.conn, data, front.created, lifetime) {
+                match send_datagram_before_deadline(path, data, front.created, lifetime) {
                     None => {
                         frontier.add(path.id, is_small, Gate::ExpiredBeforeApi);
                         let expired = queue.pop(repair).expect("expired front");
@@ -3044,7 +3053,7 @@ async fn session_loop(
             _=tick.tick()=>{
                 flows.retain(|_,(_,t)|t.elapsed()<Duration::from_secs(60));
                 let p=session.paths.lock().expect("paths lock");
-                for path in p.iter(){let stats=path.conn.stats();info!(path=path.id,rtt_ms=path.conn.rtt().as_secs_f64()*1000.0,tx_packets=stats.udp_tx.datagrams,rx_packets=stats.udp_rx.datagrams,tx_bytes=stats.udp_tx.bytes,rx_bytes=stats.udp_rx.bytes,lost=stats.path.lost_packets,cwnd=stats.path.cwnd,"server path statistics");}
+                for path in p.iter(){let stats=path.conn.stats();info!(path=path.id,rtt_ms=path.conn.rtt_hint().as_secs_f64()*1000.0,tx_packets=stats.udp_tx.datagrams,rx_packets=stats.udp_rx.datagrams,tx_bytes=stats.udp_tx.bytes,rx_bytes=stats.udp_rx.bytes,lost=stats.path.lost_packets,cwnd=stats.path.cwnd,"server path statistics");}
                 info!(paths=p.len(),flows=flows.len(),originals=decoder.originals,recovered=decoder.recovered,duplicates=decoder.duplicates,invalid=decoder.invalid,dropped,ingress_drops=session.ingress_drops.load(Ordering::Relaxed),"server session");
             },
             _=retention_deadline(&decoder)=>{decoder.expire_adaptive(Instant::now());publish_retention(&decoder,&session.forward);},
@@ -3445,7 +3454,7 @@ async fn server_connection(
                                 let mut generations=session.generations.lock().expect("generation lock");
                                 scheduler::admit_generation(&mut generations[usize::from(pid)],generation)?;
                                 if let Some(i)=existing {paths.remove(i).conn.close(0u32.into(),b"path rejoined");}
-                                paths.push(OutPath{id:pid,group,conn:conn.clone(),empty_datagram_space:conn.datagram_send_buffer_space(),stream:stream_id,quality:Arc::new(Mutex::new(quality::State::new(generation))),capacity_probe:Arc::new(Mutex::new(capacity_probe::State::new(generation))),capacity_probe_enabled:capacity_probe_bps>0,epoch:Instant::now(),probe_reply:Arc::new(Mutex::new(None))});
+                                paths.push(OutPath{id:pid,group,conn:conn.clone(),writer:writer::Writer::spawn(&conn),stream:stream_id,quality:Arc::new(Mutex::new(quality::State::new(generation))),capacity_probe:Arc::new(Mutex::new(capacity_probe::State::new(generation))),capacity_probe_enabled:capacity_probe_bps>0,epoch:Instant::now(),probe_reply:Arc::new(Mutex::new(None))});
                                 *session.empty_since.lock().expect("empty time lock")=None;
                             }
                             Some(session)
@@ -3871,7 +3880,7 @@ async fn client_session(
                             for old in active.iter().filter(|p|p.id==pid) {old.conn.close(0u32.into(),b"path replaced");}
                             active.retain(|p|p.id!=pid);
                             active.push(OutPath{id:pid,group:configs[id].group,conn:value.conn.clone(),stream:value.stream,
-                                empty_datagram_space:value.conn.datagram_send_buffer_space(),
+                                writer:writer::Writer::spawn(&value.conn),
                                 quality:Arc::new(Mutex::new(quality::State::new(generation))),capacity_probe:Arc::new(Mutex::new(capacity_probe::State::new(generation))),capacity_probe_enabled:options.policy.capacity_probe_bps>0,epoch:Instant::now(),
                                 probe_reply:Arc::new(Mutex::new(None))});
                         }

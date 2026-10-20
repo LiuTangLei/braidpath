@@ -35,3 +35,7 @@ rustix = { version = "1", features = ["fs"] }
 [dev-dependencies]
 tempfile = "3"
 tokio = { version = "1", features = ["test-util"] }
+
+# Quinn 0.11.12 with lock-free connection hints; see vendor/quinn/PATCH.md.
+[patch.crates-io]
+quinn = { path = "vendor/quinn" }

@@ -98,9 +98,9 @@ enum Command {
         /// Session sender cap in bits/s; `auto` defers to the client's request.
         #[arg(long, default_value = "auto", value_parser = parse_rate_cap)]
         max_rate_bps: RateCap,
-        /// Outgoing Quinn buffer for reverse traffic; bytes include metadata.
-        /// Controlled measurements only; this does not bound residence time.
-        #[arg(long, default_value_t = 1200, value_parser = clap::value_parser!(u32).range(1200..=76_800))]
+        /// Ceiling of Quinn's outgoing datagram buffer, bytes including metadata.
+        /// Each path fills it with at most 1 ms of its pace; 1200 keeps one datagram.
+        #[arg(long, default_value_t = 76_800, value_parser = clap::value_parser!(u32).range(1200..=76_800))]
         datagram_send_buffer_bytes: u32,
         /// BBR is the supported sending controller.
         #[arg(long, value_enum, default_value_t = transport::Congestion::default())]
@@ -132,9 +132,9 @@ enum Command {
         /// One explicit local UDP bind per interface–entrance pair, in path order.
         #[arg(long = "path-bind")]
         path_binds: Vec<SocketAddr>,
-        /// Outgoing Quinn buffer bytes, including metadata; does not bound residence time.
-        /// Override only for controlled measurements; normal operation defaults to 1200.
-        #[arg(long, default_value_t = 1200, value_parser = clap::value_parser!(u32).range(1200..=76_800))]
+        /// Ceiling of Quinn's outgoing datagram buffer, bytes including metadata.
+        /// Each path fills it with at most 1 ms of its pace; 1200 keeps one datagram.
+        #[arg(long, default_value_t = 76_800, value_parser = clap::value_parser!(u32).range(1200..=76_800))]
         datagram_send_buffer_bytes: u32,
         /// Bottleneck group per interface–entrance pair; defaults to interface index.
         #[arg(long = "path-group")]
@@ -666,7 +666,7 @@ mod tests {
                 _ => unreachable!(),
             })
         };
-        assert_eq!(parse_size(&[]).unwrap(), 1200);
+        assert_eq!(parse_size(&[]).unwrap(), 76_800);
         for size in ["1200", "9600", "38400", "76800"] {
             assert_eq!(
                 parse_size(&["--datagram-send-buffer-bytes", size]).unwrap(),
@@ -762,7 +762,7 @@ mod tests {
                 _ => unreachable!(),
             })
         };
-        assert_eq!(parse_size(&[]).unwrap(), 1200);
+        assert_eq!(parse_size(&[]).unwrap(), 76_800);
         for size in ["1200", "9600", "38400", "76800"] {
             assert_eq!(
                 parse_size(&["--datagram-send-buffer-bytes", size]).unwrap(),
