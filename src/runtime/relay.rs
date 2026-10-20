@@ -101,6 +101,7 @@ pub async fn run(options: Options) -> Result<()> {
         "invalid impairment interval"
     );
     let front = Arc::new(UdpSocket::bind(options.listen).await?);
+    crate::runtime::transport::enlarge_receive_buffer(socket2::SockRef::from(front.as_ref()));
     let budget = Arc::new(Mutex::new(Budget {
         tokens: 16.0 * 2048.0,
         last: Instant::now(),
@@ -128,7 +129,7 @@ pub async fn run(options: Options) -> Result<()> {
             peers.retain(|_,tx|!tx.is_closed());
             if !peers.contains_key(&peer){
                 if peers.len()>=64{count(&options.stats,stats::FORWARD,|d|d.mapping_limit_dropped+=1);continue;}
-                let mapping=async{let back=UdpSocket::bind(if options.target.is_ipv4(){"0.0.0.0:0"}else{"[::]:0"}).await?;back.connect(options.target).await?;Ok::<_,std::io::Error>(back)}.await;
+                let mapping=async{let back=UdpSocket::bind(if options.target.is_ipv4(){"0.0.0.0:0"}else{"[::]:0"}).await?;back.connect(options.target).await?;crate::runtime::transport::enlarge_receive_buffer(socket2::SockRef::from(&back));Ok::<_,std::io::Error>(back)}.await;
                 let back=match mapping{Ok(back)=>back,Err(error)=>{count(&options.stats,stats::FORWARD,|d|d.mapping_error_dropped+=1);return Err(error.into());}};
                 let (tx,mut rx)=mpsc::channel::<Vec<u8>>(32);peers.insert(peer,tx);
                 let front=front.clone();let budget=budget.clone();let metrics=options.stats.clone();let mut quit=stop.subscribe();

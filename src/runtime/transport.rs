@@ -27,17 +27,26 @@ const SOCKET_RECEIVE_BUFFER_BYTES: usize = 8 * 1024 * 1024;
 const MIN_SOCKET_RECEIVE_BUFFER_BYTES: usize = 1024 * 1024;
 
 /// Ask for the largest receive buffer the platform grants. macOS refuses a
-/// request above its socket limit; Linux caps it at `net.core.rmem_max`.
-fn enlarge_receive_buffer(socket: socket2::SockRef<'_>) {
+/// request above its socket limit; Linux caps it at `net.core.rmem_max`,
+/// which is worth raising on servers and relays: one warning says so.
+pub(crate) fn enlarge_receive_buffer(socket: socket2::SockRef<'_>) {
+    static LIMITED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     let mut bytes = SOCKET_RECEIVE_BUFFER_BYTES;
     while socket.set_recv_buffer_size(bytes).is_err() && bytes > MIN_SOCKET_RECEIVE_BUFFER_BYTES {
         bytes /= 2;
     }
-    tracing::debug!(
-        requested = bytes,
-        granted = socket.recv_buffer_size().ok(),
-        "endpoint receive buffer"
-    );
+    let granted = socket.recv_buffer_size().ok();
+    // Linux reports twice the granted payload space.
+    if granted.is_some_and(|granted| granted < MIN_SOCKET_RECEIVE_BUFFER_BYTES)
+        && !LIMITED.swap(true, std::sync::atomic::Ordering::Relaxed)
+    {
+        warn!(
+            requested = bytes,
+            granted,
+            "UDP receive buffer is small; bursts may be dropped (raise net.core.rmem_max on Linux)"
+        );
+    }
+    tracing::debug!(requested = bytes, granted, "UDP receive buffer");
 }
 
 /// One TLS client configuration per trusted CA set. rustls binds resumption
