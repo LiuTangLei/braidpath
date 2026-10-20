@@ -23,9 +23,11 @@
 //!
 //! A kept cap follows loss above its learned floor. Below the most recent
 //! overrun rate it grows by 5%; at or above 95% of that rate it only probes by
-//! 1%, including after crossing that rate. Every cut waits at least two seconds
-//! and for every connected path's finalized prefix to pass the symbol admitted
-//! at the cut. Only subsequent report intervals enter decisions. An unchanged
+//! 1%, including after crossing that rate. Every cut waits for every connected
+//! path's finalized prefix to pass the symbol admitted at the cut. Initial
+//! trials decide on two subsequent qualified report windows, without a blind
+//! timer. Kept-cap decreases also wait at least two seconds. Only subsequent
+//! report intervals enter decisions. An unchanged
 //! loss raises the floor only if the actual sending rate also fell by 5%.
 //! This bounds the aggregate pacer, not individual path clocks or native
 //! congestion control, and remains a heuristic rather than a capacity proof.
@@ -133,7 +135,7 @@ pub struct Snapshot {
     pub rejected: u64,
     pub inconclusive: u64,
     pub decreases: u64,
-    /// A post-cut decision requires both a grace period and post-cut symbols.
+    /// Post-cut symbols are pending (plus a grace period after kept-cap decreases).
     pub settling: bool,
     pub growth_threshold_bps: Option<u64>,
     pub releases: u64,
@@ -231,8 +233,16 @@ impl Guard {
                 self.lost[id] = 0;
             }
         }
+        // A provisional trial can finish as soon as its post-cut evidence is
+        // complete. Kept caps still cool down before the next decrease: their
+        // feedback may describe a queue that has not yet drained.
+        let settle_us = if matches!(self.state, State::Trial { .. }) {
+            0
+        } else {
+            SETTLE_US
+        };
         let ready = self.settlement.as_ref().is_none_or(|wait| {
-            now_us.saturating_sub(wait.started_us) >= SETTLE_US
+            now_us.saturating_sub(wait.started_us) >= settle_us
                 && paths
                     .iter()
                     .filter(|(id, _)| *id < MAX_PATHS)
@@ -583,7 +593,10 @@ mod tests {
         d.policed(80e6, 1e9, 0.11);
         let trial = d.policed(80e6, 1e9, 0.11).expect("trial") as f64;
         assert!(d.guard.shared_loss(), "a trial defers per-path tests");
-        for _ in 0..6 {
+        for _ in 0..TRIAL_WINDOWS {
+            if !matches!(d.guard.state, State::Trial { .. }) {
+                break;
+            }
             d.policed(trial, 1e9, 0.11);
         }
         assert_eq!(d.guard.cap_bps(), None);
@@ -593,7 +606,10 @@ mod tests {
         assert_eq!(d.policed(200e6, 90e6, 0.11), None);
         let trial = d.policed(200e6, 90e6, 0.11).expect("trial") as f64;
         assert!((110e6..=130e6).contains(&trial), "{trial}");
-        for _ in 0..6 {
+        for _ in 0..TRIAL_WINDOWS {
+            if !matches!(d.guard.state, State::Trial { .. }) {
+                break;
+            }
             d.policed(trial, 90e6, 0.11);
         }
         let snapshot = d.guard.snapshot();
@@ -615,7 +631,10 @@ mod tests {
         d.policed(107e6, 86e6, 0.05);
         let trial = d.policed(107e6, 86e6, 0.05).expect("trial") as f64;
         assert!(trial > 86e6, "the cut stays above the bottleneck: {trial}");
-        for _ in 0..6 {
+        for _ in 0..TRIAL_WINDOWS {
+            if !matches!(d.guard.state, State::Trial { .. }) {
+                break;
+            }
             d.policed(trial, 86e6, 0.05);
         }
         assert_eq!(d.guard.snapshot().confirmed, 1);
@@ -626,7 +645,10 @@ mod tests {
         let mut d = Drive::new();
         d.window([0.3; 4], 100e6);
         let trial = d.window([0.3; 4], 100e6).expect("trial") as f64;
-        for _ in 0..6 {
+        for _ in 0..TRIAL_WINDOWS {
+            if !matches!(d.guard.state, State::Trial { .. }) {
+                break;
+            }
             d.window([0.3; 4], trial);
         }
         assert_eq!(d.guard.cap_bps(), None);
@@ -645,7 +667,10 @@ mod tests {
         let mut d = Drive::new();
         d.window([0.3; 4], 100e6);
         d.window([0.3; 4], 100e6).expect("trial");
-        for _ in 0..6 {
+        for _ in 0..TRIAL_WINDOWS {
+            if !matches!(d.guard.state, State::Trial { .. }) {
+                break;
+            }
             d.window([0.3; 4], 95e6);
         }
         let snapshot = d.guard.snapshot();
@@ -658,7 +683,10 @@ mod tests {
         let mut d = Drive::new();
         d.policed(200e6, 90e6, 0.0);
         let trial = d.policed(200e6, 90e6, 0.0).unwrap() as f64;
-        for _ in 0..6 {
+        for _ in 0..TRIAL_WINDOWS {
+            if !matches!(d.guard.state, State::Trial { .. }) {
+                break;
+            }
             d.policed(trial, 90e6, 0.0);
         }
         assert_eq!(d.guard.snapshot().cap_floor, Some(0.0));
@@ -681,9 +709,13 @@ mod tests {
             d.window([0.0; 4], 100e6);
         }
         assert_eq!(d.guard.snapshot().trials, 0);
-        d.policed(200e6, 90e6, 0.0);
-        let trial = d.policed(200e6, 90e6, 0.0).unwrap();
-        for _ in 0..6 {
+        let trial = d
+            .policed(200e6, 90e6, 0.0)
+            .unwrap_or_else(|| d.policed(200e6, 90e6, 0.0).unwrap());
+        for _ in 0..TRIAL_WINDOWS {
+            if !matches!(d.guard.state, State::Trial { .. }) {
+                break;
+            }
             d.policed(trial as f64, 90e6, 0.0);
         }
         let mut cap = d.guard.cap_bps().unwrap() as f64;
@@ -714,7 +746,10 @@ mod tests {
         let mut d = Drive::new();
         d.policed(200e6, 90e6, 0.0);
         let trial = d.policed(200e6, 90e6, 0.0).unwrap() as f64;
-        for _ in 0..6 {
+        for _ in 0..TRIAL_WINDOWS {
+            if !matches!(d.guard.state, State::Trial { .. }) {
+                break;
+            }
             d.policed(trial, 90e6, 0.0);
         }
         assert!(d.guard.cap_bps().is_some());
@@ -800,6 +835,9 @@ mod tests {
     #[test]
     fn a_replaced_path_restarts_settlement_without_using_its_old_prefix() {
         let mut d = Drive::new();
+        // Keep an outstanding prefix: proof, rather than a blind timer,
+        // prevents this trial from finishing before the replacement.
+        d.counts[0].sent_symbols = 10_000;
         d.window([0.3; 4], 100e6);
         let cap = d.window([0.3; 4], 100e6).unwrap();
         for _ in 0..3 {
@@ -872,5 +910,41 @@ mod tests {
         assert!(d.guard.snapshot().confirmed > 0);
         assert!(measured_loss < 0.25);
         assert!(cap > 75e6, "must keep useful throughput: {cap}");
+    }
+    #[test]
+    fn qualified_random_loss_trial_does_not_wait_for_an_extra_timer() {
+        let mut d = Drive::new();
+        d.window([0.11; 4], 100e6);
+        let cap = d.window([0.11; 4], 100e6).unwrap() as f64;
+        // All four finalized prefixes are already past the cut. Two complete
+        // post-cut intervals prove that delivery fell with rate, not congestion.
+        for _ in 0..2 {
+            d.window([0.11; 4], cap);
+        }
+        assert_eq!(
+            d.guard.snapshot().rejected,
+            1,
+            "qualified feedback must not leave a random-loss startup capped"
+        );
+        assert_eq!(d.guard.cap_bps(), None);
+    }
+
+    #[test]
+    fn a_trial_cannot_skip_its_old_prefix_to_reject_loss_early() {
+        let mut d = Drive::new();
+        for c in &mut d.counts {
+            c.sent_symbols = 20_000;
+        }
+        d.window([0.11; 4], 100e6);
+        let cap = d.window([0.11; 4], 100e6).unwrap() as f64;
+        for _ in 0..8 {
+            d.window([0.11; 4], cap);
+        }
+        assert!(d.guard.snapshot().settling);
+        assert_eq!(
+            (d.guard.snapshot().confirmed, d.guard.snapshot().rejected),
+            (0, 0)
+        );
+        assert_eq!(d.guard.snapshot().floor, 0.0);
     }
 }
