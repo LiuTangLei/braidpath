@@ -39,6 +39,10 @@ use serde::Serialize;
 
 /// Each decision spans one window of finalized forward symbols.
 const WINDOW_US: u64 = 500_000;
+/// A provisional cut need not hold for half a second once a substantial fresh
+/// cohort is finalized. Thin feedback retains the ordinary window cadence.
+const TRIAL_WINDOW_US: u64 = 100_000;
+const MIN_TRIAL_SYMBOLS: u64 = 1024;
 /// A path's window is evidence only with this many finalized symbols.
 const MIN_PATH_SYMBOLS: u64 = 100;
 const MIN_TRIGGER_BPS: f64 = 2_000_000.0;
@@ -300,7 +304,12 @@ impl Guard {
             return false;
         };
         let elapsed = now_us.saturating_sub(start);
-        if elapsed < WINDOW_US {
+        let complete_trial_cohort = ready
+            && matches!(self.state, State::Trial { .. })
+            && elapsed >= TRIAL_WINDOW_US
+            && self.expected.iter().sum::<u64>() >= MIN_TRIAL_SYMBOLS
+            && self.common_loss().is_some();
+        if elapsed < WINDOW_US && !complete_trial_cohort {
             return false;
         }
         let sent = sent_bytes.saturating_sub(self.sent_at_start) as f64 * 8e6 / elapsed as f64;
@@ -1035,6 +1044,69 @@ mod tests {
             d.window([0.11; 4], 1e6);
         }
         assert_eq!(d.guard.snapshot().rejected, 1);
+        assert!(d.guard.take_random_loss().iter().all(Option::is_none));
+    }
+    fn trial_tick(d: &mut Drive, cap: f64, symbols: u64) {
+        for counts in &mut d.counts {
+            counts.sent_symbols += symbols;
+            counts.expected += symbols;
+            counts.lost += symbols * 11 / 100;
+        }
+        d.now_us += TRIAL_WINDOW_US;
+        d.sent += (cap * TRIAL_WINDOW_US as f64 / 8e6) as u64;
+        d.call();
+    }
+
+    #[test]
+    fn substantial_post_cut_cohorts_finish_a_trial_without_half_second_padding() {
+        let mut d = Drive::new();
+        d.window([0.11; 4], 100e6);
+        let cap = d.window([0.11; 4], 100e6).unwrap() as f64;
+        trial_tick(&mut d, cap, 400);
+        assert_eq!(
+            d.guard.snapshot().rejected,
+            0,
+            "two cohorts are still required"
+        );
+        trial_tick(&mut d, cap, 400);
+        assert_eq!(d.guard.snapshot().rejected, 1);
+        assert!(d.guard.take_random_loss()[..4].iter().all(Option::is_some));
+    }
+
+    #[test]
+    fn thin_feedback_accumulates_at_the_original_cadence() {
+        let mut d = Drive::new();
+        d.window([0.11; 4], 100e6);
+        let cap = d.window([0.11; 4], 100e6).unwrap() as f64;
+        let start = d.guard.window_start_us;
+        for _ in 0..4 {
+            trial_tick(&mut d, cap, 20);
+        }
+        assert_eq!(
+            d.guard.window_start_us, start,
+            "do not discard a thin cohort"
+        );
+        trial_tick(&mut d, cap, 20);
+        assert_eq!(d.guard.snapshot().rejected, 0);
+        for _ in 0..5 {
+            trial_tick(&mut d, cap, 20);
+        }
+        assert_eq!(d.guard.snapshot().rejected, 1);
+    }
+
+    #[test]
+    fn faster_trial_windows_cannot_include_the_pre_cut_prefix() {
+        let mut d = Drive::new();
+        d.window([0.11; 4], 100e6);
+        for counts in &mut d.counts {
+            counts.sent_symbols += 20_000;
+        }
+        let cap = d.window([0.11; 4], 100e6).unwrap() as f64;
+        for _ in 0..2 {
+            trial_tick(&mut d, cap, 400);
+        }
+        assert!(d.guard.snapshot().settling);
+        assert_eq!(d.guard.snapshot().rejected, 0);
         assert!(d.guard.take_random_loss().iter().all(Option::is_none));
     }
 }
