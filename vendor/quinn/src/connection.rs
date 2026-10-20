@@ -555,6 +555,17 @@ impl Connection {
         self.0.shared.hints.cwnd.load(Ordering::Relaxed)
     }
 
+    /// ACK frames received and ACK-eliciting frames sent, as last published.
+    ///
+    /// The second value includes datagram, stream and ping frames. The values
+    /// may lag the driver but never take its connection lock. Loading ACKs
+    /// first ensures the sent count is at least as recent as that publication.
+    pub fn liveness_hint(&self) -> (u64, u64) {
+        let acks = self.0.shared.hints.acks.load(Ordering::Acquire);
+        let eliciting = self.0.shared.hints.eliciting.load(Ordering::Relaxed);
+        (acks, eliciting)
+    }
+
     /// Resolves when published datagram buffer space grows or the connection
     /// closes. Enable it before reading the space to not miss a wakeup.
     pub fn datagrams_drained(&self) -> Notified<'_> {
@@ -1051,6 +1062,8 @@ struct Hints {
     rtt_us: AtomicU64,
     min_rtt_us: AtomicU64,
     cwnd: AtomicU64,
+    acks: AtomicU64,
+    eliciting: AtomicU64,
 }
 
 pub(crate) struct State {
@@ -1297,13 +1310,17 @@ impl State {
         let max = datagrams.max_size().unwrap_or(0);
         hints.max_datagram.store(max, Ordering::Relaxed);
         let micros = |d: Duration| d.as_micros().min(u128::from(u64::MAX)) as u64;
-        hints.rtt_us.store(micros(self.inner.rtt()), Ordering::Relaxed);
+        let stats = self.inner.stats();
+        hints.rtt_us.store(micros(stats.path.rtt), Ordering::Relaxed);
         hints
             .min_rtt_us
-            .store(micros(self.inner.min_rtt()), Ordering::Relaxed);
-        hints
-            .cwnd
-            .store(self.inner.congestion_state().window(), Ordering::Relaxed);
+            .store(micros(stats.path.min_rtt), Ordering::Relaxed);
+        hints.cwnd.store(stats.path.cwnd, Ordering::Relaxed);
+        hints.eliciting.store(
+            stats.frame_tx.datagram + stats.frame_tx.stream + stats.frame_tx.ping,
+            Ordering::Relaxed,
+        );
+        hints.acks.store(stats.frame_rx.acks, Ordering::Release);
         if hints.datagram_space.swap(space, Ordering::AcqRel) < space {
             shared.datagrams_drained.notify_waiters();
         }

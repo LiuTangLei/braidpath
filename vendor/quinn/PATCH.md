@@ -12,7 +12,15 @@ every accepted datagram, a few values that can be read without the lock:
 - `Connection::datagram_send_buffer_space_hint`
 - `Connection::max_datagram_size_hint`
 - `Connection::rtt_hint`, `min_rtt_hint`, `cwnd_hint`
+- `Connection::liveness_hint` (received ACK and transmitted eliciting-frame counts)
 
 `Connection::datagrams_drained` resolves when the published send buffer space
 grows or the connection closes. Published space never exceeds the actual
 space, because transmissions in progress are published when their poll ends.
+
+Liveness counters use the same publication points. The sender's 5 ms reachability
+check reads these counters and `rtt_hint` without waiting for a UDP send in the
+driver. Sent frames are published before the release-store of received ACKs;
+the reader loads ACKs first. These are monotonic advisory values, not a new
+synchronized connection-statistics API. The existing silence bound and new
+connection reset remain unchanged.

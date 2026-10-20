@@ -2271,3 +2271,32 @@ async fn writer_queue_accounting_release_wakes_admission() {
         "writer freed its last queued bytes after Quinn's drain notification; the waiter must wake and finish"
     );
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn native_liveness_hints_track_real_data_and_ack_progress() {
+    let pair = Pair::connect().await;
+    let before = pair.outgoing.liveness_hint();
+    for _ in 0..16 {
+        pair.outgoing
+            .send_datagram(Bytes::from_static(b"liveness"))
+            .unwrap();
+    }
+    for _ in 0..16 {
+        assert_eq!(&pair.receive().await[..], b"liveness");
+    }
+    timeout(Duration::from_secs(3), async {
+        loop {
+            let (acks, eliciting) = pair.outgoing.liveness_hint();
+            if acks > before.0 && eliciting >= before.1 + 16 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("real ACK and sent frames must reach the published hints");
+    let (acks, eliciting) = pair.outgoing.liveness_hint();
+    let actual = pair.outgoing.stats();
+    assert!(acks <= actual.frame_rx.acks);
+    assert!(eliciting <= actual.frame_tx.datagram + actual.frame_tx.stream + actual.frame_tx.ping);
+}

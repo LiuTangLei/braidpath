@@ -24,11 +24,8 @@ pub(super) struct Counters {
 }
 impl Counters {
     pub fn of(conn: &quinn::Connection) -> Self {
-        let stats = conn.stats();
-        Self {
-            acks: stats.frame_rx.acks,
-            eliciting: stats.frame_tx.datagram + stats.frame_tx.stream + stats.frame_tx.ping,
-        }
+        let (acks, eliciting) = conn.liveness_hint();
+        Self { acks, eliciting }
     }
 }
 
@@ -52,7 +49,7 @@ impl Liveness {
         {
             return;
         }
-        self.update(conn.stable_id(), Counters::of(conn), conn.rtt(), now);
+        self.update(conn.stable_id(), Counters::of(conn), conn.rtt_hint(), now);
     }
 
     fn update(&mut self, connection: usize, counters: Counters, rtt: Duration, now: Instant) {

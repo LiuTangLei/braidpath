@@ -421,3 +421,8 @@ A measured drain restoration requires both receiver and local admission interval
 An underfilled actual admission/allowance window may remain pending for up to 500 ms while otherwise eligible fresh evidence remains available, including while a growth monitor awaits settlement. With a currently qualified independent probe-service reference, a pending monitor retains the same unchanged-pace window within that bound even after actual use reaches 90%; meeting the exercise floor does not start a new pacing interval. Without that reference, an exercised ordinary window retains its original settlement behavior. Keeping the window does not allow growth before the monitor settles or before the original 90% actual-use requirement is met. Pressure, idle demand, stale evidence and generation or pace changes still settle the window.
 
 In probe-guided recovery, current independently corroborated erasure uses the expected retained fraction for scheduling instead of the fourth-power penalty. This applies only while the existing covered-loss classification, qualified owned reference covering business pace, control observation, positive business progress and RTT are current within200ms. Unknown startup loss, missing/expired measurement and uncovered loss keep the original policy. Both multipliers remain0.25..1; weights remain4..2048. Statistics expose weight_erasure_corroborated. This changes relative service shares and creates no pacing or capacity credit.
+
+The sender's reachability check uses the native driver's published ACK-frame,
+ACK-eliciting-frame and RTT hints. It does not acquire the QUIC connection lock
+while holding the path list. The 5 ms check cadence, 100 ms minimum silence,
+2 RTT plus ACK-delay bound, and all-path-silent fallback are unchanged.
