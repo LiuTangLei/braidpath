@@ -136,6 +136,7 @@ class Target(threading.Thread):
         self.address = "127.0.0.1:%d" % self.listener.getsockname()[1]
         self.error = None
         self.max_gap_seconds = 0.0
+        self.max_gap_end_unix_ms = None
 
     def run(self):
         workers = []
@@ -160,8 +161,9 @@ class Target(threading.Thread):
                     digest, count, last = hashlib.sha256(), 0, None
                     while chunk := conn.recv(1 << 16):
                         now = time.monotonic()
-                        if last is not None:
-                            self.max_gap_seconds = max(self.max_gap_seconds, now - last)
+                        if last is not None and now - last > self.max_gap_seconds:
+                            self.max_gap_seconds = now - last
+                            self.max_gap_end_unix_ms = round(time.time() * 1000)
                         last = now
                         digest.update(chunk)
                         count += len(chunk)
@@ -580,6 +582,9 @@ def run(args):
                   "max_gap_seconds": max([r["max_gap_seconds"] or 0.0 for r in results if r]
                                          + [t.max_gap_seconds for t in targets.values()]),
                   "connections": results, "events_applied": applied}
+        # The end of the longest upload gap, to align with role sample_unix_ms.
+        widest = max(targets.values(), key=lambda t: t.max_gap_seconds, default=None)
+        result["target_max_gap_end_unix_ms"] = widest and widest.max_gap_end_unix_ms
         result["by_direction"] = {
             direction: {"exact": all(r["exact"] for r in results if r["direction"] == direction),
                         "received_bytes": sum(r["received_bytes"] for r in results
