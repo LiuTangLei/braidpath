@@ -331,7 +331,10 @@ pub struct Sender {
     tail_probe_due: bool,
     /// The head-of-line segment and the repair to follow with one copy once admitted.
     head_copy: Option<(u64, u32)>,
-    /// Duplicate bytes the peer may report because of copies this sender chose to send.
+    /// Copies awaiting their admission/drop callback. Keep them independently
+    /// of segments: the original can be acknowledged while its copy is queued.
+    pending_copies: BTreeMap<(u64, u32), u64>,
+    /// Duplicate bytes the peer may report because of copies admitted to Quinn.
     expected_duplicates: u64,
 }
 
@@ -375,6 +378,7 @@ impl Sender {
             open_sent: false,
             tail_probe_due: false,
             head_copy: None,
+            pending_copies: BTreeMap::new(),
             expected_duplicates: 0,
         }
     }
@@ -507,8 +511,8 @@ impl Sender {
             // A probe is a bounded additional copy, not a loss declaration.
             // Preserve the original timer, route and failure/backoff evidence.
             segment.probe_transmission = Some(transmission);
-            self.expected_duplicates =
-                (self.expected_duplicates + (data_end - start)).min(EXPECTED_DUPLICATES_MAX);
+            self.pending_copies
+                .insert((start, transmission), data_end - start);
         } else if segment.stalls == 0 {
             segment.sent_at = now;
             segment.path = UNKNOWN_PATH;
@@ -607,11 +611,18 @@ impl Sender {
         at: Instant,
     ) {
         let path = usize::from(path);
-        if path >= MAX_PATHS
-            || self
-                .segments
-                .get(&start)
-                .is_none_or(|s| s.transmissions != transmission || s.path != UNKNOWN_PATH)
+        if path >= MAX_PATHS {
+            return;
+        }
+        if let Some(bytes) = self.pending_copies.remove(&(start, transmission)) {
+            self.expected_duplicates =
+                (self.expected_duplicates + bytes).min(EXPECTED_DUPLICATES_MAX);
+            return;
+        }
+        if self
+            .segments
+            .get(&start)
+            .is_none_or(|s| s.transmissions != transmission || s.path != UNKNOWN_PATH)
         {
             return;
         }
@@ -637,6 +648,9 @@ impl Sender {
     /// A transmission left the local queue without admission. Retransmit it
     /// unless a later transmission or an acknowledgment has superseded it.
     pub fn locally_dropped(&mut self, start: u64, transmission: u32) -> bool {
+        if self.pending_copies.remove(&(start, transmission)).is_some() {
+            return false;
+        }
         if self.segments.get(&start).is_none_or(|s| {
             s.transmissions != transmission || s.probe_transmission == Some(transmission)
         }) || self.lost.contains(&start)
@@ -1286,7 +1300,15 @@ mod tests {
         s.on_timeout(loss);
         let repair = s.poll_transmit(loss).unwrap();
         s.admitted(0, repair.transmission, 0, Duration::from_millis(50), loss);
-        assert!(s.poll_transmit(loss).unwrap().head_copy);
+        let copy = s.poll_transmit(loss).unwrap();
+        assert!(copy.head_copy);
+        s.admitted(
+            copy.start,
+            copy.transmission,
+            0,
+            Duration::from_millis(50),
+            loss,
+        );
         let reorder = s.reorder;
         let segment = MAX_SEGMENT as u64;
         let done = 2 * segment;
@@ -1297,6 +1319,97 @@ mod tests {
         );
         assert!(s.on_ack(&ack(2 * segment, done), loss).unwrap().1);
         assert!(s.reorder > reorder, "a further duplicate still is");
+    }
+
+    #[test]
+    fn an_unsent_head_copy_cannot_hide_a_spurious_repair() {
+        for dropped in [false, true] {
+            let now = Instant::now();
+            let mut s = Sender::new(false);
+            s.push(&[7; 2 * MAX_SEGMENT]);
+            for _ in 0..2 {
+                let t = s.poll_transmit(now).unwrap();
+                s.admitted(t.start, t.transmission, 0, Duration::from_millis(50), now);
+            }
+            let n = MAX_SEGMENT as u64;
+            let at = now + Duration::from_millis(60);
+            s.on_ack(
+                &Ack {
+                    cumulative: 0,
+                    limit: INITIAL_WINDOW,
+                    duplicate_bytes: 0,
+                    ranges: vec![(n, 2 * n)],
+                },
+                at,
+            )
+            .unwrap();
+            let loss = s.next_deadline(at).unwrap();
+            s.on_timeout(loss);
+            let repair = s.poll_transmit(loss).unwrap();
+            s.admitted(0, repair.transmission, 0, Duration::from_millis(50), loss);
+            let copy = s.poll_transmit(loss).unwrap();
+            assert!(copy.head_copy);
+            let deadline = s.next_deadline(loss);
+            if dropped {
+                assert!(!s.locally_dropped(0, copy.transmission));
+                assert!(s.pending_copies.is_empty());
+            }
+            // The original arrives after its repair. The copy is still local
+            // or was discarded there, so it cannot explain the duplicate.
+            let reorder = s.reorder;
+            assert!(
+                s.on_ack(
+                    &Ack {
+                        cumulative: 2 * n,
+                        limit: INITIAL_WINDOW,
+                        duplicate_bytes: n,
+                        ranges: vec![],
+                    },
+                    loss
+                )
+                .unwrap()
+                .1,
+                "dropped={dropped}"
+            );
+            assert!(s.reorder > reorder);
+            assert!(deadline.is_some());
+            if !dropped {
+                // Discarding a queued copy must still retire its accounting
+                // after the original's ACK has removed the segment.
+                assert!(!s.locally_dropped(0, copy.transmission));
+                assert!(s.pending_copies.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn a_copy_admitted_after_acknowledgment_is_credited_only_once() {
+        let now = Instant::now();
+        let mut s = Sender::new(false);
+        s.push(&[7; 64]);
+        let original = s.poll_transmit(now).unwrap();
+        s.admitted(0, original.transmission, 0, Duration::from_millis(50), now);
+        let probe_at = s.next_deadline(now).unwrap();
+        s.on_timeout(probe_at);
+        let copy = s.poll_transmit(probe_at).unwrap();
+        assert!(copy.tail_probe);
+        let ack = |duplicate_bytes| Ack {
+            cumulative: 64,
+            limit: INITIAL_WINDOW,
+            duplicate_bytes,
+            ranges: vec![],
+        };
+        s.on_ack(&ack(0), probe_at).unwrap();
+        assert!(s.segments.is_empty());
+        assert_eq!(s.expected_duplicates, 0, "a queued copy grants no credit");
+        // The repair can still leave the local queue after its segment was
+        // acknowledged; duplicated callbacks must not add a second allowance.
+        for _ in 0..2 {
+            s.admitted(0, copy.transmission, 1, Duration::from_millis(50), probe_at);
+        }
+        assert!(!s.on_ack(&ack(64), probe_at).unwrap().1);
+        assert!(s.on_ack(&ack(128), probe_at).unwrap().1);
+        assert!(s.pending_copies.is_empty());
     }
 
     #[test]

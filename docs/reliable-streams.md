@@ -279,6 +279,9 @@ timed it. Like the tail probe, the copy is not a loss declaration: it keeps the
 repair's loss clock, route and backoff evidence, its local drop does not mark the
 segment lost, and it counts toward the one-probe limit of the retained segment.
 A segment receives at most one such copy; repairs behind the cumulative point are
-not copied. The copy waits for the repair's admission and is abandoned if the
-repair is superseded or the segment is acknowledged. `tcp_streams.head_copies_queued`
+not copied. Before queueing, the copy waits for the repair's admission and is
+abandoned if the repair is superseded or the segment is acknowledged. `tcp_streams.head_copies_queued`
 counts successful local queue entries, also included in retransmission totals.
+The duplicate allowance is credited only when Quinn admits the copy, once per
+transmission. A copy discarded locally grants no allowance. Admission or discard
+can follow the original's acknowledgment without changing the repair's timer.
