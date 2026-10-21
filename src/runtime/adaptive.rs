@@ -82,6 +82,13 @@ const LOSS_TEST_MIN_BPS: u64 = 2_000_000;
 /// no faster than the initial search: one false brake early in a transfer
 /// must not leave it seconds below a path it never measured.
 const CLEAN_GROWTH_STREAK_MAX: u32 = 4;
+/// Congestion evidence is the wire rate a path delivered when it braked.
+/// Clean growth to this multiple of that rate, with delivery past
+/// `CONGESTION_EXPIRY_DELIVERY` of it, shows the brake was not its capacity
+/// (an RTT spike at a light pace, for example), so the path searches again
+/// at the initial speed instead of cautious steps sized for a known ceiling.
+const CONGESTION_EXPIRY_GAIN: f64 = 2.0;
+const CONGESTION_EXPIRY_DELIVERY: f64 = 1.5;
 
 /// Finalized loss observed while this path's own queue signal was clear.
 /// The floor is the smallest recent bucket, so a congestion episode can only
@@ -963,6 +970,8 @@ pub struct PathController {
     /// application-limited sample never decreases this exploration reference.
     remembered_bps: f64,
     congestion_seen: bool,
+    /// Highest wire rate delivered at a brake since congestion was established.
+    congestion_delivery_bps: Option<f64>,
     weight_loss: Option<WeightLoss>,
     weight_window: WeightWindow,
     loss_evidence: LossEvidence,
@@ -1063,6 +1072,7 @@ impl PathController {
             drain_restore_pending: false,
             remembered_bps: 0.0,
             congestion_seen: false,
+            congestion_delivery_bps: None,
             weight_loss: None,
             weight_window: WeightWindow::default(),
             loss_evidence: LossEvidence::default(),
@@ -2518,6 +2528,16 @@ impl PathController {
                 self.congestion_seen |= service_deficit
                     || backlogged_queue
                     || (self.pressure_episode_exercised == Some(true) && capacity_evidence);
+                if self.congestion_seen {
+                    let delivered = self
+                        .latest_delivery_bps
+                        .map_or(0.0, |rate| rate * self.wire_per_symbol)
+                        .max(reduced as f64);
+                    self.congestion_delivery_bps = Some(
+                        self.congestion_delivery_bps
+                            .map_or(delivered, |old| old.max(delivered)),
+                    );
+                }
                 if new_delay {
                     self.braked_queue_ms = Some(self.queue_delay_ms);
                     self.drain_restore_pending = true;
@@ -3280,6 +3300,21 @@ impl PathController {
         {
             rejected.baseline_bps = self.rate_bps;
             rejected.increment_bps = (self.rate_bps - previous_rate).saturating_mul(2);
+        }
+        if self.fast_recovery_enabled
+            && self.congestion_seen
+            && ordinary_growth
+            && self.rate_bps > previous_rate
+            && self.queue_delay_ms <= self.target_ms * 0.25
+            && self.congestion_delivery_bps.is_some_and(|braked| {
+                self.rate_bps as f64 >= braked * CONGESTION_EXPIRY_GAIN
+                    && self.latest_delivery_bps.is_some_and(|rate| {
+                        rate * self.wire_per_symbol >= braked * CONGESTION_EXPIRY_DELIVERY
+                    })
+            })
+        {
+            self.congestion_seen = false;
+            self.congestion_delivery_bps = None;
         }
         self.record_rate_change(now, previous_rate, rate_reason);
         if ordinary_growth
@@ -11511,6 +11546,64 @@ mod tests {
             controller.observe(&sample);
         }
         controller
+    }
+
+    fn grown_after_brake(braked: Option<f64>, fast_recovery: bool) -> PathController {
+        let mut controller = PathController::new(20_000_000, 20);
+        controller.fast_recovery_enabled = fast_recovery;
+        let mut sample = observation(0, 80.0);
+        sample.delivery_sample_span_us = 100_000;
+        sample.delivery_report_time_us = Some(100_000_000);
+        sample.delivered_bps = Some(500_000.0);
+        controller.observe(&sample);
+        controller.rate_bps = 500_000;
+        controller.remembered_bps = 500_000.0;
+        controller.congestion_seen = true;
+        controller.congestion_delivery_bps = braked;
+        let mut delivered_bytes = 0;
+        for now in (100_000..=600_000).step_by(100_000) {
+            delivered_bytes += exercise_budget(&mut controller, now - 100_000, 100_000);
+            sample.now_us = now;
+            sample.report_number = now / 100_000 + 1;
+            sample.probe_sample_id = sample.report_number;
+            sample.delivered_bytes = delivered_bytes;
+            sample.delivery_report_time_us = Some(100_000_000 + now);
+            sample.positive_delivery_age_us = Some(0);
+            controller.observe(&sample);
+        }
+        controller
+    }
+
+    #[test]
+    fn clean_growth_past_twice_the_braked_delivery_restarts_the_initial_search() {
+        // A brake at 250 kbit/s delivered, then clean growth to 544 kbit/s
+        // with 500 kbit/s delivered: that brake was not this path's capacity.
+        let expired = grown_after_brake(Some(250_000.0), true);
+        assert_eq!(expired.rate_bps, 544_444);
+        assert!(!expired.congestion_seen);
+        assert_eq!(expired.congestion_delivery_bps, None);
+        // Short of twice the braked delivery, the ceiling still holds.
+        let held = grown_after_brake(Some(300_000.0), true);
+        assert_eq!(held.rate_bps, 544_444);
+        assert!(held.congestion_seen);
+        assert_eq!(held.congestion_delivery_bps, Some(300_000.0));
+        // Without brake evidence, or under legacy recovery, nothing expires.
+        assert!(grown_after_brake(None, true).congestion_seen);
+        assert!(grown_after_brake(Some(250_000.0), false).congestion_seen);
+    }
+
+    #[test]
+    fn a_congested_brake_records_the_delivery_it_could_not_exceed() {
+        let (mut controller, mut sample) = paired_loss_service_fixture();
+        sample.delivered_bytes = 3_500_000;
+        sample.delivered_bps = Some(7_800_000.0);
+        controller.observe(&sample);
+        assert!(controller.congestion_seen);
+        let delivered = controller.latest_delivery_bps.unwrap() * controller.wire_per_symbol;
+        assert_eq!(
+            controller.congestion_delivery_bps,
+            Some(delivered.max(controller.rate_bps as f64))
+        );
     }
 
     #[test]
