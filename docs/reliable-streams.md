@@ -128,7 +128,8 @@ target sees.
 | Acknowledgment | Cumulative point, receive limit, total duplicate bytes, and up to 64 selective ranges. Sent after 16 segments or 2 ms, and immediately for gaps, duplicates, FIN, zero-length probes, or a window opening by a quarter. When the window holds more ranges, as under sustained loss, the frame describes the ranges holding the most recently stored data first (a repair that filled an old hole, then the newest data), as TCP SACK does; describing only the lowest ranges let data above them reach its loss deadline although it had arrived. |
 | Loss | A segment is lost when older than the reorder threshold and a later transmission was delivered, or older than 1.5 thresholds without that evidence. The threshold uses the larger of the actual admitting path's QUIC RTT and the largest of that path's recent stream RTT samples (including acknowledgment return delay), times a reorder factor of 1.25–2. QUIC's estimate already carries the path's variance; the stream's own first-sample variance bound (three RTTs) is not applied per path, so a new stream does not wait three RTTs to repair its first loss. Timing starts at admission, excluding the local queue. Before admission is known, the conservative aggregate RTT estimate remains in use. |
 | Backoff | Only a retransmission with no acknowledgment progress since its previous attempt backs off (1.5× per stall, bounded). Random loss with live acknowledgments is repaired at the threshold pace. |
-| Spurious repair | A rise in the peer's duplicate count raises the reorder factor by 25%, up to 2; progress decays it toward 1.25. |
+| Head-of-line repair | The repair of the segment at the cumulative point is followed by one extra copy once the repair is admitted (see below), so one further loss does not hold every later byte for another loss threshold. |
+| Spurious repair | A rise in the peer's duplicate count raises the reorder factor by 25%, up to 2; progress decays it toward 1.25. Duplicates explained by the sender's own extra copies (tail probes and head-of-line copies, at most two segments' worth outstanding) do not count. |
 | Local drop | Each stream original carries a hold through the sender queue. If it leaves without Quinn admission (expiry, queue rejection, API error) the stream retransmits it at once instead of waiting for loss detection. |
 | Local backlog | Stream bytes waiting for admission are capped at half the admission lifetime of the measured admission rate, between 8 and 56 records, so stream data does not age out of the adaptive 20 ms sender lifetime. |
 | Windows | 256 KiB initial, then the receiver advertises its share of a 64 MiB session budget, between 256 KiB and 32 MiB per stream. Out-of-order data that continues a held range extends it, so an acknowledgment walks the holes rather than every segment. The sender reads from its local socket only up to the peer limit plus 256 KiB. |
@@ -266,3 +267,18 @@ flights retain their existing recovery policy. Probes obey normal queue, pacing,
 receiver-window and native congestion constraints. `tcp_streams.tail_probes_queued`
 counts successful local queue entries, also included in retransmission totals;
 it does not claim native admission or prove which copy caused acknowledgment.
+
+### Head-of-line repair copy
+
+Every byte the receiver holds above a hole waits for that hole's repair. Under
+random loss the repair itself can be lost, and the hole then lasts a further loss
+threshold (with stall backoff), during which the receiver releases nothing. When
+the sender retransmits the segment at the cumulative acknowledgment point, it
+therefore queues one additional copy of it, after the repair's own admission has
+timed it. Like the tail probe, the copy is not a loss declaration: it keeps the
+repair's loss clock, route and backoff evidence, its local drop does not mark the
+segment lost, and it counts toward the one-probe limit of the retained segment.
+A segment receives at most one such copy; repairs behind the cumulative point are
+not copied. The copy waits for the repair's admission and is abandoned if the
+repair is superseded or the segment is acknowledged. `tcp_streams.head_copies_queued`
+counts successful local queue entries, also included in retransmission totals.

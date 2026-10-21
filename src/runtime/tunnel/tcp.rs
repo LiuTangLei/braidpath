@@ -991,6 +991,7 @@ impl Mux {
             }
             self.stats.segments_sent += 1;
             self.stats.tail_probes_queued += u64::from(t.tail_probe);
+            self.stats.head_copies_queued += u64::from(t.head_copy);
             if t.retransmission {
                 self.stats.retransmitted_segments += 1;
                 self.stats.retransmitted_bytes += match &t.frame {

@@ -45,6 +45,9 @@ const REORDER_BASE: f64 = 1.25;
 const REORDER_MAX: f64 = 2.0;
 const MAX_PTO: Duration = Duration::from_secs(2);
 const DEAD_AFTER: Duration = Duration::from_secs(30);
+/// Copies sent without a loss declaration may produce up to this many duplicate
+/// bytes that are not evidence of reordering.
+const EXPECTED_DUPLICATES_MAX: u64 = 2 * MAX_SEGMENT as u64;
 
 const UNKNOWN_PATH: usize = MAX_PATHS;
 
@@ -185,6 +188,8 @@ pub struct Snapshot {
     pub retransmitted_bytes: u64,
     /// Bounded additional short-tail copies queued, before native admission.
     pub tail_probes_queued: u64,
+    /// Bounded additional copies of head-of-line repairs queued, before native admission.
+    pub head_copies_queued: u64,
     /// Retransmissions caused by an original leaving the local sender queue unsent.
     pub local_drop_retransmits: u64,
     pub probe_timeouts: u64,
@@ -324,6 +329,10 @@ pub struct Sender {
     open_pending: bool,
     open_sent: bool,
     tail_probe_due: bool,
+    /// The head-of-line segment and the repair to follow with one copy once admitted.
+    head_copy: Option<(u64, u32)>,
+    /// Duplicate bytes the peer may report because of copies this sender chose to send.
+    expected_duplicates: u64,
 }
 
 /// A frame chosen for transmission, with the identity a local drop reports.
@@ -333,6 +342,7 @@ pub struct Transmit {
     pub transmission: u32,
     pub retransmission: bool,
     pub tail_probe: bool,
+    pub head_copy: bool,
 }
 
 impl Sender {
@@ -364,6 +374,8 @@ impl Sender {
             open_pending: open,
             open_sent: false,
             tail_probe_due: false,
+            head_copy: None,
+            expected_duplicates: 0,
         }
     }
     pub fn push(&mut self, data: &[u8]) {
@@ -407,6 +419,7 @@ impl Sender {
     }
     pub fn has_transmit(&self) -> bool {
         self.tail_probe_due
+            || self.head_copy_ready().is_some()
             || !self.lost.is_empty()
             || (self.next < self.written && self.next < self.limit)
             || (self.fin == Some(self.next) && !self.fin_sent)
@@ -494,6 +507,8 @@ impl Sender {
             // A probe is a bounded additional copy, not a loss declaration.
             // Preserve the original timer, route and failure/backoff evidence.
             segment.probe_transmission = Some(transmission);
+            self.expected_duplicates =
+                (self.expected_duplicates + (data_end - start)).min(EXPECTED_DUPLICATES_MAX);
         } else if segment.stalls == 0 {
             segment.sent_at = now;
             segment.path = UNKNOWN_PATH;
@@ -517,12 +532,23 @@ impl Sender {
             transmission,
             retransmission: transmission > 1,
             tail_probe: probe,
+            head_copy: false,
         }
     }
     pub fn poll_transmit(&mut self, now: Instant) -> Option<Transmit> {
         if let Some(start) = self.lost.pop_first() {
             let end = self.segments[&start].end;
-            return Some(self.send_segment(start, end, now, false));
+            let t = self.send_segment(start, end, now, false);
+            if start == self.acked {
+                self.head_copy = Some((start, t.transmission));
+            }
+            return Some(t);
+        }
+        if let Some((start, end)) = self.head_copy_ready() {
+            self.head_copy = None;
+            let mut t = self.send_segment(start, end, now, true);
+            (t.tail_probe, t.head_copy) = (false, true);
+            return Some(t);
         }
         if self.tail_probe_due {
             self.tail_probe_due = false;
@@ -565,6 +591,7 @@ impl Sender {
                 transmission: 0,
                 retransmission: false,
                 tail_probe: false,
+                head_copy: false,
             });
         }
         None
@@ -678,9 +705,12 @@ impl Sender {
                     .map_or(segment.sent_at, |r| r.max(segment.sent_at)),
             );
         }
-        let spurious = ack.duplicate_bytes > self.peer_duplicates;
+        let reported = ack.duplicate_bytes.saturating_sub(self.peer_duplicates);
+        let expected = reported.min(self.expected_duplicates);
+        self.expected_duplicates -= expected;
+        let spurious = reported > expected;
+        self.peer_duplicates = self.peer_duplicates.max(ack.duplicate_bytes);
         if spurious {
-            self.peer_duplicates = ack.duplicate_bytes;
             self.reorder = (self.reorder * 1.25).min(REORDER_MAX);
         } else if progressed {
             self.reorder = (self.reorder * 0.98).max(REORDER_BASE);
@@ -715,6 +745,22 @@ impl Sender {
         // Delayed ACKs must not move the first repair beyond the peer's
         // failure deadline. Repeated repairs retain their bounded backoff.
         sent_at + delay.min(MAX_PTO)
+    }
+
+    /// A repair of the segment holding back in-order delivery gets one extra
+    /// copy on its own admission, so a single further loss of either copy does
+    /// not stall the receiver for another loss timer. It waits until the repair
+    /// is admitted (so that admission keeps the repair's timer) and is dropped
+    /// once the repair is superseded.
+    fn head_copy_ready(&self) -> Option<(u64, u64)> {
+        let (start, transmission) = self.head_copy?;
+        let s = self.segments.get(&start)?;
+        (start == self.acked
+            && s.transmissions == transmission
+            && s.path != UNKNOWN_PATH
+            && s.probe_transmission.is_none()
+            && !self.lost.contains(&start))
+        .then_some((start, s.end))
     }
 
     fn tail_probe_deadline(&self) -> Option<(Instant, u64)> {
@@ -1138,6 +1184,119 @@ mod tests {
         );
         let loss_at = s.next_deadline(at).unwrap();
         assert!(loss_at <= now + Duration::from_millis(90));
+    }
+
+    #[test]
+    fn head_of_line_repair_is_copied_once_after_admission_without_retiming() {
+        let now = Instant::now();
+        let mut s = Sender::new(false);
+        s.push(&[7; 3 * MAX_SEGMENT]);
+        for _ in 0..3 {
+            let t = s.poll_transmit(now).unwrap();
+            s.admitted(t.start, t.transmission, 0, Duration::from_millis(50), now);
+        }
+        // The first segment is lost; later data arrived.
+        let ack = Ack {
+            cumulative: 0,
+            limit: INITIAL_WINDOW,
+            duplicate_bytes: 0,
+            ranges: vec![(MAX_SEGMENT as u64, 3 * MAX_SEGMENT as u64)],
+        };
+        let at = now + Duration::from_millis(60);
+        s.on_ack(&ack, at).unwrap();
+        let loss = s.next_deadline(at).unwrap();
+        s.on_timeout(loss);
+        let repair = s.poll_transmit(loss).unwrap();
+        assert!(repair.retransmission && !repair.head_copy && repair.start == 0);
+        assert!(
+            !s.has_transmit() && s.poll_transmit(loss).is_none(),
+            "no copy before the repair is admitted"
+        );
+        s.admitted(0, repair.transmission, 1, Duration::from_millis(50), loss);
+        let deadline = s.next_deadline(loss);
+        assert!(s.has_transmit());
+        let copy = s.poll_transmit(loss).unwrap();
+        assert!(copy.head_copy && !copy.tail_probe && copy.start == 0);
+        s.admitted(0, copy.transmission, 2, Duration::from_millis(10), loss);
+        assert_eq!(
+            s.next_deadline(loss),
+            deadline,
+            "the copy keeps the repair's timer"
+        );
+        assert!(!s.locally_dropped(0, copy.transmission));
+        assert!(s.lost.is_empty() && s.poll_transmit(loss).is_none());
+        // A later repair of the same segment is not copied again.
+        let again = s.next_deadline(loss).unwrap();
+        s.on_timeout(again);
+        let repair = s.poll_transmit(again).unwrap();
+        s.admitted(0, repair.transmission, 0, Duration::from_millis(50), again);
+        assert!(!repair.head_copy && s.poll_transmit(again).is_none());
+    }
+
+    #[test]
+    fn only_the_head_of_line_repair_is_copied() {
+        let now = Instant::now();
+        let mut s = Sender::new(false);
+        s.push(&[7; 3 * MAX_SEGMENT]);
+        for _ in 0..3 {
+            let t = s.poll_transmit(now).unwrap();
+            s.admitted(t.start, t.transmission, 0, Duration::from_millis(50), now);
+        }
+        // The first two segments are lost; the third arrived.
+        let ack = Ack {
+            cumulative: 0,
+            limit: INITIAL_WINDOW,
+            duplicate_bytes: 0,
+            ranges: vec![(2 * MAX_SEGMENT as u64, 3 * MAX_SEGMENT as u64)],
+        };
+        let at = now + Duration::from_millis(60);
+        s.on_ack(&ack, at).unwrap();
+        let loss = s.next_deadline(at).unwrap();
+        s.on_timeout(loss);
+        let mut sent = Vec::new();
+        while let Some(t) = s.poll_transmit(loss) {
+            s.admitted(t.start, t.transmission, 0, Duration::from_millis(50), loss);
+            sent.push((t.start, t.head_copy));
+        }
+        let segment = MAX_SEGMENT as u64;
+        assert_eq!(sent, [(0, false), (segment, false), (0, true)]);
+    }
+
+    #[test]
+    fn duplicates_from_a_copy_are_not_reordering_evidence() {
+        let now = Instant::now();
+        let mut s = Sender::new(false);
+        s.push(&[7; 2 * MAX_SEGMENT]);
+        for _ in 0..2 {
+            let t = s.poll_transmit(now).unwrap();
+            s.admitted(t.start, t.transmission, 0, Duration::from_millis(50), now);
+        }
+        let at = now + Duration::from_millis(60);
+        let ack = |duplicate_bytes, cumulative| Ack {
+            cumulative,
+            limit: INITIAL_WINDOW,
+            duplicate_bytes,
+            ranges: vec![(MAX_SEGMENT as u64, 2 * MAX_SEGMENT as u64)]
+                .into_iter()
+                .filter(|r| r.0 >= cumulative)
+                .collect(),
+        };
+        s.on_ack(&ack(0, 0), at).unwrap();
+        let loss = s.next_deadline(at).unwrap();
+        s.on_timeout(loss);
+        let repair = s.poll_transmit(loss).unwrap();
+        s.admitted(0, repair.transmission, 0, Duration::from_millis(50), loss);
+        assert!(s.poll_transmit(loss).unwrap().head_copy);
+        let reorder = s.reorder;
+        let segment = MAX_SEGMENT as u64;
+        let done = 2 * segment;
+        assert!(!s.on_ack(&ack(segment, done), loss).unwrap().1);
+        assert!(
+            s.reorder <= reorder,
+            "the expected duplicate is not spurious"
+        );
+        assert!(s.on_ack(&ack(2 * segment, done), loss).unwrap().1);
+        assert!(s.reorder > reorder, "a further duplicate still is");
     }
 
     #[test]
