@@ -203,7 +203,28 @@ pub(super) fn prime_full_input_turn(
     }
 }
 
-async fn full_input_turn_services_old_records(expires: bool) {
+// Receiving the first 64 records does not imply the actor has polled the
+// deferred 65th record's readiness future. Model a legal scheduler suspension
+// at that exact boundary instead of relying on wall-clock load to hit it.
+#[derive(Default)]
+struct DeferredExpiryGate {
+    reached: tokio::sync::Notify,
+    resume: tokio::sync::Notify,
+}
+thread_local! {
+    static DEFERRED_EXPIRY_GATE: std::cell::RefCell<Option<Arc<DeferredExpiryGate>>> = const { std::cell::RefCell::new(None) };
+}
+pub(super) async fn hold_deferred_expiry(deferred: bool) {
+    if deferred {
+        let gate = DEFERRED_EXPIRY_GATE.with(|cell| cell.borrow_mut().take());
+        if let Some(gate) = gate {
+            gate.reached.notify_one();
+            gate.resume.notified().await;
+        }
+    }
+}
+
+async fn full_input_turn_services_old_records(expires: bool, settle: bool) {
     let pair = Pair::connect().await;
     let paths = Arc::new(Mutex::new(vec![pair.path()]));
     let mut policy = policy();
@@ -228,6 +249,8 @@ async fn full_input_turn_services_old_records(expires: bool) {
         created,
     })
     .unwrap();
+    let gate = expires.then(|| Arc::new(DeferredExpiryGate::default()));
+    DEFERRED_EXPIRY_GATE.with(|cell| *cell.borrow_mut() = gate.clone());
     PRIME_FULL_INPUT.with(|prime| prime.set(true));
     let task = tokio::spawn(sender(rx, paths, policy, stopped, scope, None));
     let mut received = BTreeSet::new();
@@ -261,6 +284,42 @@ async fn full_input_turn_services_old_records(expires: bool) {
             assert!(received.insert(record.id));
         }
     }
+    if let Some(gate) = gate {
+        timeout(Duration::from_secs(2), gate.reached.notified())
+            .await
+            .unwrap();
+        metrics.state(|s| {
+            let d = &s.sessions["full-input"][stats::FORWARD];
+            assert_eq!(d.symbols.originals_quinn_admitted, 64);
+            assert_eq!(
+                d.symbols.originals_expired_dropped, 0,
+                "delivery of old records must not be mistaken for deferred-input settlement"
+            );
+        });
+        if !settle {
+            stop.send(true).unwrap();
+        }
+        gate.resume.notify_one();
+        if settle {
+            timeout(Duration::from_secs(2), async {
+                loop {
+                    let mut expired = false;
+                    metrics.state(|s| {
+                        expired = s.sessions["full-input"][stats::FORWARD]
+                            .symbols
+                            .originals_expired_dropped
+                            == 1
+                    });
+                    if expired {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("deferred input never settled at its fixed admission deadline");
+        }
+    }
     stop.send(true).unwrap();
     task.await.unwrap();
     ADMISSION_CLOCK_FIXED.with(|clock| clock.set(None));
@@ -272,8 +331,11 @@ async fn full_input_turn_services_old_records(expires: bool) {
             d.symbols.originals_quinn_admitted,
             if expires { 64 } else { 65 }
         );
-        assert_eq!(d.symbols.originals_expired_dropped, u64::from(expires));
-        assert_eq!(d.symbols.originals_shutdown_dropped, 0);
+        assert_eq!(d.symbols.originals_expired_dropped, u64::from(expires && settle));
+        assert_eq!(d.symbols.originals_shutdown_dropped, u64::from(expires && !settle));
+        if expires && !settle {
+            eprintln!("controlled scheduler suspension: generated=65 admitted=64 expired=0 shutdown=1; the former test stopped before deferred expiry settled");
+        }
         if !expires {
             assert!(
                 d.symbols.admitted_wait.max_ms >= 20.0,
@@ -286,12 +348,17 @@ async fn full_input_turn_services_old_records(expires: bool) {
 
 #[tokio::test(flavor = "current_thread")]
 async fn full_input_turn_services_old_records_before_rejecting_new_original() {
-    full_input_turn_services_old_records(false).await;
+    full_input_turn_services_old_records(false, true).await;
 }
 
 #[tokio::test(flavor = "current_thread")]
 async fn full_input_turn_cannot_revive_deferred_record_past_its_ingress_deadline() {
-    full_input_turn_services_old_records(true).await;
+    full_input_turn_services_old_records(true, true).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn stopping_before_deferred_input_settles_is_shutdown_not_deadline_failure() {
+    full_input_turn_services_old_records(true, false).await;
 }
 
 async fn full_input_turn_with_blocked_group(new_flow: u32) {

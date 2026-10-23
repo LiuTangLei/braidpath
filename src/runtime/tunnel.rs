@@ -1,5 +1,5 @@
 use super::{
-    MAX_PATHS, MAX_PAYLOAD, QUEUE, adaptive, capacity_probe, outbound, quality, scheduler,
+    MAX_PATHS, MAX_PAYLOAD, QUEUE, adaptive, capacity_probe, mesh, outbound, quality, scheduler,
     sender_frontier::{self, Gate},
     shutdown::Shutdown,
     stats::{self, Scope},
@@ -36,6 +36,7 @@ use tracing::{info, warn};
 const MAX_FLOWS: usize = 64;
 const SESSION_IDLE_GRACE: Duration = Duration::from_secs(120);
 const SESSION_PATH: &str = "/session";
+pub(crate) const ADMISSION_TIMEOUT_MS: u64 = 10_000;
 mod coding;
 #[cfg(test)]
 mod dual_tests;
@@ -1397,6 +1398,13 @@ async fn sender(
     let lifetime = policy.admission_lifetime();
     let mut waiting: Option<WaitingSend> = None;
     loop {
+        #[cfg(test)]
+        sender_ready_tests::hold_deferred_expiry(
+            waiting
+                .as_ref()
+                .is_some_and(|wait| wait.prepared.front.record_id == Some(64)),
+        )
+        .await;
         if *stop.borrow() {
             break;
         }
@@ -2705,11 +2713,31 @@ struct Session {
 }
 type Sessions = Arc<Mutex<HashMap<String, Arc<Session>>>>;
 
+// Session loops are detached from connection handlers. Stop them even if the
+// owning server future is cancelled before its normal shutdown path runs.
+struct ServerLifetime {
+    endpoint: quinn::Endpoint,
+    sessions: Sessions,
+}
+impl Drop for ServerLifetime {
+    fn drop(&mut self) {
+        self.endpoint.close(0u32.into(), b"server stopped");
+        for session in self.sessions.lock().expect("sessions lock").values() {
+            let _ = session.stop.send(true);
+        }
+    }
+}
+
 async fn session_loop(
     session: Arc<Session>,
     mut events: mpsc::Receiver<Event>,
     target: SocketAddr,
 ) {
+    if *session.stop.borrow() {
+        session.done.store(true, Ordering::Release);
+        session.finished.notify_waiters();
+        return;
+    }
     let (tx, rx) = mpsc::channel(QUEUE);
     let mut tasks = JoinSet::new();
     tasks.spawn(sender(
@@ -2877,6 +2905,31 @@ pub async fn serve_with_ack_request(
     options: ServerOptions,
     ack_request: transport::AckRequest,
 ) -> Result<()> {
+    serve_with_mesh(options, ack_request, None).await
+}
+
+pub(crate) async fn serve_with_mesh(
+    options: ServerOptions,
+    ack_request: transport::AckRequest,
+    mesh: Option<Arc<mesh::State>>,
+) -> Result<()> {
+    serve_with_budgets(
+        options,
+        ack_request,
+        mesh,
+        Arc::new(Semaphore::new(64)),
+        Arc::new(Semaphore::new(128)),
+    )
+    .await
+}
+
+async fn serve_with_budgets(
+    options: ServerOptions,
+    ack_request: transport::AckRequest,
+    mesh: Option<Arc<mesh::State>>,
+    pending_connections: Arc<Semaphore>,
+    data_connections: Arc<Semaphore>,
+) -> Result<()> {
     ensure!(
         (64_000..=1_000_000_000).contains(&options.max_rate),
         "invalid server rate"
@@ -2891,7 +2944,10 @@ pub async fn serve_with_ack_request(
     )?;
     let secret = Arc::new(format!("Bearer {}", transport::token(&options.token)?));
     let sessions: Sessions = Arc::new(Mutex::new(HashMap::new()));
-    let limit = Arc::new(Semaphore::new(128));
+    let _lifetime = ServerLifetime {
+        endpoint: endpoint.clone(),
+        sessions: sessions.clone(),
+    };
     let mut tasks = JoinSet::new();
     let mut maintenance = interval(Duration::from_secs(1));
     let mut shutdown = Shutdown::new();
@@ -2913,12 +2969,11 @@ pub async fn serve_with_ack_request(
             },
             incoming=endpoint.accept()=>{
                 let Some(incoming)=incoming else{break};
-                let Ok(permit)=limit.clone().try_acquire_owned() else{incoming.refuse();continue};
-                let sessions=sessions.clone(); let secret=secret.clone(); let target=options.target; let settings=ServerSessionSettings{max_rate:options.max_rate,adaptive_fec_retention:options.adaptive_fec_retention}; let metrics=options.stats.clone();
+                let Ok(permit)=pending_connections.clone().try_acquire_owned() else{incoming.refuse();continue};
+                let sessions=sessions.clone(); let secret=secret.clone(); let target=options.target; let settings=ServerSessionSettings{max_rate:options.max_rate,adaptive_fec_retention:options.adaptive_fec_retention,mesh:mesh.clone(),data_connections:data_connections.clone()}; let metrics=options.stats.clone();
                 tasks.spawn(async move {
-                    let _permit=permit;
                     let mut diagnostic=stats::ConnectionTrace::new(metrics.clone(),incoming.remote_address(),None,"incoming");
-                    let result=server_connection(incoming,sessions,secret,target,settings,metrics,&mut diagnostic).await;
+                    let result=server_connection(incoming,permit,sessions,secret,target,settings,metrics,&mut diagnostic).await;
                     let normal=diagnostic.finish(result.as_ref().err());
                     if let Err(e)=result {
                         if normal {info!(context=%diagnostic.context(),"HTTP/3 connection closed");}
@@ -2973,14 +3028,18 @@ pub async fn serve_with_ack_request(
     Ok(())
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct ServerSessionSettings {
+    data_connections: Arc<Semaphore>,
+    mesh: Option<Arc<mesh::State>>,
     max_rate: u64,
     adaptive_fec_retention: bool,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn server_connection(
     incoming: quinn::Incoming,
+    permit: tokio::sync::OwnedSemaphorePermit,
     sessions: Sessions,
     secret: Arc<String>,
     target: SocketAddr,
@@ -2989,27 +3048,56 @@ async fn server_connection(
     diagnostic: &mut stats::ConnectionTrace,
 ) -> Result<()> {
     let ServerSessionSettings {
+        data_connections,
+        mesh,
         max_rate,
         adaptive_fec_retention,
     } = settings;
     let conn = timeout(Duration::from_secs(5), incoming).await??;
     diagnostic.handshake_succeeded(&conn);
     diagnostic.enter("http3", "http3_setup");
-    let mut h3 = h3::server::builder()
-        .enable_datagram(true)
-        .max_field_section_size(8192)
-        .build::<_, Bytes>(h3_quinn::Connection::new(conn.clone()))
-        .await?;
+    let mut admission_deadline =
+        tokio::time::Instant::now() + Duration::from_millis(ADMISSION_TIMEOUT_MS);
+    let setup = async {
+        Ok::<_, anyhow::Error>(
+            tokio::time::timeout_at(
+                admission_deadline,
+                h3::server::builder()
+                    .enable_datagram(true)
+                    .max_field_section_size(8192)
+                    .build::<_, Bytes>(h3_quinn::Connection::new(conn.clone())),
+            )
+            .await??,
+        )
+    }
+    .await;
+    let mut h3 = match setup {
+        Ok(h3) => h3,
+        Err(error) => {
+            conn.close(0u32.into(), b"HTTP/3 admission failed");
+            return Err(error);
+        }
+    };
     diagnostic.succeeded();
     let mut joined: Option<(String, Arc<Session>, u8, u64, u64)> = None;
     let mut request: Option<h3::server::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>> = None;
-    let admission_deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    // Our clients send their first request within their 8-second (data) or
+    // 4-second (control) attempt deadline. Unclassified connections hold the
+    // small pending budget, so release it soon after that.
+
+    // Data paths hold the shared connection permit. An authenticated mesh
+    // control connection moves to the mesh budget and closes when idle.
+    let mut pending_permit = Some(permit);
+    let mut data_permit = None;
+    let mut control_permit = None;
+    let mut mesh_authenticated = false;
     let admission_started = Instant::now();
     diagnostic.enter_since("path_admission", "admission_wait", admission_started);
     let result:Result<()>=async {
         loop {
             tokio::select! {
                 _=tokio::time::sleep_until(admission_deadline),if joined.is_none()=>{
+                    if mesh_authenticated {break;}
                     diagnostic.enter_since("path_admission","admission_wait",admission_started);
                     diagnostic.failed("admission_deadline_elapsed");
                     bail!("session admission timed out")
@@ -3017,8 +3105,24 @@ async fn server_connection(
                 accepted=h3.accept()=>{
                     let Some(resolver)=accepted? else{break};
                     diagnostic.enter("http3_request","request_resolve");
-                    let (req,mut stream)=timeout(Duration::from_secs(5),resolver.resolve_request()).await??;
+                    let request_deadline = tokio::time::Instant::now()+Duration::from_secs(5);
+                    let request_deadline = if joined.is_none() {request_deadline.min(admission_deadline)} else {request_deadline};
+                    let (req,mut stream)=tokio::time::timeout_at(request_deadline,resolver.resolve_request()).await??;
                     diagnostic.succeeded();
+                    if let Some(mesh)=&mesh && req.uri().path().starts_with("/mesh/") {
+                        ensure!(joined.is_none(),"data connection cannot carry mesh control");
+                        if control_permit.is_none() && mesh.authorized(&req) {
+                            // Acquire before handling: no allocations or successful
+                            // responses may escape a full control budget.
+                            control_permit=Some(mesh.control_permit().context("mesh control connection limit reached")?);
+                            pending_permit=None;
+                            mesh_authenticated=true;
+                        }
+                        if timeout(Duration::from_secs(5),mesh.handle(&req,&mut stream,conn.remote_address().ip())).await?? {
+                            admission_deadline=tokio::time::Instant::now()+mesh::CONTROL_IDLE;
+                        }
+                        continue;
+                    }
                     if req.method()!=Method::POST || req.uri().path()!=SESSION_PATH {
                         let ok=req.method()==Method::GET && req.uri().path()=="/";
                         stream.send_response(Response::builder().status(if ok{StatusCode::OK}else{StatusCode::NOT_FOUND}).header("content-type","text/html; charset=utf-8").body(())?).await?;
@@ -3035,6 +3139,11 @@ async fn server_connection(
                         if joined.is_some(){diagnostic.enter("established","connected");}
                         else{diagnostic.enter_since("path_admission","admission_wait",admission_started);}
                         continue
+                    }
+                    ensure!(!mesh_authenticated,"mesh control connection cannot carry a session");
+                    if data_permit.is_none() {
+                        data_permit=Some(data_connections.clone().try_acquire_owned().context("data connection limit reached")?);
+                        pending_permit=None;
                     }
                     ensure!(joined.is_none(),"only one aggregate request per connection");
                     // Request and control streams can arrive in either order. Drive
@@ -3206,6 +3315,7 @@ async fn server_connection(
         }
         info!(path = pid, "path left");
     }
+    drop((pending_permit, data_permit, control_permit));
     result
 }
 
@@ -3251,11 +3361,104 @@ struct PathConfig {
     group: u8,
     generation: u64,
     attempted: bool,
+    enabled: bool,
+}
+
+async fn entrances_changed(
+    updates: &mut Option<watch::Receiver<Vec<SocketAddr>>>,
+) -> Vec<SocketAddr> {
+    if let Some(updates) = updates
+        && updates.changed().await.is_ok()
+    {
+        return updates.borrow_and_update().clone();
+    }
+    std::future::pending().await
+}
+
+fn reconcile_entrances(
+    desired: &[SocketAddr],
+    configs: &mut Vec<PathConfig>,
+    inflight: &[bool; MAX_PATHS],
+    endpoints: &mut [Option<quinn::Endpoint>; MAX_PATHS],
+    paths: &Paths,
+    rotations: &mut [scheduler::Rotation; MAX_PATHS],
+) {
+    // Keep IDs and connections for unchanged addresses, irrespective of the
+    // discovery order. Never reuse a slot while its old handshake is in flight.
+    for (id, config) in configs.iter_mut().enumerate() {
+        if config.enabled && !inflight[id] && !desired.contains(&config.remote) {
+            config.enabled = false;
+            let mut paths = paths.lock().expect("paths lock");
+            for path in paths.iter().filter(|p| usize::from(p.id) == id) {
+                path.conn.close(0u32.into(), b"entrance retired");
+            }
+            paths.retain(|p| usize::from(p.id) != id);
+            if let Some(endpoint) = endpoints[id].take() {
+                endpoint.close(0u32.into(), b"entrance retired");
+            }
+        }
+    }
+    for remote in desired {
+        if configs.iter().any(|c| c.enabled && c.remote == *remote) {
+            continue;
+        }
+        if let Some((id, config)) = configs
+            .iter_mut()
+            .enumerate()
+            .find(|(id, c)| !c.enabled && !inflight[*id])
+        {
+            config.remote = *remote;
+            config.enabled = true;
+            config.attempted = false;
+            // Preserve the generation counter when reusing a path ID so the
+            // selected exit's replay protection accepts the replacement.
+            rotations[id] = scheduler::Rotation::default();
+        } else if configs.len() < MAX_PATHS {
+            configs.push(PathConfig {
+                remote: *remote,
+                interface: None,
+                bind: None,
+                group: 0,
+                generation: rand::random::<u64>() >> 1,
+                attempted: false,
+                enabled: true,
+            });
+        }
+    }
 }
 
 /// Keep the local application socket while explicitly replacing an expired session epoch.
 pub async fn client(options: ClientOptions) -> Result<()> {
+    client_with_entrances(options, None).await
+}
+
+/// Mesh control publishes addresses only when membership or a lease changes.
+/// Existing paths and the local UDP socket survive entrance replacement.
+pub(crate) async fn client_with_entrances(
+    options: ClientOptions,
+    entrances: Option<watch::Receiver<Vec<SocketAddr>>>,
+) -> Result<()> {
+    client_with_health(options, entrances, None).await
+}
+
+pub(crate) async fn client_with_health(
+    mut options: ClientOptions,
+    mut entrances: Option<watch::Receiver<Vec<SocketAddr>>>,
+    health: Option<watch::Sender<mesh::PathHealth>>,
+) -> Result<()> {
+    if entrances.is_some() {
+        // Path replacement needs authenticated monotonic generations, carried
+        // by feedback v2 even when adaptive pacing is disabled.
+        options.policy.receiver_feedback = true;
+    }
     options.policy.validate()?;
+    ensure!(
+        entrances.is_none()
+            || (options.interfaces.is_empty()
+                && options.path_binds.is_empty()
+                && options.path_groups.is_empty()),
+        "dynamic entrances use the default local route"
+    );
     ensure!(
         !options.rotate_source_port || options.policy.quality_schedule,
         "source-port rotation requires quality scheduling or adaptive mode"
@@ -3284,8 +3487,15 @@ pub async fn client(options: ClientOptions) -> Result<()> {
     let socket = Arc::new(UdpSocket::bind(options.listen).await?);
     let mut shutdown = Shutdown::new();
     loop {
-        let result = client_session(&options, socket.clone(), &mut shutdown).await;
-        if options.policy.adaptive
+        let result = client_session(
+            &options,
+            socket.clone(),
+            &mut shutdown,
+            &mut entrances,
+            health.as_ref(),
+        )
+        .await;
+        if (options.policy.adaptive || entrances.is_some())
             && result
                 .as_ref()
                 .err()
@@ -3308,6 +3518,8 @@ async fn client_session(
     options: &ClientOptions,
     socket: Arc<UdpSocket>,
     shutdown: &mut Shutdown,
+    entrances: &mut Option<watch::Receiver<Vec<SocketAddr>>>,
+    health: Option<&watch::Sender<mesh::PathHealth>>,
 ) -> Result<()> {
     let token = transport::token(&options.token)?;
     let sid = transport::hex(&rand::random::<[u8; 16]>());
@@ -3332,8 +3544,11 @@ async fn client_session(
     } else {
         options.interfaces.iter().cloned().map(Some).collect()
     };
+    let recover_paths = options.policy.adaptive || entrances.is_some();
+    let mut desired = entrances.as_mut().map(|rx| rx.borrow_and_update().clone());
+    let initial = desired.as_ref().unwrap_or(&options.entrances);
     for (interface_index, interface) in interfaces.into_iter().enumerate() {
-        for remote in &options.entrances {
+        for remote in initial {
             let id = configs.len();
             configs.push(PathConfig {
                 remote: *remote,
@@ -3346,6 +3561,7 @@ async fn client_session(
                     .unwrap_or(interface_index as u8),
                 generation: rand::random::<u64>() >> 1,
                 attempted: false,
+                enabled: true,
             });
         }
     }
@@ -3389,17 +3605,35 @@ async fn client_session(
     let result:Result<()>=async {loop {
         tokio::select! {
             _=shutdown.wait()=>break,
+            updated=entrances_changed(entrances)=>{
+                ensure!(!updated.is_empty() && updated.len()<=MAX_PATHS,"invalid entrance update");
+                desired=Some(updated);
+            },
             _=retention_deadline(&decoder)=>{decoder.expire_adaptive(Instant::now());publish_retention(&decoder,&returning);},
             completed=delivery.ready()=>drops+=completed,
             _=tick.tick()=>{
                 let now_us=epoch.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
+                if let Some(desired)=&desired {
+                    reconcile_entrances(desired,&mut configs,&inflight,&mut endpoints,&paths,&mut rotations);
+                    let configured=configs.iter().filter(|c|c.enabled).count();
+                    options.stats.state(|s|s.configured_paths=configured);
+                }
                 peers.retain(|_,(id,last)|{if last.elapsed()<Duration::from_secs(60){true}else{reverse.remove(id);false}});
                 let current=paths.lock().expect("paths lock").clone();
                 let live=current.iter().filter(|p|p.conn.close_reason().is_none()).count();
-                if announced && !options.policy.adaptive && live==0 {bail!("all paths failed");}
+                if let Some(health)=health {
+                    let addresses=current.iter().filter(|p| p.conn.close_reason().is_none())
+                        .map(|p| configs[usize::from(p.id)].remote).collect();
+                    health.send_replace(mesh::PathHealth{checked:Instant::now(),addresses});
+                }
+                if announced && !recover_paths && live==0 {bail!("all paths failed");}
+                // With no working path, try every configured entrance (at most
+                // eight) so blackholes cannot block a healthy later candidate.
+                // Background reconnects/rotations keep the two-attempt bound.
+                let attempt_limit=if live==0 {MAX_PATHS}else{2};
                 for (id,config) in configs.iter_mut().enumerate() {
-                    if inflight.iter().filter(|busy|**busy).count()>=2 {break;}
-                    if inflight[id] {continue;}
+                    if inflight.iter().filter(|busy|**busy).count()>=attempt_limit {break;}
+                    if inflight[id] || !config.enabled {continue;}
                     let path=current.iter().find(|p|usize::from(p.id)==id);
                     let open=path.is_some_and(|p|p.conn.close_reason().is_none());
                     let elective=if options.rotate_source_port && open {
@@ -3417,7 +3651,7 @@ async fn client_session(
                     // An initial failed path can join an already established
                     // session without coupling recovery to adaptive rate control.
                     // Previously joined fixed-mode paths keep their old policy.
-                    let recovery=(!config.attempted || options.policy.adaptive
+                    let recovery=(!config.attempted || recover_paths
                         || (has_session && endpoints[id].is_none()))
                         && rotations[id].should_retry(now_us,open);
                     if !elective && !recovery {continue;}
@@ -3461,20 +3695,24 @@ async fn client_session(
                         let _=tx.send((id as u8,generation,attempt)).await;
                     });
                 }
-                if !announced && !options.policy.adaptive && configs.iter().all(|c|c.attempted) && !inflight.iter().any(|v|*v) {
+                if !announced && !recover_paths && configs.iter().all(|c|c.attempted) && !inflight.iter().any(|v|*v) {
                     ensure!(live>0,"no authenticated paths available");
                     announced=true;
-                    options.stats.readiness(true,configs.len());
+                    options.stats.readiness(true,configs.iter().filter(|c|c.enabled).count());
                     info!(listen=%socket.local_addr()?,paths=live,congestion=?options.congestion,"UDP client ready");
                 }
                 if now_us.saturating_sub(last_stats)>=2_000_000 {
                     last_stats=now_us;
-                    info!(live,configured=configs.len(),originals=decoder.originals,recovered=decoder.recovered,duplicates=decoder.duplicates,invalid=decoder.invalid,drops,"client path status");
+                    info!(live,configured=configs.iter().filter(|c|c.enabled).count(),originals=decoder.originals,recovered=decoder.recovered,duplicates=decoder.duplicates,invalid=decoder.invalid,drops,"client path status");
                 }
             },
             rebuilt=rejoin_rx.recv()=>{
                 let Some((pid,generation,rebuild))=rebuilt else {bail!("path supervisor ended")};
                 let id=usize::from(pid);inflight[id]=false;
+                if desired.as_ref().is_some_and(|addresses|!addresses.contains(&configs[id].remote)) {
+                    if let Ok((value,_))=rebuild {value.endpoint.close(0u32.into(),b"entrance retired");}
+                    continue;
+                }
                 let now_us=epoch.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
                 match rebuild {
                     Ok((value,diagnostic))=>{
@@ -3500,8 +3738,8 @@ async fn client_session(
                         tasks.spawn(drive_client_path(value.conn,value.stream,value.driver,value.request,value.send,diagnostic,pid,generation,
                             wire_tx.clone(),ingress_drops.clone(),returning.clone(),forward.clone(),paths.clone(),options.policy.receiver_feedback,observation_notify.clone()));
                         has_session=true;
-                        if options.policy.adaptive && !announced {
-                            options.stats.readiness(true,configs.len());
+                        if recover_paths && !announced {
+                            options.stats.readiness(true,configs.iter().filter(|c|c.enabled).count());
                             announced=true;
                             info!(listen=%socket.local_addr()?,paths=paths.lock().expect("paths lock").len(),congestion=?options.congestion,"UDP client ready");
                         }
@@ -3549,7 +3787,9 @@ async fn client_session(
     decoder.close_retention();
     publish_retention(&decoder, &returning);
     let _ = stop.send(true);
-    options.stats.readiness(false, configs.len());
+    options
+        .stats
+        .readiness(false, configs.iter().filter(|c| c.enabled).count());
     for endpoint in endpoints.iter().flatten() {
         endpoint.close(0u32.into(), b"client session stopped");
     }
@@ -3861,6 +4101,9 @@ pub async fn get(remote: SocketAddr, name: &str, ca: &std::path::Path) -> Result
 
 #[cfg(test)]
 mod sender_ready_tests;
+
+#[cfg(test)]
+mod entrance_tests;
 
 #[cfg(test)]
 mod reprobe_tests;

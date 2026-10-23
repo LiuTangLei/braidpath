@@ -1,5 +1,12 @@
 # Experimental runtime
 
+For platform installation and service management, see [installation](install.md).
+
+For automatic credentials, peer discovery and client-selected exits, use the
+[distributed-server mode](mesh.md). The commands below also support manually
+configured single-exit deployments.
+
+
 BraidPath currently forwards unreliable UDP messages to one operator-configured destination. Each path uses real HTTP/3 over Quinn/rustls, with authenticated HTTP Datagrams. There is no Xray runtime, TCP adapter, TUN device or transparent IP tunnel.
 
 ## Local quick start
@@ -13,7 +20,7 @@ Build with `cargo build --release --locked` (Rust 1.88+). The following commands
 # Terminal 1: test destination (or use your own UDP service).
 ./target/release/braidpath echo --listen 127.0.0.1:9000
 
-# Terminal 2: main server.
+# Terminal 2: selected exit.
 ./target/release/braidpath server --listen 127.0.0.1:7443 \
   --cert local/identity/cert.pem --key local/identity/key.pem \
   --token-file local/identity/token --target 127.0.0.1:9000
@@ -30,9 +37,9 @@ Build with `cargo build --release --locked` (Rust 1.88+). The following commands
   --count 1000 --size 1000 --pps 200 --deadline-ms 250
 ```
 
-For separate hosts, bind the server to its intended address, use a certificate matching `--server-name`, and securely copy the public certificate and token to the client. Keep the private key only on the main server. `init` creates a self-signed test certificate; production identity provisioning and rotation are not automated. One server token defines one authorization domain. Unix identity permissions are restricted; operators must restrict credential ACLs on Windows.
+For separate hosts, bind the server to its intended address, use a certificate matching `--server-name`, and securely copy the public certificate and token to the client. Keep the private key only on the selected exit. `init` creates a self-signed test certificate; production identity provisioning and rotation are not automated. One server token defines one authorization domain. Unix identity permissions are restricted; operators must restrict credential ACLs on Windows.
 
-The local client listener should stay on loopback unless other local-network callers are deliberately authorized. Its callers share the tunnel credential. The main server permits only its configured UDP target; it is not an arbitrary destination proxy.
+The local client listener should stay on loopback unless other local-network callers are deliberately authorized. Its callers share the tunnel credential. The selected exit permits only its configured UDP target; it is not an arbitrary destination proxy.
 
 ## Multiple entrances and interfaces
 
@@ -43,7 +50,7 @@ A loopback relay can be added in another terminal:
   --target 127.0.0.1:7443 --allow-source 127.0.0.1
 ```
 
-Restart the client with both `--entrance 127.0.0.1:7443` and `--entrance 127.0.0.1:7444`. For remote relays, configure the main server's reachable address and allow the client's actual public source IP. No credentials or TLS keys are installed on relays. Each client socket gets a separate return mapping; relay backhaul traffic goes directly to the main server.
+Restart the client with both `--entrance 127.0.0.1:7443` and `--entrance 127.0.0.1:7444`. For remote relays, configure the selected exit's reachable address and allow the client's actual public source IP. No credentials or TLS keys are installed on relays. Each client socket gets a separate return mapping; relay backhaul traffic goes directly to the selected exit.
 
 On Linux, repeat `--interface eth0 --interface wlan0` to create the interface–entrance Cartesian product, up to eight connections. Binding requires appropriate socket permissions and routes; it does not create policy routes. Non-Linux explicit interface binding returns an error. Without the option, all platforms use the default route. Creating several connections on one interface does not demonstrate multiple access links.
 
@@ -184,7 +191,7 @@ record-set changes, not network throughput or cross-machine deadline performance
 
 ### Envelope and session mapping
 
-- TLS verifies the main server's certificate and name; ALPN is `h3`; 0-RTT is disabled. Both peers must advertise QUIC DATAGRAM capacity and HTTP/3 `H3_DATAGRAM` support.
+- TLS verifies the selected exit's certificate and name; ALPN is `h3`; 0-RTT is disabled. Both peers must advertise QUIC DATAGRAM capacity and HTTP/3 `H3_DATAGRAM` support.
 - `GET /` serves a small ordinary HTML page. Unknown requests and unauthenticated `POST /session` return the same 404 response. This is a functional HTTP/3 endpoint, not browser impersonation or a complete production website.
 - A long-lived `POST /session` carries the bearer token and version, random 128-bit session ID, path ID and policy headers. Joining another path requires the same credential and session policy. A request FIN or connection closure removes that path. An adaptive session retains an empty-path epoch for approximately 120 s; a baseline session ends when its last path leaves.
 - This is a BraidPath application mapping using RFC 9297 HTTP Datagrams, **not CONNECT-UDP, MASQUE, WebTransport or Xray compatibility**. It has no Capsule or reliable HTTP-body fallback.
@@ -338,7 +345,7 @@ The per-generation minimum RTT currently has no aging: a permanent propagation c
 
 The default 20 ms target applies to local sender age and the added-delay control objective; admission uses local age alone. Native probes report 100 ms and 150 ms arrival buckets using the complete requested count, including missing and unsent operations. Echo buckets use monotonic application RTT; bulk buckets use relative one-way delay. A prospective run must declare its primary threshold before launch. Selecting 150 ms does not change queue admission or rewrite the original controlled-scenario protocol, which retains its 100 ms clean/recovered 95% and impaired 90% interactive objectives and matched-goodput requirements. A longer run may additionally report recovery, steady and fixed-duration cohorts, while retaining its full-run denominator. These are workload-specific validation objectives, not a hard cross-host SLA or a claim that the candidate passes.
 
-Example with the local main server and relay above:
+Example with the local selected exit and relay above:
 
 ```bash
 ./target/release/braidpath client --listen 127.0.0.1:7000 \
@@ -353,7 +360,7 @@ This assigns both entrances to one explicitly capped group. By default, all entr
 
 ## Path and session recovery
 
-Adaptive mode retries initially unavailable and disconnected paths, including an all-path outage. There is at most one attempt per path and two attempts across the client at once. Attempts have an 8-second deadline; consecutive failures back off from 2 s to at most 60 s. A newly disconnected path remains recoverable after a successful connection; a lifetime attempt counter cannot permanently disable it. Each retry preserves interface, entrance and explicit source IP, while selecting a new source port.
+Adaptive mode and mesh clients retry initially unavailable and disconnected paths, including an all-path outage. Mesh clients also refresh discovery and replace lost relay allocations; see [distributed operation](mesh.md). There is at most one attempt per path and two attempts across the client at once. Attempts have an 8-second deadline; consecutive failures back off from 2 s to at most 60 s. A newly disconnected path remains recoverable after a successful connection; a lifetime attempt counter cannot permanently disable it. Each retry preserves interface, entrance and explicit source IP, while selecting a new source port.
 
 `--rotate-source-port` additionally permits elective replacement of an open degraded path and requires quality scheduling or adaptive mode. The legacy quality criterion uses at least 32 finalized symbols, fresh forward feedback and 4 continuous seconds with loss above 5% or transit variation above 100 ms. Adaptive mode corroborates the delay criterion with local RTT-probe evidence. Return-only degradation does not independently trigger this client-side elective policy. An initial connection does not spend the elective cooldown; a successful elective rotation starts a 30-second cooldown. Replacement can discard in-flight old-generation datagrams, which remain losses.
 

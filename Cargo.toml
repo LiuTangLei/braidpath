@@ -1,6 +1,6 @@
 [package]
 name = "braidpath"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.88"
 description = "Experimental FEC-assisted multipath transport over HTTP/3 datagrams"
@@ -13,6 +13,7 @@ publish = false
 anyhow = "1"
 bytes = "1"
 clap = { version = "4", features = ["derive"] }
+fs2 = "0.4.3"
 h3 = { version = "=0.0.8", features = ["i-implement-a-third-party-backend-and-opt-into-breaking-changes"] }
 h3-quinn = "=0.0.10"
 http = "1"
@@ -25,10 +26,16 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 socket2 = { version = "0.6", features = ["all"] }
 subtle = "2"
+tempfile = "3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "signal", "io-util"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
-tempfile = "3"
 tokio = { version = "1", features = ["test-util"] }
+
+# Socket integration tests launch the test-profile executable at fixed packet
+# rates and deadlines. Keep debug assertions, but avoid interpreting unoptimized
+# codec/packet-trace overhead on small CI runners as network packet loss.
+[profile.test]
+opt-level = 1

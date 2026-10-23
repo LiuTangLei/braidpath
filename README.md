@@ -16,20 +16,20 @@ BraidPath is a Rust multipath transport project combining **forward error correc
 
 “Braid” means weaving several imperfect paths into a more resilient connection.
 
-> **Status: experimental UDP tunnel.** The client, main server and fixed-target relays run over real HTTP/3 and HTTP Datagrams. Opt-in `--adaptive` adds per-path pacing, independent health probes, sender-age admission and bounded outage recovery. These mechanisms are implemented; sustained WAN benefit and deployment readiness are not established. Round robin and the existing XOR settings remain the defaults.
+> **Status: experimental UDP tunnel.** Equal distributed servers, client-selected exits and automatically refreshed entrances run over real HTTP/3 and HTTP Datagrams. See the [distributed-server guide](docs/mesh.md). Opt-in `--adaptive` adds per-path pacing, independent health probes, sender-age admission and bounded outage recovery. These mechanisms are implemented; sustained WAN benefit and deployment readiness are not established. Round robin and the existing XOR settings remain the defaults.
 
 ## One interface works. Several can contribute.
 
-The topology is:
+For each session, the client chooses an exit; servers have no permanent leader role:
 
 ```mermaid
 flowchart LR
     App[Application] --> C[BraidPath client]
     C --> E[Ethernet]
     C --> W[Wi-Fi or cellular - optional]
-    E --> M[Main server]
-    E --> R1[Nearby relay A]
-    E --> R2[Nearby relay B]
+    E --> M[Client-selected exit]
+    E --> R1[Cooperating server A]
+    E --> R2[Cooperating server B]
     W --> M
     W --> R1
     W --> R2
@@ -38,7 +38,7 @@ flowchart LR
     M --> S[Destination service]
 ```
 
-Nearby relays provide **logical server-side entrances**, giving one main server multiple route choices. Relays forward encrypted traffic; the client and main server own the aggregate session. Each transport path returns through its own entrance. Application downlink traffic is scheduled independently of uplink traffic.
+Every server can act as an exit or provide **logical entrances** for another exit. Clients discover members through any server and select an exit; peers forward encrypted traffic toward it. The client and selected exit own that session. Different clients can choose different exits. Each transport path returns through its own entrance. The mesh client currently uses the default local route; the original `client` command retains interface aggregation.
 
 | Client interfaces | Server entrances | Intended use |
 | --- | --- | --- |
@@ -47,7 +47,7 @@ Nearby relays provide **logical server-side entrances**, giving one main server 
 | Several | One | Aggregate client access links |
 | Several | Several | Schedule across interface–entrance pairs |
 
-Entrance count is not independent capacity. Paths may share the last mile, transit routes, relay backhaul, or the main server's uplink. A single interface cannot exceed its access bandwidth by adding entrances.
+Entrance count is not independent capacity. Paths may share the last mile, transit routes, relay backhaul, or the selected exit's uplink. A single interface cannot exceed its access bandwidth by adding entrances.
 
 ## Design priorities
 
@@ -62,11 +62,13 @@ BBR is the only runtime congestion controller. The initial priority is latency a
 
 The default adaptive target is 20 ms of local sender age and an added-delay control objective. Admission uses local ingress age alone. Health requires positive delivery on that path or a valid probe reply; fresh reports of complete loss through another path do not prove reachability. Stale or confirmed zero-delivery paths become probe-only. Same-generation recovery retains learned pace, while a new generation starts a new search. A pending queue-drain recovery survives the gap between RTT observations and rate-control ticks. Rate-change records preserve the RTT inputs and mixed baseline actually used, alongside diagnostic per-source observed minima. Original-only adaptive traffic can also test a higher allowance when loss has stalled a busy, low-delay path. A trial lasts at most four seconds and must demonstrate increased receiver service before its pace is retained; shared-group and aggregate limits still apply. Native probes report both 100 ms and 150 ms arrival rates over the complete requested population. These are application validation thresholds, separate from the 20 ms queue objective and from any cross-host latency guarantee. The mixed RTT baseline can still misclassify estimator switching as queueing, the minimum has no aging, and permanently reduced capacity can still receive bounded upward trials. See the [adaptive policy](docs/runtime.md#adaptive-mode).
 
-Each interface–entrance pair owns an end-to-end Quinn/rustls connection to the main server. HTTP/3 handles ordinary requests and authenticated session admission; unreliable HTTP Datagrams carry aggregate records. Relays forward encrypted packets to a fixed destination.
+Each interface–entrance pair owns an end-to-end Quinn/rustls connection to the selected exit. HTTP/3 handles ordinary requests and authenticated session admission; unreliable HTTP Datagrams carry aggregate records. Relays forward encrypted packets to a fixed destination.
 
 **Xray is a design reference only:** no Xray dependency, sidecar or protocol compatibility. Stock Quinn does not imitate browser fingerprints, and this prototype provides no TCP fallback. An ordinary website response does not establish resistance to network filtering. See the [carrier analysis](docs/transports.md).
 
 ## Build and run
+
+Use the [official installers](docs/install.md): `install.sh` for Unix and `install.ps1` for Windows. They support version selection, offline installation, checksums and key-preserving removal. Releases provide binaries for 12 platform targets. Download the scripts from the [latest release](https://github.com/LiuTangLei/braidpath/releases/latest), or build locally and install with `--local`.
 
 Rust 1.88 or newer:
 
@@ -85,13 +87,14 @@ Follow the [runtime guide](docs/runtime.md) for credentials, local forwarding, m
 | XOR `k + 1`, immediate originals, timed partial blocks | Implemented; at most one missing original per block |
 | HTTP/3 website, verified server identity, authenticated session joins | Implemented experimental profile |
 | Bidirectional FEC, session deduplication, UDP forwarding | Implemented; messages up to 1,000 bytes |
+| Equal servers, key-based enrollment, discovery and exit selection | Implemented; [operation and limits](docs/mesh.md) |
 | Fixed-target opaque relays with source allowlists | Implemented |
 | Interface × entrance paths | Linux interface binding; default-route sockets on other platforms |
 | Round robin and optional quality-weighted scheduling | Implemented baselines; weighted service is charged on actual admitted bytes |
 | Per-flow queues, original-ingress deadlines, admission-based repair credit | Implemented bounded mechanisms |
 | Adaptive pacing, sender-age admission, idle health probes and feedback v2 | Implemented opt-in mode; performance acceptance pending |
 | Aggregate and explicit bottleneck-group caps | Implemented; not automatic bottleneck detection or fairness proof |
-| Startup/outage recovery and explicit session-epoch replacement | Implemented in adaptive mode; bounded backoff and server retention |
+| Startup/outage recovery and explicit session-epoch replacement | Implemented in adaptive mode and mesh clients; bounded backoff and server retention |
 | Receiver-local adaptive FEC retention | Implemented as an opt-in bounded policy |
 | Two independent bulk repair equations | Opt-in mixed 16+2 mode; single-repair defaults unchanged; WAN tradeoffs not yet verified |
 | Rate-adaptive FEC strength and coupled congestion control | Deferred or separate research work |

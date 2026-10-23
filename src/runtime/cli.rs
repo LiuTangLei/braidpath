@@ -1,4 +1,4 @@
-use super::{probe, relay, stats, transport, tunnel};
+use super::{mesh, probe, relay, stats, transport, tunnel};
 use anyhow::{Context, Result, ensure};
 use clap::{Args, Parser, Subcommand};
 use std::{
@@ -65,6 +65,60 @@ enum Command {
         dir: PathBuf,
         #[arg(long, default_value = "localhost")]
         name: String,
+    },
+    /// Run an equal mesh server; a fresh directory creates cluster keys automatically.
+    MeshServer {
+        #[arg(long)]
+        dir: PathBuf,
+        #[arg(long)]
+        id: String,
+        #[arg(long)]
+        listen: SocketAddr,
+        /// Reachable address, with the same UDP port exposed by --listen.
+        #[arg(long)]
+        advertise: SocketAddr,
+        /// Relay UDP port or inclusive range (up to 1024 ports); otherwise OS-assigned.
+        #[arg(long)]
+        relay_ports: Option<mesh::RelayPorts>,
+        #[arg(long)]
+        target: SocketAddr,
+        /// Any existing member; persisted peers remain usable if this entry is down.
+        #[arg(long)]
+        join: Option<SocketAddr>,
+        #[arg(long, requires = "join")]
+        join_key: Option<PathBuf>,
+        #[arg(long, default_value = "auto", value_parser = parse_rate_cap)]
+        max_rate_bps: RateCap,
+        #[command(flatten)]
+        stats: stats::Options,
+    },
+    /// Discover live distributed servers through any member using a client key.
+    Nodes {
+        /// Repeat for multiple bootstrap servers; saved members are fallback entries.
+        #[arg(long, required = true)]
+        connect: Vec<SocketAddr>,
+        #[arg(long)]
+        connection_key: PathBuf,
+        #[arg(long)]
+        dir: PathBuf,
+    },
+    /// Select an exit and automatically use the other servers as encrypted entrances.
+    MeshClient {
+        /// Repeat for multiple bootstrap servers; saved members are fallback entries.
+        #[arg(long, required = true)]
+        connect: Vec<SocketAddr>,
+        #[arg(long)]
+        connection_key: PathBuf,
+        #[arg(long)]
+        dir: PathBuf,
+        #[arg(long)]
+        exit: String,
+        #[arg(long, default_value = "127.0.0.1:7000")]
+        listen: SocketAddr,
+        #[command(flatten)]
+        policy: PolicyArgs,
+        #[command(flatten)]
+        stats: stats::Options,
     },
     /// Serve a website and authenticated datagrams to one configured UDP target.
     Server {
@@ -135,7 +189,7 @@ enum Command {
         #[command(flatten)]
         stats: stats::Options,
     },
-    /// Forward opaque UDP packets only to the configured main server.
+    /// Forward opaque UDP packets only to the configured exit server.
     Relay {
         #[arg(long)]
         listen: SocketAddr,
@@ -275,6 +329,87 @@ pub async fn run() -> Result<()> {
             );
             Ok(())
         }
+        Command::MeshServer {
+            dir,
+            id,
+            listen,
+            advertise,
+            relay_ports,
+            target,
+            join,
+            join_key,
+            max_rate_bps,
+            stats,
+        } => {
+            let reporter = stats::Reporter::new("mesh-server", stats)?;
+            let result = mesh::serve(mesh::ServerOptions {
+                dir,
+                id,
+                listen,
+                advertise,
+                relay_ports,
+                target,
+                join,
+                join_key,
+                rate: max_rate_bps.bps(),
+                stats: reporter.metrics.clone(),
+            })
+            .await;
+            reporter.finish(result).await
+        }
+        Command::Nodes {
+            connect,
+            connection_key,
+            dir,
+        } => {
+            let identity = mesh::ClientIdentity::open(dir, &connection_key)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&identity.discover_any(&connect).await?)?
+            );
+            Ok(())
+        }
+        Command::MeshClient {
+            connect,
+            connection_key,
+            dir,
+            exit,
+            listen,
+            policy,
+            stats,
+        } => {
+            let rate = client_rate(&policy)?;
+            let group_rates = parse_group_rates(&policy.group_rates, rate)?;
+            let session_policy = policy.build(rate, group_rates);
+            session_policy.validate()?;
+            let identity = mesh::ClientIdentity::open(dir, &connection_key)?;
+            let nodes = identity.discover_any(&connect).await?;
+            let (entrances, leases) = identity.entrances(nodes, &exit, super::MAX_PATHS).await?;
+            tracing::info!(%exit, paths=entrances.len(), "selected mesh exit and cooperating entrances");
+            let reporter = stats::Reporter::new("mesh-client", stats)?;
+            let result = tunnel::client_with_health(
+                tunnel::ClientOptions {
+                    listen,
+                    entrances,
+                    interfaces: vec![],
+                    path_binds: vec![],
+                    path_groups: vec![],
+                    name: identity.name(),
+                    ca: identity.dir.join("cert.pem"),
+                    token: identity.dir.join("token"),
+                    datagram_send_buffer_bytes: transport::DEFAULT_DATAGRAM_SEND_BUFFER_BYTES,
+                    congestion: transport::Congestion::default(),
+                    adaptive_fec_retention: false,
+                    rotate_source_port: policy.rotate_source_port,
+                    policy: session_policy,
+                    stats: reporter.metrics.clone(),
+                },
+                Some(leases.updates()),
+                Some(leases.health()),
+            )
+            .await;
+            reporter.finish(result).await
+        }
         Command::Server {
             ack_request,
             listen,
@@ -339,25 +474,7 @@ pub async fn run() -> Result<()> {
                 token: token_file,
                 congestion,
                 rotate_source_port: policy.rotate_source_port,
-                policy: tunnel::Policy {
-                    adaptive: policy.adaptive,
-                    capacity_probe_bps: policy.capacity_probe_bps,
-                    probe_guided_recovery: policy.probe_guided_recovery,
-                    latency_target_ms: policy.latency_target_ms,
-                    group_rates,
-                    fec: policy.fec,
-                    fec_repairs: policy.fec_repairs,
-                    small_fec_bytes: policy.small_fec_bytes,
-                    mixed_fec: policy.mixed_fec,
-                    receiver_feedback: policy.receiver_feedback
-                        || policy.quality_schedule
-                        || policy.adaptive,
-                    quality_schedule: policy.quality_schedule || policy.adaptive,
-                    redundancy: policy.redundancy_percent,
-                    rate,
-                    block_ms: policy.block_ms,
-                    queue_ms: policy.queue_ms,
-                },
+                policy: policy.build(rate, group_rates),
             })
             .await;
             reporter.finish(result).await
@@ -802,5 +919,75 @@ mod tests {
             assert!(parse_group_rates(&values, 2000000).is_err());
         }
         assert!(Cli::try_parse_from(["braidpath", "server", "--congestion", "cubic"]).is_err());
+    }
+
+    #[test]
+    fn mesh_bootstrap_and_relay_port_options_are_explicit() {
+        let nodes = Cli::try_parse_from([
+            "braidpath",
+            "nodes",
+            "--dir",
+            "local/client",
+            "--connection-key",
+            "local/key.json",
+            "--connect",
+            "127.0.0.1:4433",
+            "--connect",
+            "127.0.0.1:4434",
+        ])
+        .unwrap();
+        let Command::Nodes { connect, .. } = nodes.command else {
+            panic!("wrong command")
+        };
+        assert_eq!(
+            connect,
+            vec![
+                "127.0.0.1:4433".parse::<SocketAddr>().unwrap(),
+                "127.0.0.1:4434".parse().unwrap()
+            ]
+        );
+        let server = [
+            "braidpath",
+            "mesh-server",
+            "--dir",
+            "local/node",
+            "--id",
+            "node",
+            "--listen",
+            "127.0.0.1:4433",
+            "--advertise",
+            "127.0.0.1:4433",
+            "--target",
+            "127.0.0.1:9000",
+        ];
+        let parsed =
+            Cli::try_parse_from(server.iter().chain(&["--relay-ports", "44400-44463"])).unwrap();
+        let Command::MeshServer { relay_ports, .. } = parsed.command else {
+            panic!("wrong command")
+        };
+        assert_eq!(relay_ports, Some("44400-44463".parse().unwrap()));
+        assert!(Cli::try_parse_from(server.iter().chain(&["--relay-ports", "0"])).is_err());
+    }
+}
+
+impl PolicyArgs {
+    fn build(&self, rate: u64, group_rates: [u64; super::MAX_PATHS]) -> tunnel::Policy {
+        tunnel::Policy {
+            adaptive: self.adaptive,
+            capacity_probe_bps: self.capacity_probe_bps,
+            probe_guided_recovery: self.probe_guided_recovery,
+            latency_target_ms: self.latency_target_ms,
+            group_rates,
+            fec: self.fec,
+            fec_repairs: self.fec_repairs,
+            small_fec_bytes: self.small_fec_bytes,
+            mixed_fec: self.mixed_fec,
+            receiver_feedback: self.receiver_feedback || self.quality_schedule || self.adaptive,
+            quality_schedule: self.quality_schedule || self.adaptive,
+            redundancy: self.redundancy_percent,
+            rate,
+            block_ms: self.block_ms,
+            queue_ms: self.queue_ms,
+        }
     }
 }

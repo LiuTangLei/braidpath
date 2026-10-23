@@ -11,6 +11,14 @@ use std::{
 const BIN: &str = env!("CARGO_BIN_EXE_braidpath");
 // Negotiation/integrity fixture: retain 2000 pps, but provision the encoded cost.
 const DUAL_FEC_TEST_RATE_BPS: u64 = 20_000_000;
+// This fixture proves parity negotiation/integrity and the 13% repair budget,
+// not a 20 ms latency SLO. Coarse host scheduling must still allow a full
+// 16-record block before flushing and enough time to admit its second repair.
+const DUAL_FEC_TEST_WINDOW_MS: u64 = 100;
+// Each fixture starts several multithreaded tunnel/relay processes. Keep their
+// timing-sensitive loopback traffic isolated on small CI runners, as in stats.rs.
+// Source rate, loss and delivery assertions remain unchanged.
+static THREE_PATH_FIXTURES: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[test]
 fn dual_fec_fixture_budget_covers_its_unchanged_source_and_encoded_frames() {
@@ -22,7 +30,7 @@ fn dual_fec_fixture_budget_covers_its_unchanged_source_and_encoded_frames() {
         },
     };
     let created = Instant::now();
-    let mut encoder = DualEncoder::new(16, Duration::from_millis(25)).unwrap();
+    let mut encoder = DualEncoder::new(16, Duration::from_millis(DUAL_FEC_TEST_WINDOW_MS)).unwrap();
     let mut symbols = Vec::new();
     for id in 0..200 {
         let record = Record {
@@ -527,6 +535,9 @@ fn persistent_bad_path_rejoins_with_new_udp_port() {
     three_paths(3);
 }
 fn three_paths(mode: u8) {
+    let _fixture = THREE_PATH_FIXTURES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let feedback = mode > 0;
     let dual = matches!(mode, 6 | 8 | 9);
     let frontier_enabled = matches!(mode, 7 | 8);
@@ -719,6 +730,15 @@ fn three_paths(mode: u8) {
         ]));
     }
     if dual {
+        let block = client_args
+            .iter()
+            .position(|arg| arg == "--block-ms")
+            .unwrap();
+        client_args[block + 1] = DUAL_FEC_TEST_WINDOW_MS.to_string();
+        client_args.extend([
+            "--latency-target-ms".into(),
+            DUAL_FEC_TEST_WINDOW_MS.to_string(),
+        ]);
         client_args.extend(args(&[
             "--fec",
             "16",
@@ -899,7 +919,9 @@ fn three_paths(mode: u8) {
             }
             assert!(
                 Instant::now() < until,
-                "both authenticated directions must actually transmit and receive Q parity"
+                "both authenticated directions must actually transmit and receive Q parity\nclient counters:{}\nserver counters:{}",
+                latest_directions(&client_stats),
+                latest_directions(&server_stats)
             );
             thread::sleep(Duration::from_millis(50));
         }

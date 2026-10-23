@@ -511,7 +511,9 @@ impl ConnectionTrace {
         } else {
             match self.stage {
                 "incoming" | "request_resolve" | "peer_settings" => (Some(5000), Some("stage")),
-                "admission_wait" => (Some(60000), Some("admission")),
+                "http3_setup" | "admission_wait" => {
+                    (Some(super::tunnel::ADMISSION_TIMEOUT_MS), Some("admission"))
+                }
                 _ => (None, None),
             }
         };

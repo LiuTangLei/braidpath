@@ -2,9 +2,14 @@
 
 This document defines the implementation direction and its acceptance gates. The first experimental implementation is described in the [runtime guide](runtime.md); the full design below still includes future work. See the [README](../README.md) for current capabilities and the [roadmap](roadmap.md) for dependencies.
 
+Distributed mode implements a leaderless server directory and leased opaque
+entrances. Every server can be an exit; session state lives only at the client
+and its selected exit. See [distributed servers](mesh.md) for implemented
+behavior, trust boundaries and limits.
+
 ## 1. Feasibility boundary
 
-The topology is implementable: independently reachable client–entrance paths can carry symbols belonging to one endpoint session, and nearby relays can forward those paths to one main server. The expected latency and capacity gains remain workload- and network-dependent.
+The topology is implementable: independently reachable client–entrance paths can carry symbols belonging to one endpoint session, and nearby relays can forward those paths to one client-selected exit. The expected latency and capacity gains remain workload- and network-dependent.
 
 | Constraint | Consequence |
 | --- | --- |
@@ -51,7 +56,7 @@ Before selecting a deployment default, pass the [deployment reachability gate](v
 
 ## 3. Session, path and data identity
 
-The plain-QUIC engineering profile uses operator-managed client/server certificates: verify the main server identity through every entrance and authenticate each client connection with TLS client authentication. The web-facing HTTP/3 candidate verifies the server certificate and authenticates client credentials inside the encrypted application exchange, allowing ordinary website requests without a client certificate. Both must establish an authorized client identity before session admission. Disable 0-RTT application data in the initial protocol. Credential trust, rotation and revocation are deployment requirements.
+The plain-QUIC engineering profile uses operator-managed client/server certificates: verify the selected exit identity through every entrance and authenticate each client connection with TLS client authentication. The web-facing HTTP/3 candidate verifies the server certificate and authenticates client credentials inside the encrypted application exchange, allowing ordinary website requests without a client certificate. Both must establish an authorized client identity before session admission. Disable 0-RTT application data in the initial protocol. Credential trust, rotation and revocation are deployment requirements.
 
 The first authenticated connection creates a session. Additional connections request a join over a control stream. The server checks the same authorized client identity, session identifier, current session epoch, protocol version and negotiated limits before accepting their data. Knowing a session ID alone grants no access.
 
@@ -67,7 +72,7 @@ Use separate identity spaces:
 
 Do not use the current `(block, index)` alone as a session-wide delivery identity. The session must work when FEC is disabled or a repair packet is lost. Reliable flow termination declares the final byte offset so a lost tail cannot look like successful completion.
 
-Control operations need request IDs and idempotent responses so they can be retried through another surviving path. A primary control connection must not become a permanent single point of failure. All-path loss permits bounded reconnection; expiry or main-server restart produces an explicit session failure, not silent byte-stream continuation.
+Control operations need request IDs and idempotent responses so they can be retried through another surviving path. A primary control connection must not become a permanent single point of failure. All-path loss permits bounded reconnection; expiry or selected-exit restart produces an explicit session failure, not silent byte-stream continuation.
 
 ## 4. FEC and encryption order
 
@@ -113,11 +118,11 @@ Sparse traffic exposes a real trade-off: closing every one-packet block with par
 
 ## 7. Relay and interface integration
 
-For the QUIC engineering baseline, the reference authenticated relay route is **TURN over UDP** using an existing TURN server, with one allocation per client path and peer permission for the main server. A client adapter exposes the relayed datagrams to Quinn; QUIC still terminates at the main server. Allocation/channel refresh, idle timeouts and return mapping are mandatory. TURN over TCP/TLS is outside the initial low-latency baseline because a reliable outer stream can introduce ordering delays. [RFC 8656](https://www.rfc-editor.org/rfc/rfc8656.html)
+For the QUIC engineering baseline, the reference authenticated relay route is **TURN over UDP** using an existing TURN server, with one allocation per client path and peer permission for the selected exit. A client adapter exposes the relayed datagrams to Quinn; QUIC still terminates at the selected exit. Allocation/channel refresh, idle timeouts and return mapping are mandatory. TURN over TCP/TLS is outside the initial low-latency baseline because a reliable outer stream can introduce ordering delays. [RFC 8656](https://www.rfc-editor.org/rfc/rfc8656.html)
 
-Restrict TURN relay destinations to the configured main server, with host firewall enforcement for the intended UDP port. TURN permissions alone are per IP, not a port allowlist. Bound allocations, per-client bandwidth and idle lifetime. Test wrong credentials, forbidden destinations, expiry and rebinding. An unrestricted transparent UDP forwarder is not a public deployment design.
+Restrict TURN relay destinations to the configured selected exit, with host firewall enforcement for the intended UDP port. TURN permissions alone are per IP, not a port allowlist. Bound allocations, per-client bandwidth and idle lifetime. Test wrong credentials, forbidden destinations, expiry and rebinding. An unrestricted transparent UDP forwarder is not a public deployment design.
 
-For the web-facing HTTP/3 candidate, public TURN framing would change the visible protocol. Evaluate a **fixed-destination L4 entrance** that forwards only the configured main service address/port and preserves its encrypted handshake in both directions. Authentication of proxy use remains on the main server; normal website requests are permitted without proxy credentials. Bound relay state, traffic and idle lifetime, preserve return mapping, and expose no client-selected destination. This profile has different admission and abuse controls from TURN and requires its own acceptance. TURN integration is not a prerequisite for selecting fixed L4 entrances.
+For the web-facing HTTP/3 candidate, public TURN framing would change the visible protocol. Evaluate a **fixed-destination L4 entrance** that forwards only the configured selected exit service address/port and preserves its encrypted handshake in both directions. Authentication of proxy use remains on the selected exit; normal website requests are permitted without proxy credentials. Bound relay state, traffic and idle lifetime, preserve return mapping, and expose no client-selected destination. This profile has different admission and abuse controls from TURN and requires its own acceptance. TURN integration is not a prerequisite for selecting fixed L4 entrances.
 
 For direct and fixed-L4-entrance paths, supply an explicitly configured UDP socket to Quinn. For TURN paths, use its abstract socket adapter and account for TURN framing, batching and PMTU behavior. Integration must demonstrate correct per-datagram metadata and segmentation rather than assuming default GSO behavior survives a wrapper. [Quinn Endpoint API](https://docs.rs/quinn/0.11.12/quinn/struct.Endpoint.html)
 

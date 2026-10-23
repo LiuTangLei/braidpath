@@ -1,0 +1,165 @@
+name: Release artifacts
+on:
+  workflow_dispatch:
+    inputs:
+      platform:
+        description: Artifact family to validate (all is required for a complete bundle)
+        type: choice
+        default: all
+        options: [all, linux, native, freebsd]
+  push:
+    tags: ['v*']
+    branches: ['codex/build-*']
+permissions:
+  contents: read
+concurrency:
+  group: release-${{ github.ref }}-${{ github.sha }}
+  cancel-in-progress: false
+jobs:
+  verify:
+    if: github.event_name != 'workflow_dispatch' || inputs.platform == 'all'
+    uses: ./.github/workflows/ci.yml
+  matrix:
+    runs-on: ubuntu-latest
+    outputs:
+      cross: ${{ steps.plan.outputs.cross }}
+      native: ${{ steps.plan.outputs.native }}
+      freebsd: ${{ steps.plan.outputs.freebsd }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Validate tag and create matrices
+        id: plan
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          if [ "$REF_TYPE" = tag ]; then python3 scripts/release.py check-tag "$REF_NAME"; fi
+          for kind in cross native freebsd; do
+            echo "$kind=$(python3 scripts/release.py matrix "$kind")" >> "$GITHUB_OUTPUT"
+          done
+  linux:
+    if: github.event_name != 'workflow_dispatch' || inputs.platform == 'all' || inputs.platform == 'linux'
+    needs: matrix
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.matrix.outputs.cross) }}
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: rustup toolchain install 1.88.0 --profile minimal
+      - run: cargo +stable install cross --version 0.2.5 --locked
+      - name: Build and smoke test under cross/QEMU
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          cross +1.88.0 build --release --locked --bin braidpath --target "$TARGET"
+          # cross 0.2.5 consumes --version even after --. Invoke its runner
+          # directly so the smoke check actually passes the binary's arguments.
+          case "$TARGET" in arm*) arch=arm ;; *) arch=${TARGET%%-*} ;; esac
+          docker run --rm --network none --entrypoint /qemu-runner \
+            -v "$PWD/target/$TARGET/release:/app:ro" \
+            "ghcr.io/cross-rs/$TARGET:0.2.5" "$arch" /app/braidpath --version
+          python3 scripts/release.py package --target "$TARGET"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: dist/*
+          if-no-files-found: error
+  native:
+    if: github.event_name != 'workflow_dispatch' || inputs.platform == 'all' || inputs.platform == 'native'
+    needs: matrix
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.matrix.outputs.native) }}
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Build and smoke test
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          rustup toolchain install 1.88.0 --profile minimal --target "$TARGET"
+          if [[ "$TARGET" = *windows* ]]; then export RUSTFLAGS='-C target-feature=+crt-static'; fi
+          cargo +1.88.0 build --release --locked --bin braidpath --target "$TARGET"
+          cargo +1.88.0 run --release --locked --bin braidpath --target "$TARGET" -- --version
+          python scripts/release.py package --target "$TARGET"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: dist/*
+          if-no-files-found: error
+  freebsd:
+    if: github.event_name != 'workflow_dispatch' || inputs.platform == 'all' || inputs.platform == 'freebsd'
+    needs: matrix
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.matrix.outputs.freebsd) }}
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and test in FreeBSD
+        uses: vmactions/freebsd-vm@v1.5.9
+        with:
+          release: '14.4'
+          arch: ${{ matrix.vm_arch }}
+          prepare: pkg install -y rust python312
+          run: |
+            cargo build --release --locked --bin braidpath
+            ./target/release/braidpath --version
+            python3.12 scripts/release.py package --target '${{ matrix.target }}' --source target/release/braidpath
+            sh install.sh --local ./target/release/braidpath --prefix /tmp/braidpath-smoke --service none
+            sh install.sh --remove --prefix /tmp/braidpath-smoke --service none
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: dist/*
+          if-no-files-found: error
+  assemble:
+    if: github.event_name != 'workflow_dispatch' || inputs.platform == 'all'
+    needs: [verify, linux, native, freebsd]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Require complete matrix and create checksums
+        run: |
+          cp install.sh install.ps1 LICENSE NOTICE dist/
+          python3 scripts/release.py checksums dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-bundle
+          path: dist/*
+          if-no-files-found: error
+  draft:
+    if: github.ref_type == 'tag'
+    needs: assemble
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-bundle
+          path: dist
+      - name: Create reviewable draft (never publish automatically)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: gh release create "$RELEASE_TAG" dist/* --verify-tag --draft --title "$RELEASE_TAG" --generate-notes

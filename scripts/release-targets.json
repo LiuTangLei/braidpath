@@ -1,0 +1,14 @@
+[
+  {"asset":"braidpath-linux-amd64","target":"x86_64-unknown-linux-musl","kind":"cross","runner":"ubuntu-22.04"},
+  {"asset":"braidpath-linux-386","target":"i686-unknown-linux-musl","kind":"cross","runner":"ubuntu-22.04"},
+  {"asset":"braidpath-linux-arm64","target":"aarch64-unknown-linux-musl","kind":"cross","runner":"ubuntu-22.04"},
+  {"asset":"braidpath-linux-armv7","target":"armv7-unknown-linux-musleabihf","kind":"cross","runner":"ubuntu-22.04"},
+  {"asset":"braidpath-linux-armv6","target":"arm-unknown-linux-musleabihf","kind":"cross","runner":"ubuntu-22.04"},
+  {"asset":"braidpath-darwin-amd64","target":"x86_64-apple-darwin","kind":"native","runner":"macos-15-intel"},
+  {"asset":"braidpath-darwin-arm64","target":"aarch64-apple-darwin","kind":"native","runner":"macos-15"},
+  {"asset":"braidpath-windows-amd64.exe","target":"x86_64-pc-windows-msvc","kind":"native","runner":"windows-2022"},
+  {"asset":"braidpath-windows-386.exe","target":"i686-pc-windows-msvc","kind":"native","runner":"windows-2022"},
+  {"asset":"braidpath-windows-arm64.exe","target":"aarch64-pc-windows-msvc","kind":"native","runner":"windows-11-arm"},
+  {"asset":"braidpath-freebsd-amd64","target":"x86_64-unknown-freebsd","kind":"freebsd","runner":"ubuntu-latest","vm_arch":"x86_64"},
+  {"asset":"braidpath-freebsd-arm64","target":"aarch64-unknown-freebsd","kind":"freebsd","runner":"ubuntu-latest","vm_arch":"aarch64"}
+]

@@ -1,5 +1,9 @@
 name: CI
-on: [push, pull_request]
+on:
+  push:
+    branches-ignore: ['codex/build-*']
+  pull_request:
+  workflow_call:
 permissions:
   contents: read
 jobs:
@@ -28,3 +32,27 @@ jobs:
       - uses: actions/checkout@v4
       - run: rustup toolchain install 1.88.0 --profile minimal
       - run: cargo +1.88.0 test --all-targets --locked
+
+  installers:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - if: runner.os != 'Windows'
+        run: python3 -m unittest discover -s scripts -p 'test_*.py'
+      - if: runner.os == 'Windows'
+        run: python -m unittest discover -s scripts -p 'test_release.py'
+      - if: runner.os == 'Linux'
+        run: shellcheck -s sh install.sh
+      - if: runner.os == 'Linux'
+        shell: pwsh
+        run: ./scripts/test-install.ps1
+      - if: runner.os == 'Windows'
+        shell: powershell
+        run: ./scripts/test-install.ps1
