@@ -42,9 +42,10 @@ mod coding;
 mod dual_tests;
 mod ingress;
 mod local_delivery;
-mod messages;
+pub(crate) mod messages;
 #[cfg(test)]
 mod mixed_fec_tests;
+mod path_health;
 #[cfg(test)]
 mod repair_usefulness_tests;
 mod small_delivery;
@@ -2523,11 +2524,12 @@ fn queue_trace_reason<T>(layer: QueueLayer, error: &mpsc::error::TrySendError<T>
 }
 
 fn publish_messages(messages: &mut messages::Reassembly, scope: &Scope) {
-    let (completed, dropped) = messages.take_counters();
+    let (completed, dropped, failures) = messages.take_counters();
     if completed > 0 || dropped > 0 {
         scope.update(|d| {
             d.records.messages_reassembled += completed;
             d.records.message_reassembly_dropped += dropped;
+            d.records.message_reassembly_failures.add(failures);
         });
     }
 }
@@ -2539,23 +2541,82 @@ fn enqueue_message(
     scope: &Scope,
     small_threshold: usize,
 ) -> bool {
-    let mut accepted = true;
-    for record in records {
-        if enqueue_record(tx, record, created, scope, small_threshold) {
-            scope.update(|d| d.records.sender_queue_enqueued += 1);
-        } else {
-            accepted = false;
+    let count = records.len() as u64;
+    records.trace(scope, trace::Stage::MessageAssigned, None);
+    let permits = ingress::reserve(
+        tx,
+        records.len(),
+        small_threshold > 0 && !records.is_small(small_threshold),
+    );
+    match permits {
+        Ok(permits) => {
+            for (record, permit) in records.zip(permits) {
+                // Small single messages keep the ordinary FIFO semantics.
+                admit_record(record, created, scope, |queued| {
+                    permit.send(queued);
+                    Ok(())
+                });
+            }
+            scope.update(|d| d.records.sender_queue_enqueued += count);
+            true
+        }
+        Err(error) => {
+            records.trace(
+                scope,
+                trace::Stage::MessageDropped,
+                Some(queue_trace_reason(QueueLayer::Sender, &error)),
+            );
+            let closed = matches!(error, mpsc::error::TrySendError::Closed(()));
+            if count == 1 {
+                for record in records {
+                    admit_record(record, created, scope, |queued| {
+                        Err(if closed {
+                            mpsc::error::TrySendError::Closed(queued)
+                        } else {
+                            mpsc::error::TrySendError::Full(queued)
+                        })
+                    });
+                }
+            } else {
+                // No fragment buffers or per-fragment metrics locks are needed
+                // for a message that never obtained input capacity.
+                scope.update(|d| {
+                    if closed {
+                        d.records.sender_queue_closed_dropped += count;
+                    } else {
+                        d.records.sender_queue_full_dropped += count;
+                    }
+                });
+            }
+            scope.update(|d| d.records.messages_admission_dropped += 1);
+            false
         }
     }
-    accepted
 }
 
+#[cfg(test)]
 fn enqueue_record(
     tx: &mpsc::Sender<QueuedRecord>,
     record: Record,
     created: Instant,
     scope: &Scope,
     small_threshold: usize,
+) -> bool {
+    let payload_bytes = if record.flow & messages::FLAG != 0 {
+        super::MAX_MESSAGE
+    } else {
+        record.payload.len()
+    };
+    admit_record(record, created, scope, |queued| {
+        ingress::try_send(tx, queued, payload_bytes, small_threshold)
+    })
+}
+
+fn admit_record(
+    record: Record,
+    created: Instant,
+    scope: &Scope,
+    send: impl FnOnce(QueuedRecord) -> Result<(), mpsc::error::TrySendError<QueuedRecord>>,
 ) -> bool {
     let mut assigned_event = None;
     scope.trace_with(|context, capture| {
@@ -2564,24 +2625,13 @@ fn enqueue_record(
             flow: record.flow,
             record_id: record.id,
         });
+        event.message = messages::metadata(&record);
         event.bytes.payload = u32::try_from(record.payload.len()).ok();
         event.probe = capture.probe_identity(&record.payload);
         assigned_event = Some(event);
         event
     });
-    // A short tail of a large message is still bulk input; it cannot spend
-    // the slots reserved for independently deliverable small messages.
-    let payload_bytes = if record.flow & messages::FLAG != 0 {
-        super::MAX_MESSAGE
-    } else {
-        record.payload.len()
-    };
-    let result = ingress::try_send(
-        tx,
-        QueuedRecord { record, created },
-        payload_bytes,
-        small_threshold,
-    );
+    let result = send(QueuedRecord { record, created });
     if let Some(mut event) = assigned_event {
         event.stage = if result.is_ok() {
             trace::Stage::IngressQueued
@@ -2813,7 +2863,8 @@ async fn session_loop(
     let mut messages = messages::Reassembly::new(
         session.policy.max_message_bytes,
         session.policy.admission_lifetime(),
-    );
+    )
+    .with_scope(session.forward.clone());
     publish_retention(&decoder, &session.forward);
     let mut delivery = local_delivery::Queue::new(
         session.forward.clone(),
@@ -3776,6 +3827,8 @@ async fn client_session(
         std::array::from_fn(|_| Default::default());
     let mut inflight = [false; MAX_PATHS];
     let mut elective_inflight = [false; MAX_PATHS];
+    let mut delivery_health: [path_health::DeliveryHealth; MAX_PATHS] =
+        std::array::from_fn(|_| Default::default());
     options.stats.state(|s| s.shutdown_complete = false);
     let epoch = Instant::now();
     let (rejoin_tx, mut rejoin_rx) =
@@ -3842,7 +3895,8 @@ async fn client_session(
     let mut messages = messages::Reassembly::new(
         options.policy.max_message_bytes,
         options.policy.admission_lifetime(),
-    );
+    )
+    .with_scope(returning.clone());
     let mut delivery = local_delivery::Queue::new(
         returning.clone(),
         Duration::from_millis(
@@ -3877,19 +3931,30 @@ async fn client_session(
                 }
                 peers.retain(|_,(id,last)|{if last.elapsed()<Duration::from_secs(60){true}else{reverse.remove(id);false}});
                 let current=paths.lock().expect("paths lock").clone();
-                let live=current.iter().filter(|p|p.conn.close_reason().is_none()).count();
                 if let Some(health)=health {
-                    let addresses=current.iter().filter(|p| p.conn.close_reason().is_none())
-                        .map(|p| configs[usize::from(p.id)].remote).collect();
-                    let samples = current.iter().filter(|p| p.conn.close_reason().is_none()).map(|p| {
-                        let elapsed = p.epoch.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
-                        let estimate = p.quality.lock().expect("quality").snapshot_at(elapsed).sender_estimate;
-                        mesh::PathSample { address: configs[usize::from(p.id)].remote, group: p.group,
-                            delivered: estimate.sample_symbols >= 8 && estimate.delivered_updated_us.is_some_and(|at| elapsed.saturating_sub(at) < 2_000_000) && estimate.updated_us.is_some_and(|at| elapsed.saturating_sub(at) < 2_000_000),
-                            rtt_ms: p.conn.rtt().as_secs_f64() * 1000.0, loss: estimate.loss_rate }
-                    }).collect();
+                    let mut samples = Vec::new();
+                    for (id, config) in configs.iter().enumerate().filter(|(_, c)| c.enabled) {
+                        if let Some(path) = current.iter().find(|p| usize::from(p.id) == id) {
+                            let elapsed = quality_time(path);
+                            let q = path.quality.lock().expect("quality").snapshot_at(elapsed);
+                            let stalled = delivery_health[id].stalled(elapsed, &q);
+                            if stalled && path.conn.close_reason().is_none() {
+                                tracing::debug!(path=id, group=path.group, "mesh data delivery stalled; reconnecting");
+                                path.conn.close(0u32.into(), b"mesh delivery stalled");
+                            }
+                            let estimate = q.sender_estimate;
+                            samples.push(mesh::PathSample { address: config.remote, group: path.group,
+                                failed: stalled || path.conn.close_reason().is_some(),
+                                delivered: estimate.sample_symbols >= 8 && estimate.delivered_updated_us.is_some_and(|at| elapsed.saturating_sub(at) < 2_000_000) && estimate.updated_us.is_some_and(|at| elapsed.saturating_sub(at) < 2_000_000),
+                                rtt_ms: path.conn.rtt().as_secs_f64() * 1000.0, loss: estimate.loss_rate });
+                        } else if config.attempted && !inflight[id] {
+                            samples.push(mesh::PathSample { address: config.remote, group: config.group, failed: true, delivered: false, rtt_ms: 0.0, loss: 0.0 });
+                        }
+                    }
+                    let addresses = samples.iter().filter(|s| !s.failed).map(|s| s.address).collect();
                     health.send_replace(mesh::PathHealth{checked:Instant::now(),addresses,samples});
                 }
+                let live=current.iter().filter(|p|p.conn.close_reason().is_none()).count();
                 if announced && !recover_paths && live==0 {bail!("all paths failed");}
                 // With no working path, try every configured entrance (at most
                 // eight) so blackholes cannot block a healthy later candidate.

@@ -430,7 +430,10 @@ pub async fn run() -> Result<()> {
                 })
                 .collect();
             let nodes = identity.discover_on(&connect, &exit, &uplinks).await?;
-            let leases = identity.networks(nodes, &exit, uplinks).await?;
+            let reporter = stats::Reporter::new("mesh-client", stats)?;
+            let leases = identity
+                .networks_with_metrics(nodes, &exit, uplinks, reporter.metrics.clone())
+                .await?;
             let entrances = leases
                 .routes()
                 .borrow()
@@ -438,7 +441,6 @@ pub async fn run() -> Result<()> {
                 .map(|r| r.address)
                 .collect::<Vec<_>>();
             tracing::info!(%exit, paths=entrances.len(), "selected mesh exit and cooperating entrances");
-            let reporter = stats::Reporter::new("mesh-client", stats)?;
             let result = tunnel::client_with_routes(
                 tunnel::ClientOptions {
                     listen,

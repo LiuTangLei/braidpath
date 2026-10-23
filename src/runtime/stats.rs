@@ -86,8 +86,10 @@ impl Wait {
 }
 #[derive(Clone, Default, Serialize)]
 pub struct Records {
+    pub messages_admission_dropped: u64,
     pub messages_reassembled: u64,
     pub message_reassembly_dropped: u64,
+    pub message_reassembly_failures: MessageFailures,
     pub application_received: u64,
     pub application_oversize_dropped: u64,
     pub application_flow_limit_dropped: u64,
@@ -116,6 +118,36 @@ pub struct Records {
     pub udp_target_bytes: u64,
     pub udp_target_send_dropped: u64,
     pub udp_target_flow_dropped: u64,
+}
+
+#[derive(Clone, Copy, Default, Serialize)]
+pub struct MessageFailures {
+    pub expired: u64,
+    pub window: u64,
+    pub capacity: u64,
+    pub invalid: u64,
+    pub conflict: u64,
+    pub shutdown: u64,
+}
+impl MessageFailures {
+    pub(crate) fn add(&mut self, other: Self) {
+        self.expired += other.expired;
+        self.window += other.window;
+        self.capacity += other.capacity;
+        self.invalid += other.invalid;
+        self.conflict += other.conflict;
+        self.shutdown += other.shutdown;
+    }
+    pub(crate) fn since(self, old: Self) -> Self {
+        Self {
+            expired: self.expired - old.expired,
+            window: self.window - old.window,
+            capacity: self.capacity - old.capacity,
+            invalid: self.invalid - old.invalid,
+            conflict: self.conflict - old.conflict,
+            shutdown: self.shutdown - old.shutdown,
+        }
+    }
 }
 #[derive(Clone, Default, Serialize)]
 pub struct UdpDelivery {
@@ -397,6 +429,7 @@ pub struct RelayDirection {
 }
 #[derive(Clone, Default, Serialize)]
 pub struct State {
+    pub mesh_uplinks: Vec<MeshUplink>,
     pub ready: bool,
     pub configured_paths: usize,
     pub listener_bound: bool,
@@ -425,6 +458,19 @@ pub struct State {
     pub connection_attempts: u64,
     pub connection_events: VecDeque<ConnectionEvent>,
     pub omitted_connection_events: u64,
+}
+
+#[derive(Clone, Serialize)]
+pub struct MeshUplink {
+    pub group: u8,
+    pub interface: Option<String>,
+    pub source_ip: Option<String>,
+    pub state: &'static str,
+    pub usable_paths: usize,
+    pub path_limit: usize,
+    pub configured_paths: usize,
+    pub control_starts: u64,
+    pub failure: Option<&'static str>,
 }
 impl State {
     fn evict_oldest_retired(&mut self) -> bool {
@@ -1015,6 +1061,7 @@ impl Scope {
                 flow: record.flow,
                 record_id: record.id,
             });
+            event.message = super::tunnel::messages::metadata(record);
             event.path = path;
             event.bytes.payload = u32::try_from(record.payload.len()).ok();
             event.probe = capture.probe_identity(&record.payload);

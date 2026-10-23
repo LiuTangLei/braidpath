@@ -1,6 +1,6 @@
 //! Message segmentation above the existing FEC records. No retransmission.
 use super::{MAX_PAYLOAD, Record};
-use crate::runtime::MAX_MESSAGE;
+use crate::runtime::{MAX_MESSAGE, stats, trace};
 use anyhow::{Result, ensure};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -14,6 +14,32 @@ const ACTIVE_LIMIT: usize = 64;
 const BYTE_LIMIT: usize = ACTIVE_LIMIT * MAX_MESSAGE;
 const WINDOW: u64 = 8192;
 
+pub(crate) fn metadata(record: &Record) -> Option<trace::MessageKey> {
+    let b = &record.payload;
+    if record.flow & FLAG == 0 || b.len() < HEADER {
+        return None;
+    }
+    let base = u64::from_be_bytes(b[..8].try_into().ok()?);
+    let total = u16::from_be_bytes(b[8..10].try_into().ok()?);
+    let index = b[10];
+    let count = usize::from(total).div_ceil(CHUNK);
+    if base == 0
+        || usize::from(total) <= MAX_PAYLOAD
+        || usize::from(total) > MAX_MESSAGE
+        || usize::from(index) >= count
+        || base.checked_add(u64::from(index)) != Some(record.id)
+    {
+        return None;
+    }
+    Some(trace::MessageKey {
+        base_record_id: base,
+        payload_bytes: total,
+        fragments: count as u8,
+        fragment_index: Some(index),
+        received_mask: None,
+    })
+}
+
 /// Stack-owned iterator: the common unfragmented path keeps its payload buffer
 /// and does not allocate an intermediate record vector.
 pub(super) struct Fragments {
@@ -22,6 +48,37 @@ pub(super) struct Fragments {
     index: usize,
     count: usize,
     payload: Vec<u8>,
+}
+impl Fragments {
+    pub(super) fn is_small(&self, threshold: usize) -> bool {
+        self.count == 1 && self.payload.len() <= threshold
+    }
+    pub(super) fn trace(
+        &self,
+        scope: &stats::Scope,
+        stage: trace::Stage,
+        reason: Option<trace::Reason>,
+    ) {
+        if self.count > 1 {
+            scope.trace_with(|context, capture| {
+                let mut event = trace::Event::new(context, stage);
+                event.record = Some(trace::RecordKey {
+                    flow: self.flow,
+                    record_id: self.base,
+                });
+                event.message = Some(trace::MessageKey {
+                    base_record_id: self.base,
+                    payload_bytes: self.payload.len() as u16,
+                    fragments: self.count as u8,
+                    fragment_index: None,
+                    received_mask: None,
+                });
+                event.probe = capture.probe_identity(&self.payload);
+                event.reason = reason;
+                event
+            });
+        }
+    }
 }
 impl Iterator for Fragments {
     type Item = Record;
@@ -95,6 +152,9 @@ struct Assembly {
     created: Instant,
 }
 pub(super) struct Reassembly {
+    scope: Option<stats::Scope>,
+    failures: stats::MessageFailures,
+    reported_failures: stats::MessageFailures,
     limit: usize,
     ttl: Duration,
     active: BTreeMap<u64, Assembly>,
@@ -108,6 +168,9 @@ pub(super) struct Reassembly {
 impl Reassembly {
     pub(super) fn new(limit: usize, ttl: Duration) -> Self {
         Self {
+            scope: None,
+            failures: stats::MessageFailures::default(),
+            reported_failures: stats::MessageFailures::default(),
             limit,
             ttl,
             active: BTreeMap::new(),
@@ -119,15 +182,52 @@ impl Reassembly {
             dropped: 0,
         }
     }
-    pub(super) fn take_counters(&mut self) -> (u64, u64) {
+    pub(super) fn with_scope(mut self, scope: stats::Scope) -> Self {
+        self.scope = Some(scope);
+        self
+    }
+    fn trace_assembly(&self, base: u64, a: &Assembly, reason: Option<trace::Reason>) {
+        if let Some(scope) = &self.scope {
+            scope.trace_with(|context, _| {
+                let mut event = trace::Event::new(
+                    context,
+                    if reason.is_some() {
+                        trace::Stage::MessageDropped
+                    } else {
+                        trace::Stage::MessageReassembled
+                    },
+                );
+                event.record = Some(trace::RecordKey {
+                    flow: a.flow,
+                    record_id: base,
+                });
+                event.message = Some(trace::MessageKey {
+                    base_record_id: base,
+                    payload_bytes: a.total as u16,
+                    fragments: a.total.div_ceil(CHUNK) as u8,
+                    fragment_index: None,
+                    received_mask: Some(a.received),
+                });
+                event.reason = reason;
+                event
+            });
+        }
+    }
+    pub(super) fn take_counters(&mut self) -> (u64, u64, stats::MessageFailures) {
         let delta = (
             self.completed - self.reported.0,
             self.dropped - self.reported.1,
+            self.failures.since(self.reported_failures),
         );
         self.reported = (self.completed, self.dropped);
+        self.reported_failures = self.failures;
         delta
     }
     pub(super) fn close(&mut self) {
+        for (base, assembly) in &self.active {
+            self.trace_assembly(*base, assembly, Some(trace::Reason::Shutdown));
+        }
+        self.failures.shutdown += self.active.len() as u64;
         self.dropped += self.active.len() as u64;
         self.active.clear();
         self.bytes = 0;
@@ -151,7 +251,15 @@ impl Reassembly {
             .map(|(id, _)| *id)
             .collect();
         for id in ids {
-            self.remove(id);
+            let assembly = self.remove(id).expect("active assembly");
+            let reason = if now >= assembly.created + self.ttl {
+                self.failures.expired += 1;
+                trace::Reason::Expired
+            } else {
+                self.failures.window += 1;
+                trace::Reason::Stale
+            };
+            self.trace_assembly(id, &assembly, Some(reason));
             self.dropped += 1;
         }
         let floor = self.highest.saturating_sub(WINDOW);
@@ -167,6 +275,7 @@ impl Reassembly {
         let b = &record.payload;
         if self.limit <= MAX_PAYLOAD || b.len() < HEADER {
             self.dropped += 1;
+            self.failures.invalid += 1;
             return None;
         }
         let base = u64::from_be_bytes(b[..8].try_into().ok()?);
@@ -181,6 +290,7 @@ impl Reassembly {
             || b.len() != HEADER + (total - index * CHUNK).min(CHUNK)
         {
             self.dropped += 1;
+            self.failures.invalid += 1;
             return None;
         }
         if base < self.highest.saturating_sub(WINDOW) || self.finished.contains(&base) {
@@ -193,6 +303,15 @@ impl Reassembly {
             if self.active.len() >= ACTIVE_LIMIT || self.bytes + total > BYTE_LIMIT {
                 self.finished.insert(base);
                 self.dropped += 1;
+                self.failures.capacity += 1;
+                if let Some(scope) = &self.scope {
+                    scope.trace_record(
+                        trace::Stage::MessageDropped,
+                        &record,
+                        None,
+                        Some(trace::Reason::ByteLimit),
+                    );
+                }
                 return None;
             }
             self.active.insert(
@@ -214,8 +333,10 @@ impl Reassembly {
             || a.total != total
             || (a.received & (1 << index) != 0 && a.data[start..end] != b[HEADER..])
         {
-            self.remove(base);
+            let assembly = self.remove(base).expect("conflicting assembly");
+            self.trace_assembly(base, &assembly, Some(trace::Reason::FragmentConflict));
             self.dropped += 1;
+            self.failures.conflict += 1;
             return None;
         }
         a.data[start..end].copy_from_slice(&b[HEADER..]);
@@ -224,6 +345,7 @@ impl Reassembly {
             return None;
         }
         let a = self.remove(base)?;
+        self.trace_assembly(base, &a, None);
         self.completed += 1;
         Some((
             Record {
@@ -359,6 +481,108 @@ mod integration_tests {
         wire,
     };
     #[test]
+    fn whole_message_admission_never_publishes_a_partial_message() {
+        use crate::runtime::{
+            QUEUE,
+            tunnel::{QueuedRecord, enqueue_message},
+        };
+        for size in [1001, 1472, MAX_MESSAGE] {
+            for threshold in [0, 128] {
+                let needed = split(1, &mut 0, vec![0; size], MAX_MESSAGE).unwrap().len();
+                let reserve = if threshold == 0 { 0 } else { QUEUE / 16 };
+                for available in [needed - 1, needed] {
+                    let (tx, mut rx) = tokio::sync::mpsc::channel(QUEUE);
+                    let occupied = QUEUE - reserve - available;
+                    let now = Instant::now();
+                    for id in 0..occupied {
+                        tx.try_send(QueuedRecord {
+                            record: Record {
+                                flow: 2,
+                                id: id as u64,
+                                payload: vec![0],
+                            },
+                            created: now,
+                        })
+                        .unwrap();
+                    }
+                    let metrics = stats::Metrics::new("atomic-message");
+                    let scope = metrics.scope("message", stats::FORWARD);
+                    let parts = split(1, &mut 0, vec![7; size], MAX_MESSAGE).unwrap();
+                    let accepted = enqueue_message(&tx, parts, now, &scope, threshold);
+                    assert_eq!(accepted, available == needed);
+                    let mut fragments = Vec::new();
+                    while let Ok(item) = rx.try_recv() {
+                        if item.record.flow & FLAG != 0 {
+                            fragments.push(item.record);
+                        }
+                    }
+                    assert_eq!(fragments.len(), if accepted { needed } else { 0 });
+                    assert_eq!(tx.capacity(), QUEUE);
+                    if accepted {
+                        let mut reassembly = Reassembly::new(MAX_MESSAGE, Duration::from_secs(1));
+                        let result = fragments
+                            .into_iter()
+                            .filter_map(|r| reassembly.receive(r, now))
+                            .collect::<Vec<_>>();
+                        assert_eq!(result.len(), 1);
+                        assert_eq!(result[0].0.payload, vec![7; size]);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn atomic_admission_preserves_small_reserve_and_closed_channel_counters() {
+        use crate::runtime::{QUEUE, tunnel::enqueue_message};
+        let (tx, mut rx) = tokio::sync::mpsc::channel(QUEUE);
+        let metrics = stats::Metrics::new("atomic-reserve");
+        let scope = metrics.scope("message", stats::FORWARD);
+        let mut id = 0;
+        let now = Instant::now();
+        for _ in 0..QUEUE - QUEUE / 16 {
+            assert!(enqueue_message(
+                &tx,
+                split(1, &mut id, vec![0; 1000], MAX_MESSAGE).unwrap(),
+                now,
+                &scope,
+                128
+            ));
+        }
+        assert!(!enqueue_message(
+            &tx,
+            split(1, &mut id, vec![0; 1001], MAX_MESSAGE).unwrap(),
+            now,
+            &scope,
+            128
+        ));
+        assert!(enqueue_message(
+            &tx,
+            split(2, &mut id, vec![0; 128], MAX_MESSAGE).unwrap(),
+            now,
+            &scope,
+            128
+        ));
+        while rx.try_recv().is_ok() {}
+        drop(rx);
+        assert!(!enqueue_message(
+            &tx,
+            split(1, &mut id, vec![0; MAX_MESSAGE], MAX_MESSAGE).unwrap(),
+            now,
+            &scope,
+            0
+        ));
+        let snapshot = metrics.snapshot(false, "running", None).unwrap();
+        assert_eq!(
+            snapshot["stats"]["directions"][stats::FORWARD]["records"]["messages_admission_dropped"],
+            2
+        );
+        assert_eq!(
+            snapshot["stats"]["directions"][stats::FORWARD]["records"]["sender_queue_closed_dropped"],
+            5
+        );
+    }
+    #[test]
     fn short_fragment_tails_cannot_use_the_small_message_lane_or_its_reserved_slots() {
         let mut policy = mesh::tests::policy();
         policy.max_message_bytes = MAX_MESSAGE;
@@ -451,6 +675,72 @@ mod integration_tests {
 mod accounting_tests {
     use super::*;
     use crate::runtime::{stats, tunnel::publish_messages};
+    #[tokio::test]
+    async fn missing_fragment_has_a_message_identity_bitmap_and_expiry_reason() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("trace.jsonl");
+        let reporter = stats::Reporter::new(
+            "fragment-evidence",
+            stats::Options {
+                stats_interval_ms: 1000,
+                trace: trace::Options {
+                    packet_trace: Some(file.clone()),
+                    packet_trace_probe_header: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let scope = reporter
+            .metrics
+            .scope("00000000000000000000000000000001", stats::RETURN);
+        let mut body = vec![7; 1472];
+        body[..4].copy_from_slice(b"BPP2");
+        body[4] = 3;
+        body[5..8].fill(0);
+        body[8..24].copy_from_slice(&17u128.to_be_bytes());
+        body[24..28].copy_from_slice(&29u32.to_be_bytes());
+        let mut parts = split(3, &mut 0, body, MAX_MESSAGE).unwrap();
+        parts.trace(&scope, trace::Stage::MessageAssigned, None);
+        let now = Instant::now();
+        let mut rx =
+            Reassembly::new(MAX_MESSAGE, Duration::from_millis(100)).with_scope(scope.clone());
+        let first = parts.next().unwrap();
+        scope.trace_record(trace::Stage::RecordDecoded, &first, None, None);
+        assert!(rx.receive(first, now).is_none());
+        rx.expire(now + Duration::from_millis(100));
+        publish_messages(&mut rx, &scope);
+        publish_messages(&mut rx, &scope);
+        let snapshot = reporter.metrics.snapshot(false, "running", None).unwrap();
+        assert_eq!(
+            snapshot["stats"]["directions"][stats::RETURN]["records"]["message_reassembly_failures"]
+                ["expired"],
+            1
+        );
+        reporter.finish(Ok(())).await.unwrap();
+        let rows: Vec<serde_json::Value> = std::fs::read_to_string(file)
+            .unwrap()
+            .lines()
+            .map(|s| serde_json::from_str(s).unwrap())
+            .collect();
+        let assigned = rows
+            .iter()
+            .find(|r| r["stage"] == "message_assigned")
+            .unwrap();
+        assert_eq!(assigned["probe"]["seq"], 29);
+        let lost = rows
+            .iter()
+            .find(|r| r["stage"] == "message_dropped")
+            .unwrap();
+        assert_eq!(lost["reason"], "expired");
+        assert_eq!(
+            lost["message"]["base_record_id"],
+            assigned["message"]["base_record_id"]
+        );
+        assert_eq!(lost["message"]["fragments"], 2);
+        assert_eq!(lost["message"]["received_mask"], 1);
+    }
     #[test]
     fn reassembly_counters_accumulate_across_sessions_without_double_counting() {
         let metrics = stats::Metrics::new("reassembly");

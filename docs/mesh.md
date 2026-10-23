@@ -318,13 +318,25 @@ braidpath mesh-client --connect 192.0.2.20:4433 \
 ```
 
 Use `--source-ip` once per uplink to bind an explicitly configured local address.
-Only address families supported by that source address can be used; the chosen
-exit must be reachable through each configured uplink. Interface names and
-source addresses must exist when starting. Removing a network after startup
-uses the existing bounded path retry policy; the local UDP listener remains.
+Only address families supported by that source address can be used. In v0.3.1,
+at least one uplink must initialize; a missing local interface/address on another
+uplink does not fail the whole client. Unavailable uplinks retry initialization
+every two seconds. A control owner with no usable path for 30 seconds is retired
+and recreated, including its bound sockets. The local UDP listener remains.
+Each initialized uplink retains one reconnect slot. Remaining slots are shared
+among usable uplinks (or all starting uplinks for a ten-second grace period),
+within the same eight-path total and the unchanged per-group rate limits.
+Shrinking an allocation releases excess leases and rejects late allocations.
 All paths continue to authenticate the same selected exit.
 
-When every connected data path disappears, a health notification starts one
+A mesh path that has admitted at least eight symbols without positive delivery
+feedback for three seconds is closed and retried. Successful QUIC keepalives
+alone do not clear this condition; idle paths without outstanding evidence are
+not failed. Generation changes reset the evidence. A failed relay can be replaced
+by an available candidate without waiting for an elective quality score. That
+failed member has a 30-second selection cooldown. The chosen exit never changes.
+
+When every usable data path disappears, a health notification starts one
 coalesced directory refresh, with at least two seconds between starts. The
 normal 15-second refresh and independent lease renewal remain active. The
 connection event stream identifies QUIC, HTTP/3 and session admission stages;
@@ -372,7 +384,14 @@ without that extension remain limited to 1,000 bytes. Use
 `--max-message-bytes 1000` for a data session with an older peer; this does not
 bypass mesh capability or exit-identity requirements.
 
-Native tests cover separate bound control sockets and lease ownership, four
+Client statistics include bounded `mesh_uplinks` entries: group, bound source,
+initialization attempts, controlled failure code, path allowance and current
+usable/configured counts. States distinguish waiting, connecting, connected,
+unavailable and stopped. These are local path observations, not application
+reachability or independent-WAN certification.
+
+Native tests cover missing-uplink startup/reinitialization, bounded slot sharing,
+failed-relay replacement, resize/release/reallocation and separate bound control sockets and lease ownership, four
 routes in one tunnel, larger-message echo, cleanup and bounded candidate
 selection. Portable loopback tests do not certify two independent WANs. A
 physical multi-network acceptance run must record actual source routes, network

@@ -15,6 +15,7 @@ pub(super) struct Explorer {
     ready: Instant,
     pub(super) preferred: Option<String>,
     cursor: usize,
+    failed_until: BTreeMap<String, Instant>,
 }
 impl Default for Explorer {
     fn default() -> Self {
@@ -23,10 +24,14 @@ impl Default for Explorer {
             ready: Instant::now() + COOLDOWN,
             preferred: None,
             cursor: 0,
+            failed_until: BTreeMap::new(),
         }
     }
 }
 impl Explorer {
+    pub(super) fn available(&self, id: &str, now: Instant) -> bool {
+        self.failed_until.get(id).is_none_or(|until| now >= *until)
+    }
     pub(super) fn reset(&mut self) {
         *self = Self::default();
     }
@@ -43,6 +48,27 @@ impl Explorer {
     ) -> Option<String> {
         if now.saturating_duration_since(health.checked) >= Duration::from_secs(2) {
             return None;
+        }
+        self.failed_until.retain(|_, until| now < *until);
+        // Failed delivery is different from an elective quality trial: a
+        // healthy control connection cannot keep a failed relay in every slot.
+        let failed = leases.iter().find(|(_, lease)| {
+            health
+                .samples
+                .iter()
+                .any(|sample| sample.address == lease.reply.address && sample.failed)
+        });
+        if let Some((id, _)) = failed
+            && let Some(candidate) = nodes.iter().find(|n| {
+                n.id != selected.id && !leases.contains_key(&n.id) && self.available(&n.id, now)
+            })
+        {
+            let retired = id.clone();
+            self.failed_until.insert(retired.clone(), now + COOLDOWN);
+            self.trial = None;
+            self.preferred = Some(candidate.id.clone());
+            self.ready = now + COOLDOWN;
+            return Some(retired);
         }
         if let Some(trial) = &self.trial {
             if now.saturating_duration_since(trial.started) < TRIAL {
@@ -101,7 +127,9 @@ impl Explorer {
         let (worst, score) = worst?;
         let candidates: Vec<_> = nodes
             .iter()
-            .filter(|n| n.id != selected.id && !leases.contains_key(&n.id))
+            .filter(|n| {
+                n.id != selected.id && !leases.contains_key(&n.id) && self.available(&n.id, now)
+            })
             .collect();
         if candidates.is_empty() {
             return None;
@@ -123,6 +151,46 @@ impl Explorer {
 mod tests {
     use super::super::entrances::PathSample;
     use super::*;
+    #[test]
+    fn failed_relay_is_replaced_without_a_delivery_score_and_is_not_immediately_reselected() {
+        let nodes: Vec<_> = (0..4).map(node).collect();
+        let leases = BTreeMap::from([
+            ("1".into(), lease(nodes[1].clone())),
+            ("2".into(), lease(nodes[2].clone())),
+        ]);
+        let now = Instant::now();
+        let health = PathHealth {
+            checked: now,
+            addresses: vec![nodes[0].address],
+            samples: vec![PathSample {
+                address: nodes[1].address,
+                group: 0,
+                delivered: false,
+                failed: true,
+                rtt_ms: 1.0,
+                loss: 0.0,
+            }],
+        };
+        let mut explorer = Explorer::default();
+        assert_eq!(
+            explorer.advance(&nodes, &nodes[0], &leases, &health, 3, now),
+            Some("1".into())
+        );
+        assert_eq!(explorer.preferred.as_deref(), Some("3"));
+        assert!(!explorer.available("1", now));
+        assert!(explorer.available("1", now + COOLDOWN));
+        // Silence with no failed observation never retires the working relay.
+        let idle = PathHealth {
+            checked: now,
+            addresses: vec![nodes[2].address],
+            samples: vec![],
+        };
+        assert!(
+            explorer
+                .advance(&nodes, &nodes[0], &leases, &idle, 3, now)
+                .is_none()
+        );
+    }
     fn node(id: usize) -> Node {
         Node {
             id: id.to_string(),
@@ -158,6 +226,7 @@ mod tests {
                     address: n.address,
                     group: 0,
                     delivered: true,
+                    failed: false,
                     rtt_ms: 10.0 + i as f64 * 10.0,
                     loss: 0.0,
                 })
@@ -179,6 +248,7 @@ mod tests {
             address: nodes[8].address,
             group: 0,
             delivered: false,
+            failed: false,
             rtt_ms: 1.0,
             loss: 0.0,
         });
@@ -232,6 +302,7 @@ mod tests {
                 address: nodes[1].address,
                 group: 0,
                 delivered: true,
+                failed: false,
                 rtt_ms: 99.0,
                 loss: 0.0,
             }],

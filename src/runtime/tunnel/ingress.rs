@@ -6,6 +6,20 @@ use tokio::sync::mpsc::{Sender, error::TrySendError};
 
 const SMALL_SLOTS: usize = QUEUE / 16;
 
+/// Reserve the complete message before publishing any fragment. A rejected
+/// reservation returns every permit, including the small-message reserve.
+pub(super) fn reserve<T>(
+    tx: &Sender<T>,
+    count: usize,
+    bulk: bool,
+) -> Result<tokio::sync::mpsc::PermitIterator<'_, T>, TrySendError<()>> {
+    let permits = tx.try_reserve_many(count)?;
+    if bulk && tx.capacity() < SMALL_SLOTS {
+        return Err(TrySendError::Full(()));
+    }
+    Ok(permits)
+}
+
 pub(super) fn small_threshold(policy: &Policy) -> usize {
     if policy.adaptive && policy.mixed_fec {
         usize::from(policy.small_fec_bytes)

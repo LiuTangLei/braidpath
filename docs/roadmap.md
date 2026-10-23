@@ -84,7 +84,7 @@ Current protocol, commands and limits: [experimental runtime](runtime.md). Check
 - [ ] Selective application ACKs, bounded retransmission and receiver credit, without synthesizing QUIC ACKs for FEC recovery.
 - [ ] Per-flow offsets, reassembly bounds, FIN/final-offset acknowledgment, reset and half-close.
 - [ ] Preserve reliable-flow acknowledgment/reassembly state across path changes and define terminal delivery failure; the existing datagram reconnection lifecycle is not a reliable-flow implementation.
-- [x] UDP forwarding to a fixed target with explicit 1,000-byte maximum messages.
+- [x] UDP forwarding to a fixed target with negotiated messages up to 4,096 bytes, bounded fragmentation/reassembly and whole-message input admission.
 - [ ] TCP forwarding on the reliable-flow service.
 - [ ] Compare FEC with the no-FEC reliable baseline; verify bytes, completion, timeout rates and latency under bulk/interactive coexistence.
 

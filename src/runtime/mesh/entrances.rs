@@ -26,18 +26,20 @@ pub(crate) struct PathSample {
     pub address: SocketAddr,
     pub group: u8,
     pub delivered: bool,
+    pub failed: bool,
     pub rtt_ms: f64,
     pub loss: f64,
 }
 impl PathSample {
     pub(super) fn score(&self) -> Option<f64> {
-        (self.delivered && self.rtt_ms.is_finite() && self.loss.is_finite())
+        (!self.failed && self.delivered && self.rtt_ms.is_finite() && self.loss.is_finite())
             .then_some(self.rtt_ms.max(1.0) * (1.0 + 4.0 * self.loss.clamp(0.0, 1.0)))
     }
 }
 
 /// Owns maintenance and its bounded, best-effort remote lease cleanup.
 pub struct Entrances {
+    limit: watch::Sender<usize>,
     health: watch::Sender<PathHealth>,
     updates: watch::Receiver<Vec<SocketAddr>>,
     stop: Option<tokio::sync::oneshot::Sender<()>>,
@@ -51,6 +53,16 @@ impl Drop for Entrances {
     }
 }
 impl Entrances {
+    pub(super) fn resize(&self, limit: usize) {
+        self.limit.send_if_modified(|old| {
+            if *old == limit {
+                false
+            } else {
+                *old = limit;
+                true
+            }
+        });
+    }
     pub(crate) fn health(&self) -> watch::Sender<PathHealth> {
         self.health.clone()
     }
@@ -121,12 +133,14 @@ impl Entrances {
         let initial = directory.addresses();
         let (tx, updates) = watch::channel(initial.clone());
         let (stop, stopped) = tokio::sync::oneshot::channel();
-        let maintenance = tokio::spawn(directory.run(tx, interval, async {
+        let (limit_tx, limit_rx) = watch::channel(limit);
+        let maintenance = tokio::spawn(directory.run(tx, interval, Some(limit_rx), async {
             let _ = stopped.await;
         }));
         Ok((
             initial,
             Self {
+                limit: limit_tx,
                 health,
                 updates,
                 stop: Some(stop),
@@ -207,13 +221,14 @@ impl Directory {
 
     #[cfg(test)]
     async fn maintain(self, tx: watch::Sender<Vec<SocketAddr>>, interval: Duration) {
-        self.run(tx, interval, std::future::pending()).await;
+        self.run(tx, interval, None, std::future::pending()).await;
     }
 
     async fn run(
         mut self,
         tx: watch::Sender<Vec<SocketAddr>>,
         interval: Duration,
+        mut limits: Option<watch::Receiver<usize>>,
         stop: impl Future<Output = ()>,
     ) {
         let renew_every = interval.min(RENEW_EVERY);
@@ -243,6 +258,17 @@ impl Directory {
         loop {
             tokio::select! {
                 _ = &mut stop => break,
+                result = async { limits.as_mut().expect("enabled limits").changed().await }, if limits.is_some() => {
+                    if result.is_err() { limits = None; continue; }
+                    self.limit = (*limits.as_mut().expect("limits").borrow_and_update()).clamp(1, MAX_PATHS);
+                    self.explorer.reset();
+                    allocations.abort_all();
+                    for allocation in self.resize() {
+                        self.start_release(&mut releases, allocation);
+                    }
+                    allocations = self.allocations();
+                    self.publish(&tx);
+                }
                 result = self.health.changed(), if health_open => {
                     if result.is_err() { health_open = false; continue; }
                     let health = self.health.borrow_and_update().clone();
@@ -298,7 +324,7 @@ impl Directory {
                 Some(result) = allocations.join_next() => {
                     match result {
                         Ok((allocation, Ok(reply))) => {
-                            if self.current(&allocation) {
+                            if self.current(&allocation) && self.leases.len() < self.limit - 1 {
                                 let node = allocation.node;
                                 self.leases.insert(node.id.clone(), ClientLease {
                                     node, reply, renewed: Instant::now(),
@@ -361,6 +387,35 @@ impl Directory {
                 .is_some_and(|current| {
                     current.node == allocation.node && current.request == allocation.request
                 })
+    }
+
+    fn resize(&mut self) -> Vec<Allocation> {
+        let health = self.health.borrow();
+        let mut retained: Vec<_> = self.leases.keys().cloned().collect();
+        retained.sort_by(|a, b| {
+            let score = |id: &String| {
+                let address = self.leases[id].reply.address;
+                health
+                    .samples
+                    .iter()
+                    .find(|s| s.address == address)
+                    .and_then(PathSample::score)
+                    .unwrap_or(f64::INFINITY)
+            };
+            score(a).total_cmp(&score(b)).then_with(|| a.cmp(b))
+        });
+        retained.truncate(self.limit - 1);
+        self.leases.retain(|id, _| retained.contains(id));
+        let mut retired = Vec::new();
+        self.requests.retain(|id, allocation| {
+            if retained.contains(id) {
+                true
+            } else {
+                retired.push(allocation.clone());
+                false
+            }
+        });
+        retired
     }
 
     fn start_release(&self, pending: &mut JoinSet<()>, allocation: Allocation) {
@@ -537,6 +592,7 @@ impl Directory {
             .nodes
             .iter()
             .filter(|n| n.id != self.selected.id && !self.leases.contains_key(&n.id))
+            .filter(|n| self.explorer.available(&n.id, Instant::now()))
             .cloned()
             .collect::<Vec<_>>();
         if candidates.is_empty() {

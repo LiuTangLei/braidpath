@@ -204,6 +204,9 @@ pub struct ProbeIdentity {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Stage {
+    MessageAssigned,
+    MessageReassembled,
+    MessageDropped,
     RecordIngress,
     RecordAssigned,
     IngressQueued,
@@ -228,6 +231,7 @@ pub enum Stage {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Reason {
+    FragmentConflict,
     Expired,
     QueueFull,
     FlowFull,
@@ -258,11 +262,22 @@ pub enum Reason {
     Cancelled,
 }
 
+/// Links fragment records to the application message without recording bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct MessageKey {
+    pub base_record_id: u64,
+    pub payload_bytes: u16,
+    pub fragments: u8,
+    pub fragment_index: Option<u8>,
+    pub received_mask: Option<u8>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub struct Event {
     pub context: Context,
     pub stage: Stage,
     pub record: Option<RecordKey>,
+    pub message: Option<MessageKey>,
     pub symbol: Option<SymbolKey>,
     pub path: Option<PathKey>,
     pub bytes: ByteCounts,
@@ -280,6 +295,7 @@ impl Event {
             context,
             stage,
             record: None,
+            message: None,
             symbol: None,
             path: None,
             bytes: ByteCounts {

@@ -27,10 +27,17 @@ impl From<SocketAddr> for Route {
     }
 }
 pub struct Networks {
-    guards: Vec<Entrances>,
     routes: watch::Receiver<Vec<Route>>,
     health: watch::Sender<PathHealth>,
-    bridge: AbortTask,
+    stop: Option<tokio::sync::oneshot::Sender<()>>,
+    maintenance: Option<tokio::task::JoinHandle<()>>,
+}
+impl Drop for Networks {
+    fn drop(&mut self) {
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+    }
 }
 impl Networks {
     pub(crate) fn routes(&self) -> watch::Receiver<Vec<Route>> {
@@ -39,14 +46,126 @@ impl Networks {
     pub(crate) fn health(&self) -> watch::Sender<PathHealth> {
         self.health.clone()
     }
-    pub async fn shutdown(self) {
-        self.bridge.0.abort();
-        let mut cleanup = JoinSet::new();
-        for guard in self.guards {
-            cleanup.spawn(guard.shutdown());
+    pub async fn shutdown(mut self) {
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
         }
-        while cleanup.join_next().await.is_some() {}
+        if let Some(task) = self.maintenance.take() {
+            let _ = task.await;
+        }
     }
+}
+
+struct NetworkSlot {
+    uplink: Uplink,
+    guard: Option<Entrances>,
+    retry_at: Instant,
+    started: Instant,
+    last_usable: Instant,
+    attempts: u64,
+    failure: Option<&'static str>,
+}
+impl NetworkSlot {
+    fn new(uplink: Uplink) -> Self {
+        let now = Instant::now();
+        Self {
+            uplink,
+            guard: None,
+            retry_at: now,
+            started: now,
+            last_usable: now,
+            attempts: 0,
+            failure: None,
+        }
+    }
+    async fn start(&mut self, identity: &ClientIdentity, nodes: &[Node], exit: &str) {
+        self.attempts += 1;
+        self.retry_at = Instant::now() + Duration::from_secs(2);
+        let nodes: Vec<_> = nodes
+            .iter()
+            .filter(|n| self.uplink.supports(n.address))
+            .cloned()
+            .collect();
+        if !nodes.iter().any(|n| n.id == exit) {
+            self.failure = Some("exit_address_family");
+            return;
+        }
+        match Entrances::start_bound(
+            identity,
+            nodes,
+            exit,
+            1,
+            Duration::from_secs(15),
+            &self.uplink,
+        )
+        .await
+        {
+            Ok((_, guard)) => {
+                self.guard = Some(guard);
+                self.started = Instant::now();
+                self.last_usable = self.started;
+                self.failure = None;
+            }
+            Err(error) => {
+                self.failure = Some("uplink_initialization");
+                tracing::debug!(group=self.uplink.group, %error, "uplink unavailable; bounded retry scheduled");
+            }
+        }
+    }
+}
+
+// Reserve one reconnect path for each initialized uplink. Only the remaining
+// slots are borrowed; discovery and the total eight-path envelope stay bounded.
+fn allocate_limits(capacities: &[usize], preferred: &[bool]) -> Vec<usize> {
+    let mut limits: Vec<_> = capacities.iter().map(|n| usize::from(*n > 0)).collect();
+    let prefer = capacities.iter().zip(preferred).any(|(n, p)| *n > 0 && *p);
+    let mut remaining = MAX_PATHS - limits.iter().sum::<usize>();
+    while remaining > 0 {
+        let mut changed = false;
+        for i in 0..limits.len() {
+            if remaining > 0 && limits[i] < capacities[i] && (!prefer || preferred[i]) {
+                limits[i] += 1;
+                remaining -= 1;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    limits
+}
+
+fn publish_routes(slots: &[NetworkSlot], limits: &[usize], tx: &watch::Sender<Vec<Route>>) {
+    let next = slots
+        .iter()
+        .zip(limits)
+        .flat_map(|(slot, limit)| {
+            slot.guard
+                .as_ref()
+                .map(|guard| {
+                    guard
+                        .updates()
+                        .borrow()
+                        .iter()
+                        .take(*limit)
+                        .map(|address| Route {
+                            address: *address,
+                            uplink: slot.uplink.clone(),
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        })
+        .collect::<Vec<_>>();
+    tx.send_if_modified(|old| {
+        if *old == next {
+            false
+        } else {
+            *old = next;
+            true
+        }
+    });
 }
 impl ClientIdentity {
     pub async fn discover_on(
@@ -116,9 +235,25 @@ impl ClientIdentity {
         exit: &str,
         uplinks: Vec<Uplink>,
     ) -> Result<Networks> {
+        self.networks_with_metrics(nodes, exit, uplinks, stats::Metrics::new("mesh-networks"))
+            .await
+    }
+
+    pub(crate) async fn networks_with_metrics(
+        &self,
+        nodes: Vec<Node>,
+        exit: &str,
+        uplinks: Vec<Uplink>,
+        metrics: stats::Metrics,
+    ) -> Result<Networks> {
         ensure!(
             !uplinks.is_empty() && uplinks.len() <= MAX_PATHS,
             "uplink count must be 1..8"
+        );
+        entrances::validate_nodes(&nodes)?;
+        ensure!(
+            nodes.iter().any(|n| n.id == exit),
+            "selected exit not found"
         );
         let mut groups = std::collections::BTreeSet::new();
         for uplink in &uplinks {
@@ -127,64 +262,102 @@ impl ClientIdentity {
                 "uplink groups must be distinct and below eight"
             );
         }
-        let mut guards = Vec::new();
-        for (index, uplink) in uplinks.iter().enumerate() {
-            let limit = MAX_PATHS / uplinks.len() + usize::from(index < MAX_PATHS % uplinks.len());
-            let nodes: Vec<_> = nodes
-                .iter()
-                .filter(|n| uplink.supports(n.address))
-                .cloned()
-                .collect();
-            let (_, guard) =
-                Entrances::start_bound(self, nodes, exit, limit, Duration::from_secs(15), uplink)
-                    .await?;
-            guards.push(guard);
+        let mut slots: Vec<_> = uplinks.into_iter().map(NetworkSlot::new).collect();
+        for slot in &mut slots {
+            slot.start(self, &nodes, exit).await;
         }
-        let mut updates: Vec<_> = guards.iter().map(Entrances::updates).collect();
-        let reporters: Vec<_> = guards.iter().map(Entrances::health).collect();
-        let collect = |updates: &mut [watch::Receiver<Vec<SocketAddr>>]| {
-            updates
-                .iter_mut()
-                .zip(&uplinks)
-                .flat_map(|(rx, uplink)| {
-                    rx.borrow_and_update()
-                        .iter()
-                        .map(|address| Route {
-                            address: *address,
-                            uplink: uplink.clone(),
-                        })
-                        .collect::<Vec<_>>()
-                })
-                .collect::<Vec<_>>()
-        };
-        let (tx, routes) = watch::channel(collect(&mut updates));
+        ensure!(
+            slots.iter().any(|s| s.guard.is_some()),
+            "no usable mesh uplink: local bind or exit address family unavailable"
+        );
+        let (tx, routes) = watch::channel(Vec::new());
         let (health, mut observed) = watch::channel(PathHealth::default());
-        // One bounded bridge, no per-packet task. The 200 ms tick also coalesces
-        // simultaneous membership updates across interfaces.
-        let bridge = AbortTask(tokio::spawn(async move {
+        let (stop, mut stopped) = tokio::sync::oneshot::channel();
+        publish_routes(&slots, &vec![1; slots.len()], &tx);
+        let identity = self.clone();
+        let exit = exit.to_owned();
+        let maintenance = tokio::spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_millis(200));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut cleanups = JoinSet::new();
+            let mut health_open = true;
             loop {
                 tokio::select! {
-                    _ = tick.tick() => {
-                        let next: Vec<_> = updates.iter_mut().zip(&uplinks).flat_map(|(rx, uplink)| rx.borrow_and_update().iter().map(|address| Route { address: *address, uplink: uplink.clone() }).collect::<Vec<_>>()).collect();
-                        tx.send_if_modified(|old| if *old == next {false} else {*old = next; true});
-                    }
-                    result = observed.changed() => {
-                        if result.is_err() { break; }
+                    _ = &mut stopped => break,
+                    Some(_) = cleanups.join_next() => {},
+                    result = observed.changed(), if health_open => {
+                        if result.is_err() { health_open = false; continue; }
                         let all = observed.borrow_and_update();
-                        for (reporter, uplink) in reporters.iter().zip(&uplinks) {
-                            let samples: Vec<_> = all.samples.iter().filter(|s| s.group == uplink.group).cloned().collect();
-                            reporter.send_replace(PathHealth { checked: all.checked, addresses: samples.iter().map(|s| s.address).collect(), samples });
+                        for slot in &slots {
+                            if let Some(guard) = &slot.guard {
+                                let samples: Vec<_> = all.samples.iter().filter(|s| s.group == slot.uplink.group).cloned().collect();
+                                guard.health().send_replace(PathHealth { checked: all.checked, addresses: samples.iter().filter(|s| !s.failed).map(|s| s.address).collect(), samples });
+                            }
                         }
+                    }
+                    _ = tick.tick() => {
+                        let now = Instant::now();
+                        let known = identity.cache.known();
+                        let all = observed.borrow().clone();
+                        let fresh = now.saturating_duration_since(all.checked) < Duration::from_secs(2);
+                        let mut capacities = Vec::new();
+                        let mut preferred = Vec::new();
+                        let mut diagnostics = Vec::new();
+                        for slot in &mut slots {
+                            let usable = if fresh { all.samples.iter().filter(|s| s.group == slot.uplink.group && !s.failed).count() } else { 0 };
+                            if usable > 0 { slot.last_usable = now; }
+                            // Recreate the bound control socket after prolonged failure,
+                            // including interfaces removed and recreated with a new index.
+                            if slot.guard.is_some() && now.saturating_duration_since(slot.last_usable) >= Duration::from_secs(30) {
+                                if let Some(guard) = slot.guard.take() { cleanups.spawn(guard.shutdown()); }
+                                slot.retry_at = now + Duration::from_secs(2);
+                                slot.failure = Some("no_usable_path");
+                            }
+                            if slot.guard.is_none() && now >= slot.retry_at {
+                                slot.start(&identity, &known, &exit).await;
+                            }
+                            let capacity = if slot.guard.is_some() { known.iter().filter(|n| slot.uplink.supports(n.address)).count().clamp(1, MAX_PATHS) } else { 0 };
+                            capacities.push(capacity);
+                            let starting = now.saturating_duration_since(slot.started) < Duration::from_secs(10);
+                            preferred.push(usable > 0 || starting);
+                            diagnostics.push(stats::MeshUplink {
+                                group: slot.uplink.group, interface: slot.uplink.interface.clone(), source_ip: slot.uplink.bind.map(|ip| ip.to_string()),
+                                state: if slot.guard.is_none() { "waiting" } else if usable > 0 { "connected" } else if starting { "connecting" } else { "unavailable" },
+                                usable_paths: usable, path_limit: 0, configured_paths: 0, control_starts: slot.attempts, failure: slot.failure,
+                            });
+                        }
+                        let limits = allocate_limits(&capacities, &preferred);
+                        for ((slot, limit), diagnostic) in slots.iter().zip(&limits).zip(&mut diagnostics) {
+                            if let Some(guard) = &slot.guard {
+                                guard.resize(*limit);
+                                diagnostic.configured_paths = guard.updates().borrow().len().min(*limit);
+                            }
+                            diagnostic.path_limit = *limit;
+                        }
+                        publish_routes(&slots, &limits, &tx);
+                        metrics.state(|s| s.mesh_uplinks = diagnostics);
                     }
                 }
             }
-        }));
+            for slot in &mut slots {
+                if let Some(guard) = slot.guard.take() {
+                    cleanups.spawn(guard.shutdown());
+                }
+            }
+            while cleanups.join_next().await.is_some() {}
+            metrics.state(|s| {
+                for uplink in &mut s.mesh_uplinks {
+                    uplink.state = "stopped";
+                    uplink.configured_paths = 0;
+                    uplink.usable_paths = 0;
+                }
+            });
+        });
         Ok(Networks {
-            guards,
             routes,
             health,
-            bridge,
+            stop: Some(stop),
+            maintenance: Some(maintenance),
         })
     }
 }
@@ -193,6 +366,175 @@ impl ClientIdentity {
 mod tests {
     use super::super::tests::{Task, address, policy, server, wait_nodes};
     use super::*;
+
+    #[test]
+    fn shared_path_slots_follow_available_networks_without_exceeding_eight() {
+        assert_eq!(allocate_limits(&[8, 8], &[true, true]), [4, 4]);
+        assert_eq!(allocate_limits(&[8, 8], &[true, false]), [7, 1]);
+        assert_eq!(allocate_limits(&[8, 0], &[true, false]), [8, 0]);
+        assert_eq!(allocate_limits(&[2, 8], &[true, true]), [2, 6]);
+        assert_eq!(allocate_limits(&[8; 8], &[false; 8]), [1; 8]);
+        for healthy in 0..256u16 {
+            let preferred: Vec<_> = (0..8).map(|i| healthy & (1 << i) != 0).collect();
+            assert_eq!(
+                allocate_limits(&[8; 8], &preferred).iter().sum::<usize>(),
+                8
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_local_uplink_does_not_block_other_network_and_can_reinitialize() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let root = tempfile::tempdir().unwrap();
+        let exit = address();
+        let _exit = server(root.path(), "exit", exit, address(), None).await;
+        let identity = ClientIdentity::open(
+            root.path().join("client"),
+            &root.path().join("exit/client-key.json"),
+        )
+        .unwrap();
+        let nodes = wait_nodes(&identity, exit, &["exit"]).await;
+        let missing = Uplink {
+            bind: Some("192.0.2.123".parse().unwrap()),
+            group: 0,
+            interface: None,
+        };
+        let available = Uplink {
+            bind: Some("127.0.0.1".parse().unwrap()),
+            group: 1,
+            interface: None,
+        };
+        let metrics = stats::Metrics::new("missing-uplink");
+        let networks = identity
+            .networks_with_metrics(
+                nodes.clone(),
+                "exit",
+                vec![missing.clone(), available.clone()],
+                metrics.clone(),
+            )
+            .await
+            .unwrap();
+        assert!(networks.routes.borrow().iter().all(|r| r.uplink.group == 1));
+        assert_eq!(networks.routes.borrow().len(), 1);
+        // Exercise the exact retry initialization with availability restored.
+        let mut slot = NetworkSlot::new(missing);
+        slot.start(&identity, &nodes, "exit").await;
+        assert!(slot.guard.is_none());
+        assert_eq!(slot.failure, Some("uplink_initialization"));
+        slot.uplink = available;
+        slot.start(&identity, &nodes, "exit").await;
+        assert!(slot.guard.is_some());
+        assert_eq!(slot.attempts, 2);
+        slot.guard.take().unwrap().shutdown().await;
+        networks.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn resizing_and_failed_data_paths_release_leases_and_preserve_the_exit() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let root = tempfile::tempdir().unwrap();
+        let exit = address();
+        let _exit = server(root.path(), "exit", exit, address(), None).await;
+        let mut servers = Vec::new();
+        for id in ["entry_a", "entry_b", "entry_c"] {
+            servers.push(
+                server(
+                    root.path(),
+                    id,
+                    address(),
+                    address(),
+                    Some((exit, root.path().join("exit/server-key.json"))),
+                )
+                .await,
+            );
+        }
+        let identity = ClientIdentity::open(
+            root.path().join("client"),
+            &root.path().join("exit/client-key.json"),
+        )
+        .unwrap();
+        let nodes = wait_nodes(&identity, exit, &["entry_a", "entry_b", "entry_c", "exit"]).await;
+        let (_, guard) = Entrances::start_bound(
+            &identity,
+            nodes,
+            "exit",
+            3,
+            Duration::from_secs(1),
+            &Uplink::default(),
+        )
+        .await
+        .unwrap();
+        let mut updates = guard.updates();
+        async fn count(updates: &mut watch::Receiver<Vec<SocketAddr>>, expected: usize) {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while updates.borrow_and_update().len() != expected {
+                    updates.changed().await.unwrap();
+                }
+            })
+            .await
+            .unwrap();
+        }
+        count(&mut updates, 3).await;
+        let original = updates.borrow().clone();
+        let bad = original[1];
+        guard.health().send_replace(PathHealth {
+            checked: Instant::now(),
+            addresses: vec![exit, original[2]],
+            samples: vec![PathSample {
+                address: bad,
+                group: 0,
+                delivered: false,
+                failed: true,
+                rtt_ms: 0.0,
+                loss: 0.0,
+            }],
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let routes = updates.borrow_and_update().clone();
+                if routes.len() == 3 && !routes.contains(&bad) {
+                    break;
+                }
+                updates.changed().await.unwrap();
+            }
+        })
+        .await
+        .unwrap();
+        let replaced = updates.borrow().clone();
+        assert!(replaced.contains(&exit));
+        assert!(replaced.contains(&original[2]));
+        guard.resize(1);
+        count(&mut updates, 1).await;
+        assert_eq!(*updates.borrow(), vec![exit]);
+        // Release completion is asynchronous; check the actual remote lease
+        // table rather than merely the watch publication.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let free = original
+                    .iter()
+                    .chain(replaced.iter())
+                    .filter(|a| **a != exit)
+                    .all(|a| std::net::UdpSocket::bind(a).is_ok());
+                if free {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        guard.resize(3);
+        count(&mut updates, 3).await;
+        let final_routes = updates.borrow().clone();
+        guard.shutdown().await;
+        assert!(
+            final_routes
+                .iter()
+                .filter(|a| **a != exit)
+                .all(|a| std::net::UdpSocket::bind(a).is_ok())
+        );
+    }
 
     #[tokio::test]
     async fn bound_uplinks_share_one_tunnel_and_preserve_large_udp_messages() {
@@ -242,7 +584,7 @@ mod tests {
             .unwrap();
         assert_eq!(discovered, nodes);
         let guard = identity
-            .networks(discovered, "exit", uplinks)
+            .networks_with_metrics(discovered, "exit", uplinks, stats::Metrics::new("uplinks"))
             .await
             .unwrap();
         let mut routes = guard.routes();
