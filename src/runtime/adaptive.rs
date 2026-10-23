@@ -13955,4 +13955,87 @@ mod tests {
             })
         );
     }
+    #[test]
+    #[ignore = "one registered causal comparison; not a default tuning workload"]
+    fn capacity_memory_retirement_v030_causal_comparison() {
+        let run = |retire: bool| {
+            let mut lane = Lane::new(true);
+            lane.controller = lane.controller.with_rtt_source_baselines(true);
+            let mut bytes = [0u64; 3];
+            let mut queues = [vec![], vec![], vec![]];
+            let mut recovery = [0u64; 12];
+            let mut trace = Vec::new();
+            let mut retired = false;
+            for now in (0..148_000_000u64).step_by(1000) {
+                if retire
+                    && !retired
+                    && (46_000_000..47_000_000).contains(&now)
+                    && lane.controller.congestion_seen
+                    && let Some(report) = lane.report
+                    && now.saturating_sub(report.due) < 200_000
+                    && report.rate < lane.controller.remembered_bps * 0.4
+                    && (lane.controller.rate_bps as f64) < lane.controller.remembered_bps * 0.4
+                {
+                    // Test-only intervention: proves or falsifies a cause. It is
+                    // deliberately not a new production timer or configuration.
+                    lane.controller.remembered_bps = report.rate * 1.1;
+                    retired = true;
+                }
+                let capacity = if (16_000_000..136_000_000).contains(&now) {
+                    350_000.0
+                } else {
+                    3_000_000.0
+                };
+                let before = lane.delivered_app_bytes;
+                let previous = lane.controller.rate_changes_total;
+                lane.tick(now, capacity);
+                let delivered = lane.delivered_app_bytes - before;
+                if lane.controller.rate_changes_total != previous {
+                    trace.push(serde_json::json!({"change":lane.controller.rate_changes.back(), "remembered_bps":lane.controller.remembered_bps, "model_queue_ms":lane.queue_bits / capacity * 1000.0}));
+                }
+                assert!(lane.queue_bits <= 65536.0 * 8.0 && lane.controller.rate_bps <= 8_000_000);
+                assert!(lane.packets.front().is_none_or(|p| now - p.at < 250_000));
+                if now >= 136_000_000 {
+                    recovery[((now - 136_000_000) / 1_000_000) as usize] += delivered;
+                }
+                let window = if (10_000_000..16_000_000).contains(&now) {
+                    Some(0)
+                } else if (130_000_000..136_000_000).contains(&now) {
+                    Some(1)
+                } else if now >= 142_000_000 {
+                    Some(2)
+                } else {
+                    None
+                };
+                if let Some(w) = window {
+                    bytes[w] += delivered;
+                    queues[w].push(lane.queue_bits / capacity * 1000.0);
+                }
+            }
+            let p95 = queues.map(|mut values| {
+                values.sort_by(f64::total_cmp);
+                values[values.len() * 95 / 100]
+            });
+            let threshold = 3_000_000.0 * Lane::APP as f64 / Lane::NETWORK as f64 * 0.9;
+            serde_json::json!({"intervention_applied":retired, "phase_app_bps":bytes.map(|v| v as f64 * 8.0 / 6.0), "phase_queue_p95_ms":p95,
+                "total_drops":lane.dropped,"ineligible_ticks":lane.ineligible_ticks,"recovery_seconds":recovery.iter().position(|v| *v as f64 * 8.0 >= threshold).map(|i| i + 1),
+                "recovery_one_second_bytes":recovery,"rate_changes":trace})
+        };
+        let a = run(false);
+        let b = run(true);
+        let gate = b["phase_app_bps"][1].as_f64().unwrap()
+            >= a["phase_app_bps"][1].as_f64().unwrap() * 1.1
+            && b["phase_queue_p95_ms"][1].as_f64().unwrap()
+                <= a["phase_queue_p95_ms"][1].as_f64().unwrap()
+            && b["total_drops"].as_u64().unwrap() <= a["total_drops"].as_u64().unwrap()
+            && b["recovery_seconds"]
+                .as_u64()
+                .is_some_and(|v| v <= a["recovery_seconds"].as_u64().unwrap());
+        let report = serde_json::json!({"window_a":a,"window_b":b,"model_gate_passed":gate,"production_default_changed":false,"scope":"deterministic causal model only; omits Quinn, flow scheduling and application deadlines"}).to_string();
+        eprintln!("capacity_memory_v030: {report}");
+        assert!(
+            b["intervention_applied"].as_bool().unwrap(),
+            "candidate was not exercised"
+        );
+    }
 }

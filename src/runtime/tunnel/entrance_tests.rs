@@ -681,3 +681,86 @@ async fn admission_deadline(scenario: AdmissionScenario) {
     }
     tokio::time::resume();
 }
+
+#[test]
+fn route_identity_includes_uplink_and_retains_other_network_during_removal() {
+    let address = "127.0.0.1:12345".parse().unwrap();
+    let mut routes: Vec<_> = (0..2)
+        .map(|group| mesh::Route {
+            address,
+            uplink: mesh::Uplink {
+                interface: Some(format!("test{group}")),
+                bind: Some(format!("127.0.0.{}", group + 1).parse().unwrap()),
+                group,
+            },
+        })
+        .collect();
+    let mut configs = Vec::new();
+    let mut endpoints = std::array::from_fn(|_| None);
+    let paths = Arc::new(Mutex::new(vec![]));
+    let mut rotations = std::array::from_fn(|_| scheduler::Rotation::default());
+    let inflight = [false; MAX_PATHS];
+    reconcile_routes(
+        &routes,
+        &mut configs,
+        &inflight,
+        &mut endpoints,
+        &paths,
+        &mut rotations,
+    );
+    assert_eq!(configs.len(), 2);
+    let generations: Vec<_> = configs.iter().map(|c| c.generation).collect();
+    routes.reverse();
+    reconcile_routes(
+        &routes,
+        &mut configs,
+        &inflight,
+        &mut endpoints,
+        &paths,
+        &mut rotations,
+    );
+    assert_eq!(configs[0].group, 0);
+    assert_eq!(configs[1].group, 1);
+    routes.retain(|r| r.uplink.group == 1);
+    reconcile_routes(
+        &routes,
+        &mut configs,
+        &inflight,
+        &mut endpoints,
+        &paths,
+        &mut rotations,
+    );
+    assert!(!configs[0].enabled && configs[1].enabled);
+    assert_eq!(configs[1].generation, generations[1]);
+    routes.push(mesh::Route {
+        address,
+        uplink: mesh::Uplink {
+            interface: Some("restored".into()),
+            bind: Some("127.0.0.3".parse().unwrap()),
+            group: 0,
+        },
+    });
+    reconcile_routes(
+        &routes,
+        &mut configs,
+        &inflight,
+        &mut endpoints,
+        &paths,
+        &mut rotations,
+    );
+    assert_eq!(configs.len(), 2);
+    assert_eq!(configs[0].generation, generations[0]);
+    assert_eq!(configs[0].bind, Some("127.0.0.3:0".parse().unwrap()));
+}
+
+#[test]
+fn fragmentation_requires_exact_capability_echo_and_legacy_is_explicit() {
+    let mut headers = http::HeaderMap::new();
+    validate_message_echo(&headers, 1000).unwrap();
+    assert!(validate_message_echo(&headers, 4096).is_err());
+    headers.insert("braidpath-message-bytes", "4096".parse().unwrap());
+    validate_message_echo(&headers, 4096).unwrap();
+    assert!(validate_message_echo(&headers, 1000).is_err());
+    headers.insert("braidpath-message-bytes", "65535".parse().unwrap());
+    assert!(validate_message_echo(&headers, 4096).is_err());
+}

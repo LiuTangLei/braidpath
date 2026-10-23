@@ -19,5 +19,6 @@ pub mod tunnel;
 pub mod wire;
 
 pub const MAX_PAYLOAD: usize = 1000;
+pub const MAX_MESSAGE: usize = 4096;
 pub const MAX_PATHS: usize = 8;
 pub const QUEUE: usize = 256;

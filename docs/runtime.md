@@ -74,7 +74,7 @@ On Linux, repeat `--interface eth0 --interface wlan0` to create the interface–
 | `--group-rate-bps GROUP:BITS_PER_SECOND` | Shared per-direction cap for every path in that group; repeat for different groups; each cap is 64,000..aggregate bits/s |
 | Server `--max-rate-bps auto` | Caps the session's server-side sender; not a server-wide or inbound traffic policer. The default `auto` accepts the client's request up to the validated 1 Gbit/s maximum; a number keeps an operator cap |
 | `--queue-ms 100` | Sender lifetime starts at original application ingress; adaptive mode uses the smaller of this and `--latency-target-ms` |
-| Message size | 1,000 application bytes; no fragmentation; larger local UDP messages drop |
+| `--max-message-bytes 4096` | Negotiated application UDP limit, 1,000..4,096 bytes; larger messages are segmented into existing bounded records; oversize messages drop |
 | State | 16 sessions, 8 paths/session, 64 flows/session, 256 queued events/records, 256 decode-block slots, 8,192-ID dedup window |
 | Sender symbol queue | At most 256 total symbols, 64 originals per flow and 64 repairs; admitted flows receive turns |
 | Lifetimes | Receiver repair waiting uses `--queue-ms`; UDP flows expire after 60 s idle; adaptive sessions retain an empty-path epoch for approximately 120 s |
@@ -379,3 +379,41 @@ final statistics snapshot. Repair symbols retain the oldest contributing
 original ingress time in the encoder, even when many intervening small blocks
 evict the sender's bounded scheduling metadata. Flushing a block never renews
 its admission deadline.
+
+
+## UDP message boundaries
+
+v0.3.0 defaults to at most 4,096 application bytes in either direction. The
+session request and response must agree on `braidpath-message-bytes`; absence
+means the legacy 1,000-byte limit. A client requesting a larger limit rejects a
+peer that omits or changes the echo. Session joins must use the same policy.
+No limit is inferred from a successful QUIC handshake alone.
+
+Messages up to 1,000 bytes retain their existing wire encoding. Larger messages
+use version-1 fragments with a message identity, total length and chunk index.
+The record flow's high bit identifies a fragment; the application flow ID is the
+remaining 31 bits. Each fragment has its own deduplication ID and at most 1,000
+payload bytes including its 11-byte fragment header (989 data bytes). Fragment
+originals and FEC repairs use the existing path MTU checks, total/group pacing,
+flow quota and queue budgets. Short tail fragments remain in the bulk lane and cannot spend small-message reservations. The outer transport does not depend on IP fragmentation; no reliable retry is added.
+A path whose transport allowance is too small for a queued symbol cannot admit
+that symbol; it waits for a suitable path within its original deadline.
+
+All fragments of one message inherit its original local ingress time. Receiver
+reassembly has at most 64 messages / 256 KiB of payload allocation per session
+direction, plus a bounded 8,192-ID completion window. Its deadline starts with
+the first fragment and is never refreshed by duplicates. It uses the negotiated
+sender queue lifetime (the smaller latency/queue limit in adaptive mode).
+Reassembly time also counts toward local delivery's existing deadline. Missing,
+conflicting, expired or capacity-rejected fragments never produce a partial UDP
+message; late fragments cannot revive an expired message within the deduplication
+window. A process/session close releases all assemblies. These local bounds do
+not establish a cross-host deadline or guarantee UDP delivery during path startup,
+loss or migration.
+
+The `echo` and application-probe commands also accept up to 4,096 bytes; their default probe size remains 1,000. Packet-level coding counters describe fragments, while probe results describe whole application messages.
+
+Focused tests cover 1,200/1,472/4,096-byte messages, reordering, duplicates,
+missing fragments, invalid lengths, memory limits, original ingress deadlines,
+existing FEC framing within the minimum QUIC MTU allowance, and real loopback
+bidirectional echo after all configured paths are ready.

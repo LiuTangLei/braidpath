@@ -20,18 +20,23 @@ pub(super) async fn wait_nodes(
     expected: &[&str],
 ) -> Vec<Node> {
     eprintln!("waiting for {expected:?} at {at}");
+    let mut last = String::from("no response");
     timeout(Duration::from_secs(30), async {
         loop {
-            if let Ok(nodes) = identity.discover(at).await
-                && nodes.iter().map(|n| n.id.as_str()).collect::<Vec<_>>() == expected
-            {
-                return nodes;
+            match identity.discover(at).await {
+                Ok(nodes)
+                    if nodes.iter().map(|n| n.id.as_str()).collect::<Vec<_>>() == expected =>
+                {
+                    return nodes;
+                }
+                Ok(nodes) => last = format!("authenticated nodes: {nodes:?}"),
+                Err(error) => last = format!("{error:#}"),
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
     })
     .await
-    .expect("membership did not converge")
+    .unwrap_or_else(|_| panic!("membership at {at} expected {expected:?}: {last}"))
 }
 pub(super) async fn server(
     root: &Path,
@@ -39,6 +44,24 @@ pub(super) async fn server(
     listen: SocketAddr,
     target: SocketAddr,
     join: Option<(SocketAddr, PathBuf)>,
+) -> Task<Result<()>> {
+    server_with_metrics(
+        root,
+        id,
+        listen,
+        target,
+        join,
+        stats::Metrics::new("test-server"),
+    )
+    .await
+}
+pub(super) async fn server_with_metrics(
+    root: &Path,
+    id: &str,
+    listen: SocketAddr,
+    target: SocketAddr,
+    join: Option<(SocketAddr, PathBuf)>,
+    metrics: stats::Metrics,
 ) -> Task<Result<()>> {
     let dir = root.join(id);
     let options = ServerOptions {
@@ -51,21 +74,31 @@ pub(super) async fn server(
         rate: 10_000_000,
         join: join.as_ref().map(|(a, _)| *a),
         join_key: join.map(|(_, p)| p),
-        stats: stats::Metrics::new("test-server"),
+        stats: metrics.clone(),
     };
-    let task = Task(tokio::spawn(serve(options)));
+    let mut task = Task(tokio::spawn(serve(options)));
     timeout(Duration::from_secs(8), async {
-        while !dir.join("client-key.json").exists() && !task.0.is_finished() {
+        while !metrics.is_ready() && !task.0.is_finished() {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await
     .unwrap();
-    assert!(!task.0.is_finished(), "mesh server exited during startup");
+    if task.0.is_finished() {
+        panic!(
+            "mesh server {id} at {listen} exited before readiness: {:?}",
+            (&mut task.0).await
+        );
+    }
+    assert!(
+        metrics.is_ready(),
+        "mesh fixture returned before socket readiness"
+    );
     task
 }
 pub(crate) fn policy() -> Policy {
     Policy {
+        max_message_bytes: 1000,
         adaptive: true,
         capacity_probe_bps: 0,
         probe_guided_recovery: false,
@@ -319,6 +352,7 @@ pub(crate) fn state(root: &Path) -> State {
         peers: Arc::new(Mutex::new(BTreeMap::new())),
         reconnect: Arc::new(Mutex::new(Vec::new())),
         membership_write: Arc::new(tokio::sync::Mutex::new(())),
+        persistence: Arc::default(),
         relay_budget: Arc::new(relay::HostBudget::new(10_000_000)),
         leases: Mutex::new(BTreeMap::new()),
         released_requests: Mutex::new(ReleasedRequests::default()),

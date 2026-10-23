@@ -138,8 +138,15 @@ When no data path is connected, the client attempts all configured entrances
 concurrently (at most eight), so unavailable earlier entries cannot delay a
 working later entry. Background reconnections retain a two-attempt limit.
 
-The current mesh client uses the default local route; explicit multi-interface
-binding remains available through the original `client` command. Mesh path
+From v0.3.0, `mesh-client` accepts repeated `--interface` (Linux) and/or
+`--source-ip` options. When both are present, counts must match. Interface and
+source binding apply to bootstrap discovery, allocation, renewal, release and
+the matching data paths. Each uplink gets a distinct group in option order;
+`--group-rate-bps` applies to that group's data, feedback, probes and repairs.
+The eight-path session budget is divided across uplinks, including one direct
+path per uplink. Reordering discovery does not change an unchanged route's ID.
+Source-IP binding is portable, but alone does not override the OS routing table
+or prove independent physical networks. Mesh path
 reconnection and generation feedback are enabled even without `--adaptive`;
 that flag additionally enables adaptive pacing. Reconnect to change the exit.
 If the selected exit restarts and loses its session, the client creates a new
@@ -297,3 +304,77 @@ renewal. A process test keeps a client running while its selected server moves
 using the original state directory and keys, then reuses the old address for a
 different node; recovery must deliver to the selected exit and never to the
 address successor. These checks do not establish a WAN recovery-time guarantee.
+
+
+## v0.3.0 multi-network operation and diagnostics
+
+For example, on Linux with two configured uplinks:
+
+```sh
+braidpath mesh-client --connect 192.0.2.20:4433 \
+  --connection-key ./client-key.json --dir ./client-state --exit node_a \
+  --interface eth0 --interface eth1 --adaptive \
+  --group-rate-bps 0:10000000 --group-rate-bps 1:5000000
+```
+
+Use `--source-ip` once per uplink to bind an explicitly configured local address.
+Only address families supported by that source address can be used; the chosen
+exit must be reachable through each configured uplink. Interface names and
+source addresses must exist when starting. Removing a network after startup
+uses the existing bounded path retry policy; the local UDP listener remains.
+All paths continue to authenticate the same selected exit.
+
+When every connected data path disappears, a health notification starts one
+coalesced directory refresh, with at least two seconds between starts. The
+normal 15-second refresh and independent lease renewal remain active. The
+connection event stream identifies QUIC, HTTP/3 and session admission stages;
+refresh/lease failures also have diagnostic logs. These timers are not measured
+outage-to-business-packet guarantees.
+
+A full uplink path allocation with at least two connected paths can use one
+slot to assess another known entrance. The direct exit stays configured. Trials
+have a 30-second cooldown and an eight-second evaluation period. An incumbent
+requires fresh positive delivery (at least eight symbols, evidence younger than
+two seconds); a candidate must improve RTT weighted by observed loss by more
+than 20%. RTT alone cannot promote a candidate. A failed or unproven candidate
+returns its slot to the incumbent when another usable path remains. The last
+connected path is retained. These are bounded entrance-selection heuristics,
+not a claim of optimal routes or higher application goodput. A small allocation
+with fewer than three slots does not run elective trials.
+
+Read-only status uses the existing authenticated HTTP/3 port:
+
+```sh
+braidpath mesh-status --connect 192.0.2.20:4433 \
+  --connection-key ./client-key.json --dir ./client-state
+```
+
+The JSON separates known peers, directly live peers and reconnect hints; reports
+lease and control-connection occupancy and limits; and counts persistence
+failures since process start. Recovery is `standalone`, `reconnecting` or
+`connected`. Occupancy includes the diagnostic control connection itself and
+leases awaiting periodic cleanup. Inspection does not renew leases or alter
+membership. Tokens, private keys, lease selectors and filesystem error details
+are excluded. An unauthenticated request still gets an empty 404.
+
+`GET /mesh/info` advertises control protocol 1 and named features. New lease
+allocations require exit binding, node incarnation, allocation request identity
+and explicit release support. Unknown optional features are ignored; a missing
+required feature rejects that entrance without weakening ownership rules.
+Upgrade servers before v0.3.0 clients. Typed authenticated errors distinguish
+expired leases, owner mismatch, released requests, unavailable exits, node/source
+lease limits and persistence failures. Old generic error responses remain
+errors, not successful fallback responses.
+
+Larger UDP messages use a separately echoed session limit (see
+[runtime message contract](runtime.md#udp-message-boundaries)). Old sessions
+without that extension remain limited to 1,000 bytes. Use
+`--max-message-bytes 1000` for a data session with an older peer; this does not
+bypass mesh capability or exit-identity requirements.
+
+Native tests cover separate bound control sockets and lease ownership, four
+routes in one tunnel, larger-message echo, cleanup and bounded candidate
+selection. Portable loopback tests do not certify two independent WANs. A
+physical multi-network acceptance run must record actual source routes, network
+removal/recovery and the time to the first valid application response, with
+run details kept in ignored `local/`.

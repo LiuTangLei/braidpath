@@ -127,6 +127,7 @@ enum Mode {
 
 pub(super) struct RecordEncoder {
     mode: Mode,
+    fragments: bool,
     // Only one block per coding lane can be open. Keep its ingress clock even
     // if many immediate small blocks evict its sender scheduling metadata.
     clocks: [Option<(u64, Instant)>; 2],
@@ -151,6 +152,7 @@ impl RecordEncoder {
         };
         Ok(Self {
             mode,
+            fragments: policy.max_message_bytes > crate::runtime::MAX_PAYLOAD,
             clocks: [None; 2],
         })
     }
@@ -166,12 +168,14 @@ impl RecordEncoder {
         now: Instant,
         ingress: Instant,
     ) -> Result<Vec<EncodedSymbol>> {
+        let fragmented = self.fragments && record.flow & super::messages::FLAG != 0;
         let mut symbols = match &mut self.mode {
             Mode::Legacy { encoder, policy } => {
                 // Keep the legacy branch and one output collection. Wrapping a
                 // Vec<Bytes> afterwards would add an allocation to every record.
                 if policy.fec == 0
-                    && (policy.small_fec_bytes == 0
+                    && (fragmented
+                        || policy.small_fec_bytes == 0
                         || record.payload.len() > usize::from(policy.small_fec_bytes))
                 {
                     Ok::<_, anyhow::Error>(vec![EncodedSymbol {
@@ -201,7 +205,7 @@ impl RecordEncoder {
                 // Small arrivals cannot postpone a due bulk repair. The sender
                 // also drives this same flush from its existing bounded timer.
                 let mut out = bulk.flush_due(now, next_block, false)?;
-                if record.payload.len() <= *cutoff {
+                if !fragmented && record.payload.len() <= *cutoff {
                     out.extend(small.push(&bytes, now, next_block, true)?);
                 } else {
                     out.extend(bulk.push(&bytes, now, next_block, false)?);
@@ -326,6 +330,7 @@ mod tests {
 
     fn policy(fec: u8, cutoff: u16, mixed: bool) -> Policy {
         Policy {
+            max_message_bytes: 1000,
             fec_repairs: 1,
             adaptive: false,
             capacity_probe_bps: 0,

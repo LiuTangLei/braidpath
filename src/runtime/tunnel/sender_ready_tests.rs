@@ -136,6 +136,7 @@ fn block_and_poll(
 
 fn policy() -> Policy {
     Policy {
+        max_message_bytes: 1000,
         fec_repairs: 1,
         adaptive: false,
         capacity_probe_bps: 0,

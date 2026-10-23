@@ -42,6 +42,7 @@ mod coding;
 mod dual_tests;
 mod ingress;
 mod local_delivery;
+mod messages;
 #[cfg(test)]
 mod mixed_fec_tests;
 #[cfg(test)]
@@ -52,6 +53,7 @@ const WEBSITE: &str = "<!doctype html><html lang=\"en\"><meta charset=\"utf-8\">
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Policy {
+    pub max_message_bytes: usize,
     pub adaptive: bool,
     pub capacity_probe_bps: u64,
     pub probe_guided_recovery: bool,
@@ -69,6 +71,13 @@ pub struct Policy {
     pub queue_ms: u64,
 }
 impl Policy {
+    fn flow(&self, flow: u32) -> u32 {
+        if self.max_message_bytes > MAX_PAYLOAD {
+            flow & !messages::FLAG
+        } else {
+            flow
+        }
+    }
     fn admission_lifetime(&self) -> Duration {
         Duration::from_millis(if self.adaptive {
             self.queue_ms.min(self.latency_target_ms)
@@ -78,6 +87,10 @@ impl Policy {
     }
 
     pub fn validate(&self) -> Result<()> {
+        ensure!(
+            (MAX_PAYLOAD..=super::MAX_MESSAGE).contains(&self.max_message_bytes),
+            "max-message-bytes must be 1000..4096"
+        );
         ensure!(
             (1..=2).contains(&self.fec_repairs),
             "fec-repairs must be 1 or 2"
@@ -650,7 +663,7 @@ fn enqueue_coded_symbol(
     } else {
         block_created
     };
-    let flow = record.map(|(flow, _)| flow);
+    let flow = record.map(|(flow, _)| policy.map_or(flow, |p| p.flow(flow)));
     metrics.update(|d| {
         if let Some(id) = record_id {
             d.symbols.originals_generated += 1;
@@ -1552,7 +1565,7 @@ async fn sender(
                 };
                 metrics.update(|d| d.records.sender_input_consumed += 1);
                 metrics.trace_record(trace::Stage::SenderInput, &record, None, None);
-                if created.elapsed() < lifetime && queue.would_be_full(record.flow) {
+                if created.elapsed() < lifetime && queue.would_be_full(policy.flow(record.flow)) {
                     deferred_input = Some(QueuedRecord { record, created });
                 } else {
                     encode_input(
@@ -1997,7 +2010,7 @@ async fn sender(
         'drain: loop {
             if deferred_input
                 .as_ref()
-                .is_some_and(|input| !queue.would_be_full(input.record.flow))
+                .is_some_and(|input| !queue.would_be_full(policy.flow(input.record.flow)))
             {
                 encode_input(
                     deferred_input.take().expect("current input"),
@@ -2423,7 +2436,7 @@ async fn sender(
         if let Some(input) = deferred_input {
             // No immediate service freed the original slot. Keep the existing
             // bounded rejection, without changing a prepared wait's queue head.
-            debug_assert!(queue.would_be_full(input.record.flow));
+            debug_assert!(queue.would_be_full(policy.flow(input.record.flow)));
             encode_input(
                 input,
                 &mut encoder,
@@ -2509,6 +2522,34 @@ fn queue_trace_reason<T>(layer: QueueLayer, error: &mpsc::error::TrySendError<T>
     }
 }
 
+fn publish_messages(messages: &mut messages::Reassembly, scope: &Scope) {
+    let (completed, dropped) = messages.take_counters();
+    if completed > 0 || dropped > 0 {
+        scope.update(|d| {
+            d.records.messages_reassembled += completed;
+            d.records.message_reassembly_dropped += dropped;
+        });
+    }
+}
+
+fn enqueue_message(
+    tx: &mpsc::Sender<QueuedRecord>,
+    records: messages::Fragments,
+    created: Instant,
+    scope: &Scope,
+    small_threshold: usize,
+) -> bool {
+    let mut accepted = true;
+    for record in records {
+        if enqueue_record(tx, record, created, scope, small_threshold) {
+            scope.update(|d| d.records.sender_queue_enqueued += 1);
+        } else {
+            accepted = false;
+        }
+    }
+    accepted
+}
+
 fn enqueue_record(
     tx: &mpsc::Sender<QueuedRecord>,
     record: Record,
@@ -2528,7 +2569,13 @@ fn enqueue_record(
         assigned_event = Some(event);
         event
     });
-    let payload_bytes = record.payload.len();
+    // A short tail of a large message is still bulk input; it cannot spend
+    // the slots reserved for independently deliverable small messages.
+    let payload_bytes = if record.flow & messages::FLAG != 0 {
+        super::MAX_MESSAGE
+    } else {
+        record.payload.len()
+    };
     let result = ingress::try_send(
         tx,
         QueuedRecord { record, created },
@@ -2763,6 +2810,10 @@ async fn session_loop(
         session.adaptive_fec_retention,
     )
     .with_dual_repairs(session.policy.fec_repairs == 2);
+    let mut messages = messages::Reassembly::new(
+        session.policy.max_message_bytes,
+        session.policy.admission_lifetime(),
+    );
     publish_retention(&decoder, &session.forward);
     let mut delivery = local_delivery::Queue::new(
         session.forward.clone(),
@@ -2791,18 +2842,21 @@ async fn session_loop(
                 info!(paths=p.len(),flows=flows.len(),originals=decoder.originals,recovered=decoder.recovered,duplicates=decoder.duplicates,invalid=decoder.invalid,dropped,ingress_drops=session.ingress_drops.load(Ordering::Relaxed),"server session");
             },
             _=retention_deadline(&decoder)=>{decoder.expire_adaptive(Instant::now());publish_retention(&decoder,&session.forward);},
+            _=messages::deadline(&messages)=>{messages.expire(Instant::now()); publish_messages(&mut messages, &session.forward);},
             completed=delivery.ready()=>dropped+=completed,
             e=events.recv()=>match e {
                 Some(Event::Wire(pid,data))=>{
                     let records=receive_records(&mut decoder,&session.forward,pid,&data);
                     let decoded=Instant::now();
                     for r in records {
+                        let Some((r, decoded)) = messages.receive(r, decoded) else { publish_messages(&mut messages, &session.forward); continue; };
+                        publish_messages(&mut messages, &session.forward);
                         if !flows.contains_key(&r.flow) {
                             if flows.len()>=MAX_FLOWS{dropped+=1;session.forward.trace_record(trace::Stage::RecordDropped,&r,None,Some(trace::Reason::FlowLimit));session.forward.update(|d|d.records.udp_target_flow_dropped+=1);session.forward.path(pid,|p|p.udp_target_flow_dropped+=1);continue}
                             let bind=if target.is_ipv4(){"0.0.0.0:0"}else{"[::]:0"};
                             let Ok(socket)=UdpSocket::bind(bind).await else{dropped+=delivery.socket_error(pid,&r);continue};
                             if socket.connect(target).await.is_err(){dropped+=delivery.socket_error(pid,&r);continue}
-                            let socket=Arc::new(socket); let weak=Arc::downgrade(&socket); let events=session.events.clone(); let flow=r.flow; let mut quit=session.stop.subscribe(); let ingress_drops=session.ingress_drops.clone();let returning=session.returning.clone();let small_threshold=ingress::small_threshold(&session.policy);
+                            let socket=Arc::new(socket); let weak=Arc::downgrade(&socket); let events=session.events.clone(); let flow=r.flow; let mut quit=session.stop.subscribe(); let ingress_drops=session.ingress_drops.clone();let returning=session.returning.clone();let small_threshold=ingress::small_threshold(&session.policy);let max_message_bytes=session.policy.max_message_bytes;
                             tasks.spawn(async move {
                                 let mut b=vec![0;65536];
                                 loop {
@@ -2813,7 +2867,7 @@ async fn session_loop(
                                             Ok(Ok(n))=>{
                                                 returning.update(|d|d.records.application_received+=1);
                                                 trace_payload(&returning,trace::Stage::RecordIngress,&b[..n],None);
-                                                if n>MAX_PAYLOAD{trace_payload(&returning,trace::Stage::RecordDropped,&b[..n],Some(trace::Reason::Oversize));returning.update(|d|d.records.application_oversize_dropped+=1);continue;}
+                                                if n>max_message_bytes{trace_payload(&returning,trace::Stage::RecordDropped,&b[..n],Some(trace::Reason::Oversize));returning.update(|d|d.records.application_oversize_dropped+=1);continue;}
                                                 let now=Instant::now();
                                                 if let Err(error)=ingress::try_send(&events,Event::Reply(flow,b[..n].to_vec(),now),n,small_threshold){trace_payload(&returning,trace::Stage::RecordDropped,&b[..n],Some(queue_trace_reason(QueueLayer::Ingress,&error)));ingress_drops.fetch_add(1,Ordering::Relaxed);queue_error(&returning,QueueLayer::Ingress,&error,None);}else{trace_payload(&returning,trace::Stage::IngressQueued,&b[..n],None);returning.update(|d|d.records.ingress_queue_enqueued+=1);}
                                             },
@@ -2833,14 +2887,16 @@ async fn session_loop(
                 },
                 Some(Event::Reply(flow,payload,created))=>{
                     let Some((_,last))=flows.get_mut(&flow) else{trace_payload(&session.returning,trace::Stage::RecordDropped,&payload,Some(trace::Reason::FlowUnavailable));session.returning.update(|d|d.records.application_unavailable_dropped+=1);continue}; *last=Instant::now();
-                    let Some(id)=next_id.checked_add(1) else{break}; next_id=id;
-                    if !enqueue_record(&tx,Record{flow,id,payload},created,&session.returning,ingress::small_threshold(&session.policy)){dropped+=1;}else{session.returning.update(|d|d.records.sender_queue_enqueued+=1);}
+                    let Ok(parts)=messages::split(flow,&mut next_id,payload,session.policy.max_message_bytes) else {break};
+                    if !enqueue_message(&tx,parts,created,&session.returning,ingress::small_threshold(&session.policy)){dropped+=1;}
                 },
                 None=>break,
             }
         }
         while tasks.try_join_next().is_some() {}
     }
+    messages.close();
+    publish_messages(&mut messages, &session.forward);
     dropped += delivery.close();
     decoder.close_retention();
     publish_retention(&decoder, &session.forward);
@@ -3149,192 +3205,195 @@ async fn server_connection(
     let processing = async {
         loop {
             tokio::select! {
-                _=tokio::time::sleep_until(admission_deadline),if joined.is_none()=>{
-                    if mesh_authenticated {break;}
-                    diagnostic.enter_since("path_admission","admission_wait",admission_started);
-                    diagnostic.failed("admission_deadline_elapsed");
-                    bail!("session admission timed out")
-                },
-                accepted=h3.accept()=>{
-                    let Some(resolver)=accepted? else{break};
-                    diagnostic.enter("http3_request","request_resolve");
-                    let request_deadline = tokio::time::Instant::now()+Duration::from_secs(5);
-                    let request_deadline = if joined.is_none() {request_deadline.min(admission_deadline)} else {request_deadline};
-                    let (req,mut stream)=tokio::time::timeout_at(request_deadline,resolver.resolve_request()).await??;
-                    diagnostic.succeeded();
-                    if let Some(mesh)=&mesh && req.uri().path().starts_with("/mesh/") {
-                        ensure!(joined.is_none(),"data connection cannot carry mesh control");
-                        if control_permit.is_none() && mesh.authorized(&req) {
-                            // Acquire before handling: no allocations or successful
-                            // responses may escape a full control budget.
-                            control_permit=Some(mesh.control_permit().context("mesh control connection limit reached")?);
-                            pending_permit=None;
-                            mesh_authenticated=true;
-                            if let Some(authenticated)=authenticated.take() {let _=authenticated.send(());}
-                        }
-                        if timeout(Duration::from_secs(5),mesh.handle(&req,&mut stream,conn.remote_address().ip())).await?? {
-                            admission_deadline=tokio::time::Instant::now()+mesh::CONTROL_IDLE;
-                        }
-                        continue;
-                    }
-                    if req.method()!=Method::POST || req.uri().path()!=SESSION_PATH {
-                        let ok=req.method()==Method::GET && req.uri().path()=="/";
-                        let deadline=if joined.is_none(){admission_deadline}else{tokio::time::Instant::now()+Duration::from_secs(5)};
-                        cover_response(&mut stream,ok,deadline).await?;
-                        if joined.is_some(){diagnostic.enter("established","connected");}
-                        else{diagnostic.enter_since("path_admission","admission_wait",admission_started);}
-                        continue
-                    }
-                    diagnostic.begin_admission();
-                    let auth=req.headers().get("authorization").map(|h|h.as_bytes()).unwrap_or_default();
-                    if !bool::from(auth.ct_eq(secret.as_bytes())) {
-                        diagnostic.rejected("authorization_rejected");
-                        let deadline=if joined.is_none(){admission_deadline}else{tokio::time::Instant::now()+Duration::from_secs(5)};
-                        cover_response(&mut stream,false,deadline).await?;
-                        if joined.is_some(){diagnostic.enter("established","connected");}
-                        else{diagnostic.enter_since("path_admission","admission_wait",admission_started);}
-                        continue
-                    }
-                    ensure!(!mesh_authenticated,"mesh control connection cannot carry a session");
-                    let requested_exit=req.headers().get("braidpath-exit").map(|v|v.to_str()).transpose()?;
-                    if requested_exit != mesh.as_ref().map(|state|state.node_id()) {
-                        diagnostic.rejected("exit_identity_mismatch");
-                        let mut response=Response::builder().status(StatusCode::PRECONDITION_FAILED);
-                        if let Some(state)=&mesh {response=response.header("braidpath-exit",state.node_id());}
-                        stream.send_response(response.body(())?).await?;
-                        stream.finish().await?;
-                        continue;
-                    }
-                    if data_permit.is_none() {
-                        data_permit=Some(data_connections.clone().try_acquire_owned().context("data connection limit reached")?);
-                        pending_permit=None;
-                    }
-                    ensure!(joined.is_none(),"only one aggregate request per connection");
-                    // Request and control streams can arrive in either order. Drive
-                    // control processing before deciding whether the peer supports DATAGRAM.
-                    diagnostic.enter("path_admission","peer_settings");
-                    if !h3.settings().enable_datagram() {
-                        timeout(Duration::from_secs(5), std::future::poll_fn(|cx| {
-                            match h3.poll_accept_request_stream(cx) {
-                                Poll::Ready(Ok(_)) => Poll::Ready(Err(anyhow::anyhow!("connection ended or extra request before SETTINGS"))),
-                                Poll::Ready(Err(e)) => Poll::Ready(Err(e.into())),
-                                Poll::Pending if h3.settings().enable_datagram() => Poll::Ready(Ok(())),
-                                Poll::Pending => Poll::Pending,
+                            _=tokio::time::sleep_until(admission_deadline),if joined.is_none()=>{
+                                if mesh_authenticated {break;}
+                                diagnostic.enter_since("path_admission","admission_wait",admission_started);
+                                diagnostic.failed("admission_deadline_elapsed");
+                                bail!("session admission timed out")
+                            },
+                            accepted=h3.accept()=>{
+                                let Some(resolver)=accepted? else{break};
+                                diagnostic.enter("http3_request","request_resolve");
+                                let request_deadline = tokio::time::Instant::now()+Duration::from_secs(5);
+                                let request_deadline = if joined.is_none() {request_deadline.min(admission_deadline)} else {request_deadline};
+                                let (req,mut stream)=tokio::time::timeout_at(request_deadline,resolver.resolve_request()).await??;
+                                diagnostic.succeeded();
+                                if let Some(mesh)=&mesh && req.uri().path().starts_with("/mesh/") {
+                                    ensure!(joined.is_none(),"data connection cannot carry mesh control");
+                                    if control_permit.is_none() && mesh.authorized(&req) {
+                                        // Acquire before handling: no allocations or successful
+                                        // responses may escape a full control budget.
+                                        control_permit=Some(mesh.control_permit().context("mesh control connection limit reached")?);
+                                        pending_permit=None;
+                                        mesh_authenticated=true;
+                                        if let Some(authenticated)=authenticated.take() {let _=authenticated.send(());}
+                                    }
+                                    if timeout(Duration::from_secs(5),mesh.handle(&req,&mut stream,conn.remote_address().ip())).await?? {
+                                        admission_deadline=tokio::time::Instant::now()+mesh::CONTROL_IDLE;
+                                    }
+                                    continue;
+                                }
+                                if req.method()!=Method::POST || req.uri().path()!=SESSION_PATH {
+                                    let ok=req.method()==Method::GET && req.uri().path()=="/";
+                                    let deadline=if joined.is_none(){admission_deadline}else{tokio::time::Instant::now()+Duration::from_secs(5)};
+                                    cover_response(&mut stream,ok,deadline).await?;
+                                    if joined.is_some(){diagnostic.enter("established","connected");}
+                                    else{diagnostic.enter_since("path_admission","admission_wait",admission_started);}
+                                    continue
+                                }
+                                diagnostic.begin_admission();
+                                let auth=req.headers().get("authorization").map(|h|h.as_bytes()).unwrap_or_default();
+                                if !bool::from(auth.ct_eq(secret.as_bytes())) {
+                                    diagnostic.rejected("authorization_rejected");
+                                    let deadline=if joined.is_none(){admission_deadline}else{tokio::time::Instant::now()+Duration::from_secs(5)};
+                                    cover_response(&mut stream,false,deadline).await?;
+                                    if joined.is_some(){diagnostic.enter("established","connected");}
+                                    else{diagnostic.enter_since("path_admission","admission_wait",admission_started);}
+                                    continue
+                                }
+                                ensure!(!mesh_authenticated,"mesh control connection cannot carry a session");
+                                let requested_exit=req.headers().get("braidpath-exit").map(|v|v.to_str()).transpose()?;
+                                if requested_exit != mesh.as_ref().map(|state|state.node_id()) {
+                                    diagnostic.rejected("exit_identity_mismatch");
+                                    let mut response=Response::builder().status(StatusCode::PRECONDITION_FAILED);
+                                    if let Some(state)=&mesh {response=response.header("braidpath-exit",state.node_id());}
+                                    stream.send_response(response.body(())?).await?;
+                                    stream.finish().await?;
+                                    continue;
+                                }
+                                if data_permit.is_none() {
+                                    data_permit=Some(data_connections.clone().try_acquire_owned().context("data connection limit reached")?);
+                                    pending_permit=None;
+                                }
+                                ensure!(joined.is_none(),"only one aggregate request per connection");
+                                // Request and control streams can arrive in either order. Drive
+                                // control processing before deciding whether the peer supports DATAGRAM.
+                                diagnostic.enter("path_admission","peer_settings");
+                                if !h3.settings().enable_datagram() {
+                                    timeout(Duration::from_secs(5), std::future::poll_fn(|cx| {
+                                        match h3.poll_accept_request_stream(cx) {
+                                            Poll::Ready(Ok(_)) => Poll::Ready(Err(anyhow::anyhow!("connection ended or extra request before SETTINGS"))),
+                                            Poll::Ready(Err(e)) => Poll::Ready(Err(e.into())),
+                                            Poll::Pending if h3.settings().enable_datagram() => Poll::Ready(Ok(())),
+                                            Poll::Pending => Poll::Pending,
+                                        }
+                                    })).await??;
+                                }
+                                diagnostic.succeeded();
+                                diagnostic.enter("path_admission","admission");
+                                ensure!(conn.max_datagram_size().is_some_and(|n|n>=wire::MAX_WIRE+9),"peer lacks required datagram capacity");
+                                let header=|name:&str|->Result<&str>{req.headers().get(name).context("missing session header")?.to_str().context("invalid session header")};
+                                ensure!(header("braidpath-version")?=="1","unsupported version");
+                                let sid=header("braidpath-session")?.to_owned(); ensure!(sid.len()==32 && sid.bytes().all(|b|b.is_ascii_hexdigit()),"invalid session id");
+                                let pid:u8=header("braidpath-path")?.parse()?; ensure!(usize::from(pid)<MAX_PATHS,"path limit");
+                                diagnostic.path_id(pid);
+                                let feedback=req.headers().get("braidpath-feedback").map(|v|v.to_str()).transpose()?;ensure!(feedback.is_none() || feedback==Some("2"),"unsupported feedback version");
+                                let generation=if feedback.is_some(){header("braidpath-generation")?.parse::<u64>()?}else{0};
+                                ensure!(feedback.is_none() || conn.max_datagram_size().is_some_and(|n|n>=quality::MAX_FRAME+9),"peer lacks feedback datagram capacity");
+                                let quality_schedule=req.headers().get("braidpath-scheduler").map(|v|v.to_str()).transpose()?;
+                                ensure!(matches!(quality_schedule,None|Some("quality")|Some("adaptive")),"unknown scheduler");ensure!(quality_schedule.is_none() || feedback.is_some(),"quality scheduler requires feedback");
+                                let rate=header("braidpath-rate")?.parse::<u64>()?.min(max_rate);
+                                let mut group_rates=[rate;MAX_PATHS];
+                                if let Some(value)=req.headers().get("braidpath-group-rates") {
+                                    let values=value.to_str()?.split(',').map(str::parse::<u64>).collect::<std::result::Result<Vec<_>,_>>()?;
+                                    ensure!(values.len()==MAX_PATHS,"invalid group caps");
+                                    for (slot,value) in group_rates.iter_mut().zip(values) {*slot=value.min(rate);}
+                                }
+                                let group=req.headers().get("braidpath-group").map(|v|v.to_str()).transpose()?.unwrap_or("0").parse::<u8>()?;
+                                ensure!(usize::from(group)<MAX_PATHS,"invalid path group");
+                                let latency_target_ms=req.headers().get("braidpath-latency-ms").map(|v|v.to_str()).transpose()?.unwrap_or("20").parse::<u64>()?;
+                                let capacity_probe_bps=req.headers().get("braidpath-capacity-probe-bps").map(|v|v.to_str()).transpose()?.unwrap_or("0").parse::<u64>()?;
+                                capacity_probe::validate_format(capacity_probe_bps,req.headers().get("braidpath-capacity-probe-format").map(|v|v.to_str()).transpose()?)?;
+                                let guided=req.headers().get("braidpath-probe-guided-recovery").map(|v|v.to_str()).transpose()?;
+                                ensure!(guided.is_none() || guided==Some("1"),"invalid probe-guided recovery header");
+                                let probe_guided_recovery=guided.is_some();
+                                let small_fec_bytes=req.headers().get("braidpath-small-fec-bytes").map(|v|v.to_str()).transpose()?.unwrap_or("0").parse::<u16>()?;
+                                let mixed_fec=mixed_fec_header(req.headers())?;
+                                let fec_repairs=fec_repairs_header(req.headers())?;
+                                let max_message_bytes = req.headers().get("braidpath-message-bytes").map(|v| v.to_str()).transpose()?.unwrap_or("1000").parse::<usize>()?;
+                                let policy=Policy{max_message_bytes,
+            fec_repairs,small_fec_bytes,mixed_fec,probe_guided_recovery,capacity_probe_bps,adaptive:quality_schedule==Some("adaptive"),latency_target_ms,group_rates,quality_schedule:quality_schedule.is_some(),receiver_feedback:feedback.is_some(),fec:header("braidpath-fec")?.parse()?,redundancy:header("braidpath-redundancy")?.parse()?,rate,block_ms:header("braidpath-block-ms")?.parse()?,queue_ms:header("braidpath-queue-ms")?.parse()?};policy.validate()?;
+                                let rejoin=req.headers().get("braidpath-rejoin").is_some_and(|v|v=="1");
+                                let stream_id=stream.id().into_inner();
+                                // Membership and idle expiry share one map -> paths -> generation lock order.
+                                // A reconnect never creates a fresh server session under an old identifier.
+                                let admitted={
+                                    let mut map=sessions.lock().expect("sessions lock");
+                                    if rejoin && !map.contains_key(&sid) {None}
+                                    else {
+                                        let session=if let Some(session)=map.get(&sid) {
+                                            ensure!(session.policy==policy,"session policy mismatch");
+                                            ensure!(!session.done.load(Ordering::Acquire) && !*session.stop.borrow(),"session stopped");
+                                            session.clone()
+                                        } else {
+                                            ensure!(map.len()<16,"session limit");
+                                            let (tx,rx)=mpsc::channel(QUEUE);let (stop,_)=watch::channel(false);
+                                            let observation_notify=policy.adaptive.then(||Arc::new(Notify::new()));
+                                            let session=Arc::new(Session{adaptive_fec_retention,generations:Mutex::new([None;MAX_PATHS]),empty_since:Mutex::new(Some(Instant::now())),events:tx,paths:Arc::new(Mutex::new(Vec::new())),stop,policy,observation_notify,ingress_drops:Arc::new(AtomicU64::new(0)),forward:metrics.scope(&sid,stats::FORWARD),returning:metrics.scope(&sid,stats::RETURN),finished:tokio::sync::Notify::new(),done:std::sync::atomic::AtomicBool::new(false)});
+                                            map.insert(sid.clone(),session.clone());
+                                            tokio::spawn(session_loop(session.clone(),rx,target));
+                                            session
+                                        };
+                                        {
+                                            let mut paths=session.paths.lock().expect("paths lock");
+                                            let existing=paths.iter().position(|p|p.id==pid);
+                                            ensure!(existing.is_none() || (rejoin && feedback.is_some()),"duplicate path");
+                                            ensure!(existing.is_some() || paths.len()<MAX_PATHS,"path limit");
+                                            let mut generations=session.generations.lock().expect("generation lock");
+                                            scheduler::admit_generation(&mut generations[usize::from(pid)],generation)?;
+                                            if let Some(i)=existing {paths.remove(i).conn.close(0u32.into(),b"path rejoined");}
+                                            paths.push(OutPath{id:pid,group,conn:conn.clone(),empty_datagram_space:conn.datagram_send_buffer_space(),stream:stream_id,quality:Arc::new(Mutex::new(quality::State::new(generation))),capacity_probe:Arc::new(Mutex::new(capacity_probe::State::new(generation))),capacity_probe_enabled:capacity_probe_bps>0,epoch:Instant::now(),probe_reply:Arc::new(Mutex::new(None))});
+                                            *session.empty_since.lock().expect("empty time lock")=None;
+                                        }
+                                        Some(session)
+                                    }
+                                };
+                                let Some(session)=admitted else {
+                                    diagnostic.rejected("session_expired");
+                                    let mut response=Response::builder().status(StatusCode::GONE);
+                                    if let Some(state)=&mesh {response=response.header("braidpath-exit",state.node_id());}
+                                    stream.send_response(response.body(())?).await?;
+                                    stream.finish().await?;
+                                    // FIN only queues the response. Keep the connection alive long
+                                    // enough for the client to receive 410 and select a fresh epoch.
+                                    let _=timeout(Duration::from_secs(2),conn.closed()).await;
+                                    bail!("session expired; a fresh session epoch is required");
+                                };
+                                metrics.register(&sid,pid,stream_id,stats::RETURN,&conn);
+                                let trace_key=trace::PathKey{path_id:pid,generation,connection_id:conn.stable_id() as u64};
+                                trace_path(&session.forward,trace::Stage::PathOpened,trace_key);
+                                trace_path(&session.returning,trace::Stage::PathOpened,trace_key);
+                                joined=Some((sid,session,pid,stream_id,generation));
+                                let mut response=Response::builder().status(200).header("braidpath-version","1").header("braidpath-max-payload",MAX_PAYLOAD);if max_message_bytes > MAX_PAYLOAD {response=response.header("braidpath-message-bytes",max_message_bytes);}
+                                if feedback.is_some(){response=response.header("braidpath-feedback","2");}
+                                if let Some(state)=&mesh {response=response.header("braidpath-exit",state.node_id());}
+                                if small_fec_bytes>0 {response=response.header("braidpath-small-fec-bytes",small_fec_bytes);}
+                                if mixed_fec {response=response.header("braidpath-mixed-fec","1");}
+                                if fec_repairs==2 {response=response.header("braidpath-fec-repairs","2");}
+                                if capacity_probe_bps>0 {response=response.header("braidpath-capacity-probe-bps",capacity_probe_bps).header("braidpath-capacity-probe-format",capacity_probe::FORMAT);}
+                                if probe_guided_recovery {response=response.header("braidpath-probe-guided-recovery","1");}
+                                if let Some(scheduler)=quality_schedule {response=response.header("braidpath-scheduler",scheduler);}stream.send_response(response.body(())?).await?;
+                                request=Some(stream);
+                                if let Some(authenticated)=authenticated.take() {let _=authenticated.send(());}
+                                diagnostic.admitted();
+                                info!(path=pid,remote=%conn.remote_address(),"authenticated path joined");
+                            },
+                            data=conn.read_datagram()=>{
+                                let data=data?;
+                                if let Some((_,session,pid,stream,generation))=&joined {
+                                    let trace_key=trace::PathKey{path_id:*pid,generation:*generation,connection_id:conn.stable_id() as u64};
+                                    trace_http(&session.forward,trace::Stage::PeerHttpReceived,&data,*stream,session.policy.receiver_feedback,trace_key,None);
+                                    session.forward.path(*pid,|p|p.http_datagrams_received+=1);
+                                    if let Ok(payload)=wire::http_payload(&data,*stream) && payload.len()<=(if session.policy.receiver_feedback{quality::MAX_FRAME}else{wire::MAX_WIRE}) {
+                                        match measured_payload(&session.paths,*pid,payload,session.policy.receiver_feedback,&session.returning,session.observation_notify.as_deref()) {
+                                        Ok(Some(payload))=>{if let Err(error)=session.events.try_send(Event::Wire(*pid,payload)){if let Event::Wire(_,payload)=rejected_item(&error){session.forward.trace_symbol(trace::Stage::SymbolDropped,payload,Some(trace_key),Some(data.len()),Some(queue_trace_reason(QueueLayer::Receiver,&error)));}session.ingress_drops.fetch_add(1,Ordering::Relaxed);queue_error(&session.forward,QueueLayer::Receiver,&error,Some(*pid));}},Ok(None)=>{},Err(_)=>{trace_http(&session.forward,trace::Stage::SymbolDropped,&data,*stream,session.policy.receiver_feedback,trace_key,Some(trace::Reason::InvalidHttp));session.forward.path(*pid,|p|p.invalid_http_datagrams_dropped+=1);}}
+                                    } else {trace_http(&session.forward,trace::Stage::SymbolDropped,&data,*stream,session.policy.receiver_feedback,trace_key,Some(trace::Reason::InvalidHttp));session.forward.path(*pid,|p|p.invalid_http_datagrams_dropped+=1);session.forward.update(|d|d.records.invalid_symbols_dropped+=1);}
+                                }
+                            },
+                            body=async {request.as_mut().expect("guarded request").recv_data().await},if request.is_some()=>{
+                                let _=body?; break; // No reliable data is defined for this request; FIN ends membership.
                             }
-                        })).await??;
-                    }
-                    diagnostic.succeeded();
-                    diagnostic.enter("path_admission","admission");
-                    ensure!(conn.max_datagram_size().is_some_and(|n|n>=wire::MAX_WIRE+9),"peer lacks required datagram capacity");
-                    let header=|name:&str|->Result<&str>{req.headers().get(name).context("missing session header")?.to_str().context("invalid session header")};
-                    ensure!(header("braidpath-version")?=="1","unsupported version");
-                    let sid=header("braidpath-session")?.to_owned(); ensure!(sid.len()==32 && sid.bytes().all(|b|b.is_ascii_hexdigit()),"invalid session id");
-                    let pid:u8=header("braidpath-path")?.parse()?; ensure!(usize::from(pid)<MAX_PATHS,"path limit");
-                    diagnostic.path_id(pid);
-                    let feedback=req.headers().get("braidpath-feedback").map(|v|v.to_str()).transpose()?;ensure!(feedback.is_none() || feedback==Some("2"),"unsupported feedback version");
-                    let generation=if feedback.is_some(){header("braidpath-generation")?.parse::<u64>()?}else{0};
-                    ensure!(feedback.is_none() || conn.max_datagram_size().is_some_and(|n|n>=quality::MAX_FRAME+9),"peer lacks feedback datagram capacity");
-                    let quality_schedule=req.headers().get("braidpath-scheduler").map(|v|v.to_str()).transpose()?;
-                    ensure!(matches!(quality_schedule,None|Some("quality")|Some("adaptive")),"unknown scheduler");ensure!(quality_schedule.is_none() || feedback.is_some(),"quality scheduler requires feedback");
-                    let rate=header("braidpath-rate")?.parse::<u64>()?.min(max_rate);
-                    let mut group_rates=[rate;MAX_PATHS];
-                    if let Some(value)=req.headers().get("braidpath-group-rates") {
-                        let values=value.to_str()?.split(',').map(str::parse::<u64>).collect::<std::result::Result<Vec<_>,_>>()?;
-                        ensure!(values.len()==MAX_PATHS,"invalid group caps");
-                        for (slot,value) in group_rates.iter_mut().zip(values) {*slot=value.min(rate);}
-                    }
-                    let group=req.headers().get("braidpath-group").map(|v|v.to_str()).transpose()?.unwrap_or("0").parse::<u8>()?;
-                    ensure!(usize::from(group)<MAX_PATHS,"invalid path group");
-                    let latency_target_ms=req.headers().get("braidpath-latency-ms").map(|v|v.to_str()).transpose()?.unwrap_or("20").parse::<u64>()?;
-                    let capacity_probe_bps=req.headers().get("braidpath-capacity-probe-bps").map(|v|v.to_str()).transpose()?.unwrap_or("0").parse::<u64>()?;
-                    capacity_probe::validate_format(capacity_probe_bps,req.headers().get("braidpath-capacity-probe-format").map(|v|v.to_str()).transpose()?)?;
-                    let guided=req.headers().get("braidpath-probe-guided-recovery").map(|v|v.to_str()).transpose()?;
-                    ensure!(guided.is_none() || guided==Some("1"),"invalid probe-guided recovery header");
-                    let probe_guided_recovery=guided.is_some();
-                    let small_fec_bytes=req.headers().get("braidpath-small-fec-bytes").map(|v|v.to_str()).transpose()?.unwrap_or("0").parse::<u16>()?;
-                    let mixed_fec=mixed_fec_header(req.headers())?;
-                    let fec_repairs=fec_repairs_header(req.headers())?;
-                    let policy=Policy{fec_repairs,small_fec_bytes,mixed_fec,probe_guided_recovery,capacity_probe_bps,adaptive:quality_schedule==Some("adaptive"),latency_target_ms,group_rates,quality_schedule:quality_schedule.is_some(),receiver_feedback:feedback.is_some(),fec:header("braidpath-fec")?.parse()?,redundancy:header("braidpath-redundancy")?.parse()?,rate,block_ms:header("braidpath-block-ms")?.parse()?,queue_ms:header("braidpath-queue-ms")?.parse()?};policy.validate()?;
-                    let rejoin=req.headers().get("braidpath-rejoin").is_some_and(|v|v=="1");
-                    let stream_id=stream.id().into_inner();
-                    // Membership and idle expiry share one map -> paths -> generation lock order.
-                    // A reconnect never creates a fresh server session under an old identifier.
-                    let admitted={
-                        let mut map=sessions.lock().expect("sessions lock");
-                        if rejoin && !map.contains_key(&sid) {None}
-                        else {
-                            let session=if let Some(session)=map.get(&sid) {
-                                ensure!(session.policy==policy,"session policy mismatch");
-                                ensure!(!session.done.load(Ordering::Acquire) && !*session.stop.borrow(),"session stopped");
-                                session.clone()
-                            } else {
-                                ensure!(map.len()<16,"session limit");
-                                let (tx,rx)=mpsc::channel(QUEUE);let (stop,_)=watch::channel(false);
-                                let observation_notify=policy.adaptive.then(||Arc::new(Notify::new()));
-                                let session=Arc::new(Session{adaptive_fec_retention,generations:Mutex::new([None;MAX_PATHS]),empty_since:Mutex::new(Some(Instant::now())),events:tx,paths:Arc::new(Mutex::new(Vec::new())),stop,policy,observation_notify,ingress_drops:Arc::new(AtomicU64::new(0)),forward:metrics.scope(&sid,stats::FORWARD),returning:metrics.scope(&sid,stats::RETURN),finished:tokio::sync::Notify::new(),done:std::sync::atomic::AtomicBool::new(false)});
-                                map.insert(sid.clone(),session.clone());
-                                tokio::spawn(session_loop(session.clone(),rx,target));
-                                session
-                            };
-                            {
-                                let mut paths=session.paths.lock().expect("paths lock");
-                                let existing=paths.iter().position(|p|p.id==pid);
-                                ensure!(existing.is_none() || (rejoin && feedback.is_some()),"duplicate path");
-                                ensure!(existing.is_some() || paths.len()<MAX_PATHS,"path limit");
-                                let mut generations=session.generations.lock().expect("generation lock");
-                                scheduler::admit_generation(&mut generations[usize::from(pid)],generation)?;
-                                if let Some(i)=existing {paths.remove(i).conn.close(0u32.into(),b"path rejoined");}
-                                paths.push(OutPath{id:pid,group,conn:conn.clone(),empty_datagram_space:conn.datagram_send_buffer_space(),stream:stream_id,quality:Arc::new(Mutex::new(quality::State::new(generation))),capacity_probe:Arc::new(Mutex::new(capacity_probe::State::new(generation))),capacity_probe_enabled:capacity_probe_bps>0,epoch:Instant::now(),probe_reply:Arc::new(Mutex::new(None))});
-                                *session.empty_since.lock().expect("empty time lock")=None;
-                            }
-                            Some(session)
                         }
-                    };
-                    let Some(session)=admitted else {
-                        diagnostic.rejected("session_expired");
-                        let mut response=Response::builder().status(StatusCode::GONE);
-                        if let Some(state)=&mesh {response=response.header("braidpath-exit",state.node_id());}
-                        stream.send_response(response.body(())?).await?;
-                        stream.finish().await?;
-                        // FIN only queues the response. Keep the connection alive long
-                        // enough for the client to receive 410 and select a fresh epoch.
-                        let _=timeout(Duration::from_secs(2),conn.closed()).await;
-                        bail!("session expired; a fresh session epoch is required");
-                    };
-                    metrics.register(&sid,pid,stream_id,stats::RETURN,&conn);
-                    let trace_key=trace::PathKey{path_id:pid,generation,connection_id:conn.stable_id() as u64};
-                    trace_path(&session.forward,trace::Stage::PathOpened,trace_key);
-                    trace_path(&session.returning,trace::Stage::PathOpened,trace_key);
-                    joined=Some((sid,session,pid,stream_id,generation));
-                    let mut response=Response::builder().status(200).header("braidpath-version","1").header("braidpath-max-payload",MAX_PAYLOAD);if feedback.is_some(){response=response.header("braidpath-feedback","2");}
-                    if let Some(state)=&mesh {response=response.header("braidpath-exit",state.node_id());}
-                    if small_fec_bytes>0 {response=response.header("braidpath-small-fec-bytes",small_fec_bytes);}
-                    if mixed_fec {response=response.header("braidpath-mixed-fec","1");}
-                    if fec_repairs==2 {response=response.header("braidpath-fec-repairs","2");}
-                    if capacity_probe_bps>0 {response=response.header("braidpath-capacity-probe-bps",capacity_probe_bps).header("braidpath-capacity-probe-format",capacity_probe::FORMAT);}
-                    if probe_guided_recovery {response=response.header("braidpath-probe-guided-recovery","1");}
-                    if let Some(scheduler)=quality_schedule {response=response.header("braidpath-scheduler",scheduler);}stream.send_response(response.body(())?).await?;
-                    request=Some(stream);
-                    if let Some(authenticated)=authenticated.take() {let _=authenticated.send(());}
-                    diagnostic.admitted();
-                    info!(path=pid,remote=%conn.remote_address(),"authenticated path joined");
-                },
-                data=conn.read_datagram()=>{
-                    let data=data?;
-                    if let Some((_,session,pid,stream,generation))=&joined {
-                        let trace_key=trace::PathKey{path_id:*pid,generation:*generation,connection_id:conn.stable_id() as u64};
-                        trace_http(&session.forward,trace::Stage::PeerHttpReceived,&data,*stream,session.policy.receiver_feedback,trace_key,None);
-                        session.forward.path(*pid,|p|p.http_datagrams_received+=1);
-                        if let Ok(payload)=wire::http_payload(&data,*stream) && payload.len()<=(if session.policy.receiver_feedback{quality::MAX_FRAME}else{wire::MAX_WIRE}) {
-                            match measured_payload(&session.paths,*pid,payload,session.policy.receiver_feedback,&session.returning,session.observation_notify.as_deref()) {
-                            Ok(Some(payload))=>{if let Err(error)=session.events.try_send(Event::Wire(*pid,payload)){if let Event::Wire(_,payload)=rejected_item(&error){session.forward.trace_symbol(trace::Stage::SymbolDropped,payload,Some(trace_key),Some(data.len()),Some(queue_trace_reason(QueueLayer::Receiver,&error)));}session.ingress_drops.fetch_add(1,Ordering::Relaxed);queue_error(&session.forward,QueueLayer::Receiver,&error,Some(*pid));}},Ok(None)=>{},Err(_)=>{trace_http(&session.forward,trace::Stage::SymbolDropped,&data,*stream,session.policy.receiver_feedback,trace_key,Some(trace::Reason::InvalidHttp));session.forward.path(*pid,|p|p.invalid_http_datagrams_dropped+=1);}}
-                        } else {trace_http(&session.forward,trace::Stage::SymbolDropped,&data,*stream,session.policy.receiver_feedback,trace_key,Some(trace::Reason::InvalidHttp));session.forward.path(*pid,|p|p.invalid_http_datagrams_dropped+=1);session.forward.update(|d|d.records.invalid_symbols_dropped+=1);}
-                    }
-                },
-                body=async {request.as_mut().expect("guarded request").recv_data().await},if request.is_some()=>{
-                    let _=body?; break; // No reliable data is defined for this request; FIN ends membership.
-                }
-            }
         }
         Ok(())
     };
@@ -3441,19 +3500,66 @@ struct PathConfig {
     enabled: bool,
 }
 
-async fn entrances_changed(
-    updates: &mut Option<watch::Receiver<Vec<SocketAddr>>>,
-) -> Vec<SocketAddr> {
+enum EntranceUpdates {
+    Addresses(watch::Receiver<Vec<SocketAddr>>),
+    Routes(watch::Receiver<Vec<mesh::Route>>),
+}
+impl EntranceUpdates {
+    fn current(&mut self) -> Vec<mesh::Route> {
+        match self {
+            Self::Addresses(rx) => rx
+                .borrow_and_update()
+                .iter()
+                .copied()
+                .map(Into::into)
+                .collect(),
+            Self::Routes(rx) => rx.borrow_and_update().clone(),
+        }
+    }
+    async fn changed(&mut self) -> Result<()> {
+        match self {
+            Self::Addresses(rx) => rx.changed().await?,
+            Self::Routes(rx) => rx.changed().await?,
+        }
+        Ok(())
+    }
+}
+async fn entrances_changed(updates: &mut Option<EntranceUpdates>) -> Vec<mesh::Route> {
     if let Some(updates) = updates
         && updates.changed().await.is_ok()
     {
-        return updates.borrow_and_update().clone();
+        return updates.current();
     }
     std::future::pending().await
 }
 
+#[cfg(test)]
 fn reconcile_entrances(
     desired: &[SocketAddr],
+    configs: &mut Vec<PathConfig>,
+    inflight: &[bool; MAX_PATHS],
+    endpoints: &mut [Option<quinn::Endpoint>; MAX_PATHS],
+    paths: &Paths,
+    rotations: &mut [scheduler::Rotation; MAX_PATHS],
+) {
+    reconcile_routes(
+        &desired.iter().copied().map(Into::into).collect::<Vec<_>>(),
+        configs,
+        inflight,
+        endpoints,
+        paths,
+        rotations,
+    );
+}
+fn matches_route(config: &PathConfig, route: &mesh::Route) -> bool {
+    config.remote == route.address
+        && config.interface == route.uplink.interface
+        && config.bind == route.uplink.bind.map(|ip| SocketAddr::new(ip, 0))
+        && config.group == route.uplink.group
+}
+
+fn reconcile_routes(
+    desired: &[mesh::Route],
     configs: &mut Vec<PathConfig>,
     inflight: &[bool; MAX_PATHS],
     endpoints: &mut [Option<quinn::Endpoint>; MAX_PATHS],
@@ -3463,7 +3569,10 @@ fn reconcile_entrances(
     // Keep IDs and connections for unchanged addresses, irrespective of the
     // discovery order. Never reuse a slot while its old handshake is in flight.
     for (id, config) in configs.iter_mut().enumerate() {
-        if config.enabled && !inflight[id] && !desired.contains(&config.remote) {
+        if config.enabled
+            && !inflight[id]
+            && !desired.iter().any(|route| matches_route(config, route))
+        {
             config.enabled = false;
             let mut paths = paths.lock().expect("paths lock");
             for path in paths.iter().filter(|p| usize::from(p.id) == id) {
@@ -3476,7 +3585,10 @@ fn reconcile_entrances(
         }
     }
     for remote in desired {
-        if configs.iter().any(|c| c.enabled && c.remote == *remote) {
+        if configs
+            .iter()
+            .any(|c| c.enabled && matches_route(c, remote))
+        {
             continue;
         }
         if let Some((id, config)) = configs
@@ -3484,7 +3596,10 @@ fn reconcile_entrances(
             .enumerate()
             .find(|(id, c)| !c.enabled && !inflight[*id])
         {
-            config.remote = *remote;
+            config.remote = remote.address;
+            config.interface = remote.uplink.interface.clone();
+            config.bind = remote.uplink.bind.map(|ip| SocketAddr::new(ip, 0));
+            config.group = remote.uplink.group;
             config.enabled = true;
             config.attempted = false;
             // Preserve the generation counter when reusing a path ID so the
@@ -3492,10 +3607,10 @@ fn reconcile_entrances(
             rotations[id] = scheduler::Rotation::default();
         } else if configs.len() < MAX_PATHS {
             configs.push(PathConfig {
-                remote: *remote,
-                interface: None,
-                bind: None,
-                group: 0,
+                remote: remote.address,
+                interface: remote.uplink.interface.clone(),
+                bind: remote.uplink.bind.map(|ip| SocketAddr::new(ip, 0)),
+                group: remote.uplink.group,
                 generation: rand::random::<u64>() >> 1,
                 attempted: false,
                 enabled: true,
@@ -3523,23 +3638,51 @@ pub(crate) async fn client_with_health(
     entrances: Option<watch::Receiver<Vec<SocketAddr>>>,
     health: Option<watch::Sender<mesh::PathHealth>>,
 ) -> Result<()> {
-    client_inner(options, entrances, health, None).await
+    client_inner(
+        options,
+        entrances.map(EntranceUpdates::Addresses),
+        health,
+        None,
+    )
+    .await
 }
 
 /// Mesh credentials are shared; the selected exit must be bound independently
 /// on every admission, including retries through a different entrance.
+#[cfg(test)]
 pub(crate) async fn client_with_mesh_exit(
     options: ClientOptions,
     entrances: Option<watch::Receiver<Vec<SocketAddr>>>,
     health: Option<watch::Sender<mesh::PathHealth>>,
     exit: String,
 ) -> Result<()> {
-    client_inner(options, entrances, health, Some(exit)).await
+    client_inner(
+        options,
+        entrances.map(EntranceUpdates::Addresses),
+        health,
+        Some(exit),
+    )
+    .await
+}
+
+pub(crate) async fn client_with_routes(
+    options: ClientOptions,
+    routes: watch::Receiver<Vec<mesh::Route>>,
+    health: watch::Sender<mesh::PathHealth>,
+    exit: String,
+) -> Result<()> {
+    client_inner(
+        options,
+        Some(EntranceUpdates::Routes(routes)),
+        Some(health),
+        Some(exit),
+    )
+    .await
 }
 
 async fn client_inner(
     mut options: ClientOptions,
-    mut entrances: Option<watch::Receiver<Vec<SocketAddr>>>,
+    mut entrances: Option<EntranceUpdates>,
     health: Option<watch::Sender<mesh::PathHealth>>,
     exit: Option<String>,
 ) -> Result<()> {
@@ -3554,7 +3697,7 @@ async fn client_inner(
             || (options.interfaces.is_empty()
                 && options.path_binds.is_empty()
                 && options.path_groups.is_empty()),
-        "dynamic entrances use the default local route"
+        "dynamic routes carry their own uplink configuration"
     );
     ensure!(
         !options.rotate_source_port || options.policy.quality_schedule,
@@ -3616,7 +3759,7 @@ async fn client_session(
     options: &ClientOptions,
     socket: Arc<UdpSocket>,
     shutdown: &mut Shutdown,
-    entrances: &mut Option<watch::Receiver<Vec<SocketAddr>>>,
+    entrances: &mut Option<EntranceUpdates>,
     health: Option<&watch::Sender<mesh::PathHealth>>,
     exit: Option<&str>,
 ) -> Result<()> {
@@ -3644,24 +3787,34 @@ async fn client_session(
         options.interfaces.iter().cloned().map(Some).collect()
     };
     let recover_paths = options.policy.adaptive || entrances.is_some();
-    let mut desired = entrances.as_mut().map(|rx| rx.borrow_and_update().clone());
-    let initial = desired.as_ref().unwrap_or(&options.entrances);
-    for (interface_index, interface) in interfaces.into_iter().enumerate() {
-        for remote in initial {
-            let id = configs.len();
-            configs.push(PathConfig {
-                remote: *remote,
-                interface: interface.clone(),
-                bind: options.path_binds.get(id).copied(),
-                group: options
-                    .path_groups
-                    .get(id)
-                    .copied()
-                    .unwrap_or(interface_index as u8),
-                generation: rand::random::<u64>() >> 1,
-                attempted: false,
-                enabled: true,
-            });
+    let mut desired = entrances.as_mut().map(EntranceUpdates::current);
+    if let Some(routes) = &desired {
+        reconcile_routes(
+            routes,
+            &mut configs,
+            &inflight,
+            &mut endpoints,
+            &paths,
+            &mut rotations,
+        );
+    } else {
+        for (interface_index, interface) in interfaces.into_iter().enumerate() {
+            for remote in &options.entrances {
+                let id = configs.len();
+                configs.push(PathConfig {
+                    remote: *remote,
+                    interface: interface.clone(),
+                    bind: options.path_binds.get(id).copied(),
+                    group: options
+                        .path_groups
+                        .get(id)
+                        .copied()
+                        .unwrap_or(interface_index as u8),
+                    generation: rand::random::<u64>() >> 1,
+                    attempted: false,
+                    enabled: true,
+                });
+            }
         }
     }
     let (tx, rx) = mpsc::channel(QUEUE);
@@ -3686,6 +3839,10 @@ async fn client_session(
     )
     .with_dual_repairs(options.policy.fec_repairs == 2);
     publish_retention(&decoder, &returning);
+    let mut messages = messages::Reassembly::new(
+        options.policy.max_message_bytes,
+        options.policy.admission_lifetime(),
+    );
     let mut delivery = local_delivery::Queue::new(
         returning.clone(),
         Duration::from_millis(
@@ -3709,11 +3866,12 @@ async fn client_session(
                 desired=Some(updated);
             },
             _=retention_deadline(&decoder)=>{decoder.expire_adaptive(Instant::now());publish_retention(&decoder,&returning);},
+            _=messages::deadline(&messages)=>{messages.expire(Instant::now()); publish_messages(&mut messages, &returning);},
             completed=delivery.ready()=>drops+=completed,
             _=tick.tick()=>{
                 let now_us=epoch.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
                 if let Some(desired)=&desired {
-                    reconcile_entrances(desired,&mut configs,&inflight,&mut endpoints,&paths,&mut rotations);
+                    reconcile_routes(desired,&mut configs,&inflight,&mut endpoints,&paths,&mut rotations);
                     let configured=configs.iter().filter(|c|c.enabled).count();
                     options.stats.state(|s|s.configured_paths=configured);
                 }
@@ -3723,7 +3881,14 @@ async fn client_session(
                 if let Some(health)=health {
                     let addresses=current.iter().filter(|p| p.conn.close_reason().is_none())
                         .map(|p| configs[usize::from(p.id)].remote).collect();
-                    health.send_replace(mesh::PathHealth{checked:Instant::now(),addresses});
+                    let samples = current.iter().filter(|p| p.conn.close_reason().is_none()).map(|p| {
+                        let elapsed = p.epoch.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
+                        let estimate = p.quality.lock().expect("quality").snapshot_at(elapsed).sender_estimate;
+                        mesh::PathSample { address: configs[usize::from(p.id)].remote, group: p.group,
+                            delivered: estimate.sample_symbols >= 8 && estimate.delivered_updated_us.is_some_and(|at| elapsed.saturating_sub(at) < 2_000_000) && estimate.updated_us.is_some_and(|at| elapsed.saturating_sub(at) < 2_000_000),
+                            rtt_ms: p.conn.rtt().as_secs_f64() * 1000.0, loss: estimate.loss_rate }
+                    }).collect();
+                    health.send_replace(mesh::PathHealth{checked:Instant::now(),addresses,samples});
                 }
                 if announced && !recover_paths && live==0 {bail!("all paths failed");}
                 // With no working path, try every configured entrance (at most
@@ -3809,7 +3974,7 @@ async fn client_session(
             rebuilt=rejoin_rx.recv()=>{
                 let Some((pid,generation,rebuild))=rebuilt else {bail!("path supervisor ended")};
                 let id=usize::from(pid);inflight[id]=false;
-                if desired.as_ref().is_some_and(|addresses|!addresses.contains(&configs[id].remote)) {
+                if desired.as_ref().is_some_and(|addresses|!addresses.iter().any(|route| matches_route(&configs[id], route))) {
                     if let Ok((value,_))=rebuild {value.endpoint.close(0u32.into(),b"entrance retired");}
                     continue;
                 }
@@ -3857,23 +4022,25 @@ async fn client_session(
                 let (n,peer)=received?;let created=Instant::now();
                 forward.update(|d|d.records.application_received+=1);
                 trace_payload(&forward,trace::Stage::RecordIngress,&input[..n],None);
-                if n>MAX_PAYLOAD {drops+=1;trace_payload(&forward,trace::Stage::RecordDropped,&input[..n],Some(trace::Reason::Oversize));forward.update(|d|d.records.application_oversize_dropped+=1);continue;}
+                if n>options.policy.max_message_bytes {drops+=1;trace_payload(&forward,trace::Stage::RecordDropped,&input[..n],Some(trace::Reason::Oversize));forward.update(|d|d.records.application_oversize_dropped+=1);continue;}
                 if !peers.contains_key(&peer) {
                     if peers.len()>=MAX_FLOWS {drops+=1;trace_payload(&forward,trace::Stage::RecordDropped,&input[..n],Some(trace::Reason::FlowLimit));forward.update(|d|d.records.application_flow_limit_dropped+=1);continue;}
-                    next_flow=next_flow.checked_add(1).context("flow id exhausted")?;
+                    next_flow=next_flow.checked_add(1).filter(|flow| *flow < messages::FLAG).context("flow id exhausted")?;
                     peers.insert(peer,(next_flow,created));reverse.insert(next_flow,peer);
                 }
                 let (flow,last)=peers.get_mut(&peer).expect("inserted peer");*last=created;
-                next_id=next_id.checked_add(1).context("message id exhausted")?;
-                if !enqueue_record(&tx,Record{flow:*flow,id:next_id,payload:input[..n].to_vec()},created,&forward,ingress::small_threshold(&options.policy)) {
+                let parts=messages::split(*flow,&mut next_id,input[..n].to_vec(),options.policy.max_message_bytes)?;
+                if !enqueue_message(&tx,parts,created,&forward,ingress::small_threshold(&options.policy)) {
                     drops+=1;
-                } else {forward.update(|d|{d.records.ingress_queue_enqueued+=1;d.records.sender_queue_enqueued+=1;});}
+                } else {forward.update(|d|{d.records.ingress_queue_enqueued+=1;});}
             },
             data=wire_rx.recv()=>{
                 let Some((pid,data))=data else {bail!("all receivers ended")};
                 let records=receive_records(&mut decoder,&returning,pid,&data);
                 let decoded=Instant::now();
                 for record in records {
+                    let Some((record, decoded)) = messages.receive(record, decoded) else {publish_messages(&mut messages, &returning);continue;};
+                    publish_messages(&mut messages, &returning);
                     if let Some(peer)=reverse.get(&record.flow) {
                         if let Some((_,last))=peers.get_mut(peer) {*last=Instant::now();}
                         drops+=delivery.send(&socket,Some(*peer),record,pid,decoded);
@@ -3883,6 +4050,8 @@ async fn client_session(
         }
         while let Some(completion)=tasks.try_join_next() {completion.context("path task failed")?;}
     }Ok(())}.await;
+    messages.close();
+    publish_messages(&mut messages, &returning);
     delivery.close();
     decoder.close_retention();
     publish_retention(&decoder, &returning);
@@ -3976,6 +4145,20 @@ async fn drive_client_path(
 type H3Client = h3::client::Connection<h3_quinn::Connection, Bytes>;
 type H3Send = h3::client::SendRequest<h3_quinn::OpenStreams, Bytes>;
 type H3Request = h3::client::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>;
+fn validate_message_echo(headers: &http::HeaderMap, expected: usize) -> Result<()> {
+    let actual = headers
+        .get("braidpath-message-bytes")
+        .map(|v| v.to_str())
+        .transpose()?
+        .unwrap_or("1000")
+        .parse::<usize>()?;
+    ensure!(
+        actual == expected,
+        "UDP message fragmentation capability not negotiated"
+    );
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn connect_path(
     endpoint: &quinn::Endpoint,
@@ -4043,6 +4226,9 @@ async fn connect_path(
         .header("braidpath-rate", policy.rate)
         .header("braidpath-block-ms", policy.block_ms)
         .header("braidpath-queue-ms", policy.queue_ms);
+    if policy.max_message_bytes > MAX_PAYLOAD {
+        req = req.header("braidpath-message-bytes", policy.max_message_bytes);
+    }
     if let Some(exit) = exit {
         req = req.header("braidpath-exit", exit);
     }
@@ -4134,6 +4320,7 @@ async fn connect_path(
         "mixed FEC not negotiated"
     );
     validate_fec_repairs_echo(response.headers(), policy.fec_repairs)?;
+    validate_message_echo(response.headers(), policy.max_message_bytes)?;
     ensure!(
         !policy.receiver_feedback
             || response

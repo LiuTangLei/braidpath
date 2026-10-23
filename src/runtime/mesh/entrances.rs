@@ -9,13 +9,30 @@ const RENEW_EVERY: Duration = Duration::from_secs(LEASE_FOR.as_secs() / 4);
 pub(crate) struct PathHealth {
     pub checked: Instant,
     pub addresses: Vec<SocketAddr>,
+    pub samples: Vec<PathSample>,
 }
 impl Default for PathHealth {
     fn default() -> Self {
         Self {
             checked: Instant::now(),
             addresses: Vec::new(),
+            samples: Vec::new(),
         }
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct PathSample {
+    pub address: SocketAddr,
+    pub group: u8,
+    pub delivered: bool,
+    pub rtt_ms: f64,
+    pub loss: f64,
+}
+impl PathSample {
+    pub(super) fn score(&self) -> Option<f64> {
+        (self.delivered && self.rtt_ms.is_finite() && self.loss.is_finite())
+            .then_some(self.rtt_ms.max(1.0) * (1.0 + 4.0 * self.loss.clamp(0.0, 1.0)))
     }
 }
 
@@ -61,6 +78,17 @@ impl Entrances {
         limit: usize,
         interval: Duration,
     ) -> Result<(Vec<SocketAddr>, Self)> {
+        Self::start_bound(identity, nodes, exit, limit, interval, &Uplink::default()).await
+    }
+
+    pub(super) async fn start_bound(
+        identity: &ClientIdentity,
+        nodes: Vec<Node>,
+        exit: &str,
+        limit: usize,
+        interval: Duration,
+        uplink: &Uplink,
+    ) -> Result<(Vec<SocketAddr>, Self)> {
         ensure!((1..=MAX_PATHS).contains(&limit), "invalid entrance limit");
         validate_nodes(&nodes)?;
         let known = identity.cache.remember(&nodes)?;
@@ -73,9 +101,10 @@ impl Entrances {
         let (health, observed) = watch::channel(PathHealth::default());
         let directory = Directory {
             health: observed,
-            control: Arc::new(Control::new(
+            control: Arc::new(Control::bound(
                 &identity.dir.join("cert.pem"),
                 nodes.iter().any(|n| n.address.is_ipv6()),
+                uplink,
             )?),
             auth: identity.auth.clone(),
             selected,
@@ -87,6 +116,7 @@ impl Entrances {
             limit,
             discovery_cursor: 0,
             allocation_cursor: 0,
+            explorer: selection::Explorer::default(),
         };
         let initial = directory.addresses();
         let (tx, updates) = watch::channel(initial.clone());
@@ -106,10 +136,10 @@ impl Entrances {
     }
 }
 
-struct ClientLease {
-    node: Node,
-    reply: RelayReply,
-    renewed: Instant,
+pub(super) struct ClientLease {
+    pub(super) node: Node,
+    pub(super) reply: RelayReply,
+    pub(super) renewed: Instant,
 }
 #[derive(Clone)]
 struct Allocation {
@@ -135,6 +165,7 @@ struct Directory {
     limit: usize,
     discovery_cursor: usize,
     allocation_cursor: usize,
+    explorer: selection::Explorer,
 }
 
 pub(super) fn validate_nodes(nodes: &[Node]) -> Result<()> {
@@ -202,6 +233,8 @@ impl Directory {
             self.request_for(&node);
         }
         let mut discovery = JoinSet::new();
+        let mut recovery_after = Instant::now();
+        let mut health_open = true;
         let mut allocations = self.allocations();
         let mut renewals = JoinSet::new();
         let mut renewing = std::collections::BTreeSet::new();
@@ -210,6 +243,23 @@ impl Directory {
         loop {
             tokio::select! {
                 _ = &mut stop => break,
+                result = self.health.changed(), if health_open => {
+                    if result.is_err() { health_open = false; continue; }
+                    let health = self.health.borrow_and_update().clone();
+                    let now = Instant::now();
+                    if health.addresses.is_empty() && now >= recovery_after && discovery.is_empty() {
+                        recovery_after = now + Duration::from_secs(2);
+                        tracing::debug!(stage="discovery", "mesh has no usable paths; refreshing directory");
+                        discovery.spawn(self.discovery());
+                    }
+                    if allocations.is_empty()
+                        && let Some(retired) = self.explorer.advance(&self.nodes, &self.selected, &self.leases, &health, self.limit, now) {
+                        self.leases.remove(&retired);
+                        if let Some(allocation) = self.requests.remove(&retired) { self.start_release(&mut releases, allocation); }
+                        self.publish(&tx);
+                        allocations = self.allocations();
+                    }
+                }
                 _ = renew.tick() => {
                     self.expire_leases();
                     self.start_renewals(&mut renewals, &mut renewing);
@@ -226,6 +276,7 @@ impl Directory {
                                 self.start_release(&mut releases, allocation);
                             }
                             if self.selected != previous_exit {
+                                self.explorer.reset();
                                 allocations.abort_all();
                                 allocations = JoinSet::new();
                                 renewals.abort_all();
@@ -493,6 +544,9 @@ impl Directory {
         }
         self.allocation_cursor %= candidates.len();
         candidates.rotate_left(self.allocation_cursor);
+        if let Some(preferred) = &self.explorer.preferred {
+            candidates.sort_by_key(|n| n.id != *preferred);
+        }
         let available = self.limit - 1 - self.leases.len();
         self.allocation_cursor += available;
         // Each completion is consumed by maintenance independently of slower
@@ -543,6 +597,7 @@ async fn allocate_request(
     auth: &str,
     allocation: &Allocation,
 ) -> Result<RelayReply> {
+    control.capabilities(allocation.node.address, auth).await?;
     let body = serde_json::to_vec(&RelayRequest {
         exit: allocation.exit.id.clone(),
         lease: None,
@@ -604,6 +659,44 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn all_paths_lost_triggers_discovery_before_periodic_refresh() {
+        use super::super::tests::{address, server, wait_nodes};
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let temp = tempfile::tempdir().unwrap();
+        let exit = address();
+        let entry = address();
+        let _exit = server(temp.path(), "exit", exit, address(), None).await;
+        let identity = ClientIdentity::open(
+            temp.path().join("client"),
+            &temp.path().join("exit/client-key.json"),
+        )
+        .unwrap();
+        let nodes = wait_nodes(&identity, exit, &["exit"]).await;
+        let (_, guard) = Entrances::start(&identity, nodes, "exit", 2, Duration::from_secs(3600))
+            .await
+            .unwrap();
+        let _entry = server(
+            temp.path(),
+            "entry",
+            entry,
+            address(),
+            Some((exit, temp.path().join("exit/server-key.json"))),
+        )
+        .await;
+        wait_nodes(&identity, exit, &["entry", "exit"]).await;
+        let mut updates = guard.updates();
+        guard.health().send_replace(PathHealth::default());
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while updates.borrow_and_update().len() != 2 {
+                updates.changed().await.unwrap();
+            }
+        })
+        .await
+        .expect("lost paths waited for periodic discovery");
+        guard.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn allocation_completion_is_consumed_while_other_lease_renewal_is_blocked() {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let temp = tempfile::tempdir().unwrap();
@@ -643,6 +736,26 @@ mod tests {
                 .build::<_, Bytes>(h3_quinn::Connection::new(connection.clone()))
                 .await
                 .unwrap();
+            let (request, mut stream) = h3
+                .accept()
+                .await
+                .unwrap()
+                .unwrap()
+                .resolve_request()
+                .await
+                .unwrap();
+            assert_eq!(request.uri().path(), "/mesh/info");
+            stream
+                .send_response(http::Response::builder().status(200).body(()).unwrap())
+                .await
+                .unwrap();
+            stream
+                .send_data(Bytes::from(
+                    serde_json::to_vec(&Capabilities::default()).unwrap(),
+                ))
+                .await
+                .unwrap();
+            stream.finish().await.unwrap();
             let (request, mut stream) = h3
                 .accept()
                 .await
@@ -695,6 +808,7 @@ mod tests {
             limit: 3,
             discovery_cursor: 0,
             allocation_cursor: 0,
+            explorer: selection::Explorer::default(),
         };
         let (tx, mut updates) = watch::channel(directory.addresses());
         let _maintenance = AbortTask(tokio::spawn(
@@ -955,6 +1069,7 @@ mod tests {
             limit: 2,
             discovery_cursor: 0,
             allocation_cursor: 0,
+            explorer: selection::Explorer::default(),
         };
         let (tx, mut updates) = watch::channel(directory.addresses());
         let (paths, rx) = watch::channel(vec![relay_address]);
@@ -1037,6 +1152,7 @@ mod tests {
         health.send_replace(PathHealth {
             checked: Instant::now() - LEASE_FOR,
             addresses: vec![relay_address],
+            samples: vec![],
         });
         directory.expire_leases();
         assert!(directory.leases.is_empty());
@@ -1115,6 +1231,7 @@ mod tests {
             limit: if with_unavailable_lease { 3 } else { 2 },
             discovery_cursor: 0,
             allocation_cursor: 0,
+            explorer: selection::Explorer::default(),
         };
         if with_unavailable_lease {
             directory.leases.insert(
@@ -1176,6 +1293,7 @@ mod tests {
             limit: MAX_PATHS,
             discovery_cursor: 0,
             allocation_cursor: 0,
+            explorer: selection::Explorer::default(),
         };
         directory.cache.remember(&nodes).unwrap();
         let partial = vec![nodes[1].clone()];

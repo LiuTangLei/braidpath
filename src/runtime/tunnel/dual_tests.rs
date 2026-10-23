@@ -3,6 +3,7 @@ use std::collections::BTreeSet;
 
 fn dual_policy() -> Policy {
     Policy {
+        max_message_bytes: 1000,
         adaptive: false,
         capacity_probe_bps: 0,
         probe_guided_recovery: false,

@@ -1,5 +1,5 @@
 //! Finite UDP workloads. One-way delay is relative to the minimum signed transit delta.
-use super::{MAX_PAYLOAD, shutdown::Shutdown};
+use super::{MAX_MESSAGE, shutdown::Shutdown};
 use anyhow::{Context, Result, bail, ensure};
 use clap::{Args, ValueEnum};
 use serde::Serialize;
@@ -113,7 +113,7 @@ fn run_id(w: &Workload, one_way: bool) -> Result<[u8; 16]> {
         (1..=MAX_RECORDS).contains(&w.count)
             && (1..=MAX_PPS).contains(&w.pps)
             && u64::from(w.count - 1) <= u64::from(w.pps) * MAX_SEND_SPAN_SECONDS
-            && (if one_way { HEADER } else { 16 }..=MAX_PAYLOAD).contains(&w.size)
+            && (if one_way { HEADER } else { 16 }..=MAX_MESSAGE).contains(&w.size)
             && (1..=10_000).contains(&w.deadline_ms)
             && w.drain_ms <= 60_000
             && (1..=60_000).contains(&w.startup_timeout_ms),
@@ -393,7 +393,7 @@ async fn control(
 /// No remote request can select a source count, rate or payload size.
 async fn accept(socket: &UdpSocket, id: &[u8; 16], w: &Workload, state: &mut State) -> Result<()> {
     let until = tokio::time::Instant::now() + Duration::from_millis(w.startup_timeout_ms);
-    let mut b = [0u8; MAX_PAYLOAD + 1];
+    let mut b = [0u8; MAX_MESSAGE + 1];
     loop {
         tokio::select! {
             _=tokio::time::sleep_until(until)=>bail!("startup timeout waiting for authorized registration"),
@@ -416,7 +416,7 @@ async fn register(
     state: &mut State,
 ) -> Result<()> {
     let start = tokio::time::Instant::now();
-    let mut b = [0u8; MAX_PAYLOAD + 1];
+    let mut b = [0u8; MAX_MESSAGE + 1];
     for attempt in 0..REGISTRATION_ATTEMPTS {
         state.registration_attempts += 1;
         control(socket, REGISTER, id, 0, 0, state).await?;
@@ -563,7 +563,7 @@ async fn receive_stream(
 ) -> Result<f64> {
     let start = Instant::now();
     let mut window = ReceiveWindow::new(w, state, tokio::time::Instant::now());
-    let mut b = [0u8; MAX_PAYLOAD + 1];
+    let mut b = [0u8; MAX_MESSAGE + 1];
     loop {
         tokio::select! {
             _=tokio::time::sleep_until(window.until)=>break,
@@ -599,7 +599,7 @@ async fn send_stream(
     let (period, mut tick) = source_interval(w.pps);
     state.source_pacing = Some(SourcePacing::default());
     let mut until = None;
-    let mut b = [0u8; MAX_PAYLOAD + 1];
+    let mut b = [0u8; MAX_MESSAGE + 1];
     let mut first = None;
     loop {
         tokio::select! {
@@ -967,10 +967,10 @@ pub async fn echo(listen: SocketAddr, ready_file: Option<PathBuf>) -> Result<()>
     let result=async {
         let socket=UdpSocket::bind(listen).await?;ready(ready_file.as_deref(),"echo",&socket,None)?;
         tracing::info!(%listen,"test echo ready");
-        let mut b=[0u8;MAX_PAYLOAD+1];let mut received=0u64;let mut sent=0u64;
+        let mut b=[0u8;MAX_MESSAGE+1];let mut received=0u64;let mut sent=0u64;
         loop {tokio::select! {
             _=shutdown.wait()=>break,
-            r=socket.recv_from(&mut b)=>{let(n,peer)=r?;received+=1;if n<=MAX_PAYLOAD {socket.send_to(&b[..n],peer).await?;sent+=1;}}
+            r=socket.recv_from(&mut b)=>{let(n,peer)=r?;received+=1;if n<=MAX_MESSAGE {socket.send_to(&b[..n],peer).await?;sent+=1;}}
         }}
         Ok(json!({"command":"echo","final":true,"outcome":"ok","received":received,"sent":sent}))
     }.await;
@@ -1038,6 +1038,18 @@ mod tests {
             "source_pacing stall_us=6000 period_us=25 before_phase_us=0 after_phase_us={}",
             phase_offset.as_micros()
         );
+    }
+
+    #[test]
+    fn bounded_probe_supports_the_negotiated_message_limit() {
+        let mut workload = receive_workload();
+        workload.run_id = Some("1".repeat(32));
+        for size in [1000, 1200, 1472, 4096] {
+            workload.size = size;
+            assert!(run_id(&workload, true).is_ok());
+        }
+        workload.size = 4097;
+        assert!(run_id(&workload, true).is_err());
     }
 
     fn receive_workload() -> Workload {

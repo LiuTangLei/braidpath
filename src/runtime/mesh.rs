@@ -23,14 +23,21 @@ use tokio::{
 mod discovery;
 mod hints;
 mod ports;
+mod status;
 mod storage;
 pub use ports::RelayPorts;
+use status::Failure;
+pub use status::{Capabilities, Status};
 mod control;
 use control::Control;
 
+mod networks;
+mod selection;
+pub(crate) use networks::Route;
+pub use networks::{Networks, Uplink};
 mod entrances;
 pub use entrances::Entrances;
-pub(crate) use entrances::PathHealth;
+pub(crate) use entrances::{PathHealth, PathSample};
 
 const NAME: &str = "braidpath.mesh";
 const MAX_NODES: usize = 32;
@@ -245,6 +252,7 @@ pub struct State {
     // restart-safe set of addresses to heal partitions without manual joins.
     reconnect: Arc<Mutex<Vec<hints::Hint>>>,
     membership_write: Arc<tokio::sync::Mutex<()>>,
+    persistence: Arc<status::Persistence>,
     leases: Mutex<BTreeMap<String, Lease>>,
     // Always locked after leases. Bounded cancellation history prevents a
     // delayed allocation from recreating a just-released path.
@@ -379,6 +387,7 @@ impl State {
         let peers = self.peers.clone();
         let reconnect = self.reconnect.clone();
         let directory_lock = self._directory_lock.clone();
+        let persistence = self.persistence.clone();
         tokio::task::spawn_blocking(move || {
             let _write = write;
             // A cancelled server may drop State while this write finishes.
@@ -392,7 +401,7 @@ impl State {
             // Publish hints before removing membership: interruption must not
             // erase the only saved route back across a long partition.
             if next_hints != previous_hints {
-                hints::save(&dir, &next_hints)?;
+                persistence.record(hints::save(&dir, &next_hints))?;
                 *reconnect.lock().expect("reconnect hints") = next_hints.clone();
             }
             if !previous
@@ -401,7 +410,11 @@ impl State {
                 .eq(next.values().map(|p| &p.node))
             {
                 let nodes: Vec<_> = next.values().map(|p| &p.node).collect();
-                storage::atomic_write(&dir.join("peers.json"), &serde_json::to_vec(&nodes)?, true)?;
+                persistence.record(storage::atomic_write(
+                    &dir.join("peers.json"),
+                    &serde_json::to_vec(&nodes)?,
+                    true,
+                ))?;
             }
             let nodes: Vec<_> = next.values().map(|p| &p.node).collect();
             let useful = hints::useful(&next_hints, &own, &nodes, hints::now_unix());
@@ -410,7 +423,7 @@ impl State {
             // record is durable. Failed cleanup leaves harmless extra hints
             // and is retried on the next membership operation.
             if useful != next_hints {
-                match hints::save(&dir, &useful) {
+                match persistence.record(hints::save(&dir, &useful)) {
                     Ok(()) => *reconnect.lock().expect("reconnect hints") = useful,
                     Err(error) => {
                         tracing::warn!(%error, "could not prune persisted reconnect hints")
@@ -420,6 +433,11 @@ impl State {
             Ok(())
         })
         .await
+        .map_err(|error| {
+            self.persistence
+                .record::<()>(Err(error.into()))
+                .unwrap_err()
+        })
         .context("membership persistence worker failed")?
     }
     async fn merge(&self, exchange: Exchange, direct: bool) -> Result<()> {
@@ -563,14 +581,14 @@ impl State {
             released.prune();
             ensure!(
                 !released.0.contains_key(&(source, key.clone())),
-                "allocation request was released"
+                Failure::RequestReleased
             );
         }
         if let Some(id) = request.lease {
-            let lease = leases.get_mut(&id).context("lease expired")?;
+            let lease = leases.get_mut(&id).context(Failure::LeaseExpired)?;
             ensure!(
                 lease.source == source && lease.exit == request.exit,
-                "lease owner mismatch"
+                Failure::OwnerMismatch
             );
             lease.touched = Instant::now();
             return Ok(RelayReply {
@@ -586,10 +604,7 @@ impl State {
                 .iter_mut()
                 .find(|(_, lease)| lease.source == source && lease.request.as_ref() == Some(key))
         {
-            ensure!(
-                lease.exit == request.exit,
-                "allocation request exit mismatch"
-            );
+            ensure!(lease.exit == request.exit, Failure::OwnerMismatch);
             lease.touched = Instant::now();
             return Ok(RelayReply {
                 lease: id.clone(),
@@ -603,11 +618,11 @@ impl State {
             .active()
             .into_iter()
             .find(|n| n.id == request.exit)
-            .context("exit is not live")?;
-        ensure!(leases.len() < 64, "relay lease limit reached");
+            .context(Failure::ExitUnavailable)?;
+        ensure!(leases.len() < 64, Failure::LeaseLimit);
         ensure!(
             leases.values().filter(|l| l.source == source).count() < MAX_SOURCE_LEASES,
-            "relay lease limit reached for this source"
+            Failure::SourceLimit
         );
         // Bind synchronously so allocation is atomic with respect to the lease
         // limit without holding a lock across an await.
@@ -669,7 +684,7 @@ impl State {
                 let mut released = self.released_requests.lock().expect("released requests");
                 released.prune();
                 if let Some((exit, _)) = released.0.get(&(source, key.clone())) {
-                    ensure!(*exit == request.exit, "released request exit mismatch");
+                    ensure!(*exit == request.exit, Failure::OwnerMismatch);
                 }
             }
             let id = request.lease.clone().or_else(|| {
@@ -682,7 +697,7 @@ impl State {
                 if let Some(lease) = leases.get(&id) {
                     ensure!(
                         lease.source == source && lease.exit == request.exit,
-                        "lease owner mismatch"
+                        Failure::OwnerMismatch
                     );
                 }
                 leases.remove(&id)
@@ -739,6 +754,8 @@ impl State {
         }
         let result: Result<Vec<u8>> = async {
             match (request.method(), path) {
+                (&Method::GET, "/mesh/info") => Ok(serde_json::to_vec(&Capabilities::default())?),
+                (&Method::GET, "/mesh/status") => Ok(serde_json::to_vec(&self.status())?),
                 (&Method::GET, "/mesh/nodes") => Ok(serde_json::to_vec(&self.active())?),
                 (&Method::POST, "/mesh/sync") => {
                     let exchange: Exchange = serde_json::from_slice(&read_body(stream).await?)?;
@@ -755,7 +772,7 @@ impl State {
                     let request = serde_json::from_slice(&read_body(stream).await?)?;
                     Ok(serde_json::to_vec(&self.release(source, request).await?)?)
                 }
-                _ => bail!("unknown mesh operation"),
+                _ => bail!(Failure::UnsupportedOperation),
             }
         }
         .await;
@@ -763,7 +780,15 @@ impl State {
             Ok(body) => (200, body),
             Err(error) => {
                 tracing::debug!(%error, "mesh request rejected");
-                (400, b"mesh request rejected".to_vec())
+                (
+                    400,
+                    serde_json::to_vec(&status::ErrorReply {
+                        code: error
+                            .downcast_ref::<Failure>()
+                            .copied()
+                            .unwrap_or(Failure::InvalidRequest),
+                    })?,
+                )
             }
         };
         stream
@@ -838,6 +863,7 @@ pub async fn serve(options: ServerOptions) -> Result<()> {
         peers: Arc::new(Mutex::new(BTreeMap::new())),
         reconnect: Arc::new(Mutex::new(hints::load(&options.dir))),
         membership_write: Arc::new(tokio::sync::Mutex::new(())),
+        persistence: Arc::default(),
         relay_budget: Arc::new(relay::HostBudget::new(options.rate)),
         leases: Mutex::new(BTreeMap::new()),
         released_requests: Mutex::new(ReleasedRequests::default()),
@@ -942,6 +968,7 @@ pub async fn serve(options: ServerOptions) -> Result<()> {
     .await
 }
 
+#[derive(Clone)]
 pub struct ClientIdentity {
     pub dir: PathBuf,
     auth: String,

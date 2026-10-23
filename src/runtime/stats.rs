@@ -86,6 +86,8 @@ impl Wait {
 }
 #[derive(Clone, Default, Serialize)]
 pub struct Records {
+    pub messages_reassembled: u64,
+    pub message_reassembly_dropped: u64,
     pub application_received: u64,
     pub application_oversize_dropped: u64,
     pub application_flow_limit_dropped: u64,

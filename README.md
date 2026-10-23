@@ -86,10 +86,10 @@ Follow the [runtime guide](docs/runtime.md) for credentials, local forwarding, m
 | --- | --- |
 | XOR `k + 1`, immediate originals, timed partial blocks | Implemented; at most one missing original per block |
 | HTTP/3 website, verified server identity, authenticated session joins | Implemented experimental profile |
-| Bidirectional FEC, session deduplication, UDP forwarding | Implemented; messages up to 1,000 bytes |
+| Bidirectional FEC, session deduplication, UDP forwarding | Implemented; negotiated messages up to 4,096 bytes with bounded fragmentation |
 | Equal servers, key-based enrollment, discovery and exit selection | Implemented; [operation and limits](docs/mesh.md) |
 | Fixed-target opaque relays with source allowlists | Implemented |
-| Interface × entrance paths | Linux interface binding; default-route sockets on other platforms |
+| Interface × entrance paths | Ordinary and mesh clients; Linux interface binding and portable source-IP binding |
 | Round robin and optional quality-weighted scheduling | Implemented baselines; weighted service is charged on actual admitted bytes |
 | Per-flow queues, original-ingress deadlines, admission-based repair credit | Implemented bounded mechanisms |
 | Adaptive pacing, sender-age admission, idle health probes and feedback v2 | Implemented opt-in mode; performance acceptance pending |

@@ -17,10 +17,10 @@ type Sender = h3::client::SendRequest<h3_quinn::OpenStreams, Bytes>;
 type Slot = Arc<Mutex<Option<Connection>>>;
 
 #[derive(Debug)]
-pub(super) struct Rejected(pub StatusCode);
+pub(super) struct Rejected(pub StatusCode, pub Option<super::status::Failure>);
 impl std::fmt::Display for Rejected {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "mesh request rejected ({})", self.0)
+        write!(f, "mesh request rejected ({}, {:?})", self.0, self.1)
     }
 }
 impl std::error::Error for Rejected {}
@@ -74,40 +74,72 @@ impl Connection {
             data.extend(part.copy_to_bytes(part.remaining()));
         }
         if response.status() != StatusCode::OK {
-            return Err(Rejected(response.status()).into());
+            return Err(Rejected(
+                response.status(),
+                serde_json::from_slice::<super::status::ErrorReply>(&data)
+                    .ok()
+                    .map(|r| r.code),
+            )
+            .into());
         }
         Ok(serde_json::from_slice(&data)?)
     }
 }
 
 pub(super) struct Control {
-    v4: quinn::Endpoint,
+    v4: Option<quinn::Endpoint>,
     v6: Option<quinn::Endpoint>,
     peers: std::sync::Mutex<BTreeMap<SocketAddr, Slot>>,
     capacity: usize,
 }
 impl Control {
     pub(super) fn new(ca: &Path, ipv6: bool) -> Result<Self> {
-        Ok(Self {
-            v4: transport::client(
-                "127.0.0.1:1".parse()?,
+        Self::bound(ca, ipv6, &super::Uplink::default())
+    }
+
+    pub(super) fn bound(ca: &Path, ipv6: bool, uplink: &super::Uplink) -> Result<Self> {
+        let endpoint = |remote| {
+            transport::client_bound(
+                remote,
                 ca,
-                None,
+                uplink.interface.as_deref(),
                 transport::Congestion::default(),
-            )?,
-            v6: match transport::client(
-                "[::1]:1".parse()?,
-                ca,
-                None,
-                transport::Congestion::default(),
-            ) {
-                Ok(endpoint) => Some(endpoint),
-                Err(error) if ipv6 => return Err(error),
+                uplink.bind.map(|ip| SocketAddr::new(ip, 0)),
+            )
+        };
+        let v4 = if uplink.bind.is_none_or(|ip| ip.is_ipv4()) {
+            Some(endpoint("127.0.0.1:1".parse()?)?)
+        } else {
+            None
+        };
+        let v6 = if uplink.bind.is_none_or(|ip| ip.is_ipv6()) {
+            match endpoint("[::1]:1".parse()?) {
+                Ok(e) => Some(e),
+                Err(e) if ipv6 => return Err(e),
                 Err(_) => None,
-            },
+            }
+        } else {
+            None
+        };
+        Ok(Self {
+            v4,
+            v6,
             peers: std::sync::Mutex::new(BTreeMap::new()),
             capacity: MAX_NODES,
         })
+    }
+
+    pub(super) async fn capabilities(
+        &self,
+        address: SocketAddr,
+        auth: &str,
+    ) -> Result<super::Capabilities> {
+        let caps: super::Capabilities = self
+            .request(address, auth, "/mesh/info", None)
+            .await
+            .context("server must support v0.3 mesh capability negotiation")?;
+        caps.check()?;
+        Ok(caps)
     }
 
     pub(super) fn server(ca: &Path, ipv6: bool) -> Result<Self> {
@@ -132,7 +164,9 @@ impl Control {
 
     async fn connect(&self, address: SocketAddr) -> Result<Connection> {
         let endpoint = if address.is_ipv4() {
-            &self.v4
+            self.v4
+                .as_ref()
+                .context("IPv4 control endpoint unavailable for uplink")?
         } else {
             self.v6
                 .as_ref()

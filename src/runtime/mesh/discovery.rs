@@ -221,6 +221,15 @@ impl ClientIdentity {
             &self.dir.join("cert.pem"),
             entries.iter().any(|a| a.is_ipv6()),
         )?);
+        self.query_with(control, entries, exit).await
+    }
+
+    pub(super) async fn query_with(
+        &self,
+        control: Arc<Control>,
+        entries: &[SocketAddr],
+        exit: Option<&str>,
+    ) -> Result<Vec<Node>> {
         let mut pending = JoinSet::new();
         for address in entries
             .iter()

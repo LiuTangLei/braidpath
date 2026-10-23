@@ -102,6 +102,15 @@ enum Command {
         #[arg(long)]
         dir: PathBuf,
     },
+    /// Read authenticated server health, resource occupancy and capabilities as JSON.
+    MeshStatus {
+        #[arg(long)]
+        connect: SocketAddr,
+        #[arg(long)]
+        connection_key: PathBuf,
+        #[arg(long)]
+        dir: PathBuf,
+    },
     /// Select an exit and automatically use the other servers as encrypted entrances.
     MeshClient {
         /// Repeat for multiple bootstrap servers; saved members are fallback entries.
@@ -115,6 +124,12 @@ enum Command {
         exit: String,
         #[arg(long, default_value = "127.0.0.1:7000")]
         listen: SocketAddr,
+        /// Linux uplink interface; repeat for independent networks.
+        #[arg(long = "interface")]
+        interfaces: Vec<String>,
+        /// Local source IP per uplink, also used by its control connections.
+        #[arg(long = "source-ip")]
+        source_ips: Vec<std::net::IpAddr>,
         #[command(flatten)]
         policy: PolicyArgs,
         #[command(flatten)]
@@ -270,6 +285,9 @@ mod dual_cli_tests {
 }
 #[derive(Args)]
 struct PolicyArgs {
+    /// Maximum UDP application message; larger messages use bounded fragmentation.
+    #[arg(long, default_value_t = 4096, value_parser = clap::value_parser!(u16).range(1000..=4096))]
+    max_message_bytes: u16,
     /// Adapt path pacing and eligibility to queue growth; automatically recover paths.
     #[arg(long)]
     adaptive: bool,
@@ -369,12 +387,26 @@ pub async fn run() -> Result<()> {
             );
             Ok(())
         }
+        Command::MeshStatus {
+            connect,
+            connection_key,
+            dir,
+        } => {
+            let identity = mesh::ClientIdentity::open(dir, &connection_key)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&identity.status(connect).await?)?
+            );
+            Ok(())
+        }
         Command::MeshClient {
             connect,
             connection_key,
             dir,
             exit,
             listen,
+            interfaces,
+            source_ips,
             policy,
             stats,
         } => {
@@ -383,11 +415,31 @@ pub async fn run() -> Result<()> {
             let session_policy = policy.build(rate, group_rates);
             session_policy.validate()?;
             let identity = mesh::ClientIdentity::open(dir, &connection_key)?;
-            let nodes = identity.discover_exit(&connect, &exit).await?;
-            let (entrances, leases) = identity.entrances(nodes, &exit, super::MAX_PATHS).await?;
+            let count = interfaces.len().max(source_ips.len()).max(1);
+            ensure!(
+                interfaces.is_empty()
+                    || source_ips.is_empty()
+                    || interfaces.len() == source_ips.len(),
+                "interface and source-ip counts must match"
+            );
+            let uplinks: Vec<_> = (0..count)
+                .map(|i| mesh::Uplink {
+                    interface: interfaces.get(i).cloned(),
+                    bind: source_ips.get(i).copied(),
+                    group: i as u8,
+                })
+                .collect();
+            let nodes = identity.discover_on(&connect, &exit, &uplinks).await?;
+            let leases = identity.networks(nodes, &exit, uplinks).await?;
+            let entrances = leases
+                .routes()
+                .borrow()
+                .iter()
+                .map(|r| r.address)
+                .collect::<Vec<_>>();
             tracing::info!(%exit, paths=entrances.len(), "selected mesh exit and cooperating entrances");
             let reporter = stats::Reporter::new("mesh-client", stats)?;
-            let result = tunnel::client_with_mesh_exit(
+            let result = tunnel::client_with_routes(
                 tunnel::ClientOptions {
                     listen,
                     entrances,
@@ -404,8 +456,8 @@ pub async fn run() -> Result<()> {
                     policy: session_policy,
                     stats: reporter.metrics.clone(),
                 },
-                Some(leases.updates()),
-                Some(leases.health()),
+                leases.routes(),
+                leases.health(),
                 exit,
             )
             .await;
@@ -975,6 +1027,7 @@ mod tests {
 impl PolicyArgs {
     fn build(&self, rate: u64, group_rates: [u64; super::MAX_PATHS]) -> tunnel::Policy {
         tunnel::Policy {
+            max_message_bytes: usize::from(self.max_message_bytes),
             adaptive: self.adaptive,
             capacity_probe_bps: self.capacity_probe_bps,
             probe_guided_recovery: self.probe_guided_recovery,

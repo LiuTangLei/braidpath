@@ -32,7 +32,7 @@ delivery samples alone cannot distinguish that change from a standing queue
 elsewhere on the path; periodically replacing the minimum would hide both.
 Changing this behavior requires an independent requalification signal and a
 comparison that also preserves real-queue braking. No timer-based reset or
-automatic decay of remembered service is enabled in v0.2.2.
+automatic decay of remembered service is enabled in v0.2.2 or v0.3.0.
 
 The long-lived regression fixtures keep one generation through a sustained RTT
 step and through a prolonged capacity reduction followed by recovery. They
