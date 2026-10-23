@@ -25,8 +25,8 @@ class ReadinessRequirement:
     instance_id: str | None = None
 
     def __post_init__(self):
-        if self.role not in {"client", "server", "relay"}:
-            raise ValueError("role must be client, server or relay")
+        if self.role not in {"client", "mesh-client", "server", "relay"}:
+            raise ValueError("role must be client, mesh-client, server or relay")
         if type(self.process_id) is not int or self.process_id <= 0:
             raise ValueError("process_id must be the launched positive PID")
         if type(self.started_unix_ms) is not int or self.started_unix_ms < 0:
@@ -35,7 +35,7 @@ class ReadinessRequirement:
             raise ValueError("expected path IDs must be nonnegative integers")
         if len(set(self.expected_path_ids)) != len(self.expected_path_ids):
             raise ValueError("expected path IDs must be unique")
-        if self.role == "client" and not self.expected_path_ids:
+        if self.role in {"client", "mesh-client"} and not self.expected_path_ids:
             raise ValueError("client readiness requires expected path IDs")
         if self.role == "server" and self.expected_path_ids and not self.session_id:
             raise ValueError("server path readiness requires the client session ID")
@@ -172,7 +172,11 @@ def wait_for_ready(
                 pending = "target_not_configured"
             elif stats.get("ready") is not True:
                 pending = "not_ready"
-            elif requirement.role == "client" and stats.get("configured_paths") != len(requirement.expected_path_ids):
+            elif requirement.role == "mesh-client" and type(stats.get("configured_paths")) is int and 0 <= stats["configured_paths"] < len(requirement.expected_path_ids):
+                # Optional relay allocations publish independently after the
+                # first direct path. Wait within the same readiness deadline.
+                pending = "allocating_mesh_paths"
+            elif requirement.role in {"client", "mesh-client"} and stats.get("configured_paths") != len(requirement.expected_path_ids):
                 return result(False, "configured_paths_mismatch")
             elif requirement.expected_path_ids:
                 status, pending, session = _path_status(stats, requirement)

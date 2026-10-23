@@ -73,6 +73,22 @@ class ReadinessTests(unittest.TestCase):
         self.assertEqual(result.instance_id, "instance-a")
         self.assertEqual(self.budgets, [3])
 
+    def test_mesh_allocations_expand_within_one_deadline_without_weakening_identity(self):
+        requirement = ReadinessRequirement("mesh-client", 123, 1000, (0, 1, 2))
+        initial = snapshot("mesh-client", ids=(0,))
+        initial["stats"]["configured_paths"] = 1
+        complete = snapshot("mesh-client")
+        complete["stats"]["configured_paths"] = 3
+        result = self.wait(lambda now: initial if now < 2 else complete, requirement)
+        self.assertTrue(result.ready)
+        self.assertEqual(result.waited_seconds, 2)
+        self.clock.now = 0
+        pending = self.wait(lambda _: initial, requirement)
+        self.assertEqual((pending.reason, pending.detail), ("timeout", "allocating_mesh_paths"))
+        self.clock.now = 0
+        complete["stats"]["configured_paths"] = 4
+        self.assertEqual(self.wait(lambda _: complete, requirement).reason, "configured_paths_mismatch")
+
     def test_delayed_ready_uses_one_total_deadline(self):
         pending = snapshot()
         pending["stats"]["ready"] = False
