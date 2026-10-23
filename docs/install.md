@@ -83,7 +83,7 @@ the release draft. CPU selection accounts for 32-bit Linux userspace on a
 | Linux | amd64, 386, arm64, armv7, armv6 | Static musl binaries; POSIX sh |
 | macOS | amd64, arm64 | Native Mach-O; per-user install / LaunchAgent |
 | Windows | amd64, 386, arm64 | MSVC with static CRT; PowerShell |
-| FreeBSD | amd64, arm64 | Native FreeBSD 14.4 VM build; POSIX sh / rc.d |
+| FreeBSD | amd64 | Native FreeBSD 14.4 VM build; POSIX sh / rc.d |
 
 Linux builds serve both glibc and musl distributions, including Debian, Ubuntu,
 Fedora, RHEL-family distributions and Alpine. ARMv6/ARMv7 builds use the
@@ -145,7 +145,7 @@ is atomic, but the upgrade is not a transaction across OS service configuration.
 ## Build and validation
 
 `scripts/release-targets.json` is the asset/matrix source. The release workflow
-runs the existing CI, builds 12 targets, runs their `--version` smoke checks
+runs the existing CI, builds 11 targets, runs their `--version` smoke checks
 (natively, in a FreeBSD VM, or under cross/QEMU), verifies executable headers,
 and produces `SHA256SUMS`. Builds and CI run concurrently; assembly requires
 both to pass. Tag versions must match `Cargo.toml`. A manual workflow run or a

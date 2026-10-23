@@ -29,6 +29,10 @@ def binary_header(asset):
 
 
 class ReleaseBoundaryTests(unittest.TestCase):
+    def test_freebsd_arm64_is_not_an_official_release_target(self):
+        freebsd = [t['target'] for t in release.TARGETS if t['kind'] == 'freebsd']
+        self.assertEqual(freebsd, ['x86_64-unknown-freebsd'])
+
     def test_optimized_python_rejects_wrong_machine_before_packaging(self):
         with tempfile.TemporaryDirectory() as directory:
             directory = Path(directory)

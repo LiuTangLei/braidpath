@@ -61,7 +61,7 @@ FEC 是恢复手段，不能消除拥塞或保证零丢包。聚合默认分发�
 
 ## 构建与运行
 
-提供 [官方安装脚本](docs/install.md)：Unix 使用 `install.sh`，Windows 使用 `install.ps1`。支持版本选择、离线安装、校验和保留密钥的卸载；发布包覆盖 12 个平台目标，可从 [最新版本](https://github.com/LiuTangLei/braidpath/releases/latest) 下载安装脚本，也可从源码构建并通过 `--local` 安装。
+提供 [官方安装脚本](docs/install.md)：Unix 使用 `install.sh`，Windows 使用 `install.ps1`。支持版本选择、离线安装、校验和保留密钥的卸载；发布包覆盖 11 个平台目标，可从 [最新版本](https://github.com/LiuTangLei/braidpath/releases/latest) 下载安装脚本，也可从源码构建并通过 `--local` 安装。
 
 运行时只提供 BBR，初版优先延迟和有效吞吐，CPU 占用后续再优化。自适应模式在各连接独立拥塞控制之上增加发送额度，提高额度需要实际使用量支持；新的本地 RTT 和已完成区间的丢包证据可以降低发送速度，健康证据新鲜时仍保留业务资格。业务本身发送得少，不能据此断定线路容量小。自适应会话不需要配置带宽：客户端 `--rate-bps` 和服务端 `--max-rate-bps` 默认 `auto`，只保留已验证的 1 Gbit/s 会话上限；这是探测上限，不是固定发送速率。排队刹车之后再次刹车至少间隔一个当前 RTT；排队排空后一步回到实测排空速率的 90%（`--legacy-recovery` 恢复旧策略）。
 

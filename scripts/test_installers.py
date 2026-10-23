@@ -56,7 +56,7 @@ done
 cp "$TEST_PAYLOAD/${url##*/}" "$output"''')
 
     def test_all_unix_release_targets_and_32_bit_userspace(self):
-        cases = [('Linux','x86_64','64','linux-amd64'), ('Linux','x86_64','32','linux-386'), ('Linux','i686','32','linux-386'), ('Linux','aarch64','64','linux-arm64'), ('Linux','aarch64','32','linux-armv7'), ('Linux','armv7l','32','linux-armv7'), ('Linux','armv6l','32','linux-armv6'), ('Darwin','x86_64','64','darwin-amd64'), ('Darwin','arm64','64','darwin-arm64'), ('FreeBSD','amd64','64','freebsd-amd64'), ('FreeBSD','aarch64','64','freebsd-arm64')]
+        cases = [('Linux','x86_64','64','linux-amd64'), ('Linux','x86_64','32','linux-386'), ('Linux','i686','32','linux-386'), ('Linux','aarch64','64','linux-arm64'), ('Linux','aarch64','32','linux-armv7'), ('Linux','armv7l','32','linux-armv7'), ('Linux','armv6l','32','linux-armv6'), ('Darwin','x86_64','64','darwin-amd64'), ('Darwin','arm64','64','darwin-arm64'), ('FreeBSD','amd64','64','freebsd-amd64')]
         assets = {t['asset'] for t in release.TARGETS}
         for system, arch, bits, suffix in cases:
             with self.subTest(system=system,arch=arch,bits=bits):
@@ -64,6 +64,14 @@ cp "$TEST_PAYLOAD/${url##*/}" "$output"''')
                 result = self.run_install('--print-target')
                 self.assertEqual(result.stdout.strip(), 'braidpath-' + suffix)
                 self.assertIn(result.stdout.strip(), assets)
+
+    def test_freebsd_arm64_requires_source_build_without_writes(self):
+        for architecture in ['aarch64', 'arm64']:
+            with self.subTest(architecture=architecture):
+                self.env.update(TEST_OS='FreeBSD', TEST_ARCH=architecture)
+                result = self.run_install('--print-target', success=False)
+                self.assertIn('No supported release asset', result.stderr)
+                self.assertFalse(self.prefix.exists())
 
     def test_rosetta_uses_native_arm64(self):
         self.env.update(TEST_OS='Darwin', TEST_ARCH='x86_64')
@@ -161,7 +169,7 @@ cp "$TEST_PAYLOAD/${url##*/}" "$output"''')
 
 class ReleaseTests(unittest.TestCase):
     def test_asset_and_target_names_are_unique(self):
-        self.assertEqual(len(release.TARGETS),12)
+        self.assertEqual(len(release.TARGETS),11)
         for field in ['asset','target']:
             self.assertEqual(len({t[field] for t in release.TARGETS}),len(release.TARGETS))
 

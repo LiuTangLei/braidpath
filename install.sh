@@ -108,7 +108,7 @@ if [ -z "$architecture" ]; then
     fi
 fi
 case "$os/$architecture" in
-    linux/amd64|linux/arm64|linux/386|linux/armv7|linux/armv6|darwin/amd64|darwin/arm64|freebsd/amd64|freebsd/arm64) ;;
+    linux/amd64|linux/arm64|linux/386|linux/armv7|linux/armv6|darwin/amd64|darwin/arm64|freebsd/amd64) ;;
     *) fail "No supported release asset for $os/$architecture";;
 esac
 asset=braidpath-$os-$architecture

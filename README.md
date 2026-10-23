@@ -68,7 +68,7 @@ Each interface–entrance pair owns an end-to-end Quinn/rustls connection to the
 
 ## Build and run
 
-Use the [official installers](docs/install.md): `install.sh` for Unix and `install.ps1` for Windows. They support version selection, offline installation, checksums and key-preserving removal. Releases provide binaries for 12 platform targets. Download the scripts from the [latest release](https://github.com/LiuTangLei/braidpath/releases/latest), or build locally and install with `--local`.
+Use the [official installers](docs/install.md): `install.sh` for Unix and `install.ps1` for Windows. They support version selection, offline installation, checksums and key-preserving removal. Releases provide binaries for 11 platform targets. Download the scripts from the [latest release](https://github.com/LiuTangLei/braidpath/releases/latest), or build locally and install with `--local`.
 
 Rust 1.88 or newer:
 
