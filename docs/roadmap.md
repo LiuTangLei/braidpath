@@ -81,6 +81,9 @@ Current protocol, commands and limits: [experimental runtime](runtime.md). Check
 
 ## M4 — Reliable flows and application adapters
 
+- [x] v0.3.3: 10 Gbit/s default operational ceiling, larger authenticated proxy
+  flow-control windows, and rate-proportional burst credit for high-rate traffic.
+  Focused local regression checks pass; this does not establish WAN throughput.
 - [x] v0.3.2: authenticated QUIC TCP/UDP proxy with local SOCKS5, fixed exits,
   concurrent use of selected exits, remote DNS, half-close and bounded cleanup.
   This uses QUIC's native reliable streams; application-level multipath FEC
