@@ -81,6 +81,10 @@ Current protocol, commands and limits: [experimental runtime](runtime.md). Check
 
 ## M4 — Reliable flows and application adapters
 
+- [x] v0.3.2: authenticated QUIC TCP/UDP proxy with local SOCKS5, fixed exits,
+  concurrent use of selected exits, remote DNS, half-close and bounded cleanup.
+  This uses QUIC's native reliable streams; application-level multipath FEC
+  reliability remains the separate work below. See [proxy operation](mesh.md).
 - [ ] Selective application ACKs, bounded retransmission and receiver credit, without synthesizing QUIC ACKs for FEC recovery.
 - [ ] Per-flow offsets, reassembly bounds, FIN/final-offset acknowledgment, reset and half-close.
 - [ ] Preserve reliable-flow acknowledgment/reassembly state across path changes and define terminal delivery failure; the existing datagram reconnection lifecycle is not a reliable-flow implementation.

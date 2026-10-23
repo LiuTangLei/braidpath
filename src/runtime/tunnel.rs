@@ -3006,7 +3006,8 @@ pub struct ServerOptions {
     pub cert: std::path::PathBuf,
     pub key: std::path::PathBuf,
     pub token: std::path::PathBuf,
-    pub target: SocketAddr,
+    pub target: Option<SocketAddr>,
+    pub proxy: Option<Arc<super::proxy::Server>>,
     pub max_rate: u64,
     pub congestion: transport::Congestion,
     pub datagram_send_buffer_bytes: usize,
@@ -3068,7 +3069,7 @@ async fn serve_with_budgets(
     let mut maintenance = interval(Duration::from_secs(1));
     let mut shutdown = Shutdown::new();
     options.stats.readiness(true, 0);
-    info!(address=%endpoint.local_addr()?,target=%options.target,congestion=?options.congestion,?ack_request,"HTTP/3 server ready");
+    info!(address=%endpoint.local_addr()?,target=?options.target,proxy=options.proxy.is_some(),congestion=?options.congestion,?ack_request,"HTTP/3 server ready");
     loop {
         tokio::select! {
             _=shutdown.wait()=>break,
@@ -3086,7 +3087,7 @@ async fn serve_with_budgets(
             incoming=endpoint.accept()=>{
                 let Some(incoming)=incoming else{break};
                 let Ok(permit)=pending_connections.clone().try_acquire_owned() else{incoming.refuse();continue};
-                let sessions=sessions.clone(); let secret=secret.clone(); let target=options.target; let settings=ServerSessionSettings{max_rate:options.max_rate,adaptive_fec_retention:options.adaptive_fec_retention,mesh:mesh.clone(),data_connections:data_connections.clone()}; let metrics=options.stats.clone();
+                let sessions=sessions.clone(); let secret=secret.clone(); let target=options.target; let settings=ServerSessionSettings{max_rate:options.max_rate,adaptive_fec_retention:options.adaptive_fec_retention,mesh:mesh.clone(),data_connections:data_connections.clone(),proxy:options.proxy.clone()}; let metrics=options.stats.clone();
                 tasks.spawn(async move {
                     let mut diagnostic=stats::ConnectionTrace::new(metrics.clone(),incoming.remote_address(),None,"incoming");
                     let result=server_connection(incoming,permit,sessions,secret,target,settings,metrics,&mut diagnostic).await;
@@ -3146,6 +3147,7 @@ async fn serve_with_budgets(
 
 #[derive(Clone)]
 struct ServerSessionSettings {
+    proxy: Option<Arc<super::proxy::Server>>,
     data_connections: Arc<Semaphore>,
     mesh: Option<Arc<mesh::State>>,
     max_rate: u64,
@@ -3189,12 +3191,13 @@ async fn server_connection(
     permit: tokio::sync::OwnedSemaphorePermit,
     sessions: Sessions,
     secret: Arc<String>,
-    target: SocketAddr,
+    target: Option<SocketAddr>,
     settings: ServerSessionSettings,
     metrics: stats::Metrics,
     diagnostic: &mut stats::ConnectionTrace,
 ) -> Result<()> {
     let ServerSessionSettings {
+        proxy,
         data_connections,
         mesh,
         max_rate,
@@ -3202,6 +3205,17 @@ async fn server_connection(
     } = settings;
     let conn = timeout(Duration::from_secs(5), incoming).await??;
     diagnostic.handshake_succeeded(&conn);
+    let protocol = conn
+        .handshake_data()
+        .and_then(|data| data.downcast::<quinn::crypto::rustls::HandshakeData>().ok())
+        .and_then(|data| data.protocol);
+    if protocol.as_deref() == Some(super::proxy::ALPN) {
+        let Some(proxy) = proxy else {
+            conn.close(0u32.into(), b"proxy disabled");
+            bail!("proxy service disabled");
+        };
+        return proxy.connection(conn, permit).await;
+    }
     diagnostic.enter("http3", "http3_setup");
     let mut admission_deadline =
         tokio::time::Instant::now() + Duration::from_millis(ADMISSION_TIMEOUT_MS);
@@ -3303,6 +3317,11 @@ async fn server_connection(
                                     continue
                                 }
                                 ensure!(!mesh_authenticated,"mesh control connection cannot carry a session");
+                                let Some(target) = target else {
+                                    stream.send_response(Response::builder().status(StatusCode::NOT_FOUND).body(())?).await?;
+                                    stream.finish().await?;
+                                    continue;
+                                };
                                 let requested_exit=req.headers().get("braidpath-exit").map(|v|v.to_str()).transpose()?;
                                 if requested_exit != mesh.as_ref().map(|state|state.node_id()) {
                                     diagnostic.rejected("exit_identity_mismatch");

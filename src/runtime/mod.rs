@@ -1,4 +1,4 @@
-//! Experimental authenticated HTTP/3 datagram transport. No reliable stream service.
+//! Authenticated multipath UDP tunnels and QUIC TCP/UDP proxy services.
 pub mod adaptive;
 pub mod capacity_probe;
 pub mod cli;
@@ -6,6 +6,7 @@ pub mod fec_retention;
 pub mod mesh;
 pub mod outbound;
 pub mod probe;
+pub mod proxy;
 pub mod quality;
 pub mod receiver_budget;
 pub mod relay;

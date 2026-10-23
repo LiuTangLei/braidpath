@@ -16,7 +16,7 @@ BraidPath is a Rust multipath transport project combining **forward error correc
 
 “Braid” means weaving several imperfect paths into a more resilient connection.
 
-> **Status: experimental UDP tunnel.** Equal distributed servers, client-selected exits and automatically refreshed entrances run over real HTTP/3 and HTTP Datagrams. See the [distributed-server guide](docs/mesh.md). Opt-in `--adaptive` adds per-path pacing, independent health probes, sender-age admission and bounded outage recovery. These mechanisms are implemented; sustained WAN benefit and deployment readiness are not established. Round robin and the existing XOR settings remain the defaults.
+> **Status: experimental UDP tunnel and TCP/UDP proxy.** Equal distributed servers support client-selected exits and automatically refreshed tunnel entrances. v0.3.2 adds authenticated proxy egress and local SOCKS5, with fixed exits or several exits serving concurrent connections. See the [proxy and distributed-server guide](docs/mesh.md). The UDP tunnel uses HTTP/3 Datagrams; the proxy uses reliable QUIC streams for TCP and QUIC DATAGRAM for UDP. Sustained WAN benefit and deployment readiness are not established. Existing tunnel defaults remain unchanged.
 
 ## One interface works. Several can contribute.
 

@@ -1,4 +1,4 @@
-use super::{mesh, probe, relay, stats, transport, tunnel};
+use super::{mesh, probe, proxy, relay, stats, transport, tunnel};
 use anyhow::{Context, Result, ensure};
 use clap::{Args, Parser, Subcommand};
 use std::{
@@ -14,6 +14,66 @@ use std::{
 pub struct Cli {
     #[command(subcommand)]
     command: Command,
+}
+
+#[cfg(test)]
+mod proxy_cli_tests {
+    use super::*;
+    #[test]
+    fn server_can_offer_proxy_tunnel_or_both_and_client_can_select_multiple_exits() {
+        let base = [
+            "braidpath",
+            "mesh-server",
+            "--dir",
+            "state",
+            "--id",
+            "a",
+            "--listen",
+            "127.0.0.1:4433",
+            "--advertise",
+            "127.0.0.1:4433",
+        ];
+        assert!(Cli::try_parse_from(base).is_err());
+        assert!(Cli::try_parse_from(base.into_iter().chain(["--proxy"])).is_ok());
+        assert!(
+            Cli::try_parse_from(base.into_iter().chain(["--target", "127.0.0.1:9000"])).is_ok()
+        );
+        assert!(
+            Cli::try_parse_from(
+                base.into_iter()
+                    .chain(["--proxy", "--target", "127.0.0.1:9000"])
+            )
+            .is_ok()
+        );
+        assert!(
+            Cli::try_parse_from(base.into_iter().chain([
+                "--target",
+                "127.0.0.1:9000",
+                "--proxy-allow-private"
+            ]))
+            .is_err()
+        );
+        let client = [
+            "braidpath",
+            "proxy-client",
+            "--connect",
+            "127.0.0.1:4433",
+            "--connection-key",
+            "key",
+            "--dir",
+            "client",
+            "--exit",
+            "a",
+            "--exit",
+            "b",
+            "--socks5",
+            "a=127.0.0.1:1081",
+        ];
+        assert!(Cli::try_parse_from(client).is_ok());
+        assert!(
+            Cli::try_parse_from(client.into_iter().chain(["--socks5", "b=0.0.0.0:1082"])).is_err()
+        );
+    }
 }
 
 #[cfg(test)]
@@ -80,8 +140,14 @@ enum Command {
         /// Relay UDP port or inclusive range (up to 1024 ports); otherwise OS-assigned.
         #[arg(long)]
         relay_ports: Option<mesh::RelayPorts>,
+        #[arg(long, required_unless_present = "proxy")]
+        target: Option<SocketAddr>,
+        /// Enable authenticated TCP/UDP proxy egress on the same QUIC port.
         #[arg(long)]
-        target: SocketAddr,
+        proxy: bool,
+        /// Allow proxy destinations on private/loopback networks (trusted clients only).
+        #[arg(long, requires = "proxy")]
+        proxy_allow_private: bool,
         /// Any existing member; persisted peers remain usable if this entry is down.
         #[arg(long)]
         join: Option<SocketAddr>,
@@ -91,6 +157,23 @@ enum Command {
         max_rate_bps: RateCap,
         #[command(flatten)]
         stats: stats::Options,
+    },
+    /// Offer local SOCKS5 TCP/UDP access through one or several selected mesh exits.
+    ProxyClient {
+        #[arg(long, required = true)]
+        connect: Vec<SocketAddr>,
+        #[arg(long)]
+        connection_key: PathBuf,
+        #[arg(long)]
+        dir: PathBuf,
+        /// Repeat to distribute new connections across these exits. Existing flows stay pinned.
+        #[arg(long, required = true)]
+        exit: Vec<String>,
+        #[arg(long, default_value = "127.0.0.1:1080")]
+        listen: SocketAddr,
+        /// Additional pinned SOCKS5 listener, EXIT=127.0.0.1:PORT. Repeat for Clash selection.
+        #[arg(long)]
+        socks5: Vec<proxy::Listener>,
     },
     /// Discover live distributed servers through any member using a client key.
     Nodes {
@@ -354,6 +437,8 @@ pub async fn run() -> Result<()> {
             advertise,
             relay_ports,
             target,
+            proxy,
+            proxy_allow_private,
             join,
             join_key,
             max_rate_bps,
@@ -367,6 +452,9 @@ pub async fn run() -> Result<()> {
                 advertise,
                 relay_ports,
                 target,
+                proxy: proxy.then_some(proxy::ServerConfig {
+                    allow_private: proxy_allow_private,
+                }),
                 join,
                 join_key,
                 rate: max_rate_bps.bps(),
@@ -374,6 +462,24 @@ pub async fn run() -> Result<()> {
             })
             .await;
             reporter.finish(result).await
+        }
+        Command::ProxyClient {
+            connect,
+            connection_key,
+            dir,
+            exit,
+            listen,
+            socks5,
+        } => {
+            let identity = mesh::ClientIdentity::open(dir, &connection_key)?;
+            proxy::client(proxy::ClientOptions {
+                identity,
+                connect,
+                exits: exit,
+                listen,
+                socks5,
+            })
+            .await
         }
         Command::Nodes {
             connect,
@@ -488,7 +594,8 @@ pub async fn run() -> Result<()> {
                     cert,
                     key,
                     token: token_file,
-                    target,
+                    target: Some(target),
+                    proxy: None,
                     max_rate: max_rate_bps.bps(),
                     datagram_send_buffer_bytes: datagram_send_buffer_bytes as usize,
                     congestion,

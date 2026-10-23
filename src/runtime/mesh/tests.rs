@@ -70,7 +70,8 @@ pub(super) async fn server_with_metrics(
         listen,
         advertise: listen,
         relay_ports: None,
-        target,
+        target: Some(target),
+        proxy: None,
         rate: 10_000_000,
         join: join.as_ref().map(|(a, _)| *a),
         join_key: join.map(|(_, p)| p),
@@ -338,6 +339,7 @@ async fn mesh_survives_bootstrap_loss_and_selects_any_exit_through_peers() {
 
 pub(crate) fn state(root: &Path) -> State {
     State {
+        proxy: None,
         _directory_lock: None,
         own: Node {
             id: "own".into(),
@@ -1386,7 +1388,8 @@ async fn partition_heals_after_both_groups_forget_and_reload_hints() {
                 cert: identity.join("cert.pem"),
                 key: identity.join("key.pem"),
                 token: identity.join("token"),
-                target: address(),
+                target: Some(address()),
+                proxy: None,
                 max_rate: 10_000_000,
                 congestion: transport::Congestion::default(),
                 datagram_send_buffer_bytes: transport::DEFAULT_DATAGRAM_SEND_BUFFER_BYTES,

@@ -240,6 +240,7 @@ impl Drop for AbortTask {
     }
 }
 pub struct State {
+    proxy: Option<Arc<super::proxy::Server>>,
     own: Node,
     _directory_lock: Option<Arc<fs::File>>,
     bind: SocketAddr,
@@ -754,7 +755,7 @@ impl State {
         }
         let result: Result<Vec<u8>> = async {
             match (request.method(), path) {
-                (&Method::GET, "/mesh/info") => Ok(serde_json::to_vec(&Capabilities::default())?),
+                (&Method::GET, "/mesh/info") => Ok(serde_json::to_vec(&self.capabilities())?),
                 (&Method::GET, "/mesh/status") => Ok(serde_json::to_vec(&self.status())?),
                 (&Method::GET, "/mesh/nodes") => Ok(serde_json::to_vec(&self.active())?),
                 (&Method::POST, "/mesh/sync") => {
@@ -826,11 +827,16 @@ pub struct ServerOptions {
     pub relay_ports: Option<RelayPorts>,
     pub join: Option<SocketAddr>,
     pub join_key: Option<PathBuf>,
-    pub target: SocketAddr,
+    pub target: Option<SocketAddr>,
+    pub proxy: Option<super::proxy::ServerConfig>,
     pub rate: u64,
     pub stats: stats::Metrics,
 }
 pub async fn serve(options: ServerOptions) -> Result<()> {
+    ensure!(
+        options.target.is_some() || options.proxy.is_some(),
+        "enable a UDP tunnel target or proxy service"
+    );
     ensure!(
         (64_000..=1_000_000_000).contains(&options.rate),
         "invalid server rate"
@@ -851,7 +857,19 @@ pub async fn serve(options: ServerOptions) -> Result<()> {
         options.join_key.as_deref(),
         options.join.is_some(),
     )?;
+    let proxy = options
+        .proxy
+        .map(|config| {
+            super::proxy::Server::new(
+                config,
+                key.client.token.clone(),
+                own.id.clone(),
+                options.rate,
+            )
+        })
+        .transpose()?;
     let state = Arc::new(State {
+        proxy: proxy.clone(),
         own,
         _directory_lock: Some(Arc::new(directory_lock)),
         bind: options.listen,
@@ -956,6 +974,7 @@ pub async fn serve(options: ServerOptions) -> Result<()> {
             key: options.dir.join("key.pem"),
             token: options.dir.join("token"),
             target: options.target,
+            proxy,
             max_rate: options.rate,
             congestion: transport::Congestion::default(),
             datagram_send_buffer_bytes: transport::DEFAULT_DATAGRAM_SEND_BUFFER_BYTES,

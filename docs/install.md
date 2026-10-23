@@ -108,6 +108,11 @@ Windows `args.json` is a JSON array of literal argument strings; embedded quotes
 empty arguments and trailing backslashes are preserved on PowerShell 5.1 and 7.
 Edit `CHANGE_ME:4433`, node ID and target before starting. Both examples use
 `mesh-server`, a dedicated `node` child directory and `--relay-ports 44400-44463`.
+For v0.3.2 proxy service, replace `--target` and its value with `--proxy`, or add
+`--proxy` to run both services. Client SOCKS5 and multiple-exit configuration are
+in the [proxy guide](mesh.md#tcpudp-proxy-and-multiple-exits-v032). Existing
+argument files are preserved on upgrade, so proxy egress is never enabled by
+an installer upgrade alone.
 Allow UDP at the service port and that relay range, or adjust the range for your
 firewall/NAT. The first start initializes keys; subsequent starts reuse them.
 For joining another server or using client mode, use arguments from the

@@ -93,8 +93,19 @@ pub struct Status {
     pub control_connection_limit: usize,
     pub persistence_failures: u64,
     pub recovery: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy: Option<super::super::proxy::Snapshot>,
 }
 impl State {
+    pub(super) fn capabilities(&self) -> Capabilities {
+        let mut capabilities = Capabilities::default();
+        if self.proxy.is_some() {
+            capabilities
+                .features
+                .extend(["proxy-tcp-v1".into(), "proxy-udp-v1".into()]);
+        }
+        capabilities
+    }
     pub(super) fn status(&self) -> Status {
         let peers = self.peers.lock().expect("peers");
         let known = peers.len();
@@ -106,7 +117,8 @@ impl State {
         let hints = self.reconnect.lock().expect("hints").len();
         Status {
             node: self.own.clone(),
-            capabilities: Capabilities::default(),
+            capabilities: self.capabilities(),
+            proxy: self.proxy.as_ref().map(|p| p.snapshot()),
             known_peers: known,
             directly_live_peers: live,
             reconnect_hints: hints,

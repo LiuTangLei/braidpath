@@ -139,6 +139,126 @@ fn port() -> String {
         .unwrap()
         .to_string()
 }
+
+#[test]
+fn proxy_cli_discovers_exit_and_serves_socks_tcp_with_remote_half_close() {
+    use std::io::{Read, Write};
+    use std::net::{Shutdown, TcpListener, TcpStream};
+    let _serial = THREE_PATH_FIXTURES.lock().unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    let state = root.join("server");
+    let server_addr = port();
+    let mut server = launch(
+        &args(&[
+            "mesh-server",
+            "--dir",
+            state.to_str().unwrap(),
+            "--id",
+            "node-a",
+            "--listen",
+            &server_addr,
+            "--advertise",
+            &server_addr,
+            "--proxy",
+            "--proxy-allow-private",
+        ]),
+        root,
+        "proxy-server",
+    );
+    ready(&mut server, "HTTP/3 server ready");
+    let key = state.join("client-key.json");
+    let client_state = root.join("client");
+    let mut client = launch(
+        &args(&[
+            "proxy-client",
+            "--connect",
+            &server_addr,
+            "--connection-key",
+            key.to_str().unwrap(),
+            "--dir",
+            client_state.to_str().unwrap(),
+            "--exit",
+            "node-a",
+            "--listen",
+            "127.0.0.1:0",
+        ]),
+        root,
+        "proxy-client",
+    );
+    ready(&mut client, "SOCKS5 proxy ready");
+    let log = fs::read_to_string(&client.log).unwrap();
+    let listener = log
+        .lines()
+        .find(|l| l.contains("SOCKS5 proxy ready"))
+        .unwrap()
+        .split_whitespace()
+        .find_map(|part| part.strip_prefix("address="))
+        .unwrap();
+    let target = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = target.local_addr().unwrap();
+    let target = thread::spawn(move || {
+        let (mut stream, _) = target.accept().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut request = Vec::new();
+        stream.read_to_end(&mut request).unwrap();
+        assert_eq!(request, b"proxy process acceptance");
+        stream.write_all(b"response after request FIN").unwrap();
+    });
+    let mut socket = TcpStream::connect(listener).unwrap();
+    socket
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    socket.write_all(&[5, 1, 0]).unwrap();
+    let mut method = [0; 2];
+    socket.read_exact(&mut method).unwrap();
+    assert_eq!(method, [5, 0]);
+    let mut request = vec![5, 1, 0, 1, 127, 0, 0, 1];
+    request.extend(address.port().to_be_bytes());
+    socket.write_all(&request).unwrap();
+    let mut reply = [0; 10];
+    socket.read_exact(&mut reply).unwrap();
+    assert_eq!(&reply[..4], &[5, 0, 0, 1]);
+    socket.write_all(b"proxy process acceptance").unwrap();
+    socket.shutdown(Shutdown::Write).unwrap();
+    let mut body = Vec::new();
+    socket.read_to_end(&mut body).unwrap();
+    assert_eq!(body, b"response after request FIN");
+    target.join().unwrap();
+    let status = run(&args(&[
+        "mesh-status",
+        "--connect",
+        &server_addr,
+        "--connection-key",
+        key.to_str().unwrap(),
+        "--dir",
+        root.join("inspect").to_str().unwrap(),
+    ]));
+    assert!(status.status.success());
+    let status: Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(status["proxy"]["streams"], 0);
+    #[cfg(unix)]
+    {
+        assert!(
+            Command::new("kill")
+                .args(["-INT", &client.child.id().to_string()])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let deadline = Instant::now() + Duration::from_secs(4);
+        loop {
+            if let Some(status) = client.child.try_wait().unwrap() {
+                assert!(status.success());
+                break;
+            }
+            assert!(Instant::now() < deadline, "proxy client failed to stop");
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
 fn args(v: &[&str]) -> Vec<String> {
     v.iter().map(|s| s.to_string()).collect()
 }

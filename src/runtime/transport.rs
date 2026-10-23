@@ -137,7 +137,7 @@ pub fn server_with_ack_request(
     let mut tls = rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(certificates(cert)?, key(key_path)?)?;
-    tls.alpn_protocols = vec![b"h3".to_vec()];
+    tls.alpn_protocols = vec![b"h3".to_vec(), super::proxy::ALPN.to_vec()];
     tls.max_early_data_size = 0;
     let mut conf = ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(tls)?));
     let mut transport = config(congestion);
@@ -182,6 +182,38 @@ pub fn client_bound_with_datagram_buffer(
     bind: Option<SocketAddr>,
     datagram_send_buffer_bytes: usize,
 ) -> Result<Endpoint> {
+    client_with_alpn(
+        remote,
+        ca,
+        interface,
+        congestion,
+        bind,
+        datagram_send_buffer_bytes,
+        b"h3",
+    )
+}
+
+pub(crate) fn proxy_client(remote: SocketAddr, ca: &Path) -> Result<Endpoint> {
+    client_with_alpn(
+        remote,
+        ca,
+        None,
+        Congestion::default(),
+        None,
+        DEFAULT_DATAGRAM_SEND_BUFFER_BYTES,
+        super::proxy::ALPN,
+    )
+}
+
+fn client_with_alpn(
+    remote: SocketAddr,
+    ca: &Path,
+    interface: Option<&str>,
+    congestion: Congestion,
+    bind: Option<SocketAddr>,
+    datagram_send_buffer_bytes: usize,
+    alpn: &[u8],
+) -> Result<Endpoint> {
     ensure!(
         (DEFAULT_DATAGRAM_SEND_BUFFER_BYTES..=MAX_DATAGRAM_SEND_BUFFER_BYTES)
             .contains(&datagram_send_buffer_bytes),
@@ -194,7 +226,7 @@ pub fn client_bound_with_datagram_buffer(
     let mut tls = rustls::ClientConfig::builder()
         .with_root_certificates(roots)
         .with_no_client_auth();
-    tls.alpn_protocols = vec![b"h3".to_vec()];
+    tls.alpn_protocols = vec![alpn.to_vec()];
     tls.enable_early_data = false;
     let mut conf = ClientConfig::new(Arc::new(QuicClientConfig::try_from(tls)?));
     let mut transport = config(congestion);

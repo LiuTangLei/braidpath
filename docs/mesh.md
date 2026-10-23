@@ -5,6 +5,110 @@ client discovery, become a selected exit, or forward encrypted traffic toward
 another exit. The first server only initializes credentials; it has no permanent
 coordination role. Membership converges through authenticated peer exchanges.
 
+## TCP/UDP proxy and multiple exits (v0.3.2)
+
+Enable proxy egress with `--proxy`. A fixed `--target` is optional in this mode;
+provide both options to serve the existing UDP tunnel and the proxy together.
+Existing state directories and client/server keys can be reused.
+
+```sh
+braidpath mesh-server --dir local/node-a --id node-a \
+  --listen 0.0.0.0:4433 --advertise 192.0.2.10:4433 --proxy
+
+braidpath mesh-server --dir local/node-b --id node-b \
+  --listen 0.0.0.0:4433 --advertise 192.0.2.20:4433 --proxy \
+  --join 192.0.2.10:4433 --join-key local/server-key.json
+
+# One SOCKS5 endpoint distributes new connections across the selected exits.
+# Additional endpoints let applications select an exit explicitly.
+braidpath proxy-client --connect 192.0.2.10:4433 \
+  --connection-key local/client-key.json --dir local/proxy-client \
+  --exit node-a --exit node-b --listen 127.0.0.1:1080 \
+  --socks5 node-a=127.0.0.1:1081 --socks5 node-b=127.0.0.1:1082
+```
+
+Repeat `--exit` for up to eight nodes, or specify just one for a fixed exit.
+The main listener assigns new TCP connections and UDP associations round robin.
+Each connection/association retains its exit for its entire lifetime, including
+all destinations within one UDP association. If connecting to an exit fails,
+the pool can try another selected exit before sending the application request.
+A pinned `--socks5 EXIT=ADDRESS` listener uses only that exit. A destination
+rejection is returned to the application; requests are never replayed elsewhere.
+Existing streams fail if their exit fails; other exits continue serving their
+own streams. Clients discover address updates in the background every 15 seconds;
+new connections use updated addresses while existing connections retain their
+original peer. This is concurrent use of exits by separate flows; one TCP stream
+uses one reliable QUIC stream to one exit.
+
+All local listeners must bind loopback. Their SOCKS5 interface supports CONNECT,
+UDP ASSOCIATE and the no-authentication method; BIND returns command unsupported.
+The remote link requires the existing pinned certificate and client token, and
+authenticates the requested exit ID before accepting destinations. There is no
+public unauthenticated SOCKS port. Domains are sent to the selected exit for
+resolution; both IPv4 and IPv6 destinations are supported. UDP prefers IPv4 when
+DNS provides both families; an explicit IPv6 destination uses IPv6.
+
+For [Clash/Mihomo SOCKS5 nodes](https://wiki.metacubex.one/en/config/proxies/socks/),
+merge these entries into the application's existing configuration:
+
+```yaml
+proxies:
+  - {name: BP-Pool, type: socks5, server: 127.0.0.1, port: 1080, udp: true}
+  - {name: BP-A, type: socks5, server: 127.0.0.1, port: 1081, udp: true}
+  - {name: BP-B, type: socks5, server: 127.0.0.1, port: 1082, udp: true}
+proxy-groups:
+  - name: BraidPath
+    type: select
+    proxies: [BP-Pool, BP-A, BP-B]
+```
+
+Choose BP-A/B for a fixed exit, or BP-Pool for concurrent use by new connections.
+Route the desired application rules to the BraidPath group. BraidPath must run on
+the same machine as these loopback SOCKS endpoints. This supplies the proxy
+service model requested for v0.3.2; its wire protocol is not Hysteria 2, so a
+Clash `hysteria2` entry cannot connect to it directly.
+
+The proxy uses ALPN `braidpath-proxy/1` on the existing server UDP port. TCP uses
+QUIC reliability and backpressure, including half-close. UDP uses QUIC DATAGRAM
+with bounded fragmentation (up to 65,507 payload bytes), no retransmission and
+no FEC. SOCKS UDP headers also consume the local operating system's datagram
+limit. SOCKS-level fragments (`FRAG != 0`) are dropped as permitted by
+[RFC 1928](https://www.rfc-editor.org/rfc/rfc1928.txt). The existing HTTP/3 FEC
+tunnel and its cooperating relay entrances retain their separate behavior.
+
+Proxy limits and lifecycle:
+
+- Each server admits 64 proxy connections, 256 streams, 64 UDP associations and
+  1,024 UDP destinations in total; each association allows 32 destinations.
+  Each authenticated QUIC connection permits 64 concurrent streams. The client
+  admits 256 local sessions. Up to 32 OS DNS lookups may be in flight; a timed-out
+  lookup retains its slot until the resolver actually returns. Pending connections retain the shared server
+  admission budget and must authenticate within eight seconds.
+- `--max-rate-bps` caps the combined TCP/UDP proxy payload in both directions,
+  across all proxy clients, with a 128 KiB burst. TCP waits for credit; excess
+  UDP is dropped. This is the proxy budget; existing relay/tunnel budgets are
+  separate. `auto` uses the existing 1 Gbit/s maximum.
+- UDP associations close when their SOCKS TCP owner closes, after 60 seconds
+  without traffic, or when their QUIC connection closes. UDP destination sockets
+  expire after 60 seconds idle. TCP streams expire after 300 seconds idle across
+  both directions. An empty proxy connection closes after 60 seconds.
+- Datagram assembly allows four incomplete packets per association, a two-second
+  lifetime and a 64-packet history. Expired/completed packet IDs cannot be revived
+  by late fragments. Queues, socket buffers and per-send waits are bounded.
+- Public destinations are allowed by default. Private, loopback, link-local,
+  shared-address and local IPv6 destinations are blocked after DNS resolution;
+  the checked IP is the actual connection target. `--proxy-allow-private` opts
+  into access to those networks for trusted client-key holders. Unspecified and
+  multicast addresses remain blocked. Proxy access must be explicitly enabled
+  on each desired exit.
+
+`mesh-status` advertises `proxy-tcp-v1` / `proxy-udp-v1` only when enabled, and
+includes live proxy connection, stream, association, destination and rejection
+counts. Local tests cover real QUIC/SOCKS sockets, selected and simultaneous
+exits, domain resolution, half-close, fragmented UDP, authentication, destination
+policy, exit failure and resource cleanup. Public-network performance and
+application-specific Clash acceptance remain separate validation work.
+
 ## Credentials and startup
 
 Keep state and copied credentials under ignored `local/`. A new or empty dedicated
