@@ -28,13 +28,26 @@ Restart with the same arguments. Saved identity is reused, and an unavailable
 `--join` entry does not block a server that has persisted peers. Enrollment keys
 may be removed after a successful import; an existing `--join-key` file must
 still match the saved cluster. Both join options may also be omitted on restart.
+From v0.2.2, stop a node and restart it with the same `--dir` and `--id`, but
+the new `--listen` / `--advertise` address, to move it. Its keys remain unchanged.
+The authoritative identity atomically increments an address incarnation; normal
+restarts at the same address retain it. Newer incarnations replace older records
+for that ID, and stale gossip cannot roll the address back. A migration cannot
+displace a different live node at the new address. Upgrade all mesh participants
+before using this operation. Existing UDP target flow state is not migrated.
+Incarnation ordering is retained in membership and unexpired reconnect hints;
+the seven-day hint limit is not a permanent identity revocation registry.
+
 IDs and advertised addresses must be unique among running servers. The
 directory holds up to 32 members. Membership maintenance is automatic:
 
-- A server that moved to a new address, or a new server that reuses a departed
-  member's ID or address, replaces the old record once no member has reported
-  the old record running for 20 seconds. Two running claims never displace
-  each other; the conflicting record is ignored and logged at debug level.
+- A persisted address migration supersedes the same ID's older incarnation.
+  Conflicting legacy records with incarnation zero, or a different ID reusing
+  a departed member's address, replace the old record once no member has
+  reported it running for 20 seconds. Other running claims never displace each
+  other; the conflicting record is ignored and logged at debug level. Retaining
+  a versioned node ID requires its saved state; a fresh directory cannot reset
+  an existing member's incarnation.
 - Records that no member has reported running for 10 minutes are forgotten,
   freeing their slot. A server with no live peer forgets nothing, so its own
   isolation cannot erase the cluster. If the table is full, an authenticated new
@@ -108,14 +121,19 @@ timer; discovery runs every 15 seconds in the background, so unavailable
 members cannot delay a renewal. After discovery the client adds newly
 discovered nodes when a path slot is available. A lease the server explicitly
 rejects is recreated, or released at once if no replacement can be allocated.
+Renewal completions are consumed individually alongside discovery and allocation;
+a stalled renewal does not prevent a newly allocated entrance being published.
 Unchanged paths keep their connections; replacements keep the local UDP
 listener and selected exit. Each recovered entrance is published immediately,
 without waiting for other renewals to finish.
 Discovery rotates among known members and falls back to other members on
 failure. A partial live directory does not erase previously known candidates.
 The saved member cache is bounded to 32 entries. A fresh authenticated
-response replaces cached records with the same ID or address, and evicts older
-hints first when the cache is full.
+response replaces cached records with the same ID or address, subject to the
+incarnation ordering above, and evicts older hints first when the cache is full.
+Cache writes are serialized on a blocking worker with coalesced pending state;
+maintenance and network lease cleanup do not wait for disk sync. Runtime teardown
+can still wait for an outstanding filesystem operation.
 When no data path is connected, the client attempts all configured entrances
 concurrently (at most eight), so unavailable earlier entries cannot delay a
 working later entry. Background reconnections retain a two-attempt limit.
@@ -135,9 +153,30 @@ and reacquired. Existing UDP flows may need to restart.
 
 Upgrade the mesh client and its selected exit together to v0.2.1 or newer.
 Older mesh clients omit this binding, and older exits cannot acknowledge it;
-both cases fail explicitly. The cluster key format and membership exchange
-remain unchanged. Ordinary `client`/`server` sessions still work without a mesh
+both cases fail explicitly. The cluster key format remains unchanged. v0.2.2
+adds allocation request identities, explicit release, and nonzero address
+incarnations; upgrade mesh clients and servers together before using these
+features. Older parsers reject the added fields. Ordinary `client`/`server`
+sessions still work without a mesh
 exit header.
+
+Each v0.2.2 allocation has a stable random request identity. Repeating it from
+the same source IP for the same exit returns the existing lease, including when
+the response was lost or the lease quota is full. Deduplication state is bounded
+by the live lease table and expires with the lease. It does not preserve a lease
+across a relay restart. Changing the exit under the same request identity is
+rejected. Normal client exit and address migration explicitly release old
+allocations; release can select a lease or its allocation request identity, so
+an allocation whose response was lost can still be reclaimed. Release is
+authenticated and source/exit bound. A successful release waits for its relay
+task and UDP socket to close; repeating a release is harmless.
+
+Graceful client cleanup is bounded to five seconds. A killed client, unreachable
+control endpoint still relies on the existing idle lease timeout. A bounded
+history of 512 released request identities rejects late allocations for 45
+seconds, including release arriving before allocation. Oldest entries are
+evicted at capacity; requests arriving beyond this history still rely on idle
+expiration. Control-plane failure alone does not release a working data path.
 
 ## Coordination and resource bounds
 
@@ -248,3 +287,13 @@ reuse through direct and relay paths, incomplete discovery, optional allocation
 blackholes, blocked unauthenticated responses, aggregate relay budgets, and
 SIGTERM against the local executable. These are local correctness checks, not
 public-network throughput or service-manager deployment acceptance.
+
+The v0.2.2 checks cut a real HTTP/3 allocation response after server commit,
+retry without consuming another lease, reject unauthorized release, and cycle
+allocation/release 64 times through one relay port. They also cover bounded
+release-before-allocation cancellation, slow and failed cache writes, stale
+cache incarnations, and allocation publication during an unrelated blocked
+renewal. A process test keeps a client running while its selected server moves
+using the original state directory and keys, then reuses the old address for a
+different node; recovery must deliver to the selected exit and never to the
+address successor. These checks do not establish a WAN recovery-time guarantee.

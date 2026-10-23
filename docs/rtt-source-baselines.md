@@ -26,6 +26,23 @@ probe identifiers cannot lower a learned probe baseline. Generation changes
 reset all minima and counters while preserving the local setting. Peers cannot
 change that setting through negotiation.
 
+Minima do not age upward within a generation. A lasting increase in propagation
+delay can therefore remain classified as queue pressure. Sustained RTT and
+delivery samples alone cannot distinguish that change from a standing queue
+elsewhere on the path; periodically replacing the minimum would hide both.
+Changing this behavior requires an independent requalification signal and a
+comparison that also preserves real-queue braking. No timer-based reset or
+automatic decay of remembered service is enabled in v0.2.2.
+
+The long-lived regression fixtures keep one generation through a sustained RTT
+step and through a prolonged capacity reduction followed by recovery. They
+record allowances, fixed-window simulated delivery, queue percentiles, drops
+and recovery intervals while checking memory, packet-age and admission bounds.
+The FIFO model omits Quinn congestion control, flow scheduling and application
+ingress deadlines. Its results can expose controller behavior, but cannot
+establish an end-to-end performance improvement or justify weakening those
+safeguards. Run-specific measurements and decisions remain in ignored `local/`.
+
 Control snapshots expose `rtt_source_baselines_enabled`, the two `source_*`
 minima, `mixed_rtt_excess_ms`, and `rtt_source_baseline_corrections`. The last is
 an observation count, not saved requests, prevented brakes or bandwidth gain.

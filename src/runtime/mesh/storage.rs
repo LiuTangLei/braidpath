@@ -82,7 +82,7 @@ pub(super) fn open_server(
     node: &Node,
     join_key: Option<&Path>,
     joining: bool,
-) -> Result<(ServerKey, fs::File)> {
+) -> Result<(ServerKey, Node, fs::File)> {
     private_dir(dir)?;
     let mut options = fs::OpenOptions::new();
     options.read(true).write(true).create(true).truncate(false);
@@ -97,57 +97,47 @@ pub(super) fn open_server(
     // Keep the file itself: unlinking a lock file lets another process lock a
     // different inode. The OS releases the lock even after a process crash.
     let identity_path = dir.join(IDENTITY);
-    let identity: Identity = if identity_path.exists() {
+    let saved = identity_path.exists();
+    let mut identity: Identity = if saved {
         read_json(&identity_path)?
+    } else if dir.join("server-key.json").exists() || dir.join("node.json").exists() {
+        // Preserve complete pre-manifest identities. Partial legacy state
+        // is rejected instead of silently minting replacement credentials.
+        Identity {
+            node: read_json(&dir.join("node.json"))?,
+            key: read_json(&dir.join("server-key.json"))?,
+        }
     } else {
-        let identity = if dir.join("server-key.json").exists() || dir.join("node.json").exists() {
-            // Preserve complete pre-manifest identities. Partial legacy state
-            // is rejected instead of silently minting replacement credentials.
-            Identity {
-                node: read_json(&dir.join("node.json"))?,
-                key: read_json(&dir.join("server-key.json"))?,
-            }
+        ensure!(
+            fs::read_dir(dir)?.all(|entry| entry.is_ok_and(|e| {
+                let name = e.file_name();
+                name == "server.lock" || name.to_string_lossy().starts_with(STAGED)
+            })),
+            "unrecognized state files; refusing to replace credentials"
+        );
+        let key = if let Some(path) = join_key {
+            read_json(path)?
         } else {
-            ensure!(
-                fs::read_dir(dir)?.all(|entry| entry.is_ok_and(|e| {
-                    let name = e.file_name();
-                    name == "server.lock" || name.to_string_lossy().starts_with(STAGED)
-                })),
-                "unrecognized state files; refusing to replace credentials"
-            );
-            let key = if let Some(path) = join_key {
-                read_json(path)?
-            } else {
-                ensure!(!joining, "first join requires --join-key");
-                let certificate = rcgen::generate_simple_self_signed(vec![NAME.into()])?;
-                ServerKey {
-                    client: ClientKey {
-                        version: 1,
-                        certificate: certificate.cert.pem(),
-                        token: transport::hex(&rand::random::<[u8; 32]>()),
-                    },
-                    private_key: certificate.signing_key.serialize_pem(),
-                    member_token: transport::hex(&rand::random::<[u8; 32]>()),
-                }
-            };
-            Identity {
-                node: node.clone(),
-                key,
+            ensure!(!joining, "first join requires --join-key");
+            let certificate = rcgen::generate_simple_self_signed(vec![NAME.into()])?;
+            ServerKey {
+                client: ClientKey {
+                    version: 1,
+                    certificate: certificate.cert.pem(),
+                    token: transport::hex(&rand::random::<[u8; 32]>()),
+                },
+                private_key: certificate.signing_key.serialize_pem(),
+                member_token: transport::hex(&rand::random::<[u8; 32]>()),
             }
         };
-        ensure!(
-            identity.node == *node,
-            "node identity/address differs from saved state"
-        );
-        validate_key(&identity.key)?;
-        // This single durable record is authoritative. A later restart can
-        // finish publishing any missing derived file after interrupted setup.
-        write_json(&identity_path, &identity)?;
-        identity
+        Identity {
+            node: node.clone(),
+            key,
+        }
     };
     ensure!(
-        identity.node == *node,
-        "node identity/address differs from saved state"
+        identity.node.id == node.id,
+        "node identity differs from saved state"
     );
     validate_key(&identity.key)?;
     if let Some(path) = join_key
@@ -159,14 +149,49 @@ pub(super) fn open_server(
             "join key belongs to a different cluster"
         );
     }
+    node.validate()?;
+    let moved = identity.node.address != node.address;
+    if moved {
+        identity.node.incarnation = identity
+            .node
+            .incarnation
+            .checked_add(1)
+            .context("node incarnation exhausted")?;
+        identity.node.address = node.address;
+    }
+    let node_path = dir.join("node.json");
+    let derived = if node_path.try_exists()? {
+        let derived: Node = read_json(&node_path)?;
+        ensure!(
+            derived.id == identity.node.id
+                && (derived == identity.node || derived.incarnation < identity.node.incarnation),
+            "node file conflicts with saved identity"
+        );
+        Some(derived)
+    } else {
+        None
+    };
+    if !saved || moved {
+        // Publish the complete identity first. A crash before updating node.json
+        // is repaired from this journal without incrementing the version again.
+        let encoded = serde_json::to_vec(&identity)?;
+        ensure!(encoded.len() <= MAX_BODY, "mesh state exceeds size limit");
+        atomic_write(&identity_path, &encoded, saved)?;
+    }
     // A once-imported key may be removed without breaking the original service
     // arguments. Persistent identity, not the enrollment file, owns a restart.
     install_client(dir, &identity.key.client)?;
     materialize(&dir.join("key.pem"), identity.key.private_key.as_bytes())?;
     materialize_json(&dir.join("server-key.json"), &identity.key)?;
     materialize_json(&dir.join("client-key.json"), &identity.key.client)?;
-    materialize_json(&dir.join("node.json"), node)?;
-    Ok((identity.key, lock))
+    if derived.as_ref() != Some(&identity.node) {
+        atomic_write(
+            &node_path,
+            &serde_json::to_vec(&identity.node)?,
+            derived.is_some(),
+        )?;
+    }
+    Ok((identity.key, identity.node, lock))
 }
 
 #[cfg(test)]
@@ -178,6 +203,7 @@ mod tests {
         Node {
             id: "node".into(),
             address: "127.0.0.1:4433".parse().unwrap(),
+            incarnation: 0,
         }
     }
 
@@ -186,7 +212,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let dir = temp.path().join("node");
         let node = node();
-        let (key, lock) = open_server(&dir, &node, None, false).unwrap();
+        let (key, _, lock) = open_server(&dir, &node, None, false).unwrap();
         let before = fs::read(dir.join(IDENTITY)).unwrap();
         assert!(open_server(&dir, &node, None, false).is_err());
         drop(lock);
@@ -201,7 +227,7 @@ mod tests {
             fs::remove_file(dir.join(name)).unwrap();
         }
         // Enrollment input can be removed after import; service args still work.
-        let (restored, lock) = open_server(
+        let (restored, _, lock) = open_server(
             &dir,
             &node,
             Some(&temp.path().join("removed-join-key")),
@@ -246,7 +272,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let node = node();
         let source = temp.path().join("source");
-        let (mut key, lock) = open_server(&source, &node, None, false).unwrap();
+        let (mut key, _, lock) = open_server(&source, &node, None, false).unwrap();
         drop(lock);
         let input = temp.path().join("import.json");
         let pem = key.private_key.clone();
@@ -262,13 +288,13 @@ mod tests {
         assert!(!dir.join("cert.pem").exists());
         key.private_key = pem;
         atomic_write(&input, &serde_json::to_vec(&key).unwrap(), true).unwrap();
-        let (imported, lock) = open_server(&dir, &node, Some(&input), true).unwrap();
+        let (imported, _, lock) = open_server(&dir, &node, Some(&input), true).unwrap();
         assert!(imported == key);
         drop(lock);
         key.member_token = "b".repeat(64);
         atomic_write(&input, &serde_json::to_vec(&key).unwrap(), true).unwrap();
         assert!(open_server(&dir, &node, Some(&input), true).is_err());
-        let (saved, _lock) = open_server(&dir, &node, None, false).unwrap();
+        let (saved, _, _lock) = open_server(&dir, &node, None, false).unwrap();
         assert!(saved == imported);
     }
 
@@ -277,7 +303,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let dir = temp.path().join("node");
         let node = node();
-        let (key, lock) = open_server(&dir, &node, None, false).unwrap();
+        let (key, _, lock) = open_server(&dir, &node, None, false).unwrap();
         drop(lock);
         fs::remove_file(dir.join(IDENTITY)).unwrap();
         fs::write(
@@ -286,9 +312,100 @@ mod tests {
         )
         .unwrap();
         fs::write(dir.join("node.json"), serde_json::to_vec(&node).unwrap()).unwrap();
-        let (adopted, _lock) = open_server(&dir, &node, None, false).unwrap();
+        let (adopted, _, _lock) = open_server(&dir, &node, None, false).unwrap();
         assert!(adopted == key);
         assert!(dir.join(IDENTITY).exists());
+    }
+
+    #[test]
+    fn address_migration_preserves_keys_and_recovers_an_interrupted_node_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("node");
+        let original = node();
+        let (key, saved, lock) = open_server(&dir, &original, None, false).unwrap();
+        assert_eq!(saved, original);
+        let original_node = fs::read(dir.join("node.json")).unwrap();
+        let key_files: Vec<_> = [
+            "cert.pem",
+            "key.pem",
+            "token",
+            "client-key.json",
+            "server-key.json",
+        ]
+        .into_iter()
+        .map(|name| (name, fs::read(dir.join(name)).unwrap()))
+        .collect();
+        let mut requested = original.clone();
+        requested.address.set_port(4434);
+        // The existing process must retain exclusive ownership during a move.
+        assert!(open_server(&dir, &requested, None, false).is_err());
+        drop(lock);
+        let (moved_key, moved, lock) = open_server(&dir, &requested, None, false).unwrap();
+        assert!(moved_key == key);
+        assert_eq!(moved.address, requested.address);
+        assert_eq!(moved.incarnation, 1);
+        let journal = fs::read(dir.join(IDENTITY)).unwrap();
+        drop(lock);
+
+        // Model a crash after identity publication but before node.json was
+        // replaced: restart must repair this file and keep exactly version 1.
+        atomic_write(&dir.join("node.json"), &original_node, true).unwrap();
+        let (recovered_key, recovered, lock) = open_server(&dir, &requested, None, false).unwrap();
+        assert!(recovered_key == key);
+        assert_eq!(recovered, moved);
+        assert_eq!(fs::read(dir.join(IDENTITY)).unwrap(), journal);
+        assert_eq!(read_json::<Node>(&dir.join("node.json")).unwrap(), moved);
+        for (name, bytes) in key_files {
+            assert_eq!(fs::read(dir.join(name)).unwrap(), bytes);
+        }
+        drop(lock);
+        let (_, returned, _lock) = open_server(&dir, &original, None, false).unwrap();
+        assert_eq!(returned.address, original.address);
+        assert_eq!(returned.incarnation, 2);
+    }
+
+    #[test]
+    fn migration_rejects_wrong_keys_and_overflow_before_mutating_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("node");
+        let original = node();
+        let (mut wrong_key, _, lock) = open_server(&dir, &original, None, false).unwrap();
+        drop(lock);
+        let mut requested = original.clone();
+        requested.address.set_port(4434);
+        let before = fs::read(dir.join(IDENTITY)).unwrap();
+        wrong_key.member_token = if wrong_key.member_token == "b".repeat(64) {
+            "c".repeat(64)
+        } else {
+            "b".repeat(64)
+        };
+        let key_path = temp.path().join("wrong-key.json");
+        write_json(&key_path, &wrong_key).unwrap();
+        assert!(open_server(&dir, &requested, Some(&key_path), true).is_err());
+        assert_eq!(fs::read(dir.join(IDENTITY)).unwrap(), before);
+        assert_eq!(read_json::<Node>(&dir.join("node.json")).unwrap(), original);
+
+        let mut identity: Identity = read_json(&dir.join(IDENTITY)).unwrap();
+        identity.node.incarnation = u64::MAX;
+        atomic_write(
+            &dir.join(IDENTITY),
+            &serde_json::to_vec(&identity).unwrap(),
+            true,
+        )
+        .unwrap();
+        atomic_write(
+            &dir.join("node.json"),
+            &serde_json::to_vec(&identity.node).unwrap(),
+            true,
+        )
+        .unwrap();
+        let before = fs::read(dir.join(IDENTITY)).unwrap();
+        assert!(open_server(&dir, &requested, None, false).is_err());
+        assert_eq!(fs::read(dir.join(IDENTITY)).unwrap(), before);
+        assert_eq!(
+            read_json::<Node>(&dir.join("node.json")).unwrap(),
+            identity.node
+        );
     }
 
     #[test]

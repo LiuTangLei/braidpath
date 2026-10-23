@@ -210,6 +210,7 @@ async fn mesh_survives_bootstrap_loss_and_selects_any_exit_through_peers() {
         sender: Node {
             id: "intruder".into(),
             address: address(),
+            incarnation: 0,
         },
         nodes: vec![],
     };
@@ -238,6 +239,7 @@ async fn mesh_survives_bootstrap_loss_and_selects_any_exit_through_peers() {
                 "/mesh/relay",
                 Some(
                     serde_json::to_vec(&RelayRequest {
+                        request: None,
                         exit: "intruder".into(),
                         lease: None
                     })
@@ -307,6 +309,7 @@ pub(crate) fn state(root: &Path) -> State {
         own: Node {
             id: "own".into(),
             address: "127.0.0.1:10000".parse().unwrap(),
+            incarnation: 0,
         },
         bind: "127.0.0.1:10000".parse().unwrap(),
         relay_ports: None,
@@ -318,6 +321,7 @@ pub(crate) fn state(root: &Path) -> State {
         membership_write: Arc::new(tokio::sync::Mutex::new(())),
         relay_budget: Arc::new(relay::HostBudget::new(10_000_000)),
         leases: Mutex::new(BTreeMap::new()),
+        released_requests: Mutex::new(ReleasedRequests::default()),
         control_connections: Arc::new(tokio::sync::Semaphore::new(CONTROL_CONNECTIONS)),
         rate: 10_000_000,
     }
@@ -326,6 +330,7 @@ fn node(id: &str, port: u16) -> Node {
     Node {
         id: id.into(),
         address: SocketAddr::from(([127, 0, 0, 1], port)),
+        incarnation: 0,
     }
 }
 fn age(state: &State, id: &str, by: Duration) {
@@ -476,6 +481,7 @@ async fn failed_restart_cache_write_does_not_commit_membership_and_can_retry() {
     let peer = Node {
         id: "peer".into(),
         address: "127.0.0.1:10001".parse().unwrap(),
+        incarnation: 0,
     };
     fs::create_dir(temp.path().join("peers.json")).unwrap();
     let exchange = || Exchange {
@@ -639,6 +645,7 @@ async fn stalled_membership_write_keeps_reads_and_relay_live_and_cancellation_pr
         .relay(
             source,
             RelayRequest {
+                request: None,
                 exit: "own".into(),
                 lease: None,
             },
@@ -683,6 +690,7 @@ async fn stalled_membership_write_keeps_reads_and_relay_live_and_cancellation_pr
         server.relay(
             source,
             RelayRequest {
+                request: None,
                 exit: "own".into(),
                 lease: Some(lease.lease.clone()),
             },
@@ -839,6 +847,7 @@ async fn relay_leases_are_source_bound_and_expire() {
         .relay(
             source,
             RelayRequest {
+                request: None,
                 exit: "own".into(),
                 lease: None,
             },
@@ -846,6 +855,7 @@ async fn relay_leases_are_source_bound_and_expire() {
         .await
         .unwrap();
     let request = || RelayRequest {
+        request: None,
         exit: "own".into(),
         lease: Some(created.lease.clone()),
     };
@@ -875,6 +885,7 @@ async fn relay_traffic_keeps_a_lease_and_sources_are_capped() {
     state.bind = "127.0.0.1:0".parse().unwrap();
     let source = "127.0.0.1".parse().unwrap();
     let request = || RelayRequest {
+        request: None,
         exit: "own".into(),
         lease: None,
     };
@@ -927,6 +938,7 @@ async fn membership_outage_preserves_owned_lease_and_udp_delivery() {
     let exit = Node {
         id: "exit".into(),
         address: target.local_addr().unwrap(),
+        incarnation: 0,
     };
     state
         .merge(
@@ -943,6 +955,7 @@ async fn membership_outage_preserves_owned_lease_and_udp_delivery() {
         .relay(
             source,
             RelayRequest {
+                request: None,
                 exit: "exit".into(),
                 lease: None,
             },
@@ -956,6 +969,7 @@ async fn membership_outage_preserves_owned_lease_and_udp_delivery() {
             .relay(
                 source,
                 RelayRequest {
+                    request: None,
                     exit: "exit".into(),
                     lease: None,
                 }
@@ -965,6 +979,7 @@ async fn membership_outage_preserves_owned_lease_and_udp_delivery() {
         "offline exits must not get new allocations"
     );
     let request = || RelayRequest {
+        request: None,
         exit: "exit".into(),
         lease: Some(created.lease.clone()),
     };
@@ -979,6 +994,7 @@ async fn membership_outage_preserves_owned_lease_and_udp_delivery() {
             .relay(
                 source,
                 RelayRequest {
+                    request: None,
                     exit: "own".into(),
                     lease: Some(created.lease.clone()),
                 }
@@ -1016,6 +1032,7 @@ async fn relay_port_exhaustion_and_reclamation_stay_within_configured_range() {
     state.relay_ports = Some(port.to_string().parse().unwrap());
     let source = "127.0.0.1".parse().unwrap();
     let request = || RelayRequest {
+        request: None,
         exit: "own".into(),
         lease: None,
     };
@@ -1288,6 +1305,7 @@ async fn partition_heals_after_both_groups_forget_and_reload_hints() {
         .map(|i| Node {
             id: format!("node_{i}"),
             address: address(),
+            incarnation: 0,
         })
         .collect();
     let mut states = Vec::new();

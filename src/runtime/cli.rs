@@ -409,6 +409,7 @@ pub async fn run() -> Result<()> {
                 exit,
             )
             .await;
+            leases.shutdown().await;
             reporter.finish(result).await
         }
         Command::Server {

@@ -43,6 +43,7 @@ const SYNC_EVERY: Duration = Duration::from_secs(5);
 const FORGET_AFTER: Duration = Duration::from_secs(10 * 60);
 const RECONNECT_EVERY: Duration = Duration::from_secs(60);
 const MAX_SOURCE_LEASES: usize = 16;
+const MAX_RELEASED_REQUESTS: usize = MAX_NODES * MAX_SOURCE_LEASES;
 // Control connections have their own budget, separate from data paths.
 const CONTROL_CONNECTIONS: usize = 256;
 pub(crate) const CONTROL_IDLE: Duration = Duration::from_secs(60);
@@ -52,8 +53,22 @@ pub(crate) const CONTROL_IDLE: Duration = Duration::from_secs(60);
 pub struct Node {
     pub id: String,
     pub address: SocketAddr,
+    // Persisted locally and advanced only when the advertised address changes.
+    // Zero is the legacy wire format; unchanged nodes can still be discovered
+    // by older peers while a cluster is upgraded.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub incarnation: u64,
+}
+fn is_zero(value: &u64) -> bool {
+    *value == 0
 }
 impl Node {
+    pub(super) fn supersedes(&self, previous: &Node) -> bool {
+        self.id == previous.id
+            && (self.incarnation > previous.incarnation
+                || (self.incarnation == previous.incarnation
+                    && (self.address == previous.address || self.incarnation == 0)))
+    }
     fn validate(&self) -> Result<()> {
         ensure!(
             !self.id.is_empty()
@@ -164,11 +179,32 @@ enum Admission {
 struct Lease {
     source: IpAddr,
     exit: String,
+    request: Option<String>,
     address: SocketAddr,
     touched: Instant,
     metrics: stats::Metrics,
     forwarded: u64,
     task: AbortTask,
+}
+#[derive(Default)]
+struct ReleasedRequests(BTreeMap<(IpAddr, String), (String, Instant)>);
+impl ReleasedRequests {
+    fn prune(&mut self) {
+        self.0.retain(|_, (_, at)| at.elapsed() < LEASE_FOR);
+    }
+    fn insert(&mut self, source: IpAddr, request: String, exit: String) {
+        self.prune();
+        self.0.insert((source, request), (exit, Instant::now()));
+        if self.0.len() > MAX_RELEASED_REQUESTS {
+            let oldest = self
+                .0
+                .iter()
+                .min_by_key(|(_, (_, at))| *at)
+                .map(|(key, _)| key.clone())
+                .expect("nonempty cancellations");
+            self.0.remove(&oldest);
+        }
+    }
 }
 impl Lease {
     fn forwarded(&self) -> u64 {
@@ -210,6 +246,9 @@ pub struct State {
     reconnect: Arc<Mutex<Vec<hints::Hint>>>,
     membership_write: Arc<tokio::sync::Mutex<()>>,
     leases: Mutex<BTreeMap<String, Lease>>,
+    // Always locked after leases. Bounded cancellation history prevents a
+    // delayed allocation from recreating a just-released path.
+    released_requests: Mutex<ReleasedRequests>,
     control_connections: Arc<Semaphore>,
     rate: u64,
     relay_budget: Arc<relay::HostBudget>,
@@ -225,6 +264,23 @@ struct Exchange {
 struct RelayRequest {
     exit: String,
     lease: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    request: Option<String>,
+}
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReleaseRequest {
+    exit: String,
+    lease: Option<String>,
+    request: Option<String>,
+}
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReleaseReply {
+    released: bool,
+}
+fn valid_lease_id(id: &str) -> bool {
+    id.len() == 32 && id.bytes().all(|b| b.is_ascii_hexdigit())
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -286,13 +342,22 @@ impl State {
         if peers.get(&node.id).is_some_and(|p| p.node == *node) {
             return Admission::Unchanged;
         }
+        if peers
+            .get(&node.id)
+            .is_some_and(|p| !node.supersedes(&p.node))
+        {
+            return Admission::Reject("stale or inconsistent node incarnation");
+        }
         let conflicts: Vec<_> = peers
             .values()
             .filter(|p| p.node.id == node.id || p.node.address == node.address)
             .collect();
-        // A moved or replaced server takes over only from records nobody has
-        // reported running recently; two live claims never displace each other.
-        if conflicts.iter().any(|p| p.heard.elapsed() < LIVE_FOR) {
+        // A persisted address update supersedes the same node immediately.
+        // Other IDs still cannot take an address a live member currently owns.
+        if conflicts.iter().any(|p| {
+            p.heard.elapsed() < LIVE_FOR
+                && !(p.node.id == node.id && node.incarnation > p.node.incarnation)
+        }) {
             return Admission::Reject("conflicts with a current member");
         }
         Admission::Add {
@@ -360,10 +425,24 @@ impl State {
     async fn merge(&self, exchange: Exchange, direct: bool) -> Result<()> {
         ensure!(exchange.nodes.len() <= MAX_NODES, "too many members");
         let now = Instant::now();
+        let now_unix = hints::now_unix();
         self.update_members(move |own, next, reconnect| {
             let records = std::iter::once(&exchange.sender).chain(&exchange.nodes);
             for (index, node) in records.enumerate() {
                 let sender = index == 0;
+                if reconnect
+                    .iter()
+                    .any(|hint| {
+                        now_unix.saturating_sub(hint.forgotten_unix)
+                            < hints::HINT_TTL.as_secs()
+                            && hint.node.id == node.id
+                            && !node.supersedes(&hint.node)
+                    })
+                {
+                    ensure!(!sender, "stale or inconsistent forgotten node incarnation");
+                    tracing::debug!(node=%node.id, "stale membership hint ignored");
+                    continue;
+                }
                 match Self::admit(own, next, node) {
                     Admission::Unchanged => {}
                     Admission::Add { mut replaces } => {
@@ -472,8 +551,21 @@ impl State {
         self.control_connections.clone().try_acquire_owned().ok()
     }
     async fn relay(&self, source: IpAddr, request: RelayRequest) -> Result<RelayReply> {
+        ensure!(
+            request.request.as_deref().is_none_or(valid_lease_id)
+                && !(request.lease.is_some() && request.request.is_some()),
+            "invalid allocation request"
+        );
         let mut leases = self.leases.lock().expect("leases");
         reap(&mut leases);
+        if let Some(key) = &request.request {
+            let mut released = self.released_requests.lock().expect("released requests");
+            released.prune();
+            ensure!(
+                !released.0.contains_key(&(source, key.clone())),
+                "allocation request was released"
+            );
+        }
         if let Some(id) = request.lease {
             let lease = leases.get_mut(&id).context("lease expired")?;
             ensure!(
@@ -483,6 +575,24 @@ impl State {
             lease.touched = Instant::now();
             return Ok(RelayReply {
                 lease: id,
+                address: lease.address,
+            });
+        }
+        // A reply can be lost after the socket was allocated. Replaying that
+        // allocation returns the same owned path, even at the resource cap or
+        // during a membership outage. The key lives only as long as its lease.
+        if let Some(key) = &request.request
+            && let Some((id, lease)) = leases
+                .iter_mut()
+                .find(|(_, lease)| lease.source == source && lease.request.as_ref() == Some(key))
+        {
+            ensure!(
+                lease.exit == request.exit,
+                "allocation request exit mismatch"
+            );
+            lease.touched = Instant::now();
+            return Ok(RelayReply {
+                lease: id.clone(),
                 address: lease.address,
             });
         }
@@ -530,6 +640,7 @@ impl State {
             Lease {
                 source,
                 exit: request.exit,
+                request: request.request,
                 address,
                 touched: Instant::now(),
                 metrics,
@@ -538,6 +649,66 @@ impl State {
             },
         );
         Ok(RelayReply { lease: id, address })
+    }
+    async fn release(&self, source: IpAddr, request: ReleaseRequest) -> Result<ReleaseReply> {
+        ensure!(
+            request.lease.is_some() != request.request.is_some(),
+            "release requires exactly one lease or allocation request"
+        );
+        ensure!(
+            request
+                .lease
+                .as_deref()
+                .or(request.request.as_deref())
+                .is_some_and(valid_lease_id),
+            "invalid release selector"
+        );
+        let removed = {
+            let mut leases = self.leases.lock().expect("leases");
+            if let Some(key) = &request.request {
+                let mut released = self.released_requests.lock().expect("released requests");
+                released.prune();
+                if let Some((exit, _)) = released.0.get(&(source, key.clone())) {
+                    ensure!(*exit == request.exit, "released request exit mismatch");
+                }
+            }
+            let id = request.lease.clone().or_else(|| {
+                leases
+                    .iter()
+                    .find(|(_, lease)| lease.source == source && lease.request == request.request)
+                    .map(|(id, _)| id.clone())
+            });
+            let removed = if let Some(id) = id {
+                if let Some(lease) = leases.get(&id) {
+                    ensure!(
+                        lease.source == source && lease.exit == request.exit,
+                        "lease owner mismatch"
+                    );
+                }
+                leases.remove(&id)
+            } else {
+                None
+            };
+            let key = request
+                .request
+                .or_else(|| removed.as_ref().and_then(|lease| lease.request.clone()));
+            if let Some(key) = key {
+                self.released_requests
+                    .lock()
+                    .expect("released requests")
+                    .insert(source, key, request.exit);
+            }
+            removed
+        };
+        if let Some(mut lease) = removed {
+            // Wait outside the map lock: success means the relay task and its
+            // UDP socket have actually gone away, not merely left the table.
+            lease.task.0.abort();
+            let _ = (&mut lease.task.0).await;
+            Ok(ReleaseReply { released: true })
+        } else {
+            Ok(ReleaseReply { released: false })
+        }
     }
     pub(crate) fn authorized(&self, request: &Request<()>) -> bool {
         let expected = if request.uri().path() == "/mesh/sync" {
@@ -579,6 +750,10 @@ impl State {
                 (&Method::POST, "/mesh/relay") => {
                     let request = serde_json::from_slice(&read_body(stream).await?)?;
                     Ok(serde_json::to_vec(&self.relay(source, request).await?)?)
+                }
+                (&Method::POST, "/mesh/release") => {
+                    let request = serde_json::from_slice(&read_body(stream).await?)?;
+                    Ok(serde_json::to_vec(&self.release(source, request).await?)?)
                 }
                 _ => bail!("unknown mesh operation"),
             }
@@ -638,13 +813,14 @@ pub async fn serve(options: ServerOptions) -> Result<()> {
     let own = Node {
         id: options.id,
         address: options.advertise,
+        incarnation: 0,
     };
     own.validate()?;
     ensure!(
         options.listen.is_ipv4() == options.advertise.is_ipv4(),
         "listen and advertise address families differ"
     );
-    let (key, directory_lock) = storage::open_server(
+    let (key, own, directory_lock) = storage::open_server(
         &options.dir,
         &own,
         options.join_key.as_deref(),
@@ -664,6 +840,7 @@ pub async fn serve(options: ServerOptions) -> Result<()> {
         membership_write: Arc::new(tokio::sync::Mutex::new(())),
         relay_budget: Arc::new(relay::HostBudget::new(options.rate)),
         leases: Mutex::new(BTreeMap::new()),
+        released_requests: Mutex::new(ReleasedRequests::default()),
         control_connections: Arc::new(Semaphore::new(CONTROL_CONNECTIONS)),
     });
     if options.dir.join("peers.json").exists() {
@@ -768,6 +945,7 @@ pub async fn serve(options: ServerOptions) -> Result<()> {
 pub struct ClientIdentity {
     pub dir: PathBuf,
     auth: String,
+    cache: discovery::Cache,
 }
 impl ClientIdentity {
     pub fn open(dir: PathBuf, key_path: &Path) -> Result<Self> {
@@ -775,6 +953,7 @@ impl ClientIdentity {
         private_dir(&dir)?;
         install_client(&dir, &key)?;
         Ok(Self {
+            cache: discovery::Cache::open(dir.clone()),
             dir,
             auth: format!("Bearer {}", key.token),
         })
@@ -794,5 +973,9 @@ impl ClientIdentity {
     }
 }
 
+#[cfg(test)]
+mod lease_tests;
+#[cfg(test)]
+mod migration_tests;
 #[cfg(test)]
 pub(crate) mod tests;

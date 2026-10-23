@@ -19,11 +19,19 @@ impl Default for PathHealth {
     }
 }
 
-/// Owns the maintenance task; dropping it stops discovery and lease renewal.
+/// Owns maintenance and its bounded, best-effort remote lease cleanup.
 pub struct Entrances {
     health: watch::Sender<PathHealth>,
     updates: watch::Receiver<Vec<SocketAddr>>,
-    _maintenance: AbortTask,
+    stop: Option<tokio::sync::oneshot::Sender<()>>,
+    maintenance: Option<tokio::task::JoinHandle<()>>,
+}
+impl Drop for Entrances {
+    fn drop(&mut self) {
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+    }
 }
 impl Entrances {
     pub(crate) fn health(&self) -> watch::Sender<PathHealth> {
@@ -32,6 +40,18 @@ impl Entrances {
 
     pub fn updates(&self) -> watch::Receiver<Vec<SocketAddr>> {
         self.updates.clone()
+    }
+
+    /// Normal CLI exit waits for remote cleanup; dropping the guard requests
+    /// the same cleanup without blocking its caller. An unreachable server or
+    /// a request completed after cancellation still has its idle lease TTL.
+    pub async fn shutdown(mut self) {
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+        if let Some(maintenance) = self.maintenance.take() {
+            let _ = maintenance.await;
+        }
     }
 
     pub(super) async fn start(
@@ -43,6 +63,8 @@ impl Entrances {
     ) -> Result<(Vec<SocketAddr>, Self)> {
         ensure!((1..=MAX_PATHS).contains(&limit), "invalid entrance limit");
         validate_nodes(&nodes)?;
+        let known = identity.cache.remember(&nodes)?;
+        let nodes = discovery::current_nodes(&known, &nodes)?;
         let selected = nodes
             .iter()
             .find(|n| n.id == exit)
@@ -57,23 +79,28 @@ impl Entrances {
             )?),
             auth: identity.auth.clone(),
             selected,
-            cache_dir: identity.dir.clone(),
-            known: discovery::merge_known(&discovery::cached(&identity.dir), &nodes)?,
+            cache: identity.cache.clone(),
+            known,
             nodes,
             leases: BTreeMap::new(),
+            requests: BTreeMap::new(),
             limit,
             discovery_cursor: 0,
             allocation_cursor: 0,
         };
         let initial = directory.addresses();
         let (tx, updates) = watch::channel(initial.clone());
-        let maintenance = AbortTask(tokio::spawn(directory.maintain(tx, interval)));
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let maintenance = tokio::spawn(directory.run(tx, interval, async {
+            let _ = stopped.await;
+        }));
         Ok((
             initial,
             Self {
                 health,
                 updates,
-                _maintenance: maintenance,
+                stop: Some(stop),
+                maintenance: Some(maintenance),
             },
         ))
     }
@@ -84,15 +111,27 @@ struct ClientLease {
     reply: RelayReply,
     renewed: Instant,
 }
+#[derive(Clone)]
+struct Allocation {
+    node: Node,
+    exit: Node,
+    request: String,
+}
+struct Renewal {
+    allocation: Allocation,
+    previous: RelayReply,
+    result: Result<Option<RelayReply>>,
+}
 struct Directory {
     health: watch::Receiver<PathHealth>,
     control: Arc<Control>,
     auth: String,
     selected: Node,
-    cache_dir: PathBuf,
+    cache: discovery::Cache,
     nodes: Vec<Node>,
     known: Vec<Node>,
     leases: BTreeMap<String, ClientLease>,
+    requests: BTreeMap<String, Allocation>,
     limit: usize,
     discovery_cursor: usize,
     allocation_cursor: usize,
@@ -135,9 +174,17 @@ impl Directory {
         });
     }
 
-    async fn maintain(mut self, tx: watch::Sender<Vec<SocketAddr>>, interval: Duration) {
-        // Renewal has its own cadence and discovery runs in the background, so
-        // unavailable members never delay a working entrance's lease renewal.
+    #[cfg(test)]
+    async fn maintain(self, tx: watch::Sender<Vec<SocketAddr>>, interval: Duration) {
+        self.run(tx, interval, std::future::pending()).await;
+    }
+
+    async fn run(
+        mut self,
+        tx: watch::Sender<Vec<SocketAddr>>,
+        interval: Duration,
+        stop: impl Future<Output = ()>,
+    ) {
         let renew_every = interval.min(RENEW_EVERY);
         let mut renew = tokio::time::interval(renew_every);
         let mut discover = tokio::time::interval(interval);
@@ -145,30 +192,52 @@ impl Directory {
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             tick.reset();
         }
+        // Adopt already-held leases too (used by restored/test directories).
+        for node in self
+            .leases
+            .values()
+            .map(|lease| lease.node.clone())
+            .collect::<Vec<_>>()
+        {
+            self.request_for(&node);
+        }
         let mut discovery = JoinSet::new();
         let mut allocations = self.allocations();
+        let mut renewals = JoinSet::new();
+        let mut renewing = std::collections::BTreeSet::new();
+        let mut releases = JoinSet::new();
+        tokio::pin!(stop);
         loop {
             tokio::select! {
+                _ = &mut stop => break,
                 _ = renew.tick() => {
-                    self.renew_leases(&tx).await;
+                    self.expire_leases();
+                    self.start_renewals(&mut renewals, &mut renewing);
                     self.publish(&tx);
                 }
                 _ = discover.tick(), if discovery.is_empty() => {
                     discovery.spawn(self.discovery());
                 }
                 Some(result) = discovery.join_next() => {
-                    let previous_exit = self.selected.address;
                     match result {
-                        Ok(Some(nodes)) => self.apply_nodes(nodes),
+                        Ok(Some(nodes)) => {
+                            let previous_exit = self.selected.clone();
+                            for allocation in self.apply_nodes(nodes) {
+                                self.start_release(&mut releases, allocation);
+                            }
+                            if self.selected != previous_exit {
+                                allocations.abort_all();
+                                allocations = JoinSet::new();
+                                renewals.abort_all();
+                                renewals = JoinSet::new();
+                                renewing.clear();
+                            }
+                        }
                         _ => tracing::debug!("mesh directory refresh unavailable; retaining known peers"),
                     }
-                    if self.selected.address != previous_exit {
-                        // These requests selected an immutable relay target
-                        // before the exit moved; their results are now stale.
-                        allocations.abort_all();
-                        allocations = JoinSet::new();
-                    }
-                    // Keep connections to lease holders; close rotated ones.
+                    // In-flight requests keep their captured node and exit.
+                    // Their completions are checked before publishing, so a
+                    // changed directory never reintroduces a stale route.
                     self.control.prune(renew_every * 3);
                     if allocations.is_empty() {
                         allocations = self.allocations();
@@ -177,43 +246,126 @@ impl Directory {
                 }
                 Some(result) = allocations.join_next() => {
                     match result {
-                        Ok((node, Ok(reply))) => {
-                            // An allocation made for an old member address is
-                            // never published after that member moves.
-                            if self.nodes.contains(&node) {
+                        Ok((allocation, Ok(reply))) => {
+                            if self.current(&allocation) {
+                                let node = allocation.node;
                                 self.leases.insert(node.id.clone(), ClientLease {
                                     node, reply, renewed: Instant::now(),
                                 });
                                 self.publish(&tx);
+                            } else {
+                                // This also handles a response that completed
+                                // after a migration's earlier release attempt.
+                                self.start_release(&mut releases, allocation);
                             }
                         }
-                        Ok((node, Err(error))) => tracing::debug!(node=%node.id, %error, "optional entrance unavailable"),
+                        Ok((allocation, Err(error))) => tracing::debug!(node=%allocation.node.id, %error, "optional entrance unavailable"),
                         Err(error) => tracing::warn!(%error, "entrance allocation task failed"),
                     }
                 }
+                Some(result) = renewals.join_next() => {
+                    match result {
+                        Ok(renewal) => {
+                            renewing.remove(&renewal.allocation.node.id);
+                            if self.current(&renewal.allocation) {
+                                self.apply_renewal(renewal, &tx);
+                            } else {
+                                self.start_release(&mut releases, renewal.allocation);
+                            }
+                        }
+                        Err(error) => tracing::warn!(%error, "entrance renewal task failed"),
+                    }
+                }
+                Some(_) = releases.join_next() => {}
             }
         }
+        discovery.abort_all();
+        // Give already-sent requests one second to settle before releasing by
+        // request identity. Cancelled/late server work still has its idle TTL.
+        let _ = tokio::time::timeout(Duration::from_secs(1), async {
+            while allocations.join_next().await.is_some() {}
+            while renewals.join_next().await.is_some() {}
+        })
+        .await;
+        allocations.abort_all();
+        renewals.abort_all();
+        while allocations.join_next().await.is_some() {}
+        while renewals.join_next().await.is_some() {}
+        let _ = tokio::time::timeout(Duration::from_secs(4), async {
+            // Queue current allocations alongside retired ones: an unreachable
+            // old member must not delay release at a healthy current member.
+            for (_, allocation) in std::mem::take(&mut self.requests) {
+                self.start_release(&mut releases, allocation);
+            }
+            while releases.join_next().await.is_some() {}
+        })
+        .await;
     }
 
-    fn apply_nodes(&mut self, nodes: Vec<Node>) {
-        let Ok(known) = discovery::merge_known(&self.known, &nodes) else {
+    fn current(&self, allocation: &Allocation) -> bool {
+        self.selected == allocation.exit
+            && self
+                .requests
+                .get(&allocation.node.id)
+                .is_some_and(|current| {
+                    current.node == allocation.node && current.request == allocation.request
+                })
+    }
+
+    fn start_release(&self, pending: &mut JoinSet<()>, allocation: Allocation) {
+        // Changing membership cannot accumulate unbounded cleanup tasks. TTL
+        // remains the fallback when previous releases fill this bounded set.
+        if pending.len() >= MAX_NODES + MAX_PATHS {
             return;
-        };
-        if known != self.known {
-            if let Err(error) = discovery::remember(&self.cache_dir, &known) {
-                tracing::warn!(%error, "could not persist updated discovery hints");
-            }
-            self.known = known;
         }
-        if let Some(selected) = nodes.iter().find(|node| node.id == self.selected.id) {
-            if selected.address != self.selected.address {
-                // Renewal preserves a lease's original UDP target. Allocate
-                // fresh leases after migration instead of renewing old routes.
-                self.leases.clear();
+        let control = self.control.clone();
+        let auth = self.auth.clone();
+        pending.spawn(async move {
+            let body = serde_json::to_vec(&ReleaseRequest {
+                exit: allocation.exit.id,
+                lease: None,
+                request: Some(allocation.request),
+            }).expect("release request");
+            if let Err(error) = control.request::<ReleaseReply>(
+                allocation.node.address, &auth, "/mesh/release", Some(body),
+            ).await {
+                tracing::debug!(node=%allocation.node.id, %error, "lease release unavailable; retaining idle expiry");
             }
+        });
+    }
+
+    fn apply_nodes(&mut self, incoming: Vec<Node>) -> Vec<Allocation> {
+        let Ok(known) = self.cache.remember(&incoming) else {
+            return vec![];
+        };
+        // A slower authenticated response must not roll back an already-known
+        // address incarnation, either in the cache or in the active directory.
+        let Ok(nodes) = discovery::current_nodes(&known, &incoming) else {
+            return vec![];
+        };
+        self.known = known;
+        if let Some(selected) = nodes.iter().find(|node| node.id == self.selected.id) {
             self.selected = selected.clone();
         }
+        let mut retired = Vec::new();
+        self.requests.retain(|id, allocation| {
+            let current = allocation.exit == self.selected
+                && nodes.iter().find(|node| node.id == *id).map_or_else(
+                    || self.leases.contains_key(id),
+                    |node| *node == allocation.node,
+                );
+            if !current {
+                retired.push(allocation.clone());
+            }
+            current
+        });
+        self.leases.retain(|id, lease| {
+            self.requests
+                .get(id)
+                .is_some_and(|request| request.node == lease.node)
+        });
         self.nodes = nodes;
+        retired
     }
 
     fn discovery(&mut self) -> impl Future<Output = Option<Vec<Node>>> + Send + 'static {
@@ -258,46 +410,65 @@ impl Directory {
         }
     }
 
-    async fn renew_leases(&mut self, tx: &watch::Sender<Vec<SocketAddr>>) {
-        let mut pending = JoinSet::new();
-        for lease in self.leases.values() {
+    fn request_for(&mut self, node: &Node) -> Allocation {
+        self.requests
+            .entry(node.id.clone())
+            .or_insert_with(|| Allocation {
+                node: node.clone(),
+                exit: self.selected.clone(),
+                request: format!("{:032x}", rand::random::<u128>()),
+            })
+            .clone()
+    }
+
+    fn start_renewals(
+        &mut self,
+        pending: &mut JoinSet<Renewal>,
+        renewing: &mut std::collections::BTreeSet<String>,
+    ) {
+        let leases: Vec<_> = self
+            .leases
+            .values()
+            .map(|lease| (lease.node.clone(), lease.reply.clone()))
+            .collect();
+        for (node, previous) in leases {
+            if !renewing.insert(node.id.clone()) {
+                continue;
+            }
+            let allocation = self.request_for(&node);
             let control = self.control.clone();
             let auth = self.auth.clone();
-            let exit = self.selected.id.clone();
-            let node = lease.node.clone();
-            let old = lease.reply.clone();
             pending.spawn(async move {
-                let result = renew(&control, &auth, &node, &exit, old).await;
-                (node.id, result)
+                let result = renew(&control, &auth, &allocation, previous.clone()).await;
+                Renewal {
+                    allocation,
+                    previous,
+                    result,
+                }
             });
         }
-        while let Some(result) = pending.join_next().await {
-            if let Ok((id, result)) = result {
-                let lease = self.leases.get_mut(&id).expect("existing lease");
-                match result {
-                    Ok(None) => {
-                        // The server no longer has this allocation, so its path
-                        // cannot work; free the slot for another member now.
-                        self.leases.remove(&id);
-                        self.publish(tx);
-                    }
-                    Ok(Some(reply)) => {
-                        let changed = lease.reply.address != reply.address;
-                        lease.reply = reply;
-                        lease.renewed = Instant::now();
-                        // One failed peer must not hold a recovered entrance
-                        // behind the rest of this concurrent renewal batch.
-                        if changed {
-                            self.publish(tx);
-                        }
-                    }
-                    Err(error) => tracing::debug!(node=%id, %error, "entrance renewal unavailable"),
-                }
-            }
+    }
+
+    fn apply_renewal(&mut self, renewal: Renewal, tx: &watch::Sender<Vec<SocketAddr>>) {
+        let id = &renewal.allocation.node.id;
+        let Some(lease) = self.leases.get_mut(id) else {
+            return;
+        };
+        if lease.node != renewal.allocation.node || lease.reply.lease != renewal.previous.lease {
+            return;
         }
-        // A live authenticated data connection can outlast failed control
-        // renewals. Stale observations cannot pin a slot after its client stops.
-        self.expire_leases();
+        match renewal.result {
+            Ok(None) => {
+                self.leases.remove(id);
+                self.publish(tx);
+            }
+            Ok(Some(reply)) => {
+                lease.reply = reply;
+                lease.renewed = Instant::now();
+                self.publish(tx);
+            }
+            Err(error) => tracing::debug!(node=%id, %error, "entrance renewal unavailable"),
+        }
     }
 
     fn expire_leases(&mut self) {
@@ -309,7 +480,7 @@ impl Directory {
         });
     }
 
-    fn allocations(&mut self) -> JoinSet<(Node, Result<RelayReply>)> {
+    fn allocations(&mut self) -> JoinSet<(Allocation, Result<RelayReply>)> {
         let mut pending = JoinSet::new();
         let mut candidates = self
             .nodes
@@ -329,10 +500,10 @@ impl Directory {
         for node in candidates.into_iter().take(available) {
             let control = self.control.clone();
             let auth = self.auth.clone();
-            let exit = self.selected.id.clone();
+            let allocation = self.request_for(&node);
             pending.spawn(async move {
-                let reply = allocate(&control, &auth, &node, &exit).await;
-                (node, reply)
+                let reply = allocate_request(&control, &auth, &allocation).await;
+                (allocation, reply)
             });
         }
         pending
@@ -349,28 +520,52 @@ fn validate_reply(node: &Node, reply: &RelayReply) -> Result<()> {
     );
     Ok(())
 }
+#[cfg(test)]
 async fn allocate(control: &Control, auth: &str, node: &Node, exit: &str) -> Result<RelayReply> {
+    allocate_request(
+        control,
+        auth,
+        &Allocation {
+            node: node.clone(),
+            exit: Node {
+                id: exit.into(),
+                address: node.address,
+                incarnation: 0,
+            },
+            request: format!("{:032x}", rand::random::<u128>()),
+        },
+    )
+    .await
+}
+
+async fn allocate_request(
+    control: &Control,
+    auth: &str,
+    allocation: &Allocation,
+) -> Result<RelayReply> {
     let body = serde_json::to_vec(&RelayRequest {
-        exit: exit.into(),
+        exit: allocation.exit.id.clone(),
         lease: None,
+        request: Some(allocation.request.clone()),
     })?;
     let reply = control
-        .request(node.address, auth, "/mesh/relay", Some(body))
+        .request(allocation.node.address, auth, "/mesh/relay", Some(body))
         .await?;
-    validate_reply(node, &reply)?;
+    validate_reply(&allocation.node, &reply)?;
     Ok(reply)
 }
 /// `Ok(None)`: the server rejected the lease and no replacement was allocated.
 async fn renew(
     control: &Control,
     auth: &str,
-    node: &Node,
-    exit: &str,
+    allocation: &Allocation,
     old: RelayReply,
 ) -> Result<Option<RelayReply>> {
+    let node = &allocation.node;
     let body = serde_json::to_vec(&RelayRequest {
-        exit: exit.into(),
+        exit: allocation.exit.id.clone(),
         lease: Some(old.lease.clone()),
+        request: None,
     })?;
     let result = control
         .request::<RelayReply>(node.address, auth, "/mesh/relay", Some(body))
@@ -389,9 +584,10 @@ async fn renew(
                 .downcast_ref::<super::control::Rejected>()
                 .is_some_and(|e| e.0 == http::StatusCode::BAD_REQUEST) =>
         {
-            // Explicit rejection means the old allocation is gone (e.g. a
-            // restarted server). A transport timeout alone is not retried here.
-            match allocate(control, auth, node, exit).await {
+            // The replacement reuses a stable request identity, including when
+            // its first response is lost. A timeout alone does not replace a
+            // potentially healthy lease.
+            match allocate_request(control, auth, allocation).await {
                 Ok(reply) => Ok(Some(reply)),
                 Err(error) => {
                     tracing::debug!(node=%node.id, %error, "entrance replacement unavailable");
@@ -406,6 +602,124 @@ async fn renew(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn allocation_completion_is_consumed_while_other_lease_renewal_is_blocked() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("identity");
+        transport::initialize(&dir, NAME).unwrap();
+        let endpoint = transport::server(
+            "127.0.0.1:0".parse().unwrap(),
+            &dir.join("cert.pem"),
+            &dir.join("key.pem"),
+            transport::Congestion::default(),
+        )
+        .unwrap();
+        let available = Node {
+            id: "available".into(),
+            address: endpoint.local_addr().unwrap(),
+            incarnation: 0,
+        };
+        let silent_exit = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let unavailable = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let selected = Node {
+            id: "exit".into(),
+            address: silent_exit.local_addr().unwrap(),
+            incarnation: 0,
+        };
+        let unavailable_node = Node {
+            id: "unavailable".into(),
+            address: unavailable.local_addr().unwrap(),
+            incarnation: 0,
+        };
+        let reply_address = SocketAddr::from(([127, 0, 0, 1], 21001));
+        let (ready, accepted) = tokio::sync::oneshot::channel();
+        let (reply_now, reply_allowed) = tokio::sync::oneshot::channel();
+        let _server = AbortTask(tokio::spawn(async move {
+            let connection = endpoint.accept().await.unwrap().await.unwrap();
+            let mut h3 = h3::server::builder()
+                .enable_datagram(true)
+                .build::<_, Bytes>(h3_quinn::Connection::new(connection.clone()))
+                .await
+                .unwrap();
+            let (request, mut stream) = h3
+                .accept()
+                .await
+                .unwrap()
+                .unwrap()
+                .resolve_request()
+                .await
+                .unwrap();
+            assert_eq!(request.uri().path(), "/mesh/relay");
+            while stream.recv_data().await.unwrap().is_some() {}
+            ready.send(()).unwrap();
+            reply_allowed.await.unwrap();
+            stream
+                .send_response(http::Response::builder().status(200).body(()).unwrap())
+                .await
+                .unwrap();
+            stream
+                .send_data(Bytes::from(
+                    serde_json::to_vec(&RelayReply {
+                        lease: "2".repeat(32),
+                        address: reply_address,
+                    })
+                    .unwrap(),
+                ))
+                .await
+                .unwrap();
+            stream.finish().await.unwrap();
+            let _ = connection.closed().await;
+        }));
+        let directory = Directory {
+            health: watch::channel(PathHealth::default()).1,
+            control: Arc::new(Control::new(&dir.join("cert.pem"), false).unwrap()),
+            auth: format!("Bearer {}", transport::token(&dir.join("token")).unwrap()),
+            selected: selected.clone(),
+            cache: discovery::Cache::open(dir),
+            nodes: vec![selected.clone(), available],
+            known: vec![selected],
+            leases: BTreeMap::from([(
+                unavailable_node.id.clone(),
+                ClientLease {
+                    node: unavailable_node,
+                    reply: RelayReply {
+                        lease: "1".repeat(32),
+                        address: unavailable.local_addr().unwrap(),
+                    },
+                    renewed: Instant::now(),
+                },
+            )]),
+            requests: BTreeMap::new(),
+            limit: 3,
+            discovery_cursor: 0,
+            allocation_cursor: 0,
+        };
+        let (tx, mut updates) = watch::channel(directory.addresses());
+        let _maintenance = AbortTask(tokio::spawn(
+            directory.maintain(tx, Duration::from_millis(50)),
+        ));
+        tokio::time::timeout(Duration::from_secs(2), accepted)
+            .await
+            .unwrap()
+            .unwrap();
+        // Only renewal can contact this address: discovery uses silent_exit.
+        // Receipt of the QUIC handshake proves renewal is now in flight.
+        let mut packet = [0; 1500];
+        tokio::time::timeout(Duration::from_secs(1), unavailable.recv_from(&mut packet))
+            .await
+            .unwrap()
+            .unwrap();
+        reply_now.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !updates.borrow_and_update().contains(&reply_address) {
+                updates.changed().await.unwrap();
+            }
+        })
+        .await
+        .expect("ready allocation waited for unrelated renewal timeout");
+    }
 
     #[tokio::test]
     async fn direct_start_and_first_optional_lease_do_not_wait_for_blackholed_allocation() {
@@ -436,6 +750,7 @@ mod tests {
             0,
             Node {
                 id: "blackhole".into(),
+                incarnation: 0,
                 address: blackhole.local_addr().unwrap(),
             },
         );
@@ -486,6 +801,12 @@ mod tests {
         .await
         .expect("successful optional allocation waited for blackhole");
         assert_eq!(updates.borrow().len(), 2);
+        let released_address = updates.borrow()[1];
+        drop(_client);
+        guard.shutdown().await;
+        let _rebound = UdpSocket::bind(released_address)
+            .await
+            .expect("graceful shutdown did not release relay socket");
     }
 
     #[tokio::test]
@@ -585,6 +906,7 @@ mod tests {
         let unavailable = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let relay_node = Node {
             id: "relay".into(),
+            incarnation: 0,
             address: unavailable.local_addr().unwrap(),
         };
         let mut relay = state(root);
@@ -606,6 +928,7 @@ mod tests {
                 RelayRequest {
                     exit: selected.id.clone(),
                     lease: None,
+                    request: None,
                 },
             )
             .await
@@ -617,7 +940,7 @@ mod tests {
             control: Arc::new(Control::new(&identity.dir.join("cert.pem"), false).unwrap()),
             auth: identity.auth.clone(),
             selected,
-            cache_dir: identity.dir.clone(),
+            cache: identity.cache.clone(),
             nodes: nodes.clone(),
             known: nodes,
             leases: BTreeMap::from([(
@@ -628,6 +951,7 @@ mod tests {
                     renewed: Instant::now() - LEASE_FOR * 2,
                 },
             )]),
+            requests: BTreeMap::new(),
             limit: 2,
             discovery_cursor: 0,
             allocation_cursor: 0,
@@ -676,7 +1000,13 @@ mod tests {
         .await
         .unwrap();
         let before = metrics.snapshot(false, "test", None).unwrap();
-        directory.renew_leases(&tx).await; // Real four-second control timeout.
+        let mut renewals = JoinSet::new();
+        directory.start_renewals(&mut renewals, &mut Default::default());
+        // Real four-second control timeout, without blocking maintenance.
+        while let Some(Ok(renewal)) = renewals.join_next().await {
+            directory.apply_renewal(renewal, &tx);
+        }
+        directory.expire_leases();
         directory.publish(&tx);
         assert!(directory.addresses().contains(&relay_address));
         relay
@@ -755,6 +1085,7 @@ mod tests {
             .clone();
         let unavailable_node = Node {
             id: "unavailable".into(),
+            incarnation: 0,
             address: unavailable.local_addr().unwrap(),
         };
         let mut known = vec![unavailable_node.clone()];
@@ -764,7 +1095,7 @@ mod tests {
             control: Arc::new(Control::new(&identity.dir.join("cert.pem"), false).unwrap()),
             auth: identity.auth.clone(),
             selected,
-            cache_dir: identity.dir.clone(),
+            cache: identity.cache.clone(),
             nodes,
             known,
             // Model the client's old lease after a relay restart. The live
@@ -780,6 +1111,7 @@ mod tests {
                     renewed: Instant::now(),
                 },
             )]),
+            requests: BTreeMap::new(),
             limit: if with_unavailable_lease { 3 } else { 2 },
             discovery_cursor: 0,
             allocation_cursor: 0,
@@ -827,6 +1159,7 @@ mod tests {
         let nodes: Vec<_> = (0..MAX_NODES)
             .map(|i| Node {
                 id: format!("node_{i:02}"),
+                incarnation: 0,
                 address: SocketAddr::from(([127, 0, 0, 1], 10000 + i as u16)),
             })
             .collect();
@@ -835,14 +1168,16 @@ mod tests {
             control: Arc::new(Control::new(&dir.join("cert.pem"), false).unwrap()),
             auth: String::new(),
             selected: nodes[0].clone(),
-            cache_dir: dir.clone(),
+            cache: discovery::Cache::open(dir.clone()),
             nodes: nodes.clone(),
             known: nodes.clone(),
             leases: BTreeMap::new(),
+            requests: BTreeMap::new(),
             limit: MAX_PATHS,
             discovery_cursor: 0,
             allocation_cursor: 0,
         };
+        directory.cache.remember(&nodes).unwrap();
         let partial = vec![nodes[1].clone()];
         directory.apply_nodes(partial.clone());
         assert_eq!(directory.known, nodes);
@@ -861,11 +1196,13 @@ mod tests {
         // A full cache evicts an old hint for a current member.
         let extra = Node {
             id: "extra".into(),
+            incarnation: 0,
             address: "127.0.0.1:20001".parse().unwrap(),
         };
         directory.apply_nodes(vec![extra.clone()]);
         assert_eq!(directory.known.len(), MAX_NODES);
         assert!(directory.known.contains(&extra));
+        directory.cache.flush().await;
         assert_eq!(discovery::cached(&dir), directory.known);
         directory.leases.insert(
             extra.id.clone(),

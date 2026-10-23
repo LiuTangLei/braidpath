@@ -13822,4 +13822,137 @@ mod tests {
         assert!(controller.rate_bps >= 2_500_000);
         assert!(controller.rate_bps < 3_100_000);
     }
+
+    #[test]
+    fn long_lived_rtt_step_retains_pressure_until_generation_requalification() {
+        let mut controller = PathController::new(2_000_000, 20).with_rtt_source_baselines(true);
+        controller.observe(&rtt_evidence_observation(0, 20.0, Some((1, 20.0, 0))));
+        let mut delivered = 0;
+        for tick in 1..=600 {
+            let now = tick * CONTROL_US;
+            let bytes = exercise_budget(&mut controller, now - CONTROL_US, CONTROL_US);
+            delivered += bytes;
+            let mut sample = rtt_evidence_observation(now, 60.0, Some((tick + 1, 60.0, 0)));
+            sample.delivered_bytes = delivered;
+            sample.delivered_bps = Some(bytes as f64 * 8_000_000.0 / CONTROL_US as f64);
+            controller.observe(&sample);
+            assert!(controller.decision(now).eligible);
+        }
+        let now = 120_000_000;
+        let retained_rate = controller.rate_bps;
+        let retained_queue = controller.queue_delay_ms;
+        // These observations are compatible with either a propagation change
+        // or a standing queue outside our sender. Time alone cannot tell them
+        // apart, so an automatic baseline reset would erase real pressure too.
+        assert_eq!(controller.source_local_min_rtt_ms, Some(20.0));
+        assert_eq!(controller.source_probe_min_rtt_ms, Some(20.0));
+        assert_eq!(retained_queue, 40.0);
+        assert!(!controller.allow(now, 100, 21.0));
+        controller.tokens = 0.0;
+        let mut duplicate = rtt_evidence_observation(now, 60.0, Some((601, 60.0, 0)));
+        duplicate.delivered_bytes = delivered;
+        controller.observe(&duplicate);
+        assert_eq!(controller.tokens, 0.0);
+        assert!(!controller.allow(now, 1, 0.0));
+
+        let mut next = rtt_evidence_observation(now + CONTROL_US, 60.0, Some((1, 60.0, 0)));
+        next.generation += 1;
+        next.delivered_bytes = 0;
+        controller.observe(&next);
+        assert_eq!(controller.source_local_min_rtt_ms, Some(60.0));
+        assert_eq!(controller.source_probe_min_rtt_ms, Some(60.0));
+        assert_eq!(controller.queue_delay_ms, 0.0);
+        eprintln!(
+            "long_lived_rtt_evidence: {}",
+            serde_json::json!({
+                "conditions": {"duration_us":now, "initial_rtt_ms":20, "subsequent_rtt_ms":60,
+                    "cause":"not identifiable from these observations", "source_baselines":true},
+                "window_a": {"generation":7, "allowance_bps":retained_rate,
+                    "inferred_queue_ms":retained_queue, "minimum_rtt_ms":20},
+                "window_b": {"generation":8, "allowance_bps":controller.rate_bps,
+                    "inferred_queue_ms":controller.queue_delay_ms, "minimum_rtt_ms":60},
+                "scope":"controller replay; no network throughput or proposed algorithm comparison"
+            })
+        );
+    }
+
+    #[test]
+    fn long_lived_capacity_step_records_default_controller_recovery_and_bounds() {
+        const DROP_AT: u64 = 16_000_000;
+        const RECOVER_AT: u64 = 136_000_000;
+        const END: u64 = 148_000_000;
+        let mut lane = Lane::new(true);
+        lane.controller = lane.controller.with_rtt_source_baselines(true);
+        let mut phase_bytes = [0_u64; 3];
+        let mut phase_queues = [Vec::new(), Vec::new(), Vec::new()];
+        let mut phase_rates = [0; 3];
+        let mut phase_remembered = [0.0; 3];
+        let mut phase_drops = [0; 3];
+        let mut impaired_growth_events = 0;
+        let mut recovery_seconds = [0_u64; 12];
+        for now in (0..END).step_by(1000) {
+            let impaired = (DROP_AT..RECOVER_AT).contains(&now);
+            let capacity = if impaired { 350_000.0 } else { 3_000_000.0 };
+            let before_bytes = lane.delivered_app_bytes;
+            let before_rate = lane.controller.rate_bps;
+            let before_drops = lane.dropped;
+            lane.tick(now, capacity);
+            if impaired && lane.controller.rate_bps > before_rate {
+                impaired_growth_events += 1;
+            }
+            assert!(lane.controller.rate_bps <= 8_000_000);
+            assert!(lane.queue_bits <= 65536.0 * 8.0);
+            assert!(lane.packets.front().is_none_or(|p| now - p.at < 250_000));
+            let delivered = lane.delivered_app_bytes - before_bytes;
+            if now >= RECOVER_AT {
+                recovery_seconds[((now - RECOVER_AT) / 1_000_000) as usize] += delivered;
+            }
+            let phase = if (10_000_000..DROP_AT).contains(&now) {
+                Some(0)
+            } else if (RECOVER_AT - 6_000_000..RECOVER_AT).contains(&now) {
+                Some(1)
+            } else if now >= END - 6_000_000 {
+                Some(2)
+            } else {
+                None
+            };
+            if let Some(phase) = phase {
+                phase_bytes[phase] += delivered;
+                phase_queues[phase].push(lane.queue_bits / capacity * 1000.0);
+                phase_rates[phase] = lane.controller.rate_bps;
+                phase_remembered[phase] = lane.controller.remembered_bps;
+                phase_drops[phase] += lane.dropped - before_drops;
+            }
+        }
+        assert!(phase_bytes.iter().all(|bytes| *bytes > 0));
+        assert_eq!(lane.ineligible_with_fresh_evidence, 0);
+        let queue_p95 = phase_queues.map(|mut values| {
+            values.sort_by(f64::total_cmp);
+            values[values.len() * 95 / 100]
+        });
+        let ideal_clean = 3_000_000.0 * Lane::APP as f64 / Lane::NETWORK as f64;
+        let first_recovered_second = recovery_seconds
+            .iter()
+            .position(|bytes| *bytes as f64 * 8.0 >= ideal_clean * 0.9)
+            .map(|index| index + 1);
+        let window = |index: usize| {
+            serde_json::json!({"simulated_app_bps":phase_bytes[index] as f64 * 8.0 / 6.0,
+                "queue_p95_ms":queue_p95[index], "allowance_at_end_bps":phase_rates[index],
+                "remembered_at_end_bps":phase_remembered[index], "dropped_packets":phase_drops[index]})
+        };
+        eprintln!(
+            "long_lived_capacity_evidence: {}",
+            serde_json::json!({
+                "conditions":{"duration_us":END, "drop_at_us":DROP_AT, "recover_at_us":RECOVER_AT,
+                    "capacity_bps":[3000000,350000,3000000], "generation":7, "source_baselines":true,
+                    "sample_windows_us":[[10000000,16000000],[130000000,136000000],[142000000,148000000]]},
+                "window_a":window(0), "window_b":window(1), "window_c":window(2),
+                "impaired_growth_events":impaired_growth_events,
+                "first_recovered_one_second_bin_end_after_recovery_seconds":first_recovered_second,
+                "recovery_one_second_app_bytes":recovery_seconds,
+                "total_dropped_packets":lane.dropped, "ineligible_ticks":lane.ineligible_ticks,
+                "scope":"deterministic bounded FIFO; omits Quinn congestion control, flow scheduling and application deadlines"
+            })
+        );
+    }
 }
