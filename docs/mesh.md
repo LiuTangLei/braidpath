@@ -92,9 +92,16 @@ Proxy limits and lifecycle:
   lookup retains its slot until the resolver actually returns. Pending connections retain the shared server
   admission budget and must authenticate within eight seconds.
 - `--max-rate-bps` caps the combined TCP/UDP proxy payload in both directions,
-  across all proxy clients, with a 128 KiB burst. TCP waits for credit; excess
-  UDP is dropped. This is the proxy budget; existing relay/tunnel budgets are
-  separate. `auto` uses the existing 1 Gbit/s maximum.
+  across all proxy clients. Burst credit holds 10 ms of traffic, with a 128 KiB
+  minimum (12.5 MB at 10 Gbit/s), avoiding refill-credit loss with millisecond
+  timers. TCP waits for credit; excess UDP is dropped. This is the proxy budget; existing relay/tunnel budgets are
+  separate. The default `auto` uses a 10 Gbit/s operational ceiling; this does
+  not guarantee measured throughput. A numeric value applies an explicit cap.
+- Proxy TCP streams have a 16 MiB receive window and each authenticated proxy
+  connection has 32 MiB receive/send windows. Server connections retain a
+  256 KiB aggregate limit until token and exit authentication succeeds. These
+  are bounded flow-control budgets, allocated as needed; QUIC congestion
+  control still determines how quickly data can be sent.
 - UDP associations close when their SOCKS TCP owner closes, after 60 seconds
   without traffic, or when their QUIC connection closes. UDP destination sockets
   expire after 60 seconds idle. TCP streams expire after 300 seconds idle across

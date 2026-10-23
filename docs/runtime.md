@@ -64,7 +64,7 @@ On Linux, repeat `--interface eth0 --interface wlan0` to create the interface–
 | `--small-fec-bytes 0` | Optional immediate single-record XOR repair threshold, at most 1,000 application bytes; requires FEC0/redundancy0 unless mixed mode is explicit |
 | `--mixed-fec` | Explicitly combine small-record repair with ordinary FEC for larger records; disabled by default, negotiated by both peers |
 | `--congestion bbr` (client/server) | BBR is the only runtime congestion controller; each QUIC connection still controls its own congestion window |
-| `--rate-bps auto` (adaptive) / `10000000` (otherwise) | Per-session, per-direction aggregate pacing cap, including an estimated header allowance; independent QUIC congestion control remains active. `auto`, the adaptive default, requires `--adaptive` and sets no operator cap below the validated 1 Gbit/s session maximum; per-path adaptive control then sets the pace. Without `--adaptive` the cap is the sending pace and must be a number |
+| `--rate-bps auto` (adaptive) / `10000000` (otherwise) | Per-session, per-direction aggregate pacing cap, including an estimated header allowance; independent QUIC congestion control remains active. `auto`, the adaptive default, requires `--adaptive` and sets no operator cap below the 10 Gbit/s operational ceiling; per-path adaptive control then sets the pace. Without `--adaptive` the cap is the sending pace and must be a number |
 | `--legacy-recovery` (client/server) | Restore the earlier adaptive recovery: 100 ms queue-brake spacing, post-brake restoration only from the qualified 500 ms service window, 20% cuts for unexercised new-queue brakes, fixed 3% cautious steps and loss-only brakes at any queue delay; off by default |
 | `--adaptive` | Opt-in per-path pacing, sender-age admission, fresh-health eligibility, independent RTT probes and automatic startup/outage recovery |
 | `--capacity-probe-bps 0` | Optional independent delivery samples; disabled by default, requires adaptive FEC0, capped at 5% of aggregate and each group budget |
@@ -72,7 +72,7 @@ On Linux, repeat `--interface eth0 --interface wlan0` to create the interface–
 | `--latency-target-ms 20` | Local sender-age limit and added-delay control objective; does not bound propagation RTT or end-to-end delivery |
 | `--path-group GROUP` | One group ID per interface–entrance pair; omitted assignments default to the interface index |
 | `--group-rate-bps GROUP:BITS_PER_SECOND` | Shared per-direction cap for every path in that group; repeat for different groups; each cap is 64,000..aggregate bits/s |
-| Server `--max-rate-bps auto` | Caps the session's server-side sender; not a server-wide or inbound traffic policer. The default `auto` accepts the client's request up to the validated 1 Gbit/s maximum; a number keeps an operator cap |
+| Server `--max-rate-bps auto` | Caps the session's server-side sender; not a server-wide or inbound traffic policer. The default `auto` accepts the client's request up to the 10 Gbit/s operational ceiling; a number keeps an operator cap |
 | `--queue-ms 100` | Sender lifetime starts at original application ingress; adaptive mode uses the smaller of this and `--latency-target-ms` |
 | `--max-message-bytes 4096` | Negotiated application UDP limit, 1,000..4,096 bytes; larger messages are segmented into existing bounded records; oversize messages drop |
 | State | 16 sessions, 8 paths/session, 64 flows/session, 256 queued events/records, 256 decode-block slots, 8,192-ID dedup window |

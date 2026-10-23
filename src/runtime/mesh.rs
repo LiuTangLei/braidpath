@@ -838,7 +838,7 @@ pub async fn serve(options: ServerOptions) -> Result<()> {
         "enable a UDP tunnel target or proxy service"
     );
     ensure!(
-        (64_000..=1_000_000_000).contains(&options.rate),
+        (64_000..=super::MAX_RATE_BPS).contains(&options.rate),
         "invalid server rate"
     );
     let own = Node {

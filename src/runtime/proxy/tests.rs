@@ -39,7 +39,7 @@ async fn start(
         proxy: Some(ServerConfig { allow_private }),
         join,
         join_key: join.map(|_| root.join("a/server-key.json")),
-        rate: 100_000_000,
+        rate: crate::runtime::MAX_RATE_BPS,
         stats: metrics.clone(),
     })));
     timeout(Duration::from_secs(5), async {
@@ -109,6 +109,38 @@ fn node(id: &str, address: SocketAddr) -> mesh::Node {
         id: id.into(),
         address,
         incarnation: 0,
+    }
+}
+
+#[test]
+fn proxy_accepts_ten_gigabit_ceiling_and_rejects_out_of_range_rates() {
+    for (rate, accepted) in [
+        (63_999, false),
+        (64_000, true),
+        (10_000_000_000, true),
+        (10_000_000_001, false),
+    ] {
+        assert_eq!(
+            Server::new(ServerConfig::default(), "a".repeat(64), "exit".into(), rate).is_ok(),
+            accepted,
+            "rate {rate}"
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn ten_gigabit_budget_retains_credit_between_millisecond_timer_ticks() {
+    let rate = Rate::new(10_000_000_000);
+    // Exhaust the bounded startup burst; idle time must not grow it further.
+    tokio::time::advance(Duration::from_secs(1)).await;
+    assert!(rate.delay(12_500_000).is_none());
+    assert!(rate.delay(1).is_some());
+    for _ in 0..10 {
+        tokio::time::advance(Duration::from_millis(1)).await;
+        // 10 Gbit/s supplies 1.25 MB per millisecond, including after the
+        // initial burst. A fixed 128 KiB bucket silently loses this credit.
+        assert!(rate.delay(1_250_000).is_none());
+        assert!(rate.delay(1).is_some());
     }
 }
 async fn empty(identity: &mesh::ClientIdentity, at: SocketAddr) {

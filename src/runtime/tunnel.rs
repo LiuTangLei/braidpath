@@ -155,8 +155,8 @@ impl Policy {
             );
         }
         ensure!(
-            (64_000..=1_000_000_000).contains(&self.rate),
-            "rate must be 64000..1000000000 bits/s"
+            (64_000..=super::MAX_RATE_BPS).contains(&self.rate),
+            "rate must be 64000..10000000000 bits/s"
         );
         ensure!(
             (1..=100).contains(&self.block_ms) && (1..=1000).contains(&self.queue_ms),
@@ -3048,16 +3048,17 @@ async fn serve_with_budgets(
     data_connections: Arc<Semaphore>,
 ) -> Result<()> {
     ensure!(
-        (64_000..=1_000_000_000).contains(&options.max_rate),
+        (64_000..=super::MAX_RATE_BPS).contains(&options.max_rate),
         "invalid server rate"
     );
-    let endpoint = transport::server_with_ack_request(
+    let endpoint = transport::server_with_proxy(
         options.bind,
         &options.cert,
         &options.key,
         options.congestion,
         options.datagram_send_buffer_bytes,
         ack_request,
+        options.proxy.is_some(),
     )?;
     let secret = Arc::new(format!("Bearer {}", transport::token(&options.token)?));
     let sessions: Sessions = Arc::new(Mutex::new(HashMap::new()));

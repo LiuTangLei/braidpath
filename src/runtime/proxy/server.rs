@@ -44,7 +44,7 @@ impl Server {
         rate_bps: u64,
     ) -> Result<Arc<Self>> {
         ensure!(
-            (64_000..=1_000_000_000).contains(&rate_bps),
+            (64_000..=crate::runtime::MAX_RATE_BPS).contains(&rate_bps),
             "invalid proxy rate"
         );
         ensure!(
@@ -104,6 +104,7 @@ impl Server {
         })
         .await??;
         drop(pending);
+        crate::runtime::transport::authenticated_proxy(&conn);
         conn.set_max_concurrent_bi_streams(64u32.into());
         let router = Arc::new(Router::default());
         let mut tasks = JoinSet::new();

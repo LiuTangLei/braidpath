@@ -52,19 +52,25 @@ impl Drop for AbortTask {
 struct Rate {
     state: Mutex<(Instant, f64)>,
     bytes_per_sec: f64,
+    burst: f64,
 }
 impl Rate {
     fn new(bps: u64) -> Self {
+        let bytes_per_sec = bps as f64 / 8.0;
+        // Retain enough credit for 10 ms of traffic. A fixed 128 KiB bucket
+        // would discard most refill credit at high rates on millisecond timers.
+        let burst = (bytes_per_sec * 0.010).max(131_072.0);
         Self {
-            state: Mutex::new((Instant::now(), 131_072.0)),
-            bytes_per_sec: bps as f64 / 8.0,
+            state: Mutex::new((Instant::now(), burst)),
+            bytes_per_sec,
+            burst,
         }
     }
     fn delay(&self, n: usize) -> Option<Duration> {
         let mut state = self.state.lock().expect("proxy rate");
         let now = Instant::now();
         state.1 = (state.1 + now.duration_since(state.0).as_secs_f64() * self.bytes_per_sec)
-            .min(131_072.0);
+            .min(self.burst);
         state.0 = now;
         if state.1 >= n as f64 {
             state.1 -= n as f64;

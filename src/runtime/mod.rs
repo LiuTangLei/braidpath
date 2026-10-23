@@ -23,3 +23,5 @@ pub const MAX_PAYLOAD: usize = 1000;
 pub const MAX_MESSAGE: usize = 4096;
 pub const MAX_PATHS: usize = 8;
 pub const QUEUE: usize = 256;
+/// Default operational ceiling; actual throughput remains congestion controlled.
+pub const MAX_RATE_BPS: u64 = 10_000_000_000;

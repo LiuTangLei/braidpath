@@ -411,7 +411,7 @@ struct PolicyArgs {
     #[arg(long, default_value_t = 30)]
     redundancy_percent: u8,
     /// Aggregate cap in bits/s. `auto` (requires --adaptive) sets no operator
-    /// cap below the validated maximum; per-path control finds the pace.
+    /// cap below 10 Gbit/s; per-path control finds the pace.
     /// Defaults to `auto` with --adaptive and 10000000 otherwise.
     #[arg(long, value_parser = parse_rate_cap)]
     rate_bps: Option<RateCap>,
@@ -677,8 +677,8 @@ pub async fn run() -> Result<()> {
     }
 }
 
-/// The validated session maximum, used when no explicit cap is configured.
-const AUTO_RATE_BPS: u64 = 1_000_000_000;
+/// Operational ceiling used when no explicit cap is configured.
+const AUTO_RATE_BPS: u64 = super::MAX_RATE_BPS;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RateCap {
@@ -1065,7 +1065,8 @@ mod tests {
             Command::Server { max_rate_bps, .. } => max_rate_bps.bps(),
             _ => unreachable!(),
         };
-        assert_eq!(maximum(&[]), AUTO_RATE_BPS);
+        assert_eq!(maximum(&[]), 10_000_000_000);
+        assert_eq!(maximum(&["--max-rate-bps", "10000000000"]), 10_000_000_000);
         assert_eq!(maximum(&["--max-rate-bps", "8000000"]), 8_000_000);
     }
 

@@ -141,7 +141,7 @@ async fn run_with_budget(
         "relay requires at least one allowed client source IP"
     );
     ensure!(
-        (64_000..=1_000_000_000).contains(&options.rate),
+        (64_000..=super::MAX_RATE_BPS).contains(&options.rate),
         "invalid relay rate"
     );
     ensure!(

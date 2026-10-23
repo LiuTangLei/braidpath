@@ -9,6 +9,14 @@ use std::{fs, io::BufReader, net::SocketAddr, path::Path, sync::Arc, time::Durat
 
 pub const DEFAULT_DATAGRAM_SEND_BUFFER_BYTES: usize = 1200;
 pub const MAX_DATAGRAM_SEND_BUFFER_BYTES: usize = 76_800;
+const PROXY_STREAM_WINDOW: u32 = 16 * 1024 * 1024;
+const PROXY_CONNECTION_WINDOW: u32 = 32 * 1024 * 1024;
+
+/// Expand shared stream credit only after the proxy token and exit are verified.
+pub(crate) fn authenticated_proxy(connection: &quinn::Connection) {
+    connection.set_receive_window(PROXY_CONNECTION_WINDOW.into());
+    connection.set_send_window(u64::from(PROXY_CONNECTION_WINDOW));
+}
 
 pub fn token(path: &Path) -> Result<String> {
     let s = fs::read_to_string(path).context("read token file")?;
@@ -129,6 +137,26 @@ pub fn server_with_ack_request(
     datagram_send_buffer_bytes: usize,
     ack_request: AckRequest,
 ) -> Result<Endpoint> {
+    server_with_proxy(
+        bind,
+        cert,
+        key_path,
+        congestion,
+        datagram_send_buffer_bytes,
+        ack_request,
+        false,
+    )
+}
+
+pub(crate) fn server_with_proxy(
+    bind: SocketAddr,
+    cert: &Path,
+    key_path: &Path,
+    congestion: Congestion,
+    datagram_send_buffer_bytes: usize,
+    ack_request: AckRequest,
+    proxy: bool,
+) -> Result<Endpoint> {
     ensure!(
         (DEFAULT_DATAGRAM_SEND_BUFFER_BYTES..=MAX_DATAGRAM_SEND_BUFFER_BYTES)
             .contains(&datagram_send_buffer_bytes),
@@ -141,6 +169,11 @@ pub fn server_with_ack_request(
     tls.max_early_data_size = 0;
     let mut conf = ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(tls)?));
     let mut transport = config(congestion);
+    if proxy {
+        // The per-stream window cannot be changed after QUIC negotiation.
+        // Keep the aggregate receive/send windows at 256 KiB until proxy auth.
+        transport.stream_receive_window(PROXY_STREAM_WINDOW.into());
+    }
     transport.datagram_send_buffer_size(datagram_send_buffer_bytes);
     ack_request.apply(&mut transport);
     conf.transport_config(Arc::new(transport));
@@ -230,6 +263,11 @@ fn client_with_alpn(
     tls.enable_early_data = false;
     let mut conf = ClientConfig::new(Arc::new(QuicClientConfig::try_from(tls)?));
     let mut transport = config(congestion);
+    if alpn == super::proxy::ALPN {
+        transport.stream_receive_window(PROXY_STREAM_WINDOW.into());
+        transport.receive_window(PROXY_CONNECTION_WINDOW.into());
+        transport.send_window(u64::from(PROXY_CONNECTION_WINDOW));
+    }
     transport.datagram_send_buffer_size(datagram_send_buffer_bytes);
     conf.transport_config(Arc::new(transport));
     let s = Socket::new(
@@ -299,4 +337,62 @@ pub fn initialize(dir: &Path, name: &str) -> Result<()> {
 }
 pub fn hex(b: &[u8]) -> String {
     b.iter().map(|v| format!("{v:02x}")).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn proxy_streams_acknowledge_large_flight_before_application_reads() {
+        let temp = tempfile::tempdir().unwrap();
+        let identity = temp.path().join("identity");
+        initialize(&identity, "localhost").unwrap();
+        let server = server_with_proxy(
+            "127.0.0.1:0".parse().unwrap(),
+            &identity.join("cert.pem"),
+            &identity.join("key.pem"),
+            Congestion::Bbr,
+            DEFAULT_DATAGRAM_SEND_BUFFER_BYTES,
+            AckRequest::Unchanged,
+            true,
+        )
+        .unwrap();
+        let address = server.local_addr().unwrap();
+        let client = proxy_client(address, &identity.join("cert.pem")).unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let (outgoing, incoming) =
+                tokio::join!(client.connect(address, "localhost").unwrap(), async {
+                    server.accept().await.unwrap().await
+                });
+            let outgoing = outgoing.unwrap();
+            let incoming = incoming.unwrap();
+            authenticated_proxy(&incoming);
+            let (mut upload, mut download) = outgoing.open_bi().await.unwrap();
+            // Make the stream visible to accept_bi without reading its payload.
+            upload.write_all(&[1]).await.unwrap();
+            let (response, mut request) = incoming.accept_bi().await.unwrap();
+            let payload = vec![7; 512 * 1024];
+            // Completion requires peer ACKs, not just local write buffering.
+            // The old 16 KiB stream / 256 KiB connection windows would stall
+            // here in both directions until the application consumed data.
+            let send = |mut stream: quinn::SendStream, data: Vec<u8>| async move {
+                stream.write_all(&data).await.unwrap();
+                stream.finish().unwrap();
+                assert_eq!(stream.stopped().await.unwrap(), None);
+            };
+            tokio::join!(
+                send(upload, payload.clone()),
+                send(response, payload.clone())
+            );
+            let received = request.read_to_end(payload.len() + 1).await.unwrap();
+            assert_eq!(received[0], 1);
+            assert_eq!(&received[1..], payload);
+            assert_eq!(download.read_to_end(payload.len()).await.unwrap(), payload);
+        })
+        .await
+        .expect("proxy flow-control windows blocked outstanding data");
+        client.close(0u32.into(), b"test complete");
+        server.close(0u32.into(), b"test complete");
+    }
 }
