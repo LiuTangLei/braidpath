@@ -4,8 +4,8 @@ use anyhow::{Result, ensure};
 use std::{
     collections::HashMap,
     net::{IpAddr, SocketAddr},
-    sync::{Arc, Mutex},
-    time::{Duration, Instant},
+    sync::Arc,
+    time::Duration,
 };
 use tokio::{
     net::UdpSocket,
@@ -15,26 +15,10 @@ use tokio::{
 };
 use tracing::{debug, info};
 
-struct Budget {
-    tokens: f64,
-    last: Instant,
-    rate: f64,
-}
-impl Budget {
-    fn take(&mut self, n: usize) -> bool {
-        let now = Instant::now();
-        self.tokens = (self.tokens + now.duration_since(self.last).as_secs_f64() * self.rate)
-            .min(16.0 * 2048.0);
-        self.last = now;
-        let cost = (n + 48) as f64;
-        if self.tokens < cost {
-            false
-        } else {
-            self.tokens -= cost;
-            true
-        }
-    }
-}
+mod budget;
+use budget::Budget;
+pub(crate) use budget::HostBudget;
+
 pub struct Options {
     pub listen: SocketAddr,
     pub target: SocketAddr,
@@ -134,6 +118,24 @@ pub(crate) async fn run_on_socket(
     front: Arc<UdpSocket>,
     announce: bool,
 ) -> Result<()> {
+    run_with_budget(options, front, announce, None).await
+}
+
+pub(crate) async fn run_on_socket_with_budget(
+    options: Options,
+    front: Arc<UdpSocket>,
+    announce: bool,
+    host: Arc<HostBudget>,
+) -> Result<()> {
+    run_with_budget(options, front, announce, Some(host)).await
+}
+
+async fn run_with_budget(
+    options: Options,
+    front: Arc<UdpSocket>,
+    announce: bool,
+    host: Option<Arc<HostBudget>>,
+) -> Result<()> {
     ensure!(
         !options.allow.is_empty(),
         "relay requires at least one allowed client source IP"
@@ -146,11 +148,7 @@ pub(crate) async fn run_on_socket(
         options.drop_every == 0 || options.drop_every >= 2,
         "invalid impairment interval"
     );
-    let budget = Arc::new(Mutex::new(Budget {
-        tokens: 16.0 * 2048.0,
-        last: Instant::now(),
-        rate: options.rate as f64 / 8.0,
-    }));
+    let budget = Arc::new(Budget::new(options.rate, host));
     let mut peers: HashMap<SocketAddr, mpsc::Sender<Vec<u8>>> = HashMap::new();
     let mut tasks = JoinSet::new();
     let (stop, _) = watch::channel(false);
@@ -173,7 +171,7 @@ pub(crate) async fn run_on_socket(
             if n>2048{count(&options.stats,stats::FORWARD,|d|d.oversize_dropped+=1);continue;}
             packets+=1;
             if options.drop_every>0 && packets.is_multiple_of(options.drop_every){count(&options.stats,stats::FORWARD,|d|d.impairment_dropped+=1);continue;}
-            if !budget.lock().expect("budget lock").take(n){count(&options.stats,stats::FORWARD,|d|d.budget_dropped+=1);continue;}
+            if !budget.take(n){count(&options.stats,stats::FORWARD,|d|d.budget_dropped+=1);continue;}
             if peers.get(&peer).is_some_and(|tx|tx.is_closed()){peers.remove(&peer);}
             if !peers.contains_key(&peer){
                 if peers.len()>=64{count(&options.stats,stats::FORWARD,|d|d.mapping_limit_dropped+=1);continue;}
@@ -189,7 +187,7 @@ pub(crate) async fn run_on_socket(
                             received=back.recv(&mut back_buffer)=>match received{
                                 Ok(n)=>{count(&metrics,stats::RETURN,|d|d.received+=1);
                                     if n>2048{count(&metrics,stats::RETURN,|d|d.oversize_dropped+=1);Ok(())}
-                                    else if !budget.lock().expect("budget lock").take(n){count(&metrics,stats::RETURN,|d|d.budget_dropped+=1);Ok(())}
+                                    else if !budget.take(n){count(&metrics,stats::RETURN,|d|d.budget_dropped+=1);Ok(())}
                                     else{send(&front,&back_buffer[..n],Some(peer),&metrics,stats::RETURN).await}
                                 },Err(e)=>Err(e),
                             }

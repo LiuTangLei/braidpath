@@ -70,6 +70,7 @@ fn replay_enqueue(
         coding::EncodedSymbol {
             data: symbol.data,
             small: symbol.small,
+            oldest_ingress: None,
         },
         created,
         queue,

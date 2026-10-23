@@ -29,6 +29,19 @@ MAX_SNAPSHOT_BYTES = 16 * 1024 * 1024
 FILES = ("launch.json", "exit.json", "ready.json", "result.json", "samples.json", "stats.json", "stats.jsonl", "stdout.log", "stderr.log")
 
 
+def harness_fingerprints():
+    # run.py includes the exact remote collector and launch wrapper sent by SSH.
+    return {name: hashlib.sha256((Path(__file__).parent / name).read_bytes()).hexdigest()
+            for name in ("run.py", "readiness.py")}
+
+
+def validate_resume(manifest, configuration, harness):
+    if manifest["configuration"] != configuration:
+        raise ValueError("output already belongs to a different configuration; use a new output directory")
+    if manifest.get("harness_sha256") != harness:
+        raise ValueError("harness identity changed or missing; use a new output directory")
+
+
 def save(path, value):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -877,9 +890,10 @@ def main(argv=None):
     rows = schedule(matrix, args.case)
     output.mkdir(parents=True, exist_ok=True)
     config = {"topology_sha256": digest(topology), "matrix_sha256": digest(matrix), "case_filter": args.case}
+    harness = harness_fingerprints()
     manifest_path = output / "manifest.json"
-    if manifest_path.exists() and json.loads(manifest_path.read_text())["configuration"] != config:
-        raise ValueError("output already belongs to a different configuration; use a new output directory")
+    if manifest_path.exists():
+        validate_resume(json.loads(manifest_path.read_text()), config, harness)
     save(output / "schedule.json", {"configuration": config, "rows": rows})
     if args.dry_run:
         print(json.dumps({"configuration": config, "rows": rows}))
@@ -891,7 +905,9 @@ def main(argv=None):
             raise ValueError("remote binary fingerprints changed; use a new output directory")
     else:
         head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=ROOT, capture_output=True, text=True, check=True).stdout.strip()
-        save(manifest_path, {"schema_version": 1, "configuration": config, "git_head": head, "binary_fingerprints": fingerprints, "created_unix_ms": time.time_ns() // 1000000})
+        save(manifest_path, {"schema_version": 1, "configuration": config, "git_head": head,
+                            "harness_sha256": harness, "binary_fingerprints": fingerprints,
+                            "created_unix_ms": time.time_ns() // 1000000})
     # Each attempt is bounded to duration+90 seconds; include the one optional retry.
     lease_seconds = len(rows) * (1 + matrix.get("retry_startup", 0)) * (matrix.get("duration_seconds", 15) + 180) + 300
     firewall = Firewall(remote, topology, output, lease_seconds)

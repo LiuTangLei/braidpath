@@ -345,7 +345,7 @@ def main(argv=None):
         "binary_sha256": hashlib.sha256(args.binary.read_bytes()).hexdigest(),
         "lab_binary_sha256": hashlib.sha256(args.lab_binary.read_bytes()).hexdigest(),
         "harness_sha256": {name: hashlib.sha256((Path(__file__).parent / name).read_bytes()).hexdigest()
-                           for name in ("native_lab.py", "netem.py", "readiness.py")},
+                           for name in ("native_lab.py", "netem.py", "source_burst.py", "readiness.py")},
     })
     save(args.output / "registration.json", registration)
     lab = Lab(args.output)

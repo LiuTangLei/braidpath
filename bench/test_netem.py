@@ -20,6 +20,25 @@ def samples(count, received):
 
 
 class DeliveryAccounting(unittest.TestCase):
+    def test_microburst_invalidates_steady_source_despite_valid_whole_rate(self):
+        count, pps = 40000, 40000
+        population = [{"seq": i, "send_unix_us": 1_000_000 + i * 25,
+                       "receive_unix_us": None} for i in range(count)]
+        # Preserve the full count and duration, but release 80 overdue packets
+        # together after a 2 ms stall. This is source pressure, not tunnel loss.
+        for row in population[100:180]:
+            row["send_unix_us"] = population[179]["send_unix_us"]
+        source = {"requested_count": count, "sent": count,
+                  "send_span_seconds": (count - 1) / pps}
+        checked = summarize(population, source, count, source_samples=population, pps=pps)
+        quality = checked["source_qualification"]
+        self.assertFalse(checked["source_qualified"])
+        self.assertGreaterEqual(quality["actual_raw_rate_bps"], quality["expected_raw_rate_bps"])
+        self.assertTrue(all(c["qualified"] for c in quality["one_second_source_cohorts"]))
+        self.assertEqual(quality["rolling_windows_us"]["100"]["max_packets"], 83)
+        self.assertEqual(quality["rolling_windows_us"]["100"]["maximum_allowed_packets"], 8)
+        self.assertIn("steady source burst exceeds allowance in 100us window", quality["reasons"])
+
     def test_source_cohort_stall_is_not_hidden_by_later_catchup_or_whole_average(self):
         # First nominal second takes1.1s, second catches up in.9s.
         population = [{"seq": i, "send_unix_us": int(1000000 + (i * .011 if i < 100 else 1.1 + (i - 100) * .009) * 1e6),

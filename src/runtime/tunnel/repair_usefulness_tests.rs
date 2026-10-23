@@ -258,6 +258,7 @@ fn repeated_rejection_of_one_index_does_not_fake_three_missing_originals() {
             coding::EncodedSymbol {
                 data: data.clone(),
                 small: false,
+                oldest_ingress: None,
             },
             now,
             &mut q,

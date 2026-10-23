@@ -198,19 +198,21 @@ impl Drop for AbortTask {
 }
 pub struct State {
     own: Node,
-    _directory_lock: Option<fs::File>,
+    _directory_lock: Option<Arc<fs::File>>,
     bind: SocketAddr,
     relay_ports: Option<RelayPorts>,
     dir: PathBuf,
     client_auth: String,
     member_auth: String,
-    peers: Mutex<BTreeMap<String, Peer>>,
+    peers: Arc<Mutex<BTreeMap<String, Peer>>>,
     // Forgotten membership is not a revocation of cluster trust. Keep a bounded
     // restart-safe set of addresses to heal partitions without manual joins.
-    reconnect: Mutex<Vec<hints::Hint>>,
+    reconnect: Arc<Mutex<Vec<hints::Hint>>>,
+    membership_write: Arc<tokio::sync::Mutex<()>>,
     leases: Mutex<BTreeMap<String, Lease>>,
     control_connections: Arc<Semaphore>,
     rate: u64,
+    relay_budget: Arc<relay::HostBudget>,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -232,6 +234,9 @@ struct RelayReply {
 }
 
 impl State {
+    pub(crate) fn node_id(&self) -> &str {
+        &self.own.id
+    }
     fn known(&self) -> Vec<Node> {
         let mut nodes = vec![self.own.clone()];
         nodes.extend(
@@ -264,18 +269,18 @@ impl State {
             nodes: self.active(),
         }
     }
-    fn admit(&self, peers: &BTreeMap<String, Peer>, node: &Node) -> Admission {
+    fn admit(own: &Node, peers: &BTreeMap<String, Peer>, node: &Node) -> Admission {
         if node.validate().is_err() {
             return Admission::Reject("invalid node");
         }
-        if node.id == self.own.id {
-            return if *node == self.own {
+        if node.id == own.id {
+            return if node == own {
                 Admission::Unchanged
             } else {
                 Admission::Reject("record conflicts with the local node")
             };
         }
-        if node.address == self.own.address {
+        if node.address == own.address {
             return Admission::Reject("record reuses the local address");
         }
         if peers.get(&node.id).is_some_and(|p| p.node == *node) {
@@ -294,119 +299,152 @@ impl State {
             replaces: conflicts.into_iter().map(|p| p.node.id.clone()).collect(),
         }
     }
-    fn merge(&self, exchange: Exchange, direct: bool) -> Result<()> {
+    // Serialize mutations independently of the read locks. The blocking task
+    // owns the sequence guard and completes both disk and memory publication
+    // even if its request is cancelled; a later write cannot overtake it.
+    async fn update_members(
+        &self,
+        update: impl FnOnce(&Node, &mut BTreeMap<String, Peer>, &mut Vec<hints::Hint>) -> Result<()>
+        + Send
+        + 'static,
+    ) -> Result<()> {
+        let write = self.membership_write.clone().lock_owned().await;
+        let own = self.own.clone();
+        let dir = self.dir.clone();
+        let peers = self.peers.clone();
+        let reconnect = self.reconnect.clone();
+        let directory_lock = self._directory_lock.clone();
+        tokio::task::spawn_blocking(move || {
+            let _write = write;
+            // A cancelled server may drop State while this write finishes.
+            // Keep the directory exclusively owned until publication ends.
+            let _directory_lock = directory_lock;
+            let previous = peers.lock().expect("peers").clone();
+            let previous_hints = reconnect.lock().expect("reconnect hints").clone();
+            let mut next = previous.clone();
+            let mut next_hints = previous_hints.clone();
+            update(&own, &mut next, &mut next_hints)?;
+            // Publish hints before removing membership: interruption must not
+            // erase the only saved route back across a long partition.
+            if next_hints != previous_hints {
+                hints::save(&dir, &next_hints)?;
+                *reconnect.lock().expect("reconnect hints") = next_hints.clone();
+            }
+            if !previous
+                .values()
+                .map(|p| &p.node)
+                .eq(next.values().map(|p| &p.node))
+            {
+                let nodes: Vec<_> = next.values().map(|p| &p.node).collect();
+                storage::atomic_write(&dir.join("peers.json"), &serde_json::to_vec(&nodes)?, true)?;
+            }
+            let nodes: Vec<_> = next.values().map(|p| &p.node).collect();
+            let useful = hints::useful(&next_hints, &own, &nodes, hints::now_unix());
+            *peers.lock().expect("peers") = next;
+            // Removing a returning node's hint is safe only after its member
+            // record is durable. Failed cleanup leaves harmless extra hints
+            // and is retried on the next membership operation.
+            if useful != next_hints {
+                match hints::save(&dir, &useful) {
+                    Ok(()) => *reconnect.lock().expect("reconnect hints") = useful,
+                    Err(error) => {
+                        tracing::warn!(%error, "could not prune persisted reconnect hints")
+                    }
+                }
+            }
+            Ok(())
+        })
+        .await
+        .context("membership persistence worker failed")?
+    }
+    async fn merge(&self, exchange: Exchange, direct: bool) -> Result<()> {
         ensure!(exchange.nodes.len() <= MAX_NODES, "too many members");
         let now = Instant::now();
-        let mut peers = self.peers.lock().expect("peers");
-        let mut next = peers.clone();
-        // The sender must be consistent. Each listed record is judged alone, so
-        // one conflicting hint cannot block the sender's liveness or other news.
-        let records = std::iter::once(&exchange.sender).chain(&exchange.nodes);
-        for (index, node) in records.enumerate() {
-            let sender = index == 0;
-            match self.admit(&next, node) {
-                Admission::Unchanged => {}
-                Admission::Add { replaces } if next.len() + 1 - replaces.len() >= MAX_NODES => {
-                    ensure!(!sender, "cluster member limit reached");
-                    tracing::debug!(node=%node.id, "membership hint ignored: member limit");
-                    continue;
-                }
-                Admission::Add { replaces } => {
-                    for id in replaces {
-                        next.remove(&id);
-                        tracing::info!(node=%id, "replaced stale member record");
+        self.update_members(move |own, next, reconnect| {
+            let records = std::iter::once(&exchange.sender).chain(&exchange.nodes);
+            for (index, node) in records.enumerate() {
+                let sender = index == 0;
+                match Self::admit(own, next, node) {
+                    Admission::Unchanged => {}
+                    Admission::Add { mut replaces } => {
+                        if next.len() + 1 - replaces.len() >= MAX_NODES {
+                            // A valid new sender can heal a full isolated table.
+                            // Hints alone may not evict members, and recently
+                            // heard records are never displaced for capacity.
+                            let stale = sender.then(|| {
+                                next.values()
+                                    .filter(|p| p.heard.elapsed() >= FORGET_AFTER)
+                                    .min_by_key(|p| p.heard)
+                                    .map(|p| p.node.clone())
+                            }).flatten();
+                            if let Some(stale) = stale {
+                                *reconnect = hints::add(reconnect, std::slice::from_ref(&stale), hints::now_unix());
+                                replaces.push(stale.id);
+                            } else {
+                                ensure!(!sender, "cluster member limit reached");
+                                tracing::debug!(node=%node.id, "membership hint ignored: member limit");
+                                continue;
+                            }
+                        }
+                        for id in replaces {
+                            next.remove(&id);
+                            tracing::debug!(node=%id, "replaced stale member record");
+                        }
+                        next.insert(node.id.clone(), Peer { node: node.clone(), seen: None, heard: now });
                     }
-                    next.insert(
-                        node.id.clone(),
-                        Peer {
-                            node: node.clone(),
-                            seen: None,
-                            heard: now,
-                        },
-                    );
+                    Admission::Reject(reason) => {
+                        ensure!(!sender, "{reason}");
+                        tracing::debug!(node=%node.id, reason, "membership hint ignored");
+                        continue;
+                    }
                 }
-                Admission::Reject(reason) => {
-                    ensure!(!sender, "{reason}");
-                    tracing::debug!(node=%node.id, reason, "membership hint ignored");
-                    continue;
+                if let Some(peer) = next.get_mut(&node.id) {
+                    peer.heard = now;
+                    if sender && direct {
+                        peer.seen = Some(now);
+                    }
                 }
             }
-            if let Some(peer) = next.get_mut(&node.id) {
-                peer.heard = now;
-                if sender && direct {
-                    peer.seen = Some(now);
+            Ok(())
+        }).await
+    }
+    async fn forget_departed(&self) -> Result<()> {
+        self.update_members(|_, peers, reconnect| {
+            // Isolation alone must not erase the directory. An authenticated
+            // new sender can still reclaim an old slot through merge().
+            if !peers
+                .values()
+                .any(|p| p.seen.is_some_and(|at| at.elapsed() < LIVE_FOR))
+            {
+                return Ok(());
+            }
+            let departed: Vec<_> = peers
+                .values()
+                .filter(|p| p.heard.elapsed() >= FORGET_AFTER)
+                .map(|p| p.node.clone())
+                .collect();
+            if !departed.is_empty() {
+                *reconnect = hints::add(reconnect, &departed, hints::now_unix());
+                for node in departed {
+                    peers.remove(&node.id);
                 }
             }
-        }
-        self.commit(&mut peers, next)
-    }
-    fn commit(
-        &self,
-        peers: &mut BTreeMap<String, Peer>,
-        next: BTreeMap<String, Peer>,
-    ) -> Result<()> {
-        if !peers
-            .values()
-            .map(|p| &p.node)
-            .eq(next.values().map(|p| &p.node))
-        {
-            let nodes: Vec<_> = next.values().map(|p| &p.node).collect();
-            // Persist before changing memory. A failed write can be retried by
-            // the next exchange, and cannot erase the previous restart cache.
-            storage::atomic_write(
-                &self.dir.join("peers.json"),
-                &serde_json::to_vec(&nodes)?,
-                true,
-            )?;
-        }
-        *peers = next;
-        Ok(())
-    }
-    fn forget_departed(&self) -> Result<()> {
-        let mut peers = self.peers.lock().expect("peers");
-        // Without a live peer this server cannot tell departed members from
-        // its own isolation, so it keeps every record until it reconnects.
-        if !peers
-            .values()
-            .any(|p| p.seen.is_some_and(|at| at.elapsed() < LIVE_FOR))
-        {
-            return Ok(());
-        }
-        let mut next = peers.clone();
-        next.retain(|_, p| p.heard.elapsed() < FORGET_AFTER);
-        let departed: Vec<_> = peers
-            .keys()
-            .filter(|id| !next.contains_key(*id))
-            .cloned()
-            .collect();
-        if !departed.is_empty() {
-            let mut hints = self.reconnect.lock().expect("reconnect hints");
-            let departed_nodes: Vec<_> = departed.iter().map(|id| peers[id].node.clone()).collect();
-            let saved = hints::add(&hints, &departed_nodes, hints::now_unix());
-            // Publish hints first: interruption must never erase the only way
-            // back to the other side of a partition.
-            hints::save(&self.dir, &saved)?;
-            *hints = saved;
-        }
-        self.commit(&mut peers, next)?;
-        for id in departed {
-            tracing::info!(node=%id, "forgot departed member");
-        }
-        Ok(())
+            Ok(())
+        })
+        .await
     }
     /// Drop hints for members that returned or expired, then pick the next
     /// rotating batch to probe. A failed save is retried on the next round.
-    fn reconnect_candidates(&self, cursor: &mut usize) -> Vec<Node> {
-        let peers = self.peers.lock().expect("peers");
-        let mut hints = self.reconnect.lock().expect("reconnect hints");
-        let members: Vec<_> = peers.values().map(|p| &p.node).collect();
-        let useful = hints::useful(&hints, &self.own, &members, hints::now_unix());
-        if useful != *hints {
-            match hints::save(&self.dir, &useful) {
-                Ok(()) => *hints = useful.clone(),
-                Err(error) => tracing::warn!(%error, "could not persist reconnect hints"),
-            }
+    async fn reconnect_candidates(&self, cursor: &mut usize) -> Vec<Node> {
+        if let Err(error) = self.update_members(|_, _, _| Ok(())).await {
+            tracing::warn!(%error, "could not persist reconnect hints");
         }
+        let useful = {
+            let peers = self.peers.lock().expect("peers");
+            let hints = self.reconnect.lock().expect("reconnect hints");
+            let members: Vec<_> = peers.values().map(|p| &p.node).collect();
+            hints::useful(&hints, &self.own, &members, hints::now_unix())
+        };
         if useful.is_empty() {
             return vec![];
         }
@@ -423,7 +461,7 @@ impl State {
             .await;
         match result {
             Ok(reply) if reply.sender == peer => {
-                if let Err(error) = self.merge(reply, true) {
+                if let Err(error) = self.merge(reply, true).await {
                     tracing::warn!(%error, "membership rejected");
                 }
             }
@@ -480,8 +518,10 @@ impl State {
             drop_every: 0,
             stats: metrics.clone(),
         };
+        let host = self.relay_budget.clone();
         let task = AbortTask(tokio::spawn(async move {
-            if let Err(error) = relay::run_on_socket(options, socket, false).await {
+            if let Err(error) = relay::run_on_socket_with_budget(options, socket, false, host).await
+            {
                 tracing::warn!(%error, "mesh relay ended");
             }
         }));
@@ -533,7 +573,7 @@ impl State {
                     let exchange: Exchange = serde_json::from_slice(&read_body(stream).await?)?;
                     // Incoming announcements are hints, never proof that the
                     // advertised service is reachable. Our next probe checks it.
-                    self.merge(exchange, false)?;
+                    self.merge(exchange, false).await?;
                     Ok(serde_json::to_vec(&self.exchange())?)
                 }
                 (&Method::POST, "/mesh/relay") => {
@@ -612,27 +652,31 @@ pub async fn serve(options: ServerOptions) -> Result<()> {
     )?;
     let state = Arc::new(State {
         own,
-        _directory_lock: Some(directory_lock),
+        _directory_lock: Some(Arc::new(directory_lock)),
         bind: options.listen,
         relay_ports: options.relay_ports,
         dir: options.dir.clone(),
         rate: options.rate,
         client_auth: format!("Bearer {}", key.client.token),
         member_auth: format!("Bearer {}", key.member_token),
-        peers: Mutex::new(BTreeMap::new()),
-        reconnect: Mutex::new(hints::load(&options.dir)),
+        peers: Arc::new(Mutex::new(BTreeMap::new())),
+        reconnect: Arc::new(Mutex::new(hints::load(&options.dir))),
+        membership_write: Arc::new(tokio::sync::Mutex::new(())),
+        relay_budget: Arc::new(relay::HostBudget::new(options.rate)),
         leases: Mutex::new(BTreeMap::new()),
         control_connections: Arc::new(Semaphore::new(CONTROL_CONNECTIONS)),
     });
     if options.dir.join("peers.json").exists() {
         let nodes = read_json(&options.dir.join("peers.json"))?;
-        state.merge(
-            Exchange {
-                sender: state.own.clone(),
-                nodes,
-            },
-            false,
-        )?;
+        state
+            .merge(
+                Exchange {
+                    sender: state.own.clone(),
+                    nodes,
+                },
+                false,
+            )
+            .await?;
     }
     let control = Arc::new(Control::server(
         &options.dir.join("cert.pem"),
@@ -654,7 +698,7 @@ pub async fn serve(options: ServerOptions) -> Result<()> {
                 exchange.sender.address == seed,
                 "join endpoint differs from advertised address"
             );
-            state.merge(exchange, true)
+            state.merge(exchange, true).await
         }
         .await;
         if let Err(error) = joined {
@@ -674,7 +718,7 @@ pub async fn serve(options: ServerOptions) -> Result<()> {
         loop {
             tick.tick().await;
             reap(&mut background.leases.lock().expect("leases"));
-            if let Err(error) = background.forget_departed() {
+            if let Err(error) = background.forget_departed().await {
                 tracing::warn!(%error, "could not persist departed members");
             }
             // Release connections to forgotten or replaced addresses.
@@ -685,7 +729,7 @@ pub async fn serve(options: ServerOptions) -> Result<()> {
                 .filter(|n| n.id != background.own.id)
                 .collect();
             if Instant::now() >= next_reconnect {
-                peers.extend(background.reconnect_candidates(&mut reconnect_cursor));
+                peers.extend(background.reconnect_candidates(&mut reconnect_cursor).await);
                 next_reconnect = Instant::now() + RECONNECT_EVERY;
             }
             let body = serde_json::to_vec(&background.exchange()).expect("exchange serialization");

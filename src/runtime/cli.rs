@@ -383,11 +383,11 @@ pub async fn run() -> Result<()> {
             let session_policy = policy.build(rate, group_rates);
             session_policy.validate()?;
             let identity = mesh::ClientIdentity::open(dir, &connection_key)?;
-            let nodes = identity.discover_any(&connect).await?;
+            let nodes = identity.discover_exit(&connect, &exit).await?;
             let (entrances, leases) = identity.entrances(nodes, &exit, super::MAX_PATHS).await?;
             tracing::info!(%exit, paths=entrances.len(), "selected mesh exit and cooperating entrances");
             let reporter = stats::Reporter::new("mesh-client", stats)?;
-            let result = tunnel::client_with_health(
+            let result = tunnel::client_with_mesh_exit(
                 tunnel::ClientOptions {
                     listen,
                     entrances,
@@ -406,6 +406,7 @@ pub async fn run() -> Result<()> {
                 },
                 Some(leases.updates()),
                 Some(leases.health()),
+                exit,
             )
             .await;
             reporter.finish(result).await

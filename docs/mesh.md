@@ -37,7 +37,10 @@ directory holds up to 32 members. Membership maintenance is automatic:
   each other; the conflicting record is ignored and logged at debug level.
 - Records that no member has reported running for 10 minutes are forgotten,
   freeing their slot. A server with no live peer forgets nothing, so its own
-  isolation cannot erase the cluster. A forgotten server that returns is
+  isolation cannot erase the cluster. If the table is full, an authenticated new
+  sender may replace the oldest record unheard for at least 10 minutes; that
+  record is first saved as a reconnect hint. Recent members cannot be displaced
+  for capacity. A forgotten server that returns is
   admitted again through its saved peers or `--join`. Before forgetting,
   each server persists up to 32 separate reconnect hints with the UTC time
   they were recorded. Once per minute it probes up to four forgotten addresses
@@ -57,8 +60,13 @@ initialization can finish on the next start with the same keys; missing derived
 key files are restored from that identity. Conflicting files are rejected rather
 than overwritten. Only one server can own a state directory; its operating-system
 lock is released even after a crash. Peer caches are atomically replaced before
-new membership is committed. Complete older state directories are adopted with
-their existing identity.
+new membership is committed. Writes are serialized on blocking workers, outside
+the runtime and membership read locks; reads, lease renewals and forwarding do
+not wait for disk sync. Cancelling a request cannot reorder its pending write.
+A worker retains the directory lock until its disk and memory publication ends.
+Reconnect hints are saved before removing members, and returning-member hints
+are deleted only after membership is durable. Complete older state directories
+are adopted with their existing identity.
 
 Export **only `client-key.json`** to clients. It contains the pinned certificate
 and client access token, but no TLS private key or membership token. The server
@@ -81,8 +89,10 @@ braidpath mesh-client --connect 192.0.2.20:4433 \
 ```
 
 Discovery returns live node IDs and addresses. `--connect` is only the discovery
-entry and may be repeated. Explicit entries are queried concurrently; if all
-fail, the client tries previously authenticated members saved in its local
+entry and may be repeated. Explicit entries are queried concurrently. A mesh
+client waits for a response containing its selected exit; a fast partial view
+does not cancel the other requests. If no entry supplies that exit, the client
+tries previously authenticated members saved in its local
 directory. Those cached addresses are hints, and every response still needs
 certificate and token authentication. Reusing that directory allows client
 restart after the original entry disappears. `--exit` decides which server delivers traffic to **its configured UDP
@@ -91,8 +101,9 @@ exit responsible for deduplication, FEC and UDP flows; this is not a cluster
 leader. Selecting a different exit starts a new session. There is no TCP, TUN,
 system-wide default route, or transparent migration of existing UDP flow state.
 
-The client uses a direct exit path and allocates cooperating entrances from
-other live nodes, up to eight paths. Leases renew every 11 seconds on their own
+The client starts with its direct exit path immediately and allocates cooperating
+entrances in the background, up to eight paths. Each successful allocation is
+published without waiting for slower optional nodes. Leases renew every 11 seconds on their own
 timer; discovery runs every 15 seconds in the background, so unavailable
 members cannot delay a renewal. After discovery the client adds newly
 discovered nodes when a path slot is available. A lease the server explicitly
@@ -115,7 +126,18 @@ reconnection and generation feedback are enabled even without `--adaptive`;
 that flag additionally enables adaptive pacing. Reconnect to change the exit.
 If the selected exit restarts and loses its session, the client creates a new
 session epoch; existing UDP target flow state cannot be preserved. It never
-silently selects a different exit.
+silently selects a different exit. From v0.2.1, every mesh session request and
+response must name the selected exit ID, including the response that authorizes
+a new epoch. A reused address belonging to another node is rejected before
+any application traffic. When discovery learns a new address for the same exit,
+the direct path is replaced and leases targeting the old address are discarded
+and reacquired. Existing UDP flows may need to restart.
+
+Upgrade the mesh client and its selected exit together to v0.2.1 or newer.
+Older mesh clients omit this binding, and older exits cannot acknowledge it;
+both cases fail explicitly. The cluster key format and membership exchange
+remain unchanged. Ordinary `client`/`server` sessions still work without a mesh
+exit header.
 
 ## Coordination and resource bounds
 
@@ -138,18 +160,25 @@ silently selects a different exit.
   authenticated mesh request takes a slot from a separate budget of 256
   control connections. Pending handshakes and unclassified connections have a
   separate 64-connection budget and must authenticate within 10 seconds of
-  the handshake; authenticated data connections have 128 slots.
+  the handshake; this absolute deadline also covers blocked response writes.
+  Authenticated data connections have 128 slots.
   Full data capacity therefore does not block a new control handshake. A full
   control budget rejects the connection before executing an operation, without
   borrowing data slots. The server closes a control connection after 60 seconds
-  without an authenticated request. Connections cannot switch between control
+  without an authenticated request, including when an unrelated response is
+  blocked by the peer. Connections cannot switch between control
   and data roles.
 - A relay allocation accepts UDP only from the authenticated control client's
   observed source IP. New allocations require a live registered exit. Allocations
   are limited to 64 per server and 16 per client source IP, with the existing
-  64 source mappings, bounded
-  queues and rate budget per allocation. The selected exit's aggregate session
-  cap still applies; allocation rate caps are not a host-wide bandwidth cap.
+  64 source mappings and bounded queues per allocation. All allocations share
+  one server-wide `--max-rate-bps` relay budget, charging both directions
+  together with the existing 48-byte per-datagram overhead estimate and a
+  32 KiB burst. This relay budget is separate from the selected exit's session
+  cap. Leases with recent demand share the refill rate; idle shares are reclaimed
+  after one second, checked every 100 ms or when activity changes. A busy lease
+  cannot spend other active leases' ongoing shares. Releasing a lease returns
+  its share without granting extra total tokens.
 - Leases expire after 45 seconds without renewal *or forwarded client traffic*,
   reaped on the five-second maintenance interval, so a working data path
   survives a control-plane outage. An idle orphaned allocation still expires.
@@ -185,6 +214,10 @@ preserve their port numbers. A single exposed service port alone cannot carry
 cooperating relays. Differing source routes between control and data, and
 automatic NAT traversal, remain unsupported.
 
+On Unix, SIGTERM and SIGINT follow the same bounded cleanup path: endpoints,
+relay mappings and background tasks stop before final statistics and trace
+output are finalized.
+
 ## Validation boundary
 
 Local socket tests exercise authenticated membership, all three nodes acting
@@ -208,3 +241,10 @@ tests exhaust independent budgets and verify role separation over HTTP/3.
 Unit tests cover merge atomicity, stale gossip, member limits and credential separation. These are functional
 checks, not evidence of WAN reachability, higher throughput, or lower CPU use.
 The original `server`, `client` and fixed-target `relay` commands remain usable.
+
+The v0.2.1 regressions additionally cover a full isolated directory admitting a
+new authenticated member, stalled/cancelled/failed persistence, exit-address
+reuse through direct and relay paths, incomplete discovery, optional allocation
+blackholes, blocked unauthenticated responses, aggregate relay budgets, and
+SIGTERM against the local executable. These are local correctness checks, not
+public-network throughput or service-manager deployment acceptance.

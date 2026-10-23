@@ -49,7 +49,7 @@ impl Entrances {
             .context("selected exit not found")?
             .clone();
         let (health, observed) = watch::channel(PathHealth::default());
-        let mut directory = Directory {
+        let directory = Directory {
             health: observed,
             control: Arc::new(Control::new(
                 &identity.dir.join("cert.pem"),
@@ -65,7 +65,6 @@ impl Entrances {
             discovery_cursor: 0,
             allocation_cursor: 0,
         };
-        directory.allocate_leases().await;
         let initial = directory.addresses();
         let (tx, updates) = watch::channel(initial.clone());
         let maintenance = AbortTask(tokio::spawn(directory.maintain(tx, interval)));
@@ -147,6 +146,7 @@ impl Directory {
             tick.reset();
         }
         let mut discovery = JoinSet::new();
+        let mut allocations = self.allocations();
         loop {
             tokio::select! {
                 _ = renew.tick() => {
@@ -157,14 +157,39 @@ impl Directory {
                     discovery.spawn(self.discovery());
                 }
                 Some(result) = discovery.join_next() => {
+                    let previous_exit = self.selected.address;
                     match result {
                         Ok(Some(nodes)) => self.apply_nodes(nodes),
                         _ => tracing::debug!("mesh directory refresh unavailable; retaining known peers"),
                     }
+                    if self.selected.address != previous_exit {
+                        // These requests selected an immutable relay target
+                        // before the exit moved; their results are now stale.
+                        allocations.abort_all();
+                        allocations = JoinSet::new();
+                    }
                     // Keep connections to lease holders; close rotated ones.
                     self.control.prune(renew_every * 3);
-                    self.allocate_leases().await;
+                    if allocations.is_empty() {
+                        allocations = self.allocations();
+                    }
                     self.publish(&tx);
+                }
+                Some(result) = allocations.join_next() => {
+                    match result {
+                        Ok((node, Ok(reply))) => {
+                            // An allocation made for an old member address is
+                            // never published after that member moves.
+                            if self.nodes.contains(&node) {
+                                self.leases.insert(node.id.clone(), ClientLease {
+                                    node, reply, renewed: Instant::now(),
+                                });
+                                self.publish(&tx);
+                            }
+                        }
+                        Ok((node, Err(error))) => tracing::debug!(node=%node.id, %error, "optional entrance unavailable"),
+                        Err(error) => tracing::warn!(%error, "entrance allocation task failed"),
+                    }
                 }
             }
         }
@@ -180,6 +205,14 @@ impl Directory {
             }
             self.known = known;
         }
+        if let Some(selected) = nodes.iter().find(|node| node.id == self.selected.id) {
+            if selected.address != self.selected.address {
+                // Renewal preserves a lease's original UDP target. Allocate
+                // fresh leases after migration instead of renewing old routes.
+                self.leases.clear();
+            }
+            self.selected = selected.clone();
+        }
         self.nodes = nodes;
     }
 
@@ -192,14 +225,20 @@ impl Directory {
         self.discovery_cursor += 1;
         let control = self.control.clone();
         let auth = self.auth.clone();
+        let exit = self.selected.id.clone();
         async move {
             let query = |address: SocketAddr| {
                 let control = control.clone();
                 let auth = auth.clone();
+                let exit = exit.clone();
                 async move {
                     let nodes: Vec<Node> =
                         control.request(address, &auth, "/mesh/nodes", None).await?;
                     validate_nodes(&nodes)?;
+                    ensure!(
+                        nodes.iter().any(|node| node.id == exit),
+                        "selected exit absent from directory"
+                    );
                     Ok::<_, anyhow::Error>(nodes)
                 }
             };
@@ -270,7 +309,8 @@ impl Directory {
         });
     }
 
-    async fn allocate_leases(&mut self) {
+    fn allocations(&mut self) -> JoinSet<(Node, Result<RelayReply>)> {
+        let mut pending = JoinSet::new();
         let mut candidates = self
             .nodes
             .iter()
@@ -278,15 +318,14 @@ impl Directory {
             .cloned()
             .collect::<Vec<_>>();
         if candidates.is_empty() {
-            return;
+            return pending;
         }
         self.allocation_cursor %= candidates.len();
         candidates.rotate_left(self.allocation_cursor);
         let available = self.limit - 1 - self.leases.len();
         self.allocation_cursor += available;
-        let mut pending = JoinSet::new();
-        // Try only as many allocations as free paths. Rotate on later ticks
-        // so unreachable earlier members cannot starve other candidates.
+        // Each completion is consumed by maintenance independently of slower
+        // optional peers. Renewal and discovery remain independently scheduled.
         for node in candidates.into_iter().take(available) {
             let control = self.control.clone();
             let auth = self.auth.clone();
@@ -296,24 +335,7 @@ impl Directory {
                 (node, reply)
             });
         }
-        while let Some(result) = pending.join_next().await {
-            match result {
-                Ok((node, Ok(reply))) => {
-                    self.leases.insert(
-                        node.id.clone(),
-                        ClientLease {
-                            node,
-                            reply,
-                            renewed: Instant::now(),
-                        },
-                    );
-                }
-                Ok((node, Err(error))) => {
-                    tracing::debug!(node=%node.id, %error, "optional entrance unavailable")
-                }
-                Err(error) => tracing::warn!(%error, "entrance allocation task failed"),
-            }
-        }
+        pending
     }
 }
 
@@ -386,6 +408,164 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn direct_start_and_first_optional_lease_do_not_wait_for_blackholed_allocation() {
+        use super::super::tests::{
+            Task, address, echo, policy, server, wait_for_response, wait_nodes,
+        };
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let (target, _echo) = echo(b'E').await;
+        let exit = address();
+        let relay = address();
+        let _exit = server(root, "exit", exit, target, None).await;
+        let identity =
+            ClientIdentity::open(root.join("client"), &root.join("exit/client-key.json")).unwrap();
+        wait_nodes(&identity, exit, &["exit"]).await;
+        let _relay = server(
+            root,
+            "relay",
+            relay,
+            address(),
+            Some((exit, root.join("exit/server-key.json"))),
+        )
+        .await;
+        let mut nodes = wait_nodes(&identity, relay, &["exit", "relay"]).await;
+        let blackhole = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        nodes.insert(
+            0,
+            Node {
+                id: "blackhole".into(),
+                address: blackhole.local_addr().unwrap(),
+            },
+        );
+        let (initial, guard) = tokio::time::timeout(
+            Duration::from_secs(1),
+            Entrances::start(&identity, nodes, "exit", 3, Duration::from_secs(60)),
+        )
+        .await
+        .expect("direct path waited for optional allocation")
+        .unwrap();
+        assert_eq!(initial, vec![exit]);
+        let mut updates = guard.updates();
+        let listen = address();
+        let _client = Task(tokio::spawn(tunnel::client_with_mesh_exit(
+            tunnel::ClientOptions {
+                listen,
+                entrances: initial,
+                interfaces: vec![],
+                path_binds: vec![],
+                path_groups: vec![],
+                ca: identity.dir.join("cert.pem"),
+                token: identity.dir.join("token"),
+                name: identity.name(),
+                adaptive_fec_retention: false,
+                rotate_source_port: false,
+                policy: policy(),
+                datagram_send_buffer_bytes: transport::DEFAULT_DATAGRAM_SEND_BUFFER_BYTES,
+                congestion: transport::Congestion::default(),
+                stats: stats::Metrics::new("direct-start"),
+            },
+            Some(guard.updates()),
+            Some(guard.health()),
+            "exit".into(),
+        )));
+        let app = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        app.connect(listen).await.unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            wait_for_response(&app, b"E-direct-start"),
+        )
+        .await
+        .expect("working direct path waited four seconds for blackhole");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while updates.borrow_and_update().len() < 2 {
+                updates.changed().await.unwrap();
+            }
+        })
+        .await
+        .expect("successful optional allocation waited for blackhole");
+        assert_eq!(updates.borrow().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn reused_exit_address_and_relay_cannot_forward_to_another_cluster_target() {
+        use super::super::tests::{
+            Task, address, echo, policy, server, wait_for_response, wait_nodes,
+        };
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let (target, _echo) = echo(b'A').await;
+        let wrong_target = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let exit = address();
+        let replacement = address();
+        let _exit = server(root, "exit", exit, target, None).await;
+        let identity =
+            ClientIdentity::open(root.join("client"), &root.join("exit/client-key.json")).unwrap();
+        wait_nodes(&identity, exit, &["exit"]).await;
+        let _replacement = server(
+            root,
+            "replacement",
+            replacement,
+            wrong_target.local_addr().unwrap(),
+            Some((exit, root.join("exit/server-key.json"))),
+        )
+        .await;
+        let nodes = wait_nodes(&identity, replacement, &["exit", "replacement"]).await;
+        let node = nodes.iter().find(|node| node.id == "replacement").unwrap();
+        let control = Control::new(&identity.dir.join("cert.pem"), false).unwrap();
+        let relay = allocate(&control, &identity.auth, node, "replacement")
+            .await
+            .unwrap();
+        // Both stale paths now terminate at another authenticated cluster node:
+        // a reused direct address and a lease whose old target was replaced.
+        let stale = vec![replacement, relay.address];
+        let (updates, observed) = watch::channel(stale.clone());
+        let metrics = stats::Metrics::new("bound-exit-client");
+        let listen = address();
+        let _client = Task(tokio::spawn(tunnel::client_with_mesh_exit(
+            tunnel::ClientOptions {
+                listen,
+                entrances: stale,
+                interfaces: vec![],
+                path_binds: vec![],
+                path_groups: vec![],
+                ca: identity.dir.join("cert.pem"),
+                token: identity.dir.join("token"),
+                name: identity.name(),
+                adaptive_fec_retention: false,
+                rotate_source_port: false,
+                policy: policy(),
+                datagram_send_buffer_bytes: transport::DEFAULT_DATAGRAM_SEND_BUFFER_BYTES,
+                congestion: transport::Congestion::default(),
+                stats: metrics.clone(),
+            },
+            Some(observed),
+            None,
+            "exit".into(),
+        )));
+        let app = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        app.connect(listen).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                app.send(b"A-never-to-replacement").await.unwrap();
+                if metrics.snapshot(false, "test", None).unwrap()["stats"]["path_admission_failures"].as_u64().unwrap() >= 2 { break; }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }).await.expect("both wrong exit paths must reject");
+        let mut buffer = [0; 128];
+        assert!(
+            matches!(wrong_target.try_recv_from(&mut buffer), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+        );
+        updates.send_replace(vec![exit]);
+        wait_for_response(&app, b"A-after-exit-moved").await;
+        assert!(
+            matches!(wrong_target.try_recv_from(&mut buffer), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+        );
+    }
+
+    #[tokio::test]
     async fn healthy_data_path_survives_expired_control_renewal_and_stale_health_expires() {
         use super::super::tests::{
             Task, address, echo, policy, server, state, wait_for_response, wait_nodes,
@@ -418,6 +598,7 @@ mod tests {
                 },
                 true,
             )
+            .await
             .unwrap();
         let reply = relay
             .relay(
@@ -463,7 +644,7 @@ mod tests {
         let mut fixed = policy();
         fixed.adaptive = false;
         fixed.quality_schedule = false;
-        let client = Task(tokio::spawn(tunnel::client_with_health(
+        let client = Task(tokio::spawn(tunnel::client_with_mesh_exit(
             tunnel::ClientOptions {
                 listen,
                 entrances: vec![relay_address],
@@ -482,6 +663,7 @@ mod tests {
             },
             Some(rx),
             Some(health.clone()),
+            "exit".into(),
         )));
         let app = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         app.connect(listen).await.unwrap();
@@ -685,5 +867,24 @@ mod tests {
         assert_eq!(directory.known.len(), MAX_NODES);
         assert!(directory.known.contains(&extra));
         assert_eq!(discovery::cached(&dir), directory.known);
+        directory.leases.insert(
+            extra.id.clone(),
+            ClientLease {
+                node: extra,
+                reply: RelayReply {
+                    lease: "1".repeat(32),
+                    address: "127.0.0.1:21000".parse().unwrap(),
+                },
+                renewed: Instant::now(),
+            },
+        );
+        let mut moved_exit = directory.selected.clone();
+        moved_exit.address.set_port(22000);
+        directory.apply_nodes(vec![moved_exit.clone()]);
+        assert_eq!(directory.addresses(), vec![moved_exit.address]);
+        assert!(
+            directory.leases.is_empty(),
+            "old immutable relay targets survived exit migration"
+        );
     }
 }

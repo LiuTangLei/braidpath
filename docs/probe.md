@@ -98,6 +98,11 @@ capability, not a substitute for transport authentication or anti-spoofing.
   carried to the receiver by a separate end marker; it is unavailable if the
   marker is lost. `observed_send_span_seconds` spans timestamps of received
   packets and may understate the actual source span after loss.
+- `source_pacing_policy.maximum_catch_up_packets` bounds consecutive overdue
+  source ticks to 64. `bounded_catch_up_resets` counts schedule reanchors; it
+  does not prove uniform packet spacing. Steady performance comparisons also
+  qualify the actual micro-window source peaks, as described in
+  [source timing diagnostics](source-burst-diagnostics.md).
 - Nominal `requested_offered_load_bps` is `pps * size * 8`.
   `actual_offered_load_bps` is `(sent - 1) * size * 8 / send_span_seconds`,
   measuring the intervals between successful sends; a single packet has no nonzero span and yields null.

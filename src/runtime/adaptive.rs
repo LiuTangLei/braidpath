@@ -10957,6 +10957,14 @@ mod tests {
         assert_eq!(fixed.rate_bps, START_BPS);
         assert_eq!(fixed.queue_delay_ms, 0.0);
         assert!(fixed.last_brake_us.is_none());
+        eprintln!(
+            "rtt_source_comparison: {}",
+            serde_json::json!({
+                "conditions": {"local_rtt_ms":100, "probe_rtt_ms":80, "observations_us":[0,600000,700000], "initial_allowance_bps":START_BPS},
+                "window_a": {"source_baselines":false, "allowance_bps":legacy.rate_bps, "queue_ms":legacy.queue_delay_ms},
+                "window_b": {"source_baselines":true, "allowance_bps":fixed.rate_bps, "queue_ms":fixed.queue_delay_ms}
+            })
+        );
         let s = &fixed.last_control;
         assert_eq!(s.selected_rtt_ms, Some(100.0));
         assert_eq!(s.mixed_min_rtt_ms, Some(80.0));

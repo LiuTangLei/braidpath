@@ -16,8 +16,13 @@ import random
 import signal
 import socket
 import struct
+import sys
 import time
 from typing import Callable
+
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from bench.source_burst import steady_source_peaks
 
 MAGIC = b"BPADAPT1"
 HEADER = struct.Struct("!8sBQQ")
@@ -309,12 +314,17 @@ def packet(kind, seq, stamp, size):
 class EchoTarget(asyncio.DatagramProtocol):
     def __init__(self, streams):
         self.streams = streams
-        self.counters = Counter()
+        self.accepting = True
+        self.counters = Counter(dict.fromkeys(("received_packets", "unique_records",
+            "duplicate_records", "corrupt_or_unknown", "echoes_submitted"), 0))
 
     def connection_made(self, transport):
         self.transport = transport
 
     def datagram_received(self, data, peer):
+        if not self.accepting:
+            return
+        self.counters["received_packets"] += 1
         now = time.monotonic_ns()
         try:
             magic, kind, seq, stamp = HEADER.unpack_from(data)
@@ -324,18 +334,27 @@ class EchoTarget(asyncio.DatagramProtocol):
                 raise ValueError("integrity")
             if sample["target_ns"] is None:
                 sample["target_ns"] = now
+                self.counters["unique_records"] += 1
             else:
                 self.counters["duplicate_records"] += 1
             self.transport.sendto(data, peer)
+            self.counters["echoes_submitted"] += 1
         except (ValueError, KeyError, IndexError, struct.error):
             self.counters["corrupt_or_unknown"] += 1
+
+    def finish(self):
+        # Freeze the target observation boundary before shutdown yields again;
+        # late callbacks must not mutate samples after the counter snapshot.
+        self.accepting = False
+        return dict(self.counters)
 
 
 class Traffic:
     def __init__(self, kind, pps, size, destination):
         self.kind, self.pps, self.size, self.destination = kind, pps, size, destination
         self.samples = []
-        self.counters = Counter()
+        self.counters = Counter(dict.fromkeys(("sent_packets", "received_packets", "unique_echoes",
+            "duplicate_echoes", "corrupt_or_unknown", "receive_socket_errors", "send_errors", "generator_late"), 0))
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1 << 20)
         self.socket.setblocking(False)
@@ -350,6 +369,7 @@ class Traffic:
                 await asyncio.sleep(.01)
                 continue
             now = time.monotonic_ns()
+            self.counters["received_packets"] += 1
             try:
                 magic, kind, seq, stamp = HEADER.unpack_from(data)
                 sample = self.samples[seq]
@@ -358,6 +378,7 @@ class Traffic:
                     raise ValueError("integrity")
                 if sample["echo_ns"] is None:
                     sample["echo_ns"] = now
+                    self.counters["unique_echoes"] += 1
                 else:
                     self.counters["duplicate_echoes"] += 1
             except (ValueError, IndexError, struct.error):
@@ -399,6 +420,7 @@ class Traffic:
                 try:
                     await udp_send(self.socket, packet(self.kind, seq, stamp, self.size), self.destination)
                     sample["status"] = "kernel_accepted"
+                    self.counters["sent_packets"] += 1
                 except OSError as error:
                     sample["status"] = "send_error"
                     sample["error"] = type(error).__name__
@@ -543,6 +565,7 @@ def summarize(streams, phases, deadline_ms, start_ns):
                 "planned_operations": planned, "kernel_accepted_operations": len(sent),
                 "generator_not_issued_operations": planned - len(samples),
                 "actual_offered_fraction": len(sent) / max(1, planned),
+                "source_pacing": steady_source_peaks([s["send_ns"] // 1000 for s in sent], stream.pps),
                 "actual_offered_bps": len(sent) * stream.size * 8 / phase["seconds"],
                 "target_unique_records": target, "echo_unique_records": received,
                 "offered_application_bytes": len(sent) * stream.size,
@@ -587,7 +610,8 @@ async def experiment(args):
     phases = phases_for(args)
     manifest = {"schema_version": 1, "registered_utc": utc(), "binary": str(binary),
                 "sha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
-                "harness_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+                "harness_sha256": hashlib.sha256(Path(__file__).read_bytes()
+                    + (Path(__file__).parent / "source_burst.py").read_bytes()).hexdigest(),
                 "profile": args.profile, "topology": args.topology, "paths": args.paths,
                 "rate_bps": args.rate_bps, "queue_ms": args.queue_ms, "fec": args.fec,
                 "latency_target_ms": args.latency_target_ms, "loss": args.loss,
@@ -716,7 +740,7 @@ async def experiment(args):
         await asyncio.wait_for(asyncio.gather(*work_tasks), total + 8)
         await asyncio.sleep(max(0, start + total + 2 - time.monotonic()))
         outcome = "completed" if client.returncode is None and server.returncode is None else "runtime_exited"
-        save(output / "target-counters.json", dict(echo.counters))
+        save(output / "target-counters.json", echo.finish())
     except BaseException as caught:
         error = f"{type(caught).__name__}: {caught}"
         if isinstance(caught, (KeyboardInterrupt, asyncio.CancelledError)):

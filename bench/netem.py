@@ -17,6 +17,7 @@ import time
 import uuid
 
 from bench.readiness import ProcessSample, ReadinessRequirement, wait_for_ready
+from bench.source_burst import steady_source_peaks
 
 
 def save(path, value):
@@ -63,10 +64,12 @@ def latest_complete_snapshot(path, maximum_bytes=1024 * 1024):
 
 
 def source_qualification(samples, source, count, pps):
-    """Apply warmup_profile's95% whole-source and nominal1s cohort floor."""
+    """Qualify a steady source, including sub-millisecond catchup pressure."""
     expected = pps * 1000 * 8
     span = source["send_span_seconds"]
     result = {"expected_raw_rate_bps": expected, "actual_raw_rate_bps": count * 1000 * 8 / span,
+              "pacing_policy": "steady", "micro_window_maximum_nominal_multiple": 2,
+              "micro_window_minimum_packet_allowance": 2,
               "minimum_pacing_fraction": .95, "reasons": [], "one_second_source_cohorts": []}
     reasons = result["reasons"]
     if len(samples) != count or any(row.get("seq") != i for i, row in enumerate(samples)):
@@ -78,6 +81,13 @@ def source_qualification(samples, source, count, pps):
         return {"source_qualified": False, "source_qualification": result}
     if any(b < a for a, b in zip(stamps, stamps[1:])):
         reasons.append("source wall clock regressed")
+        return {"source_qualified": False, "source_qualification": result}
+    shape = steady_source_peaks(stamps, pps)
+    peaks = shape["rolling_windows_us"]
+    result.update({key: value for key, value in shape.items() if key != "qualified"})
+    for width, peak in peaks.items():
+        if not peak["qualified"]:
+            reasons.append(f"steady source burst exceeds allowance in {width}us window")
     tolerance = max(.01, span * .005)
     wall_span = (stamps[-1] - stamps[0]) / 1e6
     result["clock_check"] = {"full_monotonic_span_seconds": span, "full_wall_span_seconds": wall_span,
@@ -657,7 +667,7 @@ def main():
     registration.update({"registered_unix_ms": int(time.time() * 1000), "payload_bytes": 964,
                          "deadline_ms": 200, "outer_budget_bps": 400000000, "full_population": True})
     registration["harness_sha256"] = {name: hashlib.sha256((Path(__file__).parent / name).read_bytes()).hexdigest()
-        for name in ("netem.py", "readiness.py", "netem_calibration.py", "netem_shared.py")}
+        for name in ("netem.py", "readiness.py", "source_burst.py", "netem_calibration.py", "netem_shared.py")}
     if args.binary:
         registration["binary_sha256"] = hashlib.sha256(args.binary.read_bytes()).hexdigest()
     save(args.output / "registration.json", registration)

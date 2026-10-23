@@ -82,6 +82,186 @@ impl<T> Drop for Task<T> {
     }
 }
 
+#[tokio::test]
+async fn mesh_session_rejects_wrong_or_missing_exit_before_epoch_recovery() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let temp = tempfile::tempdir().unwrap();
+    let identity = temp.path().join("identity");
+    transport::initialize(&identity, "braidpath.mesh").unwrap();
+    let address = mesh::tests::address();
+    let state = mesh::tests::connection_state(&identity, address, 1);
+    let metrics = stats::Metrics::new("identity-server");
+    let pending = Arc::new(Semaphore::new(1));
+    let data = Arc::new(Semaphore::new(1));
+    let _server = Task(tokio::spawn(serve_with_budgets(
+        ServerOptions {
+            bind: address,
+            cert: identity.join("cert.pem"),
+            key: identity.join("key.pem"),
+            token: identity.join("token"),
+            target: mesh::tests::address(),
+            max_rate: 10_000_000,
+            congestion: transport::Congestion::default(),
+            datagram_send_buffer_bytes: transport::DEFAULT_DATAGRAM_SEND_BUFFER_BYTES,
+            adaptive_fec_retention: false,
+            stats: metrics.clone(),
+        },
+        transport::AckRequest::Unchanged,
+        Some(state),
+        pending.clone(),
+        data.clone(),
+    )));
+    timeout(Duration::from_secs(2), async {
+        while !metrics.is_ready() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let endpoint = transport::client(
+        address,
+        &identity.join("cert.pem"),
+        None,
+        transport::Congestion::default(),
+    )
+    .unwrap();
+    let token = transport::token(&identity.join("token")).unwrap();
+    for exit in [None, Some("previous-address-owner")] {
+        for rejoin in [false, true] {
+            let mut diagnostic = stats::ConnectionTrace::new(
+                stats::Metrics::new("identity-client"),
+                address,
+                Some(0),
+                "test",
+            );
+            let result = connect_path(
+                &endpoint,
+                address,
+                "braidpath.mesh",
+                &token,
+                &transport::hex(&rand::random::<[u8; 16]>()),
+                0,
+                0,
+                1,
+                rejoin,
+                &mesh::tests::policy(),
+                exit,
+                &mut diagnostic,
+            )
+            .await;
+            let error = match result {
+                Ok(_) => panic!("wrong exit admitted"),
+                Err(error) => error,
+            };
+            assert!(error.to_string().contains("identity mismatch"), "{error}");
+            assert!(
+                !error.is::<SessionExpired>(),
+                "mismatch requested a fresh epoch"
+            );
+            assert_eq!(
+                data.available_permits(),
+                1,
+                "wrong exit consumed data capacity"
+            );
+            // The client's rejection closes H3 asynchronously. Wait for that
+            // exact pending permit before the next case uses our one-slot
+            // fixture, rather than accidentally testing handshake saturation.
+            timeout(Duration::from_secs(2), async {
+                while pending.available_permits() != 1 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("rejected connection retained pending capacity");
+        }
+    }
+}
+
+#[tokio::test]
+async fn legacy_session_response_cannot_silently_remove_mesh_exit_binding() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let temp = tempfile::tempdir().unwrap();
+    let identity = temp.path().join("identity");
+    transport::initialize(&identity, "braidpath.mesh").unwrap();
+    for status in [StatusCode::OK, StatusCode::GONE] {
+        let server = transport::server(
+            "127.0.0.1:0".parse().unwrap(),
+            &identity.join("cert.pem"),
+            &identity.join("key.pem"),
+            transport::Congestion::default(),
+        )
+        .unwrap();
+        let address = server.local_addr().unwrap();
+        let _server = Task(tokio::spawn(async move {
+            let connection = server.accept().await.unwrap().await.unwrap();
+            let mut h3 = h3::server::builder()
+                .enable_datagram(true)
+                .build::<_, Bytes>(h3_quinn::Connection::new(connection.clone()))
+                .await
+                .unwrap();
+            let (_request, mut stream) = h3
+                .accept()
+                .await
+                .unwrap()
+                .unwrap()
+                .resolve_request()
+                .await
+                .unwrap();
+            stream
+                .send_response(
+                    Response::builder()
+                        .status(status)
+                        .header("braidpath-version", "1")
+                        .header("braidpath-max-payload", MAX_PAYLOAD)
+                        .body(())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            stream.finish().await.unwrap();
+            let _ = connection.closed().await;
+        }));
+        let endpoint = transport::client(
+            address,
+            &identity.join("cert.pem"),
+            None,
+            transport::Congestion::default(),
+        )
+        .unwrap();
+        let mut diagnostic = stats::ConnectionTrace::new(
+            stats::Metrics::new("legacy-client"),
+            address,
+            Some(0),
+            "test",
+        );
+        let result = timeout(
+            Duration::from_secs(2),
+            connect_path(
+                &endpoint,
+                address,
+                "braidpath.mesh",
+                &transport::token(&identity.join("token")).unwrap(),
+                &transport::hex(&rand::random::<[u8; 16]>()),
+                0,
+                0,
+                1,
+                status == StatusCode::GONE,
+                &mesh::tests::policy(),
+                Some("own"),
+                &mut diagnostic,
+            ),
+        )
+        .await
+        .unwrap();
+        let error = match result {
+            Ok(_) => panic!("legacy peer accepted"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("unsupported peer"), "{error}");
+        assert!(!error.is::<SessionExpired>());
+    }
+}
+
 async fn control_connection(
     endpoint: &quinn::Endpoint,
     address: SocketAddr,
@@ -230,6 +410,7 @@ async fn connection_budgets_isolate_control_data_and_pending_admission() {
         1,
         false,
         &policy,
+        Some("own"),
         &mut diagnostic,
     )
     .await
@@ -289,15 +470,39 @@ async fn connection_budgets_isolate_control_data_and_pending_admission() {
 
 #[tokio::test]
 async fn ordinary_server_releases_unauthenticated_connection_at_ten_seconds() {
-    admission_deadline(false, false).await;
+    admission_deadline(AdmissionScenario::Idle).await;
 }
 
 #[tokio::test]
 async fn mesh_server_deadline_also_bounds_incomplete_request_headers() {
-    admission_deadline(true, true).await;
+    admission_deadline(AdmissionScenario::IncompleteHeaders).await;
 }
 
-async fn admission_deadline(mesh_enabled: bool, incomplete_headers: bool) {
+#[tokio::test]
+async fn unauthenticated_response_without_stream_credit_cannot_pin_pending_permit() {
+    admission_deadline(AdmissionScenario::StalledResponse).await;
+}
+
+#[tokio::test]
+async fn authenticated_control_response_without_stream_credit_cannot_pin_control_permit() {
+    admission_deadline(AdmissionScenario::StalledControlResponse).await;
+}
+
+enum AdmissionScenario {
+    Idle,
+    IncompleteHeaders,
+    StalledResponse,
+    StalledControlResponse,
+}
+
+async fn admission_deadline(scenario: AdmissionScenario) {
+    let incomplete_headers = matches!(scenario, AdmissionScenario::IncompleteHeaders);
+    let authenticated_control = matches!(scenario, AdmissionScenario::StalledControlResponse);
+    let stalled_response = matches!(
+        scenario,
+        AdmissionScenario::StalledResponse | AdmissionScenario::StalledControlResponse
+    );
+    let mesh_enabled = incomplete_headers || authenticated_control;
     let _ = rustls::crypto::ring::default_provider().install_default();
     let temp = tempfile::tempdir().unwrap();
     let identity = temp.path().join("identity");
@@ -321,7 +526,7 @@ async fn admission_deadline(mesh_enabled: bool, incomplete_headers: bool) {
             stats: metrics.clone(),
         },
         transport::AckRequest::Unchanged,
-        mesh,
+        mesh.clone(),
         pending.clone(),
         data.clone(),
     )));
@@ -332,13 +537,36 @@ async fn admission_deadline(mesh_enabled: bool, incomplete_headers: bool) {
     })
     .await
     .unwrap();
-    let endpoint = transport::client(
-        address,
-        &identity.join("cert.pem"),
-        None,
-        transport::Congestion::default(),
-    )
-    .unwrap();
+    let endpoint = if stalled_response {
+        // 64 bytes carry H3 settings/headers but cannot carry the website body.
+        // Keepalive stays enabled, so transport idle timeout cannot mask the
+        // application's absolute admission deadline.
+        let mut roots = rustls::RootCertStore::empty();
+        for cert in transport::certificates(&identity.join("cert.pem")).unwrap() {
+            roots.add(cert).unwrap();
+        }
+        let mut tls = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        tls.alpn_protocols = vec![b"h3".to_vec()];
+        let mut config = quinn::ClientConfig::new(Arc::new(
+            quinn::crypto::rustls::QuicClientConfig::try_from(tls).unwrap(),
+        ));
+        let mut transport = transport::config(transport::Congestion::default());
+        transport.stream_receive_window(64u32.into());
+        config.transport_config(Arc::new(transport));
+        let mut endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        endpoint.set_default_client_config(config);
+        endpoint
+    } else {
+        transport::client(
+            address,
+            &identity.join("cert.pem"),
+            None,
+            transport::Congestion::default(),
+        )
+        .unwrap()
+    };
     let (raw, mut send, _driver) = control_connection(&endpoint, address).await;
     // A complete, rejected request proves the handshake/HTTP3 setup is done;
     // rejection must not extend the absolute unauthenticated deadline.
@@ -348,7 +576,41 @@ async fn admission_deadline(mesh_enabled: bool, incomplete_headers: bool) {
             .unwrap(),
         StatusCode::NOT_FOUND
     );
-    assert_eq!(pending.available_permits(), 0);
+    if authenticated_control {
+        let token = transport::token(&identity.join("token")).unwrap();
+        assert_eq!(
+            mesh_request(&mut send, &token, "/mesh/nodes", None)
+                .await
+                .unwrap(),
+            StatusCode::OK
+        );
+        assert!(mesh.as_ref().unwrap().control_permit().is_none());
+    }
+    let _blocked_response = if stalled_response {
+        let mut request = send
+            .send_request(
+                Request::builder()
+                    .uri("https://braidpath.mesh/")
+                    .method(Method::GET)
+                    .body(())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        request.finish().await.unwrap();
+        assert_eq!(
+            request.recv_response().await.unwrap().status(),
+            StatusCode::OK
+        );
+        // Deliberately do not consume the body, withholding stream credit.
+        Some(request)
+    } else {
+        None
+    };
+    assert_eq!(
+        pending.available_permits(),
+        usize::from(authenticated_control)
+    );
     metrics.state(|s| {
         assert!(
             s.connection_events
@@ -374,12 +636,30 @@ async fn admission_deadline(mesh_enabled: bool, incomplete_headers: bool) {
     for _ in 0..128 {
         tokio::task::yield_now().await;
     }
-    assert_eq!(pending.available_permits(), 0);
+    assert_eq!(
+        pending.available_permits(),
+        usize::from(authenticated_control)
+    );
     // Eleven seconds exceeds admission but is below a five-second request
     // timeout started at second nine. No wall-clock ten-second sleep is used.
+    if authenticated_control {
+        // Advance in small steps so actual QUIC keepalives are serviced. The
+        // connection must remain open beyond the 15-second transport idle
+        // timeout and until just before its 60-second control deadline.
+        for _ in 0..50 {
+            tokio::time::advance(Duration::from_secs(1)).await;
+            for _ in 0..128 {
+                tokio::task::yield_now().await;
+            }
+            assert!(raw.close_reason().is_none());
+            assert!(mesh.as_ref().unwrap().control_permit().is_none());
+        }
+    }
     tokio::time::advance(Duration::from_millis(1950)).await;
     for _ in 0..1024 {
-        if pending.available_permits() == 1 {
+        if pending.available_permits() == 1
+            && (!authenticated_control || mesh.as_ref().unwrap().control_permit().is_some())
+        {
             break;
         }
         tokio::task::yield_now().await;
@@ -390,6 +670,12 @@ async fn admission_deadline(mesh_enabled: bool, incomplete_headers: bool) {
         "unauthenticated connection outlived its admission deadline"
     );
     assert_eq!(data.available_permits(), 1);
+    if authenticated_control {
+        assert!(
+            mesh.as_ref().unwrap().control_permit().is_some(),
+            "stalled response retained the control permit after 60 seconds"
+        );
+    }
     if let Some(tx) = partial.as_mut() {
         let _ = tx.reset(0u32.into());
     }

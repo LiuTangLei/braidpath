@@ -23,7 +23,8 @@ goodput divides by actual source span. A single diagnostic is not acceptance.
 Boundary snapshots before/after business traffic and after runtime shutdown retain
 namespace UDP/kernel counters, interface counters and socket memory. These counters
 keep their native scopes and must not be added to application drops without
-reconciliation. Registration binds the binary and four harness source hashes.
+reconciliation. Registration binds the binary and the collector, qualifier and
+timing-analysis source hashes.
 Boundary snapshots and the existing 250 ms qdisc series also retain optional
 raw Linux VM guest-wide CPU/memory/I/O pressure, container cgroup memory limits
 and events, and the owned source main thread's scheduler counters while it is
@@ -67,8 +68,18 @@ deadlines, BBR and the other physical links' calibration remain unchanged.
 The source sample file and summary retain actual source timestamps, the overall
 offered rate, and each nominal one-second cohort's rate. Any cohort below the
 existing 95 percent source floor invalidates the measurement; its raw data and
-delivery summary remain available. Source qualification does not replace the
-300 Mbps and 95-percent-within-200-ms joint delivery gate.
+delivery summary remain available. Steady-source qualification also inspects
+rolling 100, 1000, 1600 and 5000 microsecond populations. Each permits at most
+twice the nominal packet count, rounded up, with a two-packet minimum allowance.
+An excessive peak invalidates the steady-source comparison even when the whole
+run meets its offered rate. The peak measures source pressure, not tunnel loss.
+Intentionally bursty diagnostics keep their own declared workload and must not
+be reported as qualified steady traffic. Archived summaries are not rewritten.
+The runtime probe bounds overdue catchup to 64 packets before resetting its next
+deadline; it records these resets and still requires actual-source qualification.
+It does not promise precise sub-millisecond spacing from an async timer.
+Source qualification does not replace the 300 Mbps and
+95-percent-within-200-ms joint delivery gate.
 The runtime `--datagram-send-buffer-bytes` option is available independently on
 client and server. Reverse-direction experiments must configure the server's
 outgoing buffer; the client option only configures that client's outgoing bytes.
@@ -142,13 +153,28 @@ python3 -m unittest bench.test_run bench.test_readiness
 ```
 
 Dry run writes `schedule.json` and prints JSON without SSH or firewall changes.
-An existing output directory resumes only the same configuration and remote
-binary hashes. Completed rows, including failed or interrupted rows, are not
+An existing output directory resumes only the same configuration, remote
+binary hashes and actual collector/readiness source hashes. Completed rows, including failed or interrupted rows, are not
 silently rerun. A previously unfinished attempt is stopped, collected and retained
 as interrupted. Use a new output directory for a new comparison or changed
 configuration/binaries. The manifest records local Git HEAD and remote binary
-SHA-256/version; binaries are rechecked on resume. SSH management failures remain
+SHA-256/version; binaries and harness bytes are rechecked on resume. Runs without
+a recorded harness identity need a new output directory. SSH management failures remain
 errors; there is no automatic route change.
+
+`adaptive_compare.py` requires both complete registered window sequences in the
+same order, both bulk and interactive streams and their counters, finite metrics,
+and valid binary and matching harness identities. Collectors write explicit zero
+counts for sent, received, unique, duplicate and corrupt events. The comparator
+rejects sparse or invalid counters and checks receive conservation and agreement
+with complete-window counts; an empty object cannot certify zero corruption.
+The target observation boundary freezes before shutdown, so later callbacks
+cannot change samples after their counter snapshot. Integrity errors include
+corrupt and duplicate observations at each endpoint; these are not a count of
+distinct lost application packets. Empty, duplicate, missing or reordered
+windows are not evaluable; missing data cannot remove an unfavorable window.
+The comparison records its own analyzer hash. These checks establish comparison
+integrity, not statistical significance or WAN acceptance.
 
 ## Private topology schema
 

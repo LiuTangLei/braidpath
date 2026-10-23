@@ -98,24 +98,44 @@ pub(super) async fn echo(label: u8) -> (SocketAddr, Task<()>) {
         })),
     )
 }
-async fn delivery(identity: &ClientIdentity, entrances: Vec<SocketAddr>, label: u8) {
+async fn wait_entrances(guard: &Entrances, count: usize) -> Vec<SocketAddr> {
+    let mut updates = guard.updates();
+    timeout(Duration::from_secs(8), async {
+        loop {
+            let addresses = updates.borrow_and_update().clone();
+            if addresses.len() >= count {
+                return addresses;
+            }
+            updates.changed().await.unwrap();
+        }
+    })
+    .await
+    .expect("optional entrances were not allocated")
+}
+
+async fn delivery(identity: &ClientIdentity, entrances: Vec<SocketAddr>, label: u8, exit: &str) {
     let listen = address();
-    let client = Task(tokio::spawn(tunnel::client(tunnel::ClientOptions {
-        adaptive_fec_retention: false,
-        rotate_source_port: false,
-        listen,
-        entrances,
-        interfaces: vec![],
-        path_binds: vec![],
-        path_groups: vec![],
-        datagram_send_buffer_bytes: transport::DEFAULT_DATAGRAM_SEND_BUFFER_BYTES,
-        name: identity.name(),
-        ca: identity.dir.join("cert.pem"),
-        token: identity.dir.join("token"),
-        policy: policy(),
-        congestion: transport::Congestion::default(),
-        stats: stats::Metrics::new("test-client"),
-    })));
+    let client = Task(tokio::spawn(tunnel::client_with_mesh_exit(
+        tunnel::ClientOptions {
+            adaptive_fec_retention: false,
+            rotate_source_port: false,
+            listen,
+            entrances,
+            interfaces: vec![],
+            path_binds: vec![],
+            path_groups: vec![],
+            datagram_send_buffer_bytes: transport::DEFAULT_DATAGRAM_SEND_BUFFER_BYTES,
+            name: identity.name(),
+            ca: identity.dir.join("cert.pem"),
+            token: identity.dir.join("token"),
+            policy: policy(),
+            congestion: transport::Congestion::default(),
+            stats: stats::Metrics::new("test-client"),
+        },
+        None,
+        None,
+        exit.into(),
+    )));
     let app = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     app.connect(listen).await.unwrap();
     timeout(Duration::from_secs(8), async {
@@ -177,12 +197,13 @@ async fn mesh_survives_bootstrap_loss_and_selects_any_exit_through_peers() {
     // Each node can be the exit. Force relay-only traffic, excluding the direct
     // address, so an echo cannot accidentally pass without server cooperation.
     for (id, label) in [("node_a", b'A'), ("node_b", b'B'), ("node_c", b'C')] {
-        let (entrances, _leases) = identity
+        let (_, leases) = identity
             .entrances(nodes.clone(), id, MAX_PATHS)
             .await
             .unwrap();
+        let entrances = wait_entrances(&leases, 3).await;
         assert_eq!(entrances.len(), 3);
-        delivery(&identity, entrances[1..].to_vec(), label).await;
+        delivery(&identity, entrances[1..].to_vec(), label, id).await;
     }
     let control = Control::new(&identity.dir.join("cert.pem"), false).unwrap();
     let attempt = Exchange {
@@ -235,12 +256,13 @@ async fn mesh_survives_bootstrap_loss_and_selects_any_exit_through_peers() {
         ClientIdentity::open(root.join("client"), &root.join("node_a/client-key.json")).unwrap();
     assert_eq!(reopened.discover_any(&[a]).await.unwrap(), remaining);
     assert_eq!(reopened.discover_any(&[a, c]).await.unwrap(), remaining);
-    let (entrances, _leases) = identity
+    let (_, leases) = identity
         .entrances(remaining, "node_c", MAX_PATHS)
         .await
         .unwrap();
+    let entrances = wait_entrances(&leases, 2).await;
     assert_eq!(entrances.len(), 2);
-    delivery(&identity, entrances[1..].to_vec(), b'C').await;
+    delivery(&identity, entrances[1..].to_vec(), b'C', "node_c").await;
 
     // A new server joins a surviving member; it never contacts the first server.
     let d = address();
@@ -291,8 +313,10 @@ pub(crate) fn state(root: &Path) -> State {
         dir: root.into(),
         client_auth: "client".into(),
         member_auth: "member".into(),
-        peers: Mutex::new(BTreeMap::new()),
-        reconnect: Mutex::new(Vec::new()),
+        peers: Arc::new(Mutex::new(BTreeMap::new())),
+        reconnect: Arc::new(Mutex::new(Vec::new())),
+        membership_write: Arc::new(tokio::sync::Mutex::new(())),
+        relay_budget: Arc::new(relay::HostBudget::new(10_000_000)),
         leases: Mutex::new(BTreeMap::new()),
         control_connections: Arc::new(tokio::sync::Semaphore::new(CONTROL_CONNECTIONS)),
         rate: 10_000_000,
@@ -310,8 +334,8 @@ fn age(state: &State, id: &str, by: Duration) {
     peer.heard = Instant::now() - by;
     peer.seen = peer.seen.map(|_| Instant::now() - by);
 }
-#[test]
-fn gossip_does_not_extend_liveness_and_conflicting_hints_are_isolated() {
+#[tokio::test]
+async fn gossip_does_not_extend_liveness_and_conflicting_hints_are_isolated() {
     let temp = tempfile::tempdir().unwrap();
     let state = state(temp.path());
     let peer = node("peer", 10001);
@@ -323,6 +347,7 @@ fn gossip_does_not_extend_liveness_and_conflicting_hints_are_isolated() {
             },
             true,
         )
+        .await
         .unwrap();
     state.peers.lock().unwrap().get_mut("peer").unwrap().seen = Some(Instant::now() - LIVE_FOR);
     state
@@ -333,6 +358,7 @@ fn gossip_does_not_extend_liveness_and_conflicting_hints_are_isolated() {
             },
             false,
         )
+        .await
         .unwrap();
     assert_eq!(state.active(), vec![state.own.clone()]);
     // A hint conflicting with a current member is skipped; the sender and
@@ -351,6 +377,7 @@ fn gossip_does_not_extend_liveness_and_conflicting_hints_are_isolated() {
             },
             true,
         )
+        .await
         .unwrap();
     assert_eq!(
         state.known(),
@@ -367,6 +394,7 @@ fn gossip_does_not_extend_liveness_and_conflicting_hints_are_isolated() {
                 },
                 true,
             )
+            .await
             .is_err()
     );
     // New records beyond the member limit are skipped, not fatal.
@@ -381,14 +409,15 @@ fn gossip_does_not_extend_liveness_and_conflicting_hints_are_isolated() {
             },
             false,
         )
+        .await
         .unwrap();
     assert_eq!(state.known().len(), MAX_NODES);
     // Only live members are advertised to peers.
     assert_eq!(state.exchange().nodes, state.active());
 }
 
-#[test]
-fn moved_members_replace_unheard_records_and_departed_members_are_forgotten() {
+#[tokio::test]
+async fn moved_members_replace_unheard_records_and_departed_members_are_forgotten() {
     let temp = tempfile::tempdir().unwrap();
     let state = state(temp.path());
     let live = node("live", 10001);
@@ -402,6 +431,7 @@ fn moved_members_replace_unheard_records_and_departed_members_are_forgotten() {
                 },
                 true,
             )
+            .await
             .unwrap();
     }
     let mut moved = moving.clone();
@@ -412,10 +442,10 @@ fn moved_members_replace_unheard_records_and_departed_members_are_forgotten() {
         nodes: vec![],
     };
     // Records heard recently are never displaced.
-    assert!(state.merge(exchange(&moved), false).is_err());
-    assert!(state.merge(exchange(&reused), false).is_err());
+    assert!(state.merge(exchange(&moved), false).await.is_err());
+    assert!(state.merge(exchange(&reused), false).await.is_err());
     age(&state, "moving", LIVE_FOR);
-    state.merge(exchange(&moved), false).unwrap();
+    state.merge(exchange(&moved), false).await.unwrap();
     assert_eq!(
         state.known(),
         vec![state.own.clone(), live.clone(), moved.clone()]
@@ -426,21 +456,21 @@ fn moved_members_replace_unheard_records_and_departed_members_are_forgotten() {
     // An isolated server keeps every record, however old.
     age(&state, "live", FORGET_AFTER);
     age(&state, "moving", FORGET_AFTER);
-    state.forget_departed().unwrap();
+    state.forget_departed().await.unwrap();
     assert_eq!(state.known().len(), 3);
     // Once a peer is live again, records nobody reported running are dropped.
-    state.merge(exchange(&live), true).unwrap();
-    state.forget_departed().unwrap();
+    state.merge(exchange(&live), true).await.unwrap();
+    state.forget_departed().await.unwrap();
     assert_eq!(state.known(), vec![state.own.clone(), live.clone()]);
     let saved: Vec<Node> = read_json(&temp.path().join("peers.json")).unwrap();
     assert_eq!(saved, vec![live]);
     // A departed member that returns is admitted again by its own exchange.
-    state.merge(exchange(&moved), false).unwrap();
+    state.merge(exchange(&moved), false).await.unwrap();
     assert_eq!(state.known().len(), 3);
 }
 
-#[test]
-fn failed_restart_cache_write_does_not_commit_membership_and_can_retry() {
+#[tokio::test]
+async fn failed_restart_cache_write_does_not_commit_membership_and_can_retry() {
     let temp = tempfile::tempdir().unwrap();
     let state = state(temp.path());
     let peer = Node {
@@ -452,14 +482,327 @@ fn failed_restart_cache_write_does_not_commit_membership_and_can_retry() {
         sender: peer.clone(),
         nodes: vec![],
     };
-    assert!(state.merge(exchange(), true).is_err());
+    assert!(state.merge(exchange(), true).await.is_err());
     assert_eq!(state.known(), vec![state.own.clone()]);
     fs::remove_dir(temp.path().join("peers.json")).unwrap();
-    state.merge(exchange(), true).unwrap();
+    state.merge(exchange(), true).await.unwrap();
     let saved: Vec<Node> = read_json(&temp.path().join("peers.json")).unwrap();
     assert_eq!(saved, vec![peer]);
     assert_eq!(state.known().len(), 2);
 }
+#[tokio::test]
+async fn full_isolated_directory_admits_sender_and_preserves_displaced_peer() {
+    let temp = tempfile::tempdir().unwrap();
+    let server = state(temp.path());
+    let old: Vec<_> = (0..MAX_NODES as u16 - 1)
+        .map(|i| node(&format!("old_{i:02}"), 11000 + i))
+        .collect();
+    server
+        .merge(
+            Exchange {
+                sender: server.own.clone(),
+                nodes: old.clone(),
+            },
+            false,
+        )
+        .await
+        .unwrap();
+    let newcomer = node("newcomer", 12000);
+    let exchange = || Exchange {
+        sender: newcomer.clone(),
+        nodes: vec![],
+    };
+    assert!(
+        server.merge(exchange(), false).await.is_err(),
+        "live records were evicted"
+    );
+    for peer in &old {
+        age(&server, &peer.id, FORGET_AFTER);
+    }
+    age(&server, &old[0].id, FORGET_AFTER + LIVE_FOR);
+    server.forget_departed().await.unwrap();
+    assert_eq!(
+        server.known().len(),
+        MAX_NODES,
+        "isolation erased the directory"
+    );
+    server
+        .merge(
+            Exchange {
+                sender: server.own.clone(),
+                nodes: vec![newcomer.clone()],
+            },
+            false,
+        )
+        .await
+        .unwrap();
+    assert!(
+        !server.known().contains(&newcomer),
+        "gossip evicted a member"
+    );
+    server.merge(exchange(), false).await.unwrap();
+    assert_eq!(server.known().len(), MAX_NODES);
+    assert!(server.known().contains(&newcomer));
+    assert!(!server.known().contains(&old[0]));
+    assert_eq!(
+        hints::load(temp.path())
+            .iter()
+            .map(|h| &h.node)
+            .collect::<Vec<_>>(),
+        vec![&old[0]]
+    );
+    let saved: Vec<Node> = read_json(&temp.path().join("peers.json")).unwrap();
+    assert_eq!(saved, server.known()[1..]);
+}
+
+#[tokio::test]
+async fn failed_capacity_recovery_keeps_old_members_and_returning_hint_until_durable() {
+    let temp = tempfile::tempdir().unwrap();
+    let server = state(temp.path());
+    let old: Vec<_> = (0..MAX_NODES as u16 - 1)
+        .map(|i| node(&format!("old_{i:02}"), 11000 + i))
+        .collect();
+    server
+        .merge(
+            Exchange {
+                sender: server.own.clone(),
+                nodes: old.clone(),
+            },
+            false,
+        )
+        .await
+        .unwrap();
+    for peer in &old {
+        age(&server, &peer.id, FORGET_AFTER);
+    }
+    age(&server, &old[0].id, FORGET_AFTER + LIVE_FOR);
+    let newcomer = node("newcomer", 12000);
+    let exchange = || Exchange {
+        sender: newcomer.clone(),
+        nodes: vec![],
+    };
+    fs::create_dir(temp.path().join("reconnect-peers.json")).unwrap();
+    assert!(server.merge(exchange(), true).await.is_err());
+    assert_eq!(server.known()[1..], old);
+    fs::remove_dir(temp.path().join("reconnect-peers.json")).unwrap();
+    fs::rename(
+        temp.path().join("peers.json"),
+        temp.path().join("prior-peers.json"),
+    )
+    .unwrap();
+    fs::create_dir(temp.path().join("peers.json")).unwrap();
+    assert!(server.merge(exchange(), true).await.is_err());
+    assert_eq!(server.known()[1..], old);
+    assert_eq!(hints::load(temp.path())[0].node, old[0]);
+    fs::remove_dir(temp.path().join("peers.json")).unwrap();
+    fs::rename(
+        temp.path().join("prior-peers.json"),
+        temp.path().join("peers.json"),
+    )
+    .unwrap();
+    server.merge(exchange(), true).await.unwrap();
+    // A returning hinted member must remain recoverable if its member-file
+    // write fails. Pruning this hint before that write would lose both routes.
+    fs::rename(
+        temp.path().join("peers.json"),
+        temp.path().join("prior-peers.json"),
+    )
+    .unwrap();
+    fs::create_dir(temp.path().join("peers.json")).unwrap();
+    let returning = || Exchange {
+        sender: old[0].clone(),
+        nodes: vec![],
+    };
+    assert!(server.merge(returning(), true).await.is_err());
+    assert!(hints::load(temp.path()).iter().any(|h| h.node == old[0]));
+    fs::remove_dir(temp.path().join("peers.json")).unwrap();
+    fs::rename(
+        temp.path().join("prior-peers.json"),
+        temp.path().join("peers.json"),
+    )
+    .unwrap();
+    server.merge(returning(), true).await.unwrap();
+    assert!(server.known().contains(&old[0]));
+    assert!(!hints::load(temp.path()).iter().any(|h| h.node == old[0]));
+}
+
+#[tokio::test]
+async fn stalled_membership_write_keeps_reads_and_relay_live_and_cancellation_preserves_order() {
+    let temp = tempfile::tempdir().unwrap();
+    let (target, _echo) = echo(b'E').await;
+    let mut server = state(temp.path());
+    server.own.address = target;
+    server.bind = "127.0.0.1:0".parse().unwrap();
+    let server = Arc::new(server);
+    let source = "127.0.0.1".parse().unwrap();
+    let lease = server
+        .relay(
+            source,
+            RelayRequest {
+                exit: "own".into(),
+                lease: None,
+            },
+        )
+        .await
+        .unwrap();
+    let first = node("first", 11000);
+    let second = node("second", 11001);
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let writing = {
+        let server = server.clone();
+        let first = first.clone();
+        tokio::spawn(async move {
+            server
+                .update_members(move |_, peers, _| {
+                    peers.insert(
+                        first.id.clone(),
+                        Peer {
+                            node: first,
+                            seen: None,
+                            heard: Instant::now(),
+                        },
+                    );
+                    started_tx.send(()).unwrap();
+                    // Controlled blocking persistence boundary; the current-thread
+                    // runtime must still service reads, traffic, renewals and timers.
+                    release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                    Ok(())
+                })
+                .await
+        })
+    };
+    timeout(Duration::from_secs(2), started_rx)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(server.known(), vec![server.own.clone()]);
+    assert_eq!(server.active(), vec![server.own.clone()]);
+    let renewed = timeout(
+        Duration::from_millis(250),
+        server.relay(
+            source,
+            RelayRequest {
+                exit: "own".into(),
+                lease: Some(lease.lease.clone()),
+            },
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(renewed.address, lease.address);
+    let app = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    app.connect(lease.address).await.unwrap();
+    app.send(b"_persisting").await.unwrap();
+    let mut received = [0; 32];
+    let n = timeout(Duration::from_secs(1), app.recv(&mut received))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(&received[..n], b"Epersisting");
+    let next_write = {
+        let server = server.clone();
+        let second = second.clone();
+        tokio::spawn(async move {
+            server
+                .merge(
+                    Exchange {
+                        sender: second,
+                        nodes: vec![],
+                    },
+                    true,
+                )
+                .await
+        })
+    };
+    writing.abort();
+    assert!(writing.await.unwrap_err().is_cancelled());
+    tokio::task::yield_now().await;
+    assert!(
+        !next_write.is_finished(),
+        "cancelled request released its unfinished write"
+    );
+    release_tx.send(()).unwrap();
+    timeout(Duration::from_secs(2), next_write)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let saved: Vec<Node> = read_json(&temp.path().join("peers.json")).unwrap();
+    assert_eq!(saved, vec![first, second]);
+    assert_eq!(server.known()[1..], saved);
+}
+
+#[tokio::test]
+async fn failed_persistence_worker_releases_writer_without_publishing_state() {
+    let temp = tempfile::tempdir().unwrap();
+    let server = state(temp.path());
+    let result = server
+        .update_members(|_, _, _| panic!("injected persistence worker failure"))
+        .await;
+    assert!(result.is_err());
+    assert_eq!(server.known(), vec![server.own.clone()]);
+    let peer = node("peer", 11000);
+    server
+        .merge(
+            Exchange {
+                sender: peer.clone(),
+                nodes: vec![],
+            },
+            true,
+        )
+        .await
+        .unwrap();
+    let saved: Vec<Node> = read_json(&temp.path().join("peers.json")).unwrap();
+    assert_eq!(saved, vec![peer]);
+}
+
+#[tokio::test]
+async fn cancelled_server_keeps_directory_exclusive_until_pending_write_finishes() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut server = state(temp.path());
+    let lock = fs::File::create(temp.path().join("server.lock")).unwrap();
+    fs2::FileExt::try_lock_exclusive(&lock).unwrap();
+    server._directory_lock = Some(Arc::new(lock));
+    let server = Arc::new(server);
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let writing = {
+        let server = server.clone();
+        tokio::spawn(async move {
+            server
+                .update_members(move |_, _, _| {
+                    started_tx.send(()).unwrap();
+                    release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                    Ok(())
+                })
+                .await
+        })
+    };
+    timeout(Duration::from_secs(2), started_rx)
+        .await
+        .unwrap()
+        .unwrap();
+    writing.abort();
+    assert!(writing.await.unwrap_err().is_cancelled());
+    drop(server);
+    let next_owner = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(temp.path().join("server.lock"))
+        .unwrap();
+    assert!(fs2::FileExt::try_lock_exclusive(&next_owner).is_err());
+    release_tx.send(()).unwrap();
+    timeout(Duration::from_secs(2), async {
+        while fs2::FileExt::try_lock_exclusive(&next_owner).is_err() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
 #[test]
 fn client_export_has_no_server_secrets_and_cannot_overwrite_another_identity() {
     let temp = tempfile::tempdir().unwrap();
@@ -593,6 +936,7 @@ async fn membership_outage_preserves_owned_lease_and_udp_delivery() {
             },
             true,
         )
+        .await
         .unwrap();
     let source = "127.0.0.1".parse().unwrap();
     let created = state
@@ -726,7 +1070,7 @@ async fn unresponsive_entrances_do_not_delay_a_healthy_path() {
     fixed.adaptive = false;
     fixed.quality_schedule = false;
     fixed.receiver_feedback = false;
-    let client = Task(tokio::spawn(tunnel::client_with_entrances(
+    let client = Task(tokio::spawn(tunnel::client_with_mesh_exit(
         tunnel::ClientOptions {
             adaptive_fec_retention: false,
             rotate_source_port: false,
@@ -744,6 +1088,8 @@ async fn unresponsive_entrances_do_not_delay_a_healthy_path() {
             stats: stats::Metrics::new("unresponsive-entrance-client"),
         },
         Some(updates),
+        None,
+        "exit".into(),
     )));
     let app = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     app.connect(listen).await.unwrap();
@@ -778,10 +1124,10 @@ async fn running_client_discovers_new_members_and_recovers_restarted_relay() {
     .await;
     let nodes = wait_nodes(&identity, b, &["exit", "relay_b"]).await;
     // Shorter maintenance cadence only in this bounded local correctness test.
-    let (initial, guard) =
-        Entrances::start(&identity, nodes, "exit", 3, Duration::from_millis(100))
-            .await
-            .unwrap();
+    let (_, guard) = Entrances::start(&identity, nodes, "exit", 3, Duration::from_millis(100))
+        .await
+        .unwrap();
+    let initial = wait_entrances(&guard, 2).await;
     assert_eq!(initial.len(), 2);
     let old_relay = initial[1];
     let mut updates = guard.updates();
@@ -801,7 +1147,7 @@ async fn running_client_discovers_new_members_and_recovers_restarted_relay() {
     fixed.adaptive = false;
     fixed.quality_schedule = false;
     fixed.receiver_feedback = false;
-    let client = Task(tokio::spawn(tunnel::client_with_entrances(
+    let client = Task(tokio::spawn(tunnel::client_with_mesh_exit(
         tunnel::ClientOptions {
             adaptive_fec_retention: false,
             rotate_source_port: false,
@@ -819,6 +1165,8 @@ async fn running_client_discovers_new_members_and_recovers_restarted_relay() {
             stats: metrics.clone(),
         },
         Some(rx),
+        None,
+        "exit".into(),
     )));
     let app = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     app.connect(listen).await.unwrap();
@@ -958,6 +1306,7 @@ async fn partition_heals_after_both_groups_forget_and_reload_hints() {
                     },
                     true,
                 )
+                .await
                 .unwrap();
         }
         // Model the elapsed partition without a ten-minute wall-clock sleep.
@@ -966,7 +1315,7 @@ async fn partition_heals_after_both_groups_forget_and_reload_hints() {
                 age(&server, &other.id, FORGET_AFTER + LIVE_FOR);
             }
         }
-        server.forget_departed().unwrap();
+        server.forget_departed().await.unwrap();
         assert_eq!(server.known().len(), 2);
         let saved: Vec<Node> = read_json(&dir.join("peers.json")).unwrap();
         assert_eq!(saved.len(), 1);
@@ -1006,7 +1355,7 @@ async fn partition_heals_after_both_groups_forget_and_reload_hints() {
     }
     let control = Control::new(&identity.join("cert.pem"), false).unwrap();
     let mut cursor = 0;
-    let candidates = states[0].reconnect_candidates(&mut cursor);
+    let candidates = states[0].reconnect_candidates(&mut cursor).await;
     assert_eq!(
         candidates,
         nodes[2..].to_vec(),
@@ -1039,8 +1388,8 @@ async fn partition_heals_after_both_groups_forget_and_reload_hints() {
     }
 }
 
-#[test]
-fn reconnect_hints_are_bounded_deduplicated_and_saved_before_forgetting() {
+#[tokio::test]
+async fn reconnect_hints_are_bounded_deduplicated_and_saved_before_forgetting() {
     let temp = tempfile::tempdir().unwrap();
     let server = state(temp.path());
     let live = node("live", 10001);
@@ -1052,6 +1401,7 @@ fn reconnect_hints_are_bounded_deduplicated_and_saved_before_forgetting() {
             },
             true,
         )
+        .await
         .unwrap();
     for i in 0..MAX_NODES as u16 {
         let old = node(&format!("old_{i:02}"), 11000 + i);
@@ -1063,9 +1413,10 @@ fn reconnect_hints_are_bounded_deduplicated_and_saved_before_forgetting() {
                 },
                 true,
             )
+            .await
             .unwrap();
         age(&server, &old.id, FORGET_AFTER);
-        server.forget_departed().unwrap();
+        server.forget_departed().await.unwrap();
     }
     assert_eq!(hints::load(temp.path()).len(), MAX_NODES);
     let departed = node("last", 12000);
@@ -1077,19 +1428,20 @@ fn reconnect_hints_are_bounded_deduplicated_and_saved_before_forgetting() {
             },
             true,
         )
+        .await
         .unwrap();
     age(&server, &departed.id, FORGET_AFTER);
     fs::remove_file(temp.path().join("reconnect-peers.json")).unwrap();
     fs::create_dir(temp.path().join("reconnect-peers.json")).unwrap();
-    assert!(server.forget_departed().is_err());
+    assert!(server.forget_departed().await.is_err());
     assert!(
         server.known().contains(&departed),
         "failed hint persistence erased membership"
     );
 }
 
-#[test]
-fn reconnect_hints_rotate_in_batches_expire_and_leave_when_members_return() {
+#[tokio::test]
+async fn reconnect_hints_rotate_in_batches_expire_and_leave_when_members_return() {
     let temp = tempfile::tempdir().unwrap();
     let server = state(temp.path());
     let now = hints::now_unix();
@@ -1107,8 +1459,8 @@ fn reconnect_hints_rotate_in_batches_expire_and_leave_when_members_return() {
 
     // Each round probes a bounded batch and the rotation covers every hint.
     let mut cursor = 0;
-    let first = server.reconnect_candidates(&mut cursor);
-    let second = server.reconnect_candidates(&mut cursor);
+    let first = server.reconnect_candidates(&mut cursor).await;
+    let second = server.reconnect_candidates(&mut cursor).await;
     assert_eq!(first.len(), hints::RECONNECT_BATCH);
     let mut probed: Vec<_> = first.iter().chain(&second).map(|n| n.id.clone()).collect();
     probed.sort();
@@ -1125,8 +1477,9 @@ fn reconnect_hints_rotate_in_batches_expire_and_leave_when_members_return() {
             },
             true,
         )
+        .await
         .unwrap();
-    let remaining = server.reconnect_candidates(&mut cursor);
+    let remaining = server.reconnect_candidates(&mut cursor).await;
     assert!(!remaining.contains(&departed[0]));
     assert_eq!(hints::load(temp.path()).len(), departed.len() - 1);
     let mut moved = departed[1].clone();

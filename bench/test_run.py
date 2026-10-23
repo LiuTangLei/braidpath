@@ -12,7 +12,8 @@ from unittest.mock import patch
 
 from bench.run import (AttemptFailure, Firewall, Job, REMOTE, WRAPPER, Remote, Runner,
                        aggregate_artifacts, last_snapshot, private_path,
-                       schedule, split_load, summary, validate)
+                       schedule, split_load, summary, validate, validate_resume,
+                       harness_fingerprints)
 
 
 def configuration():
@@ -43,6 +44,15 @@ def artifact(value, samples=None, code=0):
 
 
 class ScheduleTests(unittest.TestCase):
+    def test_resume_requires_actual_harness_bytes_not_only_git_head(self):
+        config, harness = {"topology_sha256": "fixture"}, harness_fingerprints()
+        manifest = dict(configuration=config, harness_sha256=harness, git_head="unchanged")
+        validate_resume(manifest, config, harness)
+        for changed in (None, dict(harness, **{"run.py": "changed"}),
+                        dict(harness, **{"readiness.py": "changed"})):
+            with self.subTest(changed=changed), self.assertRaisesRegex(ValueError, "harness identity"):
+                validate_resume(dict(manifest, harness_sha256=changed), config, harness)
+
     def test_abba_and_alternating_three_profiles(self):
         _, matrix = configuration()
         self.assertEqual([r["profile"] for r in schedule(matrix)], ["bbr", "bbr_fec4", "bbr_fec4", "bbr"])

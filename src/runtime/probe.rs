@@ -26,6 +26,9 @@ const MAX_RECORDS: u32 = 1_000_000;
 // 50 kpps x 1000 B is the 400 Mbps four-route bench source.
 const MAX_PPS: u32 = 50_000;
 const MAX_SEND_SPAN_SECONDS: u64 = 180;
+// Timer granularity may batch short periods, but a stalled source must not
+// replay an unbounded backlog. Qualification still checks actual microbursts.
+const MAX_SOURCE_CATCH_UP: u32 = 64;
 
 #[derive(Clone, Copy, Debug, ValueEnum, Serialize, PartialEq)]
 #[serde(rename_all = "kebab-case")]
@@ -209,6 +212,7 @@ struct SourceSendTimes {
 #[derive(Default, Serialize)]
 struct SourcePacing {
     completed_sends: u32,
+    bounded_catch_up_resets: u64,
     max_wake_lateness: TimingPeak,
     max_schedule_phase_shift: TimingPeak,
     max_nominal_send_lateness: TimingPeak,
@@ -251,11 +255,44 @@ impl SourcePacing {
     }
 }
 
-fn source_interval(pps: u32) -> (Duration, tokio::time::Interval) {
+struct SourceInterval {
+    interval: tokio::time::Interval,
+    period: Duration,
+    overdue: u32,
+    resets: u64,
+}
+
+impl SourceInterval {
+    async fn tick(&mut self) -> tokio::time::Instant {
+        let due = self.interval.tick().await;
+        let now = tokio::time::Instant::now();
+        if due + self.period <= now {
+            self.overdue += 1;
+            if self.overdue == MAX_SOURCE_CATCH_UP {
+                self.interval.reset_at(now + self.period);
+                self.overdue = 0;
+                self.resets += 1;
+            }
+        } else {
+            self.overdue = 0;
+        }
+        due
+    }
+}
+
+fn source_interval(pps: u32) -> (Duration, SourceInterval) {
     let period = Duration::from_secs_f64(1. / f64::from(pps));
     let mut tick = tokio::time::interval(period);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    (period, tick)
+    (
+        period,
+        SourceInterval {
+            interval: tick,
+            period,
+            overdue: 0,
+            resets: 0,
+        },
+    )
 }
 
 #[cfg(test)]
@@ -263,7 +300,7 @@ mod source_burst_clock_tests {
     use super::*;
 
     #[tokio::test(start_paused = true)]
-    async fn delay_mode_still_releases_eighty_overdue_ticks_after_two_ms() {
+    async fn stalled_source_reanchors_after_a_bounded_catch_up_batch() {
         let (period, mut tick) = source_interval(40_000);
         assert_eq!(period, Duration::from_micros(25));
         let first = tick.tick().await;
@@ -271,7 +308,7 @@ mod source_burst_clock_tests {
         let resumed = tokio::time::Instant::now();
         let due_count = ((resumed - first).as_nanos() / period.as_nanos()) as u32;
         assert_eq!(due_count, 80);
-        for seq in 1..=due_count {
+        for seq in 1..=MAX_SOURCE_CATCH_UP {
             assert_eq!(tick.tick().await, first + period * seq);
             assert_eq!(
                 tokio::time::Instant::now(),
@@ -279,9 +316,15 @@ mod source_burst_clock_tests {
                 "sub-threshold overdue ticks need no new timer wait"
             );
         }
-        // This demonstrates source pressure only. It does not claim a tunnel
-        // drop: concurrent path service may consume packets during that burst.
-        assert!(due_count as usize > crate::runtime::outbound::PER_FLOW_LIMIT);
+        assert_eq!(tick.resets, 1);
+        assert_eq!(tick.tick().await, resumed + period);
+        assert!(tokio::time::Instant::now() > resumed);
+        // This is a bound on source catchup, not proof of evenly paced packets
+        // or a loss-free tunnel. Qualification uses the actual send samples.
+        assert_eq!(
+            MAX_SOURCE_CATCH_UP as usize,
+            crate::runtime::outbound::PER_FLOW_LIMIT
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -569,7 +612,9 @@ async fn send_stream(
                 let instant=Instant::now();
                 socket.send(&data).await?;
                 let send_end=Instant::now();
-                state.source_pacing.as_mut().expect("source diagnostics").observe(seq,period,SourceSendTimes{scheduled_due:scheduled_due.into_std(),woke,send_begin:instant,send_end});
+                let pacing=state.source_pacing.as_mut().expect("source diagnostics");
+                pacing.bounded_catch_up_resets=tick.resets;
+                pacing.observe(seq,period,SourceSendTimes{scheduled_due:scheduled_due.into_std(),woke,send_begin:instant,send_end});
                 first.get_or_insert(instant);
                 state.sent_times[seq as usize]=Some(instant);
                 state.samples[seq as usize]=Some(Sample{seq,send_unix_us:stamp,receive_unix_us:None,rtt_ms:None});
@@ -661,6 +706,7 @@ fn report(
         "requested_count":w.count,"expected_count":w.count,"run_id":w.run_id,"sample_unix_ms":unix_us().ok().map(|us|us/1000),"pid":std::process::id(),"sent":state.sent,"payload_bytes":w.size,"offered_pps":w.pps,
         "requested_send_span_seconds":requested_span(w),"send_span_seconds":state.actual_span,
         "source_pacing":state.source_pacing,
+        "source_pacing_policy":{"mode":"steady","maximum_catch_up_packets":MAX_SOURCE_CATCH_UP,"qualification":"actual source samples required"},
         "observation_seconds":observation,"deadline_ms":w.deadline_ms,"drain_ms":w.drain_ms,
         "duplicate":state.duplicate,"corrupt":state.corrupt,"rejected_datagrams":state.rejected,
         "control_datagrams_sent":state.control_sent,"control_datagrams_received":state.control_received,

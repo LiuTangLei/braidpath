@@ -17,6 +17,8 @@ use std::time::{Duration, Instant};
 pub(super) struct EncodedSymbol {
     pub data: Bytes,
     pub small: bool,
+    /// Independent of the sender's bounded scheduling metadata cache.
+    pub oldest_ingress: Option<Instant>,
 }
 
 struct Lane {
@@ -76,6 +78,7 @@ impl Lane {
             out.push(EncodedSymbol {
                 data: wire::shard(shard),
                 small,
+                oldest_ingress: None,
             });
         }
         Ok(out)
@@ -124,6 +127,9 @@ enum Mode {
 
 pub(super) struct RecordEncoder {
     mode: Mode,
+    // Only one block per coding lane can be open. Keep its ingress clock even
+    // if many immediate small blocks evict its sender scheduling metadata.
+    clocks: [Option<(u64, Instant)>; 2],
 }
 
 impl RecordEncoder {
@@ -143,11 +149,24 @@ impl RecordEncoder {
                 policy: policy.clone(),
             }
         };
-        Ok(Self { mode })
+        Ok(Self {
+            mode,
+            clocks: [None; 2],
+        })
     }
 
+    #[cfg(test)]
     pub(super) fn encode(&mut self, record: &Record, now: Instant) -> Result<Vec<EncodedSymbol>> {
-        match &mut self.mode {
+        self.encode_ingress(record, now, now)
+    }
+
+    pub(super) fn encode_ingress(
+        &mut self,
+        record: &Record,
+        now: Instant,
+        ingress: Instant,
+    ) -> Result<Vec<EncodedSymbol>> {
+        let mut symbols = match &mut self.mode {
             Mode::Legacy { encoder, policy } => {
                 // Keep the legacy branch and one output collection. Wrapping a
                 // Vec<Bytes> afterwards would add an allocation to every record.
@@ -155,9 +174,10 @@ impl RecordEncoder {
                     && (policy.small_fec_bytes == 0
                         || record.payload.len() > usize::from(policy.small_fec_bytes))
                 {
-                    Ok(vec![EncodedSymbol {
+                    Ok::<_, anyhow::Error>(vec![EncodedSymbol {
                         data: wire::plain(record)?,
                         small: false,
+                        oldest_ingress: None,
                     }])
                 } else {
                     Ok(encoder
@@ -166,6 +186,7 @@ impl RecordEncoder {
                         .map(|shard| EncodedSymbol {
                             data: wire::shard(shard),
                             small: policy.small_fec_bytes > 0,
+                            oldest_ingress: None,
                         })
                         .collect())
                 }
@@ -187,19 +208,24 @@ impl RecordEncoder {
                 }
                 Ok(out)
             }
-        }
+        }?;
+        self.stamp_ingress(&mut symbols, ingress)?;
+        Ok(symbols)
     }
 
     pub(super) fn flush_due(&mut self, now: Instant) -> Result<Vec<EncodedSymbol>> {
-        match &mut self.mode {
-            Mode::Legacy { encoder, policy } => Ok(encoder
-                .flush_due(now)
-                .map(|shard| EncodedSymbol {
-                    data: wire::shard(shard),
-                    small: policy.small_fec_bytes > 0,
-                })
-                .into_iter()
-                .collect()),
+        let mut symbols = match &mut self.mode {
+            Mode::Legacy { encoder, policy } => Ok::<_, anyhow::Error>(
+                encoder
+                    .flush_due(now)
+                    .map(|shard| EncodedSymbol {
+                        data: wire::shard(shard),
+                        small: policy.small_fec_bytes > 0,
+                        oldest_ingress: None,
+                    })
+                    .into_iter()
+                    .collect(),
+            ),
             Mode::Mixed {
                 bulk,
                 small,
@@ -210,7 +236,30 @@ impl RecordEncoder {
                 out.extend(small.flush_due(now, next_block, true)?);
                 Ok(out)
             }
+        }?;
+        self.stamp_ingress(&mut symbols, now)?;
+        Ok(symbols)
+    }
+
+    fn stamp_ingress(&mut self, symbols: &mut [EncodedSymbol], ingress: Instant) -> Result<()> {
+        for symbol in symbols {
+            if symbol.data[3] == 2 {
+                continue;
+            }
+            let block = u64::from_be_bytes(symbol.data[4..12].try_into().expect("encoded block"));
+            let clock = &mut self.clocks[usize::from(symbol.small)];
+            if symbol.data[3] == 0 {
+                let oldest = clock
+                    .filter(|(id, _)| *id == block)
+                    .map_or(ingress, |(_, old)| old.min(ingress));
+                *clock = Some((block, oldest));
+            }
+            let (_, oldest) = clock
+                .filter(|(id, _)| *id == block)
+                .ok_or_else(|| anyhow::anyhow!("repair has no ingress clock"))?;
+            symbol.oldest_ingress = Some(oldest);
         }
+        Ok(())
     }
 }
 
@@ -223,6 +272,57 @@ mod tests {
     use super::*;
     use crate::runtime::{MAX_PATHS, wire::Receiver};
     use std::collections::BTreeMap;
+
+    #[test]
+    fn bulk_repair_keeps_ingress_deadline_after_small_blocks_evict_metadata() {
+        for repairs in [1, 2] {
+            let mut p = policy(4, 128, true);
+            p.fec_repairs = repairs;
+            let start = Instant::now();
+            let encoded_at = start + Duration::from_millis(5);
+            let mut encoder = RecordEncoder::new(&p).unwrap();
+            let mut queue = outbound::Queue::default();
+            let mut blocks = BTreeMap::new();
+            let metrics = stats::Metrics::new("client").scope("repair-ingress", stats::FORWARD);
+            for symbol in encoder
+                .encode_ingress(&record(0, 1000), encoded_at, start)
+                .unwrap()
+            {
+                enqueue_encoded(symbol, start, &mut queue, &mut blocks, &p, &metrics);
+            }
+            assert_eq!(blocks[&0].created, start);
+            // All small blocks arrive before the bulk timer, at a controlled
+            // instant. Delivery/queue pressure must not change the repair age.
+            for id in 1..=crate::runtime::QUEUE as u64 * 2 {
+                for symbol in encoder.encode(&record(id, 32), encoded_at).unwrap() {
+                    enqueue_encoded(symbol, encoded_at, &mut queue, &mut blocks, &p, &metrics);
+                }
+                while queue.pop(false).is_some() {}
+                while queue.pop(true).is_some() {}
+            }
+            assert!(
+                !blocks.contains_key(&0),
+                "exercise the real metadata eviction"
+            );
+            assert_eq!(blocks.len(), crate::runtime::QUEUE * 2);
+            let flushed = start + p.admission_lifetime() + Duration::from_millis(1);
+            let symbols = encoder.flush_due(flushed).unwrap();
+            assert_eq!(symbols.len(), repairs as usize);
+            for symbol in symbols {
+                enqueue_encoded(symbol, flushed, &mut queue, &mut blocks, &p, &metrics);
+            }
+            for _ in 0..repairs {
+                let repair = queue.pop(true).unwrap();
+                assert_eq!(repair.block, Some(0));
+                assert_eq!(
+                    repair.created, start,
+                    "flush must not restart the ingress clock"
+                );
+                assert!(flushed.duration_since(repair.created) > p.admission_lifetime());
+            }
+            assert_eq!(blocks.len(), crate::runtime::QUEUE * 2);
+        }
+    }
 
     fn policy(fec: u8, cutoff: u16, mixed: bool) -> Policy {
         Policy {

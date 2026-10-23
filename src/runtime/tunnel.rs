@@ -519,7 +519,11 @@ fn enqueue_symbol(
     metrics: &Scope,
 ) {
     enqueue_coded_symbol(
-        coding::EncodedSymbol { data, small: false },
+        coding::EncodedSymbol {
+            data,
+            small: false,
+            oldest_ingress: None,
+        },
         created,
         queue,
         blocks,
@@ -562,7 +566,7 @@ fn encode_input(
         });
         return;
     }
-    match encoder.encode(&record, Instant::now()) {
+    match encoder.encode_ingress(&record, Instant::now(), created) {
         Ok(symbols) => {
             for symbol in symbols {
                 enqueue_encoded(symbol, created, queue, blocks, policy, metrics);
@@ -588,7 +592,11 @@ fn enqueue_coded_symbol(
     policy: Option<&Policy>,
     metrics: &Scope,
 ) {
-    let coding::EncodedSymbol { data, small } = symbol;
+    let coding::EncodedSymbol {
+        data,
+        small,
+        oldest_ingress,
+    } = symbol;
     let mixed = policy.is_some_and(|p| p.mixed_fec);
     let small_repair_limit = if mixed && small && data[3] == 1 {
         // The repair can use another HTTP request stream. Reserve against the
@@ -615,18 +623,19 @@ fn enqueue_coded_symbol(
     } else {
         None
     };
+    let oldest = oldest_ingress.map_or(created, |ingress| ingress.min(created));
     let block_created = if let Some(block) = block {
         blocks
             .entry(block)
             .or_insert(BlockSend {
-                created,
+                created: oldest,
                 paths: 0,
                 locally_rejected_originals: 0,
                 small_repair_limit: 0,
                 small_repair_reserved: 0,
             })
             .created
-            .min(created)
+            .min(oldest)
     } else {
         created
     };
@@ -3036,6 +3045,37 @@ struct ServerSessionSettings {
     adaptive_fec_retention: bool,
 }
 
+async fn cover_response(
+    stream: &mut h3::server::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
+    ok: bool,
+    deadline: tokio::time::Instant,
+) -> Result<()> {
+    tokio::time::timeout_at(deadline, async {
+        stream
+            .send_response(
+                Response::builder()
+                    .status(if ok {
+                        StatusCode::OK
+                    } else {
+                        StatusCode::NOT_FOUND
+                    })
+                    .header("content-type", "text/html; charset=utf-8")
+                    .body(())?,
+            )
+            .await?;
+        stream
+            .send_data(Bytes::from_static(if ok {
+                WEBSITE.as_bytes()
+            } else {
+                b"Not found\n"
+            }))
+            .await?;
+        stream.finish().await?;
+        Ok::<_, anyhow::Error>(())
+    })
+    .await?
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn server_connection(
     incoming: quinn::Incoming,
@@ -3093,7 +3133,20 @@ async fn server_connection(
     let mut mesh_authenticated = false;
     let admission_started = Instant::now();
     diagnostic.enter_since("path_admission", "admission_wait", admission_started);
-    let result:Result<()>=async {
+    // The admission timer surrounds the entire request processor, including
+    // response writes. A peer withholding stream credit cannot suspend it.
+    let (authenticated, admitted) = tokio::sync::oneshot::channel::<()>();
+    let mut authenticated = Some(authenticated);
+    let absolute_deadline = admission_deadline;
+    let admission_guard = async {
+        if tokio::time::timeout_at(absolute_deadline, admitted)
+            .await
+            .is_ok()
+        {
+            std::future::pending::<()>().await;
+        }
+    };
+    let processing = async {
         loop {
             tokio::select! {
                 _=tokio::time::sleep_until(admission_deadline),if joined.is_none()=>{
@@ -3117,6 +3170,7 @@ async fn server_connection(
                             control_permit=Some(mesh.control_permit().context("mesh control connection limit reached")?);
                             pending_permit=None;
                             mesh_authenticated=true;
+                            if let Some(authenticated)=authenticated.take() {let _=authenticated.send(());}
                         }
                         if timeout(Duration::from_secs(5),mesh.handle(&req,&mut stream,conn.remote_address().ip())).await?? {
                             admission_deadline=tokio::time::Instant::now()+mesh::CONTROL_IDLE;
@@ -3125,8 +3179,8 @@ async fn server_connection(
                     }
                     if req.method()!=Method::POST || req.uri().path()!=SESSION_PATH {
                         let ok=req.method()==Method::GET && req.uri().path()=="/";
-                        stream.send_response(Response::builder().status(if ok{StatusCode::OK}else{StatusCode::NOT_FOUND}).header("content-type","text/html; charset=utf-8").body(())?).await?;
-                        stream.send_data(Bytes::from_static(if ok{WEBSITE.as_bytes()}else{b"Not found\n"})).await?; stream.finish().await?;
+                        let deadline=if joined.is_none(){admission_deadline}else{tokio::time::Instant::now()+Duration::from_secs(5)};
+                        cover_response(&mut stream,ok,deadline).await?;
                         if joined.is_some(){diagnostic.enter("established","connected");}
                         else{diagnostic.enter_since("path_admission","admission_wait",admission_started);}
                         continue
@@ -3135,12 +3189,22 @@ async fn server_connection(
                     let auth=req.headers().get("authorization").map(|h|h.as_bytes()).unwrap_or_default();
                     if !bool::from(auth.ct_eq(secret.as_bytes())) {
                         diagnostic.rejected("authorization_rejected");
-                        stream.send_response(Response::builder().status(404).header("content-type","text/html; charset=utf-8").body(())?).await?;stream.send_data(Bytes::from_static(b"Not found\n")).await?;stream.finish().await?;
+                        let deadline=if joined.is_none(){admission_deadline}else{tokio::time::Instant::now()+Duration::from_secs(5)};
+                        cover_response(&mut stream,false,deadline).await?;
                         if joined.is_some(){diagnostic.enter("established","connected");}
                         else{diagnostic.enter_since("path_admission","admission_wait",admission_started);}
                         continue
                     }
                     ensure!(!mesh_authenticated,"mesh control connection cannot carry a session");
+                    let requested_exit=req.headers().get("braidpath-exit").map(|v|v.to_str()).transpose()?;
+                    if requested_exit != mesh.as_ref().map(|state|state.node_id()) {
+                        diagnostic.rejected("exit_identity_mismatch");
+                        let mut response=Response::builder().status(StatusCode::PRECONDITION_FAILED);
+                        if let Some(state)=&mesh {response=response.header("braidpath-exit",state.node_id());}
+                        stream.send_response(response.body(())?).await?;
+                        stream.finish().await?;
+                        continue;
+                    }
                     if data_permit.is_none() {
                         data_permit=Some(data_connections.clone().try_acquire_owned().context("data connection limit reached")?);
                         pending_permit=None;
@@ -3228,7 +3292,9 @@ async fn server_connection(
                     };
                     let Some(session)=admitted else {
                         diagnostic.rejected("session_expired");
-                        stream.send_response(Response::builder().status(StatusCode::GONE).body(())?).await?;
+                        let mut response=Response::builder().status(StatusCode::GONE);
+                        if let Some(state)=&mesh {response=response.header("braidpath-exit",state.node_id());}
+                        stream.send_response(response.body(())?).await?;
                         stream.finish().await?;
                         // FIN only queues the response. Keep the connection alive long
                         // enough for the client to receive 410 and select a fresh epoch.
@@ -3241,6 +3307,7 @@ async fn server_connection(
                     trace_path(&session.returning,trace::Stage::PathOpened,trace_key);
                     joined=Some((sid,session,pid,stream_id,generation));
                     let mut response=Response::builder().status(200).header("braidpath-version","1").header("braidpath-max-payload",MAX_PAYLOAD);if feedback.is_some(){response=response.header("braidpath-feedback","2");}
+                    if let Some(state)=&mesh {response=response.header("braidpath-exit",state.node_id());}
                     if small_fec_bytes>0 {response=response.header("braidpath-small-fec-bytes",small_fec_bytes);}
                     if mixed_fec {response=response.header("braidpath-mixed-fec","1");}
                     if fec_repairs==2 {response=response.header("braidpath-fec-repairs","2");}
@@ -3248,6 +3315,7 @@ async fn server_connection(
                     if probe_guided_recovery {response=response.header("braidpath-probe-guided-recovery","1");}
                     if let Some(scheduler)=quality_schedule {response=response.header("braidpath-scheduler",scheduler);}stream.send_response(response.body(())?).await?;
                     request=Some(stream);
+                    if let Some(authenticated)=authenticated.take() {let _=authenticated.send(());}
                     diagnostic.admitted();
                     info!(path=pid,remote=%conn.remote_address(),"authenticated path joined");
                 },
@@ -3269,7 +3337,16 @@ async fn server_connection(
             }
         }
         Ok(())
-    }.await;
+    };
+    let result: Result<()> = tokio::select! {
+        biased;
+        _=admission_guard=>{
+            diagnostic.enter_since("path_admission","admission_wait",admission_started);
+            diagnostic.failed("admission_deadline_elapsed");
+            Err(anyhow::anyhow!("session admission timed out"))
+        },
+        result=processing=>result,
+    };
     // Classify the original close/error before our cleanup closes the connection.
     diagnostic.finish(result.as_ref().err());
     conn.close(0u32.into(), b"request closed");
@@ -3442,9 +3519,29 @@ pub(crate) async fn client_with_entrances(
 }
 
 pub(crate) async fn client_with_health(
+    options: ClientOptions,
+    entrances: Option<watch::Receiver<Vec<SocketAddr>>>,
+    health: Option<watch::Sender<mesh::PathHealth>>,
+) -> Result<()> {
+    client_inner(options, entrances, health, None).await
+}
+
+/// Mesh credentials are shared; the selected exit must be bound independently
+/// on every admission, including retries through a different entrance.
+pub(crate) async fn client_with_mesh_exit(
+    options: ClientOptions,
+    entrances: Option<watch::Receiver<Vec<SocketAddr>>>,
+    health: Option<watch::Sender<mesh::PathHealth>>,
+    exit: String,
+) -> Result<()> {
+    client_inner(options, entrances, health, Some(exit)).await
+}
+
+async fn client_inner(
     mut options: ClientOptions,
     mut entrances: Option<watch::Receiver<Vec<SocketAddr>>>,
     health: Option<watch::Sender<mesh::PathHealth>>,
+    exit: Option<String>,
 ) -> Result<()> {
     if entrances.is_some() {
         // Path replacement needs authenticated monotonic generations, carried
@@ -3493,6 +3590,7 @@ pub(crate) async fn client_with_health(
             &mut shutdown,
             &mut entrances,
             health.as_ref(),
+            exit.as_deref(),
         )
         .await;
         if (options.policy.adaptive || entrances.is_some())
@@ -3520,6 +3618,7 @@ async fn client_session(
     shutdown: &mut Shutdown,
     entrances: &mut Option<watch::Receiver<Vec<SocketAddr>>>,
     health: Option<&watch::Sender<mesh::PathHealth>>,
+    exit: Option<&str>,
 ) -> Result<()> {
     let token = transport::token(&options.token)?;
     let sid = transport::hex(&rand::random::<[u8; 16]>());
@@ -3664,6 +3763,7 @@ async fn client_session(
                     let ca=options.ca.clone();let name=options.name.clone();let token=token.clone();let sid=sid.clone();
                     let policy=options.policy.clone();let metrics=options.stats.clone();let tx=rejoin_tx.clone();
                     let congestion=options.congestion;let rejoin=has_session;
+                    let exit=exit.map(str::to_owned);
                     let datagram_send_buffer_bytes=options.datagram_send_buffer_bytes;
                     let mut cancelled=stop.subscribe();
                     inflight[id]=true;
@@ -3682,7 +3782,7 @@ async fn client_session(
                                     return Ok(None);
                                 },
                                 connected=timeout(Duration::from_secs(8),
-                                    connect_path(&endpoint,config.remote,&name,&token,&sid,id as u8,config.group,generation,rejoin,&policy,&mut diagnostic))=>connected??
+                                    connect_path(&endpoint,config.remote,&name,&token,&sid,id as u8,config.group,generation,rejoin,&policy,exit.as_deref(),&mut diagnostic))=>connected??
                             };
                             let (conn,stream,driver,request,send)=connected;
                             Ok(Some(Rejoined{endpoint,conn,stream,driver,request,send}))
@@ -3888,6 +3988,7 @@ async fn connect_path(
     generation: u64,
     rejoin: bool,
     policy: &Policy,
+    exit: Option<&str>,
     diagnostic: &mut stats::ConnectionTrace,
 ) -> Result<(quinn::Connection, u64, H3Client, H3Request, H3Send)> {
     let conn = endpoint.connect(remote, name)?.await?;
@@ -3942,6 +4043,9 @@ async fn connect_path(
         .header("braidpath-rate", policy.rate)
         .header("braidpath-block-ms", policy.block_ms)
         .header("braidpath-queue-ms", policy.queue_ms);
+    if let Some(exit) = exit {
+        req = req.header("braidpath-exit", exit);
+    }
     if policy.small_fec_bytes > 0 {
         req = req.header("braidpath-small-fec-bytes", policy.small_fec_bytes);
     }
@@ -3980,6 +4084,18 @@ async fn connect_path(
     let req = req.body(())?;
     let mut stream = send.send_request(req).await?;
     let response = tokio::select! {e=driver.wait_idle()=>bail!("HTTP/3 closed during admission: {e}"),r=stream.recv_response()=>r?};
+    // Check before 410 handling: an old or different exit must never trigger
+    // an automatic fresh epoch with shared cluster credentials.
+    ensure!(
+        response
+            .headers()
+            .get("braidpath-exit")
+            .and_then(|v| v.to_str().ok())
+            == exit
+            && response.status() != StatusCode::PRECONDITION_FAILED,
+        "mesh exit identity mismatch or unsupported peer; selected exit {:?}",
+        exit
+    );
     if response.status() == StatusCode::GONE {
         diagnostic.rejected("session_expired");
         conn.close(0u32.into(), b"session epoch expired");

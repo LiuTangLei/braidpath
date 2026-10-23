@@ -8,7 +8,29 @@ pub(super) struct Shutdown(Pin<Box<dyn Future<Output = std::io::Result<()>> + Se
 
 impl Shutdown {
     pub(super) fn new() -> Self {
-        Self(Box::pin(tokio::signal::ctrl_c()))
+        #[cfg(unix)]
+        let terminate = tokio::runtime::Handle::try_current()
+            .ok()
+            .map(|_| tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()));
+        Self(Box::pin(async move {
+            #[cfg(unix)]
+            {
+                // Collectors may be constructed before entering a runtime;
+                // live servers subscribe immediately, before reporting ready.
+                let mut terminate = match terminate {
+                    Some(signal) => signal?,
+                    None => {
+                        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?
+                    }
+                };
+                tokio::select! {
+                    result = tokio::signal::ctrl_c() => result,
+                    _ = terminate.recv() => Ok(()),
+                }
+            }
+            #[cfg(not(unix))]
+            tokio::signal::ctrl_c().await
+        }))
     }
 
     pub(super) async fn wait(&mut self) {

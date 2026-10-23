@@ -15,9 +15,34 @@ from bench.adaptive_scenario import (SerializedLink, Shape, phases_for, quantile
                                      window_at, udp_send, udp_receive, Traffic,
                                      LATE_ACCOUNTING_BATCH, HEADER)
 from bench.adaptive_compare import evaluate_window
+from bench.adaptive_compare import STREAM_COUNTER_FIELDS, TARGET_COUNTER_FIELDS, validate_counters
 
 
 class PacketShaperTests(unittest.IsolatedAsyncioTestCase):
+    async def test_collector_has_explicit_zero_counts_and_freezes_target_observations(self):
+        stream = Traffic(1, 1, 100, ("127.0.0.1", 9))
+        try:
+            validate_counters(dict(stream.counters), STREAM_COUNTER_FIELDS, "stream")
+            sample = stream.scheduled_sample(0, [{"name": "window_a", "seconds": 1}])
+            sample["send_ns"] = 123
+            target = adaptive_scenario.EchoTarget({1: stream})
+            validate_counters(dict(target.counters), TARGET_COUNTER_FIELDS, "target")
+            sent = []
+            target.connection_made(SimpleNamespace(sendto=lambda data, peer: sent.append(data)))
+            data = adaptive_scenario.packet(1, 0, 123, 100)
+            target.datagram_received(data, ("127.0.0.1", 9))
+            target.datagram_received(data, ("127.0.0.1", 9))
+            target.datagram_received(b"invalid", ("127.0.0.1", 9))
+            counters = target.finish()
+            validate_counters(counters, TARGET_COUNTER_FIELDS, "target")
+            self.assertEqual(counters, dict(received_packets=3, unique_records=1,
+                duplicate_records=1, corrupt_or_unknown=1, echoes_submitted=2))
+            target.datagram_received(data, ("127.0.0.1", 9))
+            self.assertEqual(target.finish(), counters)
+            self.assertEqual(len(sent), 2)
+        finally:
+            stream.close()
+
     async def asyncSetUp(self):
         self.links = []
 

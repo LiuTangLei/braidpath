@@ -320,7 +320,7 @@ fn four_connection_integrity(native_service_guard: bool) {
 }
 
 #[test]
-fn rtt_source_baselines_preserve_four_connection_integrity_and_local_opt_in() {
+fn rtt_source_baselines_compatibility_flag_preserves_default_integrity() {
     four_connection_profile(false, true);
 }
 
@@ -484,7 +484,7 @@ fn four_connection_profile(native_service_guard: bool, rtt_source_baselines: boo
                             && path["adaptive"]["last_control"]["native_service_guard_enabled"]
                                 == native_service_guard
                             && path["adaptive"]["last_control"]["rtt_source_baselines_enabled"]
-                                == rtt_source_baselines
+                                == true
                     })
             });
             if observed {

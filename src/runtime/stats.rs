@@ -27,9 +27,9 @@ pub struct Options {
     /// were permanently rejected locally. Off by default; no added credit.
     #[arg(long)]
     pub repair_usefulness_guard: bool,
-    /// Experimental per-RTT-source queue baselines; off by default. No new
-    /// queue, pacing credit, loss exemption or altered absolute RTT sample.
-    #[arg(long)]
+    /// Per-source RTT baselines are the default. With --legacy-recovery,
+    /// re-enable this correction without changing the other legacy controls.
+    #[arg(long, hide = true)]
     pub rtt_source_baselines: bool,
     /// Random-loss service accounting with the minimum floor (at most 25%).
     /// Only meaningful with --legacy-recovery; hidden, kept for old scripts.
@@ -41,7 +41,8 @@ pub struct Options {
     pub queue_gated_loss: bool,
     /// Restore the earlier adaptive controller: 100 ms brake debounce,
     /// post-brake restoration only from a qualified 500 ms service window, and
-    /// loss-only brakes at any queue delay (no queue-gated loss pacing).
+    /// loss-only brakes at any queue delay (no queue-gated loss pacing), and
+    /// the old shared RTT baseline across estimators.
     #[arg(long)]
     pub legacy_recovery: bool,
     /// Experimental native-window service recovery; off by default. Adaptive
@@ -764,7 +765,7 @@ impl Metrics {
         self.0.native_service_guard
     }
     pub fn rtt_source_baselines(&self) -> bool {
-        self.0.rtt_source_baselines
+        self.0.rtt_source_baselines || !self.0.legacy_recovery
     }
     pub fn random_loss_service(&self) -> bool {
         self.0.random_loss_service
@@ -1345,6 +1346,20 @@ mod tests {
         assert!(metrics(false, false).queue_gated_loss());
         assert!(!metrics(true, false).queue_gated_loss());
         assert!(metrics(true, true).queue_gated_loss());
+    }
+
+    #[test]
+    fn source_specific_rtt_baselines_are_default_with_an_explicit_legacy_control() {
+        assert!(Metrics::new("client").rtt_source_baselines());
+        assert!(
+            !Metrics::new("client")
+                .with_legacy_recovery(true)
+                .rtt_source_baselines()
+        );
+        let explicit =
+            Metrics::configured_rtt("client", trace::Trace::disabled(), false, false, true)
+                .with_legacy_recovery(true);
+        assert!(explicit.rtt_source_baselines());
     }
 
     #[test]
