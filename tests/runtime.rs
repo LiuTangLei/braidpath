@@ -141,7 +141,7 @@ fn port() -> String {
 }
 
 #[test]
-fn proxy_cli_discovers_exit_and_serves_socks_tcp_with_remote_half_close() {
+fn proxy_cli_creates_one_socks_endpoint_per_exit_with_remote_half_close() {
     use std::io::{Read, Write};
     use std::net::{Shutdown, TcpListener, TcpStream};
     let _serial = THREE_PATH_FIXTURES.lock().unwrap();
@@ -167,7 +167,55 @@ fn proxy_cli_discovers_exit_and_serves_socks_tcp_with_remote_half_close() {
         "proxy-server",
     );
     ready(&mut server, "HTTP/3 server ready");
+    let server_b_addr = port();
+    let mut server_b = launch(
+        &args(&[
+            "mesh-server",
+            "--dir",
+            root.join("server-b").to_str().unwrap(),
+            "--id",
+            "node-b",
+            "--listen",
+            &server_b_addr,
+            "--advertise",
+            &server_b_addr,
+            "--proxy",
+            "--proxy-allow-private",
+            "--join",
+            &server_addr,
+            "--join-key",
+            state.join("server-key.json").to_str().unwrap(),
+        ]),
+        root,
+        "proxy-server-b",
+    );
+    ready(&mut server_b, "HTTP/3 server ready");
     let key = state.join("client-key.json");
+    // Listening is not membership readiness: the bootstrap advertises b only
+    // after its own reachability probe succeeds, not on the incoming join hint.
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let identity =
+                braidpath::runtime::mesh::ClientIdentity::open(root.join("readiness"), &key)
+                    .unwrap();
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    let nodes = identity
+                        .discover(server_addr.parse().unwrap())
+                        .await
+                        .unwrap();
+                    if nodes.iter().any(|node| node.id == "node-b") {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            })
+            .await
+            .expect("bootstrap did not discover node-b");
+        });
     let client_state = root.join("client");
     let mut client = launch(
         &args(&[
@@ -179,6 +227,8 @@ fn proxy_cli_discovers_exit_and_serves_socks_tcp_with_remote_half_close() {
             "--dir",
             client_state.to_str().unwrap(),
             "--exit",
+            "node-b",
+            "--exit",
             "node-a",
             "--listen",
             "127.0.0.1:0",
@@ -186,59 +236,76 @@ fn proxy_cli_discovers_exit_and_serves_socks_tcp_with_remote_half_close() {
         root,
         "proxy-client",
     );
-    ready(&mut client, "SOCKS5 proxy ready");
+    ready(&mut client, "exit=node-a");
     let log = fs::read_to_string(&client.log).unwrap();
-    let listener = log
+    let listeners: Vec<_> = log
         .lines()
-        .find(|l| l.contains("SOCKS5 proxy ready"))
-        .unwrap()
-        .split_whitespace()
-        .find_map(|part| part.strip_prefix("address="))
-        .unwrap();
+        .filter(|l| l.contains("SOCKS5 proxy ready"))
+        .map(|line| {
+            (
+                line.split_whitespace()
+                    .find_map(|p| p.strip_prefix("exit="))
+                    .unwrap(),
+                line.split_whitespace()
+                    .find_map(|p| p.strip_prefix("address="))
+                    .unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(listeners.len(), 2, "exactly one listener per exit: {log}");
+    assert_eq!((listeners[0].0, listeners[1].0), ("node-b", "node-a"));
+    assert_ne!(listeners[0].1, listeners[1].1);
     let target = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = target.local_addr().unwrap();
     let target = thread::spawn(move || {
-        let (mut stream, _) = target.accept().unwrap();
-        stream
+        for _ in 0..2 {
+            let (mut stream, _) = target.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut request = Vec::new();
+            stream.read_to_end(&mut request).unwrap();
+            assert_eq!(request, b"proxy process acceptance");
+            stream.write_all(b"response after request FIN").unwrap();
+        }
+    });
+    for (_, listener) in listeners {
+        let mut socket = TcpStream::connect(listener).unwrap();
+        socket
             .set_read_timeout(Some(Duration::from_secs(5)))
             .unwrap();
-        let mut request = Vec::new();
-        stream.read_to_end(&mut request).unwrap();
-        assert_eq!(request, b"proxy process acceptance");
-        stream.write_all(b"response after request FIN").unwrap();
-    });
-    let mut socket = TcpStream::connect(listener).unwrap();
-    socket
-        .set_read_timeout(Some(Duration::from_secs(5)))
-        .unwrap();
-    socket.write_all(&[5, 1, 0]).unwrap();
-    let mut method = [0; 2];
-    socket.read_exact(&mut method).unwrap();
-    assert_eq!(method, [5, 0]);
-    let mut request = vec![5, 1, 0, 1, 127, 0, 0, 1];
-    request.extend(address.port().to_be_bytes());
-    socket.write_all(&request).unwrap();
-    let mut reply = [0; 10];
-    socket.read_exact(&mut reply).unwrap();
-    assert_eq!(&reply[..4], &[5, 0, 0, 1]);
-    socket.write_all(b"proxy process acceptance").unwrap();
-    socket.shutdown(Shutdown::Write).unwrap();
-    let mut body = Vec::new();
-    socket.read_to_end(&mut body).unwrap();
-    assert_eq!(body, b"response after request FIN");
+        socket.write_all(&[5, 1, 0]).unwrap();
+        let mut method = [0; 2];
+        socket.read_exact(&mut method).unwrap();
+        assert_eq!(method, [5, 0]);
+        let mut request = vec![5, 1, 0, 1, 127, 0, 0, 1];
+        request.extend(address.port().to_be_bytes());
+        socket.write_all(&request).unwrap();
+        let mut reply = [0; 10];
+        socket.read_exact(&mut reply).unwrap();
+        assert_eq!(&reply[..4], &[5, 0, 0, 1]);
+        socket.write_all(b"proxy process acceptance").unwrap();
+        socket.shutdown(Shutdown::Write).unwrap();
+        let mut body = Vec::new();
+        socket.read_to_end(&mut body).unwrap();
+        assert_eq!(body, b"response after request FIN");
+    }
     target.join().unwrap();
-    let status = run(&args(&[
-        "mesh-status",
-        "--connect",
-        &server_addr,
-        "--connection-key",
-        key.to_str().unwrap(),
-        "--dir",
-        root.join("inspect").to_str().unwrap(),
-    ]));
-    assert!(status.status.success());
-    let status: Value = serde_json::from_slice(&status.stdout).unwrap();
-    assert_eq!(status["proxy"]["streams"], 0);
+    for server_addr in [&server_addr, &server_b_addr] {
+        let status = run(&args(&[
+            "mesh-status",
+            "--connect",
+            server_addr,
+            "--connection-key",
+            key.to_str().unwrap(),
+            "--dir",
+            root.join("inspect").to_str().unwrap(),
+        ]));
+        assert!(status.status.success());
+        let status: Value = serde_json::from_slice(&status.stdout).unwrap();
+        assert_eq!(status["proxy"]["streams"], 0);
+        assert_eq!(status["proxy"]["connections"], 1);
+    }
     #[cfg(unix)]
     {
         assert!(

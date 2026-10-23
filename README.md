@@ -16,7 +16,7 @@ BraidPath is a Rust multipath transport project combining **forward error correc
 
 “Braid” means weaving several imperfect paths into a more resilient connection.
 
-> **Status: experimental UDP tunnel and TCP/UDP proxy.** Equal distributed servers support client-selected exits and automatically refreshed tunnel entrances. v0.3.2 adds authenticated proxy egress and local SOCKS5, with fixed exits or several exits serving concurrent connections. See the [proxy and distributed-server guide](docs/mesh.md). The UDP tunnel uses HTTP/3 Datagrams; the proxy uses reliable QUIC streams for TCP and QUIC DATAGRAM for UDP. Sustained WAN benefit and deployment readiness are not established. Existing tunnel defaults remain unchanged.
+> **Status: experimental UDP tunnel and TCP/UDP proxy.** Equal distributed servers support client-selected exits and automatically refreshed tunnel entrances. v0.3.2 adds authenticated proxy egress with one local SOCKS5 port per selected server, so Clash can choose exits and use several concurrently. Each port stays assigned to its server, including during failures. See the [proxy and distributed-server guide](docs/mesh.md). The UDP tunnel uses HTTP/3 Datagrams; the proxy uses reliable QUIC streams for TCP and QUIC DATAGRAM for UDP. Sustained WAN benefit and deployment readiness are not established. Existing tunnel defaults remain unchanged.
 
 ## One interface works. Several can contribute.
 

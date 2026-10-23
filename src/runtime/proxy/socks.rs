@@ -12,7 +12,7 @@ async fn reply(tcp: &mut TcpStream, status: u8, bound: SocketAddr) -> Result<()>
     tcp.write_all(&response).await?;
     Ok(())
 }
-pub(super) async fn serve(mut tcp: TcpStream, pool: Arc<Pool>, pinned: Option<&str>) -> Result<()> {
+pub(super) async fn serve(mut tcp: TcpStream, pool: Arc<Pool>, exit: &str) -> Result<()> {
     let (command, target) = timeout(CONNECT_TIMEOUT, async {
         ensure!(tcp.read_u8().await? == 5, "SOCKS version must be 5");
         let count = tcp.read_u8().await? as usize;
@@ -46,7 +46,7 @@ pub(super) async fn serve(mut tcp: TcpStream, pool: Arc<Pool>, pinned: Option<&s
         return Ok(());
     }
     let setup = timeout(CONNECT_TIMEOUT, async {
-        let (exit, conn) = pool.select(pinned).await?;
+        let conn = timeout(Duration::from_secs(2), pool.get(exit)).await??;
         let (mut send, mut recv) = conn.raw.open_bi().await?;
         let registration = if command == UDP {
             Some(conn.router.register(send.id().index())?)

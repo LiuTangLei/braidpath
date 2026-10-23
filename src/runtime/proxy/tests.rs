@@ -55,16 +55,13 @@ async fn start(
 fn identity(root: &Path, dir: &str) -> mesh::ClientIdentity {
     mesh::ClientIdentity::open(root.join(dir), &root.join("a/client-key.json")).unwrap()
 }
-async fn local_listener(
-    pool: Arc<client::Pool>,
-    pinned: Option<&str>,
-) -> (SocketAddr, Task<Result<()>>) {
+async fn local_listener(pool: Arc<client::Pool>, exit: &str) -> (SocketAddr, Task<Result<()>>) {
     let listen = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let at = listen.local_addr().unwrap();
     let task = Task(tokio::spawn(client::listen(
         listen,
         pool,
-        pinned.map(str::to_owned),
+        exit.to_owned(),
         Arc::new(Semaphore::new(16)),
     )));
     (at, task)
@@ -128,8 +125,63 @@ async fn empty(identity: &mesh::ClientIdentity, at: SocketAddr) {
     .unwrap();
 }
 
+#[test]
+fn each_exit_gets_one_port_in_selection_order_with_explicit_overrides() {
+    let exits = ["b".into(), "a".into(), "c".into()];
+    let base = "127.0.0.1:1080".parse().unwrap();
+    let expected: Vec<Listener> = ["b=127.0.0.1:1080", "a=127.0.0.1:1081", "c=127.0.0.1:1082"]
+        .into_iter()
+        .map(|s| s.parse().unwrap())
+        .collect();
+    assert_eq!(client::listener_plan(&exits, base, &[]).unwrap(), expected);
+    let custom = "a=127.0.0.1:2080".parse().unwrap();
+    let mut expected_custom = expected.clone();
+    expected_custom[1] = custom;
+    assert_eq!(
+        client::listener_plan(&exits, base, &expected_custom[1..2]).unwrap(),
+        expected_custom,
+    );
+    // Explicit mappings stay attached to IDs even when --exit order changes.
+    let reversed = ["c".into(), "a".into(), "b".into()];
+    assert_eq!(
+        client::listener_plan(&reversed, base, &expected).unwrap(),
+        expected.into_iter().rev().collect::<Vec<_>>(),
+    );
+    assert!(
+        client::listener_plan(&exits, "127.0.0.1:0".parse().unwrap(), &[])
+            .unwrap()
+            .iter()
+            .all(|listener| listener.address.port() == 0)
+    );
+    assert_eq!(
+        client::listener_plan(&["a".into()], "[::1]:65535".parse().unwrap(), &[]).unwrap()[0]
+            .address
+            .to_string(),
+        "[::1]:65535",
+    );
+}
+
+#[test]
+fn ambiguous_or_unusable_socks_listener_plans_are_rejected() {
+    let exits = ["a".into(), "b".into()];
+    let base = "127.0.0.1:1080".parse().unwrap();
+    for overrides in [
+        vec!["missing=127.0.0.1:2080"],
+        vec!["a=127.0.0.1:2080", "a=127.0.0.1:2081"],
+        vec!["a=127.0.0.1:1081"],
+        vec!["a=127.0.0.1:2080", "b=127.0.0.1:2080"],
+    ] {
+        let overrides: Vec<Listener> = overrides.into_iter().map(|s| s.parse().unwrap()).collect();
+        assert!(client::listener_plan(&exits, base, &overrides).is_err());
+    }
+    assert!(client::listener_plan(&[], base, &[]).is_err());
+    assert!(client::listener_plan(&["a".into(), "a".into()], base, &[]).is_err());
+    assert!(client::listener_plan(&exits, "0.0.0.0:1080".parse().unwrap(), &[]).is_err());
+    assert!(client::listener_plan(&exits, "127.0.0.1:65535".parse().unwrap(), &[]).is_err());
+}
+
 #[tokio::test]
-async fn tcp_round_robin_pinned_exit_half_close_and_shared_connection_cleanup() {
+async fn separate_tcp_listeners_pin_exits_half_close_and_share_connections() {
     let root = tempfile::tempdir().unwrap();
     let root = root.path();
     let (a, _a) = start(root, "a", None, true).await;
@@ -141,24 +193,24 @@ async fn tcp_round_robin_pinned_exit_half_close_and_shared_connection_cleanup() 
         vec!["a".into(), "b".into()],
     )
     .unwrap();
-    let (listen, _listen) = local_listener(pool.clone(), None).await;
+    let (listen_a, _listen_a) = local_listener(pool.clone(), "a").await;
+    let (listen_b, _listen_b) = local_listener(pool.clone(), "b").await;
     let (target, _echo) = echo().await;
     let (mut first, status, _) = socks(
-        listen,
+        listen_a,
         TCP,
         Address::Domain("localhost".into(), target.port()),
     )
     .await;
     assert_eq!(status, 0);
-    let (mut second, status, _) = socks(listen, TCP, Address::Ip(target)).await;
+    let (mut second, status, _) = socks(listen_b, TCP, Address::Ip(target)).await;
     assert_eq!(status, 0);
     for at in [a, b] {
         let s = identity.status(at).await.unwrap();
         assert!(s.capabilities.features.iter().any(|f| f == "proxy-tcp-v1"));
         assert_eq!(s.proxy.unwrap().streams, 1);
     }
-    let (pin, _pin) = local_listener(pool.clone(), Some("a")).await;
-    let (mut third, status, _) = socks(pin, TCP, Address::Ip(target)).await;
+    let (mut third, status, _) = socks(listen_a, TCP, Address::Ip(target)).await;
     assert_eq!(status, 0);
     assert_eq!(identity.status(a).await.unwrap().proxy.unwrap().streams, 2);
     assert_eq!(
@@ -188,13 +240,20 @@ async fn tcp_round_robin_pinned_exit_half_close_and_shared_connection_cleanup() 
 }
 
 #[tokio::test]
-async fn udp_domain_fragmentation_source_pin_and_tcp_lifetime_release() {
+async fn separate_udp_listeners_pin_exits_fragment_and_release_independently() {
     let root = tempfile::tempdir().unwrap();
     let root = root.path();
     let (at, _server) = start(root, "a", None, true).await;
+    let (b, _server_b) = start(root, "b", Some(at), true).await;
     let identity = identity(root, "client");
-    let pool = client::Pool::new(identity.clone(), vec![node("a", at)], vec!["a".into()]).unwrap();
-    let (listen, _listen) = local_listener(pool, None).await;
+    let pool = client::Pool::new(
+        identity.clone(),
+        vec![node("a", at), node("b", b)],
+        vec!["a".into(), "b".into()],
+    )
+    .unwrap();
+    let (listen, _listen) = local_listener(pool.clone(), "a").await;
+    let (listen_b, _listen_b) = local_listener(pool, "b").await;
     let echo = udp_socket("127.0.0.1:0".parse().unwrap()).await.unwrap();
     let target = echo.local_addr().unwrap();
     let _echo = Task(tokio::spawn(async move {
@@ -244,8 +303,51 @@ async fn udp_domain_fragmentation_source_pin_and_tcp_lifetime_release() {
     let s = identity.status(at).await.unwrap().proxy.unwrap();
     assert_eq!(s.udp_associations, 1);
     assert_eq!(s.udp_destinations, 1);
+    assert_eq!(
+        identity.status(b).await.unwrap().proxy.unwrap().connections,
+        0
+    );
+    let udp_b = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let (tcp_b, status, bound_b) =
+        socks(listen_b, UDP, Address::Ip(udp_b.local_addr().unwrap())).await;
+    assert_eq!(status, 0);
+    let Address::Ip(bound_b) = bound_b else {
+        panic!()
+    };
+    assert_eq!(
+        identity
+            .status(b)
+            .await
+            .unwrap()
+            .proxy
+            .unwrap()
+            .udp_associations,
+        1
+    );
     drop(tcp);
     empty(&identity, at).await;
+    // Closing a's association must leave b's socket and exit usable.
+    p[2] = 0;
+    udp_b.send_to(&p, bound_b).await.unwrap();
+    let (n, _) = timeout(Duration::from_secs(4), udp_b.recv_from(&mut reply))
+        .await
+        .unwrap()
+        .unwrap();
+    let (address, body) = protocol::packet(&reply[3..n]).await.unwrap();
+    assert_eq!(address, Address::Ip(target));
+    assert_eq!(body, b"must not forward");
+    assert_eq!(
+        identity
+            .status(b)
+            .await
+            .unwrap()
+            .proxy
+            .unwrap()
+            .udp_destinations,
+        1
+    );
+    drop(tcp_b);
+    empty(&identity, b).await;
 }
 
 #[tokio::test]
@@ -282,7 +384,7 @@ async fn wrong_token_wrong_exit_private_destination_and_unsupported_command_are_
         );
     }
     let pool = client::Pool::new(identity.clone(), vec![node("a", at)], vec!["a".into()]).unwrap();
-    let (listen, _listen) = local_listener(pool, None).await;
+    let (listen, _listen) = local_listener(pool, "a").await;
     let (target, _echo) = echo().await;
     for address in [
         Address::Ip(target),
@@ -365,7 +467,7 @@ fn udp_reassembly_is_bounded_out_of_order_and_does_not_extend_deadlines() {
 }
 
 #[tokio::test]
-async fn failed_exit_does_not_break_another_exit_or_move_existing_connections() {
+async fn failed_exit_never_falls_back_and_other_listener_keeps_serving() {
     let root = tempfile::tempdir().unwrap();
     let root = root.path();
     let (a, server_a) = start(root, "a", None, true).await;
@@ -377,11 +479,12 @@ async fn failed_exit_does_not_break_another_exit_or_move_existing_connections() 
         vec!["a".into(), "b".into()],
     )
     .unwrap();
-    let (listen, _listener) = local_listener(pool.clone(), None).await;
+    let (listen_a, _listener_a) = local_listener(pool.clone(), "a").await;
+    let (listen_b, _listener_b) = local_listener(pool, "b").await;
     let (target, _echo) = echo().await;
-    let (mut first, status, _) = socks(listen, TCP, Address::Ip(target)).await;
+    let (mut first, status, _) = socks(listen_a, TCP, Address::Ip(target)).await;
     assert_eq!(status, 0);
-    let (mut second, status, _) = socks(listen, TCP, Address::Ip(target)).await;
+    let (mut second, status, _) = socks(listen_b, TCP, Address::Ip(target)).await;
     assert_eq!(status, 0);
     drop(server_a);
     timeout(Duration::from_secs(3), async {
@@ -391,8 +494,13 @@ async fn failed_exit_does_not_break_another_exit_or_move_existing_connections() 
     })
     .await
     .unwrap();
-    // Round robin next selects a, which is gone. Only new work can fall back to b.
-    let (mut third, status, _) = socks(listen, TCP, Address::Ip(target)).await;
+    // Both TCP and UDP on a must fail, even though b is still healthy.
+    for command in [TCP, UDP] {
+        let (_, status, _) = socks(listen_a, command, Address::Ip(target)).await;
+        assert_ne!(status, 0);
+    }
+    assert_eq!(identity.status(b).await.unwrap().proxy.unwrap().streams, 1);
+    let (mut third, status, _) = socks(listen_b, TCP, Address::Ip(target)).await;
     assert_eq!(status, 0);
     for tcp in [&mut second, &mut third] {
         tcp.write_all(b"alive").await.unwrap();
@@ -407,7 +515,6 @@ async fn failed_exit_does_not_break_another_exit_or_move_existing_connections() 
         tcp.read_to_end(&mut fin).await.unwrap();
         assert_eq!(fin, b"FIN");
     }
-    assert!(pool.select(Some("a")).await.is_err());
     empty(&identity, b).await;
 }
 

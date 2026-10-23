@@ -2,13 +2,10 @@ use super::{protocol::*, *};
 use crate::runtime::{mesh, shutdown::Shutdown, transport};
 use anyhow::{Context, bail};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     net::SocketAddr,
     str::FromStr,
-    sync::{
-        RwLock,
-        atomic::{AtomicUsize, Ordering},
-    },
+    sync::RwLock,
 };
 use tokio::{
     net::TcpListener,
@@ -17,7 +14,7 @@ use tokio::{
     time::timeout,
 };
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Listener {
     pub exit: String,
     pub address: SocketAddr,
@@ -45,6 +42,69 @@ pub struct ClientOptions {
     pub listen: SocketAddr,
     pub socks5: Vec<Listener>,
 }
+
+pub(super) fn listener_plan(
+    exits: &[String],
+    base: SocketAddr,
+    overrides: &[Listener],
+) -> Result<Vec<Listener>> {
+    ensure!(
+        !exits.is_empty() && exits.len() <= 8,
+        "select 1..8 proxy exits"
+    );
+    ensure!(
+        base.ip().is_loopback(),
+        "SOCKS5 listeners must use loopback addresses"
+    );
+    let mut by_exit = BTreeMap::new();
+    for listener in overrides {
+        ensure!(
+            exits.contains(&listener.exit),
+            "SOCKS5 listener exit not selected: {}",
+            listener.exit
+        );
+        ensure!(
+            listener.address.ip().is_loopback(),
+            "SOCKS5 listeners must use loopback addresses"
+        );
+        ensure!(
+            by_exit.insert(&listener.exit, listener.address).is_none(),
+            "duplicate SOCKS5 listener for exit: {}",
+            listener.exit
+        );
+    }
+    let mut seen_exits = BTreeSet::new();
+    let mut addresses = BTreeSet::new();
+    exits
+        .iter()
+        .enumerate()
+        .map(|(index, exit)| {
+            ensure!(seen_exits.insert(exit), "duplicate proxy exit: {exit}");
+            let address = match by_exit.get(exit) {
+                Some(address) => *address,
+                None => {
+                    // Port zero requests a separate OS-assigned port for each exit.
+                    let port = if base.port() == 0 {
+                        0
+                    } else {
+                        base.port()
+                            .checked_add(index as u16)
+                            .context("SOCKS5 port range exceeds 65535; use --socks5 EXIT=ADDRESS")?
+                    };
+                    SocketAddr::new(base.ip(), port)
+                }
+            };
+            ensure!(
+                address.port() == 0 || addresses.insert(address),
+                "duplicate SOCKS5 listener address: {address}"
+            );
+            Ok(Listener {
+                exit: exit.clone(),
+                address,
+            })
+        })
+        .collect()
+}
 pub(super) struct Connection {
     pub(super) raw: quinn::Connection,
     pub(super) router: Arc<Router>,
@@ -60,8 +120,6 @@ pub(super) struct Pool {
     identity: mesh::ClientIdentity,
     token: String,
     slots: BTreeMap<String, Slot>,
-    exits: Vec<String>,
-    next: AtomicUsize,
 }
 impl Pool {
     pub(super) fn new(
@@ -94,31 +152,9 @@ impl Pool {
             identity,
             token,
             slots,
-            exits,
-            next: AtomicUsize::new(0),
         }))
     }
-    pub(super) async fn select(&self, pinned: Option<&str>) -> Result<(String, Arc<Connection>)> {
-        let choices = match pinned {
-            Some(id) => vec![id.to_owned()],
-            None => {
-                let start = self.next.fetch_add(1, Ordering::Relaxed) % self.exits.len();
-                (0..self.exits.len())
-                    .map(|i| self.exits[(start + i) % self.exits.len()].clone())
-                    .collect()
-            }
-        };
-        let mut last = None;
-        for id in choices {
-            match timeout(Duration::from_secs(2), self.get(&id)).await {
-                Ok(Ok(conn)) => return Ok((id, conn)),
-                Ok(Err(e)) => last = Some(e),
-                Err(e) => last = Some(e.into()),
-            }
-        }
-        Err(last.context("no selected proxy exit")?).context("selected proxy exits unavailable")
-    }
-    async fn get(&self, id: &str) -> Result<Arc<Connection>> {
+    pub(super) async fn get(&self, id: &str) -> Result<Arc<Connection>> {
         let slot = self.slots.get(id).context("exit not selected")?;
         let address = slot.node.read().expect("proxy node").address;
         let mut cached = slot.connection.lock().await;
@@ -175,18 +211,7 @@ impl Pool {
 }
 
 pub async fn client(options: ClientOptions) -> Result<()> {
-    ensure!(
-        options.listen.ip().is_loopback(),
-        "SOCKS5 listeners must use loopback addresses"
-    );
-    ensure!(
-        options.socks5.len() <= 8,
-        "at most eight pinned SOCKS5 listeners"
-    );
-    ensure!(
-        !options.exits.is_empty() && options.exits.len() <= 8,
-        "select 1..8 proxy exits"
-    );
+    let planned = listener_plan(&options.exits, options.listen, &options.socks5)?;
     let mut nodes = options.identity.discover_any(&options.connect).await?;
     let mut missing = JoinSet::new();
     for exit in &options.exits {
@@ -210,21 +235,19 @@ pub async fn client(options: ClientOptions) -> Result<()> {
     }
     let pool = Pool::new(options.identity, nodes, options.exits)?;
     // Bind every requested port before publishing readiness or accepting clients.
-    let mut listeners = vec![(TcpListener::bind(options.listen).await?, None)];
-    for listener in options.socks5 {
-        ensure!(
-            listener.address.ip().is_loopback() && pool.slots.contains_key(&listener.exit),
-            "pinned listener must reference a selected exit and a loopback address"
-        );
+    let mut listeners = Vec::with_capacity(planned.len());
+    for listener in planned {
         listeners.push((
-            TcpListener::bind(listener.address).await?,
-            Some(listener.exit),
+            TcpListener::bind(listener.address).await.with_context(|| {
+                format!("bind SOCKS5 for {} at {}", listener.exit, listener.address)
+            })?,
+            listener.exit,
         ));
     }
     let permits = Arc::new(Semaphore::new(MAX_STREAMS));
     let mut tasks = JoinSet::new();
     for (listener, exit) in listeners {
-        tracing::info!(address=%listener.local_addr()?, exit=exit.as_deref().unwrap_or("selected-exit-pool"), "SOCKS5 proxy ready");
+        tracing::info!(address=%listener.local_addr()?, %exit, "SOCKS5 proxy ready");
         tasks.spawn(listen(listener, pool.clone(), exit, permits.clone()));
     }
     let mut discovery = JoinSet::new();
@@ -251,7 +274,7 @@ pub async fn client(options: ClientOptions) -> Result<()> {
 pub(super) async fn listen(
     listener: TcpListener,
     pool: Arc<Pool>,
-    pinned: Option<String>,
+    exit: String,
     permits: Arc<Semaphore>,
 ) -> Result<()> {
     let mut tasks = JoinSet::new();
@@ -261,10 +284,10 @@ pub(super) async fn listen(
                 let (tcp, _) = accepted?;
                 let Ok(permit) = permits.clone().try_acquire_owned() else { continue; };
                 tcp.set_nodelay(true)?;
-                let pool = pool.clone(); let pinned = pinned.clone();
+                let pool = pool.clone(); let exit = exit.clone();
                 tasks.spawn(async move {
                     let _permit = permit;
-                    if let Err(error) = super::socks::serve(tcp, pool, pinned.as_deref()).await { tracing::debug!(%error, "SOCKS5 client closed"); }
+                    if let Err(error) = super::socks::serve(tcp, pool, &exit).await { tracing::debug!(%error, %exit, "SOCKS5 client closed"); }
                 });
             }
             _ = tasks.join_next(), if !tasks.is_empty() => {}

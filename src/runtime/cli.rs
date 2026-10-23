@@ -67,7 +67,7 @@ mod proxy_cli_tests {
             "--exit",
             "b",
             "--socks5",
-            "a=127.0.0.1:1081",
+            "a=127.0.0.1:2080",
         ];
         assert!(Cli::try_parse_from(client).is_ok());
         assert!(
@@ -158,7 +158,7 @@ enum Command {
         #[command(flatten)]
         stats: stats::Options,
     },
-    /// Offer local SOCKS5 TCP/UDP access through one or several selected mesh exits.
+    /// Offer a separate local SOCKS5 TCP/UDP endpoint for each selected mesh exit.
     ProxyClient {
         #[arg(long, required = true)]
         connect: Vec<SocketAddr>,
@@ -166,12 +166,13 @@ enum Command {
         connection_key: PathBuf,
         #[arg(long)]
         dir: PathBuf,
-        /// Repeat to distribute new connections across these exits. Existing flows stay pinned.
+        /// Repeat to select exits; each gets its own SOCKS5 listener, in this order.
         #[arg(long, required = true)]
         exit: Vec<String>,
+        /// Base loopback address; successive exits use successive ports (1080, 1081, ...).
         #[arg(long, default_value = "127.0.0.1:1080")]
         listen: SocketAddr,
-        /// Additional pinned SOCKS5 listener, EXIT=127.0.0.1:PORT. Repeat for Clash selection.
+        /// Override one exit's SOCKS5 address, EXIT=127.0.0.1:PORT; one listener per exit.
         #[arg(long)]
         socks5: Vec<proxy::Listener>,
     },

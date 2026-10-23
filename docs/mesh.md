@@ -19,23 +19,31 @@ braidpath mesh-server --dir local/node-b --id node-b \
   --listen 0.0.0.0:4433 --advertise 192.0.2.20:4433 --proxy \
   --join 192.0.2.10:4433 --join-key local/server-key.json
 
-# One SOCKS5 endpoint distributes new connections across the selected exits.
-# Additional endpoints let applications select an exit explicitly.
+# One SOCKS5 endpoint per exit: node-a on 1080, node-b on 1081.
 braidpath proxy-client --connect 192.0.2.10:4433 \
   --connection-key local/client-key.json --dir local/proxy-client \
-  --exit node-a --exit node-b --listen 127.0.0.1:1080 \
-  --socks5 node-a=127.0.0.1:1081 --socks5 node-b=127.0.0.1:1082
+  --exit node-a --exit node-b --listen 127.0.0.1:1080
 ```
 
 Repeat `--exit` for up to eight nodes, or specify just one for a fixed exit.
-The main listener assigns new TCP connections and UDP associations round robin.
-Each connection/association retains its exit for its entire lifetime, including
-all destinations within one UDP association. If connecting to an exit fails,
-the pool can try another selected exit before sending the application request.
-A pinned `--socks5 EXIT=ADDRESS` listener uses only that exit. A destination
-rejection is returned to the application; requests are never replayed elsewhere.
-Existing streams fail if their exit fails; other exits continue serving their
-own streams. Clients discover address updates in the background every 15 seconds;
+Each selected exit gets exactly one SOCKS5 listener. Ports increase from
+`--listen` (default `127.0.0.1:1080`) in `--exit` argument order, independently of
+discovery order. Both TCP connections and UDP associations on that port always
+use its assigned exit, including all destinations within one UDP association.
+There is no pooled listener or automatic switch to another exit: failures are
+returned to the application, so Clash controls exit selection and failover.
+Other exits continue serving their own streams.
+
+Use `--socks5 node-a=127.0.0.1:2080` to override that exit's automatically
+assigned address. This replaces its listener rather than adding another one;
+other exits keep the ports corresponding to their original positions. Repeat
+for other exits to keep explicit mappings stable when changing the `--exit`
+order. Duplicate exits, multiple overrides for one exit, unknown exit IDs,
+conflicting addresses and port overflow are rejected. Every listener is bound
+before readiness is reported; startup logs list each exit and its actual address.
+Port zero requests a separate OS-assigned port for each exit.
+
+Clients discover address updates in the background every 15 seconds;
 new connections use updated addresses while existing connections retain their
 original peer. This is concurrent use of exits by separate flows; one TCP stream
 uses one reliable QUIC stream to one exit.
@@ -53,17 +61,16 @@ merge these entries into the application's existing configuration:
 
 ```yaml
 proxies:
-  - {name: BP-Pool, type: socks5, server: 127.0.0.1, port: 1080, udp: true}
-  - {name: BP-A, type: socks5, server: 127.0.0.1, port: 1081, udp: true}
-  - {name: BP-B, type: socks5, server: 127.0.0.1, port: 1082, udp: true}
+  - {name: BP-A, type: socks5, server: 127.0.0.1, port: 1080, udp: true}
+  - {name: BP-B, type: socks5, server: 127.0.0.1, port: 1081, udp: true}
 proxy-groups:
   - name: BraidPath
     type: select
-    proxies: [BP-Pool, BP-A, BP-B]
+    proxies: [BP-A, BP-B]
 ```
 
-Choose BP-A/B for a fixed exit, or BP-Pool for concurrent use by new connections.
-Route the desired application rules to the BraidPath group. BraidPath must run on
+Choose BP-A or BP-B in the BraidPath group, or route different application rules
+to different nodes to use the exits concurrently. BraidPath must run on
 the same machine as these loopback SOCKS endpoints. This supplies the proxy
 service model requested for v0.3.2; its wire protocol is not Hysteria 2, so a
 Clash `hysteria2` entry cannot connect to it directly.
