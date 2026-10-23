@@ -76,7 +76,7 @@ pub(super) fn add(hints: &[Hint], departed: &[Node], now: u64) -> Vec<Hint> {
         }
     }
     // Stable: newly departed members stay ahead of equally recent hints.
-    next.sort_by(|a, b| b.forgotten_unix.cmp(&a.forgotten_unix));
+    next.sort_by_key(|hint| std::cmp::Reverse(hint.forgotten_unix));
     next.truncate(MAX_NODES);
     next
 }
