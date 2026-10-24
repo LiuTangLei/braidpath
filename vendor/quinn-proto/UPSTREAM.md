@@ -10,11 +10,24 @@ all contiguous data into actual byte spans. Normal compaction retains large
 buffers to avoid copying, which can leave more than 1,024 buffers for contiguous
 data with mixed frame sizes. A deterministic 5,100,672-byte backlog reproduced
 the failure without packet loss. The extra coalescing runs only when normal
-compaction would otherwise close the connection. The original fragment count
-limit, flow-control memory budgets and duplicate/gap flood tests remain in place.
+compaction would otherwise close the connection.
 
-The added regression covers mixed-size backlogs and a missing prefix restored
-after the backlog arrives. Existing upstream security regression tests are
+Second local change: a local regression shows the fixed 1,024-span bound can
+also reject genuine loss holes. Alternating lost and received 1,200-byte frames
+leave one span per 2.4 KB; a large flight can exceed 1,024 real spans. This is an
+illustrative pattern, not a bound on all legitimate traffic or proof of the exact
+WAN failure pattern. The live captures did not record span distributions. The bound is now the larger of 1,024 and one span per KiB of unread
+extent (`end - bytes_read`), which flow control limits to the receive window.
+The compaction trigger stays at twice the current bound. Span metadata therefore
+remains a small fraction of window-bounded memory, and denser gap floods are
+still rejected. A rejection logs span count, bound and extent under the
+`braidpath::quinn` tracing target. Flow-control memory budgets and the upstream
+duplicate/gap flood tests remain in place.
+
+The added regressions cover mixed-size backlogs, a missing prefix restored
+after the backlog arrives, a 16 MiB window with every other frame lost, and a
+gap flood twice as dense as the scaled bound across the same extent, preseeded
+with a high-offset frame in both ordered and unordered modes. Existing upstream security regression tests are
 retained. This extends the coalescing work described in
 <https://github.com/quinn-rs/quinn/issues/2809> and
 <https://github.com/quinn-rs/quinn/pull/2814>; it is a local correction, not an

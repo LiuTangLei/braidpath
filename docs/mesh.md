@@ -108,6 +108,16 @@ Proxy limits and lifecycle:
   remains active. Proxy UDP sockets request 8 MiB receive buffers, with smaller
   requests when a platform refuses that size. The OS may clamp the granted size;
   system-wide socket limits are not changed.
+- v0.3.4 did not cover packet loss. A stream allowed 16 MiB in flight can hold
+  more than 1,024 genuine holes after loss, so v0.3.5 bounds retained spans by
+  the larger of 1,024 and one per KiB of unread, flow-control-bounded extent.
+  Denser span patterns are still rejected. Proxy sockets also request 8 MiB
+  send buffers within OS limits and log the granted receive and send sizes. A
+  rejection logs its span count and extent. Local UDP send failures from
+  quinn-udp are now included in the default log filter, limited to one warning
+  per minute. An explicit `RUST_LOG` overrides the default filter; deployments
+  using it must include `quinn_udp=warn` to retain those warnings. The local loss
+  regression does not establish where packets were lost in the WAN capture.
 - UDP associations close when their SOCKS TCP owner closes, after 60 seconds
   without traffic, or when their QUIC connection closes. UDP destination sockets
   expire after 60 seconds idle. TCP streams expire after 300 seconds idle across

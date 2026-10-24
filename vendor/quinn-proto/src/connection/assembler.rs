@@ -106,9 +106,23 @@ impl Assembler {
         self.defragment_retaining_large_chunks(true);
     }
 
+    /// Span bound for the current unread extent
+    ///
+    /// Flow control limits `end - bytes_read` to the receive window, so this
+    /// scales with the window rather than with anything a peer sends for free.
+    /// In unordered mode `bytes_read` counts bytes, so the extent is an upper
+    /// bound that is still limited by the window.
+    fn max_chunks(&self) -> usize {
+        let extent = self.end.saturating_sub(self.bytes_read);
+        MAX_CHUNKS.max(usize::try_from(extent / BYTES_PER_EXTRA_CHUNK).unwrap_or(usize::MAX))
+    }
+
     fn defragment_retaining_large_chunks(&mut self, retain_large: bool) {
         // Chunks smaller than min_chunk_size are merged regardless of fragmentation
-        let min_chunk_size = max(self.buffered.div_ceil(MAX_CHUNKS), MIN_RETAINED_CHUNK_SIZE);
+        let min_chunk_size = max(
+            self.buffered.div_ceil(self.max_chunks()),
+            MIN_RETAINED_CHUNK_SIZE,
+        );
         let new = BinaryHeap::with_capacity(self.data.len());
         let old = mem::replace(&mut self.data, new);
         let mut buffers = old.into_sorted_vec();
@@ -216,14 +230,23 @@ impl Assembler {
         // balance between defragmentation overhead and over-allocation.
         let threshold = 32768.max(buffered * 3 / 2);
         // Small gapped frames hold over-allocation below the threshold, so bound the count too.
-        if over_allocation > threshold || self.data.len() > COMPACT_THRESHOLD {
+        let max_chunks = self.max_chunks();
+        if over_allocation > threshold || self.data.len() > 2 * max_chunks {
             self.defragment();
-            if self.data.len() > MAX_CHUNKS {
+            if self.data.len() > max_chunks {
                 // Retained large chunks can split contiguous data into many
                 // buffers. Only reject after coalescing to actual byte spans;
                 // mixed frame sizes and TCP backpressure are not stream gaps.
                 self.defragment_retaining_large_chunks(false);
-                if self.data.len() > MAX_CHUNKS {
+                if self.data.len() > max_chunks {
+                    tracing::warn!(
+                        target: "braidpath::quinn",
+                        spans = self.data.len(),
+                        max_chunks,
+                        unread_extent = self.end.saturating_sub(self.bytes_read),
+                        buffered = self.buffered,
+                        "rejecting stream data with too many disjoint spans"
+                    );
                     return Err(TooManyChunks);
                 }
             }
@@ -363,11 +386,21 @@ pub struct IllegalOrderedRead;
 #[derive(Debug)]
 pub(crate) struct TooManyChunks;
 
-/// Bound on the number of distinct spans kept for a stream
+/// Minimum bound on the number of distinct spans kept for a stream
 ///
 /// Independent of how much memory those spans over-allocate. A frame is rejected only
-/// if compaction cannot get the count back down to this.
+/// if compaction cannot get the count back down to the larger of this and
+/// [`BYTES_PER_EXTRA_CHUNK`]-scaled unread extent.
 const MAX_CHUNKS: usize = 1024;
+
+/// Unread stream bytes that earn one span beyond [`MAX_CHUNKS`]
+///
+/// Alternating lost and received 1200-byte stream frames leave about one span per
+/// 2.4 KB of flight. This illustrative loss pattern can exceed a fixed bound in
+/// a large receive window; it is not a bound on all legitimate frame patterns.
+/// Allowing one span per KiB covers this regression while bounding span metadata
+/// in proportion to flow-control credit, including for high-offset sparse frames.
+const BYTES_PER_EXTRA_CHUNK: u64 = 1024;
 
 /// Minimum size of a defragmented chunk that is retained without coalescing.
 ///
@@ -375,16 +408,14 @@ const MAX_CHUNKS: usize = 1024;
 /// being cheap to copy while reducing the overhead of many small buffer nodes.
 const MIN_RETAINED_CHUNK_SIZE: usize = 128;
 
-/// Chunk count past which `insert` compacts before deciding whether to reject
-///
-/// Above `MAX_CHUNKS` so a flood of mergeable frames cannot force a defragmentation
-/// per frame.
-const COMPACT_THRESHOLD: usize = 2 * MAX_CHUNKS;
-
 #[cfg(test)]
 mod test {
     use super::*;
     use assert_matches::assert_matches;
+
+    /// Compaction trigger at the minimum span bound; `insert` compacts past twice
+    /// the current bound so mergeable floods cannot force one defragment per frame.
+    const COMPACT_THRESHOLD: usize = 2 * MAX_CHUNKS;
 
     #[test]
     fn assemble_ordered() {
@@ -741,7 +772,7 @@ mod test {
                 assembler.insert(offset, bytes.into(), size).unwrap();
                 offset += size as u64;
             }
-            assert!(assembler.data.len() <= MAX_CHUNKS);
+            assert!(assembler.data.len() <= 2 * assembler.max_chunks());
             if missing_prefix {
                 assert!(assembler.read(usize::MAX, true).is_none());
                 assembler.insert(0, Bytes::from_static(b"x"), 1).unwrap();
@@ -757,6 +788,65 @@ mod test {
             assert_eq!(read, expected.len());
             assert_eq!(assembler.buffered, 0);
             assert_eq!(assembler.allocated, 0);
+        }
+    }
+
+    #[test]
+    fn lossy_long_flight_is_not_a_gap_flood() {
+        // A 16 MiB window of 1200-byte frames with every other frame lost leaves
+        // about 7,000 real holes, as dense loss on a long upload flight does.
+        const FRAME_LEN: usize = 1200;
+        const WINDOW: usize = 16 * 1024 * 1024;
+        let frames = WINDOW / FRAME_LEN;
+        let frame = |i: usize| Bytes::from(vec![(i % 251) as u8; FRAME_LEN]);
+        let mut x = Assembler::new();
+        for i in (1..frames).step_by(2) {
+            x.insert((i * FRAME_LEN) as u64, frame(i), FRAME_LEN)
+                .expect("holes left by packet loss within the window are not a flood");
+        }
+        x.defragment();
+        assert!(x.data.len() > 4 * MAX_CHUNKS);
+        // Retransmissions arrive and the stream drains in order.
+        for i in (0..frames).step_by(2) {
+            x.insert((i * FRAME_LEN) as u64, frame(i), FRAME_LEN).unwrap();
+        }
+        let mut read = 0;
+        while let Some(chunk) = x.read(usize::MAX, true) {
+            assert_eq!(chunk.offset, read as u64);
+            for (j, byte) in chunk.bytes.iter().enumerate() {
+                assert_eq!(*byte, (((read + j) / FRAME_LEN) % 251) as u8);
+            }
+            read += chunk.bytes.len();
+        }
+        assert_eq!(read, frames * FRAME_LEN);
+        assert_eq!((x.buffered, x.allocated), (0, 0));
+    }
+
+    #[test]
+    fn gap_flood_is_bounded_across_a_large_window() {
+        const WINDOW: u64 = 16 * 1024 * 1024;
+        for ordered in [true, false] {
+            let mut x = Assembler::new();
+            x.ensure_ordering(ordered).unwrap();
+            // Advertise the full extent first. Otherwise an ascending flood
+            // is rejected near the 1,024-span floor without testing the larger
+            // allowance an attacker can obtain with one high-offset frame.
+            x.insert(WINDOW - 1, Bytes::from_static(b"x"), 1).unwrap();
+            assert_eq!(x.max_chunks(), 16_384);
+            let mut result = Ok(());
+            let mut max_len = 0;
+            for offset in (1..WINDOW - 1).step_by(512) {
+                result = x.insert(offset, Bytes::from_static(b"gap"), 3);
+                max_len = max_len.max(x.data.len());
+                if result.is_err() {
+                    break;
+                }
+            }
+            assert_matches!(result, Err(TooManyChunks));
+            let bound = x.max_chunks();
+            assert_eq!(bound, 16_384);
+            assert!(max_len <= 2 * bound + 1, "chunk count {max_len} exceeded {bound}");
+            assert!(max_len > bound, "did not exercise the scaled span allowance");
         }
     }
 

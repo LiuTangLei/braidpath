@@ -11,16 +11,26 @@ pub const DEFAULT_DATAGRAM_SEND_BUFFER_BYTES: usize = 1200;
 pub const MAX_DATAGRAM_SEND_BUFFER_BYTES: usize = 76_800;
 const PROXY_STREAM_WINDOW: u32 = 16 * 1024 * 1024;
 const PROXY_CONNECTION_WINDOW: u32 = 32 * 1024 * 1024;
-const PROXY_SOCKET_RECEIVE_BYTES: usize = 8 * 1024 * 1024;
+const PROXY_SOCKET_BUFFER_BYTES: usize = 8 * 1024 * 1024;
 
-fn proxy_socket_receive_buffer(socket: socket2::SockRef<'_>) {
-    let mut requested = PROXY_SOCKET_RECEIVE_BYTES;
+fn proxy_socket_buffers(socket: socket2::SockRef<'_>) {
     // Some platforms reject oversized requests; others accept and clamp them.
     // Leave the platform's buffer intact if even a 1 MiB request is refused.
-    while socket.set_recv_buffer_size(requested).is_err() && requested > 1024 * 1024 {
-        requested /= 2;
-    }
-    tracing::debug!(requested, granted = ?socket.recv_buffer_size().ok(), "proxy UDP receive buffer");
+    let request = |set: &dyn Fn(usize) -> std::io::Result<()>| {
+        let mut requested = PROXY_SOCKET_BUFFER_BYTES;
+        while set(requested).is_err() && requested > 1024 * 1024 {
+            requested /= 2;
+        }
+    };
+    request(&|bytes| socket.set_recv_buffer_size(bytes));
+    request(&|bytes| socket.set_send_buffer_size(bytes));
+    // Record what the OS granted so host-wide UDP drop counters can be
+    // compared with this socket's actual limits.
+    tracing::info!(
+        receive = ?socket.recv_buffer_size().ok(),
+        send = ?socket.send_buffer_size().ok(),
+        "proxy UDP socket buffers"
+    );
 }
 
 /// Expand shared stream credit only after the proxy token and exit are verified.
@@ -190,7 +200,7 @@ pub(crate) fn server_with_proxy(
     conf.transport_config(Arc::new(transport));
     if proxy {
         let socket = std::net::UdpSocket::bind(bind)?;
-        proxy_socket_receive_buffer(socket2::SockRef::from(&socket));
+        proxy_socket_buffers(socket2::SockRef::from(&socket));
         return Ok(Endpoint::new(
             quinn::EndpointConfig::default(),
             Some(conf),
@@ -322,7 +332,7 @@ fn client_with_alpn(
     s.bind(&bind.into())?;
     s.set_nonblocking(true)?;
     if alpn == super::proxy::ALPN {
-        proxy_socket_receive_buffer(socket2::SockRef::from(&s));
+        proxy_socket_buffers(socket2::SockRef::from(&s));
     }
     let mut endpoint = Endpoint::new(
         quinn::EndpointConfig::default(),
@@ -418,6 +428,140 @@ mod tests {
         })
         .await
         .expect("proxy flow-control windows blocked outstanding data");
+        client.close(0u32.into(), b"test complete");
+        server.close(0u32.into(), b"test complete");
+    }
+
+    /// Delay both directions by `delay` and drop roughly `loss_per_mille` of
+    /// client datagrams once the handshake has had room to complete. The loss
+    /// pattern is a fixed hash of the datagram index, so runs are repeatable.
+    async fn lossy_relay(
+        server: SocketAddr,
+        delay: Duration,
+        loss_per_mille: u64,
+    ) -> (SocketAddr, Arc<std::sync::atomic::AtomicU64>) {
+        use std::collections::VecDeque;
+        use tokio::{net::UdpSocket, sync::mpsc, time::Instant};
+        // Forward each queued datagram once its delay has elapsed.
+        async fn forward(
+            mut queue: mpsc::UnboundedReceiver<(Instant, Vec<u8>)>,
+            send: impl Fn(&[u8]),
+        ) {
+            let mut held = VecDeque::new();
+            loop {
+                if held.is_empty() {
+                    match queue.recv().await {
+                        Some(item) => held.push_back(item),
+                        None => return,
+                    }
+                }
+                while let Ok(item) = queue.try_recv() {
+                    held.push_back(item);
+                }
+                tokio::time::sleep_until(held.front().unwrap().0).await;
+                while held.front().is_some_and(|(due, _)| *due <= Instant::now()) {
+                    send(&held.pop_front().unwrap().1);
+                }
+            }
+        }
+        let front = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let back = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        back.connect(server).await.unwrap();
+        let address = front.local_addr().unwrap();
+        let (to_server, server_queue) = mpsc::unbounded_channel();
+        let (to_client, client_queue) = mpsc::unbounded_channel();
+        let peer = Arc::new(std::sync::Mutex::new(None));
+        let dropped = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        {
+            let (front, peer, dropped) = (front.clone(), peer.clone(), dropped.clone());
+            tokio::spawn(async move {
+                let mut buf = vec![0; 65_536];
+                for index in 0u64.. {
+                    let Ok((n, from)) = front.recv_from(&mut buf).await else {
+                        return;
+                    };
+                    *peer.lock().unwrap() = Some(from);
+                    let hash = index.wrapping_mul(0x9E37_79B9_7F4A_7C15).rotate_left(29);
+                    if index >= 64 && hash % 1000 < loss_per_mille {
+                        dropped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        continue;
+                    }
+                    let _ = to_server.send((Instant::now() + delay, buf[..n].to_vec()));
+                }
+            });
+        }
+        {
+            let back = back.clone();
+            tokio::spawn(async move {
+                let mut buf = vec![0; 65_536];
+                while let Ok(n) = back.recv(&mut buf).await {
+                    let _ = to_client.send((Instant::now() + delay, buf[..n].to_vec()));
+                }
+            });
+        }
+        tokio::spawn(forward(server_queue, move |data| {
+            let _ = back.try_send(data);
+        }));
+        tokio::spawn(forward(client_queue, move |data| {
+            if let Some(to) = *peer.lock().unwrap() {
+                let _ = front.try_send_to(data, to);
+            }
+        }));
+        (address, dropped)
+    }
+
+    // Single-threaded and modest in size so parallel timing tests keep their CPU.
+    #[tokio::test]
+    async fn proxy_upload_recovers_from_loss_across_a_large_stream_window() {
+        let temp = tempfile::tempdir().unwrap();
+        let identity = temp.path().join("identity");
+        initialize(&identity, "localhost").unwrap();
+        let server = server_with_proxy(
+            "127.0.0.1:0".parse().unwrap(),
+            &identity.join("cert.pem"),
+            &identity.join("key.pem"),
+            Congestion::Bbr,
+            DEFAULT_DATAGRAM_SEND_BUFFER_BYTES,
+            AckRequest::Unchanged,
+            true,
+        )
+        .unwrap();
+        // Non-congestive loss on a long flight keeps many holes open in one
+        // stream while retransmissions catch up. The dense-hole bound itself
+        // is covered by the assembler regressions; this checks the whole
+        // proxy transport still delivers every byte in order.
+        let (relay, dropped) =
+            lossy_relay(server.local_addr().unwrap(), Duration::from_millis(50), 100).await;
+        let client = proxy_client(relay, &identity.join("cert.pem")).unwrap();
+        tokio::time::timeout(Duration::from_secs(60), async {
+            let (outgoing, incoming) =
+                tokio::join!(client.connect(relay, "localhost").unwrap(), async {
+                    server.accept().await.unwrap().await
+                });
+            let outgoing = outgoing.unwrap();
+            let incoming = incoming.unwrap();
+            authenticated_proxy(&incoming);
+            let (mut upload, _download) = outgoing.open_bi().await.unwrap();
+            upload.write_all(&[1]).await.unwrap();
+            let (_response, mut request) = incoming.accept_bi().await.unwrap();
+            let payload: Vec<u8> = (0..8 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
+            let expected = payload.clone();
+            let send = tokio::spawn(async move {
+                upload.write_all(&payload).await.unwrap();
+                upload.finish().unwrap();
+                upload.stopped().await
+            });
+            let received = request.read_to_end(expected.len() + 1).await.unwrap();
+            assert_eq!(received[0], 1);
+            assert!(received[1..] == expected[..]);
+            assert_eq!(send.await.unwrap().unwrap(), None);
+        })
+        .await
+        .expect("lossy upload did not complete");
+        assert!(
+            dropped.load(std::sync::atomic::Ordering::Relaxed) > 0,
+            "relay did not inject packet loss"
+        );
         client.close(0u32.into(), b"test complete");
         server.close(0u32.into(), b"test complete");
     }

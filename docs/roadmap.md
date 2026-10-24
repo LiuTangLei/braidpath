@@ -81,6 +81,12 @@ Current protocol, commands and limits: [experimental runtime](runtime.md). Check
 
 ## M4 — Reliable flows and application adapters
 
+- [x] v0.3.5: scale Quinn's stream span limit with the flow-control-bounded
+  unread extent, so loss holes in a 16 MiB proxy window are not treated as a gap
+  flood. Gap-flood rejection is retained at the same density. Proxy sockets also
+  request larger send buffers, and granted sizes, rejected spans and local UDP
+  send errors are logged by default. Local regressions pass; WAN upload is not
+  yet re-verified.
 - [x] v0.3.4: prevent contiguous mixed-size stream backlogs from triggering
   Quinn's fragment guard, retaining the real gap limit and flow-control budgets.
   Proxy endpoints request larger UDP receive buffers within OS limits.
