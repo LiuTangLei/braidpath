@@ -15,7 +15,7 @@ mod service;
 mod transfer;
 mod wire;
 pub(crate) use server::Registry;
-pub(crate) use service::PathService;
+pub(crate) use service::{Delivery, PathService};
 pub(crate) use transfer::open;
 pub(crate) use wire::{
     ACK_FIN, BUSY, CLOSE, DOWNLOAD_ACK, FIN, Incoming, Key, OPEN, Operation, PULL, PUT, Reply,

@@ -206,7 +206,7 @@ impl Puller {
             end: None,
             usage: self.usage.clone(),
             route: route.clone(),
-            service: None,
+            delivery: None,
             interactive,
             avoid,
         };

@@ -78,7 +78,7 @@ pub(crate) struct StreamSink {
     pub end: Option<(u64, u64)>,
     pub usage: Arc<Mutex<BTreeMap<SocketAddr, (u64, u64)>>>,
     pub route: Arc<Mutex<SocketAddr>>,
-    pub service: Option<Arc<PathService>>,
+    pub delivery: Option<Delivery>,
     /// Waits for target bytes not yet produced: route by latency, not backlog.
     pub interactive: bool,
     /// Prefer any other path; used when re-requesting a stalled head record.
@@ -170,6 +170,9 @@ pub(crate) async fn rpc(
     op: &mut Operation,
     mut stream: Option<&mut StreamSink>,
 ) -> Result<Reply> {
+    // The caller reserves ready work when selecting a path, before connection
+    // setup, stream admission or a response header can delay this request.
+    let mut delivery = stream.as_deref_mut().and_then(|sink| sink.delivery.take());
     let (mut send, mut recv) = tokio::time::timeout(CONNECT_TIMEOUT, conn.open_bi()).await??;
     let mut header = vec![op.command()];
     header.extend(key);
@@ -262,15 +265,13 @@ pub(crate) async fn rpc(
                 anyhow::bail!("lane reply to a scalar operation")
             };
             ensure!(count <= *requested as usize, "unrequested download records");
+            if let Some(delivery) = &mut delivery {
+                delivery.skip(*requested as usize - count);
+            }
             *requested = count as u8;
             let excess = sink.credit.num_permits().saturating_sub(count * CHUNK);
             drop(sink.credit.split(excess));
         }
-        // Requests for produced data are real backlog; future-data waits are not.
-        let mut delivery = stream.as_ref().and_then(|sink| {
-            let records = if sink.interactive { 0 } else { count };
-            sink.service.as_ref().map(|service| service.start(records))
-        });
         ensure!(
             stream.is_some(),
             "download lane requires a streaming consumer"
@@ -391,7 +392,7 @@ mod stream_tests {
             end: None,
             usage: Arc::new(Mutex::new(BTreeMap::new())),
             route: Arc::new(Mutex::new("127.0.0.1:1".parse().unwrap())),
-            service: None,
+            delivery: None,
             interactive: false,
             avoid: None,
         };
@@ -491,7 +492,7 @@ mod stream_tests {
             end: None,
             usage: usage.clone(),
             route: Arc::new(Mutex::new("127.0.0.1:1".parse().unwrap())),
-            service: None,
+            delivery: None,
             interactive: false,
             avoid: None,
         };

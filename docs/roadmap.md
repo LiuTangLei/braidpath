@@ -81,6 +81,11 @@ Current protocol, commands and limits: [experimental runtime](runtime.md). Check
 
 ## M4 — Reliable flows and application adapters
 
+- [x] v0.4.2: account for queued download work before a response arrives, so
+  expected-arrival scheduling sees requests awaiting connection/stream admission
+  and reply headers. A withheld-response regression covers admission-time
+  accounting and cancellation cleanup. Active proxy transports expose bounded
+  native counters at info level for matched single-connection investigations.
 - [x] v0.4.1: fix aggregate TCP admission and scheduling. Exhausted exit upload
   memory or handler slots return a retryable busy reply instead of resetting the
   flow or failing the path; the upload record at the delivery cursor and one

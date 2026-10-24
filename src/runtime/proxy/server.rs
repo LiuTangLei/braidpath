@@ -154,6 +154,7 @@ impl Server {
         let router = Arc::new(Router::default());
         let mut tasks = JoinSet::new();
         let mut maintenance = tokio::time::interval(Duration::from_secs(5));
+        let mut telemetry = crate::runtime::transport::ProxyTelemetry::default();
         let mut last = Instant::now();
         loop {
             tokio::select! {
@@ -183,7 +184,10 @@ impl Server {
                 }
                 data = conn.read_datagram() => router.dispatch(data?),
                 _ = tasks.join_next(), if !tasks.is_empty() => { last = Instant::now(); }
-                _ = maintenance.tick() => { if tasks.is_empty() && last.elapsed() >= UDP_IDLE && !self.bonds.owns_connection(conn.stable_id()) { return Ok(()); } }
+                _ = maintenance.tick() => {
+                    telemetry.report(&conn, "server", &self.exit);
+                    if tasks.is_empty() && last.elapsed() >= UDP_IDLE && !self.bonds.owns_connection(conn.stable_id()) { return Ok(()); }
+                }
             }
         }
     }

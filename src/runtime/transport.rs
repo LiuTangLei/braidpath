@@ -13,6 +13,59 @@ const PROXY_STREAM_WINDOW: u32 = 16 * 1024 * 1024;
 const PROXY_CONNECTION_WINDOW: u32 = 32 * 1024 * 1024;
 const PROXY_SOCKET_BUFFER_BYTES: usize = 8 * 1024 * 1024;
 
+/// Low-frequency native counters for active proxy transports. Payload and
+/// retransmission bytes are deliberately separate from application goodput.
+pub(crate) struct ProxyTelemetry {
+    at: std::time::Instant,
+    connection: Option<usize>,
+    sent: u64,
+    received: u64,
+}
+impl Default for ProxyTelemetry {
+    fn default() -> Self {
+        Self {
+            at: std::time::Instant::now(),
+            connection: None,
+            sent: 0,
+            received: 0,
+        }
+    }
+}
+impl ProxyTelemetry {
+    pub(crate) fn report(&mut self, conn: &quinn::Connection, side: &'static str, exit: &str) {
+        let id = conn.stable_id();
+        let now = std::time::Instant::now();
+        if self.connection == Some(id) && now.duration_since(self.at) < Duration::from_secs(5) {
+            return;
+        }
+        let stats = conn.stats();
+        if self.connection != Some(id) {
+            self.sent = 0;
+            self.received = 0;
+        }
+        let traffic = stats
+            .udp_tx
+            .bytes
+            .saturating_sub(self.sent)
+            .saturating_add(stats.udp_rx.bytes.saturating_sub(self.received));
+        self.at = now;
+        self.connection = Some(id);
+        self.sent = stats.udp_tx.bytes;
+        self.received = stats.udp_rx.bytes;
+        if traffic < 64 * 1024 {
+            return;
+        }
+        tracing::info!(
+            side, exit, connection = id, peer = %conn.remote_address(),
+            rtt_us = stats.path.rtt.as_micros() as u64, cwnd = stats.path.cwnd,
+            sent_packets = stats.path.sent_packets, lost_packets = stats.path.lost_packets,
+            lost_bytes = stats.path.lost_bytes, congestion_events = stats.path.congestion_events,
+            udp_tx_bytes = stats.udp_tx.bytes, udp_rx_bytes = stats.udp_rx.bytes,
+            "proxy transport counters"
+        );
+    }
+}
+
 pub(crate) fn datagram_socket_buffers(socket: socket2::SockRef<'_>, scope: &'static str) {
     // Some platforms reject oversized requests; others accept and clamp them.
     // Leave the platform's buffer intact if even a 1 MiB request is refused.

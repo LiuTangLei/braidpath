@@ -134,6 +134,7 @@ struct Path {
     // native sent/lost packet counters at the previous report.
     last_ok: Mutex<Option<Instant>>,
     reported: Mutex<(u64, u64)>,
+    telemetry: Mutex<transport::ProxyTelemetry>,
 }
 impl Path {
     fn new(address: SocketAddr) -> Self {
@@ -153,6 +154,7 @@ impl Path {
             probe: Mutex::new(None),
             last_ok: Mutex::new(None),
             reported: Mutex::new((0, 0)),
+            telemetry: Mutex::new(transport::ProxyTelemetry::default()),
         }
     }
     fn permits(&self, op: &super::bond::Operation) -> &Arc<Semaphore> {
@@ -539,6 +541,16 @@ impl Pool {
                 tokio::select! { _ = changed => {}, _ = tokio::time::sleep(Duration::from_millis(20)) => {} }
                 continue;
             };
+            if let Some(sink) = stream.as_deref_mut() {
+                *sink.route.lock().expect("download route") = path.address;
+                let records = match op {
+                    super::bond::Operation::Pull { count, .. } if !sink.interactive => {
+                        count as usize
+                    }
+                    _ => 0,
+                };
+                sink.delivery = Some(path.service.start(records));
+            }
             let mut used_connection = None;
             let result = async {
                 let conn = self.connect(id, &path).await?;
@@ -547,13 +559,13 @@ impl Pool {
                     std::sync::atomic::Ordering::Relaxed,
                 );
                 used_connection = Some(conn.clone());
-                if let Some(sink) = stream.as_deref_mut() {
-                    *sink.route.lock().expect("download route") = path.address;
-                    sink.service = Some(path.service.clone());
-                }
                 super::bond::rpc(&conn.raw, key, &mut op, stream.as_deref_mut()).await
             }
             .await;
+            // Authentication can fail before rpc() takes the reservation.
+            if let Some(sink) = stream.as_deref_mut() {
+                sink.delivery.take();
+            }
             started = Instant::now();
             match result {
                 Ok(super::bond::Reply::Failed(super::bond::BUSY)) => {
@@ -656,7 +668,7 @@ impl Pool {
     /// a failed or persistently poor relay can be replaced by another server.
     pub(super) fn report_health(&self) {
         let now = Instant::now();
-        for slot in self.slots.values() {
+        for (id, slot) in &self.slots {
             let Ok(routes) = slot.routes.try_lock() else {
                 continue;
             };
@@ -675,7 +687,13 @@ impl Pool {
                         .lock()
                         .expect("proxy connection")
                         .as_ref()
-                        .map(|c| c.raw.stats().path);
+                        .map(|c| {
+                            path.telemetry
+                                .lock()
+                                .expect("path telemetry")
+                                .report(&c.raw, "client", id);
+                            c.raw.stats().path
+                        });
                     let mut reported = path.reported.lock().expect("path health");
                     let loss = stats.map_or(0.0, |stats| {
                         let sent = stats.sent_packets.saturating_sub(reported.0);

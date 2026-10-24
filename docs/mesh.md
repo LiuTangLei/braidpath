@@ -155,11 +155,19 @@ Proxy limits and lifecycle:
   lowest observed QUIC RTT; bulk downloads use observed payload service rate and
   data-ready backlog across paths,
   rather than treating requests waiting for future target bytes as network load.
+  From v0.4.2, ready ranges enter that backlog when a path is selected, including
+  time spent establishing a connection or waiting for its response header. Busy
+  replies, cancellation and failures release the reservation before a retry.
   Future-data waits are excluded from service estimates; sender backlog hints
   distinguish available payload from application idle time. Estimates expire for
   renewed exploration and reset after path reconnection. Per-flow debug summaries include
   path payload bytes and cumulative native RTT, congestion window and loss counts.
   These budgets are additional to the bounded QUIC transport buffers.
+- Active proxy transports emit native counters at info level at most once every
+  five seconds: connection identity, RTT, congestion window, sent/lost packets,
+  lost bytes, and UDP transmit/receive bytes. Idle paths remain quiet. Compare
+  counter deltas within the same connection; native UDP bytes include protocol
+  overhead and retransmissions and must not be added to SOCKS application bytes.
 - Closing a local flow schedules a bounded close RPC and retains its admission
   slot until cleanup completes. Client shutdown drains close requests and releases
   relay leases. The exit retains a flow for a ten-second resume grace after all

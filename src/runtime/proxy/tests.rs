@@ -881,6 +881,107 @@ async fn aggregate_shutdown_releases_optional_leases_and_flow_admission_credit()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn queued_download_is_charged_before_the_reply_header_and_cancellation_reclaims_it() {
+    use super::bond::{self, Operation, Reply, StreamSink};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let root = tempfile::tempdir().unwrap();
+    let (at, _server) = start(root.path(), "a", None, true).await;
+    let identity = identity(root.path(), "queued-client");
+    let pool = client::Pool::new(identity.clone(), vec![node("a", at)], vec!["a".into()]).unwrap();
+    let front = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let via = front.local_addr().unwrap();
+    let back = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    back.connect(at).await.unwrap();
+    let blocked = Arc::new(AtomicBool::new(false));
+    let gate = blocked.clone();
+    let _relay = Task(tokio::spawn(async move {
+        let (mut up, mut down) = (vec![0; 65536], vec![0; 65536]);
+        let mut peer = None;
+        loop {
+            tokio::select! {
+                r = front.recv_from(&mut up) => {
+                    let (n, from) = r.unwrap(); peer = Some(from);
+                    back.send(&up[..n]).await.unwrap();
+                }
+                r = back.recv(&mut down) => {
+                    let n = r.unwrap();
+                    if !gate.load(Ordering::Acquire) && let Some(peer) = peer {
+                        front.send_to(&down[..n], peer).await.unwrap();
+                    }
+                }
+            }
+        }
+    }));
+    pool.test_set_routes("a", vec![via]);
+    let (target, _echo) = echo().await;
+    let key = [83; 32];
+    let usage = Arc::new(Mutex::new(std::collections::BTreeMap::new()));
+    assert!(matches!(
+        pool.call("a", key, Operation::Open(Address::Ip(target)), &usage)
+            .await
+            .unwrap(),
+        Reply::Opened(_)
+    ));
+    // Authentication is complete. Withhold every response packet, including
+    // the range header: pending work must already affect subsequent routing.
+    blocked.store(true, Ordering::Release);
+    let budget = Arc::new(Semaphore::new(bond::CHUNK * 4));
+    let (events, _incoming) = tokio::sync::mpsc::channel(4);
+    let credit = budget
+        .clone()
+        .acquire_many_owned((bond::CHUNK * 4) as u32)
+        .await
+        .unwrap();
+    let task = tokio::spawn({
+        let pool = pool.clone();
+        let usage = usage.clone();
+        async move {
+            let mut sink = StreamSink {
+                events,
+                credit,
+                next_sequence: 0,
+                end: None,
+                usage: usage.clone(),
+                route: Arc::new(Mutex::new(via)),
+                delivery: None,
+                interactive: false,
+                avoid: None,
+            };
+            pool.call_stream(
+                "a",
+                key,
+                Operation::Pull {
+                    sequence: 0,
+                    acknowledged: 0,
+                    count: 4,
+                },
+                &usage,
+                &mut sink,
+            )
+            .await
+        }
+    });
+    let queued = timeout(Duration::from_secs(1), async {
+        while pool.service_snapshot("a")[&via].1 != bond::CHUNK * 4 {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await;
+    task.abort();
+    let _ = task.await;
+    assert!(
+        queued.is_ok(),
+        "dispatched data remained invisible until the reply header"
+    );
+    assert_eq!(pool.service_snapshot("a")[&via].1, 0);
+    assert_eq!(budget.available_permits(), bond::CHUNK * 4);
+    blocked.store(false, Ordering::Release);
+    pool.call("a", key, Operation::Close, &usage).await.unwrap();
+    empty(&identity, at).await;
+    pool.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn failed_proxy_relay_is_reported_and_replaced_by_another_server() {
     let root = tempfile::tempdir().unwrap();
     let root = root.path();
