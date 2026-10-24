@@ -128,7 +128,14 @@ impl Assembler {
         let mut buffers = old.into_sorted_vec();
         self.buffered = 0;
         let mut fragmented_buffered = 0;
-        let mut offset = 0;
+        // Ordered reads may leave overlapping retransmissions behind the read
+        // cursor. Clip that consumed prefix before switching to unordered reads.
+        // In unordered mode bytes_read is a count, not a contiguous cursor.
+        let mut offset = if self.state.is_ordered() {
+            self.bytes_read
+        } else {
+            0
+        };
         for chunk in buffers.iter_mut().rev() {
             chunk.try_mark_defragment(offset);
             let size = chunk.bytes.len();
@@ -726,6 +733,34 @@ mod test {
     }
 
     #[test]
+    fn ordered_prefix_is_not_replayed_when_switching_to_unordered_after_retransmission() {
+        for tail in [false, true] {
+            let mut x = Assembler::new();
+            x.insert(0, Bytes::from_static(b"abcdefgh"), 8).unwrap();
+            let replay = if tail {
+                Bytes::from_static(b"efghijkl")
+            } else {
+                Bytes::from_static(b"efgh")
+            };
+            x.insert(4, replay.clone(), replay.len()).unwrap();
+            assert_eq!(x.read(8, true).unwrap().bytes.as_ref(), b"abcdefgh");
+            x.ensure_ordering(false).unwrap();
+            if tail {
+                let unread = x.read(usize::MAX, false).unwrap();
+                assert_eq!(unread.offset, 8);
+                assert_eq!(unread.bytes.as_ref(), b"ijkl");
+            }
+            assert!(
+                x.read(usize::MAX, false).is_none(),
+                "already consumed retransmission reached the EOF check"
+            );
+            assert_eq!(x.buffered, 0);
+            assert_eq!(x.allocated, 0);
+            assert_eq!(x.bytes_read, if tail { 12 } else { 8 });
+        }
+    }
+
+    #[test]
     fn ordered_lossless_stream_is_not_rejected() {
         const FRAME_LEN: usize = 32;
 
@@ -808,7 +843,8 @@ mod test {
         assert!(x.data.len() > 4 * MAX_CHUNKS);
         // Retransmissions arrive and the stream drains in order.
         for i in (0..frames).step_by(2) {
-            x.insert((i * FRAME_LEN) as u64, frame(i), FRAME_LEN).unwrap();
+            x.insert((i * FRAME_LEN) as u64, frame(i), FRAME_LEN)
+                .unwrap();
         }
         let mut read = 0;
         while let Some(chunk) = x.read(usize::MAX, true) {
@@ -845,8 +881,14 @@ mod test {
             assert_matches!(result, Err(TooManyChunks));
             let bound = x.max_chunks();
             assert_eq!(bound, 16_384);
-            assert!(max_len <= 2 * bound + 1, "chunk count {max_len} exceeded {bound}");
-            assert!(max_len > bound, "did not exercise the scaled span allowance");
+            assert!(
+                max_len <= 2 * bound + 1,
+                "chunk count {max_len} exceeded {bound}"
+            );
+            assert!(
+                max_len > bound,
+                "did not exercise the scaled span allowance"
+            );
         }
     }
 

@@ -36,3 +36,9 @@ passes these regressions.
 
 The source and dual MIT/Apache-2.0 licenses are preserved. Registry bookkeeping,
 the upstream development lockfile and the redundant original manifest are omitted.
+
+The local assembler also clips already-consumed ordered prefixes during
+compaction. Overlapping retransmissions could otherwise reappear when an
+application switched from ordered reads to unordered `read_to_end`, falsely
+reporting trailing stream bytes. A regression covers duplicate-only and partially
+unread overlaps. Aggregate TCP framing additionally checks EOF in ordered mode.
