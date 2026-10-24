@@ -14,7 +14,7 @@ use tokio::{
 };
 
 const DATA_RPCS: usize = 512;
-const RPCS: usize = DATA_RPCS + 128;
+const RPCS: usize = DATA_RPCS * 2 + 128;
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ServerConfig {
@@ -30,6 +30,7 @@ pub struct Server {
     streams: Arc<Semaphore>,
     rpcs: Arc<Semaphore>,
     data_rpcs: Arc<Semaphore>,
+    downloads: Arc<Semaphore>,
     associations: Arc<Semaphore>,
     destinations: Arc<Semaphore>,
     rejected: AtomicU64,
@@ -73,6 +74,7 @@ impl Server {
             streams: Arc::new(Semaphore::new(MAX_STREAMS)),
             rpcs: Arc::new(Semaphore::new(RPCS)),
             data_rpcs: Arc::new(Semaphore::new(DATA_RPCS)),
+            downloads: Arc::new(Semaphore::new(DATA_RPCS)),
             associations: Arc::new(Semaphore::new(MAX_ASSOCIATIONS)),
             destinations: Arc::new(Semaphore::new(1024)),
             rejected: AtomicU64::new(0),
@@ -92,7 +94,15 @@ impl Server {
         }
     }
     fn data_admission(&self, command: u8) -> Result<Option<OwnedSemaphorePermit>> {
-        if matches!(command, TCP | UDP | super::bond::PUT | super::bond::PULL) {
+        if command == super::bond::PULL {
+            return Ok(Some(
+                self.downloads
+                    .clone()
+                    .try_acquire_owned()
+                    .context("proxy download RPC limit")?,
+            ));
+        }
+        if matches!(command, TCP | UDP | super::bond::PUT) {
             Ok(Some(
                 self.data_rpcs
                     .clone()
@@ -136,7 +146,7 @@ impl Server {
         .await??;
         drop(pending);
         crate::runtime::transport::authenticated_proxy(&conn);
-        conn.set_max_concurrent_bi_streams(512u32.into());
+        conn.set_max_concurrent_bi_streams(1024u32.into());
         let router = Arc::new(Router::default());
         let mut tasks = JoinSet::new();
         let mut maintenance = tokio::time::interval(Duration::from_secs(5));
@@ -352,10 +362,15 @@ mod admission_tests {
             .clone()
             .try_acquire_many_owned(DATA_RPCS as u32)
             .unwrap();
+        let _downloads = server
+            .downloads
+            .clone()
+            .try_acquire_many_owned(DATA_RPCS as u32)
+            .unwrap();
         let _headers = server
             .rpcs
             .clone()
-            .try_acquire_many_owned(DATA_RPCS as u32)
+            .try_acquire_many_owned((DATA_RPCS * 2) as u32)
             .unwrap();
         assert_eq!(server.rpcs.available_permits(), 128);
         for command in [TCP, UDP, super::bond::PUT, super::bond::PULL] {

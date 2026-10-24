@@ -243,6 +243,23 @@ impl Registry {
                 return wire::respond(send, Reply::Failed(1)).await;
             }
         };
+        if let Operation::Pull {
+            sequence,
+            acknowledged,
+            stride,
+            count,
+        } = op
+        {
+            return serve_lane(
+                flow.expect("validated download flow"),
+                send,
+                sequence,
+                acknowledged,
+                stride,
+                count,
+            )
+            .await;
+        }
         let work = async {
             match op {
                 Operation::Open(target) => self.open(key, target, conn, allow_private, rate).await,
@@ -283,16 +300,6 @@ impl Registry {
                             flow.upload.insert(sequence, Input::Fin(offset)).await?;
                             Ok(Reply::Accepted)
                         }
-                        Operation::Pull {
-                            sequence,
-                            acknowledged,
-                            stride,
-                            count,
-                        } => {
-                            flow.download
-                                .pull(sequence, acknowledged, stride, count)
-                                .await
-                        }
                         Operation::AckFin { sequence, offset } => {
                             flow.download.ack_fin(sequence, offset)?;
                             Ok(Reply::Accepted)
@@ -305,6 +312,73 @@ impl Registry {
         let reply = wait_response(send, work).await?;
         wire::respond(send, reply).await
     }
+}
+
+fn lane_parameters(stride: u8, count: u8) -> Result<()> {
+    ensure!(
+        (1..=8).contains(&stride)
+            && count > 0
+            && count as usize <= MAX_BATCH
+            && count as usize * stride as usize <= PIPELINE,
+        "invalid download lane"
+    );
+    Ok(())
+}
+async fn serve_lane(
+    flow: Arc<Flow>,
+    send: &mut quinn::SendStream,
+    sequence: u64,
+    acknowledged: u64,
+    stride: u8,
+    count: u8,
+) -> Result<()> {
+    lane_parameters(stride, count)?;
+    send.write_all(&[1, 2, count]).await?;
+    for index in 0..count {
+        let sequence = sequence
+            .checked_add(index as u64 * stride as u64)
+            .context("download sequence overflow")?;
+        let work = flow.download.next(sequence, acknowledged, stride);
+        tokio::pin!(work);
+        let mut heartbeat = tokio::time::interval(Duration::from_secs(1));
+        let ready = loop {
+            tokio::select! {
+                result=&mut work=>break result,
+                _=send.stopped()=>anyhow::bail!("download lane cancelled"),
+                _=heartbeat.tick()=>send.write_all(&[0]).await?,
+            }
+        };
+        match ready {
+            Ok(Read::Data(block)) => {
+                let hint = flow
+                    .download
+                    .ready(sequence, stride, (count - index) as usize)
+                    .max(1) as u8;
+                let mut header = vec![1, hint];
+                header.extend(sequence.to_be_bytes());
+                header.extend(block.offset.to_be_bytes());
+                header.extend((block.data.len() as u32).to_be_bytes());
+                send.write_all(&header).await?;
+                send.write_all(&block.data).await?;
+            }
+            Ok(Read::End(sequence, offset)) => {
+                let mut header = vec![2];
+                header.extend(sequence.to_be_bytes());
+                header.extend(offset.to_be_bytes());
+                send.write_all(&header).await?;
+                send.finish()?;
+                return Ok(());
+            }
+            Err(error) => {
+                tracing::debug!(error=?error,"download lane rejected");
+                send.write_all(&[3, 1]).await?;
+                send.finish()?;
+                return Ok(());
+            }
+        }
+    }
+    send.finish()?;
+    Ok(())
 }
 
 async fn wait_response(
@@ -478,6 +552,10 @@ impl Upload {
     }
 }
 
+enum Read {
+    Data(Arc<Block>),
+    End(u64, u64),
+}
 struct DownloadState {
     sequence: u64,
     offset: u64,
@@ -556,15 +634,18 @@ impl Download {
         self.signal.changed.notify_waiters();
         Ok(())
     }
-    async fn pull(&self, sequence: u64, acknowledged: u64, stride: u8, count: u8) -> Result<Reply> {
-        let (stride, count) = (stride as u64, count as usize);
-        ensure!(
-            (1..=8).contains(&stride)
-                && count > 0
-                && count <= MAX_BATCH
-                && count * stride as usize <= PIPELINE,
-            "invalid download lane"
-        );
+    fn ready(&self, sequence: u64, stride: u8, count: usize) -> usize {
+        let state = self.state.lock().expect("download state");
+        (0..count)
+            .take_while(|&i| {
+                sequence
+                    .checked_add(i as u64 * stride as u64)
+                    .is_some_and(|seq| state.blocks.contains_key(&seq))
+            })
+            .count()
+    }
+    async fn next(&self, sequence: u64, acknowledged: u64, stride: u8) -> Result<Read> {
+        ensure!((1..=8).contains(&stride), "invalid download stride");
         self.acknowledge(acknowledged)?;
         loop {
             let changed = self.signal.changed.notified();
@@ -573,24 +654,19 @@ impl Download {
                 let state = self.state.lock().expect("download state");
                 ensure!(
                     sequence >= state.acknowledged
-                        && sequence < state.acknowledged.saturating_add(PIPELINE as u64 + stride),
+                        && sequence
+                            < state
+                                .acknowledged
+                                .saturating_add(PIPELINE as u64 + stride as u64),
                     "download record credit exceeded"
                 );
-                let mut blocks = Vec::new();
-                for i in 0..count {
-                    let next = sequence
-                        .checked_add(i as u64 * stride)
-                        .context("download sequence overflow")?;
-                    let Some(block) = state.blocks.get(&next) else {
-                        break;
-                    };
-                    blocks.push((block.sequence, block.offset, block.data.clone()));
+                if let Some(block) = state.blocks.get(&sequence) {
+                    return Ok(Read::Data(block.clone()));
                 }
-                if !blocks.is_empty() || state.end.is_some_and(|(last, _)| sequence >= last) {
-                    return Ok(Reply::Batch {
-                        blocks,
-                        end: state.end,
-                    });
+                if let Some((last, offset)) = state.end
+                    && sequence >= last
+                {
+                    return Ok(Read::End(last, offset));
                 }
             }
             changed.await;
@@ -752,7 +828,7 @@ mod tests {
             state.sequence = 1;
             state.offset = 5;
         }
-        let mut response = std::pin::pin!(download.pull(0, 0, 4, 32));
+        let mut response = std::pin::pin!(download.next(0, 0, 4));
         let Poll::Ready(reply) = response
             .as_mut()
             .poll(&mut Context::from_waker(Waker::noop()))
@@ -760,9 +836,7 @@ mod tests {
             panic!("interactive reply waited for a larger batch");
         };
         let reply = reply.unwrap();
-        assert!(
-            matches!(reply, Reply::Batch { blocks, end: None } if blocks.len()==1 && blocks[0].2.as_ref()==b"reply")
-        );
+        assert!(matches!(reply, Read::Data(record) if record.data.as_ref()==b"reply"));
         assert_eq!(budget.available_permits(), 0);
         download.acknowledge(1).unwrap();
         assert_eq!(budget.available_permits(), CHUNK);
@@ -781,26 +855,21 @@ mod tests {
             state.offset = 7;
             state.end = Some((1, 7));
         }
-        assert!(
-            download
-                .pull((PIPELINE * 2) as u64, 0, 4, 32)
-                .await
-                .is_err()
-        );
-        assert!(download.pull(1, 2, 4, 32).await.is_err());
+        assert!(download.next((PIPELINE * 2) as u64, 0, 4).await.is_err());
+        assert!(download.next(1, 2, 4).await.is_err());
         for (stride, count) in [(0, 32), (9, 1), (4, 33), (8, 32)] {
-            assert!(download.pull(0, 0, stride, count).await.is_err());
+            assert!(lane_parameters(stride, count).is_err());
         }
 
         assert!(download.ack_fin(1, 6).is_err());
         assert_eq!(budget.available_permits(), 0);
         assert!(matches!(
-            download.pull(0, 0, 4, 32).await.unwrap(),
-            Reply::Batch { blocks, .. } if blocks.len() == 1 && blocks[0].0 == 0
+            download.next(0, 0, 4).await.unwrap(),
+            Read::Data(record) if record.sequence==0
         ));
         assert!(matches!(
-            download.pull(1, 1, 4, 32).await.unwrap(),
-            Reply::Batch { blocks, end: Some((1, 7)) } if blocks.is_empty()
+            download.next(1, 1, 4).await.unwrap(),
+            Read::End(1, 7)
         ));
         assert_eq!(budget.available_permits(), CHUNK);
         download.ack_fin(1, 7).unwrap();

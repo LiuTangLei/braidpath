@@ -132,7 +132,7 @@ impl Path {
             address,
             connection: AsyncMutex::new(None),
             upload: Arc::new(Semaphore::new(128)),
-            download: Arc::new(Semaphore::new(128)),
+            download: Arc::new(Semaphore::new(512)),
             control: Arc::new(Semaphore::new(4)),
             progress: Arc::new(Semaphore::new(128)),
             rtt_us: std::sync::atomic::AtomicU64::new(200_000),
@@ -405,7 +405,7 @@ impl Pool {
         mut stream: Option<&mut super::bond::StreamSink>,
     ) -> Result<super::bond::Reply> {
         let mut failures = 0;
-        let started = Instant::now();
+        let mut started = Instant::now();
         loop {
             ensure!(
                 !stream.as_ref().is_some_and(|sink| sink.events.is_closed()),
@@ -435,7 +435,7 @@ impl Pool {
                         Duration::from_micros(
                             path.rtt_us.load(std::sync::atomic::Ordering::Relaxed),
                         ),
-                        path.download.available_permits() < 128,
+                        path.download.available_permits() < 512,
                     )
                 };
                 paths.sort_by(|a, b| {
@@ -490,6 +490,7 @@ impl Pool {
                 super::bond::rpc(&conn.raw, key, &mut op, stream.as_deref_mut()).await
             }
             .await;
+            started = Instant::now();
             match result {
                 Ok(reply) => {
                     let mut used = usage.lock().expect("flow usage");
@@ -498,12 +499,6 @@ impl Pool {
                         && matches!(reply, super::bond::Reply::Uploaded { .. })
                     {
                         counter.0 += data.len() as u64;
-                    }
-                    if let super::bond::Reply::Batch { blocks, .. } = &reply {
-                        counter.1 += blocks
-                            .iter()
-                            .map(|(_, _, data)| data.len() as u64)
-                            .sum::<u64>();
                     }
                     return Ok(reply);
                 }

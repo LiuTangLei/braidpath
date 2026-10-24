@@ -59,13 +59,7 @@ impl Operation {
 pub(crate) enum Reply {
     Opened(SocketAddr),
     Accepted,
-    Uploaded {
-        delivered: u64,
-    },
-    Batch {
-        blocks: Vec<(u64, u64, Bytes)>,
-        end: Option<(u64, u64)>,
-    },
+    Uploaded { delivered: u64 },
     Failed(u8),
 }
 
@@ -139,14 +133,6 @@ pub(crate) async fn eof(recv: &mut quinn::RecvStream) -> Result<()> {
     );
     Ok(())
 }
-async fn end(recv: &mut quinn::RecvStream) -> Result<Option<(u64, u64)>> {
-    match recv.read_u8().await? {
-        0 => Ok(None),
-        1 => Ok(Some((recv.read_u64().await?, recv.read_u64().await?))),
-        _ => anyhow::bail!("invalid FIN flag"),
-    }
-}
-
 pub(crate) async fn rpc(
     conn: &quinn::Connection,
     key: Key,
@@ -201,7 +187,7 @@ pub(crate) async fn rpc(
             _ => anyhow::bail!("unsupported aggregate TCP response"),
         }
     }
-    let (tag, count, final_at, simple) = tokio::time::timeout(PATH_STALL, async {
+    let (tag, count, simple) = tokio::time::timeout(PATH_STALL, async {
         let tag = recv.read_u8().await?;
         let reply = match tag {
             0 => {
@@ -213,12 +199,11 @@ pub(crate) async fn rpc(
             1 => Some(Reply::Accepted),
             2 => {
                 let count = recv.read_u8().await? as usize;
-                let end = end(&mut recv).await?;
                 ensure!(
-                    count <= MAX_BATCH && (count > 0 || end.is_some()),
-                    "invalid download batch"
+                    count > 0 && count <= MAX_BATCH,
+                    "invalid download lane length"
                 );
-                return Ok((tag, count, end, None));
+                return Ok((tag, count, None));
             }
             4 => Some(Reply::Failed(recv.read_u8().await?)),
             5 => Some(Reply::Uploaded {
@@ -226,67 +211,87 @@ pub(crate) async fn rpc(
             }),
             _ => anyhow::bail!("invalid aggregate TCP reply"),
         };
-        Ok::<_, anyhow::Error>((tag, 0, None, reply))
+        Ok::<_, anyhow::Error>((tag, 0, reply))
     })
     .await??;
-    let mut delivery = if tag == 2 {
-        stream
-            .as_ref()
-            .and_then(|sink| sink.service.as_ref())
-            .map(|service| service.start(count))
-    } else {
-        None
-    };
     let reply = if tag == 2 {
         if let Some(sink) = stream.as_deref_mut() {
             let Operation::Pull {
                 count: requested, ..
             } = op
             else {
-                anyhow::bail!("batch reply to a scalar request")
+                anyhow::bail!("lane reply to a scalar operation")
             };
             ensure!(count <= *requested as usize, "unrequested download records");
             *requested = count as u8;
             let excess = sink.credit.num_permits().saturating_sub(count * CHUNK);
             drop(sink.credit.split(excess));
-            if let Some((sequence, offset)) = final_at {
-                sink.end = Some((sequence, offset));
-                sink.events
-                    .send(Incoming::End(sequence, offset))
-                    .await
-                    .context("download consumer closed")?;
-            }
         }
-        let mut blocks = Vec::new();
-        for _ in 0..count {
-            let (sequence, offset, data) = tokio::time::timeout(PATH_STALL, async {
-                let sequence = recv.read_u64().await?;
-                let offset = recv.read_u64().await?;
-                let n = recv.read_u32().await? as usize;
-                ensure!(n > 0 && n <= CHUNK, "invalid aggregate TCP chunk");
-                let mut data = vec![0; n];
-                recv.read_exact(&mut data).await?;
-                Ok::<_, anyhow::Error>((sequence, offset, Bytes::from(data)))
-            })
-            .await??;
-            if let Some(sink) = stream.as_deref_mut() {
-                let bytes = data.len();
-                sink.record(op, sequence, offset, data).await?;
-                if let Some(delivery) = &mut delivery {
-                    delivery.record(bytes);
+        let mut delivery = stream
+            .as_ref()
+            .and_then(|sink| sink.service.as_ref())
+            .map(|service| service.start(0));
+        ensure!(
+            stream.is_some(),
+            "download lane requires a streaming consumer"
+        );
+        let mut received = 0;
+        while received < count {
+            match tokio::time::timeout(PATH_STALL, recv.read_u8()).await?? {
+                0 => continue,
+                1 => {
+                    let (hint, sequence, offset, n) = tokio::time::timeout(PATH_STALL, async {
+                        let hint = recv.read_u8().await? as usize;
+                        let sequence = recv.read_u64().await?;
+                        let offset = recv.read_u64().await?;
+                        let n = recv.read_u32().await? as usize;
+                        ensure!(
+                            hint > 0 && hint <= count - received && n > 0 && n <= CHUNK,
+                            "invalid streamed record"
+                        );
+                        Ok::<_, anyhow::Error>((hint, sequence, offset, n))
+                    })
+                    .await??;
+                    if let Some(delivery) = &mut delivery {
+                        delivery.ready(hint);
+                    }
+                    let mut data = vec![0; n];
+                    tokio::time::timeout(PATH_STALL, recv.read_exact(&mut data)).await??;
+                    let data = Bytes::from(data);
+                    if let Some(sink) = stream.as_deref_mut() {
+                        sink.record(op, sequence, offset, data).await?;
+                    }
+                    if let Some(delivery) = &mut delivery {
+                        delivery.record(n);
+                    }
+                    received += 1;
                 }
-            } else {
-                blocks.push((sequence, offset, data));
+                2 => {
+                    let at = tokio::time::timeout(PATH_STALL, async {
+                        Ok::<_, anyhow::Error>((recv.read_u64().await?, recv.read_u64().await?))
+                    })
+                    .await??;
+                    if let Some(sink) = stream.as_deref_mut() {
+                        sink.end = Some(at);
+                        if let Operation::Pull { count, .. } = op {
+                            *count = 0;
+                        }
+                        sink.events
+                            .send(Incoming::End(at.0, at.1))
+                            .await
+                            .context("download consumer closed")?;
+                    }
+                    break;
+                }
+                3 => {
+                    return Ok(Reply::Failed(
+                        tokio::time::timeout(PATH_STALL, recv.read_u8()).await??,
+                    ));
+                }
+                _ => anyhow::bail!("invalid download lane frame"),
             }
         }
-        if stream.is_some() {
-            Reply::Accepted
-        } else {
-            Reply::Batch {
-                blocks,
-                end: final_at,
-            }
-        }
+        Reply::Accepted
     } else {
         simple.expect("simple response")
     };
@@ -296,43 +301,19 @@ pub(crate) async fn rpc(
 
 pub(crate) async fn respond(send: &mut quinn::SendStream, reply: Reply) -> Result<()> {
     let mut header = vec![1];
-    let records = match reply {
+    match reply {
         Reply::Opened(at) => {
             header.push(0);
             Address::Ip(at).encode(&mut header);
-            Vec::new()
         }
-        Reply::Accepted => {
-            header.push(1);
-            Vec::new()
-        }
+        Reply::Accepted => header.push(1),
         Reply::Uploaded { delivered } => {
             header.push(5);
             header.extend(delivered.to_be_bytes());
-            Vec::new()
         }
-        Reply::Failed(code) => {
-            header.extend([4, code]);
-            Vec::new()
-        }
-        Reply::Batch { blocks, end } => {
-            header.extend([2, blocks.len() as u8, u8::from(end.is_some())]);
-            if let Some((sequence, offset)) = end {
-                header.extend(sequence.to_be_bytes());
-                header.extend(offset.to_be_bytes());
-            }
-            blocks
-        }
-    };
-    send.write_all(&header).await?;
-    for (sequence, offset, data) in records {
-        let mut header = Vec::with_capacity(20);
-        header.extend(sequence.to_be_bytes());
-        header.extend(offset.to_be_bytes());
-        header.extend((data.len() as u32).to_be_bytes());
-        send.write_all(&header).await?;
-        send.write_all(&data).await?;
+        Reply::Failed(code) => header.extend([4, code]),
     }
+    send.write_all(&header).await?;
     send.finish()?;
     Ok(())
 }

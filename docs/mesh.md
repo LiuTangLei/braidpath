@@ -108,10 +108,10 @@ tunnel and its cooperating relay entrances retain their separate behavior.
 
 Proxy limits and lifecycle:
 
-- Each server admits 64 proxy connections, 64 aggregate TCP flows, 640 concurrent
-  record RPCs (at most 512 data requests, retaining 128 control slots), 256 legacy TCP streams, 64 UDP associations and 1,024 UDP destinations
+- Each server admits 64 proxy connections, 64 aggregate TCP flows, 1,152 concurrent
+  handlers (512 download lanes, 512 upload/legacy requests, 128 control slots), 256 legacy TCP streams, 64 UDP associations and 1,024 UDP destinations
   in total; each association allows 32 destinations. Each authenticated QUIC
-  connection permits 512 concurrent streams. The client
+  connection permits 1,024 concurrent streams. The client
   admits 256 local sessions. Up to 32 OS DNS lookups may be in flight; a timed-out
   lookup retains its slot until the resolver actually returns. Pending connections retain the shared server
   admission budget and must authenticate within eight seconds.
@@ -121,7 +121,7 @@ Proxy limits and lifecycle:
   fails explicitly if its host buffer is exhausted, rather than indefinitely
   holding later records while a missing record waits for memory. Download readers
   wait for delivery credit. Downloads use 4–8 logical lanes with independent
-  reserved memory shares. A request returns up to 32 already available records;
+  reserved memory shares. A lane streams up to 32 records before renewing its request;
   records are delivered as they arrive rather than waiting for a whole batch;
   a short interactive response returns immediately. Partial replies resume at
   the first record not yet received. At most one data request per
@@ -132,7 +132,9 @@ Proxy limits and lifecycle:
   Small progress/control operations prefer the lowest observed QUIC RTT; bulk
   downloads use observed payload service rate and data-ready backlog across paths,
   rather than treating requests waiting for future target bytes as network load.
-  Estimates expire for renewed exploration and reset after path reconnection. Per-flow debug summaries include
+  Future-data waits are excluded from service estimates; sender backlog hints
+  distinguish available payload from application idle time. Estimates expire for
+  renewed exploration and reset after path reconnection. Per-flow debug summaries include
   path payload bytes and cumulative native RTT, congestion window and loss counts.
   These budgets are additional to the bounded QUIC transport buffers.
 - Closing a local flow schedules a bounded close RPC and retains its admission

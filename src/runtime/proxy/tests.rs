@@ -44,12 +44,13 @@ async fn start_metered(
     })));
     timeout(Duration::from_secs(5), async {
         while !metrics.is_ready() {
-            assert!(!task.0.is_finished());
-            tokio::task::yield_now().await;
+            assert!(!task.0.is_finished(), "mesh {id} exited before readiness");
+            // A readiness probe must not busy-poll alongside the socket workers.
+            tokio::time::sleep(Duration::from_millis(2)).await;
         }
     })
     .await
-    .unwrap();
+    .unwrap_or_else(|_| panic!("mesh {id} did not become ready at {at}"));
     (at, task, metrics)
 }
 async fn start(
@@ -65,13 +66,20 @@ fn identity(root: &Path, dir: &str) -> mesh::ClientIdentity {
     mesh::ClientIdentity::open(root.join(dir), &root.join("a/client-key.json")).unwrap()
 }
 async fn local_listener(pool: Arc<client::Pool>, exit: &str) -> (SocketAddr, Task<Result<()>>) {
+    local_listener_capacity(pool, exit, 16).await
+}
+async fn local_listener_capacity(
+    pool: Arc<client::Pool>,
+    exit: &str,
+    capacity: usize,
+) -> (SocketAddr, Task<Result<()>>) {
     let listen = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let at = listen.local_addr().unwrap();
     let task = Task(tokio::spawn(client::listen(
         listen,
         pool,
         exit.to_owned(),
-        Arc::new(Semaphore::new(16)),
+        Arc::new(Semaphore::new(capacity)),
     )));
     (at, task)
 }
@@ -780,7 +788,9 @@ async fn data_blackhole_is_quarantined_and_rejoins_the_same_tcp_flow_after_recov
             tokio::time::sleep(Duration::from_millis(2)).await;
         }
         wait.await.unwrap();
-        for _ in 0..64 {
+        // Advance the bounded live-lane cohorts after probe recovery so the
+        // restored transport can be selected again within this same TCP flow.
+        for _ in 0..512 {
             tcp.write_all(&block).await.unwrap();
         }
         tcp.shutdown().await.unwrap();
@@ -826,7 +836,7 @@ async fn data_blackhole_is_quarantined_and_rejoins_the_same_tcp_flow_after_recov
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(received.len(), 12 * 1024 * 1024);
+    assert_eq!(received.len(), 40 * 1024 * 1024);
     assert!(received.iter().all(|b| *b == 71));
     assert!(
         packets.load(Ordering::Relaxed) > before + 65536,
@@ -994,4 +1004,96 @@ async fn single_tcp_external_route_diagnostic() {
         drop(tcp); drop(listener); pool.shutdown().await;
         println!("WAN_CASE={}",serde_json::json!({"label":case.label,"direction":case.direction,"bytes":transferred,"seconds":seconds,"mbps":transferred as f64*8.0/seconds/1e6,"local_tcp_connections":1,"target_tcp_connections":1,"verified":true,"fixture":result}));
     }).await.expect("bounded WAN case exceeded its deadline");
+}
+
+#[tokio::test]
+async fn live_lanes_deliver_interactive_turns_before_batch_completion_or_tcp_eof() {
+    let root = tempfile::tempdir().unwrap();
+    let root = root.path();
+    let (a, _server) = start(root, "a", None, true).await;
+    let identity = identity(root, "interactive-lane");
+    let pool = client::Pool::new(identity.clone(), vec![node("a", a)], vec!["a".into()]).unwrap();
+    let (listen, listener) = local_listener(pool.clone(), "a").await;
+    let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let at = target.local_addr().unwrap();
+    let peer = Task(tokio::spawn(async move {
+        let (mut tcp, _) = target.accept().await.unwrap();
+        let mut request = [0; 3];
+        tcp.read_exact(&mut request).await.unwrap();
+        assert_eq!(&request, b"one");
+        tcp.write_all(b"first").await.unwrap();
+        tcp.read_exact(&mut request).await.unwrap();
+        assert_eq!(&request, b"two");
+        tcp.write_all(b"second").await.unwrap();
+        let mut rest = Vec::new();
+        tcp.read_to_end(&mut rest).await.unwrap();
+        assert!(rest.is_empty());
+        tcp.shutdown().await.unwrap();
+    }));
+    let (mut tcp, status, _) = socks(listen, TCP, Address::Ip(at)).await;
+    assert_eq!(status, 0);
+    tcp.write_all(b"one").await.unwrap();
+    let mut first = [0; 5];
+    timeout(Duration::from_secs(3), tcp.read_exact(&mut first))
+        .await
+        .expect("first turn waited for an entire lane")
+        .unwrap();
+    assert_eq!(&first, b"first");
+    tcp.write_all(b"two").await.unwrap();
+    let mut second = [0; 6];
+    timeout(Duration::from_secs(3), tcp.read_exact(&mut second))
+        .await
+        .expect("second turn waited for TCP EOF")
+        .unwrap();
+    assert_eq!(&second, b"second");
+    tcp.shutdown().await.unwrap();
+    let mut tail = Vec::new();
+    tcp.read_to_end(&mut tail).await.unwrap();
+    assert!(tail.is_empty());
+    empty(&identity, a).await;
+    drop(listener);
+    pool.shutdown().await;
+    drop(peer);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn idle_streaming_flows_do_not_starve_an_active_flow_and_all_release() {
+    let root = tempfile::tempdir().unwrap();
+    let root = root.path();
+    let (a, _server) = start(root, "a", None, true).await;
+    let identity = identity(root, "idle-lanes");
+    let pool = client::Pool::new(identity.clone(), vec![node("a", a)], vec!["a".into()]).unwrap();
+    let (listen, listener) = local_listener_capacity(pool.clone(), "a", MAX_STREAMS).await;
+    let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let at = target.local_addr().unwrap();
+    let peer = Task(tokio::spawn(async move {
+        let mut tasks = tokio::task::JoinSet::new();
+        loop {
+            tokio::select! {
+                accepted=target.accept()=>{let(mut tcp,_)=accepted.unwrap();tasks.spawn(async move {let mut input=[0;4];let n=tcp.read(&mut input).await.unwrap();if n>0 {tcp.write_all(b"PONG").await.unwrap();let mut tail=Vec::new();tcp.read_to_end(&mut tail).await.unwrap();}tcp.shutdown().await.unwrap();});},
+                _=tasks.join_next(),if !tasks.is_empty()=>{},
+            }
+        }
+    }));
+    let mut idle = Vec::new();
+    for _ in 0..40 {
+        let (tcp, status, _) = socks(listen, TCP, Address::Ip(at)).await;
+        assert_eq!(status, 0);
+        idle.push(tcp);
+    }
+    let (mut active, status, _) = socks(listen, TCP, Address::Ip(at)).await;
+    assert_eq!(status, 0);
+    active.write_all(b"PING").await.unwrap();
+    let mut reply = [0; 4];
+    timeout(Duration::from_secs(5), active.read_exact(&mut reply))
+        .await
+        .expect("idle lane requests starved active data")
+        .unwrap();
+    assert_eq!(&reply, b"PONG");
+    drop(active);
+    drop(idle);
+    empty(&identity, a).await;
+    drop(listener);
+    pool.shutdown().await;
+    drop(peer);
 }

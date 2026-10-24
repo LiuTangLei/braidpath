@@ -42,6 +42,7 @@ impl PathService {
             remaining: pending,
             bytes: 0,
             start: Instant::now(),
+            active: records > 1,
         }
     }
 }
@@ -51,19 +52,24 @@ pub(crate) struct Delivery {
     remaining: usize,
     bytes: usize,
     start: Instant,
+    active: bool,
 }
 impl Delivery {
-    pub(crate) fn record(&mut self, bytes: usize) {
-        self.remaining -= CHUNK;
-        self.bytes += bytes;
-        self.service.0.lock().expect("path service").pending -= CHUNK;
+    pub(crate) fn ready(&mut self, records: usize) {
+        if self.remaining == 0 {
+            self.start = Instant::now();
+            self.bytes = 0;
+            self.active = records > 1;
+        }
+        let bytes = records * CHUNK;
+        if bytes > self.remaining {
+            self.service.0.lock().expect("path service").pending += bytes - self.remaining;
+            self.remaining = bytes;
+        }
     }
-}
-impl Drop for Delivery {
-    fn drop(&mut self) {
+    fn sample(&mut self) {
         let mut state = self.service.0.lock().expect("path service");
-        state.pending -= self.remaining;
-        if self.bytes >= CHUNK && state.generation == self.generation {
+        if self.active && self.bytes >= CHUNK && state.generation == self.generation {
             let sample = (self.bytes as f64 / self.start.elapsed().as_secs_f64().max(0.001))
                 .min(crate::runtime::MAX_RATE_BPS as f64 / 8.0);
             state.rate = if state.rate == 0.0 {
@@ -73,6 +79,22 @@ impl Drop for Delivery {
             };
             state.updated = Some(Instant::now());
         }
+        self.bytes = 0;
+        self.active = false;
+    }
+    pub(crate) fn record(&mut self, bytes: usize) {
+        self.remaining -= CHUNK;
+        self.bytes += bytes;
+        self.service.0.lock().expect("path service").pending -= CHUNK;
+        if self.remaining == 0 {
+            self.sample();
+        }
+    }
+}
+impl Drop for Delivery {
+    fn drop(&mut self) {
+        self.sample();
+        self.service.0.lock().expect("path service").pending -= self.remaining;
     }
 }
 #[cfg(test)]
