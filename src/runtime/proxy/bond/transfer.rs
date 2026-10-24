@@ -87,7 +87,7 @@ impl ClientFlow {
             }
         };
         let result = tokio::select! { r = transfer => r, _ = idle => anyhow::bail!("aggregate TCP idle timeout") };
-        tracing::debug!(exit=%self.owner.exit, paths=?self.owner.usage.lock().expect("flow usage"), rtt_us_cwnd_sent_lost=?self.owner.pool.transport_snapshot(&self.owner.exit), completed=result.is_ok(), "aggregate TCP flow finished");
+        tracing::debug!(exit=%self.owner.exit, paths=?self.owner.usage.lock().expect("flow usage"), rtt_us_cwnd_sent_lost=?self.owner.pool.transport_snapshot(&self.owner.exit), service_bytes_per_sec_pending=?self.owner.pool.service_snapshot(&self.owner.exit), completed=result.is_ok(), "aggregate TCP flow finished");
         result
     }
 }
@@ -195,6 +195,7 @@ impl DownloadLane {
                 end: None,
                 usage: self.usage.clone(),
                 route: "0.0.0.0:0".parse().expect("constant address"),
+                service: None,
             };
             let op = Operation::Pull {
                 sequence: self.next,

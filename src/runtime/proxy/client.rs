@@ -121,6 +121,7 @@ struct Path {
     control: Arc<Semaphore>,
     progress: Arc<Semaphore>,
     rtt_us: std::sync::atomic::AtomicU64,
+    service: Arc<super::bond::PathService>,
     retry_after: Mutex<Option<Instant>>,
     failed: std::sync::atomic::AtomicBool,
     probe: Mutex<Option<AbortTask>>,
@@ -135,6 +136,7 @@ impl Path {
             control: Arc::new(Semaphore::new(4)),
             progress: Arc::new(Semaphore::new(128)),
             rtt_us: std::sync::atomic::AtomicU64::new(200_000),
+            service: Arc::new(super::bond::PathService::default()),
             retry_after: Mutex::new(None),
             failed: std::sync::atomic::AtomicBool::new(false),
             probe: Mutex::new(None),
@@ -345,6 +347,7 @@ impl Pool {
                 };
                 match result {
                     Ok(conn) => {
+                        path.service.reset();
                         *path.connection.lock().await = Some(conn);
                         path.failed
                             .store(false, std::sync::atomic::Ordering::Release);
@@ -425,10 +428,24 @@ impl Pool {
             for path in &paths {
                 self.probe(id, path);
             }
-            if matches!(
-                op,
-                super::bond::Operation::Put { .. } | super::bond::Operation::Pull { .. }
-            ) {
+            if let super::bond::Operation::Pull { count, .. } = op {
+                let cost = |path: &Path| {
+                    path.service.cost(
+                        count as usize * super::bond::CHUNK,
+                        Duration::from_micros(
+                            path.rtt_us.load(std::sync::atomic::Ordering::Relaxed),
+                        ),
+                        path.download.available_permits() < 128,
+                    )
+                };
+                paths.sort_by(|a, b| {
+                    cost(a).total_cmp(&cost(b)).then_with(|| {
+                        b.download
+                            .available_permits()
+                            .cmp(&a.download.available_permits())
+                    })
+                });
+            } else if matches!(op, super::bond::Operation::Put { .. }) {
                 paths.sort_by_key(|p| std::cmp::Reverse(p.permits(&op).available_permits()));
             } else {
                 // Progress gates every data path: do not distribute these small
@@ -468,6 +485,7 @@ impl Pool {
                 used_connection = Some(conn.clone());
                 if let Some(sink) = stream.as_deref_mut() {
                     sink.route = path.address;
+                    sink.service = Some(path.service.clone());
                 }
                 super::bond::rpc(&conn.raw, key, &mut op, stream.as_deref_mut()).await
             }
@@ -539,6 +557,15 @@ impl Pool {
         self.path_limit
             .load(std::sync::atomic::Ordering::Relaxed)
             .max(4)
+    }
+    pub(super) fn service_snapshot(&self, id: &str) -> BTreeMap<SocketAddr, (u64, usize)> {
+        self.slots[id]
+            .paths
+            .lock()
+            .expect("proxy paths")
+            .iter()
+            .map(|(address, path)| (*address, path.service.snapshot()))
+            .collect()
     }
     pub(super) fn transport_snapshot(
         &self,

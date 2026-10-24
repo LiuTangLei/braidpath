@@ -11,16 +11,18 @@ use std::{
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 
 mod server;
+mod service;
 mod transfer;
 mod wire;
 pub(crate) use server::Registry;
+pub(crate) use service::PathService;
 pub(crate) use transfer::open;
 pub(crate) use wire::{
     ACK_FIN, CLOSE, DOWNLOAD_ACK, FIN, Incoming, Key, OPEN, Operation, PULL, PUT, Reply,
     StreamSink, UPLOAD_STATUS, rpc,
 };
 
-const CHUNK: usize = 128 * 1024;
+pub(super) const CHUNK: usize = 128 * 1024;
 const WINDOW: usize = 16 * 1024 * 1024;
 const PIPELINE: usize = WINDOW / CHUNK;
 const MAX_BATCH: usize = 32;

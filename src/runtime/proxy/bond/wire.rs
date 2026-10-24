@@ -80,6 +80,7 @@ pub(crate) struct StreamSink {
     pub end: Option<(u64, u64)>,
     pub usage: Arc<Mutex<BTreeMap<SocketAddr, (u64, u64)>>>,
     pub route: SocketAddr,
+    pub service: Option<Arc<PathService>>,
 }
 
 impl StreamSink {
@@ -228,6 +229,14 @@ pub(crate) async fn rpc(
         Ok::<_, anyhow::Error>((tag, 0, None, reply))
     })
     .await??;
+    let mut delivery = if tag == 2 {
+        stream
+            .as_ref()
+            .and_then(|sink| sink.service.as_ref())
+            .map(|service| service.start(count))
+    } else {
+        None
+    };
     let reply = if tag == 2 {
         if let Some(sink) = stream.as_deref_mut() {
             let Operation::Pull {
@@ -261,7 +270,11 @@ pub(crate) async fn rpc(
             })
             .await??;
             if let Some(sink) = stream.as_deref_mut() {
+                let bytes = data.len();
                 sink.record(op, sequence, offset, data).await?;
+                if let Some(delivery) = &mut delivery {
+                    delivery.record(bytes);
+                }
             } else {
                 blocks.push((sequence, offset, data));
             }
@@ -343,6 +356,7 @@ mod stream_tests {
             end: None,
             usage: usage.clone(),
             route: "127.0.0.1:1".parse().unwrap(),
+            service: None,
         };
         let mut op = Operation::Pull {
             sequence: 0,
