@@ -935,3 +935,63 @@ async fn one_tcp_upload_replays_lost_records_without_duplicating_target_bytes() 
     pool.shutdown().await;
     assert_eq!(identity.status(c).await.unwrap().leases, 0);
 }
+
+/// Manual WAN diagnosis only. Private topology/keys and the byte budget are
+/// supplied in an ignored case file; ordinary tests never generate WAN traffic.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires an explicit bounded external fixture case"]
+async fn single_tcp_external_route_diagnostic() {
+    use serde::Deserialize;
+    #[derive(Deserialize)]
+    struct Case {
+        label: String,
+        connection_key: std::path::PathBuf,
+        bootstrap: SocketAddr,
+        exit: String,
+        routes: Vec<SocketAddr>,
+        target: SocketAddr,
+        token: String,
+        direction: String,
+        bytes: usize,
+        sha256: String,
+    }
+    let file = std::env::var("BRAIDPATH_WAN_CASE").expect("explicit case file required");
+    let case: Case = serde_json::from_slice(&std::fs::read(file).unwrap()).unwrap();
+    assert!(!case.routes.is_empty() && case.routes.len() <= 8);
+    assert!(case.bytes > 0 && case.bytes <= 128 * 1024 * 1024);
+    assert!(["upload", "download"].contains(&case.direction.as_str()));
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("warn,braidpath::runtime::proxy=debug")
+        .try_init();
+    timeout(Duration::from_secs(45), async {
+        let root = tempfile::tempdir().unwrap();
+        let identity = mesh::ClientIdentity::open(root.path().join("client"), &case.connection_key).unwrap();
+        let nodes = identity.discover(case.bootstrap).await.unwrap();
+        let pool = client::Pool::new(identity.clone(), nodes, vec![case.exit.clone()]).unwrap();
+        pool.test_set_routes(&case.exit, case.routes);
+        let (listen, listener) = local_listener(pool.clone(), &case.exit).await;
+        let (mut tcp, status, _) = socks(listen, TCP, Address::Ip(case.target)).await;
+        assert_eq!(status, 0);
+        let request = serde_json::json!({"token":case.token,"direction":case.direction,"bytes":case.bytes});
+        tcp.write_all(format!("{request}\n").as_bytes()).await.unwrap();
+        let mut ready = [0;3]; tcp.read_exact(&mut ready).await.unwrap(); assert_eq!(&ready,b"OK\n");
+        let start = std::time::Instant::now();
+        let mut transferred = 0;
+        let mut buffer = vec![b'Z';65536];
+        while transferred < case.bytes {
+            let n = buffer.len().min(case.bytes-transferred);
+            if case.direction=="upload" { tcp.write_all(&buffer[..n]).await.unwrap(); transferred+=n; }
+            else {
+                let received=tcp.read(&mut buffer[..n]).await.unwrap(); assert!(received>0,"short download at {transferred}");
+                assert!(buffer[..received].iter().all(|&byte|byte==b'Z'),"payload corruption"); transferred+=received;
+            }
+        }
+        if case.direction=="upload" {tcp.shutdown().await.unwrap();}
+        let mut response=Vec::new(); tcp.read_to_end(&mut response).await.unwrap();
+        let seconds=start.elapsed().as_secs_f64();
+        let result:serde_json::Value=serde_json::from_slice(&response).unwrap();
+        assert_eq!(result["bytes"].as_u64(),Some(case.bytes as u64)); assert_eq!(result["sha256"].as_str(),Some(case.sha256.as_str()));
+        drop(tcp); drop(listener); pool.shutdown().await;
+        println!("WAN_CASE={}",serde_json::json!({"label":case.label,"direction":case.direction,"bytes":transferred,"seconds":seconds,"mbps":transferred as f64*8.0/seconds/1e6,"local_tcp_connections":1,"target_tcp_connections":1,"verified":true,"fixture":result}));
+    }).await.expect("bounded WAN case exceeded its deadline");
+}

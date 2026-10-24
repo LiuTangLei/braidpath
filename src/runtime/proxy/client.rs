@@ -381,9 +381,33 @@ impl Pool {
         op: super::bond::Operation,
         usage: &Mutex<BTreeMap<SocketAddr, (u64, u64)>>,
     ) -> Result<super::bond::Reply> {
+        self.call_inner(id, key, op, usage, None).await
+    }
+    pub(super) async fn call_stream(
+        &self,
+        id: &str,
+        key: super::bond::Key,
+        op: super::bond::Operation,
+        usage: &Mutex<BTreeMap<SocketAddr, (u64, u64)>>,
+        sink: &mut super::bond::StreamSink,
+    ) -> Result<super::bond::Reply> {
+        self.call_inner(id, key, op, usage, Some(sink)).await
+    }
+    async fn call_inner(
+        &self,
+        id: &str,
+        key: super::bond::Key,
+        mut op: super::bond::Operation,
+        usage: &Mutex<BTreeMap<SocketAddr, (u64, u64)>>,
+        mut stream: Option<&mut super::bond::StreamSink>,
+    ) -> Result<super::bond::Reply> {
         let mut failures = 0;
         let started = Instant::now();
         loop {
+            ensure!(
+                !stream.as_ref().is_some_and(|sink| sink.events.is_closed()),
+                "download consumer closed"
+            );
             ensure!(
                 started.elapsed() < IDLE_TIMEOUT,
                 "aggregate RPC resource wait expired"
@@ -442,7 +466,10 @@ impl Pool {
                     std::sync::atomic::Ordering::Relaxed,
                 );
                 used_connection = Some(conn.clone());
-                super::bond::rpc(&conn.raw, key, &op).await
+                if let Some(sink) = stream.as_deref_mut() {
+                    sink.route = path.address;
+                }
+                super::bond::rpc(&conn.raw, key, &mut op, stream.as_deref_mut()).await
             }
             .await;
             match result {
@@ -463,10 +490,18 @@ impl Pool {
                     return Ok(reply);
                 }
                 Err(error) => {
+                    if stream.as_ref().is_some_and(|sink| sink.events.is_closed()) {
+                        return Err(error);
+                    }
+                    let delivered_batch = stream.is_some()
+                        && matches!(op, super::bond::Operation::Pull { count: 0, .. });
                     let terminal = used_connection.as_ref().and_then(|c| c.raw.close_reason()).is_some_and(|reason| {
                         matches!(reason, quinn::ConnectionError::ApplicationClosed(ref close) if close.reason.as_ref() == b"server stopped" || close.reason.as_ref() == b"shutdown" || close.reason.as_ref() == b"proxy owner stopped")
                     });
                     if terminal {
+                        if delivered_batch {
+                            return Ok(super::bond::Reply::Accepted);
+                        }
                         return Err(error.context("selected proxy exit shut down"));
                     }
                     let mut cached = path.connection.lock().await;
@@ -474,6 +509,9 @@ impl Pool {
                         && !Arc::ptr_eq(used, current)
                     {
                         // An error from the old connection cannot retire a recovered path.
+                        if delivered_batch {
+                            return Ok(super::bond::Reply::Accepted);
+                        }
                         continue;
                     }
                     path.failed
@@ -485,6 +523,9 @@ impl Pool {
                     }
                     drop(cached);
                     self.probe(id, &path);
+                    if delivered_batch {
+                        return Ok(super::bond::Reply::Accepted);
+                    }
                     failures += 1;
                     tracing::debug!(%id, address=%path.address, %error, "aggregate record moving to another path");
                     if failures >= 8 {

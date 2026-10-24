@@ -108,8 +108,8 @@ tunnel and its cooperating relay entrances retain their separate behavior.
 
 Proxy limits and lifecycle:
 
-- Each server admits 64 proxy connections, 64 aggregate TCP flows, 512 concurrent
-  record RPCs, 256 legacy TCP streams, 64 UDP associations and 1,024 UDP destinations
+- Each server admits 64 proxy connections, 64 aggregate TCP flows, 640 concurrent
+  record RPCs (at most 512 data requests, retaining 128 control slots), 256 legacy TCP streams, 64 UDP associations and 1,024 UDP destinations
   in total; each association allows 32 destinations. Each authenticated QUIC
   connection permits 512 concurrent streams. The client
   admits 256 local sessions. Up to 32 OS DNS lookups may be in flight; a timed-out
@@ -122,7 +122,9 @@ Proxy limits and lifecycle:
   holding later records while a missing record waits for memory. Download readers
   wait for delivery credit. Downloads use 4–8 logical lanes with independent
   reserved memory shares. A request returns up to 32 already available records;
-  a short interactive response returns immediately. At most one data request per
+  records are delivered as they arrive rather than waiting for a whole batch;
+  a short interactive response returns immediately. Partial replies resume at
+  the first record not yet received. At most one data request per
   logical lane waits for future target bytes, keeping idle flows from consuming
   a whole window of server RPC slots. Cumulative TCP delivery ACKs are independent
   of data requests. RPC data slots, progress queries and control commands

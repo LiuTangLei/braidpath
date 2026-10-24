@@ -13,6 +13,9 @@ use tokio::{
     time::timeout,
 };
 
+const DATA_RPCS: usize = 512;
+const RPCS: usize = DATA_RPCS + 128;
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ServerConfig {
     pub allow_private: bool,
@@ -26,6 +29,7 @@ pub struct Server {
     connections: Arc<Semaphore>,
     streams: Arc<Semaphore>,
     rpcs: Arc<Semaphore>,
+    data_rpcs: Arc<Semaphore>,
     associations: Arc<Semaphore>,
     destinations: Arc<Semaphore>,
     rejected: AtomicU64,
@@ -67,7 +71,8 @@ impl Server {
             bonds: super::bond::Registry::new(),
             connections: Arc::new(Semaphore::new(MAX_CONNECTIONS)),
             streams: Arc::new(Semaphore::new(MAX_STREAMS)),
-            rpcs: Arc::new(Semaphore::new(MAX_STREAMS * 2)),
+            rpcs: Arc::new(Semaphore::new(RPCS)),
+            data_rpcs: Arc::new(Semaphore::new(DATA_RPCS)),
             associations: Arc::new(Semaphore::new(MAX_ASSOCIATIONS)),
             destinations: Arc::new(Semaphore::new(1024)),
             rejected: AtomicU64::new(0),
@@ -80,10 +85,22 @@ impl Server {
             buffered_bytes,
             connections: MAX_CONNECTIONS - self.connections.available_permits(),
             streams: MAX_STREAMS - self.streams.available_permits() + tcp_flows,
-            rpc_streams: MAX_STREAMS * 2 - self.rpcs.available_permits(),
+            rpc_streams: RPCS - self.rpcs.available_permits(),
             udp_associations: MAX_ASSOCIATIONS - self.associations.available_permits(),
             udp_destinations: 1024 - self.destinations.available_permits(),
             rejected: self.rejected.load(Ordering::Relaxed),
+        }
+    }
+    fn data_admission(&self, command: u8) -> Result<Option<OwnedSemaphorePermit>> {
+        if matches!(command, TCP | UDP | super::bond::PUT | super::bond::PULL) {
+            Ok(Some(
+                self.data_rpcs
+                    .clone()
+                    .try_acquire_owned()
+                    .context("proxy data RPC limit")?,
+            ))
+        } else {
+            Ok(None)
         }
     }
     pub(crate) async fn connection(
@@ -155,6 +172,7 @@ impl Server {
         router: Arc<Router>,
     ) -> Result<()> {
         let command = timeout(CONNECT_TIMEOUT, recv.read_u8()).await??;
+        let _data_permit = self.data_admission(command)?;
         let _logical_permit = if command == TCP || command == UDP {
             Some(
                 self.streams
@@ -315,4 +333,44 @@ impl Server {
 // Keep the packet function distinct from the owned buffer in the receive loop.
 async fn packet_parts(data: &[u8]) -> Result<(Address, &[u8])> {
     packet(data).await
+}
+
+#[cfg(test)]
+mod admission_tests {
+    use super::*;
+    #[test]
+    fn pending_data_leaves_control_capacity_for_progress_and_reclamation() {
+        let server = Server::new(
+            ServerConfig::default(),
+            "a".repeat(64),
+            "exit".into(),
+            crate::runtime::MAX_RATE_BPS,
+        )
+        .unwrap();
+        let _data = server
+            .data_rpcs
+            .clone()
+            .try_acquire_many_owned(DATA_RPCS as u32)
+            .unwrap();
+        let _headers = server
+            .rpcs
+            .clone()
+            .try_acquire_many_owned(DATA_RPCS as u32)
+            .unwrap();
+        assert_eq!(server.rpcs.available_permits(), 128);
+        for command in [TCP, UDP, super::bond::PUT, super::bond::PULL] {
+            assert!(server.data_admission(command).is_err());
+        }
+        for command in [
+            super::bond::OPEN,
+            super::bond::CLOSE,
+            super::bond::FIN,
+            super::bond::ACK_FIN,
+            super::bond::DOWNLOAD_ACK,
+            super::bond::UPLOAD_STATUS,
+        ] {
+            let _header = server.rpcs.clone().try_acquire_owned().unwrap();
+            assert!(server.data_admission(command).unwrap().is_none());
+        }
+    }
 }

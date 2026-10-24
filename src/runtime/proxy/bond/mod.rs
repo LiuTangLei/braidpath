@@ -16,7 +16,8 @@ mod wire;
 pub(crate) use server::Registry;
 pub(crate) use transfer::open;
 pub(crate) use wire::{
-    ACK_FIN, CLOSE, DOWNLOAD_ACK, FIN, Key, OPEN, Operation, PULL, PUT, Reply, UPLOAD_STATUS, rpc,
+    ACK_FIN, CLOSE, DOWNLOAD_ACK, FIN, Incoming, Key, OPEN, Operation, PULL, PUT, Reply,
+    StreamSink, UPLOAD_STATUS, rpc,
 };
 
 const CHUNK: usize = 128 * 1024;
@@ -28,7 +29,7 @@ const MAX_FLOWS: usize = 64;
 const PATH_STALL: Duration = Duration::from_secs(4);
 const RESUME_GRACE: Duration = Duration::from_secs(10);
 
-struct Block {
+pub(crate) struct Block {
     sequence: u64,
     offset: u64,
     data: Bytes,

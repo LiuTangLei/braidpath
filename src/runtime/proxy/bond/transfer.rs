@@ -168,9 +168,55 @@ async fn upload(
     );
     accepted(owner, Operation::Fin { sequence, offset }).await
 }
-enum DownloadEvent {
-    Batch(usize, Reply, OwnedSemaphorePermit),
-    Acknowledged,
+struct DownloadLane {
+    pool: Arc<Pool>,
+    exit: String,
+    key: Key,
+    usage: Arc<Mutex<BTreeMap<SocketAddr, (u64, u64)>>>,
+    next: u64,
+    stride: u8,
+    budget: Arc<Semaphore>,
+    acknowledged: Arc<std::sync::atomic::AtomicU64>,
+    events: tokio::sync::mpsc::Sender<Incoming>,
+}
+impl DownloadLane {
+    async fn run(mut self) -> Result<()> {
+        loop {
+            let mut credit = self.budget.clone().acquire_many_owned(CHUNK as u32).await?;
+            let extra = (self.budget.available_permits() / CHUNK).min(MAX_BATCH - 1) * CHUNK;
+            if extra > 0 {
+                credit.merge(self.budget.clone().try_acquire_many_owned(extra as u32)?);
+            }
+            let count = (credit.num_permits() / CHUNK) as u8;
+            let mut sink = StreamSink {
+                events: self.events.clone(),
+                credit,
+                next_sequence: self.next,
+                end: None,
+                usage: self.usage.clone(),
+                route: "0.0.0.0:0".parse().expect("constant address"),
+            };
+            let op = Operation::Pull {
+                sequence: self.next,
+                acknowledged: self.acknowledged.load(Ordering::Acquire),
+                stride: self.stride,
+                count,
+            };
+            match self
+                .pool
+                .call_stream(&self.exit, self.key, op, &self.usage, &mut sink)
+                .await?
+            {
+                Reply::Accepted => {}
+                Reply::Failed(code) => return Err(ReplyError(code).into()),
+                _ => anyhow::bail!("invalid streamed download reply"),
+            }
+            self.next = sink.next_sequence;
+            if sink.end.is_some_and(|(last, _)| self.next >= last) {
+                return Ok(());
+            }
+        }
+    }
 }
 async fn download(
     mut tcp: OwnedWriteHalf,
@@ -178,19 +224,39 @@ async fn download(
     activity: Arc<Mutex<Instant>>,
 ) -> Result<()> {
     let lanes = owner.pool.download_lanes();
-    let batch = PIPELINE / lanes;
-    let budgets: Vec<_> = (0..lanes)
-        .map(|_| Arc::new(Semaphore::new(batch * CHUNK)))
-        .collect();
-    let mut next: Vec<_> = (0..lanes as u64).collect();
-    let mut inflight = vec![false; lanes];
-    let mut jobs = JoinSet::new();
-    let mut pending: BTreeMap<u64, (u64, Bytes, Arc<OwnedSemaphorePermit>)> = BTreeMap::new();
-    let (mut sequence, mut offset, mut acknowledged) = (0u64, 0u64, 0u64);
-    let mut ack_pending = false;
+    let acknowledged = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let (events, mut incoming) = tokio::sync::mpsc::channel(PIPELINE + 8);
+    let mut workers = JoinSet::new();
+    for lane in 0..lanes {
+        workers.spawn(
+            DownloadLane {
+                pool: owner.pool.clone(),
+                exit: owner.exit.clone(),
+                key: owner.key,
+                usage: owner.usage.clone(),
+                next: lane as u64,
+                stride: lanes as u8,
+                budget: Arc::new(Semaphore::new((PIPELINE / lanes) * CHUNK)),
+                acknowledged: acknowledged.clone(),
+                events: events.clone(),
+            }
+            .run(),
+        );
+    }
+    drop(events);
+    let mut acks = JoinSet::new();
+    let mut last_ack = 0;
+    let mut pending = BTreeMap::new();
+    let (mut sequence, mut offset) = (0u64, 0u64);
     let mut end = None;
     loop {
-        while let Some((at, data, _credit)) = pending.remove(&sequence) {
+        while let Some(Block {
+            offset: at,
+            data,
+            _credit,
+            ..
+        }) = pending.remove(&sequence)
+        {
             ensure!(
                 end.is_none_or(|(last, _)| sequence < last),
                 "aggregate data past FIN"
@@ -201,6 +267,7 @@ async fn download(
                 .checked_add(data.len() as u64)
                 .context("aggregate offset overflow")?;
             sequence += 1;
+            acknowledged.store(sequence, Ordering::Release);
             *activity.lock().expect("flow activity") = Instant::now();
         }
         if let Some((last, bytes)) = end
@@ -216,113 +283,39 @@ async fn download(
             tcp.shutdown().await?;
             return Ok(());
         }
-        for lane in 0..lanes {
-            if inflight[lane] || end.is_some_and(|(last, _)| next[lane] >= last) {
-                continue;
-            }
-            // Each logical lane owns its memory share before requesting data.
-            // Fast lanes cannot take the missing lane's replay/reassembly credit.
-            let Ok(credit) = budgets[lane]
-                .clone()
-                .try_acquire_many_owned((batch * CHUNK) as u32)
-            else {
-                continue;
-            };
+        if acks.is_empty() && sequence > last_ack {
             let (pool, exit, key, usage) = (
                 owner.pool.clone(),
                 owner.exit.clone(),
                 owner.key,
                 owner.usage.clone(),
             );
-            let request = next[lane];
-            let acknowledged = sequence;
-            jobs.spawn(async move {
-                let reply = pool
+            last_ack = sequence;
+            acks.spawn(async move {
+                match pool
                     .call(
                         &exit,
                         key,
-                        Operation::Pull {
-                            sequence: request,
-                            acknowledged,
-                            stride: lanes as u8,
-                            count: batch as u8,
+                        Operation::DownloadAck {
+                            acknowledged: sequence,
                         },
                         &usage,
                     )
-                    .await?;
-                Ok::<_, anyhow::Error>(DownloadEvent::Batch(lane, reply, credit))
-            });
-            inflight[lane] = true;
-        }
-        if !ack_pending && sequence > acknowledged {
-            let (pool, exit, key, usage) = (
-                owner.pool.clone(),
-                owner.exit.clone(),
-                owner.key,
-                owner.usage.clone(),
-            );
-            acknowledged = sequence;
-            jobs.spawn(async move {
-                match pool
-                    .call(&exit, key, Operation::DownloadAck { acknowledged }, &usage)
                     .await?
                 {
-                    Reply::Accepted => Ok(DownloadEvent::Acknowledged),
+                    Reply::Accepted => Ok(()),
                     Reply::Failed(code) => Err(ReplyError(code).into()),
                     _ => anyhow::bail!("invalid download ACK"),
                 }
             });
-            ack_pending = true;
         }
-        match jobs
-            .join_next()
-            .await
-            .context("aggregate download has a missing record")???
-        {
-            DownloadEvent::Acknowledged => ack_pending = false,
-            DownloadEvent::Batch(
-                lane,
-                Reply::Batch {
-                    blocks,
-                    end: final_at,
-                },
-                credit,
-            ) => {
-                inflight[lane] = false;
-                ensure!(
-                    blocks.len() <= batch && (!blocks.is_empty() || final_at.is_some()),
-                    "invalid download batch"
-                );
-                if let Some((last, bytes)) = final_at {
-                    ensure!(
-                        last >= sequence
-                            && bytes >= offset
-                            && end.is_none_or(|old| old == (last, bytes)),
-                        "conflicting aggregate FIN"
-                    );
-                    end = Some((last, bytes));
-                }
-                let credit = Arc::new(credit);
-                for (received, at, data) in blocks {
-                    ensure!(
-                        received == next[lane]
-                            && received >= sequence
-                            && end.is_none_or(|(last, _)| received < last),
-                        "unexpected aggregate download sequence"
-                    );
-                    next[lane] = next[lane]
-                        .checked_add(lanes as u64)
-                        .context("download sequence overflow")?;
-                    ensure!(
-                        pending
-                            .insert(received, (at, data, credit.clone()))
-                            .is_none(),
-                        "duplicate aggregate reply"
-                    );
-                }
-            }
-            DownloadEvent::Batch(_, Reply::Failed(code), _) => return Err(ReplyError(code).into()),
-            _ => anyhow::bail!("invalid aggregate download response"),
+        tokio::select! {
+            event=incoming.recv()=> match event.context("streamed download has a missing record")? {
+                Incoming::Record(record)=>{ensure!(record.sequence>=sequence && end.is_none_or(|(last,_)|record.sequence<last),"unexpected aggregate download sequence");ensure!(pending.insert(record.sequence,record).is_none(),"duplicate aggregate download");},
+                Incoming::End(last,bytes)=>{ensure!(last>=sequence && bytes>=offset && end.is_none_or(|old|old==(last,bytes)),"conflicting aggregate FIN");end=Some((last,bytes));}
+            },
+            Some(result)=workers.join_next(),if !workers.is_empty()=>{result??;},
+            Some(result)=acks.join_next(),if !acks.is_empty()=>{result??;},
         }
     }
 }

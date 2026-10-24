@@ -69,6 +69,66 @@ pub(crate) enum Reply {
     Failed(u8),
 }
 
+pub(crate) enum Incoming {
+    Record(Block),
+    End(u64, u64),
+}
+pub(crate) struct StreamSink {
+    pub events: tokio::sync::mpsc::Sender<Incoming>,
+    pub credit: OwnedSemaphorePermit,
+    pub next_sequence: u64,
+    pub end: Option<(u64, u64)>,
+    pub usage: Arc<Mutex<BTreeMap<SocketAddr, (u64, u64)>>>,
+    pub route: SocketAddr,
+}
+
+impl StreamSink {
+    async fn record(
+        &mut self,
+        op: &mut Operation,
+        sequence: u64,
+        offset: u64,
+        data: Bytes,
+    ) -> Result<()> {
+        let Operation::Pull {
+            sequence: next,
+            stride,
+            count: remaining,
+            ..
+        } = op
+        else {
+            unreachable!()
+        };
+        ensure!(sequence == *next, "unexpected streamed download sequence");
+        let credit = self
+            .credit
+            .split(CHUNK)
+            .context("streamed record exceeds reserved credit")?;
+        let n = data.len() as u64;
+        self.events
+            .send(Incoming::Record(Block {
+                sequence,
+                offset,
+                data,
+                _credit: credit,
+            }))
+            .await
+            .context("download consumer closed")?;
+        self.usage
+            .lock()
+            .expect("flow usage")
+            .entry(self.route)
+            .or_default()
+            .1 += n;
+        *next = next
+            .checked_add(*stride as u64)
+            .context("download sequence overflow")?;
+        *remaining -= 1;
+        self.next_sequence = *next;
+        Ok(())
+    }
+}
+
 // Framing is entirely ordered. Mixing an ordered prefix with read_to_end's
 // unordered mode can expose already-consumed overlapping retransmissions.
 pub(crate) async fn eof(recv: &mut quinn::RecvStream) -> Result<()> {
@@ -86,11 +146,16 @@ async fn end(recv: &mut quinn::RecvStream) -> Result<Option<(u64, u64)>> {
     }
 }
 
-pub(crate) async fn rpc(conn: &quinn::Connection, key: Key, op: &Operation) -> Result<Reply> {
+pub(crate) async fn rpc(
+    conn: &quinn::Connection,
+    key: Key,
+    op: &mut Operation,
+    mut stream: Option<&mut StreamSink>,
+) -> Result<Reply> {
     let (mut send, mut recv) = tokio::time::timeout(CONNECT_TIMEOUT, conn.open_bi()).await??;
     let mut header = vec![op.command()];
     header.extend(key);
-    match op {
+    match &*op {
         Operation::Open(target) => target.encode(&mut header),
         Operation::Put {
             sequence,
@@ -121,7 +186,7 @@ pub(crate) async fn rpc(conn: &quinn::Connection, key: Key, op: &Operation) -> R
     }
     tokio::time::timeout(CONNECT_TIMEOUT, async {
         send.write_all(&header).await?;
-        if let Operation::Put { data, .. } = op {
+        if let Operation::Put { data, .. } = &*op {
             send.write_all(data).await?;
         }
         send.finish()?;
@@ -164,26 +229,50 @@ pub(crate) async fn rpc(conn: &quinn::Connection, key: Key, op: &Operation) -> R
     })
     .await??;
     let reply = if tag == 2 {
-        let mut blocks = Vec::with_capacity(count);
-        for _ in 0..count {
-            // Bound absence of progress, rather than the duration of a whole
-            // multi-megabyte reply on a slower but working route.
-            blocks.push(
-                tokio::time::timeout(PATH_STALL, async {
-                    let sequence = recv.read_u64().await?;
-                    let offset = recv.read_u64().await?;
-                    let n = recv.read_u32().await? as usize;
-                    ensure!(n > 0 && n <= CHUNK, "invalid aggregate TCP chunk");
-                    let mut data = vec![0; n];
-                    recv.read_exact(&mut data).await?;
-                    Ok::<_, anyhow::Error>((sequence, offset, Bytes::from(data)))
-                })
-                .await??,
-            );
+        if let Some(sink) = stream.as_deref_mut() {
+            let Operation::Pull {
+                count: requested, ..
+            } = op
+            else {
+                anyhow::bail!("batch reply to a scalar request")
+            };
+            ensure!(count <= *requested as usize, "unrequested download records");
+            *requested = count as u8;
+            let excess = sink.credit.num_permits().saturating_sub(count * CHUNK);
+            drop(sink.credit.split(excess));
+            if let Some((sequence, offset)) = final_at {
+                sink.end = Some((sequence, offset));
+                sink.events
+                    .send(Incoming::End(sequence, offset))
+                    .await
+                    .context("download consumer closed")?;
+            }
         }
-        Reply::Batch {
-            blocks,
-            end: final_at,
+        let mut blocks = Vec::new();
+        for _ in 0..count {
+            let (sequence, offset, data) = tokio::time::timeout(PATH_STALL, async {
+                let sequence = recv.read_u64().await?;
+                let offset = recv.read_u64().await?;
+                let n = recv.read_u32().await? as usize;
+                ensure!(n > 0 && n <= CHUNK, "invalid aggregate TCP chunk");
+                let mut data = vec![0; n];
+                recv.read_exact(&mut data).await?;
+                Ok::<_, anyhow::Error>((sequence, offset, Bytes::from(data)))
+            })
+            .await??;
+            if let Some(sink) = stream.as_deref_mut() {
+                sink.record(op, sequence, offset, data).await?;
+            } else {
+                blocks.push((sequence, offset, data));
+            }
+        }
+        if stream.is_some() {
+            Reply::Accepted
+        } else {
+            Reply::Batch {
+                blocks,
+                end: final_at,
+            }
         }
     } else {
         simple.expect("simple response")
@@ -233,4 +322,73 @@ pub(crate) async fn respond(send: &mut quinn::SendStream, reply: Reply) -> Resul
     }
     send.finish()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod stream_tests {
+    use super::*;
+    #[tokio::test]
+    async fn partial_reply_replays_only_the_unreceived_suffix_and_releases_record_credit() {
+        let budget = Arc::new(Semaphore::new(CHUNK * 2));
+        let (events, mut received) = tokio::sync::mpsc::channel(2);
+        let usage = Arc::new(Mutex::new(BTreeMap::new()));
+        let mut sink = StreamSink {
+            events,
+            credit: budget
+                .clone()
+                .acquire_many_owned((CHUNK * 2) as u32)
+                .await
+                .unwrap(),
+            next_sequence: 0,
+            end: None,
+            usage: usage.clone(),
+            route: "127.0.0.1:1".parse().unwrap(),
+        };
+        let mut op = Operation::Pull {
+            sequence: 0,
+            acknowledged: 0,
+            stride: 4,
+            count: 2,
+        };
+        sink.record(&mut op, 0, 0, Bytes::from_static(b"first"))
+            .await
+            .unwrap();
+        let first = received
+            .try_recv()
+            .expect("first record waited for the entire reply");
+        assert!(matches!(
+            op,
+            Operation::Pull {
+                sequence: 4,
+                count: 1,
+                ..
+            }
+        ));
+        assert_eq!(sink.next_sequence, 4);
+        // A transport error at this point retries this cursor, never record 0.
+        assert!(
+            sink.record(&mut op, 0, 0, Bytes::from_static(b"first"))
+                .await
+                .is_err()
+        );
+        assert_eq!(sink.credit.num_permits(), CHUNK);
+        sink.record(&mut op, 4, 20, Bytes::from_static(b"second"))
+            .await
+            .unwrap();
+        let second = received.try_recv().unwrap();
+        assert!(matches!(
+            op,
+            Operation::Pull {
+                sequence: 8,
+                count: 0,
+                ..
+            }
+        ));
+        assert_eq!(usage.lock().unwrap().values().next().unwrap().1, 11);
+        assert_eq!(budget.available_permits(), 0);
+        drop(first);
+        drop(second);
+        drop(sink);
+        assert_eq!(budget.available_permits(), CHUNK * 2);
+    }
 }
