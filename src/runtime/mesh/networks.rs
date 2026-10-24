@@ -612,6 +612,7 @@ mod tests {
         let metrics = stats::Metrics::new("bound-message-client");
         let client = Task(tokio::spawn(tunnel::client_with_routes(
             tunnel::ClientOptions {
+                stream_connector: None,
                 tcp_listen: None,
                 proxy_listen: None,
                 listen,

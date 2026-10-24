@@ -5,7 +5,7 @@ client discovery, become a selected exit, or forward encrypted traffic toward
 another exit. The first server only initializes credentials; it has no permanent
 coordination role. Membership converges through authenticated peer exchanges.
 
-## TCP aggregation and selectable exits (v0.4.1)
+## TCP aggregation and selectable exits (v0.5.0, experimental)
 
 Enable proxy egress with `--proxy`. A fixed `--target` is optional in this mode;
 provide both options to serve the existing UDP tunnel and the proxy together.
@@ -51,43 +51,40 @@ range 1–8); `--paths 1` provides a direct-path comparison. The direct path sta
 immediately; optional relay entrances are allocated and renewed in the background.
 
 A single SOCKS TCP connection maps to exactly one destination TCP connection at
-its chosen exit. Upload and download records are distributed across authenticated
-QUIC connections reaching that exit directly or through other mesh servers. Those
-servers forward encrypted packets; they do not open extra destination connections.
-Records carry sequence numbers and byte offsets. The exit orders and deduplicates
-uploads, and the client orders downloads. Accepted records and cumulative TCP
-progress use separate acknowledgements, so replays do not wait behind later data.
-This aggregation happens within one connection and does not require Clash load
-balancing or multiple browser connections. The selected exit is per flow, without
-introducing a permanent cluster leader.
+its chosen exit. Each exit reuses one aggregate session across its authenticated
+direct and relay paths; its application connections remain separate reliable
+byte streams. Relays forward encrypted packets and never open additional
+destination TCP sockets. This aggregation takes place within the application
+connection and does not require Clash load balancing or multiple downloads.
+The selected exit belongs to that session, without a permanent cluster leader.
 
-A single client scheduler assigns contiguous download ranges. Ranges of data the
-exit has already produced go to the path with the earliest expected arrival
-(observed RTT plus queued payload over its measured service rate); a wait for
-future target bytes uses the lowest-RTT path. A path therefore carries a share
-proportional to what it delivers, and a source slower than one path uses one
-path. When later records are buffered behind a missing head record for three
-fast-path RTTs (100 ms–1 s), the head is re-requested on another path, the
-stalled path takes no new work for one second, and further heads stranded on it
-are re-requested at once. Duplicate records are discarded; a replayed range that
-overlaps records already acknowledged skips them. This is record-level fast
-resend in the KCP sense; QUIC still retransmits packets within each path.
+TCP bytes travel as aggregate HTTP Datagrams inside QUIC DATAGRAM frames. The
+stream engine uses byte offsets, cumulative and selective acknowledgments,
+bounded retransmission, receiver credit and acknowledged final offsets. Missing
+segments can be repaired on another healthy path. Automatic FEC uses qualified
+receiver feedback to select bounded repair strength, including a plain mode;
+originals, repairs and stream acknowledgments use the aggregate scheduler.
+FEC recovery preserves the logical stream identity and never fabricates a QUIC
+ACK. Each path still has its own BBR congestion control, with adaptive pacing
+and common rate budgets above it.
 
-A stalled path stops receiving new data and outstanding records replay over
-surviving paths. A four-second response deadline detects a silent path; separate
-liveness heartbeats permit a slow destination without falsely declaring a path
-failure. Isolated authenticated probes readmit recovered paths even while the
-application is idle. Native QUIC retransmissions still operate within each path.
-Each second the client reports per-path failure, completed RPCs, RTT and native
-loss to entrance selection, as the tunnel does, so a failed or persistently poor
-relay can be replaced by another server. The health tick applies entrance changes
-even while all requests wait for target data; retired paths close and late handshakes
-cannot reinstall them, so records replay without waiting for the stall deadline.
-If the exit itself loses its destination TCP state, the flow fails; another exit
-cannot transparently recreate that external TCP connection. New clients require
-`proxy-bond-v2` (v0.4.1) on the selected exit; a v0.4.0 exit rejects the v2
-download request. Servers retain the older TCP command for rolling upgrades;
-new clients use the aggregate protocol exclusively. The TCP proxy has no FEC.
+The stream retains ordered-delivery state while relay paths change. Authenticated
+health probes and actual delivery feedback govern path eligibility and entrance
+replacement. A source or shared access link can limit the useful contribution
+of additional entrances. A relay failure therefore has separate correctness and
+performance acceptance: completing the same target connection proves recovery,
+not additional capacity or lower delay.
+
+If the selected exit loses the target socket or the aggregate session is
+terminated, the corresponding application flows fail explicitly. A new session
+generation accepts new flows; old flows cannot attach to it or silently recreate
+their external TCP connection. Switching exits also requires new connections.
+
+TCP requires ALPN `braidpath-stream/2` and mesh capability `proxy-stream-v2`.
+Upgrade both endpoints together. The former record-RPC TCP profile and its
+rolling TCP compatibility path are replaced; there is no user-facing transport
+switch or automatic fallback to that profile. Mesh credentials and membership
+remain usable, and ordinary UDP-tunnel operation keeps its existing profile.
 
 All local listeners must bind loopback. Their SOCKS5 interface supports CONNECT,
 UDP ASSOCIATE and the no-authentication method; BIND returns command unsupported.
@@ -116,147 +113,91 @@ the same machine as these loopback SOCKS endpoints. This supplies the proxy
 service model requested for v0.3.2; its wire protocol is not Hysteria 2, so a
 Clash `hysteria2` entry cannot connect to it directly.
 
-The proxy uses ALPN `braidpath-proxy/1` on the existing server UDP port. TCP uses
-bounded record reassembly over reliable QUIC streams, including half-close. UDP uses QUIC DATAGRAM
-with bounded fragmentation (up to 65,507 payload bytes), no retransmission and
-no FEC. SOCKS UDP headers also consume the local operating system's datagram
-limit. SOCKS-level fragments (`FRAG != 0`) are dropped as permitted by
-[RFC 1928](https://www.rfc-editor.org/rfc/rfc1928.txt). The existing HTTP/3 FEC
-tunnel and its cooperating relay entrances retain their separate behavior.
+TCP and SOCKS UDP use different profiles on the server's existing UDP port.
+TCP uses `braidpath-stream/2` and the aggregate reliable-flow engine, including
+half-close. SOCKS UDP retains ALPN `braidpath-proxy/1`, QUIC DATAGRAM transport,
+bounded fragmentation up to 65,507 payload bytes, and no retransmission or FEC.
+SOCKS UDP headers also consume the local operating system's datagram limit.
+SOCKS-level fragments (`FRAG != 0`) are dropped as permitted by
+[RFC 1928](https://www.rfc-editor.org/rfc/rfc1928.txt). The existing fixed-target
+UDP FEC tunnel and its cooperating entrances retain their delivery semantics.
 
 Proxy limits and lifecycle:
 
-- Each server admits 64 proxy connections, 256 aggregate TCP flows, 2,176 concurrent
-  handlers (1,024 download ranges, 512 upload/legacy requests, 640 control and
-  progress slots), 256 legacy TCP streams, 64 UDP associations and 1,024 UDP destinations
-  in total; each association allows 32 destinations. Each authenticated QUIC
-  connection permits 1,024 concurrent streams. The client
-  admits 256 local sessions. Up to 32 OS DNS lookups may be in flight; a timed-out
-  lookup retains its slot until the resolver actually returns. Pending connections retain the shared server
-  admission budget and must authenticate within eight seconds.
-- Aggregate TCP has a 128-record / 16 MiB sequence window per direction and flow.
-  Payload records are at most 128 KiB. Each server has separate 32 MiB application
-  buffer budgets for upload and download, shared across flows and charged by the
-  bytes actually held. Each flow also reserves one record per direction outside
-  those budgets for the upload record at the delivery cursor and the next download
-  record. These allowances keep a stalled consumer or a flow waiting on a missing
-  record from exhausting other flows' progress credit. Concurrent requests for the
-  same flow share its allowance. Other upload records that find the
-  budget full, and requests that find exit handlers full, receive a retryable
-  busy reply; the client backs off without marking the path failed or resetting
-  the connection. Ranges of produced data hold up to four records; future-data
-  waits hold up to eight, and an idle flow keeps one such wait (two while a reply
-  streams). Records are delivered as they arrive rather than waiting for a whole
-  range; a short interactive response returns immediately. Partial replies resume
-  at the first record not yet received. Cumulative TCP delivery ACKs are independent
-  of data requests. RPC data slots, progress queries and control commands
-  have separate quotas so recovery and cleanup remain schedulable under load.
-  Small progress/control operations and upload records up to 16 KiB prefer the
-  lowest observed QUIC RTT; bulk downloads use observed payload service rate and
-  data-ready backlog across paths,
-  rather than treating requests waiting for future target bytes as network load.
-  From v0.4.2, ready ranges enter that backlog when a path is selected, including
-  time spent establishing a connection or waiting for its response header. Busy
-  replies, cancellation and failures release the reservation before a retry.
-  Future-data waits are excluded from service estimates; sender backlog hints
-  distinguish available payload from application idle time. Estimates expire for
-  renewed exploration and reset after path reconnection. Per-flow debug summaries include
-  path payload bytes and cumulative native RTT, congestion window and loss counts.
-  These budgets are additional to the bounded QUIC transport buffers.
-- Active proxy transports emit native counters at info level at most once every
-  five seconds: connection identity, RTT, congestion window, sent/lost packets,
-  lost bytes, UDP transmit/receive bytes, and modeled pacing rate in bits per
-  second. Idle paths remain quiet. Compare
-  counter deltas within the same connection; native UDP bytes include protocol
-  overhead and retransmissions and must not be added to SOCKS application bytes.
-- v0.4.2 also corrects the bundled BBR estimator's ten-round filter: lower
-  delivery samples can expire an old peak, while application-limited samples
-  cannot lower the estimate. This lets pacing follow a reduced delivery rate
-  without changing the configured application rate ceiling.
-- v0.4.3 uses BBR for both proxy directions. Its delivery sampler uses each
-  packet's saved flight context and the larger of send/ACK elapsed time; adjacent
-  compressed ACKs and unrelated sends cannot supply the capacity estimate.
-  Application-limited status belongs to the flight that produced the sample.
-  Startup no longer immediately enters RTT probing, queue drain retains its gain
-  phase until complete, startup window growth stops when its target is reached,
-  and stale ACK-burst window allowance expires. These are
-  corrections to the bundled implementation, not a claim to implement BBRv3.
-- Download service estimates combine concurrent ready requests into one path
-  observation of at least 100 ms, with a fixed smoothing baseline per one-second
-  window. A shorter buffered burst cannot replace a sustained estimate. Waiting
-  for future source bytes, cancelled work and replaced paths release their
-  sampling state. Single-connection WAN goodput, pauses and retransmissions
-  remain separate acceptance measurements; the 10 Gbit/s ceiling is unchanged.
-- Optional paths authenticate in the background when their relay leases become
-  available. This opens no destination TCP socket and does not hold up the local
-  SOCKS listeners. Ready download paths are preferred over cold paths so a
-  first-use handshake cannot hold the download head behind later records.
-  Retirement and shutdown cancel pending preparation through the path's task
-  owner; preparation uses the same connection lock as foreground requests.
-- Closing a local flow schedules a bounded close RPC and retains its admission
-  slot until cleanup completes. Client shutdown drains close requests and releases
-  relay leases. The exit retains a flow for a ten-second resume grace after all
-  its observed QUIC paths close; abandoned and idle flows release target sockets,
-  record buffers and worker tasks. Exit progress is preserved across path changes.
-- Relay front/back sockets request the same OS-bounded 8 MiB send/receive
-  buffers as the proxy. Writable upstream sockets forward without allocating a
-  per-packet queue item or waking another task; backpressure uses the existing
-  bounded queue. Direct forwarding refreshes one-way mapping activity, while idle
-  mappings still release their sockets. Shared relay rate credit retains 10 ms
-  of traffic (32 KiB minimum), apportioned across active leases, so scheduler
-  intervals do not discard high-rate credit. Status exposes active relay budget,
-  queue-full and socket-send drops alongside payload byte totals.
-- `--max-rate-bps` caps the combined TCP/UDP proxy payload in both directions,
-  across all proxy clients. Burst credit holds 10 ms of traffic, with a 128 KiB
-  minimum (12.5 MB at 10 Gbit/s), avoiding refill-credit loss with millisecond
-  timers. TCP waits for credit; excess UDP is dropped. This is the proxy budget; existing relay/tunnel budgets are
-  separate. The default `auto` uses a 10 Gbit/s operational ceiling; this does
-  not guarantee measured throughput. A numeric value applies an explicit cap.
-- Proxy TCP streams have a 16 MiB receive window and each authenticated proxy
-  connection has 32 MiB receive/send windows. Server connections retain a
-  256 KiB aggregate limit until token and exit authentication succeeds. These
-  are bounded flow-control budgets, allocated as needed; QUIC congestion
-  control still determines how quickly data can be sent.
-- v0.3.4 coalesces contiguous mixed-size backlogs before enforcing Quinn's
-  stream-fragment limit. This prevents a valid upload under TCP backpressure
-  from closing the entire shared proxy connection; genuine gap-flood protection
-  remains active. Proxy UDP sockets request 8 MiB receive buffers, with smaller
-  requests when a platform refuses that size. The OS may clamp the granted size;
-  system-wide socket limits are not changed.
-- v0.3.4 did not cover packet loss. A stream allowed 16 MiB in flight can hold
-  more than 1,024 genuine holes after loss, so v0.3.5 bounds retained spans by
-  the larger of 1,024 and one per KiB of unread, flow-control-bounded extent.
-  Denser span patterns are still rejected. Proxy sockets also request 8 MiB
-  send buffers within OS limits and log the granted receive and send sizes. A
-  rejection logs its span count and extent. Local UDP send failures from
-  quinn-udp are now included in the default log filter, limited to one warning
-  per minute. An explicit `RUST_LOG` overrides the default filter; deployments
-  using it must include `quinn_udp=warn` to retain those warnings. The local loss
-  regression does not establish where packets were lost in the WAN capture.
-- UDP associations close when their SOCKS TCP owner closes, after 60 seconds
-  without traffic, or when their QUIC connection closes. UDP destination sockets
-  expire after 60 seconds idle. TCP streams expire after 300 seconds idle across
-  both directions. An empty proxy connection closes after 60 seconds.
-- Datagram assembly allows four incomplete packets per association, a two-second
-  lifetime and a 64-packet history. Expired/completed packet IDs cannot be revived
-  by late fragments. Queues, socket buffers and per-send waits are bounded.
+- TCP admission is limited to 256 flows across the host, including all aggregate
+  sessions. The client shares one TCP budget across selected exits; the server
+  shares its budget across clients and sessions. Starting another session does
+  not multiply these limits. Flow and I/O owners retain their admission permit
+  until the related work releases it.
+- TX and RX each have a 32 MiB host-shared retained-data budget. Each admitted
+  flow also has a 128 KiB progress reserve per direction. Idle flows do not
+  preallocate shared data credit. These are retained application-byte budgets,
+  not a bound on total process memory, socket buffers or coding overhead.
+- Socket readers obtain TX credit before reading. The destination and status
+  headers use the same ledger as payload; cumulative byte acknowledgments
+  release credit, retransmissions do not reserve it again, and the virtual FIN
+  byte has no data charge. Independent ACK, FIN and RESET handling continues
+  when the data budget is full.
+- RX reserves only newly accepted bytes. Duplicate ranges have no second charge;
+  retained credit is released after a destination/status header is consumed or a
+  local socket write completes. When shared RX credit is exhausted, the flow's
+  reserve admits data advancing the cumulative receive point. Other ranges are
+  discarded without acknowledging or selectively recording them, so they can
+  be repaired later without resetting the application connection.
+- Each session has a bounded open/attach command channel. Cancellation uses an
+  independent notification and cannot be lost behind a full command queue.
+  Dropping a flow resets its stream; closing a session closes its target sockets
+  and I/O tasks and releases retained data. Explicit client shutdown terminates
+  the aggregate session before releasing its relay-entrance owner. Half-close
+  preserves the opposite direction until its remaining data and FIN complete.
+- Repeated unknown or rejected stream IDs cannot grow replay state without
+  bound: each session retains at most 4,096 closed IDs and 512 pending replay
+  control responses. Active flow acknowledgments retain their own retry state
+  and take precedence over these replay responses when output resumes.
+- Destination opening completes before the frontend reports SOCKS success.
+  The reply preserves the target socket's actual bound address. Domains resolve
+  at the selected exit. At most 32 OS DNS lookups may be in flight; a cancelled
+  or timed-out lookup keeps its slot until the resolver actually returns.
+- The native UDP proxy retains its connection and association limits: 64 proxy
+  QUIC connections, 64 UDP associations and 1,024 UDP destinations per server,
+  with at most 32 destinations per association. UDP associations close with
+  their SOCKS TCP owner, after 60 seconds without traffic, or with their QUIC
+  connection. Destination sockets expire after 60 seconds idle.
+- UDP assembly allows four incomplete packets per association, a two-second
+  lifetime and a 64-packet history. Expired/completed packet IDs cannot be
+  revived by late fragments. Queues, socket buffers and per-send waits remain
+  bounded. Proxy UDP sockets request 8 MiB send/receive buffers within OS limits
+  and report the granted sizes; no system-wide socket limit is changed.
+- `--max-rate-bps` caps combined TCP/UDP proxy payload in both directions across
+  the host. TCP I/O shares the existing proxy rate bucket with UDP. TCP waits
+  for credit and excess UDP is dropped. Relay and fixed-target tunnel budgets
+  are separate. The default `auto` uses the 10 Gbit/s operational ceiling; it
+  is neither a fixed sending rate nor a measured-throughput guarantee.
+- Native transport counters describe QUIC activity, not application delivery.
+  Compare deltas within the same connection. UDP wire bytes include framing and
+  retransmissions and cannot be added to SOCKS application-byte totals.
 - Public destinations are allowed by default. Private, loopback, link-local,
   shared-address and local IPv6 destinations are blocked after DNS resolution;
   the checked IP is the actual connection target. `--proxy-allow-private` opts
   into access to those networks for trusted client-key holders. Unspecified and
-  multicast addresses remain blocked. Proxy access must be explicitly enabled
+  multicast addresses remain blocked. Proxy egress must be enabled explicitly
   on each desired exit.
 
-`mesh-status` advertises `proxy-tcp-v1`, `proxy-bond-v2` and `proxy-udp-v1` only
-when enabled. It includes live aggregate-flow, RPC, retained application-buffer,
-connection, association, destination and rejection counts. Relay status includes
-active forward/return byte totals to verify cooperating paths carry payload. Local tests cover real QUIC/SOCKS sockets, selected and simultaneous
-exits, domain resolution, half-close, fragmented UDP, authentication, destination
-policy, exit failure and resource cleanup. Aggregate regressions verify one target
-connection across multiple server paths, relay loss during upload and download,
-silent-path quarantine and recovery, exact payload delivery, local resets,
-shutdown lease release and abandoned-flow buffer reclamation. Public-network performance and
-application-specific Clash acceptance remain separate validation work.
+`mesh-status` advertises `proxy-stream-v2` and `proxy-udp-v1` when proxy egress is
+enabled. `proxy.tcp_flows` and `proxy.buffered_bytes` expose host-wide TCP
+admission and retained application-data occupancy, alongside native connection,
+association, destination and rejection counts. Session/direction `tcp_streams`
+statistics distinguish application bytes, stream repair and acknowledgments;
+see [runtime statistics](statistics.md). Relay byte totals help verify that
+cooperating entrances actually carry traffic.
+
+The implementation remains experimental. Correctness checks cover authentication,
+destination policy, one target TCP socket, half-close, path disruption, bounded
+cancellation and resource reclamation. WAN throughput, long receive stalls,
+fluctuation and useful gain from multiple paths require separate matched
+single-connection measurements. Successful local tests or several active paths
+do not establish a bandwidth multiplier. Keep deployment topology and measured
+results in ignored local records.
 
 ## Credentials and startup
 
@@ -364,8 +305,9 @@ certificate and token authentication. Reusing that directory allows client
 restart after the original entry disappears. `--exit` decides which server delivers traffic to **its configured UDP
 target**. Each client may choose a different exit. A session has exactly one
 exit responsible for deduplication, FEC and UDP flows; this is not a cluster
-leader. Selecting a different exit starts a new session. There is no TCP, TUN,
-system-wide default route, or transparent migration of existing UDP flow state.
+leader. Selecting a different exit starts a new session. This `mesh-client`
+mode forwards UDP; use `proxy-client` for TCP proxying. It creates no TUN or
+system-wide default route, and does not migrate existing UDP flow state.
 
 The client starts with its direct exit path immediately and allocates cooperating
 entrances in the background, up to eight paths. Each successful allocation is

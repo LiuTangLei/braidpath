@@ -29,6 +29,17 @@ impl Default for Capabilities {
     }
 }
 impl Capabilities {
+    pub(crate) fn require_proxy_stream(&self) -> Result<()> {
+        self.check()?;
+        ensure!(
+            self.features
+                .iter()
+                .any(|feature| feature == crate::runtime::proxy::STREAM_CAPABILITY),
+            "exit must support {}",
+            crate::runtime::proxy::STREAM_CAPABILITY
+        );
+        Ok(())
+    }
     pub(super) fn check(&self) -> Result<()> {
         ensure!(self.protocol == 1, "unsupported mesh control protocol");
         for required in REQUIRED {
@@ -114,6 +125,7 @@ impl State {
                 "proxy-tcp-v1".into(),
                 "proxy-udp-v1".into(),
                 "proxy-bond-v2".into(),
+                crate::runtime::proxy::STREAM_CAPABILITY.into(),
             ]);
         }
         capabilities

@@ -46,13 +46,18 @@ pub(super) async fn serve(mut tcp: TcpStream, pool: Arc<Pool>, exit: &str) -> Re
         return Ok(());
     }
     if command == TCP {
-        let opened = timeout(CONNECT_TIMEOUT, super::bond::open(pool, exit, target)).await;
+        let opened = timeout(CONNECT_TIMEOUT, pool.open_stream(exit, target)).await;
         let flow = match opened {
             Ok(Ok(flow)) => flow,
             Ok(Err(error)) => {
                 reply(
                     &mut tcp,
-                    error.downcast_ref::<ReplyError>().map_or(4, |e| e.0),
+                    error
+                        .downcast_ref::<crate::runtime::tunnel::tcp::OpenError>()
+                        .map_or_else(
+                            || error.downcast_ref::<ReplyError>().map_or(4, |e| e.0),
+                            |e| e.0,
+                        ),
                     unspecified,
                 )
                 .await?;

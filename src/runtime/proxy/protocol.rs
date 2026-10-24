@@ -18,7 +18,7 @@ static DNS_WORKERS: LazyLock<Arc<tokio::sync::Semaphore>> =
     LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(32)));
 
 #[derive(Debug)]
-pub(super) struct ReplyError(pub(super) u8);
+pub(crate) struct ReplyError(pub(crate) u8);
 impl std::fmt::Display for ReplyError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "proxy request rejected (SOCKS reply {})", self.0)
@@ -31,6 +31,15 @@ pub(super) enum Address {
     Ip(SocketAddr),
     Domain(String, u16),
 }
+impl From<Address> for crate::runtime::tunnel::StreamTarget {
+    fn from(address: Address) -> Self {
+        match address {
+            Address::Ip(address) => Self::Ip(address),
+            Address::Domain(host, port) => Self::Domain(host, port),
+        }
+    }
+}
+
 impl Address {
     pub(super) async fn read<R: AsyncRead + Unpin>(r: &mut R) -> Result<Self> {
         let host = match r.read_u8().await? {

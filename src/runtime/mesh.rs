@@ -970,7 +970,9 @@ pub async fn serve(options: ServerOptions) -> Result<()> {
     tunnel::serve_with_mesh(
         tunnel::ServerOptions {
             tcp_target: None,
-            stream_proxy: None,
+            stream_proxy: options.proxy.map(|config| tunnel::ProxyAccess {
+                allow_private: config.allow_private,
+            }),
             bind: options.listen,
             cert: options.dir.join("cert.pem"),
             key: options.dir.join("key.pem"),
@@ -979,7 +981,11 @@ pub async fn serve(options: ServerOptions) -> Result<()> {
             proxy,
             max_rate: options.rate,
             congestion: transport::Congestion::default(),
-            datagram_send_buffer_bytes: transport::DEFAULT_DATAGRAM_SEND_BUFFER_BYTES,
+            datagram_send_buffer_bytes: if options.proxy.is_some() {
+                transport::MAX_DATAGRAM_SEND_BUFFER_BYTES
+            } else {
+                transport::DEFAULT_DATAGRAM_SEND_BUFFER_BYTES
+            },
             adaptive_fec_retention: false,
             stats: options.stats,
         },

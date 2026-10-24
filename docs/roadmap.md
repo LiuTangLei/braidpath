@@ -65,7 +65,7 @@ Current protocol, commands and limits: [experimental runtime](runtime.md). Check
 - [x] Add independent authenticated idle probes, positive-delivery health freshness separate from all-loss report freshness, bounded early exclusion of sampled zero-delivery paths, and aggregate/group feedback reservation.
 - [x] Preserve pending drain restoration across RTT/control-tick boundaries; add deterministic observation-gap, all-loss alternate-path report, drift, repeated-evidence, overhead and delayed-feedback capacity-step regressions.
 - [x] Integrate admitted-byte utilization against the rates active within each control window; separate immediate safety brakes from persistent caution qualified at the first pressure observation, with cold-pause/delayed-loss, changing-allowance and loss-only regressions.
-- [ ] Validate RTT-baseline refresh and permanent capacity changes: the current per-generation minimum RTT has no aging, and retained delivery can still motivate bounded upward trials after a permanent reduction.
+- [ ] Validate qualified RTT-baseline refresh and permanent capacity changes over long runs: continuous light service may retire a stable offset, while local backlog or blocked transport must preserve pressure; retained delivery can still motivate bounded upward trials after a permanent reduction.
 - [ ] Validate pressure-episode retirement against further delayed-loss patterns: a new clear finalized interval currently has no sequence watermark proving that all losses preceding the episode boundary have finalized.
 - [ ] Accept adaptive scheduling against round robin, the quality baseline and the best single path under a matched total budget. Sustained clean → congested → recovered operation, deadline success and unconditional tails must pass in both directions before changing a default.
 - [ ] Compare XOR with small-block multi-erasure coding only in a later coding phase; Reed–Solomon and sliding-window work are deferred until a demonstrated loss/recovery limitation justifies them.
@@ -80,6 +80,35 @@ Current protocol, commands and limits: [experimental runtime](runtime.md). Check
 **Current increment:** adaptive mode is experimental and opt-in. Round robin, XOR block size 4, 3 ms block closing and the existing 30% repair setting remain unchanged defaults. The source implements the mechanisms above; no sustained WAN, capacity-aggregation or deployment result is implied by a checked implementation item.
 
 ## M4 — Reliable flows and application adapters
+
+### v0.5.0 — Aggregate DATAGRAM TCP (experimental development)
+
+- [x] Keep leaderless mesh membership, authentication, exit selection and one
+  SOCKS5 listener per exit; move TCP payload to the aggregate DATAGRAM engine.
+  Each application connection uses one target TCP socket, with byte-offset SACK,
+  fine-grained cross-path repair and receiver-feedback-driven automatic FEC.
+- [x] Introduce ALPN `braidpath-stream/2` and capability `proxy-stream-v2`.
+  Both endpoints require an upgrade. Retire the former TCP record-RPC profile
+  and its rolling compatibility path; native SOCKS UDP keeps `braidpath-proxy/1`
+  and no FEC. No user-facing transport switch is added.
+- [x] Share TCP admission and retained-data budgets across all sessions: 256
+  flows, separate 32 MiB TX/RX shared credit, and a 128 KiB progress reserve per
+  flow and direction. Retain existing host rate and DNS-worker limits.
+- [x] Preserve remote destination errors and the real SOCKS bound address;
+  enforce cancellation, half-close, explicit session termination and old-generation
+  isolation. Bound replay controls and closed-stream history independently of
+  output backpressure.
+- [ ] Complete release acceptance for the final integrated frontend, including
+  byte integrity, disrupted-path recovery, cancellation and resource reclamation.
+- [ ] Validate WAN throughput, longest stalls and variation using matched single
+  TCP connections. Measure useful multipath gain separately from single-path
+  transport performance; no linear scaling is assumed.
+
+### Earlier proxy iterations — historical, superseded TCP architecture
+
+The entries below record completed earlier implementations. Their per-path
+reliable-stream/record-RPC TCP behavior is superseded by v0.5.0. They do not
+describe the current TCP profile or provide current WAN acceptance evidence.
 
 - [x] v0.4.3: replace adjacent-ACK BBR sampling with per-packet flight delivery
   context, retain application-limited samples correctly, and correct initial RTT
@@ -138,11 +167,11 @@ Current protocol, commands and limits: [experimental runtime](runtime.md). Check
   concurrent use of selected exits, remote DNS, half-close and bounded cleanup.
   This uses QUIC's native reliable streams; application-level multipath FEC
   reliability remains the separate work below. See [proxy operation](mesh.md).
-- [ ] Selective application ACKs, bounded retransmission and receiver credit, without synthesizing QUIC ACKs for FEC recovery.
-- [ ] Per-flow offsets, reassembly bounds, FIN/final-offset acknowledgment, reset and half-close.
-- [ ] Preserve reliable-flow acknowledgment/reassembly state across path changes and define terminal delivery failure; the existing datagram reconnection lifecycle is not a reliable-flow implementation.
+- [x] Selective application ACKs, bounded retransmission and receiver credit over DATAGRAMs, without synthesizing QUIC ACKs for FEC recovery.
+- [x] Per-flow offsets, reassembly bounds, FIN/final-offset acknowledgment, reset and half-close.
+- [x] Preserve reliable-flow acknowledgment/reassembly state across surviving-path changes; terminate old flows explicitly when a new aggregate session generation is required.
 - [x] UDP forwarding to a fixed target with negotiated messages up to 4,096 bytes, bounded fragmentation/reassembly and whole-message input admission.
-- [ ] TCP forwarding on the reliable-flow service.
+- [x] TCP forwarding on the reliable-flow service.
 - [ ] Compare FEC with the no-FEC reliable baseline; verify bytes, completion, timeout rates and latency under bulk/interactive coexistence.
 
 **Exit gate:** reliable-stream correctness and the selected latency/goodput targets pass. A UDP delivery metric cannot substitute for this gate.

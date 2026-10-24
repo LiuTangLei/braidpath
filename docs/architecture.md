@@ -1,11 +1,34 @@
 # Architecture and feasibility
 
-This document defines the implementation direction and its acceptance gates. The first experimental implementation is described in the [runtime guide](runtime.md); the full design below still includes future work. See the [README](../README.md) for current capabilities and the [roadmap](roadmap.md) for dependencies.
+This document defines the implementation direction and its acceptance gates. The experimental implementations are described in the [runtime guide](runtime.md) and [proxy operation guide](mesh.md); the broader design below still includes future work. See the [README](../README.md) for current capabilities and the [roadmap](roadmap.md) for dependencies.
 
 Distributed mode implements a leaderless server directory and leased opaque
 entrances. Every server can be an exit; session state lives only at the client
 and its selected exit. See [distributed servers](mesh.md) for implemented
 behavior, trust boundaries and limits.
+
+## Implemented v0.5.0 TCP profile
+
+The TCP proxy combines the existing leaderless mesh control plane with the
+aggregate DATAGRAM data plane. One SOCKS5 listener selects one exit; one
+application TCP connection opens one target TCP socket there. Multiple encrypted
+paths carry that byte stream under one aggregate session, without creating
+parallel target connections. Mesh membership, certificate/token authentication,
+destination authorization and UDP association handling remain control boundaries.
+
+The reliable stream engine uses byte-offset SACK, cumulative acknowledgments,
+receiver credit and explicit FIN/reset. Fine-grained repair can move to a healthy
+path, and automatic FEC shares the aggregate scheduler and rate budget with
+original records. QUIC handles security and per-path congestion control; it does
+not retransmit DATAGRAM payload. Ordered delivery and repair remain above the
+paths rather than inside reliable per-path QUIC payload streams.
+
+TCP uses ALPN `braidpath-stream/2` and capability `proxy-stream-v2`, requiring a
+coordinated client/server upgrade. Native SOCKS UDP retains `braidpath-proxy/1`
+without FEC; the existing fixed-target UDP tunnel remains a distinct service.
+The former TCP record-RPC profile is replaced, with no transport-selection knob.
+Implementation correctness, WAN stability and single-connection multipath gain
+are independent acceptance gates. The profile remains experimental.
 
 ## 1. Feasibility boundary
 
@@ -56,7 +79,12 @@ Before selecting a deployment default, pass the [deployment reachability gate](v
 
 ## 3. Session, path and data identity
 
-The plain-QUIC engineering profile uses operator-managed client/server certificates: verify the selected exit identity through every entrance and authenticate each client connection with TLS client authentication. The web-facing HTTP/3 candidate verifies the server certificate and authenticates client credentials inside the encrypted application exchange, allowing ordinary website requests without a client certificate. Both must establish an authorized client identity before session admission. Disable 0-RTT application data in the initial protocol. Credential trust, rotation and revocation are deployment requirements.
+Current mesh and proxy profiles verify the selected exit's pinned server
+certificate and authenticate client credentials inside the encrypted application
+exchange before admitting destinations or data. Session joins verify the same
+authorized identity. Profile-specific handshake and resumption policies do not
+replace these checks. Ordinary website requests remain separate from authorized
+proxy use; credential trust, rotation and revocation are deployment requirements.
 
 The first authenticated connection creates a session. Additional connections request a join over a control stream. The server checks the same authorized client identity, session identifier, current session epoch, protocol version and negotiated limits before accepting their data. Knowing a session ID alone grants no access.
 
@@ -88,9 +116,30 @@ Small symbols can share a QUIC/UDP packet. Losing that packet can therefore eras
 
 ## 5. Two delivery services, two kinds of acknowledgment
 
-Start with **unreliable datagrams with optional FEC**. Deliver originals/recovered data once within a bounded deduplication window, drop late messages by policy, and report losses. An expired or unrecoverable datagram is not a reliable-transport failure. Sender queue deadlines use its local monotonic clock; receiver expiry uses a negotiated lifetime/playout policy. Never compare raw monotonic timestamps from different machines. End-to-end deadline success is measured by the requesting application or synchronized instrumentation.
+The UDP tunnel provides **unreliable datagrams with optional FEC**. Deliver originals/recovered data once within a bounded deduplication window, drop late messages by policy, and report losses. An expired or unrecoverable datagram is not a reliable-transport failure. Sender queue deadlines use its local monotonic clock; receiver expiry uses a negotiated lifetime/playout policy. Never compare raw monotonic timestamps from different machines. End-to-end deadline success is measured by the requesting application or synchronized instrumentation.
 
-Add **reliable ordered streams** only with selective application ACKs, bounded retransmission, receiver credit, per-flow offsets, FIN/reset semantics and explicit failure. Retain source data until the peer has accepted responsibility for it. Receiver credit includes accepted but undelivered data; acknowledged reliable data cannot be evicted to make room. Reordering is per flow, not across unrelated streams.
+The v0.5.0 TCP proxy implements **reliable ordered streams** with selective
+application ACKs, bounded retransmission, receiver credit, byte offsets,
+FIN/reset semantics and explicit failure. Selective ACKs suppress redundant
+repair; cumulative ACK progress releases retained source bytes. Receiver credit
+includes accepted but undelivered data, which cannot be evicted after
+acknowledgment. Reordering is per flow, not across unrelated streams.
+
+Host-wide admission permits bound TCP to 256 flows across sessions. TX and RX
+each share 32 MiB of retained-data credit, with a 128 KiB progress reserve per
+flow and direction. Idle streams do not preallocate shared data. TX credit is
+acquired before reading a socket, and retries reuse it. RX charges only new
+bytes and retains credit until local delivery or header consumption. Under
+pressure, a cumulative-point repair may use its flow's reserve; other data is
+dropped before SACK state changes. ACK/FIN/RESET processing is independent of
+data credit, and live ACKs precede bounded replay-control responses.
+
+Flow ownership spans the mux and its socket tasks. Cancellation works even when
+the open/attach command channel is full. Explicit session termination closes
+its flows and releases I/O, while half-close preserves the other direction.
+A new session generation cannot inherit old Flow handles or recreate an exit's
+lost external TCP socket. Host-wide TCP payload pacing reuses the proxy's
+combined TCP/UDP rate bucket; the default operational ceiling remains 10 Gbit/s.
 
 | Signal | Meaning | May stop reliable resending? | May erase QUIC loss? |
 | --- | --- | --- | --- |

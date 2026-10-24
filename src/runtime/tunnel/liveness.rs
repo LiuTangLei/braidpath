@@ -94,6 +94,28 @@ mod tests {
     }
 
     #[test]
+    fn a_single_unanswered_frame_can_fail_and_recover_without_application_samples() {
+        let start = Instant::now();
+        let rtt = Duration::from_millis(10);
+        let mut path = Liveness::default();
+        path.update(1, counters(5, 10), rtt, start);
+        path.update(1, counters(5, 11), rtt, start + Duration::from_millis(1));
+        assert!(!path.silent());
+        path.update(1, counters(5, 11), rtt, start + Duration::from_millis(101));
+        assert!(
+            path.silent(),
+            "reachability does not require eight application symbols"
+        );
+        path.update(1, counters(6, 11), rtt, start + Duration::from_millis(102));
+        assert!(
+            !path.silent(),
+            "an authenticated QUIC ACK restores the same path"
+        );
+        path.update(1, counters(6, 11), rtt, start + Duration::from_secs(10));
+        assert!(!path.silent(), "an idle path must remain healthy");
+    }
+
+    #[test]
     fn unanswered_frames_mark_silence_until_an_ack_arrives() {
         let rtt = Duration::from_millis(20);
         let start = Instant::now();

@@ -153,6 +153,7 @@ async fn delivery(identity: &ClientIdentity, entrances: Vec<SocketAddr>, label: 
     let listen = address();
     let client = Task(tokio::spawn(tunnel::client_with_mesh_exit(
         tunnel::ClientOptions {
+            stream_connector: None,
             tcp_listen: None,
             proxy_listen: None,
             adaptive_fec_retention: false,
@@ -1150,6 +1151,7 @@ async fn unresponsive_entrances_do_not_delay_a_healthy_path() {
     fixed.receiver_feedback = false;
     let client = Task(tokio::spawn(tunnel::client_with_mesh_exit(
         tunnel::ClientOptions {
+            stream_connector: None,
             tcp_listen: None,
             proxy_listen: None,
             adaptive_fec_retention: false,
@@ -1229,6 +1231,7 @@ async fn running_client_discovers_new_members_and_recovers_restarted_relay() {
     fixed.receiver_feedback = false;
     let client = Task(tokio::spawn(tunnel::client_with_mesh_exit(
         tunnel::ClientOptions {
+            stream_connector: None,
             tcp_listen: None,
             proxy_listen: None,
             adaptive_fec_retention: false,

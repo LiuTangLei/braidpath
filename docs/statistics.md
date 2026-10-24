@@ -69,6 +69,59 @@ Quinn also exposes cumulative `ack_frames_tx/rx`, `ack_frequency_frames_tx/rx` a
 
 Relay direction counters use UDP datagrams, with received/queued/forwarded counts and bytes. Drop reasons distinguish unauthorized source, oversize, deterministic impairment, rate budget, mapping limits/errors/closed queues, queue capacity, socket send errors/cancellation, expired mapping queues and shutdown. `--drop-every` impairs forward ciphertext datagrams only, including handshake/control packets; a counter cannot identify their encrypted record contents.
 
+## Aggregate TCP and proxy budgets (v0.5.0)
+
+TCP uses the reliable byte-stream service over aggregate DATAGRAMs. It shares
+path/symbol accounting with the FEC engine; native SOCKS UDP retains its
+`braidpath-proxy/1` counters and has no FEC. Keep application goodput, stream
+repair, coded symbols and QUIC wire traffic separate when interpreting totals.
+
+Session/direction `tcp_streams` snapshots include:
+
+| Fields | Interpretation |
+| --- | --- |
+| `opened`, `completed`, `reset_local`, `reset_peer`, `rejected`, `active` | Reliable-flow lifecycle in this mux scope |
+| `bytes_from_application`, `bytes_to_application` | Local socket payload read and successful local socket writes; not proof that a remote application consumed the bytes |
+| `segments_sent`, `retransmitted_segments`, `retransmitted_bytes` | Stream-engine segment attempts and repairs; retries can use another path |
+| `tail_probes_queued`, `head_copies_queued`, `local_drop_retransmits` | Bounded extra copies and repairs following local admission failure |
+| `acks_sent`, `acks_received`, `probe_timeouts`, `spurious_retransmit_reports` | Stream acknowledgment/recovery events, distinct from QUIC ACKs and packet loss |
+| `duplicate_bytes_received`, `pending_io_events`, `local_sender_queued_bytes` | Duplicate stream bytes and currently owned mux/input backlog |
+
+Actor-stage counters do not establish wire admission. Use symbol Quinn-admission
+counters and outer transport counters for their respective stages. FEC recovery
+can deliver a logical stream segment without crediting the original's path with
+an original arrival; native QUIC loss remains intact.
+
+`mesh-status` exposes `proxy.tcp_flows` and `proxy.buffered_bytes` from the
+host-shared TCP budget. Flows include their related I/O owners until those owners
+release their admission permit. Buffer occupancy includes TX/RX reserved or
+retained application-data credit; it is not process RSS, allocated coding state
+or kernel socket memory. A session snapshot is not another copy of this budget.
+
+The host admits at most 256 TCP flows. TX and RX each share 32 MiB, with an
+additional 128 KiB progress reserve per flow and direction. TX reservations are
+released by cumulative ACK progress; selective ACKs only suppress repair, and
+retransmissions do not reserve data again. Generated destination/status headers
+are charged, while the virtual FIN byte is not. RX charges only newly retained
+bytes and releases them after a local write or header consumption. Duplicate
+frames do not add credit, and rejected future ranges never enter SACK state.
+Idle flows retain admission ownership without preallocating shared data credit.
+
+Cancellation, half-close and explicit session termination have different
+lifecycle events. A half-close can retain receive bytes while the sending side
+has finished. Cancelling a flow resets it even with a full command queue;
+session termination closes its sockets/tasks and prevents old flow handles
+from entering the next generation. Inspect budget occupancy after those I/O
+owners have settled, together with the final cleanup diagnostics. A low `active`
+count alone cannot prove that socket-task memory has been reclaimed.
+
+Automatic FEC snapshots describe the engine's selected repair policy and bounded
+credit; they are not a measured bandwidth gain. Matched application transfers
+must validate exact bytes and report goodput, receive stalls and variation.
+Single-path performance and additional multipath benefit require separate
+acceptance. Private topology, raw samples and result analyses stay in ignored
+`local/`; public documentation records the method and implementation boundary.
+
 ## Mixed-mode repair accounts
 
 The `symbols.mixed_*` fields are additive and remain zero outside explicit mixed
@@ -245,7 +298,15 @@ In short-feedback mode, a moderate probe-derived queue below four targets keeps 
 
 `observed_local_min_rtt_ms` and `observed_probe_min_rtt_ms` are additional diagnostic minima within the generation, updated only from eligible fresh observations. They are never read by control or weighting decisions and are not calibrated or trusted baselines. They cannot prove a queue-free path, complete sampling of every RTT, or absolute one-way latency. Separate `source_local_min_rtt_ms` and `source_probe_min_rtt_ms` are the default control baselines from v0.2.1; `mixed_rtt_excess_ms` preserves the old mixed-baseline comparison, while `rtt_excess_ms` is the selected source-specific excess. The old mixed baseline is retained with `--legacy-recovery`. All these fields are bounded scalars; the surrounding 16-entry event history still has cumulative eviction counters, so it is not a complete packet trace.
 
-The controller retains previously achieved delivery to guide bounded recovery trials. Its minimum RTT is per generation and currently has no aging mechanism: a permanent propagation change can remain classified as excess delay, and a permanent capacity reduction can still motivate bounded upward trials. These are explicit long-run validation limits. Sender admission uses only local ingress age for expiry; the RTT-excess estimate affects pacing and does not extend or get added to that local deadline.
+The controller retains previously achieved delivery to guide bounded recovery
+trials. RTT references are scoped to a generation. Continuous qualified light
+service can retire a stable RTT offset; local backlog or blocked transport
+prevents that baseline refresh. Where present, `rtt_wander_ms` and
+`baseline_refreshes` describe this controller policy, not proof of physical
+propagation or queue location. A permanent capacity reduction can still motivate
+bounded upward trials, so long-run adaptation remains a separate validation
+requirement. Sender admission uses only local ingress age for expiry; RTT excess
+affects pacing and does not extend that deadline.
 
 `originals_quinn_admitted_bytes` and `repairs_quinn_admitted_bytes` count complete HTTP datagrams accepted by Quinn, including the measurement envelope when enabled. Scheduler service and repair credit settle only on this successful event. Repair credit is a percentage of admitted original bytes, capped at 2,400 repair bytes, and spent on admitted repair bytes. Generated or expired originals create no credit. The outer pacers add an 80-byte transport estimate, so these counters do not equal exact NIC bytes; QUIC ACKs, handshakes and retransmissions require the outer counters. `repair_no_diverse_path` records a timely fallback to a path that admitted originals of that block; logical path diversity does not prove physical independence.
 

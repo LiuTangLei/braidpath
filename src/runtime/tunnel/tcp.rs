@@ -23,7 +23,10 @@ use std::{
     collections::{HashMap, VecDeque},
     io,
     net::SocketAddr,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 use tokio::{
@@ -32,13 +35,223 @@ use tokio::{
         TcpListener, TcpStream, UdpSocket,
         tcp::{OwnedReadHalf, OwnedWriteHalf},
     },
-    sync::{Notify, Semaphore, mpsc},
+    sync::{Notify, Semaphore, mpsc, oneshot, watch},
     task::{AbortHandle, JoinSet},
     time::{sleep_until, timeout},
 };
 use tracing::{debug, warn};
 
+#[path = "stream_budget.rs"]
+mod stream_budget;
+pub(crate) use stream_budget::Budget;
+use stream_budget::{Credit, Lease};
+
+#[derive(Debug)]
+pub(crate) struct OpenError(pub u8);
+impl std::fmt::Display for OpenError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "stream destination refused ({})", self.0)
+    }
+}
+impl std::error::Error for OpenError {}
+
+struct Channel {
+    commands: mpsc::Sender<Command>,
+    wake: Arc<Notify>,
+    closed: AtomicBool,
+}
+impl Channel {
+    fn close(&self) {
+        self.closed.store(true, Ordering::Release);
+        self.wake.notify_waiters();
+        self.wake.notify_one();
+    }
+}
+struct Cancel {
+    cancelled: AtomicBool,
+    wake: Arc<Notify>,
+}
+struct CancelGuard(Arc<Cancel>);
+impl Drop for CancelGuard {
+    fn drop(&mut self) {
+        self.0.cancelled.store(true, Ordering::Release);
+        self.0.wake.notify_one();
+    }
+}
+enum Command {
+    Open {
+        target: Destination,
+        lease: Arc<Lease>,
+        cancel: Arc<Cancel>,
+        reply: oneshot::Sender<Result<(u32, SocketAddr), u8>>,
+        done: oneshot::Sender<Result<(), String>>,
+    },
+    Attach(u32, TcpStream),
+}
+struct ConnectorState {
+    budget: Arc<Budget>,
+    active: watch::Sender<Option<Arc<Channel>>>,
+    stopped: AtomicBool,
+    stop: Notify,
+}
+/// A logical exit's current aggregate session. Existing flows retain their own generation.
+#[derive(Clone)]
+pub struct Connector(Arc<ConnectorState>);
+impl Connector {
+    pub(crate) fn new(budget: Arc<Budget>) -> Self {
+        let (active, _) = watch::channel(None);
+        Self(Arc::new(ConnectorState {
+            budget,
+            active,
+            stopped: AtomicBool::new(false),
+            stop: Notify::new(),
+        }))
+    }
+    pub(crate) fn is_closed(&self) -> bool {
+        self.0.stopped.load(Ordering::Acquire)
+    }
+    pub(crate) async fn closed(&self) {
+        loop {
+            let notified = self.0.stop.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.is_closed() {
+                return;
+            }
+            notified.await;
+        }
+    }
+    pub(crate) fn close(&self) {
+        self.0.stopped.store(true, Ordering::Release);
+        if let Some(old) = self.0.active.send_replace(None) {
+            old.close();
+        }
+        self.0.stop.notify_waiters();
+    }
+    fn register(&self) -> Registration {
+        let (commands, receiver) = mpsc::channel(MAX_STREAMS * 2);
+        let channel = Arc::new(Channel {
+            commands,
+            wake: Arc::new(Notify::new()),
+            closed: AtomicBool::new(self.is_closed()),
+        });
+        if let Some(old) = self.0.active.send_replace(Some(channel.clone())) {
+            old.close();
+        }
+        Registration {
+            connector: self.clone(),
+            channel,
+            commands: receiver,
+        }
+    }
+    pub(crate) async fn open(&self, target: Destination) -> anyhow::Result<Flow> {
+        let mut generation = self.0.active.subscribe();
+        let channel = loop {
+            anyhow::ensure!(!self.is_closed(), "aggregate connector closed");
+            if let Some(channel) = generation.borrow_and_update().clone()
+                && !channel.closed.load(Ordering::Acquire)
+            {
+                break channel;
+            }
+            generation
+                .changed()
+                .await
+                .map_err(|_| anyhow::anyhow!("aggregate session ended"))?;
+        };
+        let lease = tokio::select! {
+            lease = self.0.budget.flow() => lease,
+            _ = generation.changed() => anyhow::bail!("aggregate generation changed during admission"),
+        };
+        anyhow::ensure!(
+            !channel.closed.load(Ordering::Acquire),
+            "aggregate generation closed"
+        );
+        let cancel = Arc::new(Cancel {
+            cancelled: AtomicBool::new(false),
+            wake: channel.wake.clone(),
+        });
+        let guard = CancelGuard(cancel.clone());
+        let (reply, response) = oneshot::channel();
+        let (done, completion) = oneshot::channel();
+        channel
+            .commands
+            .send(Command::Open {
+                target,
+                lease: lease.clone(),
+                cancel,
+                reply,
+                done,
+            })
+            .await
+            .map_err(|_| anyhow::anyhow!("aggregate generation ended"))?;
+        let (id, bound) = response
+            .await
+            .map_err(|_| anyhow::anyhow!("aggregate open cancelled"))?
+            .map_err(OpenError)?;
+        Ok(Flow {
+            channel,
+            id,
+            bound,
+            completion: Some(completion),
+            _cancel: guard,
+            _lease: lease,
+        })
+    }
+}
+struct Registration {
+    connector: Connector,
+    channel: Arc<Channel>,
+    commands: mpsc::Receiver<Command>,
+}
+impl Drop for Registration {
+    fn drop(&mut self) {
+        self.channel.close();
+        self.connector.0.active.send_if_modified(|active| {
+            if active
+                .as_ref()
+                .is_some_and(|active| Arc::ptr_eq(active, &self.channel))
+            {
+                *active = None;
+                true
+            } else {
+                false
+            }
+        });
+    }
+}
+pub(crate) struct Flow {
+    channel: Arc<Channel>,
+    id: u32,
+    bound: SocketAddr,
+    completion: Option<oneshot::Receiver<Result<(), String>>>,
+    _cancel: CancelGuard,
+    _lease: Arc<Lease>,
+}
+impl Flow {
+    pub(crate) fn bound(&self) -> SocketAddr {
+        self.bound
+    }
+    pub(crate) async fn run(mut self, tcp: TcpStream) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !self.channel.closed.load(Ordering::Acquire),
+            "aggregate flow belongs to a retired generation"
+        );
+        self.channel
+            .commands
+            .send(Command::Attach(self.id, tcp))
+            .await
+            .map_err(|_| anyhow::anyhow!("aggregate generation ended"))?;
+        self.completion
+            .take()
+            .expect("flow completion")
+            .await
+            .map_err(|_| anyhow::anyhow!("aggregate flow ended"))?
+            .map_err(anyhow::Error::msg)
+    }
+}
+
 const MAX_STREAMS: usize = 256;
+const MAX_CONTROL: usize = 2 * MAX_STREAMS;
 /// Receive memory shared by all streams of one session.
 const RECEIVE_BUDGET: u64 = 64 * 1024 * 1024;
 const READ_CHUNK: usize = 64 * 1024;
@@ -78,7 +291,9 @@ pub(super) struct Targets {
 }
 
 pub(super) enum Io {
+    #[cfg(test)]
     Read(u32, Vec<u8>),
+    ReadBudgeted(u32, Vec<u8>, Credit),
     ReadEnd(u32),
     Written(u32, usize),
     Failed(u32),
@@ -164,6 +379,11 @@ impl Out<'_> {
 }
 
 struct Stream {
+    lease: Arc<Lease>,
+    cancel: Option<Arc<Cancel>>,
+    open_reply: Option<oneshot::Sender<Result<(u32, SocketAddr), u8>>>,
+    completion: Option<oneshot::Sender<Result<(), String>>>,
+    status_header: Vec<u8>,
     send: stream::Sender,
     recv: stream::Receiver,
     reads: Option<Arc<Semaphore>>,
@@ -181,8 +401,13 @@ struct Stream {
     refused: bool,
 }
 impl Stream {
-    fn new(open: bool) -> Self {
+    fn new(open: bool, lease: Arc<Lease>) -> Self {
         Self {
+            lease,
+            cancel: None,
+            open_reply: None,
+            completion: None,
+            status_header: Vec::new(),
             send: stream::Sender::new(open),
             recv: stream::Receiver::default(),
             reads: None,
@@ -195,6 +420,22 @@ impl Stream {
             status_pending: false,
             header: None,
             refused: false,
+        }
+    }
+    fn push(&mut self, data: &[u8]) -> bool {
+        let Some(credit) = self.lease.tx.try_take(data.len(), true) else {
+            return false;
+        };
+        self.send.push(data);
+        self.lease.retain_tx(credit);
+        true
+    }
+    fn complete(&mut self, result: Result<(), String>) {
+        if let Some(reply) = self.open_reply.take() {
+            let _ = reply.send(Err(proxy::GENERAL_FAILURE));
+        }
+        if let Some(done) = self.completion.take() {
+            let _ = done.send(result);
         }
     }
     fn deliver(&mut self, data: Vec<u8>) {
@@ -280,12 +521,15 @@ impl Drain {
 }
 
 pub(super) struct Mux {
+    budget: Arc<Budget>,
+    registration: Option<Registration>,
     listeners: Listeners,
     targets: Targets,
     streams: HashMap<u32, Stream>,
     turns: VecDeque<u32>,
     /// Retired streams; a completed one keeps its final acknowledgment.
     closed: HashMap<u32, (Instant, Option<Vec<u8>>)>,
+    closed_order: VecDeque<u32>,
     control: VecDeque<(u32, Vec<u8>)>,
     next_stream: u32,
     events_tx: mpsc::UnboundedSender<Io>,
@@ -310,11 +554,14 @@ impl Mux {
         let (events_tx, events) = mpsc::unbounded_channel();
         let now = Instant::now();
         Self {
+            budget: Arc::new(Budget::default()),
+            registration: None,
             listeners,
             targets,
             streams: HashMap::new(),
             turns: VecDeque::new(),
             closed: HashMap::new(),
+            closed_order: VecDeque::new(),
             control: VecDeque::new(),
             next_stream: 0,
             events_tx,
@@ -335,18 +582,37 @@ impl Mux {
         }
     }
     /// Accepts local connections; the peer connects each stream onward.
-    pub(super) fn client(listeners: Listeners, policy: &Policy, scope: Scope) -> Option<Self> {
-        (listeners.fixed.is_some() || listeners.proxy.is_some())
-            .then(|| Self::new(listeners, Targets::default(), policy, scope))
+    pub(super) fn client(
+        listeners: Listeners,
+        policy: &Policy,
+        scope: Scope,
+        connector: Option<Connector>,
+    ) -> Option<Self> {
+        (listeners.fixed.is_some() || listeners.proxy.is_some() || connector.is_some()).then(|| {
+            let mut mux = Self::new(listeners, Targets::default(), policy, scope);
+            if let Some(connector) = connector {
+                mux.budget = connector.0.budget.clone();
+                mux.registration = Some(connector.register());
+            }
+            mux
+        })
     }
     /// Connects peer-opened streams of the kinds this session negotiated.
-    pub(super) fn server(targets: Targets, policy: &Policy, scope: Scope) -> Option<Self> {
+    pub(super) fn server(
+        targets: Targets,
+        policy: &Policy,
+        scope: Scope,
+        budget: Arc<Budget>,
+    ) -> Option<Self> {
         let targets = Targets {
             fixed: targets.fixed.filter(|_| policy.streams),
             proxy: targets.proxy.filter(|_| policy.proxy),
         };
-        (targets.fixed.is_some() || targets.proxy.is_some())
-            .then(|| Self::new(Listeners::default(), targets, policy, scope))
+        (targets.fixed.is_some() || targets.proxy.is_some()).then(|| {
+            let mut mux = Self::new(Listeners::default(), targets, policy, scope);
+            mux.budget = budget;
+            mux
+        })
     }
 
     fn deadline(&self, now: Instant) -> Instant {
@@ -371,6 +637,7 @@ impl Mux {
     /// Reserve one bounded local completion per actor turn, even when a
     /// higher-priority network input is continuously ready.
     pub(super) fn service_io(&mut self) {
+        self.service_commands();
         if let Ok(event) = self.events.try_recv() {
             self.io(event);
         }
@@ -383,12 +650,15 @@ impl Mux {
             self.streams.len() < MAX_STREAMS && self.accept_paused_until.is_none_or(|at| now >= at);
         let fixed = self.listeners.fixed.clone().filter(|_| accepting);
         let proxy = self.listeners.proxy.clone().filter(|_| accepting);
+        let registration = self.registration.as_ref().map(|r| r.channel.clone());
         let queue_waiting = !self.datagrams.is_empty()
             || !self.control.is_empty()
             || self.streams.values().any(|s| s.send.has_transmit());
         tokio::select! {
             biased;
             Some(event) = self.events.recv() => Wake::Io(event),
+            _ = async { registration.as_ref().expect("registration").wake.notified().await }, if registration.is_some() => Wake::Queue,
+            Some(command) = async { self.registration.as_mut().expect("registration").commands.recv().await }, if registration.is_some() => { self.command(command); Wake::Queue },
             _ = self.gauge.notify.notified(), if queue_waiting => Wake::Queue,
             accepted = async { fixed.as_ref().expect("listener").accept().await }, if fixed.is_some() => Wake::Accept(accepted),
             accepted = async { proxy.as_ref().expect("listener").accept().await }, if proxy.is_some() => Wake::ProxyAccept(accepted),
@@ -413,10 +683,13 @@ impl Mux {
         let reads = Arc::new(Semaphore::new(0));
         let (writer, ops) = mpsc::unbounded_channel();
         let reset = Arc::new(Notify::new());
-        s.tasks.push(
-            self.tasks
-                .spawn(read_loop(id, read, reads.clone(), self.events_tx.clone())),
-        );
+        s.tasks.push(self.tasks.spawn(read_loop(
+            id,
+            read,
+            reads.clone(),
+            self.events_tx.clone(),
+            s.lease.clone(),
+        )));
         // Detached so that dropping the mux still lets each writer send its RST.
         tokio::spawn(write_loop(
             id,
@@ -424,6 +697,7 @@ impl Mux {
             ops,
             reset.clone(),
             self.events_tx.clone(),
+            s.lease.clone(),
         ));
         s.reset_writer = Some(reset);
         for data in s.undelivered.drain(..) {
@@ -435,50 +709,161 @@ impl Mux {
         s.finish_writes();
     }
 
-    fn open(&mut self, id: u32, open: bool) {
-        self.streams.insert(id, Stream::new(open));
+    fn open(&mut self, id: u32, open: bool) -> bool {
+        let Some(lease) = self.budget.try_flow() else {
+            return false;
+        };
+        self.open_lease(id, open, lease);
+        true
+    }
+    fn open_lease(&mut self, id: u32, open: bool, lease: Arc<Lease>) {
+        self.streams.insert(id, Stream::new(open, lease));
         self.turns.push_back(id);
         self.stats.opened += 1;
+    }
+    fn service_commands(&mut self) {
+        for _ in 0..MAX_STREAMS * 2 {
+            let command = self
+                .registration
+                .as_mut()
+                .and_then(|r| r.commands.try_recv().ok());
+            let Some(command) = command else {
+                break;
+            };
+            self.command(command);
+        }
+        let retired = self
+            .registration
+            .as_ref()
+            .is_some_and(|r| r.channel.closed.load(Ordering::Acquire));
+        let cancelled: Vec<_> = self
+            .streams
+            .iter()
+            .filter(|(_, s)| {
+                retired
+                    || s.cancel
+                        .as_ref()
+                        .is_some_and(|c| c.cancelled.load(Ordering::Acquire))
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        for id in cancelled {
+            self.reset(id, "aggregate flow cancelled or generation retired");
+        }
+    }
+    fn command(&mut self, command: Command) {
+        match command {
+            Command::Open {
+                target,
+                lease,
+                cancel,
+                reply,
+                done,
+            } => {
+                if cancel.cancelled.load(Ordering::Acquire)
+                    || self
+                        .registration
+                        .as_ref()
+                        .is_none_or(|r| r.channel.closed.load(Ordering::Acquire))
+                {
+                    return;
+                }
+                let Some(id) = self.next_id(true) else {
+                    let _ = reply.send(Err(proxy::GENERAL_FAILURE));
+                    return;
+                };
+                self.open_lease(id, false, lease);
+                let stream = self.streams.get_mut(&id).expect("new stream");
+                stream.cancel = Some(cancel);
+                stream.open_reply = Some(reply);
+                stream.completion = Some(done);
+                stream.status_pending = true;
+                if !stream.push(&target.encode()) {
+                    self.reset(id, "destination header budget exhausted");
+                }
+            }
+            Command::Attach(id, tcp) => {
+                let valid = self.streams.get(&id).is_some_and(|s| {
+                    !s.status_pending
+                        && s.cancel
+                            .as_ref()
+                            .is_none_or(|c| !c.cancelled.load(Ordering::Acquire))
+                }) && self
+                    .registration
+                    .as_ref()
+                    .is_some_and(|r| !r.channel.closed.load(Ordering::Acquire));
+                if valid {
+                    self.attach(id, tcp);
+                } else {
+                    let _ = socket2::SockRef::from(&tcp).set_linger(Some(Duration::ZERO));
+                }
+            }
+        }
     }
 
     fn close(&mut self, id: u32) -> Option<Stream> {
         let s = self.streams.remove(&id)?;
         self.turns.retain(|t| *t != id);
         self.closed_duplicates += s.recv.duplicates();
-        if self.closed.len() >= MAX_TOMBSTONES
-            && let Some(oldest) = self
-                .closed
-                .iter()
-                .min_by_key(|(_, (at, _))| *at)
-                .map(|(id, _)| *id)
-        {
-            self.closed.remove(&oldest);
-        }
         let final_ack = s.recv.final_ack().map(|ack| Frame::Ack(ack).encode());
-        self.closed.insert(id, (Instant::now(), final_ack));
+        self.remember_closed(id, Instant::now(), final_ack);
         Some(s)
+    }
+
+    /// Refused IDs and completed streams share the same finite replay history.
+    fn remember_closed(&mut self, id: u32, now: Instant, final_ack: Option<Vec<u8>>) {
+        if !self.closed.contains_key(&id) {
+            while self.closed.len() >= MAX_TOMBSTONES || self.closed_order.len() >= MAX_TOMBSTONES {
+                let oldest = self
+                    .closed_order
+                    .pop_front()
+                    .expect("closed stream history");
+                self.closed.remove(&oldest);
+            }
+            self.closed_order.push_back(id);
+        }
+        self.closed.insert(id, (now, final_ack));
+    }
+
+    /// Replay responses must remain bounded even while sender admission is full.
+    /// Live receive ACKs use their own defer_ack state and are not evicted here.
+    fn queue_control(&mut self, flow: u32, payload: Vec<u8>) {
+        if self.control.len() >= MAX_CONTROL {
+            if let Some((_, pending)) = self
+                .control
+                .iter_mut()
+                .find(|(pending, _)| *pending == flow)
+            {
+                *pending = payload;
+                return;
+            }
+            self.control.pop_front();
+        }
+        self.control.push_back((flow, payload));
     }
 
     fn reset(&mut self, id: u32, reason: &str) {
         if let Some(mut s) = self.close(id) {
             debug!(stream = id, reason, "stream reset");
+            s.complete(Err(reason.to_owned()));
             s.abort();
             self.stats.reset_local += 1;
             // Two independent records; the peer also answers stale frames with RESET.
             for _ in 0..2 {
-                self.control
-                    .push_back((stream::data_flow(id), Frame::Reset.encode()));
+                self.queue_control(stream::data_flow(id), Frame::Reset.encode());
             }
         }
     }
 
     pub(super) fn handle(&mut self, wake: Wake) {
+        self.service_commands();
         match wake {
             Wake::Io(event) => self.io(event),
             Wake::Accept(Ok((tcp, _))) => {
                 if let Some(id) = self.next_id(false) {
-                    self.open(id, true);
-                    self.attach(id, tcp);
+                    if self.open(id, true) {
+                        self.attach(id, tcp);
+                    }
                 }
             }
             Wake::ProxyAccept(Ok((mut tcp, _))) => {
@@ -499,10 +884,20 @@ impl Mux {
 
     fn io(&mut self, event: Io) {
         match event {
+            #[cfg(test)]
             Io::Read(id, data) => {
                 if let Some(s) = self.streams.get_mut(&id) {
                     self.stats.bytes_from_application += data.len() as u64;
+                    if !s.push(&data) {
+                        self.reset(id, "TX budget exhausted");
+                    }
+                }
+            }
+            Io::ReadBudgeted(id, data, credit) => {
+                if let Some(s) = self.streams.get_mut(&id) {
+                    self.stats.bytes_from_application += data.len() as u64;
                     s.send.push(&data);
+                    s.lease.retain_tx(credit);
                 }
             }
             Io::ReadEnd(id) => {
@@ -515,13 +910,25 @@ impl Mux {
                 if let Some(s) = self.streams.get_mut(&id) {
                     self.stats.bytes_to_application += n as u64;
                     s.recv.consumed(n as u64, window);
+                    s.lease.release_rx(n);
                 }
             }
             Io::Failed(id) => self.reset(id, "local socket failed"),
             Io::Connected(id, tcp) => self.attach(id, tcp),
             Io::Reached(id, tcp) => {
                 if let Some(s) = self.streams.get_mut(&id) {
-                    s.send.push(&[proxy::OK]);
+                    let mut response = vec![proxy::OK];
+                    match tcp.local_addr() {
+                        Ok(bound) => response.extend(Destination::Ip(bound).encode()),
+                        Err(_) => {
+                            self.reset(id, "destination bound address unavailable");
+                            return;
+                        }
+                    }
+                    if !s.push(&response) {
+                        self.reset(id, "status header budget exhausted");
+                        return;
+                    }
                     self.attach(id, tcp);
                 }
             }
@@ -530,7 +937,7 @@ impl Mux {
                     debug!(stream = id, status, "proxy destination refused");
                     s.refused = true;
                     s.undelivered.clear();
-                    s.send.push(&[status]);
+                    let _ = s.push(&[status]);
                     s.send.finish();
                     self.stats.rejected += 1;
                 }
@@ -573,17 +980,25 @@ impl Mux {
                         .spawn(refuse(tcp, request.kind, proxy::GENERAL_FAILURE));
                     return;
                 };
-                self.open(id, false);
+                if !self.open(id, false) {
+                    self.tasks
+                        .spawn(refuse(tcp, request.kind, proxy::GENERAL_FAILURE));
+                    return;
+                }
                 let s = self.streams.get_mut(&id).expect("opened");
-                s.send.push(&request.destination.encode());
-                s.send.push(&request.early);
+                if !s.push(&request.destination.encode()) || !s.push(&request.early) {
+                    self.reset(id, "proxy header budget exhausted");
+                    return;
+                }
                 self.stats.bytes_from_application += request.early.len() as u64;
                 s.status_pending = true;
                 // Reply at once, so application data follows the destination
                 // header without waiting a tunnel round trip. A refused
                 // destination later resets the local connection.
                 let events = self.events_tx.clone();
+                let owner = s.lease.clone();
                 self.tasks.spawn(async move {
+                    let _owner = owner;
                     let mut tcp = tcp;
                     // An abort before attach must not look like a clean end.
                     let _ = socket2::SockRef::from(&tcp).set_linger(Some(Duration::ZERO));
@@ -708,29 +1123,33 @@ impl Mux {
         };
         if let Some((_, Some(ack))) = self.closed.get(&id) {
             // The peer missed the final acknowledgment of a completed stream.
-            self.control.push_back((stream::ack_flow(id), ack.clone()));
+            let ack = ack.clone();
+            self.queue_control(stream::ack_flow(id), ack);
             self.stats.acks_sent += 1;
             return false;
         }
         if !accepted || self.closed.contains_key(&id) {
             // Stale, unnegotiated, or peer-opened toward a client.
-            self.control
-                .push_back((stream::data_flow(id), Frame::Reset.encode()));
+            self.queue_control(stream::data_flow(id), Frame::Reset.encode());
             return false;
         }
         if self.streams.len() >= MAX_STREAMS {
             self.stats.rejected += 1;
-            self.closed.insert(id, (now, None));
-            self.control
-                .push_back((stream::data_flow(id), Frame::Reset.encode()));
+            self.remember_closed(id, now, None);
+            self.queue_control(stream::data_flow(id), Frame::Reset.encode());
             return false;
         }
-        self.open(id, false);
+        if !self.open(id, false) {
+            self.queue_control(stream::data_flow(id), Frame::Reset.encode());
+            return false;
+        }
         let s = self.streams.get_mut(&id).expect("opened");
         match self.targets.fixed.filter(|_| !addressed) {
             Some(target) => {
                 let events = self.events_tx.clone();
+                let owner = s.lease.clone();
                 s.tasks.push(self.tasks.spawn(async move {
+                    let _owner = owner;
                     match timeout(CONNECT_TIMEOUT, TcpStream::connect(target)).await {
                         Ok(Ok(tcp)) => {
                             let _ = events.send(Io::Connected(id, tcp));
@@ -765,8 +1184,11 @@ impl Mux {
                     let mut header = s.header.take().expect("header");
                     ready = header.split_off(used);
                     s.recv.consumed(used as u64, window);
+                    s.lease.release_rx(used);
                     let events = self.events_tx.clone();
+                    let owner = s.lease.clone();
                     s.tasks.push(self.tasks.spawn(async move {
+                        let _owner = owner;
                         let _ =
                             events.send(match proxy::connect(destination, allow_private).await {
                                 Ok(tcp) => Io::Reached(id, tcp),
@@ -777,19 +1199,41 @@ impl Mux {
             }
         }
         if s.status_pending {
-            let status = if ready.is_empty() {
-                if !s.recv.fin_received() {
+            s.status_header.append(&mut ready);
+            let Some(&status) = s.status_header.first() else {
+                if s.recv.fin_received() {
+                    self.reset(id, "missing destination status");
+                }
+                return;
+            };
+            if status != proxy::OK {
+                if let Some(reply) = s.open_reply.take() {
+                    let _ = reply.send(Err(status));
+                }
+                self.reset(id, "proxy destination refused");
+                return;
+            }
+            match Destination::decode(&s.status_header[1..]) {
+                Ok(Some((Destination::Ip(bound), used))) => {
+                    let used = used + 1;
+                    ready = s.status_header.split_off(used);
+                    s.status_header.clear();
+                    s.status_pending = false;
+                    s.recv.consumed(used as u64, window);
+                    s.lease.release_rx(used);
+                    if let Some(reply) = s.open_reply.take() {
+                        let _ = reply.send(Ok((id, bound)));
+                    }
+                }
+                Ok(None)
+                    if !s.recv.fin_received() && s.status_header.len() <= proxy::MAX_HEADER + 1 =>
+                {
                     return;
                 }
-                proxy::GENERAL_FAILURE
-            } else {
-                s.recv.consumed(1, window);
-                ready.remove(0)
-            };
-            s.status_pending = false;
-            if status != proxy::OK {
-                debug!(stream = id, status, "proxy destination refused");
-                return self.reset(id, "proxy destination refused");
+                _ => {
+                    self.reset(id, "malformed destination bound address");
+                    return;
+                }
             }
         }
         s.deliver(ready);
@@ -824,6 +1268,7 @@ impl Mux {
         match frame {
             Frame::Reset => {
                 if let Some(mut s) = self.close(id) {
+                    s.complete(Err("peer reset stream".to_owned()));
                     s.abort();
                     self.stats.reset_peer += 1;
                 }
@@ -834,7 +1279,8 @@ impl Mux {
                 };
                 self.stats.acks_received += 1;
                 match s.send.on_ack(&ack, now) {
-                    Some((_, spurious)) => {
+                    Some((released, spurious)) => {
+                        s.lease.release_tx(released as usize);
                         self.stats.spurious_retransmit_reports += u64::from(spurious);
                         s.grant_reads();
                     }
@@ -846,8 +1292,17 @@ impl Mux {
                     return;
                 }
                 let s = self.streams.get_mut(&id).expect("stream");
+                let additional = s.recv.additional_bytes(offset, data.len());
+                let progress = offset <= s.recv.cumulative()
+                    && offset + data.len() as u64 > s.recv.cumulative();
+                let Some(credit) = s.lease.rx.try_take(additional, progress) else {
+                    return;
+                };
                 match s.recv.on_data(offset, fin, data, now) {
-                    Ok(ready) => self.arrived(id, ready),
+                    Ok(ready) => {
+                        s.lease.retain_rx(credit);
+                        self.arrived(id, ready);
+                    }
                     Err(violation) => self.reset(
                         id,
                         if violation == stream::Violation::FlowControl {
@@ -863,6 +1318,7 @@ impl Mux {
 
     /// Run timers, retransmit, send acknowledgments and new data, retire streams.
     pub(super) fn flush(&mut self, out: &mut Out) {
+        self.service_commands();
         let now = Instant::now();
         self.admissions();
         for (id, start, transmission) in self.gauge.take_dropped() {
@@ -899,13 +1355,24 @@ impl Mux {
                 .get_mut(&id)
                 .and_then(|s| s.recv.take_ack(now, window))
             {
-                self.control
-                    .push_back((stream::ack_flow(id), Frame::Ack(ack).encode()));
+                self.queue_control(stream::ack_flow(id), Frame::Ack(ack).encode());
                 self.stats.acks_sent += 1;
             }
             // The writer finishes its own shutdown; the reader already ended.
-            if self.close(id).is_some() {
+            if let Some(mut stream) = self.close(id) {
+                stream.complete(Ok(()));
                 self.stats.completed += 1;
+            }
+        }
+        // Live progress and window ACKs get the next available slot even if
+        // a peer continuously replenishes rejected-ID replay responses.
+        for (id, s) in &mut self.streams {
+            if let Some(ack) = s.recv.take_ack(now, window) {
+                if out.enqueue(stream::ack_flow(*id), Frame::Ack(ack).encode(), None) {
+                    self.stats.acks_sent += 1;
+                } else {
+                    s.recv.defer_ack();
+                }
             }
         }
         while let Some((flow, payload)) = self.control.pop_front() {
@@ -933,20 +1400,12 @@ impl Mux {
                 }
                 _ => true,
             });
-        for (id, s) in &mut self.streams {
-            if let Some(ack) = s.recv.take_ack(now, window) {
-                if out.enqueue(stream::ack_flow(*id), Frame::Ack(ack).encode(), None) {
-                    self.stats.acks_sent += 1;
-                } else {
-                    s.recv.defer_ack();
-                }
-            }
-        }
         self.pump(out, now);
         // Finished tasks stay in the set until reaped.
         while self.tasks.try_join_next().is_some() {}
         self.closed
             .retain(|_, (at, _)| now.saturating_duration_since(*at) < TOMBSTONE);
+        self.closed_order.retain(|id| self.closed.contains_key(id));
         if now.saturating_duration_since(self.published) >= PUBLISH_EVERY {
             self.publish(now);
         }
@@ -1043,12 +1502,20 @@ impl Mux {
         let ids: Vec<u32> = self.streams.keys().copied().collect();
         for id in ids {
             if let Some(mut s) = self.close(id) {
+                s.complete(Err("aggregate session ended".to_owned()));
                 s.abort();
                 self.stats.reset_local += 1;
             }
         }
+        self.registration.take();
         self.publish(Instant::now());
         self.tasks.abort_all();
+        while self.events.try_recv().is_ok() {}
+    }
+}
+impl Drop for Mux {
+    fn drop(&mut self) {
+        self.close_all();
     }
 }
 
@@ -1061,9 +1528,10 @@ async fn refuse(mut tcp: TcpStream, kind: proxy::Kind, status: u8) {
 
 async fn read_loop(
     id: u32,
-    mut read: OwnedReadHalf,
+    read: OwnedReadHalf,
     reads: Arc<Semaphore>,
     events: mpsc::UnboundedSender<Io>,
+    lease: Arc<Lease>,
 ) {
     let mut buffer = vec![0; READ_CHUNK];
     loop {
@@ -1080,16 +1548,33 @@ async fn read_loop(
                 .forget();
         }
         let capacity = extra + 1;
-        match read.read(&mut buffer[..capacity]).await {
+        // Idle sockets keep their flow slot, never shared data credit. A
+        // readiness false positive returns both credits before waiting again.
+        if read.readable().await.is_err() {
+            let _ = events.send(Io::Failed(id));
+            return;
+        }
+        let mut credit = lease.tx.take(capacity).await;
+        match read.try_read(&mut buffer[..capacity]) {
             Ok(0) => {
                 let _ = events.send(Io::ReadEnd(id));
                 return;
             }
             Ok(n) => {
                 reads.add_permits(capacity - n);
-                if events.send(Io::Read(id, buffer[..n].to_vec())).is_err() {
+                credit.truncate(n);
+                if let Some(rate) = &lease.rate {
+                    rate.acquire(n).await;
+                }
+                if events
+                    .send(Io::ReadBudgeted(id, buffer[..n].to_vec(), credit))
+                    .is_err()
+                {
                     return;
                 }
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                reads.add_permits(capacity);
             }
             Err(_) => {
                 let _ = events.send(Io::Failed(id));
@@ -1107,6 +1592,7 @@ async fn write_loop(
     mut ops: mpsc::UnboundedReceiver<WriteOp>,
     reset: Arc<Notify>,
     events: mpsc::UnboundedSender<Io>,
+    lease: Arc<Lease>,
 ) {
     let finished = loop {
         let op = tokio::select! {
@@ -1119,7 +1605,7 @@ async fn write_loop(
                 let written = tokio::select! {
                     biased;
                     _ = reset.notified() => break false,
-                    written = write.write_all(&data) => written,
+                    written = async { if let Some(rate) = &lease.rate { rate.acquire(data.len()).await; } write.write_all(&data).await } => written,
                 };
                 if written.is_err() {
                     let _ = events.send(Io::Failed(id));
@@ -1156,6 +1642,433 @@ mod tests {
             assert!(!associate::is_flow(data));
             assert!(!associate::is_flow(ack));
         }
+    }
+
+    fn budget_mux(budget: Arc<Budget>) -> Mux {
+        let metrics = stats::Metrics::new("budget-test");
+        let mut mux = Mux::new(
+            Listeners::default(),
+            Targets::default(),
+            &test_policy(),
+            metrics.scope("budget", stats::FORWARD),
+        );
+        mux.budget = budget;
+        mux
+    }
+    fn test_policy() -> Policy {
+        crate::runtime::mesh::tests::policy()
+    }
+    fn incoming(id: u32, frame: Frame) -> Record {
+        Record {
+            flow: stream::data_flow(id),
+            id: 1,
+            payload: frame.encode(),
+        }
+    }
+
+    #[test]
+    fn host_rx_pressure_drops_unaccepted_ranges_but_admits_the_cumulative_hole() {
+        let budget = Arc::new(Budget::default());
+        let mut blocked = budget_mux(budget.clone());
+        let mut recovering = budget_mux(budget.clone());
+        assert!(blocked.open(1, false));
+        assert!(recovering.open(2, false));
+        recovering.receive(incoming(
+            2,
+            Frame::Data {
+                offset: 10,
+                fin: false,
+                data: vec![1; 10],
+            },
+        ));
+        let lease = &blocked.streams[&1].lease;
+        lease.retain_rx(lease.rx.try_take(32 * 1024 * 1024 - 10, false).unwrap());
+        recovering.receive(incoming(
+            2,
+            Frame::Data {
+                offset: 20,
+                fin: false,
+                data: vec![1; 10],
+            },
+        ));
+        assert_eq!(
+            recovering.streams[&2].recv.additional_bytes(20, 10),
+            10,
+            "dropped data must not enter SACK state"
+        );
+        recovering.receive(incoming(
+            2,
+            Frame::Data {
+                offset: 0,
+                fin: false,
+                data: vec![1; 10],
+            },
+        ));
+        assert_eq!(recovering.streams[&2].recv.cumulative(), 20);
+        assert_eq!(budget.snapshot().1, 32 * 1024 * 1024 + 10);
+        recovering.receive(incoming(
+            2,
+            Frame::Data {
+                offset: 0,
+                fin: false,
+                data: vec![1; 20],
+            },
+        ));
+        assert_eq!(
+            budget.snapshot().1,
+            32 * 1024 * 1024 + 10,
+            "duplicate bytes have no second charge"
+        );
+        recovering.io(Io::Written(2, 20));
+        assert_eq!(budget.snapshot().1, 32 * 1024 * 1024 - 10);
+        drop(recovering);
+        drop(blocked);
+        assert_eq!(budget.snapshot(), (0, 0));
+    }
+
+    #[test]
+    fn refused_id_flood_stays_bounded_and_live_ack_resumes_after_output_pressure() {
+        let budget = Arc::new(Budget::default());
+        let mut mux = budget_mux(budget.clone());
+        mux.targets.fixed = Some("127.0.0.1:1".parse().unwrap());
+        for id in 1..=MAX_STREAMS as u32 {
+            assert!(mux.open(id, false));
+        }
+        mux.receive(incoming(
+            1,
+            Frame::Data {
+                offset: 0,
+                fin: true,
+                data: vec![9],
+            },
+        ));
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.try_send(QueuedRecord {
+            record: Record {
+                flow: 0,
+                id: 0,
+                payload: Vec::new(),
+            },
+            created: Instant::now(),
+            hold: None,
+        })
+        .unwrap();
+        let scope = mux.scope.clone();
+        let mut next_id = 0;
+        let first = MAX_STREAMS as u32 + 1;
+        let last = first + MAX_TOMBSTONES as u32 + MAX_CONTROL as u32;
+        for id in first..=last {
+            assert!(!mux.accept_stream(id, Instant::now()));
+        }
+        for _ in 0..MAX_TOMBSTONES {
+            assert!(!mux.accept_stream(last, Instant::now()));
+        }
+        assert!(
+            !mux.closed.contains_key(&first),
+            "old rejected IDs must be evicted"
+        );
+        assert!(
+            mux.closed.contains_key(&last),
+            "recent rejected IDs retain their replay boundary"
+        );
+        assert_eq!(mux.closed.len(), MAX_TOMBSTONES);
+        assert_eq!(mux.closed_order.len(), MAX_TOMBSTONES);
+        assert!(mux.control.len() <= MAX_CONTROL);
+        mux.flush(&mut Out {
+            tx: &tx,
+            next_id: &mut next_id,
+            scope: &scope,
+            small_threshold: 0,
+        });
+        assert!(
+            mux.streams[&1].recv.ack_pending(Instant::now()),
+            "a full sender must defer the live ACK"
+        );
+        rx.try_recv().unwrap();
+        let mut acknowledged = false;
+        for turn in 0..=MAX_CONTROL {
+            assert!(!mux.accept_stream(last + turn as u32 + 1, Instant::now()));
+            mux.flush(&mut Out {
+                tx: &tx,
+                next_id: &mut next_id,
+                scope: &scope,
+                small_threshold: 0,
+            });
+            while let Ok(item) = rx.try_recv() {
+                if stream::is_ack_flow(item.record.flow)
+                    && stream::stream_id(item.record.flow) == Some(1)
+                {
+                    let Some(Frame::Ack(ack)) = Frame::decode(&item.record.payload) else {
+                        panic!("expected live stream ACK");
+                    };
+                    assert_eq!(ack.cumulative, 2);
+                    acknowledged = true;
+                }
+            }
+            if acknowledged {
+                break;
+            }
+        }
+        assert!(
+            acknowledged,
+            "continuous rejected-ID traffic cannot steal every slot from the active flow's ACK"
+        );
+        assert!(mux.streams.contains_key(&1));
+        drop(mux);
+        assert_eq!(budget.snapshot(), (0, 0));
+    }
+
+    #[test]
+    fn repeated_and_expired_closed_ids_do_not_accumulate_fifo_entries() {
+        let mut mux = budget_mux(Arc::new(Budget::default()));
+        let now = Instant::now();
+        for id in 0..MAX_TOMBSTONES as u32 {
+            mux.remember_closed(id, now, None);
+        }
+        for _ in 0..MAX_TOMBSTONES * 2 {
+            mux.remember_closed(7, now, None);
+        }
+        assert_eq!(mux.closed_order.len(), mux.closed.len());
+        let expired = now - TOMBSTONE - Duration::from_secs(1);
+        for id in 0..MAX_TOMBSTONES as u32 {
+            mux.remember_closed(id, expired, None);
+        }
+        let (tx, _rx) = mpsc::channel(1);
+        let scope = mux.scope.clone();
+        let mut next_id = 0;
+        mux.flush(&mut Out {
+            tx: &tx,
+            next_id: &mut next_id,
+            scope: &scope,
+            small_threshold: 0,
+        });
+        assert!(mux.closed.is_empty());
+        assert!(mux.closed_order.is_empty());
+        for id in 10_000..10_000 + MAX_TOMBSTONES as u32 * 2 {
+            mux.remember_closed(id, now, None);
+        }
+        assert!(!mux.closed.contains_key(&10_000));
+        assert!(
+            mux.closed
+                .contains_key(&(10_000 + MAX_TOMBSTONES as u32 * 2 - 1))
+        );
+        assert_eq!(mux.closed_order.len(), MAX_TOMBSTONES);
+    }
+
+    #[test]
+    fn cumulative_ack_releases_tx_credit_and_duplicate_ack_does_not_release_more() {
+        let budget = Arc::new(Budget::default());
+        let mut mux = budget_mux(budget.clone());
+        assert!(mux.open(1, false));
+        assert!(mux.streams.get_mut(&1).unwrap().push(&vec![1; 1000]));
+        let now = Instant::now();
+        while mux
+            .streams
+            .get_mut(&1)
+            .unwrap()
+            .send
+            .poll_transmit(now)
+            .is_some()
+        {}
+        for (cumulative, retained) in [(990, 10), (990, 10), (1000, 0)] {
+            mux.receive(incoming(
+                1,
+                Frame::Ack(stream::Ack {
+                    cumulative,
+                    limit: stream::INITIAL_WINDOW,
+                    duplicate_bytes: 0,
+                    ranges: Vec::new(),
+                }),
+            ));
+            assert_eq!(budget.snapshot(), (1, retained));
+        }
+        drop(mux);
+        assert_eq!(budget.snapshot(), (0, 0));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancelled_open_reclaims_credit_even_when_the_command_queue_is_full() {
+        let budget = Arc::new(Budget::default());
+        let connector = Connector::new(budget.clone());
+        let metrics = stats::Metrics::new("cancel-test");
+        let mut mux = Mux::client(
+            Listeners::default(),
+            &test_policy(),
+            metrics.scope("cancel", stats::FORWARD),
+            Some(connector.clone()),
+        )
+        .unwrap();
+        let target = Destination::Ip("127.0.0.1:1".parse().unwrap());
+        let clone = connector.clone();
+        let request = tokio::spawn(async move { clone.open(target).await });
+        while budget.snapshot().0 == 0 {
+            tokio::task::yield_now().await;
+        }
+        let filler = budget.try_flow().unwrap();
+        let channel = mux.registration.as_ref().unwrap().channel.clone();
+        while channel.commands.capacity() > 0 {
+            let (reply, _) = oneshot::channel();
+            let (done, _) = oneshot::channel();
+            channel
+                .commands
+                .try_send(Command::Open {
+                    target: Destination::Ip("127.0.0.1:1".parse().unwrap()),
+                    lease: filler.clone(),
+                    cancel: Arc::new(Cancel {
+                        cancelled: AtomicBool::new(true),
+                        wake: channel.wake.clone(),
+                    }),
+                    reply,
+                    done,
+                })
+                .ok()
+                .unwrap();
+        }
+        request.abort();
+        assert!(
+            request
+                .await
+                .err()
+                .expect("cancelled open task")
+                .is_cancelled()
+        );
+        mux.service_commands();
+        drop(filler);
+        assert!(mux.streams.is_empty());
+        assert_eq!(budget.snapshot(), (0, 0));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn addressed_status_preserves_bound_and_application_tail_and_old_generations_close() {
+        let budget = Arc::new(Budget::default());
+        let connector = Connector::new(budget.clone());
+        let metrics = stats::Metrics::new("generation-test");
+        let mut mux = Mux::client(
+            Listeners::default(),
+            &test_policy(),
+            metrics.scope("old", stats::FORWARD),
+            Some(connector.clone()),
+        )
+        .unwrap();
+        let clone = connector.clone();
+        let request = tokio::spawn(async move {
+            clone
+                .open(Destination::Ip("127.0.0.1:1".parse().unwrap()))
+                .await
+        });
+        while budget.snapshot().0 == 0 {
+            tokio::task::yield_now().await;
+        }
+        mux.service_commands();
+        let id = *mux.streams.keys().next().unwrap();
+        let bound: SocketAddr = "127.0.0.1:1234".parse().unwrap();
+        let mut response = vec![proxy::OK];
+        response.extend(Destination::Ip(bound).encode());
+        response.extend(b"payload");
+        mux.receive(incoming(
+            id,
+            Frame::Data {
+                offset: 0,
+                fin: false,
+                data: response,
+            },
+        ));
+        let flow = request.await.unwrap().unwrap();
+        assert_eq!(flow.bound(), bound);
+        assert_eq!(mux.streams[&id].undelivered.concat(), b"payload");
+        let new_mux = Mux::client(
+            Listeners::default(),
+            &test_policy(),
+            metrics.scope("new", stats::FORWARD),
+            Some(connector.clone()),
+        )
+        .unwrap();
+        assert!(flow.channel.closed.load(Ordering::Acquire));
+        drop(flow);
+        mux.service_commands();
+        assert!(mux.streams.is_empty());
+        assert!(new_mux.streams.is_empty());
+        drop(mux);
+        drop(new_mux);
+        assert_eq!(budget.snapshot(), (0, 0));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn refused_addressed_open_preserves_the_remote_socks_status() {
+        let budget = Arc::new(Budget::default());
+        let connector = Connector::new(budget.clone());
+        let metrics = stats::Metrics::new("refused-test");
+        let mut mux = Mux::client(
+            Listeners::default(),
+            &test_policy(),
+            metrics.scope("refused", stats::FORWARD),
+            Some(connector.clone()),
+        )
+        .unwrap();
+        let request = tokio::spawn(async move {
+            connector
+                .open(Destination::Ip("127.0.0.1:1".parse().unwrap()))
+                .await
+        });
+        while budget.snapshot().0 == 0 {
+            tokio::task::yield_now().await;
+        }
+        mux.service_commands();
+        let id = *mux.streams.keys().next().unwrap();
+        mux.receive(incoming(
+            id,
+            Frame::Data {
+                offset: 0,
+                fin: true,
+                data: vec![proxy::REFUSED],
+            },
+        ));
+        let error = request.await.unwrap().err().expect("refused destination");
+        assert_eq!(error.downcast_ref::<OpenError>().unwrap().0, proxy::REFUSED);
+        assert!(mux.streams.is_empty());
+        drop(mux);
+        assert_eq!(budget.snapshot(), (0, 0));
+    }
+
+    #[test]
+    fn a_half_closed_sender_does_not_release_unwritten_receive_credit() {
+        let budget = Budget::default();
+        let lease = budget.try_flow().unwrap();
+        let now = Instant::now();
+        let mut send = stream::Sender::new(false);
+        let mut recv = stream::Receiver::default();
+        lease.retain_tx(lease.tx.try_take(3, true).unwrap());
+        send.push(b"out");
+        send.finish();
+        let sent = send.poll_transmit(now).unwrap();
+        assert!(matches!(sent.frame, Frame::Data { fin: true, .. }));
+        lease.retain_rx(lease.rx.try_take(4, true).unwrap());
+        assert_eq!(
+            recv.on_data(0, true, b"back".to_vec(), now).unwrap(),
+            b"back"
+        );
+        let (released, _) = send
+            .on_ack(
+                &stream::Ack {
+                    cumulative: 4,
+                    limit: stream::INITIAL_WINDOW,
+                    duplicate_bytes: 0,
+                    ranges: Vec::new(),
+                },
+                now,
+            )
+            .unwrap();
+        assert_eq!(released, 3, "virtual FIN has no byte credit");
+        lease.release_tx(released as usize);
+        assert!(send.finished());
+        assert!(!recv.finished());
+        assert_eq!(budget.snapshot(), (1, 4));
+        recv.consumed(4, stream::INITIAL_WINDOW);
+        lease.release_rx(4);
+        assert!(recv.finished());
+        assert_eq!(budget.snapshot(), (1, 0));
+        drop(lease);
+        assert_eq!(budget.snapshot(), (0, 0));
     }
 
     #[tokio::test(flavor = "current_thread")]

@@ -30,6 +30,7 @@ pub struct Server {
     exit: String,
     rate: Arc<Rate>,
     bonds: Arc<super::bond::Registry>,
+    stream_budget: Arc<crate::runtime::tunnel::tcp::Budget>,
     connections: Arc<Semaphore>,
     streams: Arc<Semaphore>,
     rpcs: Arc<Semaphore>,
@@ -68,11 +69,14 @@ impl Server {
             token.len() == 64 && token.bytes().all(|b| b.is_ascii_hexdigit()),
             "invalid proxy token"
         );
+        let rate = Arc::new(Rate::new(rate_bps));
+        let stream_budget = Arc::new(crate::runtime::tunnel::tcp::Budget::with_rate(rate.clone()));
         Ok(Arc::new(Self {
             config,
             token,
             exit,
-            rate: Arc::new(Rate::new(rate_bps)),
+            rate,
+            stream_budget,
             bonds: super::bond::Registry::new(),
             connections: Arc::new(Semaphore::new(MAX_CONNECTIONS)),
             streams: Arc::new(Semaphore::new(MAX_STREAMS)),
@@ -84,8 +88,14 @@ impl Server {
             rejected: AtomicU64::new(0),
         }))
     }
+    pub(crate) fn stream_budget(&self) -> Arc<crate::runtime::tunnel::tcp::Budget> {
+        self.stream_budget.clone()
+    }
     pub fn snapshot(&self) -> Snapshot {
-        let (tcp_flows, buffered_bytes) = self.bonds.snapshot();
+        let (legacy_flows, legacy_buffered) = self.bonds.snapshot();
+        let (stream_flows, stream_buffered) = self.stream_budget.snapshot();
+        let tcp_flows = legacy_flows + stream_flows;
+        let buffered_bytes = legacy_buffered + stream_buffered;
         Snapshot {
             tcp_flows,
             buffered_bytes,

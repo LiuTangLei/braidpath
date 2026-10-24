@@ -1,6 +1,6 @@
 # BraidPath
 
-The throughput `main` branch also includes an opt-in [independent bulk FEC
+The UDP tunnel on `main` also includes an opt-in [independent bulk FEC
 extension](docs/independent-fec.md): `--fec 16 --fec-repairs 2` with explicit
 mixed FEC. Existing single-repair defaults remain unchanged; this is not a
 public-network performance or reliable-delivery guarantee.
@@ -16,7 +16,7 @@ BraidPath is a Rust multipath transport project combining **forward error correc
 
 “Braid” means weaving several imperfect paths into a more resilient connection.
 
-> **Status: experimental UDP tunnel and TCP/UDP proxy.** v0.4.0 replaces the TCP proxy data plane with single-connection aggregation: one SOCKS TCP connection uses several cooperating server paths to one client-selected exit and one destination TCP socket. Each exit retains its own local SOCKS5 port for Clash selection. Sequence/offset records, bounded replay, independent progress acknowledgements and path probes preserve the flow across relay failures. v0.4.1 assigns download ranges by expected path arrival with record-level re-requests of a stalled head, returns retryable busy replies instead of resetting flows when exit memory or handlers are full, admits 256 aggregate flows per exit, and feeds proxy path health to entrance selection. v0.4.2 accounts for queued ranges before a reply arrives and exposes low-frequency native transport counters. v0.4.3 uses BBR in both proxy directions with packet-scoped delivery sampling, corrects startup/queue-drain behavior, and measures download capacity across concurrent requests on each path to avoid short-burst scheduling swings. The default maximum is four paths, configurable with `--paths`; the operational rate ceiling remains 10 Gbit/s. UDP proxying and the existing FEC tunnel retain their separate behavior. See the [proxy and distributed-server guide](docs/mesh.md). Local correctness tests and measured WAN performance are separate validation gates; aggregate bandwidth is constrained by shared links and the chosen exit.
+> **Status: experimental v0.5.0 development.** TCP proxying now uses the aggregate DATAGRAM engine while retaining main's mesh discovery, authentication, exit selection and local SOCKS5 listeners. One local TCP connection becomes one destination TCP connection at its selected exit. Byte-offset selective acknowledgments, fine-grained repair across surviving paths and automatic FEC provide reliability above the shared scheduler; TCP payload does not use per-path reliable QUIC streams. Each exit has its own SOCKS5 port for Clash. The TCP profile uses ALPN `braidpath-stream/2` and capability `proxy-stream-v2`; upgrade clients and servers together. SOCKS UDP retains the native `braidpath-proxy/1` profile without FEC. The default maximum is four cooperating paths and the operational ceiling remains 10 Gbit/s. See the [proxy and distributed-server guide](docs/mesh.md). WAN throughput, stability and single-connection multipath gain require separate acceptance; shared links and exit capacity still bound useful throughput.
 
 ## One interface works. Several can contribute.
 
@@ -90,17 +90,19 @@ Follow the [runtime guide](docs/runtime.md) for credentials, local forwarding, m
 | Equal servers, key-based enrollment, discovery and exit selection | Implemented; [operation and limits](docs/mesh.md) |
 | Fixed-target opaque relays with source allowlists | Implemented |
 | Interface × entrance paths | Ordinary and mesh clients; Linux interface binding and portable source-IP binding |
-| Round robin and optional quality-weighted scheduling | Implemented baselines; weighted service is charged on actual admitted bytes |
+| Datagram round robin and optional quality-weighted scheduling | Implemented baselines; weighted service is charged on actual admitted bytes |
 | Per-flow queues, original-ingress deadlines, admission-based repair credit | Implemented bounded mechanisms |
 | Adaptive pacing, sender-age admission, idle health probes and feedback v2 | Implemented opt-in mode; performance acceptance pending |
 | Aggregate and explicit bottleneck-group caps | Implemented; not automatic bottleneck detection or fairness proof |
 | Startup/outage recovery and explicit session-epoch replacement | Implemented in adaptive mode and mesh clients; bounded backoff and server retention |
 | Receiver-local adaptive FEC retention | Implemented as an opt-in bounded policy |
 | Two independent bulk repair equations | Opt-in mixed 16+2 mode; single-repair defaults unchanged; WAN tradeoffs not yet verified |
-| Rate-adaptive FEC strength and coupled congestion control | Deferred or separate research work |
-| Reliable streams, TCP, TUN, stream fallback, browser fingerprint shaping | Planned or deferred |
+| Reliable ordered TCP over aggregate DATAGRAMs | Implemented experimental profile; byte SACK, cross-path repair, half-close and bounded cleanup |
+| Automatic FEC strength for aggregate TCP | Implemented using qualified receiver loss feedback and bounded repair credit |
+| Automatic shared-bottleneck detection and coupled congestion control | Separate research work |
+| TUN, reliable-carrier fallback, browser fingerprint shaping | Planned or deferred |
 
-XOR cannot generally recover an entire failed path. Sparse traffic may exhaust the repair budget; FEC does not guarantee delivery. `--fec 4`, `--block-ms 3` and the 30% repair budget are unchanged; the new mechanisms do not establish a new FEC default. Multiple connections can compete unfairly at a shared bottleneck even with explicit group caps. Multi-interface capacity, competition fairness, independent HTTP/3 interoperability and deployment reachability remain separate acceptance gates.
+For the UDP tunnel, XOR cannot generally recover an entire failed path. Sparse traffic may exhaust the repair budget; FEC does not guarantee delivery. `--fec 4`, `--block-ms 3` and the 30% repair budget are unchanged; the new mechanisms do not establish a new FEC default. Multiple connections can compete unfairly at a shared bottleneck even with explicit group caps. Multi-interface capacity, competition fairness, independent HTTP/3 interoperability and deployment reachability remain separate acceptance gates.
 
 An experimental `--fec 0 --redundancy-percent 0 --small-fec-bytes 128` gives each
 successfully admitted record with at most 128 application bytes one immediate

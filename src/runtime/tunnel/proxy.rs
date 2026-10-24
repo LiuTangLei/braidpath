@@ -13,7 +13,7 @@ use std::{
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::{TcpStream, lookup_host},
+    net::TcpStream,
     time::timeout,
 };
 
@@ -43,12 +43,12 @@ pub struct Access {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) enum Destination {
+pub(crate) enum Destination {
     Ip(SocketAddr),
     Domain(String, u16),
 }
 impl Destination {
-    pub(super) fn encode(&self) -> Vec<u8> {
+    pub(crate) fn encode(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(MAX_HEADER);
         let port = match self {
             Destination::Ip(SocketAddr::V4(a)) => {
@@ -71,7 +71,7 @@ impl Destination {
         out
     }
     /// `Ok(None)` asks for more bytes; `Err` is a malformed header.
-    pub(super) fn decode(b: &[u8]) -> Result<Option<(Self, usize)>, ()> {
+    pub(crate) fn decode(b: &[u8]) -> Result<Option<(Self, usize)>, ()> {
         let Some(&kind) = b.first() else {
             return Ok(None);
         };
@@ -308,13 +308,13 @@ pub(super) async fn connect(
     allow_private: bool,
 ) -> Result<TcpStream, u8> {
     timeout(CONNECT_TIMEOUT, async {
-        let candidates: Vec<SocketAddr> = match destination {
-            Destination::Ip(address) => vec![address],
-            Destination::Domain(host, port) => lookup_host((host.as_str(), port))
-                .await
-                .map_err(|_| HOST_UNREACHABLE)?
-                .collect(),
-        };
+        let candidates = crate::runtime::proxy::resolve_stream_target(&destination, allow_private)
+            .await
+            .map_err(|error| {
+                error
+                    .downcast_ref::<crate::runtime::proxy::ReplyError>()
+                    .map_or(HOST_UNREACHABLE, |error| error.0)
+            })?;
         let mut status = if candidates.is_empty() {
             HOST_UNREACHABLE
         } else {

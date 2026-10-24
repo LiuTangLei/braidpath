@@ -576,6 +576,7 @@ pub async fn run() -> Result<()> {
             tracing::info!(%exit, paths=entrances.len(), "selected mesh exit and cooperating entrances");
             let result = tunnel::client_with_routes(
                 tunnel::ClientOptions {
+                    stream_connector: None,
                     listen,
                     tcp_listen: None,
                     proxy_listen: None,
@@ -665,6 +666,7 @@ pub async fn run() -> Result<()> {
             session_policy.streams = tcp_listen.is_some();
             session_policy.proxy = proxy_listen.is_some();
             let result = tunnel::client(tunnel::ClientOptions {
+                stream_connector: None,
                 stats: reporter.metrics.clone(),
                 adaptive_fec_retention,
                 listen,

@@ -741,6 +741,9 @@ impl Sender {
         let release_to = cumulative.min(self.written).max(self.base);
         let released = release_to - self.base;
         self.buffer.drain(..released as usize);
+        if self.buffer.capacity() > (128 * 1024).max(self.buffer.len().saturating_mul(4)) {
+            self.buffer.shrink_to_fit();
+        }
         self.base = release_to;
         if self.needs_probe() {
             self.probe_at = Some(now);
@@ -904,6 +907,23 @@ impl Default for Receiver {
     }
 }
 impl Receiver {
+    /// Unique bytes a frame would add; duplicates never reserve memory twice.
+    pub fn additional_bytes(&self, offset: u64, len: usize) -> usize {
+        let end = offset + len as u64;
+        let mut cursor = offset.max(self.cumulative).min(end);
+        if let Some((&start, data)) = self.ranges.range(..=cursor).next_back() {
+            cursor = cursor.max(start + data.len() as u64).min(end);
+        }
+        let mut additional = 0;
+        for (&start, data) in self.ranges.range(cursor..end) {
+            additional += start.saturating_sub(cursor);
+            cursor = cursor.max(start + data.len() as u64).min(end);
+        }
+        (additional + end - cursor) as usize
+    }
+    pub fn cumulative(&self) -> u64 {
+        self.cumulative
+    }
     /// Accept a data frame; returns in-order bytes now ready for the application.
     pub fn on_data(
         &mut self,

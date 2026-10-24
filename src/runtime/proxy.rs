@@ -1,4 +1,4 @@
-//! Authenticated TCP streams and UDP associations, independent of FEC tunnels.
+//! Per-exit SOCKS5 entrances over aggregate TCP streams and native UDP associations.
 use anyhow::{Result, ensure};
 use std::{
     sync::{Arc, Mutex},
@@ -17,9 +17,11 @@ mod protocol;
 mod server;
 mod socks;
 pub use client::{ClientOptions, Listener, client};
+pub(crate) use protocol::ReplyError;
 pub use server::{Server, ServerConfig, Snapshot};
 
 pub(crate) const ALPN: &[u8] = b"braidpath-proxy/1";
+pub(crate) const STREAM_CAPABILITY: &str = "proxy-stream-v2";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 const UDP_IDLE: Duration = Duration::from_secs(60);
@@ -37,6 +39,20 @@ async fn udp_socket(address: std::net::SocketAddr) -> Result<tokio::net::UdpSock
     Ok(socket)
 }
 
+/// Resolve once under the native proxy DNS worker and destination policy bounds.
+pub(crate) async fn resolve_stream_target(
+    target: &crate::runtime::tunnel::StreamTarget,
+    allow_private: bool,
+) -> Result<Vec<std::net::SocketAddr>> {
+    let address = match target {
+        crate::runtime::tunnel::StreamTarget::Ip(address) => protocol::Address::Ip(*address),
+        crate::runtime::tunnel::StreamTarget::Domain(host, port) => {
+            protocol::Address::Domain(host.clone(), *port)
+        }
+    };
+    address.resolve(allow_private).await
+}
+
 struct CloseConnection(quinn::Connection);
 impl Drop for CloseConnection {
     fn drop(&mut self) {
@@ -51,13 +67,13 @@ impl Drop for AbortTask {
 }
 
 // One bounded bucket for both directions and all proxy connections on a host.
-struct Rate {
+pub(crate) struct Rate {
     state: Mutex<(Instant, f64)>,
     bytes_per_sec: f64,
     burst: f64,
 }
 impl Rate {
-    fn new(bps: u64) -> Self {
+    pub(crate) fn new(bps: u64) -> Self {
         let bytes_per_sec = bps as f64 / 8.0;
         // Retain enough credit for 10 ms of traffic. A fixed 128 KiB bucket
         // would discard most refill credit at high rates on millisecond timers.
@@ -83,7 +99,7 @@ impl Rate {
             ))
         }
     }
-    async fn acquire(&self, n: usize) {
+    pub(crate) async fn acquire(&self, n: usize) {
         while let Some(delay) = self.delay(n) {
             tokio::time::sleep(delay).await;
         }

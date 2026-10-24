@@ -112,7 +112,13 @@ async fn echo() -> (SocketAddr, Task<()>) {
                     let (mut tcp,_) = accepted.unwrap();
                     tasks.spawn(async move {
                         let mut buffer = [0;8192];
-                        loop { let n = tcp.read(&mut buffer).await.unwrap(); if n == 0 { tcp.write_all(b"FIN").await.unwrap(); break; } tcp.write_all(&buffer[..n]).await.unwrap(); }
+                        loop {
+                            match tcp.read(&mut buffer).await {
+                                Ok(0) => { let _ = tcp.write_all(b"FIN").await; break; }
+                                Ok(n) => { if tcp.write_all(&buffer[..n]).await.is_err() { break; } }
+                                Err(_) => break,
+                            }
+                        }
                     });
                 }
                 _ = tasks.join_next(), if !tasks.is_empty() => {}
@@ -239,7 +245,7 @@ fn ambiguous_or_unusable_socks_listener_plans_are_rejected() {
 async fn separate_tcp_listeners_pin_exits_half_close_and_share_connections() {
     let root = tempfile::tempdir().unwrap();
     let root = root.path();
-    let (a, _a) = start(root, "a", None, true).await;
+    let (a, _a, metrics_a) = start_metered(root, "a", None, true).await;
     let (b, _b) = start(root, "b", Some(a), true).await;
     let identity = identity(root, "client");
     let pool = client::Pool::new(
@@ -262,16 +268,23 @@ async fn separate_tcp_listeners_pin_exits_half_close_and_share_connections() {
     assert_eq!(status, 0);
     for at in [a, b] {
         let s = identity.status(at).await.unwrap();
-        assert!(s.capabilities.features.iter().any(|f| f == "proxy-tcp-v1"));
+        assert!(
+            s.capabilities
+                .features
+                .iter()
+                .any(|f| f == "proxy-stream-v2")
+        );
         assert_eq!(s.proxy.unwrap().streams, 1);
     }
     let (mut third, status, _) = socks(listen_a, TCP, Address::Ip(target)).await;
     assert_eq!(status, 0);
     assert_eq!(identity.status(a).await.unwrap().proxy.unwrap().streams, 2);
-    // Native connections are pooled by server path, rather than by TCP flow.
-    // With two cluster members this stays bounded by two, even for three flows.
+    // All TCP streams to this exit share one aggregate session across its paths.
     let snapshot = identity.status(a).await.unwrap().proxy.unwrap();
-    assert!((1..=2).contains(&snapshot.connections));
+    assert!(snapshot.connections <= 2);
+    let mut sessions = 0;
+    metrics_a.state(|state| sessions = state.sessions.len());
+    assert_eq!(sessions, 1);
     assert_eq!(snapshot.tcp_flows, 2);
     let payload: Vec<_> = (0..131_072).map(|i| (i % 251) as u8).collect();
     for tcp in [&mut first, &mut second, &mut third] {
@@ -452,6 +465,129 @@ async fn wrong_token_wrong_exit_private_destination_and_unsupported_command_are_
     let (_, status, _) = socks(listen, 2, Address::Ip(target)).await;
     assert_eq!(status, 7);
     empty(&identity, at).await;
+}
+
+#[tokio::test]
+async fn tcp_connect_failure_is_reported_before_socks_success() {
+    let root = tempfile::tempdir().unwrap();
+    let (at, _server) = start(root.path(), "a", None, true).await;
+    let identity = identity(root.path(), "connect-failure-client");
+    let pool = client::Pool::new(identity.clone(), vec![node("a", at)], vec!["a".into()]).unwrap();
+    let (listen, _listener) = local_listener(pool.clone(), "a").await;
+    let unused = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let target = unused.local_addr().unwrap();
+    drop(unused);
+    let (mut tcp, status, bound) = timeout(
+        Duration::from_secs(8),
+        socks(listen, TCP, Address::Ip(target)),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        status, 5,
+        "a refused target must not produce a successful SOCKS reply"
+    );
+    assert_eq!(bound.port(), 0);
+    assert_eq!(
+        timeout(Duration::from_secs(1), tcp.read(&mut [0; 1]))
+            .await
+            .unwrap()
+            .unwrap(),
+        0
+    );
+    empty(&identity, at).await;
+    pool.shutdown().await;
+    assert_eq!(pool.stream_budget.snapshot(), (0, 0));
+}
+
+#[tokio::test]
+async fn aggregate_proxy_rejects_bad_credentials_and_wrong_exit_before_target_connect() {
+    let root = tempfile::tempdir().unwrap();
+    let root = root.path();
+    let (at, _server) = start(root, "a", None, true).await;
+    let valid = identity(root, "valid-client");
+    let mut key: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(root.join("a/client-key.json")).unwrap()).unwrap();
+    key["token"] = serde_json::Value::String("0".repeat(64));
+    let bad_key = root.join("bad-client-key.json");
+    std::fs::write(&bad_key, serde_json::to_vec(&key).unwrap()).unwrap();
+    let bad = mesh::ClientIdentity::open(root.join("bad-client"), &bad_key).unwrap();
+    let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let target_address = target.local_addr().unwrap();
+    for (client_identity, exit) in [(bad, "a"), (valid.clone(), "wrong")] {
+        let pool =
+            client::Pool::new(client_identity, vec![node(exit, at)], vec![exit.into()]).unwrap();
+        let (listen, listener) = local_listener(pool.clone(), exit).await;
+        let (_, status, _) = timeout(
+            Duration::from_secs(8),
+            socks(listen, TCP, Address::Ip(target_address)),
+        )
+        .await
+        .unwrap();
+        assert_ne!(status, 0);
+        assert!(
+            timeout(Duration::from_millis(50), target.accept())
+                .await
+                .is_err()
+        );
+        drop(listener);
+        pool.shutdown().await;
+        assert_eq!(pool.stream_budget.snapshot(), (0, 0));
+    }
+    empty(&valid, at).await;
+}
+
+#[tokio::test]
+async fn aggregate_proxy_requires_the_advertised_stream_capability() {
+    let root = tempfile::tempdir().unwrap();
+    let at = address();
+    let metrics = stats::Metrics::new("no-proxy-capability");
+    let _server = Task(tokio::spawn(mesh::serve(mesh::ServerOptions {
+        dir: root.path().join("a"),
+        id: "a".into(),
+        listen: at,
+        advertise: at,
+        relay_ports: None,
+        target: Some(address()),
+        proxy: None,
+        join: None,
+        join_key: None,
+        rate: crate::runtime::MAX_RATE_BPS,
+        stats: metrics.clone(),
+    })));
+    timeout(Duration::from_secs(5), async {
+        while !metrics.is_ready() {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let identity = identity(root.path(), "capability-client");
+    let status = identity.status(at).await.unwrap();
+    assert!(
+        !status
+            .capabilities
+            .features
+            .iter()
+            .any(|f| f == "proxy-stream-v2")
+    );
+    let pool = client::Pool::new(identity, vec![node("a", at)], vec!["a".into()]).unwrap();
+    let (listen, _listener) = local_listener(pool.clone(), "a").await;
+    let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let (_, code, _) = timeout(
+        Duration::from_secs(8),
+        socks(listen, TCP, Address::Ip(target.local_addr().unwrap())),
+    )
+    .await
+    .unwrap();
+    assert_ne!(code, 0);
+    assert!(
+        timeout(Duration::from_millis(50), target.accept())
+            .await
+            .is_err()
+    );
+    pool.shutdown().await;
+    assert_eq!(pool.stream_budget.snapshot(), (0, 0));
 }
 
 #[test]
@@ -644,9 +780,8 @@ async fn one_tcp_connection_uses_multiple_servers_and_survives_a_relay_stopping(
     let target_task = Task(tokio::spawn(async move {
         let (mut tcp, _) = target.accept().await.unwrap();
         count.fetch_add(1, Ordering::Relaxed);
-        // A backlog at the exit spreads ranges over paths; a source slower
-        // than one path is served by the lowest-RTT path alone. The second
-        // backlog starts only after the relay has stopped.
+        // Send the second half only after a relay has stopped. Both halves
+        // belong to the same target TCP socket and must survive path repair.
         let (head, tail) = payload.split_at(payload.len() / 2);
         tcp.write_all(head).await.unwrap();
         wait.await.unwrap();
@@ -655,7 +790,7 @@ async fn one_tcp_connection_uses_multiple_servers_and_survives_a_relay_stopping(
         let mut upload = Vec::new();
         tcp.read_to_end(&mut upload).await.unwrap();
         assert_eq!(upload, b"single-flow-upload");
-        // No second target socket may be opened by record replay or path replacement.
+        // Repair and path replacement must keep the original target socket.
         assert!(
             timeout(Duration::from_millis(10), target.accept())
                 .await
@@ -705,7 +840,7 @@ async fn one_tcp_connection_uses_multiple_servers_and_survives_a_relay_stopping(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn aggregate_client_reset_reclaims_tcp_rpc_and_payload_resources() {
+async fn aggregate_client_reset_reclaims_tcp_and_payload_resources() {
     use std::sync::atomic::{AtomicBool, Ordering};
     let root = tempfile::tempdir().unwrap();
     let root = root.path();
@@ -877,12 +1012,11 @@ async fn aggregate_shutdown_releases_optional_leases_and_flow_admission_credit()
         .expect("normal shutdown left flow owners or leases pending");
     empty(&identity, a).await;
     assert_eq!(identity.status(b).await.unwrap().leases, 0);
-    assert_eq!(pool.flow_credit.available_permits(), MAX_STREAMS);
+    assert_eq!(pool.stream_budget.snapshot(), (0, 0));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn queued_download_is_charged_before_the_reply_header_and_cancellation_reclaims_it() {
-    use super::bond::{self, Operation, Reply, StreamSink};
+async fn queued_stream_bytes_are_charged_and_reset_reclaims_them_with_downlink_blocked() {
     use std::sync::atomic::{AtomicBool, Ordering};
     let root = tempfile::tempdir().unwrap();
     let (at, _server) = start(root.path(), "a", None, true).await;
@@ -913,72 +1047,48 @@ async fn queued_download_is_charged_before_the_reply_header_and_cancellation_rec
         }
     }));
     pool.test_set_routes("a", vec![via]);
+    let (listen, _listener) = local_listener(pool.clone(), "a").await;
     let (target, _echo) = echo().await;
-    let key = [83; 32];
-    let usage = Arc::new(Mutex::new(std::collections::BTreeMap::new()));
-    assert!(matches!(
-        pool.call("a", key, Operation::Open(Address::Ip(target)), &usage)
-            .await
-            .unwrap(),
-        Reply::Opened(_)
-    ));
-    // Authentication is complete. Withhold every response packet, including
-    // the range header: pending work must already affect subsequent routing.
+    let (mut tcp, status, _) = socks(listen, TCP, Address::Ip(target)).await;
+    assert_eq!(status, 0);
+    // Keep the upstream usable so cancellation can reach the exit. No received
+    // data or ACK can get back: retained bytes must remain charged throughout.
     blocked.store(true, Ordering::Release);
-    let budget = Arc::new(Semaphore::new(bond::CHUNK * 4));
-    let (events, _incoming) = tokio::sync::mpsc::channel(4);
-    let credit = budget
-        .clone()
-        .acquire_many_owned((bond::CHUNK * 4) as u32)
+    timeout(Duration::from_secs(2), tcp.write_all(&vec![83; 128 * 1024]))
         .await
+        .unwrap()
         .unwrap();
-    let task = tokio::spawn({
-        let pool = pool.clone();
-        let usage = usage.clone();
-        async move {
-            let mut sink = StreamSink {
-                events,
-                credit,
-                next_sequence: 0,
-                end: None,
-                usage: usage.clone(),
-                route: Arc::new(Mutex::new(via)),
-                delivery: None,
-                interactive: false,
-                avoid: None,
-            };
-            pool.call_stream(
-                "a",
-                key,
-                Operation::Pull {
-                    sequence: 0,
-                    acknowledged: 0,
-                    count: 4,
-                },
-                &usage,
-                &mut sink,
-            )
-            .await
-        }
-    });
-    let queued = timeout(Duration::from_secs(1), async {
-        while pool.service_snapshot("a")[&via].1 != bond::CHUNK * 4 {
-            tokio::time::sleep(Duration::from_millis(2)).await;
+    timeout(Duration::from_secs(2), async {
+        loop {
+            let snapshot = identity.status(at).await.unwrap().proxy.unwrap();
+            if snapshot.buffered_bytes > 0 {
+                assert_eq!(snapshot.tcp_flows, 1);
+                assert!(snapshot.buffered_bytes <= 64 * 1024 * 1024);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
         }
     })
-    .await;
-    task.abort();
-    let _ = task.await;
-    assert!(
-        queued.is_ok(),
-        "dispatched data remained invisible until the reply header"
-    );
-    assert_eq!(pool.service_snapshot("a")[&via].1, 0);
-    assert_eq!(budget.available_permits(), bond::CHUNK * 4);
+    .await
+    .expect("stream bytes were retained without appearing in the host budget");
+    socket2::SockRef::from(&tcp)
+        .set_linger(Some(Duration::ZERO))
+        .unwrap();
+    drop(tcp);
+    // Local ownership must be reclaimed even with no ACK path. An exhausted
+    // QUIC congestion window cannot promise delivery of RESET until that
+    // path recovers, so assert peer reclamation after restoring delivery.
+    timeout(Duration::from_secs(4), async {
+        while pool.stream_budget.snapshot() != (0, 0) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("cancelled local flow kept its stream or payload credit");
     blocked.store(false, Ordering::Release);
-    pool.call("a", key, Operation::Close, &usage).await.unwrap();
     empty(&identity, at).await;
     pool.shutdown().await;
+    empty(&identity, at).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1034,9 +1144,9 @@ async fn failed_proxy_relay_is_reported_and_replaced_by_another_server() {
     let root = tempfile::tempdir().unwrap();
     let root = root.path();
     let (a, _a) = start(root, "a", None, true).await;
-    let (b, _b) = start(root, "b", Some(a), true).await;
-    let (c, _c) = start(root, "c", Some(a), true).await;
-    let (d, _d) = start(root, "d", Some(a), true).await;
+    let (b, relay_b) = start(root, "b", Some(a), true).await;
+    let (c, relay_c) = start(root, "c", Some(a), true).await;
+    let (d, relay_d) = start(root, "d", Some(a), true).await;
     let identity = identity(root, "health-client");
     let pool = client::Pool::new(
         identity.clone(),
@@ -1044,7 +1154,6 @@ async fn failed_proxy_relay_is_reported_and_replaced_by_another_server() {
         vec!["a".into()],
     )
     .unwrap();
-    // The exit plus two relays leaves one server available as a replacement.
     pool.set_path_limit(3);
     let original = timeout(Duration::from_secs(5), async {
         loop {
@@ -1057,32 +1166,62 @@ async fn failed_proxy_relay_is_reported_and_replaced_by_another_server() {
     })
     .await
     .unwrap();
-    let failed = *original.iter().find(|address| **address != a).unwrap();
-    let connection = pool.test_connect_path("a", failed).await;
-    pool.test_fail_path("a", failed);
-    pool.report_health();
+    pool.prepare_stream("a").await.unwrap();
+    timeout(Duration::from_secs(3), async {
+        while pool.transport_snapshot("a").len() != 3 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("aggregate paths did not authenticate");
+    let (listen, _listener) = local_listener(pool.clone(), "a").await;
+    let (target, _echo) = echo().await;
+    let (mut tcp, status, _) = socks(listen, TCP, Address::Ip(target)).await;
+    assert_eq!(status, 0);
+    let mut relays = [(b, Some(relay_b)), (c, Some(relay_c)), (d, Some(relay_d))];
+    let mut stopped = false;
+    for (address, task) in &mut relays {
+        if identity.status(*address).await.unwrap().leases > 0 {
+            drop(task.take());
+            stopped = true;
+            break;
+        }
+    }
+    assert!(stopped, "fault injection did not stop an allocated relay");
     timeout(Duration::from_secs(5), async {
         loop {
-            // The production health tick must apply route updates even without
-            // another RPC calling paths(). Otherwise an idle retired connection
-            // survives and its next records wait for the stall timeout.
+            // Exercise the same TCP socket while the runtime observes a real
+            // relay shutdown and the selector replaces its lease.
+            tcp.write_all(&[71; 1024]).await.unwrap();
+            let mut reply = [0; 1024];
+            tcp.read_exact(&mut reply).await.unwrap();
+            assert_eq!(reply, [71; 1024]);
             pool.report_health();
-            if connection.close_reason().is_some() {
+            let routes = pool.test_addresses("a").await;
+            if routes.len() == 3
+                && routes.iter().any(|p| !original.contains(p))
+                && pool
+                    .transport_snapshot("a")
+                    .keys()
+                    .all(|p| routes.contains(p))
+            {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
     .await
-    .expect("failed proxy relay was never replaced");
-    let routes = pool.test_addresses("a").await;
-    assert_eq!(routes.len(), 3);
-    assert!(!routes.contains(&failed));
+    .expect("failed aggregate relay was never replaced");
+    tcp.shutdown().await.unwrap();
+    let mut end = Vec::new();
+    tcp.read_to_end(&mut end).await.unwrap();
+    assert_eq!(end, b"FIN");
+    empty(&identity, a).await;
     pool.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn one_tcp_upload_replays_lost_records_without_duplicating_target_bytes() {
+async fn one_tcp_upload_repairs_loss_without_duplicating_target_bytes() {
     let root = tempfile::tempdir().unwrap();
     let root = root.path();
     let (a, _a) = start(root, "a", None, true).await;

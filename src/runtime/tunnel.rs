@@ -42,6 +42,10 @@ const MAX_FLOWS: usize = 64;
 const WIRE_QUEUE: usize = 4096;
 const SESSION_IDLE_GRACE: Duration = Duration::from_secs(120);
 const SESSION_PATH: &str = "/session";
+pub(crate) const STREAM_ALPN: &[u8] = b"braidpath-stream/2";
+// An authenticated stream/2 owner is discarding this epoch, rather than
+// temporarily replacing a transport path. Its remote stream budget can end now.
+const STREAM_SESSION_STOP: u32 = 0x4250;
 pub(crate) const ADMISSION_TIMEOUT_MS: u64 = 10_000;
 mod associate;
 mod coding;
@@ -58,9 +62,12 @@ mod proxy;
 #[cfg(test)]
 mod repair_usefulness_tests;
 mod small_delivery;
-mod tcp;
+pub(crate) mod tcp;
 mod writer;
 pub use proxy::Access as ProxyAccess;
+pub(crate) use proxy::Destination as StreamTarget;
+#[doc(hidden)]
+pub use tcp::Connector as StreamConnector;
 
 /// Encoded symbols up to this size are latency traffic: stream
 /// acknowledgments, keystrokes, DNS and similar small datagrams.
@@ -3179,6 +3186,7 @@ async fn session_loop(
     mut events: mpsc::Receiver<Event>,
     target: Option<SocketAddr>,
     tcp: tcp::Targets,
+    tcp_budget: Arc<tcp::Budget>,
 ) {
     if *session.stop.borrow() {
         session.done.store(true, Ordering::Release);
@@ -3217,10 +3225,12 @@ async fn session_loop(
         ),
     );
     let mut flows: HashMap<u32, (Arc<UdpSocket>, Instant)> = HashMap::new();
-    let mut streams = tcp::Mux::server(tcp, &session.policy, session.returning.clone());
+    let mut streams = tcp::Mux::server(tcp, &session.policy, session.returning.clone(), tcp_budget);
     let small_threshold = ingress::small_threshold(&session.policy);
     let mut next_id = 0u64;
     let mut tick = interval(Duration::from_secs(5));
+    let mut telemetry: [transport::ProxyTelemetry; MAX_PATHS] =
+        std::array::from_fn(|_| Default::default());
     let mut dropped = 0u64;
     loop {
         if *stop.borrow() {
@@ -3241,6 +3251,9 @@ async fn session_loop(
             _=tick.tick()=>{
                 flows.retain(|_,(_,t)|t.elapsed()<Duration::from_secs(60));
                 let p=session.paths.lock().expect("paths lock");
+                if session.policy.streams || session.policy.proxy {
+                    for path in p.iter() { telemetry[usize::from(path.id)].report(&path.conn,"server","local"); }
+                }
                 for path in p.iter(){let stats=path.conn.stats();info!(path=path.id,rtt_ms=path.conn.rtt_hint().as_secs_f64()*1000.0,tx_packets=stats.udp_tx.datagrams,rx_packets=stats.udp_rx.datagrams,tx_bytes=stats.udp_tx.bytes,rx_bytes=stats.udp_rx.bytes,lost=stats.path.lost_packets,cwnd=stats.path.cwnd,"server path statistics");}
                 info!(paths=p.len(),flows=flows.len(),originals=decoder.originals,recovered=decoder.recovered,duplicates=decoder.duplicates,invalid=decoder.invalid,dropped,ingress_drops=session.ingress_drops.load(Ordering::Relaxed),"server session");
             },
@@ -3419,6 +3432,16 @@ async fn serve_with_budgets(
             || options.proxy.is_some(),
         "configure a UDP target, a TCP target, a proxy, or several"
     );
+    // A shared proxy endpoint also serves aggregate TCP downloads. Match their
+    // validated ACK cadence; peers may clamp or decline this QUIC extension.
+    // UDP-only servers retain their ordinary ACK request policy.
+    let ack_request = if ack_request == transport::AckRequest::Unchanged
+        && (options.proxy.is_some() || options.stream_proxy.is_some())
+    {
+        transport::AckRequest::EveryEight
+    } else {
+        ack_request
+    };
     let endpoint = transport::server_with_session_config(
         options.bind,
         &options.cert,
@@ -3431,11 +3454,18 @@ async fn serve_with_budgets(
     )?;
     let secret = Arc::new(format!("Bearer {}", transport::token(&options.token)?));
     let sessions: Sessions = Arc::new(Mutex::new(HashMap::new()));
+    let tcp_budget = options
+        .proxy
+        .as_ref()
+        .map(|server| server.stream_budget())
+        .unwrap_or_else(|| Arc::new(tcp::Budget::default()));
+    let mut tasks = JoinSet::new();
+    // This guard drops before the JoinSet, so cancellation queues an explicit
+    // server close before an aborted H3 handler can send its generic NO_ERROR.
     let _lifetime = ServerLifetime {
         endpoint: endpoint.clone(),
         sessions: sessions.clone(),
     };
-    let mut tasks = JoinSet::new();
     let mut maintenance = interval(Duration::from_secs(1));
     let mut shutdown = Shutdown::new();
     options.stats.readiness(true, 0);
@@ -3457,7 +3487,7 @@ async fn serve_with_budgets(
             incoming=endpoint.accept()=>{
                 let Some(incoming)=incoming else{break};
                 let Ok(permit)=pending_connections.clone().try_acquire_owned() else{incoming.refuse();continue};
-                let sessions=sessions.clone(); let secret=secret.clone(); let target=options.target; let settings=ServerSessionSettings{max_rate:options.max_rate,adaptive_fec_retention:options.adaptive_fec_retention,mesh:mesh.clone(),data_connections:data_connections.clone(),proxy:options.proxy.clone(),tcp:tcp::Targets{fixed:options.tcp_target,proxy:options.stream_proxy}}; let metrics=options.stats.clone();
+                let sessions=sessions.clone(); let secret=secret.clone(); let target=options.target; let settings=ServerSessionSettings{max_rate:options.max_rate,adaptive_fec_retention:options.adaptive_fec_retention,mesh:mesh.clone(),data_connections:data_connections.clone(),proxy:options.proxy.clone(),tcp_budget:tcp_budget.clone(),tcp:tcp::Targets{fixed:options.tcp_target,proxy:options.stream_proxy}}; let metrics=options.stats.clone();
                 tasks.spawn(async move {
                     let mut diagnostic=stats::ConnectionTrace::new(metrics.clone(),incoming.remote_address(),None,"incoming");
                     let result=server_connection(incoming,permit,sessions,secret,target,settings,metrics,&mut diagnostic).await;
@@ -3523,6 +3553,7 @@ struct ServerSessionSettings {
     max_rate: u64,
     adaptive_fec_retention: bool,
     tcp: tcp::Targets,
+    tcp_budget: Arc<tcp::Budget>,
 }
 
 async fn cover_response(
@@ -3556,6 +3587,62 @@ async fn cover_response(
     .await?
 }
 
+fn stream_owner_stopped(stream_transport: bool, reason: Option<&quinn::ConnectionError>) -> bool {
+    stream_transport
+        && matches!(reason, Some(quinn::ConnectionError::ApplicationClosed(close))
+        if close.error_code == quinn::VarInt::from_u32(STREAM_SESSION_STOP))
+}
+
+fn exit_stopped(reason: Option<&quinn::ConnectionError>) -> bool {
+    matches!(reason, Some(quinn::ConnectionError::ApplicationClosed(close))
+        if matches!(close.reason.as_ref(), b"server stopped" | b"shutdown" | b"proxy owner stopped"))
+}
+
+fn exit_terminated(reasons: impl Iterator<Item = Option<quinn::ConnectionError>>) -> bool {
+    let mut observed = false;
+    let mut all_h3_ended = true;
+    for reason in reasons {
+        observed = true;
+        if exit_stopped(reason.as_ref()) {
+            return true;
+        }
+        all_h3_ended &= matches!(reason, Some(quinn::ConnectionError::ApplicationClosed(close))
+            if close.error_code == quinn::VarInt::from_u32(0x100));
+    }
+    observed && all_h3_ended
+}
+
+fn aggregate_protocol(protocol: Option<&[u8]>) -> Result<bool> {
+    match protocol {
+        Some(b"h3") => Ok(false),
+        Some(STREAM_ALPN) => Ok(true),
+        _ => bail!("unsupported aggregate application protocol"),
+    }
+}
+
+fn session_profile(
+    stream_transport: bool,
+    streams: Option<&str>,
+    proxy: Option<&str>,
+) -> Result<(bool, bool)> {
+    if !stream_transport {
+        ensure!(
+            streams.is_none() && proxy.is_none(),
+            "stream profile requires braidpath-stream/2"
+        );
+        return Ok((false, false));
+    }
+    ensure!(
+        matches!(streams, None | Some("2")) && matches!(proxy, None | Some("2")),
+        "unsupported aggregate stream profile"
+    );
+    ensure!(
+        streams.is_some() || proxy.is_some(),
+        "stream protocol requires a stream profile"
+    );
+    Ok((streams.is_some(), proxy.is_some()))
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn server_connection(
     incoming: quinn::Incoming,
@@ -3574,6 +3661,7 @@ async fn server_connection(
         max_rate,
         adaptive_fec_retention,
         tcp,
+        tcp_budget,
     } = settings;
     let conn = timeout(Duration::from_secs(5), incoming).await??;
     diagnostic.handshake_succeeded(&conn);
@@ -3588,6 +3676,13 @@ async fn server_connection(
         };
         return proxy.connection(conn, permit).await;
     }
+    let stream_transport = match aggregate_protocol(protocol.as_deref()) {
+        Ok(stream_transport) => stream_transport,
+        Err(error) => {
+            conn.close(0u32.into(), b"unsupported application protocol");
+            return Err(error);
+        }
+    };
     diagnostic.enter("http3", "http3_setup");
     let mut admission_deadline =
         tokio::time::Instant::now() + Duration::from_millis(ADMISSION_TIMEOUT_MS);
@@ -3656,6 +3751,7 @@ async fn server_connection(
                                 let (req,mut stream)=tokio::time::timeout_at(request_deadline,resolver.resolve_request()).await??;
                                 diagnostic.succeeded();
                                 if let Some(mesh)=&mesh && req.uri().path().starts_with("/mesh/") {
+                                    ensure!(!stream_transport,"mesh control requires h3 protocol");
                                     ensure!(joined.is_none(),"data connection cannot carry mesh control");
                                     if control_permit.is_none() && mesh.authorized(&req) {
                                         // Acquire before handling: no allocations or successful
@@ -3754,13 +3850,10 @@ async fn server_connection(
                                 let fec_repairs=fec_repairs_header(req.headers())?;
                                 let max_message_bytes = req.headers().get("braidpath-message-bytes").map(|v| v.to_str()).transpose()?.unwrap_or("1000").parse::<usize>()?;
                                 let streams=req.headers().get("braidpath-streams").map(|v|v.to_str()).transpose()?;
-                                ensure!(streams.is_none() || streams==Some("1"),"unsupported stream version");
-                                ensure!(streams.is_none() || tcp.fixed.is_some(),"TCP streams are not enabled on this server");
-                                let streams=streams.is_some();
                                 let proxy=req.headers().get("braidpath-proxy").map(|v|v.to_str()).transpose()?;
-                                ensure!(proxy.is_none() || proxy==Some("1"),"unsupported proxy version");
-                                ensure!(proxy.is_none() || tcp.proxy.is_some(),"proxy streams are not enabled on this server");
-                                let proxy=proxy.is_some();
+                                let (streams,proxy)=session_profile(stream_transport,streams,proxy)?;
+                                ensure!(!streams || tcp.fixed.is_some(),"TCP streams are not enabled on this server");
+                                ensure!(!proxy || tcp.proxy.is_some(),"proxy streams are not enabled on this server");
                                 let policy=Policy{max_message_bytes,streams,proxy,
             fec_repairs,small_fec_bytes,mixed_fec,probe_guided_recovery,capacity_probe_bps,adaptive:quality_schedule==Some("adaptive"),latency_target_ms,group_rates,quality_schedule:quality_schedule.is_some(),receiver_feedback:feedback.is_some(),fec:parse_fec(header("braidpath-fec")?).map_err(anyhow::Error::msg)?,redundancy:header("braidpath-redundancy")?.parse()?,rate,block_ms:header("braidpath-block-ms")?.parse()?,queue_ms:header("braidpath-queue-ms")?.parse()?};policy.validate()?;
                                 if policy.fec==automatic_fec::AUTO {ensure!(req.headers().get_all("braidpath-auto-small").iter().count()==1 && req.headers().get("braidpath-auto-small").is_some_and(|v|v=="1"),"automatic small protection not negotiated");}
@@ -3782,7 +3875,7 @@ async fn server_connection(
                                             let observation_notify=policy.adaptive.then(||Arc::new(Notify::new()));
                                             let session=Arc::new(Session{adaptive_fec_retention,generations:Mutex::new([None;MAX_PATHS]),empty_since:Mutex::new(Some(Instant::now())),events:tx,paths:Arc::new(Mutex::new(Vec::new())),stop,policy,observation_notify,ingress_drops:Arc::new(AtomicU64::new(0)),forward:metrics.scope(&sid,stats::FORWARD),returning:metrics.scope(&sid,stats::RETURN),finished:tokio::sync::Notify::new(),done:std::sync::atomic::AtomicBool::new(false)});
                                             map.insert(sid.clone(),session.clone());
-                                            tokio::spawn(session_loop(session.clone(),rx,target,tcp));
+                                            tokio::spawn(session_loop(session.clone(),rx,target,tcp,tcp_budget.clone()));
                                             session
                                         };
                                         {
@@ -3821,8 +3914,8 @@ async fn server_connection(
                                 if small_fec_bytes>0 {response=response.header("braidpath-small-fec-bytes",small_fec_bytes);}
                                 if mixed_fec {response=response.header("braidpath-mixed-fec","1");}
                                 if header("braidpath-fec")?=="auto" {response=response.header("braidpath-auto-small","1");}
-                                if streams {response=response.header("braidpath-streams","1");}
-                                if proxy {response=response.header("braidpath-proxy","1");}
+                                if streams {response=response.header("braidpath-streams","2");}
+                                if proxy {response=response.header("braidpath-proxy","2");}
                                 if fec_repairs==2 {response=response.header("braidpath-fec-repairs","2");}
                                 if capacity_probe_bps>0 {response=response.header("braidpath-capacity-probe-bps",capacity_probe_bps).header("braidpath-capacity-probe-format",capacity_probe::FORMAT);}
                                 if probe_guided_recovery {response=response.header("braidpath-probe-guided-recovery","1");}
@@ -3862,6 +3955,7 @@ async fn server_connection(
     };
     // Classify the original close/error before our cleanup closes the connection.
     diagnostic.finish(result.as_ref().err());
+    let owner_stopped = stream_owner_stopped(stream_transport, conn.close_reason().as_ref());
     conn.close(0u32.into(), b"request closed");
     if let Some((sid, session, pid, _, generation)) = joined {
         let trace_key = trace::PathKey {
@@ -3871,22 +3965,24 @@ async fn server_connection(
         };
         trace_path(&session.forward, trace::Stage::PathClosed, trace_key);
         trace_path(&session.returning, trace::Stage::PathClosed, trace_key);
-        let last = {
+        let ended = {
             let mut map = sessions.lock().expect("sessions lock");
             let mut paths = session.paths.lock().expect("paths lock");
             paths.retain(|p| p.id != pid || p.conn.stable_id() != conn.stable_id());
             let last = paths.is_empty();
-            if last {
-                if session.policy.adaptive {
-                    *session.empty_since.lock().expect("empty time lock") = Some(Instant::now());
-                } else {
-                    let _ = session.stop.send(true);
-                    map.remove(&sid);
+            let ended = owner_stopped || (last && !session.policy.adaptive);
+            if ended {
+                let _ = session.stop.send(true);
+                map.remove(&sid);
+                for path in paths.iter() {
+                    path.conn.close(0u32.into(), b"stream session stopped");
                 }
+            } else if last {
+                *session.empty_since.lock().expect("empty time lock") = Some(Instant::now());
             }
-            last && !session.policy.adaptive
+            ended
         };
-        if last
+        if ended
             && timeout(Duration::from_secs(3), async {
                 while !session.done.load(Ordering::Acquire) {
                     let notified = session.finished.notified();
@@ -3900,7 +3996,7 @@ async fn server_connection(
         {
             metrics.state(|s| s.drain_incomplete = true);
         }
-        if last {
+        if ended {
             metrics.retire_session(&sid);
         }
         info!(path = pid, "path left");
@@ -3926,6 +4022,8 @@ pub struct ClientOptions {
     pub tcp_listen: Option<SocketAddr>,
     /// Local SOCKS5 and HTTP CONNECT listener for addressed streams.
     pub proxy_listen: Option<SocketAddr>,
+    /// Internal proxy frontend attached to the aggregate session instead of a listener.
+    pub stream_connector: Option<StreamConnector>,
     pub entrances: Vec<SocketAddr>,
     pub interfaces: Vec<String>,
     pub path_binds: Vec<SocketAddr>,
@@ -4107,7 +4205,6 @@ pub(crate) async fn client_with_health(
 
 /// Mesh credentials are shared; the selected exit must be bound independently
 /// on every admission, including retries through a different entrance.
-#[cfg(test)]
 pub(crate) async fn client_with_mesh_exit(
     options: ClientOptions,
     entrances: Option<watch::Receiver<Vec<SocketAddr>>>,
@@ -4187,7 +4284,8 @@ async fn client_inner(
         "TCP streams require a TCP listener"
     );
     ensure!(
-        options.policy.proxy == options.proxy_listen.is_some(),
+        options.policy.proxy
+            == (options.proxy_listen.is_some() || options.stream_connector.is_some()),
         "proxy streams require a proxy listener"
     );
     let socket = Arc::new(UdpSocket::bind(options.listen).await?);
@@ -4224,6 +4322,10 @@ async fn client_inner(
         )
         .await;
         if (options.policy.adaptive || entrances.is_some())
+            && options
+                .stream_connector
+                .as_ref()
+                .is_none_or(|connector| !connector.is_closed())
             && result
                 .as_ref()
                 .err()
@@ -4265,6 +4367,9 @@ async fn client_session(
     let mut inflight = [false; MAX_PATHS];
     let mut elective_inflight = [false; MAX_PATHS];
     let mut delivery_health: [path_health::DeliveryHealth; MAX_PATHS] =
+        std::array::from_fn(|_| Default::default());
+    let mut reachability: [liveness::Liveness; MAX_PATHS] = Default::default();
+    let mut telemetry: [transport::ProxyTelemetry; MAX_PATHS] =
         std::array::from_fn(|_| Default::default());
     options.stats.state(|s| s.shutdown_complete = false);
     let epoch = Instant::now();
@@ -4319,7 +4424,12 @@ async fn client_session(
         observation_notify.clone(),
     ));
     // Streams do not survive a session epoch; a new epoch accepts new connections.
-    let mut streams = tcp::Mux::client(listeners, &options.policy, forward.clone());
+    let mut streams = tcp::Mux::client(
+        listeners,
+        &options.policy,
+        forward.clone(),
+        options.stream_connector.clone(),
+    );
     let small_threshold = ingress::small_threshold(&options.policy);
     let mut input = vec![0; 65536];
     let mut peers: HashMap<SocketAddr, (u32, Instant)> = HashMap::new();
@@ -4359,6 +4469,7 @@ async fn client_session(
         }
         tokio::select! {
             _=shutdown.wait()=>break,
+            _=async {options.stream_connector.as_ref().expect("connector").closed().await},if options.stream_connector.is_some()=>break,
             updated=entrances_changed(entrances)=>{
                 ensure!(!updated.is_empty() && updated.len()<=MAX_PATHS,"invalid entrance update");
                 desired=Some(updated);
@@ -4368,6 +4479,9 @@ async fn client_session(
             completed=delivery.ready()=>drops+=completed,
             _=tick.tick()=>{
                 let now_us=epoch.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
+                if options.policy.streams || options.policy.proxy {
+                    ensure!(!exit_terminated(paths.lock().expect("paths lock").iter().map(|path|path.conn.close_reason())), "selected stream exit shut down");
+                }
                 if let Some(desired)=&desired {
                     reconcile_routes(desired,&mut configs,&inflight,&mut endpoints,&paths,&mut rotations);
                     let configured=configs.iter().filter(|c|c.enabled).count();
@@ -4375,6 +4489,9 @@ async fn client_session(
                 }
                 peers.retain(|_,(id,last)|{if last.elapsed()<Duration::from_secs(60){true}else{reverse.remove(id);false}});
                 let current=paths.lock().expect("paths lock").clone();
+                if options.policy.streams || options.policy.proxy {
+                    for path in &current { telemetry[usize::from(path.id)].report(&path.conn,"client",exit.unwrap_or("local")); }
+                }
                 if let Some(health)=health {
                     let mut samples = Vec::new();
                     for (id, config) in configs.iter().enumerate().filter(|(_, c)| c.enabled) {
@@ -4382,14 +4499,20 @@ async fn client_session(
                             let elapsed = quality_time(path);
                             let q = path.quality.lock().expect("quality").snapshot_at(elapsed);
                             let stalled = delivery_health[id].stalled(elapsed, &q);
+                            // Stream ACKs may be carried on a different path. Native
+                            // QUIC ACK progress still qualifies this path's reachability,
+                            // even before eight measured application symbols were sent.
+                            reachability[id].observe(&path.conn, Instant::now());
+                            let silent = reachability[id].silent();
                             if stalled && path.conn.close_reason().is_none() {
                                 tracing::debug!(path=id, group=path.group, "mesh data delivery stalled; reconnecting");
                                 path.conn.close(0u32.into(), b"mesh delivery stalled");
                             }
                             let estimate = q.sender_estimate;
+                            let failed = stalled || silent || path.conn.close_reason().is_some();
                             samples.push(mesh::PathSample { address: config.remote, group: path.group,
-                                failed: stalled || path.conn.close_reason().is_some(),
-                                delivered: estimate.sample_symbols >= 8 && estimate.delivered_updated_us.is_some_and(|at| elapsed.saturating_sub(at) < 2_000_000) && estimate.updated_us.is_some_and(|at| elapsed.saturating_sub(at) < 2_000_000),
+                                failed,
+                                delivered: !failed && estimate.sample_symbols >= 8 && estimate.delivered_updated_us.is_some_and(|at| elapsed.saturating_sub(at) < 2_000_000) && estimate.updated_us.is_some_and(|at| elapsed.saturating_sub(at) < 2_000_000),
                                 rtt_ms: path.conn.rtt().as_secs_f64() * 1000.0, loss: estimate.loss_rate });
                         } else if config.attempted && !inflight[id] {
                             samples.push(mesh::PathSample { address: config.remote, group: config.group, failed: true, delivered: false, rtt_ms: 0.0, loss: 0.0 });
@@ -4447,7 +4570,7 @@ async fn client_session(
                     tasks.spawn(async move {
                         let mut diagnostic=stats::ConnectionTrace::new(metrics,config.remote,Some(id as u8),"quic_connect");
                         let attempt:Result<Option<Rejoined>>=async {
-                            let endpoint=transport::client_bound_with_ack_request(config.remote,&ca,config.interface.as_deref(),congestion,bind,datagram_send_buffer_bytes,ack_request)?;
+                            let endpoint=transport::client_bound_with_session_alpn(config.remote,&ca,config.interface.as_deref(),congestion,bind,datagram_send_buffer_bytes,ack_request,policy.streams || policy.proxy)?;
                             info!(path=id,generation,local=%endpoint.local_addr()?,remote=%config.remote,"path attempt source socket");
                             let connected=tokio::select! {
                                 biased;
@@ -4562,6 +4685,14 @@ async fn client_session(
         }
         while let Some(completion)=tasks.try_join_next() {completion.context("path task failed")?;}
     }Ok(())}.await;
+    // Publish the owner's explicit epoch close before dropping H3 drivers.
+    for endpoint in endpoints.iter().flatten() {
+        if options.policy.streams || options.policy.proxy {
+            endpoint.close(STREAM_SESSION_STOP.into(), b"stream session stopped");
+        } else {
+            endpoint.close(0u32.into(), b"client session stopped");
+        }
+    }
     if let Some(mux) = streams.as_mut() {
         mux.close_all();
     }
@@ -4574,9 +4705,6 @@ async fn client_session(
     options
         .stats
         .readiness(false, configs.iter().filter(|c| c.enabled).count());
-    for endpoint in endpoints.iter().flatten() {
-        endpoint.close(0u32.into(), b"client session stopped");
-    }
     let joined = timeout(Duration::from_secs(2), async {
         while tasks.join_next().await.is_some() {}
     })
@@ -4654,7 +4782,9 @@ async fn drive_client_path(
     } else {
         warn!(context=%diagnostic.context(),error=?result.err(),"client path ended");
     }
-    conn.close(0u32.into(), b"path ended");
+    if conn.close_reason().is_none() {
+        conn.close(0u32.into(), b"path ended");
+    }
 }
 
 type H3Client = h3::client::Connection<h3_quinn::Connection, Bytes>;
@@ -4812,10 +4942,10 @@ async fn admit_path(
         req = req.header("braidpath-mixed-fec", "1");
     }
     if policy.streams {
-        req = req.header("braidpath-streams", "1");
+        req = req.header("braidpath-streams", "2");
     }
     if policy.proxy {
-        req = req.header("braidpath-proxy", "1");
+        req = req.header("braidpath-proxy", "2");
     }
     if policy.fec_repairs == 2 {
         req = req.header("braidpath-fec-repairs", "2");
@@ -4921,21 +5051,20 @@ async fn admit_path(
         mixed_fec_header(response.headers())? == policy.mixed_fec,
         "mixed FEC not negotiated"
     );
+    let echoed_streams = response
+        .headers()
+        .get("braidpath-streams")
+        .map(|v| v.to_str())
+        .transpose()?;
+    let echoed_proxy = response
+        .headers()
+        .get("braidpath-proxy")
+        .map(|v| v.to_str())
+        .transpose()?;
     ensure!(
-        !policy.streams
-            || response
-                .headers()
-                .get("braidpath-streams")
-                .is_some_and(|v| v == "1"),
-        "TCP streams not negotiated"
-    );
-    ensure!(
-        !policy.proxy
-            || response
-                .headers()
-                .get("braidpath-proxy")
-                .is_some_and(|v| v == "1"),
-        "proxy streams not negotiated"
+        session_profile(policy.streams || policy.proxy, echoed_streams, echoed_proxy)?
+            == (policy.streams, policy.proxy),
+        "aggregate stream profile not negotiated"
     );
     validate_fec_repairs_echo(response.headers(), policy.fec_repairs)?;
     validate_message_echo(response.headers(), policy.max_message_bytes)?;
@@ -5067,5 +5196,103 @@ mod sender_clock_tests {
         assert_eq!(remaining.record_id, Some(2));
         assert_eq!(remaining.created, second);
         assert!(queue.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod stream_profile_tests {
+    use super::*;
+
+    fn peer_close(code: u32, reason: &'static [u8]) -> quinn::ConnectionError {
+        quinn::ConnectionError::ApplicationClosed(quinn::ApplicationClose {
+            error_code: code.into(),
+            reason: Bytes::from_static(reason),
+        })
+    }
+
+    #[test]
+    fn an_explicit_stream_owner_stop_is_distinct_from_a_recoverable_path_close() {
+        let stopped = peer_close(STREAM_SESSION_STOP, b"stream session stopped");
+        assert!(stream_owner_stopped(true, Some(&stopped)));
+        assert!(!stream_owner_stopped(false, Some(&stopped)));
+        for reason in [
+            peer_close(0, b"entrance retired"),
+            peer_close(0, b"mesh delivery stalled"),
+            quinn::ConnectionError::TimedOut,
+            quinn::ConnectionError::LocallyClosed,
+        ] {
+            assert!(!stream_owner_stopped(true, Some(&reason)));
+        }
+        assert!(!stream_owner_stopped(true, None));
+    }
+
+    #[test]
+    fn a_stopped_exit_ends_its_flows_but_a_relay_outage_does_not() {
+        for reason in [
+            b"server stopped".as_slice(),
+            b"shutdown",
+            b"proxy owner stopped",
+        ] {
+            assert!(exit_stopped(Some(&peer_close(0, reason))));
+        }
+        assert!(!exit_stopped(Some(&peer_close(
+            0x100,
+            b"Connection was closed by the server"
+        ))));
+        assert!(!exit_stopped(Some(&peer_close(0, b"entrance retired"))));
+        assert!(!exit_stopped(Some(&quinn::ConnectionError::TimedOut)));
+        assert!(!exit_stopped(Some(&quinn::ConnectionError::LocallyClosed)));
+        assert!(!exit_stopped(None));
+    }
+
+    #[test]
+    fn one_h3_path_end_does_not_terminate_a_healthy_aggregate() {
+        let h3_end = || Some(peer_close(0x100, b"Connection was closed by the server"));
+        assert!(!exit_terminated([h3_end(), None].into_iter()));
+        assert!(!exit_terminated(
+            [h3_end(), Some(quinn::ConnectionError::TimedOut)].into_iter()
+        ));
+        assert!(exit_terminated([h3_end(), h3_end()].into_iter()));
+        assert!(exit_terminated(
+            [Some(peer_close(0, b"server stopped")), None].into_iter()
+        ));
+        assert!(!exit_terminated(std::iter::empty()));
+    }
+
+    #[test]
+    fn aggregate_protocol_requires_explicit_supported_alpn() {
+        assert!(!aggregate_protocol(Some(b"h3")).unwrap());
+        assert!(aggregate_protocol(Some(STREAM_ALPN)).unwrap());
+        assert!(aggregate_protocol(None).is_err());
+        assert!(aggregate_protocol(Some(super::super::proxy::ALPN)).is_err());
+        assert!(aggregate_protocol(Some(b"braidpath-stream/1")).is_err());
+    }
+
+    #[test]
+    fn reliable_stream_profiles_cannot_cross_protocol_or_version() {
+        assert_eq!(session_profile(false, None, None).unwrap(), (false, false));
+        assert_eq!(
+            session_profile(true, Some("2"), None).unwrap(),
+            (true, false)
+        );
+        assert_eq!(
+            session_profile(true, None, Some("2")).unwrap(),
+            (false, true)
+        );
+        assert_eq!(
+            session_profile(true, Some("2"), Some("2")).unwrap(),
+            (true, true)
+        );
+        for (transport, streams, proxy) in [
+            (false, Some("1"), None),
+            (false, None, Some("2")),
+            (false, Some("2"), Some("2")),
+            (true, None, None),
+            (true, Some("1"), None),
+            (true, None, Some("1")),
+            (true, Some("2"), Some("1")),
+        ] {
+            assert!(session_profile(transport, streams, proxy).is_err());
+        }
     }
 }

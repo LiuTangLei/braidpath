@@ -21,6 +21,18 @@ impl Default for PathHealth {
     }
 }
 
+impl PathHealth {
+    fn all_failed(&self, routes: &[SocketAddr]) -> bool {
+        !routes.is_empty()
+            && self.addresses.is_empty()
+            && routes.iter().all(|address| {
+                self.samples
+                    .iter()
+                    .any(|sample| sample.address == *address && sample.failed)
+            })
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct PathSample {
     pub address: SocketAddr,
@@ -273,7 +285,7 @@ impl Directory {
                     if result.is_err() { health_open = false; continue; }
                     let health = self.health.borrow_and_update().clone();
                     let now = Instant::now();
-                    if health.addresses.is_empty() && now >= recovery_after && discovery.is_empty() {
+                    if health.all_failed(&self.addresses()) && now >= recovery_after && discovery.is_empty() {
                         recovery_after = now + Duration::from_secs(2);
                         tracing::debug!(stage="discovery", "mesh has no usable paths; refreshing directory");
                         discovery.spawn(self.discovery());
@@ -714,6 +726,47 @@ async fn renew(
 mod tests {
     use super::*;
 
+    #[test]
+    fn unknown_or_partial_failure_does_not_discard_discovery_candidates() {
+        let routes: Vec<SocketAddr> = ["127.0.0.1:7001", "127.0.0.1:7002", "127.0.0.1:7003"]
+            .into_iter()
+            .map(|address| address.parse().unwrap())
+            .collect();
+        let mut health = PathHealth::default();
+        assert!(
+            !health.all_failed(&routes),
+            "empty samples are unknown, not failed"
+        );
+        for address in &routes[..2] {
+            health.samples.push(PathSample {
+                address: *address,
+                group: 0,
+                delivered: false,
+                failed: true,
+                rtt_ms: 0.0,
+                loss: 0.0,
+            });
+        }
+        assert!(
+            !health.all_failed(&routes),
+            "a pending path has no failure evidence"
+        );
+        health.samples.push(PathSample {
+            address: routes[2],
+            group: 0,
+            delivered: false,
+            failed: true,
+            rtt_ms: 0.0,
+            loss: 0.0,
+        });
+        assert!(
+            health.all_failed(&routes),
+            "every published path is known to have failed"
+        );
+        health.samples[2].failed = false;
+        assert!(!health.all_failed(&routes));
+    }
+
     #[tokio::test]
     async fn all_paths_lost_triggers_discovery_before_periodic_refresh() {
         use super::super::tests::{address, server, wait_nodes};
@@ -741,7 +794,18 @@ mod tests {
         .await;
         wait_nodes(&identity, exit, &["entry", "exit"]).await;
         let mut updates = guard.updates();
-        guard.health().send_replace(PathHealth::default());
+        guard.health().send_replace(PathHealth {
+            checked: Instant::now(),
+            addresses: vec![],
+            samples: vec![PathSample {
+                address: exit,
+                group: 0,
+                delivered: false,
+                failed: true,
+                rtt_ms: 0.0,
+                loss: 0.0,
+            }],
+        });
         tokio::time::timeout(Duration::from_secs(2), async {
             while updates.borrow_and_update().len() != 2 {
                 updates.changed().await.unwrap();
@@ -936,6 +1000,7 @@ mod tests {
         let listen = address();
         let _client = Task(tokio::spawn(tunnel::client_with_mesh_exit(
             tunnel::ClientOptions {
+                stream_connector: None,
                 tcp_listen: None,
                 proxy_listen: None,
                 listen,
@@ -1019,6 +1084,7 @@ mod tests {
         let listen = address();
         let _client = Task(tokio::spawn(tunnel::client_with_mesh_exit(
             tunnel::ClientOptions {
+                stream_connector: None,
                 tcp_listen: None,
                 proxy_listen: None,
                 listen,
@@ -1145,6 +1211,7 @@ mod tests {
         fixed.quality_schedule = false;
         let client = Task(tokio::spawn(tunnel::client_with_mesh_exit(
             tunnel::ClientOptions {
+                stream_connector: None,
                 tcp_listen: None,
                 proxy_listen: None,
                 listen,

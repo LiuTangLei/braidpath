@@ -276,7 +276,11 @@ pub fn server_tls(cert: &Path, key_path: &Path) -> Result<rustls::ServerConfig> 
     let mut tls = rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(certificates(cert)?, key(key_path)?)?;
-    tls.alpn_protocols = vec![b"h3".to_vec(), super::proxy::ALPN.to_vec()];
+    tls.alpn_protocols = vec![
+        b"h3".to_vec(),
+        super::proxy::ALPN.to_vec(),
+        super::tunnel::STREAM_ALPN.to_vec(),
+    ];
     // 0-RTT. rustls accepts early data only with stateful resumption and takes
     // each ticket out of this store on use, so a replayed first flight cannot
     // have its early data accepted again. A restart forgets every ticket
@@ -449,6 +453,29 @@ pub fn client_bound_with_ack_request(
     datagram_send_buffer_bytes: usize,
     ack_request: AckRequest,
 ) -> Result<Endpoint> {
+    client_bound_with_session_alpn(
+        remote,
+        ca,
+        interface,
+        congestion,
+        bind,
+        datagram_send_buffer_bytes,
+        ack_request,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn client_bound_with_session_alpn(
+    remote: SocketAddr,
+    ca: &Path,
+    interface: Option<&str>,
+    congestion: Congestion,
+    bind: Option<SocketAddr>,
+    datagram_send_buffer_bytes: usize,
+    ack_request: AckRequest,
+    stream_transport: bool,
+) -> Result<Endpoint> {
     client_with_alpn_and_ack(
         remote,
         ca,
@@ -456,7 +483,11 @@ pub fn client_bound_with_ack_request(
         congestion,
         bind,
         datagram_send_buffer_bytes,
-        b"h3",
+        if stream_transport {
+            super::tunnel::STREAM_ALPN
+        } else {
+            b"h3"
+        },
         ack_request,
     )
 }
@@ -595,7 +626,7 @@ fn client_with_alpn_and_ack(
     );
     s.bind(&bind.into())?;
     s.set_nonblocking(true)?;
-    if alpn == super::proxy::ALPN {
+    if alpn == super::proxy::ALPN || alpn == super::tunnel::STREAM_ALPN {
         datagram_socket_buffers(socket2::SockRef::from(&s), "proxy");
     } else {
         enlarge_receive_buffer(socket2::SockRef::from(&s));
@@ -642,6 +673,80 @@ pub fn hex(b: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn aggregate_stream_endpoints_negotiate_their_own_protocol() {
+        let temp = tempfile::tempdir().unwrap();
+        let identity = temp.path().join("identity");
+        initialize(&identity, "localhost").unwrap();
+        let server = server(
+            "127.0.0.1:0".parse().unwrap(),
+            &identity.join("cert.pem"),
+            &identity.join("key.pem"),
+            Congestion::Bbr,
+        )
+        .unwrap();
+        let address = server.local_addr().unwrap();
+        for stream_transport in [false, true] {
+            let client = client_bound_with_session_alpn(
+                address,
+                &identity.join("cert.pem"),
+                None,
+                Congestion::Bbr,
+                None,
+                DEFAULT_DATAGRAM_SEND_BUFFER_BYTES,
+                AckRequest::Unchanged,
+                stream_transport,
+            )
+            .unwrap();
+            let (outgoing, incoming) = tokio::time::timeout(Duration::from_secs(3), async {
+                tokio::join!(client.connect(address, "localhost").unwrap(), async {
+                    server.accept().await.unwrap().await
+                })
+            })
+            .await
+            .unwrap();
+            let outgoing = outgoing.unwrap();
+            let incoming = incoming.unwrap();
+            let expected = if stream_transport {
+                super::super::tunnel::STREAM_ALPN
+            } else {
+                b"h3"
+            };
+            for connection in [&outgoing, &incoming] {
+                let handshake = connection
+                    .handshake_data()
+                    .unwrap()
+                    .downcast::<quinn::crypto::rustls::HandshakeData>()
+                    .unwrap();
+                assert_eq!(handshake.protocol.as_deref(), Some(expected));
+            }
+            outgoing.close(0u32.into(), b"test complete");
+            incoming.close(0u32.into(), b"test complete");
+            client.close(0u32.into(), b"test complete");
+        }
+        let unsupported = client_with_alpn(
+            address,
+            &identity.join("cert.pem"),
+            None,
+            Congestion::Bbr,
+            None,
+            DEFAULT_DATAGRAM_SEND_BUFFER_BYTES,
+            b"braidpath-stream/1",
+        )
+        .unwrap();
+        let (outgoing, incoming) = tokio::time::timeout(Duration::from_secs(3), async {
+            tokio::join!(unsupported.connect(address, "localhost").unwrap(), async {
+                server.accept().await.unwrap().await
+            })
+        })
+        .await
+        .unwrap();
+        assert!(outgoing.is_err());
+        assert!(incoming.is_err());
+        unsupported.close(0u32.into(), b"test complete");
+        server.close(0u32.into(), b"test complete");
+    }
 
     #[tokio::test]
     async fn proxy_streams_acknowledge_large_flight_before_application_reads() {

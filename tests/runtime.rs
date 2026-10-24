@@ -336,9 +336,9 @@ fn proxy_cli_creates_one_socks_endpoint_per_exit_with_remote_half_close() {
         assert!(status.status.success());
         let status: Value = serde_json::from_slice(&status.stdout).unwrap();
         assert_eq!(status["proxy"]["streams"], 0);
-        // Native direct/relay connections may remain cached after the logical
-        // TCP flow has released its socket, RPCs and reassembly buffers.
-        assert!((1..=2).contains(&status["proxy"]["connections"].as_u64().unwrap()));
+        // TCP owns aggregate DATAGRAM sessions; this TCP-only client must not
+        // also prepare a second set of native UDP proxy connections.
+        assert_eq!(status["proxy"]["connections"], 0);
         assert_eq!(status["proxy"]["tcp_flows"], 0);
         assert_eq!(status["proxy"]["buffered_bytes"], 0);
         assert_eq!(status["proxy"]["rpc_streams"], 0);
