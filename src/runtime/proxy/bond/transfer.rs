@@ -169,8 +169,7 @@ async fn upload(
     accepted(owner, Operation::Fin { sequence, offset }).await
 }
 enum DownloadEvent {
-    Record(u64, Reply, OwnedSemaphorePermit),
-    Status(Reply),
+    Batch(usize, Reply, OwnedSemaphorePermit),
     Acknowledged,
 }
 async fn download(
@@ -178,12 +177,17 @@ async fn download(
     owner: &Owner,
     activity: Arc<Mutex<Instant>>,
 ) -> Result<()> {
-    let budget = Arc::new(Semaphore::new(WINDOW));
+    let lanes = owner.pool.download_lanes();
+    let batch = PIPELINE / lanes;
+    let budgets: Vec<_> = (0..lanes)
+        .map(|_| Arc::new(Semaphore::new(batch * CHUNK)))
+        .collect();
+    let mut next: Vec<_> = (0..lanes as u64).collect();
+    let mut inflight = vec![false; lanes];
     let mut jobs = JoinSet::new();
-    let mut pending: BTreeMap<u64, (u64, Bytes, OwnedSemaphorePermit)> = BTreeMap::new();
-    let (mut requested, mut sequence, mut produced, mut offset) = (0u64, 0u64, 0u64, 0u64);
-    let (mut status_pending, mut ack_pending) = (false, false);
-    let mut acknowledged = 0u64;
+    let mut pending: BTreeMap<u64, (u64, Bytes, Arc<OwnedSemaphorePermit>)> = BTreeMap::new();
+    let (mut sequence, mut offset, mut acknowledged) = (0u64, 0u64, 0u64);
+    let mut ack_pending = false;
     let mut end = None;
     loop {
         while let Some((at, data, _credit)) = pending.remove(&sequence) {
@@ -199,10 +203,10 @@ async fn download(
             sequence += 1;
             *activity.lock().expect("flow activity") = Instant::now();
         }
-        if let Some((final_sequence, final_offset)) = end
-            && sequence == final_sequence
+        if let Some((last, bytes)) = end
+            && sequence == last
         {
-            ensure!(offset == final_offset, "invalid aggregate download FIN");
+            ensure!(offset == bytes, "invalid aggregate download FIN");
             tracing::debug!(
                 records = sequence,
                 bytes = offset,
@@ -212,10 +216,17 @@ async fn download(
             tcp.shutdown().await?;
             return Ok(());
         }
-        while requested < produced && requested < sequence.saturating_add(PIPELINE as u64) {
-            // Reserve the earliest missing record before any later reply can consume its credit.
-            let Ok(credit) = budget.clone().try_acquire_many_owned(CHUNK as u32) else {
-                break;
+        for lane in 0..lanes {
+            if inflight[lane] || end.is_some_and(|(last, _)| next[lane] >= last) {
+                continue;
+            }
+            // Each logical lane owns its memory share before requesting data.
+            // Fast lanes cannot take the missing lane's replay/reassembly credit.
+            let Ok(credit) = budgets[lane]
+                .clone()
+                .try_acquire_many_owned((batch * CHUNK) as u32)
+            else {
+                continue;
             };
             let (pool, exit, key, usage) = (
                 owner.pool.clone(),
@@ -223,7 +234,7 @@ async fn download(
                 owner.key,
                 owner.usage.clone(),
             );
-            let request = requested;
+            let request = next[lane];
             let acknowledged = sequence;
             jobs.spawn(async move {
                 let reply = pool
@@ -233,13 +244,15 @@ async fn download(
                         Operation::Pull {
                             sequence: request,
                             acknowledged,
+                            stride: lanes as u8,
+                            count: batch as u8,
                         },
                         &usage,
                     )
                     .await?;
-                Ok::<_, anyhow::Error>(DownloadEvent::Record(request, reply, credit))
+                Ok::<_, anyhow::Error>(DownloadEvent::Batch(lane, reply, credit))
             });
-            requested += 1;
+            inflight[lane] = true;
         }
         if !ack_pending && sequence > acknowledged {
             let (pool, exit, key, usage) = (
@@ -261,76 +274,54 @@ async fn download(
             });
             ack_pending = true;
         }
-        if !status_pending && end.is_none() {
-            let (pool, exit, key, usage) = (
-                owner.pool.clone(),
-                owner.exit.clone(),
-                owner.key,
-                owner.usage.clone(),
-            );
-            let acknowledged = sequence;
-            jobs.spawn(async move {
-                Ok::<_, anyhow::Error>(DownloadEvent::Status(
-                    pool.call(
-                        &exit,
-                        key,
-                        Operation::ReadStatus {
-                            produced,
-                            acknowledged,
-                        },
-                        &usage,
-                    )
-                    .await?,
-                ))
-            });
-            status_pending = true;
-        }
         match jobs
             .join_next()
             .await
             .context("aggregate download has a missing record")???
         {
             DownloadEvent::Acknowledged => ack_pending = false,
-            DownloadEvent::Status(Reply::Available {
-                produced: at,
-                end: final_at,
-            }) => {
-                status_pending = false;
-                ensure!(
-                    at >= produced && at >= requested,
-                    "download producer moved backwards"
-                );
-                if let Some((last, bytes)) = final_at {
-                    ensure!(
-                        last == at && last >= sequence && bytes >= offset,
-                        "premature aggregate EOF"
-                    );
-                }
-                produced = at;
-                end = final_at;
-            }
-            DownloadEvent::Record(
-                request,
-                Reply::Data {
-                    sequence: received,
-                    offset: at,
-                    data,
+            DownloadEvent::Batch(
+                lane,
+                Reply::Batch {
+                    blocks,
+                    end: final_at,
                 },
                 credit,
             ) => {
+                inflight[lane] = false;
                 ensure!(
-                    received == request && received >= sequence,
-                    "unexpected aggregate download sequence"
+                    blocks.len() <= batch && (!blocks.is_empty() || final_at.is_some()),
+                    "invalid download batch"
                 );
-                ensure!(
-                    pending.insert(received, (at, data, credit)).is_none(),
-                    "duplicate aggregate reply"
-                );
+                if let Some((last, bytes)) = final_at {
+                    ensure!(
+                        last >= sequence
+                            && bytes >= offset
+                            && end.is_none_or(|old| old == (last, bytes)),
+                        "conflicting aggregate FIN"
+                    );
+                    end = Some((last, bytes));
+                }
+                let credit = Arc::new(credit);
+                for (received, at, data) in blocks {
+                    ensure!(
+                        received == next[lane]
+                            && received >= sequence
+                            && end.is_none_or(|(last, _)| received < last),
+                        "unexpected aggregate download sequence"
+                    );
+                    next[lane] = next[lane]
+                        .checked_add(lanes as u64)
+                        .context("download sequence overflow")?;
+                    ensure!(
+                        pending
+                            .insert(received, (at, data, credit.clone()))
+                            .is_none(),
+                        "duplicate aggregate reply"
+                    );
+                }
             }
-            DownloadEvent::Status(Reply::Failed(code))
-            | DownloadEvent::Record(_, Reply::Failed(code), _) => {
-                return Err(ReplyError(code).into());
-            }
+            DownloadEvent::Batch(_, Reply::Failed(code), _) => return Err(ReplyError(code).into()),
             _ => anyhow::bail!("invalid aggregate download response"),
         }
     }

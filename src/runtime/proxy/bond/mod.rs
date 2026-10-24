@@ -16,13 +16,13 @@ mod wire;
 pub(crate) use server::Registry;
 pub(crate) use transfer::open;
 pub(crate) use wire::{
-    ACK_FIN, CLOSE, DOWNLOAD_ACK, FIN, Key, OPEN, Operation, PULL, PUT, READ_STATUS, Reply,
-    UPLOAD_STATUS, rpc,
+    ACK_FIN, CLOSE, DOWNLOAD_ACK, FIN, Key, OPEN, Operation, PULL, PUT, Reply, UPLOAD_STATUS, rpc,
 };
 
 const CHUNK: usize = 128 * 1024;
 const WINDOW: usize = 16 * 1024 * 1024;
 const PIPELINE: usize = WINDOW / CHUNK;
+const MAX_BATCH: usize = 32;
 const HOST_BUFFER: usize = 32 * 1024 * 1024;
 const MAX_FLOWS: usize = 64;
 const PATH_STALL: Duration = Duration::from_secs(4);

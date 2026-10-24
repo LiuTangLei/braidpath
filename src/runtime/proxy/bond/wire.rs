@@ -1,6 +1,5 @@
 use super::super::protocol::Address;
 use super::*;
-use std::net::SocketAddr;
 use tokio::io::AsyncReadExt;
 
 pub(crate) const OPEN: u8 = 16;
@@ -10,7 +9,6 @@ pub(crate) const FIN: u8 = 19;
 pub(crate) const ACK_FIN: u8 = 20;
 pub(crate) const CLOSE: u8 = 21;
 pub(crate) const UPLOAD_STATUS: u8 = 22;
-pub(crate) const READ_STATUS: u8 = 23;
 pub(crate) const DOWNLOAD_ACK: u8 = 24;
 pub(crate) type Key = [u8; 32];
 
@@ -25,6 +23,8 @@ pub(crate) enum Operation {
     Pull {
         sequence: u64,
         acknowledged: u64,
+        stride: u8,
+        count: u8,
     },
     Fin {
         sequence: u64,
@@ -36,10 +36,6 @@ pub(crate) enum Operation {
     },
     UploadStatus {
         delivered: u64,
-    },
-    ReadStatus {
-        produced: u64,
-        acknowledged: u64,
     },
     DownloadAck {
         acknowledged: u64,
@@ -56,7 +52,6 @@ impl Operation {
             Self::AckFin { .. } => ACK_FIN,
             Self::Close => CLOSE,
             Self::UploadStatus { .. } => UPLOAD_STATUS,
-            Self::ReadStatus { .. } => READ_STATUS,
             Self::DownloadAck { .. } => DOWNLOAD_ACK,
         }
     }
@@ -67,20 +62,28 @@ pub(crate) enum Reply {
     Uploaded {
         delivered: u64,
     },
-    Available {
-        produced: u64,
+    Batch {
+        blocks: Vec<(u64, u64, Bytes)>,
         end: Option<(u64, u64)>,
     },
-    Data {
-        sequence: u64,
-        offset: u64,
-        data: Bytes,
-    },
-    End {
-        sequence: u64,
-        offset: u64,
-    },
     Failed(u8),
+}
+
+// Framing is entirely ordered. Mixing an ordered prefix with read_to_end's
+// unordered mode can expose already-consumed overlapping retransmissions.
+pub(crate) async fn eof(recv: &mut quinn::RecvStream) -> Result<()> {
+    ensure!(
+        recv.read(&mut [0; 1]).await?.is_none(),
+        "trailing aggregate bytes"
+    );
+    Ok(())
+}
+async fn end(recv: &mut quinn::RecvStream) -> Result<Option<(u64, u64)>> {
+    match recv.read_u8().await? {
+        0 => Ok(None),
+        1 => Ok(Some((recv.read_u64().await?, recv.read_u64().await?))),
+        _ => anyhow::bail!("invalid FIN flag"),
+    }
 }
 
 pub(crate) async fn rpc(conn: &quinn::Connection, key: Key, op: &Operation) -> Result<Reply> {
@@ -101,22 +104,18 @@ pub(crate) async fn rpc(conn: &quinn::Connection, key: Key, op: &Operation) -> R
         Operation::Pull {
             sequence,
             acknowledged,
+            stride,
+            count,
         } => {
             header.extend(sequence.to_be_bytes());
             header.extend(acknowledged.to_be_bytes());
+            header.extend([*stride, *count]);
         }
         Operation::Fin { sequence, offset } | Operation::AckFin { sequence, offset } => {
             header.extend(sequence.to_be_bytes());
             header.extend(offset.to_be_bytes());
         }
         Operation::UploadStatus { delivered } => header.extend(delivered.to_be_bytes()),
-        Operation::ReadStatus {
-            produced,
-            acknowledged,
-        } => {
-            header.extend(produced.to_be_bytes());
-            header.extend(acknowledged.to_be_bytes());
-        }
         Operation::DownloadAck { acknowledged } => header.extend(acknowledged.to_be_bytes()),
         Operation::Close => {}
     }
@@ -129,8 +128,6 @@ pub(crate) async fn rpc(conn: &quinn::Connection, key: Key, op: &Operation) -> R
         Ok::<_, anyhow::Error>(())
     })
     .await??;
-    // A pending response is a liveness heartbeat, not an application ACK.
-    // It permits an idle target/backpressured TCP sink without replay storms.
     loop {
         match tokio::time::timeout(PATH_STALL, recv.read_u8()).await?? {
             0 => continue,
@@ -138,107 +135,100 @@ pub(crate) async fn rpc(conn: &quinn::Connection, key: Key, op: &Operation) -> R
             _ => anyhow::bail!("unsupported aggregate TCP response"),
         }
     }
-    tokio::time::timeout(PATH_STALL, async {
-        let reply = match recv.read_u8().await? {
+    let (tag, count, final_at, simple) = tokio::time::timeout(PATH_STALL, async {
+        let tag = recv.read_u8().await?;
+        let reply = match tag {
             0 => {
                 let Address::Ip(at) = Address::read(&mut recv).await? else {
                     anyhow::bail!("invalid bind address")
                 };
-                Reply::Opened(at)
+                Some(Reply::Opened(at))
             }
-            1 => Reply::Accepted,
+            1 => Some(Reply::Accepted),
             2 => {
-                let sequence = recv.read_u64().await?;
-                let offset = recv.read_u64().await?;
-                let len = recv.read_u32().await? as usize;
-                ensure!(len > 0 && len <= CHUNK, "invalid aggregate TCP chunk");
-                let mut bytes = vec![0; len];
-                recv.read_exact(&mut bytes).await?;
-                Reply::Data {
-                    sequence,
-                    offset,
-                    data: bytes.into(),
-                }
+                let count = recv.read_u8().await? as usize;
+                let end = end(&mut recv).await?;
+                ensure!(
+                    count <= MAX_BATCH && (count > 0 || end.is_some()),
+                    "invalid download batch"
+                );
+                return Ok((tag, count, end, None));
             }
-            3 => Reply::End {
-                sequence: recv.read_u64().await?,
-                offset: recv.read_u64().await?,
-            },
-            4 => Reply::Failed(recv.read_u8().await?),
-            5 => Reply::Uploaded {
+            4 => Some(Reply::Failed(recv.read_u8().await?)),
+            5 => Some(Reply::Uploaded {
                 delivered: recv.read_u64().await?,
-            },
-            6 => {
-                let produced = recv.read_u64().await?;
-                let end = match recv.read_u8().await? {
-                    0 => None,
-                    1 => Some((recv.read_u64().await?, recv.read_u64().await?)),
-                    _ => anyhow::bail!("invalid FIN flag"),
-                };
-                Reply::Available { produced, end }
-            }
+            }),
             _ => anyhow::bail!("invalid aggregate TCP reply"),
         };
-        ensure!(
-            recv.read_to_end(0).await?.is_empty(),
-            "trailing aggregate reply"
-        );
-        Ok(reply)
+        Ok::<_, anyhow::Error>((tag, 0, None, reply))
     })
-    .await?
+    .await??;
+    let reply = if tag == 2 {
+        let mut blocks = Vec::with_capacity(count);
+        for _ in 0..count {
+            // Bound absence of progress, rather than the duration of a whole
+            // multi-megabyte reply on a slower but working route.
+            blocks.push(
+                tokio::time::timeout(PATH_STALL, async {
+                    let sequence = recv.read_u64().await?;
+                    let offset = recv.read_u64().await?;
+                    let n = recv.read_u32().await? as usize;
+                    ensure!(n > 0 && n <= CHUNK, "invalid aggregate TCP chunk");
+                    let mut data = vec![0; n];
+                    recv.read_exact(&mut data).await?;
+                    Ok::<_, anyhow::Error>((sequence, offset, Bytes::from(data)))
+                })
+                .await??,
+            );
+        }
+        Reply::Batch {
+            blocks,
+            end: final_at,
+        }
+    } else {
+        simple.expect("simple response")
+    };
+    tokio::time::timeout(PATH_STALL, eof(&mut recv)).await??;
+    Ok(reply)
 }
 
 pub(crate) async fn respond(send: &mut quinn::SendStream, reply: Reply) -> Result<()> {
     let mut header = vec![1];
-    let data = match reply {
+    let records = match reply {
         Reply::Opened(at) => {
             header.push(0);
             Address::Ip(at).encode(&mut header);
-            None
+            Vec::new()
         }
         Reply::Accepted => {
             header.push(1);
-            None
-        }
-        Reply::Data {
-            sequence,
-            offset,
-            data,
-        } => {
-            header.push(2);
-            header.extend(sequence.to_be_bytes());
-            header.extend(offset.to_be_bytes());
-            header.extend((data.len() as u32).to_be_bytes());
-            Some(data)
-        }
-        Reply::End { sequence, offset } => {
-            header.push(3);
-            header.extend(sequence.to_be_bytes());
-            header.extend(offset.to_be_bytes());
-            None
+            Vec::new()
         }
         Reply::Uploaded { delivered } => {
             header.push(5);
             header.extend(delivered.to_be_bytes());
-            None
-        }
-        Reply::Available { produced, end } => {
-            header.push(6);
-            header.extend(produced.to_be_bytes());
-            header.push(u8::from(end.is_some()));
-            if let Some((seq, offset)) = end {
-                header.extend(seq.to_be_bytes());
-                header.extend(offset.to_be_bytes());
-            }
-            None
+            Vec::new()
         }
         Reply::Failed(code) => {
             header.extend([4, code]);
-            None
+            Vec::new()
+        }
+        Reply::Batch { blocks, end } => {
+            header.extend([2, blocks.len() as u8, u8::from(end.is_some())]);
+            if let Some((sequence, offset)) = end {
+                header.extend(sequence.to_be_bytes());
+                header.extend(offset.to_be_bytes());
+            }
+            blocks
         }
     };
     send.write_all(&header).await?;
-    if let Some(data) = data {
+    for (sequence, offset, data) in records {
+        let mut header = Vec::with_capacity(20);
+        header.extend(sequence.to_be_bytes());
+        header.extend(offset.to_be_bytes());
+        header.extend((data.len() as u32).to_be_bytes());
+        send.write_all(&header).await?;
         send.write_all(&data).await?;
     }
     send.finish()?;

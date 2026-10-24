@@ -630,7 +630,7 @@ async fn one_tcp_connection_uses_multiple_servers_and_survives_a_relay_stopping(
     let at = target.local_addr().unwrap();
     let accepted = Arc::new(AtomicUsize::new(0));
     let count = accepted.clone();
-    let payload: Vec<u8> = (0..8 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
+    let payload: Vec<u8> = (0..32 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
     let expected = payload.clone();
     let target_task = Task(tokio::spawn(async move {
         let (mut tcp, _) = target.accept().await.unwrap();

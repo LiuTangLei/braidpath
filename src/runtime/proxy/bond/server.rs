@@ -216,6 +216,8 @@ impl Registry {
                 PULL => Operation::Pull {
                     sequence: recv.read_u64().await?,
                     acknowledged: recv.read_u64().await?,
+                    stride: recv.read_u8().await?,
+                    count: recv.read_u8().await?,
                 },
                 FIN => Operation::Fin {
                     sequence: recv.read_u64().await?,
@@ -226,15 +228,11 @@ impl Registry {
                     offset: recv.read_u64().await?,
                 },
                 UPLOAD_STATUS => Operation::UploadStatus { delivered: recv.read_u64().await? },
-                READ_STATUS => Operation::ReadStatus { produced: recv.read_u64().await?, acknowledged: recv.read_u64().await? },
                 DOWNLOAD_ACK => Operation::DownloadAck { acknowledged: recv.read_u64().await? },
                 CLOSE => Operation::Close,
                 _ => anyhow::bail!("invalid aggregate command"),
             };
-            ensure!(
-                recv.read_to_end(0).await?.is_empty(),
-                "trailing aggregate request"
-            );
+            wire::eof(recv).await?;
             Ok::<_, anyhow::Error>((op, credit, flow))
         })
         .await?;
@@ -277,10 +275,6 @@ impl Registry {
                         Operation::UploadStatus { delivered } => Ok(Reply::Uploaded {
                             delivered: flow.upload.status(delivered).await?,
                         }),
-                        Operation::ReadStatus {
-                            produced,
-                            acknowledged,
-                        } => flow.download.status(produced, acknowledged).await,
                         Operation::DownloadAck { acknowledged } => {
                             flow.download.acknowledge(acknowledged)?;
                             Ok(Reply::Accepted)
@@ -292,7 +286,13 @@ impl Registry {
                         Operation::Pull {
                             sequence,
                             acknowledged,
-                        } => flow.download.pull(sequence, acknowledged).await,
+                            stride,
+                            count,
+                        } => {
+                            flow.download
+                                .pull(sequence, acknowledged, stride, count)
+                                .await
+                        }
                         Operation::AckFin { sequence, offset } => {
                             flow.download.ack_fin(sequence, offset)?;
                             Ok(Reply::Accepted)
@@ -556,48 +556,45 @@ impl Download {
         self.signal.changed.notify_waiters();
         Ok(())
     }
-    async fn status(&self, produced: u64, acknowledged: u64) -> Result<Reply> {
+    async fn pull(&self, sequence: u64, acknowledged: u64, stride: u8, count: u8) -> Result<Reply> {
+        let (stride, count) = (stride as u64, count as usize);
+        ensure!(
+            (1..=8).contains(&stride)
+                && count > 0
+                && count <= MAX_BATCH
+                && count * stride as usize <= PIPELINE,
+            "invalid download lane"
+        );
         self.acknowledge(acknowledged)?;
         loop {
             let changed = self.signal.changed.notified();
             self.signal.check()?;
             {
                 let state = self.state.lock().expect("download state");
-                ensure!(produced <= state.sequence, "invalid producer cursor");
-                if state.sequence > produced || state.end.is_some() {
-                    return Ok(Reply::Available {
-                        produced: state.sequence,
+                ensure!(
+                    sequence >= state.acknowledged
+                        && sequence < state.acknowledged.saturating_add(PIPELINE as u64 + stride),
+                    "download record credit exceeded"
+                );
+                let mut blocks = Vec::new();
+                for i in 0..count {
+                    let next = sequence
+                        .checked_add(i as u64 * stride)
+                        .context("download sequence overflow")?;
+                    let Some(block) = state.blocks.get(&next) else {
+                        break;
+                    };
+                    blocks.push((block.sequence, block.offset, block.data.clone()));
+                }
+                if !blocks.is_empty() || state.end.is_some_and(|(last, _)| sequence >= last) {
+                    return Ok(Reply::Batch {
+                        blocks,
                         end: state.end,
                     });
                 }
             }
             changed.await;
         }
-    }
-    async fn pull(&self, sequence: u64, acknowledged: u64) -> Result<Reply> {
-        self.acknowledge(acknowledged)?;
-        let state = self.state.lock().expect("download state");
-        ensure!(
-            sequence >= state.acknowledged
-                && sequence < state.acknowledged.saturating_add(PIPELINE as u64),
-            "download record credit exceeded"
-        );
-        if let Some(block) = state.blocks.get(&sequence) {
-            return Ok(Reply::Data {
-                sequence: block.sequence,
-                offset: block.offset,
-                data: block.data.clone(),
-            });
-        }
-        if let Some((end, offset)) = state.end
-            && sequence >= end
-        {
-            return Ok(Reply::End {
-                sequence: end,
-                offset,
-            });
-        }
-        anyhow::bail!("download record not available")
     }
     fn ack_fin(&self, sequence: u64, offset: u64) -> Result<()> {
         let mut state = self.state.lock().expect("download state");
@@ -739,6 +736,38 @@ mod tests {
         assert_eq!(budget.available_permits(), WINDOW);
     }
     #[tokio::test]
+    async fn short_interactive_reply_does_not_wait_for_a_full_batch_or_eof() {
+        use std::{
+            future::Future,
+            task::{Context, Poll, Waker},
+        };
+        let download = Download::new(Arc::new(Signal::new()));
+        let budget = Arc::new(Semaphore::new(CHUNK));
+        let Input::Data(record) = block(0, 0, b"reply", &budget).await else {
+            unreachable!()
+        };
+        {
+            let mut state = download.state.lock().unwrap();
+            state.blocks.insert(0, record);
+            state.sequence = 1;
+            state.offset = 5;
+        }
+        let mut response = std::pin::pin!(download.pull(0, 0, 4, 32));
+        let Poll::Ready(reply) = response
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+        else {
+            panic!("interactive reply waited for a larger batch");
+        };
+        let reply = reply.unwrap();
+        assert!(
+            matches!(reply, Reply::Batch { blocks, end: None } if blocks.len()==1 && blocks[0].2.as_ref()==b"reply")
+        );
+        assert_eq!(budget.available_permits(), 0);
+        download.acknowledge(1).unwrap();
+        assert_eq!(budget.available_permits(), CHUNK);
+    }
+    #[tokio::test]
     async fn download_credit_and_final_offset_reject_unearned_acknowledgements() {
         let download = Download::new(Arc::new(Signal::new()));
         let budget = Arc::new(Semaphore::new(CHUNK));
@@ -752,20 +781,26 @@ mod tests {
             state.offset = 7;
             state.end = Some((1, 7));
         }
-        assert!(download.pull(PIPELINE as u64, 0).await.is_err());
-        assert!(download.pull(1, 2).await.is_err());
+        assert!(
+            download
+                .pull((PIPELINE * 2) as u64, 0, 4, 32)
+                .await
+                .is_err()
+        );
+        assert!(download.pull(1, 2, 4, 32).await.is_err());
+        for (stride, count) in [(0, 32), (9, 1), (4, 33), (8, 32)] {
+            assert!(download.pull(0, 0, stride, count).await.is_err());
+        }
+
         assert!(download.ack_fin(1, 6).is_err());
         assert_eq!(budget.available_permits(), 0);
         assert!(matches!(
-            download.pull(0, 0).await.unwrap(),
-            Reply::Data { sequence: 0, .. }
+            download.pull(0, 0, 4, 32).await.unwrap(),
+            Reply::Batch { blocks, .. } if blocks.len() == 1 && blocks[0].0 == 0
         ));
         assert!(matches!(
-            download.pull(1, 1).await.unwrap(),
-            Reply::End {
-                sequence: 1,
-                offset: 7
-            }
+            download.pull(1, 1, 4, 32).await.unwrap(),
+            Reply::Batch { blocks, end: Some((1, 7)) } if blocks.is_empty()
         ));
         assert_eq!(budget.available_permits(), CHUNK);
         download.ack_fin(1, 7).unwrap();

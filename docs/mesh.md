@@ -120,7 +120,12 @@ Proxy limits and lifecycle:
   buffer budgets for upload and download, shared across flows. Upload admission
   fails explicitly if its host buffer is exhausted, rather than indefinitely
   holding later records while a missing record waits for memory. Download readers
-  wait for delivery credit. RPC data slots, progress queries and control commands
+  wait for delivery credit. Downloads use 4–8 logical lanes with independent
+  reserved memory shares. A request returns up to 32 already available records;
+  a short interactive response returns immediately. At most one data request per
+  logical lane waits for future target bytes, keeping idle flows from consuming
+  a whole window of server RPC slots. Cumulative TCP delivery ACKs are independent
+  of data requests. RPC data slots, progress queries and control commands
   have separate quotas so recovery and cleanup remain schedulable under load.
   Small progress/control operations prefer the lowest observed QUIC RTT; bulk
   records use available data slots across paths. Per-flow debug summaries include

@@ -144,8 +144,7 @@ impl Path {
         match op {
             super::bond::Operation::Put { .. } => &self.upload,
             super::bond::Operation::Pull { .. } => &self.download,
-            super::bond::Operation::UploadStatus { .. }
-            | super::bond::Operation::ReadStatus { .. } => &self.progress,
+            super::bond::Operation::UploadStatus { .. } => &self.progress,
             _ => &self.control,
         }
     }
@@ -450,11 +449,16 @@ impl Pool {
                 Ok(reply) => {
                     let mut used = usage.lock().expect("flow usage");
                     let counter = used.entry(path.address).or_default();
-                    if let super::bond::Operation::Put { data, .. } = &op {
+                    if let super::bond::Operation::Put { data, .. } = &op
+                        && matches!(reply, super::bond::Reply::Uploaded { .. })
+                    {
                         counter.0 += data.len() as u64;
                     }
-                    if let super::bond::Reply::Data { data, .. } = &reply {
-                        counter.1 += data.len() as u64;
+                    if let super::bond::Reply::Batch { blocks, .. } = &reply {
+                        counter.1 += blocks
+                            .iter()
+                            .map(|(_, _, data)| data.len() as u64)
+                            .sum::<u64>();
                     }
                     return Ok(reply);
                 }
@@ -489,6 +493,11 @@ impl Pool {
                 }
             }
         }
+    }
+    pub(super) fn download_lanes(&self) -> usize {
+        self.path_limit
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .max(4)
     }
     pub(super) fn transport_snapshot(
         &self,
