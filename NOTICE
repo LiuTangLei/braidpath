@@ -8,3 +8,8 @@ https://github.com/remoc-rs/aggligator
 The initial implementation does not incorporate Aggligator source code or Git
 history. Aggligator's name is used only for attribution. Any future incorporated
 third-party code must retain its applicable license and attribution notices.
+
+vendor/quinn contains Quinn 0.11.12 (https://github.com/quinn-rs/quinn),
+Copyright the Quinn contributors, under the MIT or Apache-2.0 license
+(vendor/quinn/LICENSE-MIT, vendor/quinn/LICENSE-APACHE), with BraidPath
+changes described in vendor/quinn/PATCH.md.

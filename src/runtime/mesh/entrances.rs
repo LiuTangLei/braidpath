@@ -936,6 +936,8 @@ mod tests {
         let listen = address();
         let _client = Task(tokio::spawn(tunnel::client_with_mesh_exit(
             tunnel::ClientOptions {
+                tcp_listen: None,
+                proxy_listen: None,
                 listen,
                 entrances: initial,
                 interfaces: vec![],
@@ -1017,6 +1019,8 @@ mod tests {
         let listen = address();
         let _client = Task(tokio::spawn(tunnel::client_with_mesh_exit(
             tunnel::ClientOptions {
+                tcp_listen: None,
+                proxy_listen: None,
                 listen,
                 entrances: stale,
                 interfaces: vec![],
@@ -1141,6 +1145,8 @@ mod tests {
         fixed.quality_schedule = false;
         let client = Task(tokio::spawn(tunnel::client_with_mesh_exit(
             tunnel::ClientOptions {
+                tcp_listen: None,
+                proxy_listen: None,
                 listen,
                 entrances: vec![relay_address],
                 interfaces: vec![],

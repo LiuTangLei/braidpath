@@ -71,6 +71,8 @@ pub struct Snapshot {
     pub small_rank_evaluations: u64,
     pub small_rank_opportunities: u64,
     pub small_rank_changes: u64,
+    /// AUTO originals use earliest-ready order independently of the opt-in flag.
+    pub automatic_original_rank_changes: u64,
     pub readiness_admitted: u64,
     pub readiness_gate_changed: u64,
     pub readiness_failed: u64,
@@ -104,6 +106,14 @@ pub(crate) struct Sample {
 /// Unknown/stale evidence is excluded by the caller; an unknown first choice
 /// keeps the old order. A 2ms hysteresis avoids chasing tiny timing differences.
 pub(crate) fn preferred(order: &[u8], samples: &[Sample]) -> Option<u8> {
+    preferred_by(order, samples, |candidate, anchor| candidate <= anchor)
+}
+
+fn preferred_by(
+    order: &[u8],
+    samples: &[Sample],
+    loss_ok: impl Fn(f64, f64) -> bool,
+) -> Option<u8> {
     let first = *order.first()?;
     let valid = |s: &&Sample| {
         s.id < MAX_PATHS as u8
@@ -117,10 +127,21 @@ pub(crate) fn preferred(order: &[u8], samples: &[Sample]) -> Option<u8> {
         .iter()
         .filter(valid)
         .filter(|s| order.contains(&s.id) && s.id != first && s.immediately_ready)
-        .filter(|s| s.already_used == anchor.already_used && s.loss <= anchor.loss)
+        .filter(|s| s.already_used == anchor.already_used && loss_ok(s.loss, anchor.loss))
         .filter(|s| s.finish_ms + 2.0 <= anchor.finish_ms)
         .min_by(|a, b| a.finish_ms.total_cmp(&b.finish_ms).then(a.id.cmp(&b.id)))
         .map(|s| s.id)
+}
+
+/// Reorder AUTO originals within their existing candidate set. Tiny loss
+/// differences in the same FEC tier do not justify spending another20ms;
+/// a worse protection tier, unknown quality or unready peer keeps old order.
+/// This only promotes a ready route; every fallback candidate remains present.
+pub(crate) fn preferred_original(order: &[u8], samples: &[Sample]) -> Option<u8> {
+    preferred_by(order, samples, |candidate, anchor| {
+        candidate <= anchor
+            || super::automatic_fec::target(candidate) == super::automatic_fec::target(anchor)
+    })
 }
 
 #[cfg(test)]
@@ -135,6 +156,26 @@ mod tests {
             already_used: false,
         }
     }
+    #[test]
+    fn original_order_can_prefer_ready_faster_routes_in_the_same_protection_tier() {
+        let mut fast = sample(1, 40.0, 0.012);
+        let slow = sample(0, 55.0, 0.011);
+        assert_eq!(preferred_original(&[0, 1], &[slow, fast]), Some(1));
+        fast.immediately_ready = false;
+        assert_eq!(preferred_original(&[0, 1], &[slow, fast]), None);
+        fast.immediately_ready = true;
+        fast.loss = 0.04;
+        assert_eq!(
+            preferred_original(&[0, 1], &[slow, fast]),
+            None,
+            "a route needing stronger protection cannot replace a healthier original"
+        );
+        fast.loss = 0.012;
+        fast.finish_ms = 54.0;
+        assert_eq!(preferred_original(&[0, 1], &[slow, fast]), None);
+        assert_eq!(preferred_original(&[0, 1], &[fast]), None);
+    }
+
     #[test]
     fn earlier_equal_or_better_loss_is_eligible() {
         assert_eq!(

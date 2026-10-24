@@ -327,10 +327,52 @@ fn adaptive_restart_preserves_listener_replaces_session_and_cancels_failed_recon
         b"after fresh authenticated session",
         &mut client,
     );
+    // The journal kept the first server's tickets, so the restarted server
+    // admits the path with 0-RTT.
+    #[cfg(unix)]
+    {
+        let resumed = client.wait_snapshot(Duration::from_secs(2), |v| {
+            v["stats"]["zero_rtt_accepted"].as_u64().unwrap_or(0) >= 1
+        });
+        assert_eq!(resumed["stats"]["zero_rtt_rejected"], 0, "{resumed}");
+    }
+    #[cfg(not(unix))]
+    client.wait_snapshot(Duration::from_secs(2), |v| {
+        v["stats"]["zero_rtt_rejected"].as_u64().unwrap_or(0) >= 1
+    });
+
+    // Without the journal a restarted server holds no tickets: 0-RTT is
+    // rejected and the path completes with a full handshake.
+    second_server.finish();
+    #[cfg(unix)]
+    fs::remove_file(identity.join("key.tickets")).unwrap();
+    let mut third_server = server(
+        &identity,
+        server_address,
+        echo.address,
+        dir.path(),
+        "server-third",
+    );
+    let rejected = client.wait_snapshot(Duration::from_secs(20), |v| {
+        v["stats"]["zero_rtt_rejected"].as_u64().unwrap_or(0) >= 1
+            && active_session(v, Some(&new_session)).is_some_and(|s| s != old_session)
+    });
+    assert!(
+        client
+            .logs()
+            .contains("0-RTT rejected; retrying with a full handshake"),
+        "{rejected}"
+    );
+    expect_echo(&application, b"after a ticketless restart", &mut client);
+    let stats = &rejected["stats"];
+    assert!(
+        stats["handshake_successes"].as_u64() <= stats["handshake_attempts"].as_u64(),
+        "{stats}"
+    );
 
     // Keep the destination UDP port open without responding so this is a pending
     // reconnect handshake, not immediate ICMP refusal or an idle ready client.
-    second_server.finish();
+    third_server.finish();
     let blackhole = UdpSocket::bind(server_address).unwrap();
     blackhole
         .set_read_timeout(Some(Duration::from_millis(100)))
@@ -740,6 +782,12 @@ fn fixed_initially_failed_path_rejoins_existing_session_after_network_recovers()
             .all(|path| { path["authenticated"] != true || path["session_id"] == sid })
     );
     assert_eq!(recovered["stats"]["retired_session_total"], 0);
+    // Admission can complete at 0.5-RTT, before the handshake observer counts
+    // acceptance. Await that distinct boundary rather than reading the first
+    // authenticated-path snapshot as though the handshake had completed.
+    client.wait_snapshot(Duration::from_secs(2), |v| {
+        v["stats"]["zero_rtt_accepted"].as_u64().unwrap_or(0) >= 1
+    });
     let application = UdpSocket::bind("127.0.0.1:0").unwrap();
     application.connect(client_address).unwrap();
     application

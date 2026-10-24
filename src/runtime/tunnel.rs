@@ -1,9 +1,10 @@
 use super::{
-    MAX_PATHS, MAX_PAYLOAD, QUEUE, adaptive, capacity_probe, mesh, outbound, quality, scheduler,
+    MAX_PATHS, MAX_PAYLOAD, QUEUE, adaptive, automatic_fec, capacity_probe, forward_guard, mesh,
+    outbound, quality, reverse_guard, scheduler,
     sender_frontier::{self, Gate},
     shutdown::Shutdown,
     stats::{self, Scope},
-    trace, transport,
+    stream, trace, transport,
     wire::{self, Receiver, Record},
 };
 #[cfg(test)]
@@ -26,7 +27,7 @@ use std::{
 };
 use subtle::ConstantTimeEq;
 use tokio::{
-    net::UdpSocket,
+    net::{TcpListener, UdpSocket},
     sync::{Notify, Semaphore, mpsc, watch},
     task::JoinSet,
     time::{MissedTickBehavior, interval, timeout},
@@ -34,27 +35,45 @@ use tokio::{
 use tracing::{info, warn};
 
 const MAX_FLOWS: usize = 64;
+/// Datagrams the client's paths may hand its session before it reads them:
+/// about 50 ms of a bulk download. One session task decodes every path, and a
+/// shallower queue overflows during a brief stall of that task, turning a
+/// local delay into stream retransmissions an RTT later.
+const WIRE_QUEUE: usize = 4096;
 const SESSION_IDLE_GRACE: Duration = Duration::from_secs(120);
 const SESSION_PATH: &str = "/session";
 pub(crate) const ADMISSION_TIMEOUT_MS: u64 = 10_000;
+mod associate;
 mod coding;
 #[cfg(test)]
 mod dual_tests;
 mod ingress;
+mod liveness;
 mod local_delivery;
 pub(crate) mod messages;
 #[cfg(test)]
 mod mixed_fec_tests;
 mod path_health;
+mod proxy;
 #[cfg(test)]
 mod repair_usefulness_tests;
 mod small_delivery;
+mod tcp;
+mod writer;
+pub use proxy::Access as ProxyAccess;
 
+/// Encoded symbols up to this size are latency traffic: stream
+/// acknowledgments, keystrokes, DNS and similar small datagrams.
+const LATENCY_RECORD_BYTES: usize = 320;
 const WEBSITE: &str = "<!doctype html><html lang=\"en\"><meta charset=\"utf-8\"><title>Welcome</title><h1>Welcome</h1><p>This service is online.</p></html>\n";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Policy {
     pub max_message_bytes: usize,
+    /// Reliable TCP streams to the server's fixed TCP target.
+    pub streams: bool,
+    /// Addressed streams from proxy entrances to client-named destinations.
+    pub proxy: bool,
     pub adaptive: bool,
     pub capacity_probe_bps: u64,
     pub probe_guided_recovery: bool,
@@ -78,6 +97,9 @@ impl Policy {
         } else {
             flow
         }
+    }
+    fn split_fec(&self) -> bool {
+        self.mixed_fec || self.fec == automatic_fec::AUTO
     }
     fn admission_lifetime(&self) -> Duration {
         Duration::from_millis(if self.adaptive {
@@ -132,12 +154,21 @@ impl Policy {
             "quality scheduler requires receiver feedback"
         );
         ensure!(
-            self.fec <= 32 && self.redundancy <= 100,
+            (self.fec <= 32 || self.fec == automatic_fec::AUTO) && self.redundancy <= 100,
             "invalid FEC configuration"
         );
         ensure!(
             usize::from(self.small_fec_bytes) <= MAX_PAYLOAD,
             "small-record threshold must be at most 1000 bytes"
+        );
+        ensure!(
+            self.fec != automatic_fec::AUTO
+                || (self.receiver_feedback
+                    && !self.mixed_fec
+                    && self.small_fec_bytes == 0
+                    && self.fec_repairs == 1
+                    && self.redundancy > 0),
+            "automatic FEC requires feedback, positive redundancy budget, one repair, and no small/mixed FEC"
         );
         if self.mixed_fec {
             ensure!(
@@ -164,6 +195,17 @@ impl Policy {
         );
         Ok(())
     }
+}
+
+pub(super) fn parse_fec(value: &str) -> std::result::Result<u8, String> {
+    if value == "auto" {
+        return Ok(automatic_fec::AUTO);
+    }
+    value
+        .parse::<u8>()
+        .ok()
+        .filter(|n| *n <= 32)
+        .ok_or_else(|| "FEC must be auto or 0..32".to_owned())
 }
 
 fn mixed_fec_header(headers: &http::HeaderMap) -> Result<bool> {
@@ -207,8 +249,9 @@ struct OutPath {
     id: u8,
     group: u8,
     conn: quinn::Connection,
-    /// Exact empty-buffer payload allowance, captured before this sender owns it.
-    empty_datagram_space: usize,
+    /// Moves this path's datagrams into Quinn; the sender never takes the
+    /// connection lock itself.
+    writer: Arc<writer::Writer>,
     stream: u64,
     quality: Arc<Mutex<quality::State>>,
     capacity_probe: Arc<Mutex<capacity_probe::State>>,
@@ -217,11 +260,10 @@ struct OutPath {
     probe_reply: Arc<Mutex<Option<quality::Probe>>>,
 }
 
-fn transport_pressure(empty_space: usize, available: usize, frame_bytes: usize) -> (usize, bool) {
-    (
-        empty_space.saturating_sub(available),
-        available < frame_bytes,
-    )
+impl OutPath {
+    fn open(&self) -> bool {
+        !self.conn.is_closed()
+    }
 }
 type Paths = Arc<Mutex<Vec<OutPath>>>;
 
@@ -370,7 +412,7 @@ fn grant_reprobes(
         if ceiling <= rates[id] || !controllers[id].start_reprobe(now_us, ceiling) {
             continue;
         }
-        let admitted_rate = controllers[id].decision(now_us).pacing_bps;
+        let admitted_rate = controllers[id].pacing_bps();
         let increase = admitted_rate.saturating_sub(rates[id]);
         total = total.saturating_add(increase);
         grouped[group] = grouped[group].saturating_add(increase);
@@ -492,6 +534,8 @@ fn measured_payload(
 struct QueuedRecord {
     record: Record,
     created: Instant,
+    /// Reliable-stream backpressure; released with the queued original.
+    hold: Option<Arc<outbound::Hold>>,
 }
 
 #[derive(Clone)]
@@ -503,6 +547,8 @@ struct BlockSend {
     locally_rejected_originals: u32,
     small_repair_limit: usize,
     small_repair_reserved: usize,
+    /// The block's original is a reliable-stream acknowledgment.
+    acknowledgment: bool,
 }
 
 fn repair_locally_unrecoverable(
@@ -543,6 +589,7 @@ fn enqueue_symbol(
         blocks,
         None,
         metrics,
+        &mut None,
     );
 }
 
@@ -554,7 +601,15 @@ fn enqueue_encoded(
     policy: &Policy,
     metrics: &Scope,
 ) {
-    enqueue_coded_symbol(symbol, created, queue, blocks, Some(policy), metrics);
+    enqueue_coded_symbol(
+        symbol,
+        created,
+        queue,
+        blocks,
+        Some(policy),
+        metrics,
+        &mut None,
+    );
 }
 
 fn encode_input(
@@ -565,7 +620,11 @@ fn encode_input(
     blocks: &mut BTreeMap<u64, BlockSend>,
     metrics: &Scope,
 ) {
-    let QueuedRecord { record, created } = input;
+    let QueuedRecord {
+        record,
+        created,
+        mut hold,
+    } = input;
     if created.elapsed() >= policy.admission_lifetime() {
         metrics.trace_record(
             trace::Stage::RecordDropped,
@@ -580,10 +639,19 @@ fn encode_input(
         });
         return;
     }
-    match encoder.encode_ingress(&record, Instant::now(), created) {
+    let attempt = hold.as_ref().map_or(1, |h| h.transmission());
+    match encoder.encode_attempt_ingress(&record, Instant::now(), attempt, created) {
         Ok(symbols) => {
             for symbol in symbols {
-                enqueue_encoded(symbol, created, queue, blocks, policy, metrics);
+                enqueue_coded_symbol(
+                    symbol,
+                    created,
+                    queue,
+                    blocks,
+                    Some(policy),
+                    metrics,
+                    &mut hold,
+                );
             }
         }
         Err(_) => {
@@ -605,13 +673,14 @@ fn enqueue_coded_symbol(
     blocks: &mut BTreeMap<u64, BlockSend>,
     policy: Option<&Policy>,
     metrics: &Scope,
+    hold: &mut Option<Arc<outbound::Hold>>,
 ) {
     let coding::EncodedSymbol {
         data,
         small,
         oldest_ingress,
     } = symbol;
-    let mixed = policy.is_some_and(|p| p.mixed_fec);
+    let mixed = policy.is_some_and(Policy::split_fec);
     let small_repair_limit = if mixed && small && data[3] == 1 {
         // The repair can use another HTTP request stream. Reserve against the
         // largest legal mapping, not the original's actual stream-id width.
@@ -647,6 +716,7 @@ fn enqueue_coded_symbol(
                 locally_rejected_originals: 0,
                 small_repair_limit: 0,
                 small_repair_reserved: 0,
+                acknowledgment: false,
             })
             .created
             .min(oldest)
@@ -665,6 +735,14 @@ fn enqueue_coded_symbol(
         block_created
     };
     let flow = record.map(|(flow, _)| policy.map_or(flow, |p| p.flow(flow)));
+    if let Some(block) = block
+        && flow.is_some_and(stream::is_ack_flow)
+    {
+        blocks
+            .get_mut(&block)
+            .expect("block inserted")
+            .acknowledgment = true;
+    }
     metrics.update(|d| {
         if let Some(id) = record_id {
             d.symbols.originals_generated += 1;
@@ -713,6 +791,11 @@ fn enqueue_coded_symbol(
         flow,
         block,
         small,
+        hold: if record_id.is_some() {
+            hold.take()
+        } else {
+            None
+        },
     };
     let accepted = !skipped && queue.push(pending).is_ok();
     if !accepted
@@ -739,7 +822,7 @@ fn enqueue_coded_symbol(
         && small_repair_limit > 0
         && let Some(meta) = block.and_then(|block| blocks.get_mut(&block))
     {
-        meta.small_repair_limit = small_repair_limit;
+        meta.small_repair_limit += small_repair_limit;
     }
     metrics.update(|d| {
         if skipped {
@@ -812,18 +895,28 @@ fn repair_allowed(
     pending: &outbound::Pending,
     frame_bytes: usize,
 ) -> bool {
-    if policy.small_fec_bytes > 0 && (!policy.mixed_fec || pending.small) {
+    if small_delivery::applies(policy, pending) {
         // Independent k=1 blocks create exactly one queued copy. Its original
         // must have actually entered Quinn; expiry/generation grants no credit.
         pending
             .block
             .and_then(|block| blocks.get(&block))
             .is_some_and(|meta| {
-                meta.paths != 0 && (!policy.mixed_fec || meta.small_repair_reserved >= frame_bytes)
+                meta.paths != 0
+                    && (!policy.split_fec() || meta.small_repair_reserved >= frame_bytes)
+                    && budget.small_can_repair(frame_bytes + small_copy_reserve(meta))
             })
     } else {
         budget.can_repair(frame_bytes)
     }
+}
+
+/// A bulk download acknowledges continuously: its acknowledgment copies alone
+/// can exhaust the small-copy rate, and each is superseded by the next one.
+/// They spend only credit above one datagram, which stays available for the
+/// first records of new and interactive streams.
+fn small_copy_reserve(meta: &BlockSend) -> usize {
+    if meta.acknowledgment { 1200 } else { 0 }
 }
 
 fn repair_frame_floor(policy: &Policy, pending: &outbound::Pending) -> usize {
@@ -846,7 +939,7 @@ fn account_budget_skipped(policy: &Policy, pending: &outbound::Pending, metrics:
     );
     metrics.update(|d| {
         d.symbols.repairs_budget_skipped += 1;
-        if policy.mixed_fec && !pending.small {
+        if policy.split_fec() && !pending.small {
             d.symbols.mixed_bulk_repairs_budget_skipped += 1;
             // No path/HTTP stream was selected. This is encoded wire length,
             // not hypothetical HTTP framing or admitted traffic.
@@ -866,7 +959,7 @@ fn budget_admitted(
     metrics: &Scope,
 ) {
     let repair = pending.record_id.is_none();
-    if !policy.mixed_fec {
+    if !policy.split_fec() {
         if repair {
             if policy.small_fec_bytes == 0 {
                 budget.repair_admitted(frame_bytes);
@@ -881,7 +974,8 @@ fn budget_admitted(
         if repair {
             let meta = meta.expect("admitted small repair block");
             assert!(meta.paths != 0 && meta.small_repair_reserved >= frame_bytes);
-            meta.small_repair_reserved = 0;
+            meta.small_repair_reserved -= frame_bytes;
+            budget.small_repair_admitted(frame_bytes);
             metrics.update(|d| {
                 d.symbols.mixed_small_repair_admitted_bytes += frame_bytes as u64;
                 d.symbols.mixed_small_repairs_quinn_admitted += 1;
@@ -936,9 +1030,8 @@ impl PreparedSend {
         let candidates: Vec<_> = paths
             .iter()
             .filter(|path| {
-                path.conn.close_reason().is_none()
-                    && (!policy.adaptive
-                        || controllers[usize::from(path.id)].decision(now_us).eligible)
+                path.open()
+                    && (!policy.adaptive || controllers[usize::from(path.id)].eligible(now_us))
             })
             .map(|path| (path.id, 1))
             .collect();
@@ -968,6 +1061,11 @@ impl PreparedSend {
             eligible,
             policy.admission_lifetime().saturating_sub(age),
             policy.latency_target_ms,
+            if self.repair && policy.fec == automatic_fec::AUTO {
+                self.used
+            } else {
+                0
+            },
         );
         timely & (1 << self.path.id) != 0
             && (!self.repair || small_delivery::copy_ready(&self.path, self.used))
@@ -976,7 +1074,7 @@ impl PreparedSend {
 
 struct WaitingSend {
     prepared: PreparedSend,
-    send: Pin<Box<dyn Future<Output = Result<(), quinn::SendDatagramError>> + Send>>,
+    admitted: Pin<Box<dyn Future<Output = ()> + Send>>,
 }
 
 #[derive(Debug)]
@@ -990,13 +1088,12 @@ enum SendReadiness {
 
 impl WaitingSend {
     fn new(prepared: PreparedSend) -> Self {
-        let conn = prepared.path.conn.clone();
-        let data = prepared.data.clone();
+        let writer = prepared.path.writer.clone();
+        let bytes = prepared.data.len();
         Self {
             prepared,
-            // A pending Quinn future has not queued this datagram. Dropping it
-            // before a successful poll cancels the attempt without any debit.
-            send: Box::pin(async move { conn.send_datagram_wait(data).await }),
+            // Waiting queues nothing: dropping it cancels without any debit.
+            admitted: Box::pin(async move { writer.admitted(bytes).await }),
         }
     }
 
@@ -1023,7 +1120,7 @@ impl WaitingSend {
         }) else {
             return Poll::Ready(SendReadiness::PathChanged);
         };
-        if paths[index].conn.close_reason().is_some() {
+        if !paths[index].open() {
             return Poll::Ready(SendReadiness::PathChanged);
         }
         // Take the clock after acquiring the membership locks, immediately
@@ -1035,26 +1132,29 @@ impl WaitingSend {
         if !allowed(&self.prepared, now, &paths) {
             return Poll::Ready(SendReadiness::GateChanged);
         }
-        // Control checks can take time or acquire contended locks. Refresh after
-        // them, immediately before Quinn gets ownership of this datagram.
+        // Control checks can take time. Refresh after them, immediately
+        // before the path's writer gets ownership of this datagram.
         if admission_now().saturating_duration_since(self.prepared.front.created) >= lifetime {
             return Poll::Ready(SendReadiness::Expired);
         }
-        match self.send.as_mut().poll(cx) {
-            Poll::Pending => Poll::Pending,
-            Poll::Ready(Ok(())) => Poll::Ready(SendReadiness::Admitted {
+        if self.admitted.as_mut().poll(cx).is_pending() {
+            return Poll::Pending;
+        }
+        if self.prepared.path.writer.send(self.prepared.data.clone()) {
+            Poll::Ready(SendReadiness::Admitted {
                 at: Instant::now(),
                 next_cursor: (index + 1) % paths.len(),
-            }),
-            Poll::Ready(Err(_)) => Poll::Ready(SendReadiness::Failed),
+            })
+        } else {
+            Poll::Ready(SendReadiness::Failed)
         }
         // The membership guard is local to this synchronous poll. No mutex
         // guard survives Pending or is held while the sender awaits a wakeup.
     }
 
     fn cancel(self) -> PreparedSend {
-        let Self { prepared, send } = self;
-        drop(send);
+        let Self { prepared, admitted } = self;
+        drop(admitted);
         prepared
     }
 }
@@ -1068,16 +1168,16 @@ enum SenderEvent {
 }
 
 fn send_datagram_before_deadline(
-    conn: &quinn::Connection,
+    path: &OutPath,
     data: Bytes,
     created: Instant,
     lifetime: Duration,
-) -> Option<std::result::Result<Instant, quinn::SendDatagramError>> {
-    // Preparation and lock contention can outlive the queue-head preflight.
+) -> Option<std::result::Result<Instant, ()>> {
+    // Preparation can outlive the queue-head preflight.
     if admission_now().saturating_duration_since(created) >= lifetime {
         return None;
     }
-    Some(conn.send_datagram(data).map(|()| Instant::now()))
+    Some(path.writer.send(data).then(Instant::now).ok_or(()))
 }
 
 fn admission_now() -> Instant {
@@ -1113,16 +1213,48 @@ fn update_business_pacer(
         business.update(
             now_us,
             paths.iter().filter_map(|path| {
-                if path.conn.close_reason().is_some() {
+                if !path.open() {
                     return None;
                 }
-                let decision = controllers[usize::from(path.id)].decision(now_us);
-                decision
-                    .eligible
-                    .then_some((path.group, decision.pacing_bps))
+                let controller = &controllers[usize::from(path.id)];
+                controller
+                    .eligible(now_us)
+                    .then_some((path.group, controller.pacing_bps()))
             }),
         );
     }
+}
+
+fn latency_candidates(
+    mut candidates: Vec<(u8, i32)>,
+    paths: &[OutPath],
+    front: &outbound::Pending,
+    repair: bool,
+    policy: &Policy,
+    age: Duration,
+) -> Vec<(u8, i32)> {
+    if !policy.adaptive
+        || repair
+        || small_delivery::applies(policy, front)
+        || front
+            .flow
+            .is_none_or(|flow| stream::stream_id(flow).is_none())
+        || front.data.len() > LATENCY_RECORD_BYTES
+    {
+        return candidates;
+    }
+    // Rank healthy paths before checking transient packet credit. A token gap
+    // on an idle route must not send an interactive record into a long queue.
+    // An unready head rotates normally, so other flows keep making progress.
+    let eligible = candidates.iter().fold(0, |mask, (id, _)| mask | (1 << id));
+    let timely = small_delivery::latency_mask(
+        paths,
+        eligible,
+        policy.admission_lifetime().saturating_sub(age),
+        policy.latency_target_ms,
+    );
+    candidates.retain(|(id, _)| timely & (1 << id) != 0);
+    candidates
 }
 
 fn business_ready_candidates(
@@ -1172,12 +1304,12 @@ fn transport_ready_candidates(
             return false;
         };
         let bytes = measured_payload_bytes + mapping_bytes;
-        path.conn.close_reason().is_none()
+        path.open()
             && path
                 .conn
-                .max_datagram_size()
+                .max_datagram_size_hint()
                 .is_some_and(|max| bytes <= max)
-            && path.conn.datagram_send_buffer_space() >= bytes
+            && path.writer.admits(bytes)
     })
 }
 
@@ -1213,6 +1345,9 @@ impl SendAccounting<'_> {
             at,
         } = admission;
         let sent = self.queue.pop(repair).expect("admitted front");
+        if let Some(hold) = &sent.hold {
+            hold.admitted(path.id, path.conn.rtt_hint(), at);
+        }
         debug_assert_eq!(sent.created, front.created);
         debug_assert_eq!(sent.record_id, front.record_id);
         debug_assert_eq!(sent.block, front.block);
@@ -1379,6 +1514,8 @@ async fn sender(
     observation_notify: Option<Arc<Notify>>,
 ) {
     let mut encoder = coding::RecordEncoder::new(&policy).expect("validated policy");
+    let mut fec_control =
+        (policy.fec == automatic_fec::AUTO).then(automatic_fec::Controller::default);
     let mut frontier = sender_frontier::Snapshot {
         enabled: metrics.metrics.frontier_scheduler()
             && policy.adaptive
@@ -1388,6 +1525,9 @@ async fn sender(
     let mut queue = outbound::Queue::default();
     let mut blocks = BTreeMap::<u64, BlockSend>::new();
     let mut budget = outbound::RepairBudget::new(policy.redundancy);
+    if policy.fec == automatic_fec::AUTO {
+        budget.enable_small_rate((policy.rate / 4).min(1_000_000));
+    }
     let mut scheduler = scheduler::Scheduler::default();
     let mut controllers: [adaptive::PathController; MAX_PATHS] = std::array::from_fn(|_| {
         adaptive::PathController::new(policy.rate, policy.latency_target_ms)
@@ -1415,11 +1555,16 @@ async fn sender(
     let mut feedback_schedule = quality::FeedbackSchedule::default();
     let mut pending_feedback: Option<(Bytes, quality::ReportKind)> = None;
     let mut observation_schedule = policy.adaptive.then(outbound::ObservationSchedule::default);
+    let mut reverse_guard =
+        (policy.adaptive && !metrics.metrics.legacy_recovery()).then(reverse_guard::Guard::default);
+    let mut forward_guard =
+        (policy.adaptive && !metrics.metrics.legacy_recovery()).then(forward_guard::Guard::default);
     let mut repair_turn = false;
     let mut tick = interval(Duration::from_millis(1));
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let lifetime = policy.admission_lifetime();
     let mut waiting: Option<WaitingSend> = None;
+    let mut liveness: [liveness::Liveness; MAX_PATHS] = Default::default();
     loop {
         #[cfg(test)]
         sender_ready_tests::hold_deferred_expiry(
@@ -1561,16 +1706,29 @@ async fn sender(
                     &mut pacer,
                     &mut groups,
                 );
-                let Some(QueuedRecord { record, created }) = item else {
+                let Some(QueuedRecord {
+                    record,
+                    created,
+                    hold,
+                }) = item
+                else {
                     break;
                 };
                 metrics.update(|d| d.records.sender_input_consumed += 1);
                 metrics.trace_record(trace::Stage::SenderInput, &record, None, None);
                 if created.elapsed() < lifetime && queue.would_be_full(policy.flow(record.flow)) {
-                    deferred_input = Some(QueuedRecord { record, created });
+                    deferred_input = Some(QueuedRecord {
+                        record,
+                        created,
+                        hold,
+                    });
                 } else {
                     encode_input(
-                        QueuedRecord { record, created },
+                        QueuedRecord {
+                            record,
+                            created,
+                            hold,
+                        },
                         &mut encoder,
                         &policy,
                         &mut queue,
@@ -1583,6 +1741,7 @@ async fn sender(
         let now = Instant::now();
         let now_us = epoch.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
         pacer.refill(now_us);
+        budget.refill_small(now_us);
         for group in &mut groups {
             group.refill(now_us);
         }
@@ -1590,6 +1749,25 @@ async fn sender(
             account_expired(&expired, now, &metrics);
         }
         let paths = shared_paths.lock().expect("paths lock");
+        // Paths that stopped acknowledging carry no data, unless every open
+        // path has: then nothing is gained by withholding it.
+        let silent = {
+            let (mut open, mut silent) = (0u8, 0u8);
+            for path in paths.iter().filter(|p| p.open()) {
+                let id = usize::from(path.id);
+                liveness[id].observe(&path.conn, now);
+                open |= 1 << id;
+                silent |= u8::from(liveness[id].silent()) << id;
+            }
+            if silent == open { 0 } else { silent }
+        };
+        for path in paths.iter() {
+            path.writer.set_pace(if policy.adaptive {
+                controllers[usize::from(path.id)].pacing_bps()
+            } else {
+                policy.rate
+            });
+        }
         if observation_schedule
             .as_mut()
             .and_then(|schedule| schedule.take_due(now_us))
@@ -1600,8 +1778,7 @@ async fn sender(
                 let snapshot = &q.snapshot;
                 let estimate = &snapshot.sender_estimate;
                 let at = quality_time(path);
-                let native_rtt = path.conn.rtt();
-                let space = path.conn.datagram_send_buffer_space();
+                let native_rtt = path.conn.rtt_hint();
                 let frame_bytes = wire::MAX_WIRE
                     + if policy.receiver_feedback {
                         quality::HEADER
@@ -1609,8 +1786,8 @@ async fn sender(
                         0
                     }
                     + wire::http_datagram_overhead(path.stream).expect("admitted stream");
-                let (send_queue_bytes, transport_blocked) =
-                    transport_pressure(path.empty_datagram_space, space, frame_bytes);
+                let send_queue_bytes = path.writer.backlog();
+                let transport_blocked = !path.writer.admits(frame_bytes);
                 let observation = adaptive::Observation {
                     now_us,
                     generation: snapshot.generation,
@@ -1626,7 +1803,7 @@ async fn sender(
                     reprobe_enabled: !policy.probe_guided_recovery
                         && policy.fec == 0
                         && policy.redundancy == 0
-                        && path.conn.close_reason().is_none(),
+                        && path.open(),
                     feedback_sample_symbols: estimate.sample_symbols,
                     finalized_expected: Some(estimate.expected),
                     finalized_lost: Some(estimate.lost),
@@ -1642,7 +1819,8 @@ async fn sender(
                         .map(|_| snapshot.probe_rtt_latest_ms),
                     probe_sample_id: snapshot.replies_received,
                     probe_age_us: snapshot.probe_updated_us.map(|t| at.saturating_sub(t)),
-                    transit_excess_ms: estimate.delay_variation_ms,
+                    transit_excess_ms: (estimate.report_number > 0)
+                        .then_some(estimate.delay_variation_ms),
                     send_queue_bytes,
                     offered_backlog: !queue.is_empty(),
                     transport_blocked,
@@ -1652,7 +1830,7 @@ async fn sender(
                     .lock()
                     .expect("capacity probe lock")
                     .snapshot(at);
-                let cwnd = path.conn.stats().path.cwnd;
+                let cwnd = path.conn.cwnd_hint();
                 let rtt_us = native_rtt.as_micros().min(u128::from(u64::MAX)) as u64;
                 if metrics.metrics.native_service_guard()
                     && policy.fec == 0
@@ -1722,7 +1900,7 @@ async fn sender(
             }
             let live: Vec<_> = paths
                 .iter()
-                .filter(|path| path.conn.close_reason().is_none())
+                .filter(|path| path.open())
                 .map(|path| ReprobePath {
                     id: path.id,
                     group: path.group,
@@ -1736,10 +1914,120 @@ async fn sender(
                 &mut reprobe_cursor,
                 now_us,
             );
+            let mut cap_changed = false;
+            if let Some(guard) = reverse_guard.as_mut() {
+                let mut sent_bytes = 0u64;
+                let counts: Vec<_> = paths
+                    .iter()
+                    .map(|path| {
+                        let q = path.quality.lock().expect("quality lock");
+                        sent_bytes = sent_bytes.saturating_add(q.snapshot.sent_bytes);
+                        (
+                            usize::from(path.id),
+                            reverse_guard::Counts {
+                                generation: q.snapshot.generation,
+                                expected: q.snapshot.received.expected,
+                                received: q.snapshot.received.received,
+                            },
+                        )
+                    })
+                    .collect();
+                if guard.observe(now_us, &counts, sent_bytes) {
+                    cap_changed = true;
+                    metrics.publish_reverse_guard(guard.snapshot());
+                }
+            }
+            if let Some(guard) = forward_guard.as_mut() {
+                let mut sent_bytes = 0u64;
+                let counts: Vec<_> = paths
+                    .iter()
+                    .map(|path| {
+                        let q = path.quality.lock().expect("quality lock");
+                        sent_bytes = sent_bytes.saturating_add(q.snapshot.sent_bytes);
+                        let estimate = &q.snapshot.sender_estimate;
+                        (
+                            usize::from(path.id),
+                            forward_guard::Counts {
+                                generation: q.snapshot.generation,
+                                sent_symbols: q.snapshot.sent_symbols,
+                                expected: estimate.expected,
+                                lost: estimate.lost,
+                            },
+                        )
+                    })
+                    .collect();
+                cap_changed |= guard.observe(now_us, &counts, sent_bytes);
+                metrics.publish_forward_guard(guard.snapshot());
+                let learned = guard.take_random_loss();
+                for (id, controller) in controllers.iter_mut().enumerate() {
+                    controller.set_shared_loss(guard.shared_loss());
+                    if let Some(loss) = learned[id] {
+                        controller.inherit_random_loss(loss.generation, loss.fraction, now_us);
+                    }
+                }
+            }
+            if cap_changed {
+                let cap = [
+                    reverse_guard
+                        .as_ref()
+                        .and_then(reverse_guard::Guard::cap_bps),
+                    forward_guard
+                        .as_ref()
+                        .and_then(forward_guard::Guard::cap_bps),
+                ]
+                .into_iter()
+                .flatten()
+                .fold(policy.rate, u64::min);
+                pacer.set_rate(now_us, cap);
+            }
             for path in paths.iter() {
                 let snapshot = controllers[usize::from(path.id)].snapshot(now_us);
                 metrics.path(path.id, |p| p.adaptive = Some(snapshot));
             }
+        }
+        if publish_feedback_stats
+            && let Some(control) = fec_control.as_mut()
+            && control.due(now_us)
+        {
+            let feedback: Vec<_> = paths
+                .iter()
+                .map(|path| {
+                    (
+                        path.id,
+                        path.open() && silent & (1 << path.id) == 0,
+                        path.quality
+                            .lock()
+                            .expect("quality lock")
+                            .snapshot_at(quality_time(path)),
+                    )
+                })
+                .collect();
+            let changed = control.observe(
+                now_us,
+                feedback.iter().map(|(id, active, s)| (*id, *active, s)),
+            );
+            let snapshot = control.snapshot();
+            if let Some(k) = changed.or_else(|| snapshot.loss_rate.map(|_| snapshot.data_shards)) {
+                match encoder.set_fec(k) {
+                    Ok(symbols) => {
+                        for symbol in symbols {
+                            enqueue_encoded(
+                                symbol,
+                                now,
+                                &mut queue,
+                                &mut blocks,
+                                &policy,
+                                &metrics,
+                            );
+                        }
+                    }
+                    Err(_) => {
+                        metrics.update(|d| d.records.encoding_dropped += 1);
+                        break;
+                    }
+                }
+            }
+            metrics.publish_automatic_fec(snapshot);
         }
         update_business_pacer(&mut business, &paths, &controllers, now_us);
         if policy.capacity_probe_bps > 0 {
@@ -1829,15 +2117,15 @@ async fn sender(
                 let data = wire::http_datagram(path.stream, frame).expect("admitted stream");
                 let cost = data.len() + 80;
                 let group = &mut groups[usize::from(path.group)];
-                if path.conn.close_reason().is_none()
+                if path.open()
                     && pacer.available(cost)
                     && group.available(cost)
                     && path
                         .conn
-                        .max_datagram_size()
+                        .max_datagram_size_hint()
                         .is_some_and(|m| m >= data.len())
-                    && path.conn.datagram_send_buffer_space() >= data.len()
-                    && path.conn.send_datagram(data).is_ok()
+                    && path.writer.admits(data.len())
+                    && path.writer.send_first(data)
                 {
                     pacer.spend(cost);
                     group.spend(cost);
@@ -1873,14 +2161,14 @@ async fn sender(
         let reserved_group = if feedback_reserve > 0 {
             paths
                 .iter()
-                .filter(|p| p.conn.close_reason().is_none())
+                .filter(|p| p.open())
                 .min_by_key(|p| control_priority(p))
                 .map(|p| p.group)
         } else {
             None
         };
         if policy.adaptive {
-            for path in paths.iter().filter(|p| p.conn.close_reason().is_none()) {
+            for path in paths.iter().filter(|p| p.open()) {
                 let id = usize::from(path.id);
                 let reply = path.probe_reply.lock().expect("probe reply lock").clone();
                 let frame = if let Some(reply) = reply {
@@ -1914,12 +2202,12 @@ async fn sender(
                 };
                 if pacer.available(cost + feedback_reserve)
                     && group.available(cost + group_reserve)
-                    && path.conn.datagram_send_buffer_space() >= data.len()
+                    && path.writer.admits(data.len())
                     && path
                         .conn
-                        .max_datagram_size()
+                        .max_datagram_size_hint()
                         .is_some_and(|m| m >= data.len())
-                    && path.conn.send_datagram(data).is_ok()
+                    && path.writer.send_first(data)
                 {
                     pacer.spend(cost);
                     group.spend(cost);
@@ -1942,7 +2230,7 @@ async fn sender(
         if policy.capacity_probe_bps > 0 && !paths.is_empty() {
             let mut probe_rates = [0u64; MAX_PATHS];
             for path in paths.iter() {
-                if path.conn.close_reason().is_none() {
+                if path.open() {
                     let rate = capacity_pacing[usize::from(path.id)].snapshot().pacing_bps;
                     probe_rates[usize::from(path.group)] =
                         probe_rates[usize::from(path.group)].saturating_add(rate);
@@ -1953,7 +2241,7 @@ async fn sender(
             for offset in 0..paths.len() {
                 let index = (first + offset) % paths.len();
                 let path = &paths[index];
-                if path.conn.close_reason().is_some() {
+                if !path.open() {
                     continue;
                 }
                 if !capacity_pacing[usize::from(path.id)]
@@ -1984,12 +2272,12 @@ async fn sender(
                     && capacity_budget.available(now_us, path.group, cost)
                     && pacer.available(cost + feedback_reserve)
                     && group.available(cost + reserve)
-                    && path.conn.datagram_send_buffer_space() >= data.len()
+                    && path.writer.admits(data.len())
                     && path
                         .conn
-                        .max_datagram_size()
+                        .max_datagram_size_hint()
                         .is_some_and(|size| size >= data.len())
-                    && path.conn.send_datagram(data).is_ok()
+                    && path.writer.send(data)
                 {
                     pacer.spend(cost);
                     group.spend(cost);
@@ -2030,7 +2318,7 @@ async fn sender(
             let affordable_repair = |p: &outbound::Pending| {
                 repair_allowed(&policy, &budget, &blocks, p, repair_frame_floor(&policy, p))
             };
-            let repair_ready = if policy.mixed_fec {
+            let repair_ready = if policy.split_fec() {
                 // At most REPAIR_LIMIT distinct heads are tried without an
                 // admission. A budget- or path-blocked lane cannot hide a
                 // separately authorized repair from the other coding lane.
@@ -2080,9 +2368,10 @@ async fn sender(
                 paths
                     .iter()
                     .filter(|p| {
-                        let eligible = p.conn.close_reason().is_none()
+                        let eligible = p.open()
+                            && silent & (1 << p.id) == 0
                             && (!policy.adaptive
-                                || controllers[usize::from(p.id)].decision(now_us).eligible);
+                                || controllers[usize::from(p.id)].eligible(now_us));
                         if !eligible {
                             frontier.add(p.id, is_small, Gate::PathIneligible);
                         }
@@ -2100,7 +2389,7 @@ async fn sender(
                                     .snapshot
                                     .sender_estimate,
                                 quality_time(path),
-                                path.conn.rtt().as_secs_f64() * 1000.0,
+                                path.conn.rtt_hint().as_secs_f64() * 1000.0,
                             )
                         };
                         (path.id, weight)
@@ -2109,6 +2398,7 @@ async fn sender(
             } else {
                 Vec::new()
             };
+            let candidates = latency_candidates(candidates, &paths, &front, repair, &policy, age);
             let before_allowance = candidates
                 .iter()
                 .fold(0u8, |mask, (id, _)| mask | (1 << id));
@@ -2143,6 +2433,10 @@ async fn sender(
                     frontier.no_eligible_path_previews += 1;
                 }
             }
+            let used = front
+                .block
+                .and_then(|b| blocks.get(&b))
+                .map_or(0, |b| b.paths);
             let small_mask = if is_small {
                 let eligible = if policy.quality_schedule {
                     candidates.iter().fold(0, |mask, (id, _)| mask | (1 << id))
@@ -2154,6 +2448,11 @@ async fn sender(
                     eligible,
                     lifetime.saturating_sub(age),
                     policy.latency_target_ms,
+                    if repair && policy.fec == automatic_fec::AUTO {
+                        used
+                    } else {
+                        0
+                    },
                 )
             } else {
                 u8::MAX
@@ -2183,18 +2482,31 @@ async fn sender(
                     .map(|n| (cursor + n) % paths.len())
                     .collect()
             };
-            let used = front
-                .block
-                .and_then(|b| blocks.get(&b))
-                .map_or(0, |b| b.paths);
             if is_small {
                 order.retain(|i| small_mask & (1 << paths[*i].id) != 0);
             }
             if repair {
                 order.sort_by_key(|i| u8::from(used & (1 << paths[*i].id) != 0));
+            } else if order.len() > 1
+                && !is_small
+                && (front.data.len() <= LATENCY_RECORD_BYTES
+                    || front.hold.as_ref().is_some_and(|hold| hold.interactive()))
+            {
+                // Small records (acknowledgments, interactive and control
+                // traffic) and latency-bound streams take the earliest ready
+                // path; bulk keeps the weighted spread across paths. Where the
+                // small-delivery policy applies, its delay and loss ranking
+                // decides instead.
+                let mut ranked: Vec<_> = order
+                    .iter()
+                    .map(|&i| (small_delivery::delay_ms(&paths[i]), i))
+                    .collect();
+                ranked.sort_by(|a, b| a.0.total_cmp(&b.0));
+                order = ranked.into_iter().map(|(_, i)| i).collect();
             }
-            // Shadow evaluates identical evidence in both arms. Only the local
-            // opt-in changes order; all original gates below remain authoritative.
+            // AUTO originals prefer a ready faster route in the same protection
+            // tier. Repairs/fixed policies retain the opt-in frontier treatment.
+            // Reordering never removes a fallback or bypasses any gate below.
             if is_small && policy.adaptive && order.len() > 1 {
                 frontier.small_rank_evaluations += 1;
                 let ids: Vec<_> = order.iter().map(|i| paths[*i].id).collect();
@@ -2227,16 +2539,26 @@ async fn sender(
                         Some(sample)
                     })
                     .collect();
-                if let Some(id) = sender_frontier::preferred(&ids, &samples) {
+                let auto_original = !repair && policy.fec == automatic_fec::AUTO;
+                let preferred = if auto_original {
+                    sender_frontier::preferred_original(&ids, &samples)
+                } else {
+                    sender_frontier::preferred(&ids, &samples)
+                };
+                if let Some(id) = preferred {
                     frontier.small_rank_opportunities += 1;
-                    if frontier.enabled {
+                    if frontier.enabled || auto_original {
                         let at = order
                             .iter()
                             .position(|i| paths[*i].id == id)
                             .expect("existing ranked path");
                         let selected = order.remove(at);
                         order.insert(0, selected);
-                        frontier.small_rank_changes += 1;
+                        if auto_original {
+                            frontier.automatic_original_rank_changes += 1;
+                        } else {
+                            frontier.small_rank_changes += 1;
+                        }
                     }
                 }
             }
@@ -2245,7 +2567,7 @@ async fn sender(
             for i in order {
                 let path = &paths[i];
                 let id = usize::from(path.id);
-                if path.conn.close_reason().is_some() {
+                if !path.open() || silent & (1 << path.id) != 0 {
                     frontier.add(path.id, is_small, Gate::PathIneligible);
                     continue;
                 }
@@ -2300,13 +2622,13 @@ async fn sender(
                 }
                 if path
                     .conn
-                    .max_datagram_size()
+                    .max_datagram_size_hint()
                     .is_none_or(|m| frame_bytes > m)
                 {
                     frontier.add(path.id, is_small, Gate::DatagramSize);
                     continue;
                 }
-                let blocked = path.conn.datagram_send_buffer_space() < frame_bytes;
+                let blocked = !path.writer.admits(frame_bytes);
                 #[cfg(test)]
                 let blocked =
                     blocked || sender_ready_tests::defer_expiry_candidate(front.record_id);
@@ -2350,7 +2672,7 @@ async fn sender(
                     });
                     continue;
                 }
-                match send_datagram_before_deadline(&path.conn, data, front.created, lifetime) {
+                match send_datagram_before_deadline(path, data, front.created, lifetime) {
                     None => {
                         frontier.add(path.id, is_small, Gate::ExpiredBeforeApi);
                         let expired = queue.pop(repair).expect("expired front");
@@ -2379,7 +2701,10 @@ async fn sender(
             }
             let Some((index, frame_bytes, at)) = accepted else {
                 if repair {
-                    if policy.mixed_fec {
+                    // Split lanes recompute the blocked flag from this list on
+                    // every pass; without it the same unsendable repair would
+                    // be retried until it expired, starving every original.
+                    if policy.split_fec() {
                         stalled_repairs.push(front.block.expect("encoded repair block"));
                         if repair_wait.is_none() {
                             repair_wait = wait_candidate;
@@ -2555,7 +2880,7 @@ fn enqueue_message(
         Ok(permits) => {
             for (record, permit) in records.zip(permits) {
                 // Small single messages keep the ordinary FIFO semantics.
-                admit_record(record, created, scope, |queued| {
+                admit_record(record, created, scope, None, |queued| {
                     permit.send(queued);
                     Ok(())
                 });
@@ -2572,7 +2897,7 @@ fn enqueue_message(
             let closed = matches!(error, mpsc::error::TrySendError::Closed(()));
             if count == 1 {
                 for record in records {
-                    admit_record(record, created, scope, |queued| {
+                    admit_record(record, created, scope, None, |queued| {
                         Err(if closed {
                             mpsc::error::TrySendError::Closed(queued)
                         } else {
@@ -2597,20 +2922,20 @@ fn enqueue_message(
     }
 }
 
-#[cfg(test)]
 fn enqueue_record(
     tx: &mpsc::Sender<QueuedRecord>,
     record: Record,
     created: Instant,
     scope: &Scope,
     small_threshold: usize,
+    hold: Option<Arc<outbound::Hold>>,
 ) -> bool {
     let payload_bytes = if record.flow & messages::FLAG != 0 {
         super::MAX_MESSAGE
     } else {
         record.payload.len()
     };
-    admit_record(record, created, scope, |queued| {
+    admit_record(record, created, scope, hold, |queued| {
         ingress::try_send(tx, queued, payload_bytes, small_threshold)
     })
 }
@@ -2619,6 +2944,7 @@ fn admit_record(
     record: Record,
     created: Instant,
     scope: &Scope,
+    hold: Option<Arc<outbound::Hold>>,
     send: impl FnOnce(QueuedRecord) -> Result<(), mpsc::error::TrySendError<QueuedRecord>>,
 ) -> bool {
     let mut assigned_event = None;
@@ -2634,7 +2960,11 @@ fn admit_record(
         assigned_event = Some(event);
         event
     });
-    let result = send(QueuedRecord { record, created });
+    let result = send(QueuedRecord {
+        record,
+        created,
+        hold,
+    });
     if let Some(mut event) = assigned_event {
         event.stage = if result.is_ok() {
             trace::Stage::IngressQueued
@@ -2837,10 +3167,18 @@ impl Drop for ServerLifetime {
     }
 }
 
+async fn stream_wake(streams: &mut Option<tcp::Mux>) -> tcp::Wake {
+    match streams {
+        Some(streams) => streams.wake().await,
+        None => std::future::pending().await,
+    }
+}
+
 async fn session_loop(
     session: Arc<Session>,
     mut events: mpsc::Receiver<Event>,
-    target: SocketAddr,
+    target: Option<SocketAddr>,
+    tcp: tcp::Targets,
 ) {
     if *session.stop.borrow() {
         session.done.store(true, Ordering::Release);
@@ -2879,6 +3217,8 @@ async fn session_loop(
         ),
     );
     let mut flows: HashMap<u32, (Arc<UdpSocket>, Instant)> = HashMap::new();
+    let mut streams = tcp::Mux::server(tcp, &session.policy, session.returning.clone());
+    let small_threshold = ingress::small_threshold(&session.policy);
     let mut next_id = 0u64;
     let mut tick = interval(Duration::from_secs(5));
     let mut dropped = 0u64;
@@ -2886,13 +3226,22 @@ async fn session_loop(
         if *stop.borrow() {
             break;
         }
+        if let Some(mux) = streams.as_mut() {
+            mux.service_io();
+            mux.flush(&mut tcp::Out {
+                tx: &tx,
+                next_id: &mut next_id,
+                scope: &session.returning,
+                small_threshold,
+            });
+        }
         tokio::select! {
             biased;
             _=stop.changed()=>break,
             _=tick.tick()=>{
                 flows.retain(|_,(_,t)|t.elapsed()<Duration::from_secs(60));
                 let p=session.paths.lock().expect("paths lock");
-                for path in p.iter(){let stats=path.conn.stats();info!(path=path.id,rtt_ms=path.conn.rtt().as_secs_f64()*1000.0,tx_packets=stats.udp_tx.datagrams,rx_packets=stats.udp_rx.datagrams,tx_bytes=stats.udp_tx.bytes,rx_bytes=stats.udp_rx.bytes,lost=stats.path.lost_packets,cwnd=stats.path.cwnd,"server path statistics");}
+                for path in p.iter(){let stats=path.conn.stats();info!(path=path.id,rtt_ms=path.conn.rtt_hint().as_secs_f64()*1000.0,tx_packets=stats.udp_tx.datagrams,rx_packets=stats.udp_rx.datagrams,tx_bytes=stats.udp_tx.bytes,rx_bytes=stats.udp_rx.bytes,lost=stats.path.lost_packets,cwnd=stats.path.cwnd,"server path statistics");}
                 info!(paths=p.len(),flows=flows.len(),originals=decoder.originals,recovered=decoder.recovered,duplicates=decoder.duplicates,invalid=decoder.invalid,dropped,ingress_drops=session.ingress_drops.load(Ordering::Relaxed),"server session");
             },
             _=retention_deadline(&decoder)=>{decoder.expire_adaptive(Instant::now());publish_retention(&decoder,&session.forward);},
@@ -2903,9 +3252,12 @@ async fn session_loop(
                     let records=receive_records(&mut decoder,&session.forward,pid,&data);
                     let decoded=Instant::now();
                     for r in records {
+                        if let Some(mux)=streams.as_mut() && (stream::stream_id(r.flow).is_some() || associate::is_flow(r.flow)) {mux.receive(r);continue}
+                        if stream::stream_id(r.flow).is_some() || associate::is_flow(r.flow) {dropped+=1;continue}
                         let Some((r, decoded)) = messages.receive(r, decoded) else { publish_messages(&mut messages, &session.forward); continue; };
                         publish_messages(&mut messages, &session.forward);
                         if !flows.contains_key(&r.flow) {
+                            let Some(target)=target else{dropped+=delivery.socket_error(pid,&r);continue};
                             if flows.len()>=MAX_FLOWS{dropped+=1;session.forward.trace_record(trace::Stage::RecordDropped,&r,None,Some(trace::Reason::FlowLimit));session.forward.update(|d|d.records.udp_target_flow_dropped+=1);session.forward.path(pid,|p|p.udp_target_flow_dropped+=1);continue}
                             let bind=if target.is_ipv4(){"0.0.0.0:0"}else{"[::]:0"};
                             let Ok(socket)=UdpSocket::bind(bind).await else{dropped+=delivery.socket_error(pid,&r);continue};
@@ -2945,9 +3297,13 @@ async fn session_loop(
                     if !enqueue_message(&tx,parts,created,&session.returning,ingress::small_threshold(&session.policy)){dropped+=1;}
                 },
                 None=>break,
-            }
+            },
+            wake=stream_wake(&mut streams)=>streams.as_mut().expect("stream adapter").handle(wake),
         }
         while tasks.try_join_next().is_some() {}
+    }
+    if let Some(mux) = streams.as_mut() {
+        mux.close_all();
     }
     messages.close();
     publish_messages(&mut messages, &session.forward);
@@ -3010,6 +3366,8 @@ pub struct ServerOptions {
     pub key: std::path::PathBuf,
     pub token: std::path::PathBuf,
     pub target: Option<SocketAddr>,
+    pub tcp_target: Option<SocketAddr>,
+    pub stream_proxy: Option<ProxyAccess>,
     pub proxy: Option<Arc<super::proxy::Server>>,
     pub max_rate: u64,
     pub congestion: transport::Congestion,
@@ -3054,7 +3412,14 @@ async fn serve_with_budgets(
         (64_000..=super::MAX_RATE_BPS).contains(&options.max_rate),
         "invalid server rate"
     );
-    let endpoint = transport::server_with_proxy(
+    ensure!(
+        options.target.is_some()
+            || options.tcp_target.is_some()
+            || options.stream_proxy.is_some()
+            || options.proxy.is_some(),
+        "configure a UDP target, a TCP target, a proxy, or several"
+    );
+    let endpoint = transport::server_with_session_config(
         options.bind,
         &options.cert,
         &options.key,
@@ -3062,6 +3427,7 @@ async fn serve_with_budgets(
         options.datagram_send_buffer_bytes,
         ack_request,
         options.proxy.is_some(),
+        Some(&options.key.with_extension("tickets")),
     )?;
     let secret = Arc::new(format!("Bearer {}", transport::token(&options.token)?));
     let sessions: Sessions = Arc::new(Mutex::new(HashMap::new()));
@@ -3073,7 +3439,7 @@ async fn serve_with_budgets(
     let mut maintenance = interval(Duration::from_secs(1));
     let mut shutdown = Shutdown::new();
     options.stats.readiness(true, 0);
-    info!(address=%endpoint.local_addr()?,target=?options.target,proxy=options.proxy.is_some(),congestion=?options.congestion,?ack_request,"HTTP/3 server ready");
+    info!(address=%endpoint.local_addr()?,target=?options.target,tcp_target=?options.tcp_target,stream_proxy=?options.stream_proxy,proxy=options.proxy.is_some(),congestion=?options.congestion,?ack_request,"HTTP/3 server ready");
     loop {
         tokio::select! {
             _=shutdown.wait()=>break,
@@ -3091,7 +3457,7 @@ async fn serve_with_budgets(
             incoming=endpoint.accept()=>{
                 let Some(incoming)=incoming else{break};
                 let Ok(permit)=pending_connections.clone().try_acquire_owned() else{incoming.refuse();continue};
-                let sessions=sessions.clone(); let secret=secret.clone(); let target=options.target; let settings=ServerSessionSettings{max_rate:options.max_rate,adaptive_fec_retention:options.adaptive_fec_retention,mesh:mesh.clone(),data_connections:data_connections.clone(),proxy:options.proxy.clone()}; let metrics=options.stats.clone();
+                let sessions=sessions.clone(); let secret=secret.clone(); let target=options.target; let settings=ServerSessionSettings{max_rate:options.max_rate,adaptive_fec_retention:options.adaptive_fec_retention,mesh:mesh.clone(),data_connections:data_connections.clone(),proxy:options.proxy.clone(),tcp:tcp::Targets{fixed:options.tcp_target,proxy:options.stream_proxy}}; let metrics=options.stats.clone();
                 tasks.spawn(async move {
                     let mut diagnostic=stats::ConnectionTrace::new(metrics.clone(),incoming.remote_address(),None,"incoming");
                     let result=server_connection(incoming,permit,sessions,secret,target,settings,metrics,&mut diagnostic).await;
@@ -3156,6 +3522,7 @@ struct ServerSessionSettings {
     mesh: Option<Arc<mesh::State>>,
     max_rate: u64,
     adaptive_fec_retention: bool,
+    tcp: tcp::Targets,
 }
 
 async fn cover_response(
@@ -3206,6 +3573,7 @@ async fn server_connection(
         mesh,
         max_rate,
         adaptive_fec_retention,
+        tcp,
     } = settings;
     let conn = timeout(Duration::from_secs(5), incoming).await??;
     diagnostic.handshake_succeeded(&conn);
@@ -3321,11 +3689,11 @@ async fn server_connection(
                                     continue
                                 }
                                 ensure!(!mesh_authenticated,"mesh control connection cannot carry a session");
-                                let Some(target) = target else {
+                                if target.is_none() && tcp.fixed.is_none() && tcp.proxy.is_none() {
                                     stream.send_response(Response::builder().status(StatusCode::NOT_FOUND).body(())?).await?;
                                     stream.finish().await?;
                                     continue;
-                                };
+                                }
                                 let requested_exit=req.headers().get("braidpath-exit").map(|v|v.to_str()).transpose()?;
                                 if requested_exit != mesh.as_ref().map(|state|state.node_id()) {
                                     diagnostic.rejected("exit_identity_mismatch");
@@ -3385,8 +3753,17 @@ async fn server_connection(
                                 let mixed_fec=mixed_fec_header(req.headers())?;
                                 let fec_repairs=fec_repairs_header(req.headers())?;
                                 let max_message_bytes = req.headers().get("braidpath-message-bytes").map(|v| v.to_str()).transpose()?.unwrap_or("1000").parse::<usize>()?;
-                                let policy=Policy{max_message_bytes,
-            fec_repairs,small_fec_bytes,mixed_fec,probe_guided_recovery,capacity_probe_bps,adaptive:quality_schedule==Some("adaptive"),latency_target_ms,group_rates,quality_schedule:quality_schedule.is_some(),receiver_feedback:feedback.is_some(),fec:header("braidpath-fec")?.parse()?,redundancy:header("braidpath-redundancy")?.parse()?,rate,block_ms:header("braidpath-block-ms")?.parse()?,queue_ms:header("braidpath-queue-ms")?.parse()?};policy.validate()?;
+                                let streams=req.headers().get("braidpath-streams").map(|v|v.to_str()).transpose()?;
+                                ensure!(streams.is_none() || streams==Some("1"),"unsupported stream version");
+                                ensure!(streams.is_none() || tcp.fixed.is_some(),"TCP streams are not enabled on this server");
+                                let streams=streams.is_some();
+                                let proxy=req.headers().get("braidpath-proxy").map(|v|v.to_str()).transpose()?;
+                                ensure!(proxy.is_none() || proxy==Some("1"),"unsupported proxy version");
+                                ensure!(proxy.is_none() || tcp.proxy.is_some(),"proxy streams are not enabled on this server");
+                                let proxy=proxy.is_some();
+                                let policy=Policy{max_message_bytes,streams,proxy,
+            fec_repairs,small_fec_bytes,mixed_fec,probe_guided_recovery,capacity_probe_bps,adaptive:quality_schedule==Some("adaptive"),latency_target_ms,group_rates,quality_schedule:quality_schedule.is_some(),receiver_feedback:feedback.is_some(),fec:parse_fec(header("braidpath-fec")?).map_err(anyhow::Error::msg)?,redundancy:header("braidpath-redundancy")?.parse()?,rate,block_ms:header("braidpath-block-ms")?.parse()?,queue_ms:header("braidpath-queue-ms")?.parse()?};policy.validate()?;
+                                if policy.fec==automatic_fec::AUTO {ensure!(req.headers().get_all("braidpath-auto-small").iter().count()==1 && req.headers().get("braidpath-auto-small").is_some_and(|v|v=="1"),"automatic small protection not negotiated");}
                                 let rejoin=req.headers().get("braidpath-rejoin").is_some_and(|v|v=="1");
                                 let stream_id=stream.id().into_inner();
                                 // Membership and idle expiry share one map -> paths -> generation lock order.
@@ -3405,7 +3782,7 @@ async fn server_connection(
                                             let observation_notify=policy.adaptive.then(||Arc::new(Notify::new()));
                                             let session=Arc::new(Session{adaptive_fec_retention,generations:Mutex::new([None;MAX_PATHS]),empty_since:Mutex::new(Some(Instant::now())),events:tx,paths:Arc::new(Mutex::new(Vec::new())),stop,policy,observation_notify,ingress_drops:Arc::new(AtomicU64::new(0)),forward:metrics.scope(&sid,stats::FORWARD),returning:metrics.scope(&sid,stats::RETURN),finished:tokio::sync::Notify::new(),done:std::sync::atomic::AtomicBool::new(false)});
                                             map.insert(sid.clone(),session.clone());
-                                            tokio::spawn(session_loop(session.clone(),rx,target));
+                                            tokio::spawn(session_loop(session.clone(),rx,target,tcp));
                                             session
                                         };
                                         {
@@ -3416,7 +3793,7 @@ async fn server_connection(
                                             let mut generations=session.generations.lock().expect("generation lock");
                                             scheduler::admit_generation(&mut generations[usize::from(pid)],generation)?;
                                             if let Some(i)=existing {paths.remove(i).conn.close(0u32.into(),b"path rejoined");}
-                                            paths.push(OutPath{id:pid,group,conn:conn.clone(),empty_datagram_space:conn.datagram_send_buffer_space(),stream:stream_id,quality:Arc::new(Mutex::new(quality::State::new(generation))),capacity_probe:Arc::new(Mutex::new(capacity_probe::State::new(generation))),capacity_probe_enabled:capacity_probe_bps>0,epoch:Instant::now(),probe_reply:Arc::new(Mutex::new(None))});
+                                            paths.push(OutPath{id:pid,group,conn:conn.clone(),writer:writer::Writer::spawn(&conn),stream:stream_id,quality:Arc::new(Mutex::new(quality::State::new(generation))),capacity_probe:Arc::new(Mutex::new(capacity_probe::State::new(generation))),capacity_probe_enabled:capacity_probe_bps>0,epoch:Instant::now(),probe_reply:Arc::new(Mutex::new(None))});
                                             *session.empty_since.lock().expect("empty time lock")=None;
                                         }
                                         Some(session)
@@ -3443,6 +3820,9 @@ async fn server_connection(
                                 if let Some(state)=&mesh {response=response.header("braidpath-exit",state.node_id());}
                                 if small_fec_bytes>0 {response=response.header("braidpath-small-fec-bytes",small_fec_bytes);}
                                 if mixed_fec {response=response.header("braidpath-mixed-fec","1");}
+                                if header("braidpath-fec")?=="auto" {response=response.header("braidpath-auto-small","1");}
+                                if streams {response=response.header("braidpath-streams","1");}
+                                if proxy {response=response.header("braidpath-proxy","1");}
                                 if fec_repairs==2 {response=response.header("braidpath-fec-repairs","2");}
                                 if capacity_probe_bps>0 {response=response.header("braidpath-capacity-probe-bps",capacity_probe_bps).header("braidpath-capacity-probe-format",capacity_probe::FORMAT);}
                                 if probe_guided_recovery {response=response.header("braidpath-probe-guided-recovery","1");}
@@ -3542,6 +3922,10 @@ pub struct ClientOptions {
     pub adaptive_fec_retention: bool,
     pub rotate_source_port: bool,
     pub listen: SocketAddr,
+    /// Local TCP listener; each connection becomes one reliable stream.
+    pub tcp_listen: Option<SocketAddr>,
+    /// Local SOCKS5 and HTTP CONNECT listener for addressed streams.
+    pub proxy_listen: Option<SocketAddr>,
     pub entrances: Vec<SocketAddr>,
     pub interfaces: Vec<String>,
     pub path_binds: Vec<SocketAddr>,
@@ -3798,12 +4182,41 @@ async fn client_inner(
             .all(|id| usize::from(*id) < MAX_PATHS),
         "invalid bottleneck group"
     );
+    ensure!(
+        options.policy.streams == options.tcp_listen.is_some(),
+        "TCP streams require a TCP listener"
+    );
+    ensure!(
+        options.policy.proxy == options.proxy_listen.is_some(),
+        "proxy streams require a proxy listener"
+    );
     let socket = Arc::new(UdpSocket::bind(options.listen).await?);
+    let mut listeners = tcp::Listeners::default();
+    // Neither listener authenticates its callers: every caller spends the
+    // tunnel credential, and a proxy caller also gets a UDP relay.
+    let exposed = |address: SocketAddr, kind: &str| {
+        if !address.ip().is_loopback() {
+            warn!(listen = %address, "{kind} listener is not on loopback; it has no authentication");
+        }
+    };
+    if let Some(address) = options.tcp_listen {
+        let listener = TcpListener::bind(address).await?;
+        info!(listen=%listener.local_addr()?,"TCP listener bound");
+        exposed(address, "TCP");
+        listeners.fixed = Some(Arc::new(listener));
+    }
+    if let Some(address) = options.proxy_listen {
+        let listener = TcpListener::bind(address).await?;
+        info!(listen=%listener.local_addr()?,"proxy listener bound");
+        exposed(address, "proxy");
+        listeners.proxy = Some(Arc::new(listener));
+    }
     let mut shutdown = Shutdown::new();
     loop {
         let result = client_session(
             &options,
             socket.clone(),
+            listeners.clone(),
             &mut shutdown,
             &mut entrances,
             health.as_ref(),
@@ -3832,6 +4245,7 @@ async fn client_inner(
 async fn client_session(
     options: &ClientOptions,
     socket: Arc<UdpSocket>,
+    listeners: tcp::Listeners,
     shutdown: &mut Shutdown,
     entrances: &mut Option<EntranceUpdates>,
     health: Option<&watch::Sender<mesh::PathHealth>>,
@@ -3842,7 +4256,7 @@ async fn client_session(
     let paths: Paths = Arc::new(Mutex::new(Vec::new()));
     let forward = options.stats.scope(&sid, stats::FORWARD);
     let returning = options.stats.scope(&sid, stats::RETURN);
-    let (wire_tx, mut wire_rx) = mpsc::channel::<(u8, Bytes)>(QUEUE);
+    let (wire_tx, mut wire_rx) = mpsc::channel::<(u8, Bytes)>(WIRE_QUEUE);
     let mut tasks = JoinSet::new();
     let mut endpoints: [Option<quinn::Endpoint>; MAX_PATHS] = std::array::from_fn(|_| None);
     let mut configs = Vec::<PathConfig>::new();
@@ -3904,6 +4318,9 @@ async fn client_session(
         forward.clone(),
         observation_notify.clone(),
     ));
+    // Streams do not survive a session epoch; a new epoch accepts new connections.
+    let mut streams = tcp::Mux::client(listeners, &options.policy, forward.clone());
+    let small_threshold = ingress::small_threshold(&options.policy);
     let mut input = vec![0; 65536];
     let mut peers: HashMap<SocketAddr, (u32, Instant)> = HashMap::new();
     let mut reverse = HashMap::new();
@@ -3936,6 +4353,10 @@ async fn client_session(
     let mut announced = false;
     let mut last_stats = 0u64;
     let result:Result<()>=async {loop {
+        if let Some(mux)=streams.as_mut() {
+            mux.service_io();
+            mux.flush(&mut tcp::Out{tx:&tx,next_id:&mut next_id,scope:&forward,small_threshold});
+        }
         tokio::select! {
             _=shutdown.wait()=>break,
             updated=entrances_changed(entrances)=>{
@@ -4015,6 +4436,7 @@ async fn client_session(
                     let config=config.clone();
                     let ca=options.ca.clone();let name=options.name.clone();let token=token.clone();let sid=sid.clone();
                     let policy=options.policy.clone();let metrics=options.stats.clone();let tx=rejoin_tx.clone();
+                    let ack_request=if metrics.legacy_recovery(){transport::AckRequest::Unchanged}else{transport::AckRequest::EveryEight};
                     let congestion=options.congestion;let rejoin=has_session;
                     let exit=exit.map(str::to_owned);
                     let datagram_send_buffer_bytes=options.datagram_send_buffer_bytes;
@@ -4025,7 +4447,7 @@ async fn client_session(
                     tasks.spawn(async move {
                         let mut diagnostic=stats::ConnectionTrace::new(metrics,config.remote,Some(id as u8),"quic_connect");
                         let attempt:Result<Option<Rejoined>>=async {
-                            let endpoint=transport::client_bound_with_datagram_buffer(config.remote,&ca,config.interface.as_deref(),congestion,bind,datagram_send_buffer_bytes)?;
+                            let endpoint=transport::client_bound_with_ack_request(config.remote,&ca,config.interface.as_deref(),congestion,bind,datagram_send_buffer_bytes,ack_request)?;
                             info!(path=id,generation,local=%endpoint.local_addr()?,remote=%config.remote,"path attempt source socket");
                             let connected=tokio::select! {
                                 biased;
@@ -4083,7 +4505,7 @@ async fn client_session(
                             for old in active.iter().filter(|p|p.id==pid) {old.conn.close(0u32.into(),b"path replaced");}
                             active.retain(|p|p.id!=pid);
                             active.push(OutPath{id:pid,group:configs[id].group,conn:value.conn.clone(),stream:value.stream,
-                                empty_datagram_space:value.conn.datagram_send_buffer_space(),
+                                writer:writer::Writer::spawn(&value.conn),
                                 quality:Arc::new(Mutex::new(quality::State::new(generation))),capacity_probe:Arc::new(Mutex::new(capacity_probe::State::new(generation))),capacity_probe_enabled:options.policy.capacity_probe_bps>0,epoch:Instant::now(),
                                 probe_reply:Arc::new(Mutex::new(None))});
                         }
@@ -4113,7 +4535,7 @@ async fn client_session(
                 if n>options.policy.max_message_bytes {drops+=1;trace_payload(&forward,trace::Stage::RecordDropped,&input[..n],Some(trace::Reason::Oversize));forward.update(|d|d.records.application_oversize_dropped+=1);continue;}
                 if !peers.contains_key(&peer) {
                     if peers.len()>=MAX_FLOWS {drops+=1;trace_payload(&forward,trace::Stage::RecordDropped,&input[..n],Some(trace::Reason::FlowLimit));forward.update(|d|d.records.application_flow_limit_dropped+=1);continue;}
-                    next_flow=next_flow.checked_add(1).filter(|flow| *flow < messages::FLAG).context("flow id exhausted")?;
+                    next_flow=next_flow.checked_add(1).filter(|flow| *flow < associate::FLAG).context("flow id exhausted")?;
                     peers.insert(peer,(next_flow,created));reverse.insert(next_flow,peer);
                 }
                 let (flow,last)=peers.get_mut(&peer).expect("inserted peer");*last=created;
@@ -4127,6 +4549,7 @@ async fn client_session(
                 let records=receive_records(&mut decoder,&returning,pid,&data);
                 let decoded=Instant::now();
                 for record in records {
+                    if let Some(mux)=streams.as_mut() && (stream::stream_id(record.flow).is_some() || associate::is_flow(record.flow)) {mux.receive(record);continue}
                     let Some((record, decoded)) = messages.receive(record, decoded) else {publish_messages(&mut messages, &returning);continue;};
                     publish_messages(&mut messages, &returning);
                     if let Some(peer)=reverse.get(&record.flow) {
@@ -4134,10 +4557,14 @@ async fn client_session(
                         drops+=delivery.send(&socket,Some(*peer),record,pid,decoded);
                     } else {returning.trace_record(trace::Stage::RecordDropped,&record,None,Some(trace::Reason::FlowUnavailable));returning.update(|d|d.records.udp_target_flow_dropped+=1);returning.path(pid,|p|p.udp_target_flow_dropped+=1);}
                 }
-            }
+            },
+            wake=stream_wake(&mut streams)=>streams.as_mut().expect("stream adapter").handle(wake),
         }
         while let Some(completion)=tasks.try_join_next() {completion.context("path task failed")?;}
     }Ok(())}.await;
+    if let Some(mux) = streams.as_mut() {
+        mux.close_all();
+    }
     messages.close();
     publish_messages(&mut messages, &returning);
     delivery.close();
@@ -4262,8 +4689,63 @@ async fn connect_path(
     exit: Option<&str>,
     diagnostic: &mut stats::ConnectionTrace,
 ) -> Result<(quinn::Connection, u64, H3Client, H3Request, H3Send)> {
+    macro_rules! admit {
+        ($conn:expr) => {
+            admit_path(
+                $conn, name, token, sid, pid, group, generation, rejoin, policy, exit, diagnostic,
+            )
+        };
+    }
+    // With a resumption ticket the session request travels as 0-RTT data, so
+    // admission completes one round trip after the first packet.
+    let (conn, accepted) = match endpoint.connect(remote, name)?.into_0rtt() {
+        Ok(early) => early,
+        Err(connecting) => {
+            let conn = connecting.await?;
+            diagnostic.handshake_succeeded(&conn);
+            return admit!(conn).await;
+        }
+    };
+    let outcome = diagnostic.early_data(&conn, accepted);
+    let mut rejection = outcome.clone();
+    let error = tokio::select! {
+        admitted = admit!(conn.clone()) => match admitted {
+            Ok(admitted) => return Ok(admitted),
+            Err(error) => error,
+        },
+        Ok(_) = rejection.wait_for(|o| *o == Some(stats::EarlyData::Rejected)) => anyhow::anyhow!("0-RTT rejected"),
+    };
+    let mut outcome = outcome;
+    let rejected = outcome
+        .wait_for(Option::is_some)
+        .await
+        .is_ok_and(|o| *o == Some(stats::EarlyData::Rejected));
+    if !rejected {
+        return Err(error);
+    }
+    // The server lost or refused the ticket; early data never reached it.
+    info!(path = pid, "0-RTT rejected; retrying with a full handshake");
+    conn.close(0u32.into(), b"0-RTT rejected");
+    diagnostic.retry_handshake();
     let conn = endpoint.connect(remote, name)?.await?;
     diagnostic.handshake_succeeded(&conn);
+    admit!(conn).await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn admit_path(
+    conn: quinn::Connection,
+    name: &str,
+    token: &str,
+    sid: &str,
+    pid: u8,
+    group: u8,
+    generation: u64,
+    rejoin: bool,
+    policy: &Policy,
+    exit: Option<&str>,
+    diagnostic: &mut stats::ConnectionTrace,
+) -> Result<(quinn::Connection, u64, H3Client, H3Request, H3Send)> {
     diagnostic.enter("http3", "datagram_capacity");
     ensure!(
         conn.max_datagram_size().is_some_and(|n| n
@@ -4281,13 +4763,6 @@ async fn connect_path(
         .max_field_section_size(8192)
         .build::<_, _, Bytes>(h3_quinn::Connection::new(conn.clone()))
         .await?;
-    diagnostic.succeeded();
-    diagnostic.enter("http3", "peer_settings");
-    // Poll the driver concurrently so peer SETTINGS are processed before admission.
-    tokio::select! {
-        e=driver.wait_idle()=>bail!("HTTP/3 closed before settings: {e}"),
-        _=async {while !send.settings().enable_datagram(){tokio::time::sleep(Duration::from_millis(1)).await;}}=>{}
-    }
     diagnostic.succeeded();
     diagnostic.begin_admission();
     diagnostic.enter("path_admission", "admission");
@@ -4309,7 +4784,14 @@ async fn connect_path(
                 .join(","),
         )
         .header("braidpath-latency-ms", policy.latency_target_ms)
-        .header("braidpath-fec", u16::from(policy.fec))
+        .header(
+            "braidpath-fec",
+            if policy.fec == automatic_fec::AUTO {
+                "auto".to_owned()
+            } else {
+                policy.fec.to_string()
+            },
+        )
         .header("braidpath-redundancy", u16::from(policy.redundancy))
         .header("braidpath-rate", policy.rate)
         .header("braidpath-block-ms", policy.block_ms)
@@ -4320,11 +4802,20 @@ async fn connect_path(
     if let Some(exit) = exit {
         req = req.header("braidpath-exit", exit);
     }
+    if policy.fec == automatic_fec::AUTO {
+        req = req.header("braidpath-auto-small", "1");
+    }
     if policy.small_fec_bytes > 0 {
         req = req.header("braidpath-small-fec-bytes", policy.small_fec_bytes);
     }
     if policy.mixed_fec {
         req = req.header("braidpath-mixed-fec", "1");
+    }
+    if policy.streams {
+        req = req.header("braidpath-streams", "1");
+    }
+    if policy.proxy {
+        req = req.header("braidpath-proxy", "1");
     }
     if policy.fec_repairs == 2 {
         req = req.header("braidpath-fec-repairs", "2");
@@ -4356,6 +4847,7 @@ async fn connect_path(
             .header("braidpath-capacity-probe-format", capacity_probe::FORMAT);
     }
     let req = req.body(())?;
+    // Sent without waiting for peer SETTINGS, so that 0-RTT saves its round trip.
     let mut stream = send.send_request(req).await?;
     let response = tokio::select! {e=driver.wait_idle()=>bail!("HTTP/3 closed during admission: {e}"),r=stream.recv_response()=>r?};
     // Check before 410 handling: an old or different exit must never trigger
@@ -4375,6 +4867,14 @@ async fn connect_path(
         conn.close(0u32.into(), b"session epoch expired");
         return Err(SessionExpired.into());
     }
+    diagnostic.enter("http3", "peer_settings");
+    // Poll the driver so peer SETTINGS are processed before datagrams are used.
+    tokio::select! {
+        e=driver.wait_idle()=>bail!("HTTP/3 closed before settings: {e}"),
+        _=async {while !send.settings().enable_datagram(){tokio::time::sleep(Duration::from_millis(1)).await;}}=>{}
+    }
+    diagnostic.succeeded();
+    diagnostic.enter("path_admission", "admission");
     ensure!(
         response.status() == StatusCode::OK
             && response
@@ -4394,6 +4894,20 @@ async fn connect_path(
         "payload size mismatch"
     );
     ensure!(
+        policy.fec != automatic_fec::AUTO
+            || response
+                .headers()
+                .get_all("braidpath-auto-small")
+                .iter()
+                .count()
+                == 1
+                && response
+                    .headers()
+                    .get("braidpath-auto-small")
+                    .is_some_and(|v| v == "1"),
+        "automatic small protection not negotiated"
+    );
+    ensure!(
         policy.small_fec_bytes == 0
             || response
                 .headers()
@@ -4406,6 +4920,22 @@ async fn connect_path(
     ensure!(
         mixed_fec_header(response.headers())? == policy.mixed_fec,
         "mixed FEC not negotiated"
+    );
+    ensure!(
+        !policy.streams
+            || response
+                .headers()
+                .get("braidpath-streams")
+                .is_some_and(|v| v == "1"),
+        "TCP streams not negotiated"
+    );
+    ensure!(
+        !policy.proxy
+            || response
+                .headers()
+                .get("braidpath-proxy")
+                .is_some_and(|v| v == "1"),
+        "proxy streams not negotiated"
     );
     validate_fec_repairs_echo(response.headers(), policy.fec_repairs)?;
     validate_message_echo(response.headers(), policy.max_message_bytes)?;

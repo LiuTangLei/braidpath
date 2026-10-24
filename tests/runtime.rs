@@ -9,16 +9,22 @@ use std::{
     time::{Duration, Instant},
 };
 const BIN: &str = env!("CARGO_BIN_EXE_braidpath");
+// Real-time UDP admission ages are part of the runtime contract. Concurrent
+// multi-process fixtures on a two-core runner can exhaust those ages before
+// the sender runs; isolate these socket fixtures without changing production
+// queue limits, source rates, or assertions.
+static SOCKET_FIXTURE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+fn socket_fixture() -> std::sync::MutexGuard<'static, ()> {
+    SOCKET_FIXTURE
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+}
 // Negotiation/integrity fixture: retain 2000 pps, but provision the encoded cost.
 const DUAL_FEC_TEST_RATE_BPS: u64 = 20_000_000;
 // This fixture proves parity negotiation/integrity and the 13% repair budget,
 // not a 20 ms latency SLO. Coarse host scheduling must still allow a full
 // 16-record block before flushing and enough time to admit its second repair.
 const DUAL_FEC_TEST_WINDOW_MS: u64 = 100;
-// Each fixture starts several multithreaded tunnel/relay processes. Keep their
-// timing-sensitive loopback traffic isolated on small CI runners, as in stats.rs.
-// Source rate, loss and delivery assertions remain unchanged.
-static THREE_PATH_FIXTURES: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[test]
 fn dual_fec_fixture_budget_covers_its_unchanged_source_and_encoded_frames() {
@@ -65,6 +71,26 @@ fn dual_fec_fixture_budget_covers_its_unchanged_source_and_encoded_frames() {
         "integrity fixture overloads its own sender budget: {cost} bytes demand, {supplied_bytes} supplied; source/count/codec are unchanged"
     );
 }
+/// Preserve the complete fixture when a socket/timing assertion fails.
+struct FailureEvidence(PathBuf);
+impl Drop for FailureEvidence {
+    fn drop(&mut self) {
+        if thread::panicking() {
+            let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("local/test-failures");
+            let stamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let destination = root.join(format!("runtime-{}-{stamp}", std::process::id()));
+            let _ = fs::create_dir_all(&root);
+            match fs::rename(&self.0, &destination) {
+                Ok(()) => eprintln!("fixture evidence retained at {}", destination.display()),
+                Err(error) => eprintln!("could not retain fixture evidence: {error}"),
+            }
+        }
+    }
+}
+
 struct Process {
     child: Child,
     log: PathBuf,
@@ -80,6 +106,12 @@ fn launch(args: &[String], dir: &Path, name: &str) -> Process {
     let file = fs::File::create(&log).unwrap();
     let child = Command::new(BIN)
         .env("RUST_LOG", "braidpath=info")
+        // Each fixture has several independent async runtimes. Giving every
+        // subprocess all runner cores oversubscribes the host and can fill the
+        // bounded UDP queue before QUIC gets CPU time. Keep the same packets,
+        // pacing, queue limits and assertions. Two workers also let QUIC's
+        // driver progress while the sender handles a ready ingress burst.
+        .env("TOKIO_WORKER_THREADS", "2")
         .args(args)
         .stdout(Stdio::null())
         .stderr(file)
@@ -144,7 +176,7 @@ fn port() -> String {
 fn proxy_cli_creates_one_socks_endpoint_per_exit_with_remote_half_close() {
     use std::io::{Read, Write};
     use std::net::{Shutdown, TcpListener, TcpStream};
-    let _serial = THREE_PATH_FIXTURES.lock().unwrap();
+    let _serial = socket_fixture();
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path();
     let state = root.join("server");
@@ -348,13 +380,53 @@ fn latest_stats(file: &Path) -> Value {
 fn latest_directions(file: &Path) -> Value {
     latest_stats(file)["directions"].clone()
 }
+// Quality scheduling may leave a joined path unused in one direction. Check
+// that every exercised direction was reported and every path authenticated.
+// Feedback can be piggybacked on another route, so standalone control counts
+// do not establish whether this path's data was reported.
+fn path_feedback_covers_exercised_directions(path: &Value, require_all: bool) -> bool {
+    let feedback = &path["receiver_feedback"];
+    let sent = feedback["sent_symbols"].as_u64().unwrap();
+    let received = path["original_packets_received"].as_u64().unwrap()
+        + path["repair_symbols_received"].as_u64().unwrap();
+    path["authenticated"] == true
+        && (!require_all || (sent > 0 && received > 0))
+        && (sent == 0 || feedback["sender_estimate"]["expected"].as_u64().unwrap() > 0)
+        && (received == 0 || feedback["received"]["expected"].as_u64().unwrap() > 0)
+}
+
+#[test]
+fn path_feedback_requires_reports_for_data_and_authentication_for_idle_paths() {
+    let mut path = serde_json::json!({
+        "authenticated": true,
+        "original_packets_received": 0,
+        "repair_symbols_received": 0,
+        "receiver_feedback": {
+            "sent_symbols": 0,
+            "sender_estimate": {"expected": 0}, "received": {"expected": 0}
+        }
+    });
+    assert!(path_feedback_covers_exercised_directions(&path, false));
+    assert!(!path_feedback_covers_exercised_directions(&path, true));
+    path["receiver_feedback"]["sent_symbols"] = 1.into();
+    assert!(!path_feedback_covers_exercised_directions(&path, false));
+    path["receiver_feedback"]["sender_estimate"]["expected"] = 1.into();
+    path["repair_symbols_received"] = 1.into();
+    assert!(!path_feedback_covers_exercised_directions(&path, false));
+    path["receiver_feedback"]["received"]["expected"] = 1.into();
+    assert!(path_feedback_covers_exercised_directions(&path, false));
+    path["authenticated"] = false.into();
+    assert!(!path_feedback_covers_exercised_directions(&path, false));
+}
+
 #[test]
 fn authenticated_http3_three_paths_and_udp_integrity() {
     three_paths(0);
 }
 
 #[test]
-fn server_ack_request_is_opt_in_and_directional_on_real_http3() {
+fn ack_requests_are_directional_on_real_http3() {
+    let _fixture = socket_fixture();
     let directory = tempfile::tempdir().unwrap();
     let identity = directory.path().join("identity");
     assert!(
@@ -476,14 +548,17 @@ fn server_ack_request_is_opt_in_and_directional_on_real_http3() {
                 .values()
                 .next()
                 .unwrap()["quinn"];
-            assert_eq!(c["ack_frequency_frames_tx"], 0);
-            assert_eq!(s["ack_frequency_frames_rx"], 0);
+            // The client asks for every-eight by default, whatever the server asks.
+            let upstream = c["ack_frequency_frames_tx"].as_u64().unwrap() > 0
+                && s["ack_frequency_frames_rx"].as_u64().unwrap() > 0;
             if profile == "unchanged" {
                 assert_eq!(s["ack_frequency_frames_tx"], 0);
                 assert_eq!(c["ack_frequency_frames_rx"], 0);
-                break;
-            }
-            if s["ack_frequency_frames_tx"].as_u64().unwrap() > 0
+                if upstream {
+                    break;
+                }
+            } else if upstream
+                && s["ack_frequency_frames_tx"].as_u64().unwrap() > 0
                 && c["ack_frequency_frames_rx"].as_u64().unwrap() > 0
             {
                 break;
@@ -517,6 +592,7 @@ fn rtt_source_baselines_compatibility_flag_preserves_default_integrity() {
 }
 
 fn four_connection_profile(native_service_guard: bool, rtt_source_baselines: bool) {
+    let _fixture = socket_fixture();
     use std::collections::BTreeSet;
     let dir = tempfile::tempdir().unwrap();
     let identity = dir.path().join("identity");
@@ -675,6 +751,8 @@ fn four_connection_profile(native_service_guard: bool, rtt_source_baselines: boo
                         path["sending_direction"] == direction
                             && path["adaptive"]["last_control"]["native_service_guard_enabled"]
                                 == native_service_guard
+                            // Source baselines are the default; the old
+                            // flag remains accepted and changes nothing.
                             && path["adaptive"]["last_control"]["rtt_source_baselines_enabled"]
                                 == true
                     })
@@ -727,14 +805,15 @@ fn persistent_bad_path_rejoins_with_new_udp_port() {
     three_paths(3);
 }
 fn three_paths(mode: u8) {
-    let _fixture = THREE_PATH_FIXTURES
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let _fixture = socket_fixture();
     let feedback = mode > 0;
     let dual = matches!(mode, 6 | 8 | 9);
     let frontier_enabled = matches!(mode, 7 | 8);
     let repair_guard = mode == 9;
-    let dir = tempfile::tempdir().unwrap();
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("local/test-fixtures");
+    fs::create_dir_all(&root).unwrap();
+    let dir = tempfile::tempdir_in(root).unwrap();
+    let _evidence = FailureEvidence(dir.path().to_owned());
     let identity = dir.path().join("identity");
     let ident = identity.to_str().unwrap();
     assert!(
@@ -914,6 +993,9 @@ fn three_paths(mode: u8) {
         client_args[index + 1] = "0".into();
     }
     if mode >= 5 {
+        if !dual {
+            client_args.extend(args(&["--fec", "4"]));
+        }
         client_args.extend(args(&[
             "--mixed-fec",
             "--small-fec-bytes",
@@ -945,6 +1027,12 @@ fn three_paths(mode: u8) {
             .position(|a| a == "--redundancy-percent")
             .unwrap();
         client_args[index + 1] = "13".into();
+    }
+    // These are negotiation/integrity fixtures, not 20 ms latency benchmarks.
+    // Match the existing 100 ms non-adaptive queue age on debug CI runners;
+    // retain the same source, payloads, count, rate cap, queue slots and asserts.
+    if (frontier_enabled || repair_guard) && !dual {
+        client_args.extend(args(&["--latency-target-ms", "100"]));
     }
     if frontier_enabled {
         client_args.extend(args(&["--frontier-scheduler", "--adaptive"]));
@@ -1026,16 +1114,9 @@ fn three_paths(mode: u8) {
                             .as_u64()
                             .unwrap_or(0)
                             > 0)
-                    && paths.values().all(|p| {
-                        p["receiver_feedback"]["sender_estimate"]["expected"]
-                            .as_u64()
-                            .unwrap_or(0)
-                            > 0
-                            && p["receiver_feedback"]["received"]["expected"]
-                                .as_u64()
-                                .unwrap_or(0)
-                                > 0
-                    })
+                    && paths
+                        .values()
+                        .all(|p| path_feedback_covers_exercised_directions(p, mode < 2))
             });
             if enough {
                 break;
@@ -1293,6 +1374,7 @@ fn guided_recovery_negotiates_without_promoting_idle_probe_bytes_to_business() {
 }
 
 fn independent_probe_session(guided: bool) {
+    let _fixture = socket_fixture();
     let dir = tempfile::tempdir().unwrap();
     let identity = dir.path().join("identity");
     assert!(

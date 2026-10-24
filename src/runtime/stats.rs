@@ -9,7 +9,10 @@ use std::{
     fs::{File, OpenOptions},
     io::Write,
     path::{Path as FsPath, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -261,9 +264,21 @@ pub struct Direction {
     /// Receiver-local gauges/counters, only in the owning session/direction.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fec_retention: Option<super::fec_retention::Snapshot>,
+    /// Sender-local automatic FEC strength and finalized pre-FEC loss basis.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub automatic_fec: Option<super::automatic_fec::Snapshot>,
+    /// Sender-local cap from reverse loss on the peer's shared uplink.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reverse_guard: Option<super::reverse_guard::Snapshot>,
+    /// Sender-local cap from forward loss on a bottleneck all paths share.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub forward_guard: Option<super::forward_guard::Snapshot>,
     /// Sender-owned preview counters; not packet losses or time-at-limit percentages.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sender_frontier: Option<super::sender_frontier::Snapshot>,
+    /// Reliable TCP stream counters, published by this endpoint's stream adapter.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tcp_streams: Option<super::stream::Snapshot>,
     #[serde(skip_serializing_if = "Ids::is_empty")]
     pub quinn_admitted_record_ids: Ids,
     #[serde(skip_serializing_if = "Ids::is_empty")]
@@ -451,6 +466,10 @@ pub struct State {
     pub handshake_successes: u64,
     pub handshake_failures: u64,
     pub handshake_cancelled: u64,
+    /// Handshakes whose 0-RTT data was accepted (either role) or rejected
+    /// (client only).
+    pub zero_rtt_accepted: u64,
+    pub zero_rtt_rejected: u64,
     pub path_admission_attempts: u64,
     pub path_admission_successes: u64,
     pub path_admission_failures: u64,
@@ -506,6 +525,15 @@ pub struct ConnectionEvent {
 }
 
 /// Observes existing operations and timeouts without imposing additional ones.
+/// How a handshake that allowed early data completed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EarlyData {
+    Accepted,
+    /// Completed without early data: rejected, or (server) none was sent.
+    Rejected,
+    Failed,
+}
+
 pub struct ConnectionTrace {
     metrics: Metrics,
     connection_id: u64,
@@ -516,6 +544,8 @@ pub struct ConnectionTrace {
     started: Instant,
     stage_started: Instant,
     handshake_complete: bool,
+    /// Set when a handshake that began with early data completes.
+    early_confirmed: Option<Arc<std::sync::atomic::AtomicBool>>,
     admission_pending: bool,
     authenticated: bool,
     conn: Option<quinn::Connection>,
@@ -545,6 +575,7 @@ impl ConnectionTrace {
             started: now,
             stage_started: now,
             handshake_complete: false,
+            early_confirmed: None,
             admission_pending: false,
             authenticated: false,
             conn: None,
@@ -607,6 +638,61 @@ impl ConnectionTrace {
         self.metrics.state(|s| s.handshake_successes += 1);
         self.succeeded();
     }
+    /// The connection is usable before its handshake completes (client 0-RTT,
+    /// server 0.5-RTT). A handshake success is counted when it completes; the
+    /// receiver reports the outcome.
+    pub fn early_data(
+        &mut self,
+        conn: &quinn::Connection,
+        accepted: quinn::ZeroRttAccepted,
+    ) -> tokio::sync::watch::Receiver<Option<EarlyData>> {
+        self.conn = Some(conn.clone());
+        let confirmed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        self.early_confirmed = Some(confirmed.clone());
+        let metrics = self.metrics.clone();
+        let client = self.metrics.0.role == "client";
+        let (tx, rx) = tokio::sync::watch::channel(None);
+        let conn = conn.clone();
+        tokio::spawn(async move {
+            // False also when the handshake fails, or (server) no early data was sent.
+            let outcome = if accepted.await {
+                EarlyData::Accepted
+            } else if conn.close_reason().is_none() {
+                EarlyData::Rejected
+            } else {
+                EarlyData::Failed
+            };
+            let completed = outcome != EarlyData::Failed;
+            confirmed.store(completed, std::sync::atomic::Ordering::Relaxed);
+            metrics.state(|s| {
+                s.handshake_successes += u64::from(completed);
+                s.zero_rtt_accepted += u64::from(outcome == EarlyData::Accepted);
+                // A client offers early data only with a ticket; a server
+                // cannot tell a rejection from a client that sent none.
+                s.zero_rtt_rejected += u64::from(client && outcome == EarlyData::Rejected);
+            });
+            let _ = tx.send(Some(outcome));
+        });
+        self.succeeded();
+        rx
+    }
+    /// A fresh handshake on the same path attempt, after the server rejected
+    /// 0-RTT. The rejected handshake completed and was counted; this one is a
+    /// new attempt with its own outcome.
+    pub fn retry_handshake(&mut self) {
+        self.handshake_complete = false;
+        self.early_confirmed = None;
+        self.conn = None;
+        self.metrics.state(|s| s.handshake_attempts += 1);
+        self.enter("quic_handshake", "quic_connect");
+    }
+    fn handshake_done(&self) -> bool {
+        self.handshake_complete
+            || self
+                .early_confirmed
+                .as_ref()
+                .is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+    }
     pub fn begin_admission(&mut self) {
         self.admission_pending = true;
         self.metrics.state(|s| s.path_admission_attempts += 1);
@@ -642,7 +728,7 @@ impl ConnectionTrace {
         )
     }
     pub fn failed(&mut self, reason: &'static str) {
-        if !self.handshake_complete {
+        if !self.handshake_done() {
             self.metrics.state(|s| s.handshake_failures += 1);
         }
         if self.admission_pending {
@@ -658,8 +744,9 @@ impl ConnectionTrace {
         if self.finished.is_some() {
             return;
         }
+        let handshake_done = self.handshake_done();
         self.metrics.state(|s| {
-            if !self.handshake_complete {
+            if !handshake_done {
                 s.handshake_cancelled += 1;
             }
             if self.admission_pending {
@@ -812,6 +899,8 @@ impl Metrics {
     pub fn native_service_guard(&self) -> bool {
         self.0.native_service_guard
     }
+    /// Default: a selected RTT is compared with the minimum of its own source,
+    /// so a stable Quinn/probe offset is not queue delay.
     pub fn rtt_source_baselines(&self) -> bool {
         self.0.rtt_source_baselines || !self.0.legacy_recovery
     }
@@ -1015,6 +1104,36 @@ impl Metrics {
     }
 }
 impl Scope {
+    pub fn publish_automatic_fec(&self, snapshot: super::automatic_fec::Snapshot) {
+        self.metrics.state(|s| {
+            if let Some(session) = s.sessions.get_mut(&self.session) {
+                session
+                    .entry(self.direction.to_owned())
+                    .or_default()
+                    .automatic_fec = Some(snapshot);
+            }
+        });
+    }
+    pub fn publish_reverse_guard(&self, snapshot: super::reverse_guard::Snapshot) {
+        self.metrics.state(|s| {
+            if let Some(session) = s.sessions.get_mut(&self.session) {
+                session
+                    .entry(self.direction.to_owned())
+                    .or_default()
+                    .reverse_guard = Some(snapshot);
+            }
+        });
+    }
+    pub fn publish_forward_guard(&self, snapshot: super::forward_guard::Snapshot) {
+        self.metrics.state(|s| {
+            if let Some(session) = s.sessions.get_mut(&self.session) {
+                session
+                    .entry(self.direction.to_owned())
+                    .or_default()
+                    .forward_guard = Some(snapshot);
+            }
+        });
+    }
     pub fn publish_sender_frontier(&self, snapshot: super::sender_frontier::Snapshot) {
         self.metrics.state(|s| {
             if let Some(session) = s.sessions.get_mut(&self.session) {
@@ -1169,11 +1288,37 @@ fn write_snapshot(writer: &mut impl Write, snapshot: &impl Serialize, pretty: bo
     Ok(())
 }
 
+async fn write_periodic<W, F>(
+    snapshot: F,
+    file: Arc<Mutex<W>>,
+    stopping: Arc<AtomicBool>,
+) -> Result<()>
+where
+    W: Write + Send + 'static,
+    F: FnOnce() -> Result<serde_json::Value> + Send + 'static,
+{
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        if stopping.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let value = snapshot()?;
+        let mut file = file.lock().expect("stats file lock");
+        if !stopping.load(Ordering::Acquire) {
+            write_snapshot(&mut *file, &value, false)?;
+            file.flush()?;
+        }
+        Ok(())
+    })
+    .await
+    .context("periodic statistics writer task")?
+}
+
 /// Must outlive runtime cleanup. Periodic output is stopped before the final JSON.
 pub struct Reporter {
     pub metrics: Metrics,
     options: Options,
     periodic: Option<tokio::task::JoinHandle<Result<()>>>,
+    stopping: Arc<AtomicBool>,
     jsonl: Option<Arc<Mutex<File>>>,
     trace_guard: Option<trace::Guard>,
 }
@@ -1283,18 +1428,26 @@ impl Reporter {
             options.queue_gated_loss,
         )
         .with_legacy_recovery(options.legacy_recovery);
+        let stopping = Arc::new(AtomicBool::new(false));
         let periodic = jsonl.clone().map(|file| {
             let metrics = metrics.clone();
+            let stopping = stopping.clone();
             let ms = options.stats_interval_ms;
             tokio::spawn(async move {
                 let mut tick = tokio::time::interval(Duration::from_millis(ms));
                 tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 loop {
                     tokio::select! {_=tick.tick()=>{},_=metrics.0.changed.notified()=>{}}
-                    let value = metrics.snapshot(false, "running", None)?;
-                    let mut file = file.lock().expect("stats file lock");
-                    write_snapshot(&mut *file, &value, false)?;
-                    file.flush()?;
+                    // At most one report is in flight. JSON allocation,
+                    // encoding and blocking filesystem I/O must not occupy a
+                    // network worker; skipped ticks never queue more writers.
+                    let snapshot_metrics = metrics.clone();
+                    write_periodic(
+                        move || snapshot_metrics.snapshot(false, "running", None),
+                        file.clone(),
+                        stopping.clone(),
+                    )
+                    .await?;
                 }
             })
         });
@@ -1302,12 +1455,14 @@ impl Reporter {
             metrics,
             options,
             periodic,
+            stopping,
             jsonl,
             trace_guard: Some(trace_guard),
         })
     }
     pub async fn finish(mut self, result: Result<()>) -> Result<()> {
         let mut report_error = None;
+        self.stopping.store(true, Ordering::Release);
         if let Some(task) = self.periodic.take() {
             task.abort();
             if let Ok(Err(e)) = task.await {
@@ -1350,6 +1505,7 @@ impl Reporter {
 }
 impl Drop for Reporter {
     fn drop(&mut self) {
+        self.stopping.store(true, Ordering::Release);
         if let Some(task) = self.periodic.take() {
             task.abort();
         }
@@ -1613,6 +1769,60 @@ mod tests {
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_blocked_periodic_snapshot_cannot_stop_io_or_follow_the_final_row() {
+        let stopping = Arc::new(AtomicBool::new(false));
+        let writer = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let release = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (progress_tx, progress_rx) = std::sync::mpsc::channel();
+        let released = release.clone();
+        let guard = std::thread::spawn(move || {
+            let progressed = progress_rx.recv_timeout(Duration::from_secs(2)).is_ok();
+            let (lock, wake) = &*released;
+            *lock.lock().unwrap() = true;
+            wake.notify_all();
+            progressed
+        });
+        let job = tokio::spawn(write_periodic(
+            move || {
+                let _ = entered_tx.send(());
+                let (lock, wake) = &*release;
+                let mut ready = lock.lock().unwrap();
+                while !*ready {
+                    ready = wake.wait(ready).unwrap();
+                }
+                Ok(serde_json::json!({"final":false}))
+            },
+            writer.clone(),
+            stopping.clone(),
+        ));
+        entered_rx.await.unwrap();
+        stopping.store(true, Ordering::Release);
+        write_snapshot(
+            &mut *writer.lock().unwrap(),
+            &serde_json::json!({"final":true}),
+            false,
+        )
+        .unwrap();
+        let _ = progress_tx.send(());
+        job.await.unwrap().unwrap();
+        assert!(
+            guard.join().unwrap(),
+            "the runtime must progress while serialization/diskwork blocks"
+        );
+        let text = String::from_utf8(writer.lock().unwrap().clone()).unwrap();
+        let rows: Vec<serde_json::Value> = text
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(
+            rows,
+            vec![serde_json::json!({"final":true})],
+            "a stopped in-flight report cannot append after final"
+        );
     }
 
     #[test]
@@ -1882,6 +2092,70 @@ mod tests {
                 Some("local_shutdown")
             );
         });
+    }
+
+    #[tokio::test]
+    async fn a_full_handshake_after_rejected_early_data_is_a_further_attempt() {
+        let temp = tempfile::tempdir().unwrap();
+        let identity = temp.path().join("identity");
+        transport::initialize(&identity, "localhost").unwrap();
+        let cert = identity.join("cert.pem");
+        // Two servers with separate ticket stores, as across a restart.
+        let servers = [(); 2].map(|()| {
+            // Opt this fixture into tickets explicitly. Production endpoints
+            // without a journal, and native proxy endpoints, keep 0-RTT disabled.
+            let tls = transport::server_tls(&cert, &identity.join("key.pem")).unwrap();
+            let mut config = quinn::ServerConfig::with_crypto(Arc::new(
+                quinn::crypto::rustls::QuicServerConfig::try_from(tls).unwrap(),
+            ));
+            config.transport_config(Arc::new(transport::config(Congestion::Bbr)));
+            let server = quinn::Endpoint::server(config, "127.0.0.1:0".parse().unwrap()).unwrap();
+            let address = server.local_addr().unwrap();
+            tokio::spawn(async move {
+                let mut held = Vec::new();
+                while let Some(incoming) = server.accept().await {
+                    if let Ok(conn) = incoming.await {
+                        held.push(conn);
+                    }
+                }
+            });
+            address
+        });
+        let client = transport::client(servers[0], &cert, None, Congestion::Bbr).unwrap();
+        let first = client
+            .connect(servers[0], "localhost")
+            .unwrap()
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let metrics = Metrics::new("client");
+        let mut trace = ConnectionTrace::new(metrics.clone(), servers[1], Some(0), "quic_connect");
+        let Ok((conn, accepted)) = client.connect(servers[1], "localhost").unwrap().into_0rtt()
+        else {
+            panic!("no ticket from the first server");
+        };
+        let mut outcome = trace.early_data(&conn, accepted);
+        let outcome = *timeout(Duration::from_secs(3), outcome.wait_for(Option::is_some))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(outcome, Some(EarlyData::Rejected));
+        conn.close(0u32.into(), b"0-RTT rejected");
+        trace.retry_handshake();
+        let conn = client
+            .connect(servers[1], "localhost")
+            .unwrap()
+            .await
+            .unwrap();
+        trace.handshake_succeeded(&conn);
+        metrics.state(|state| {
+            assert_eq!(state.handshake_attempts, 2);
+            assert_eq!(state.handshake_successes, 2);
+            assert_eq!(state.handshake_failures, 0);
+            assert_eq!(state.zero_rtt_rejected, 1);
+            assert_eq!(state.zero_rtt_accepted, 0);
+        });
+        first.close(0u32.into(), b"done");
     }
 
     #[tokio::test(flavor = "current_thread")]

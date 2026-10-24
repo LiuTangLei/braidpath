@@ -222,7 +222,7 @@ enum Command {
         #[command(flatten)]
         stats: stats::Options,
     },
-    /// Serve a website and authenticated datagrams to one configured UDP target.
+    /// Serve authenticated UDP sessions and optional addressed TCP streams.
     Server {
         /// Experimental server-to-peer ACK request. Does not change native BBR,
         /// recovery, or the client's request policy; default remains unchanged.
@@ -236,13 +236,25 @@ enum Command {
         key: PathBuf,
         #[arg(long)]
         token_file: PathBuf,
+        /// UDP destination for datagram flows.
+        #[arg(long, required_unless_present_any = ["tcp_target", "proxy"])]
+        target: Option<SocketAddr>,
+        /// TCP destination; each client TCP connection becomes one reliable stream.
         #[arg(long)]
-        target: SocketAddr,
+        tcp_target: Option<SocketAddr>,
+        /// Connect streams from client proxy entrances (SOCKS5, HTTP CONNECT) to
+        /// the destination each one names. Names resolve here; only globally
+        /// routable unicast addresses are permitted.
+        #[arg(long)]
+        proxy: bool,
+        /// Also permit loopback, private, link-local and shared address ranges.
+        #[arg(long, requires = "proxy")]
+        proxy_allow_private: bool,
         /// Session sender cap in bits/s; `auto` defers to the client's request.
         #[arg(long, default_value = "auto", value_parser = parse_rate_cap)]
         max_rate_bps: RateCap,
-        /// Outgoing Quinn buffer for reverse traffic; bytes include metadata.
-        /// Controlled measurements only; this does not bound residence time.
+        /// Ceiling of Quinn's outgoing datagram buffer, bytes including metadata.
+        /// Each path fills it with at most 1 ms of its pace; 1200 keeps one datagram.
         #[arg(long, default_value_t = 1200, value_parser = clap::value_parser!(u32).range(1200..=76_800))]
         datagram_send_buffer_bytes: u32,
         /// BBR is the supported sending controller.
@@ -255,19 +267,28 @@ enum Command {
         #[command(flatten)]
         stats: stats::Options,
     },
-    /// Expose a local UDP port through independently encrypted entrances.
+    /// Expose local UDP and optional TCP ports through independently encrypted entrances.
     Client {
         #[arg(long, default_value = "127.0.0.1:7000")]
         listen: SocketAddr,
+        /// Accept local TCP connections and carry each as one reliable stream
+        /// over all paths. The server must configure --tcp-target.
+        #[arg(long)]
+        tcp_listen: Option<SocketAddr>,
+        /// Accept SOCKS5 CONNECT and HTTP CONNECT on one local port; the server
+        /// must enable --proxy. Without authentication: keep it on loopback.
+        #[arg(long)]
+        proxy_listen: Option<SocketAddr>,
         #[arg(long = "entrance", required = true)]
         entrances: Vec<SocketAddr>,
+        /// Linux interface name, or macOS ifindex:<nonzero index>.
         #[arg(long = "interface")]
         interfaces: Vec<String>,
         /// One explicit local UDP bind per interface–entrance pair, in path order.
         #[arg(long = "path-bind")]
         path_binds: Vec<SocketAddr>,
-        /// Outgoing Quinn buffer bytes, including metadata; does not bound residence time.
-        /// Override only for controlled measurements; normal operation defaults to 1200.
+        /// Ceiling of Quinn's outgoing datagram buffer, bytes including metadata.
+        /// Each path fills it with at most 1 ms of its pace; 1200 keeps one datagram.
         #[arg(long, default_value_t = 1200, value_parser = clap::value_parser!(u32).range(1200..=76_800))]
         datagram_send_buffer_bytes: u32,
         /// Bottleneck group per interface–entrance pair; defaults to interface index.
@@ -291,7 +312,7 @@ enum Command {
         #[command(flatten)]
         stats: stats::Options,
     },
-    /// Forward opaque UDP packets only to the configured exit server.
+    /// Forward opaque UDP packets only to the configured main server.
     Relay {
         #[arg(long)]
         listen: SocketAddr,
@@ -399,7 +420,7 @@ struct PolicyArgs {
     /// Report per-path receiver quality; data scheduling remains round robin.
     #[arg(long)]
     receiver_feedback: bool,
-    #[arg(long, default_value_t = 4)]
+    #[arg(long, default_value = "4", value_parser = tunnel::parse_fec)]
     fec: u8,
     /// Independent bulk repair equations. Two requires --mixed-fec; small records still use one copy.
     #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u8).range(1..=2))]
@@ -556,6 +577,8 @@ pub async fn run() -> Result<()> {
             let result = tunnel::client_with_routes(
                 tunnel::ClientOptions {
                     listen,
+                    tcp_listen: None,
+                    proxy_listen: None,
                     entrances,
                     interfaces: vec![],
                     path_binds: vec![],
@@ -585,6 +608,9 @@ pub async fn run() -> Result<()> {
             key,
             token_file,
             target,
+            tcp_target,
+            proxy,
+            proxy_allow_private,
             max_rate_bps,
             datagram_send_buffer_bytes,
             congestion,
@@ -600,7 +626,11 @@ pub async fn run() -> Result<()> {
                     cert,
                     key,
                     token: token_file,
-                    target: Some(target),
+                    target,
+                    tcp_target,
+                    stream_proxy: proxy.then_some(tunnel::ProxyAccess {
+                        allow_private: proxy_allow_private,
+                    }),
                     proxy: None,
                     max_rate: max_rate_bps.bps(),
                     datagram_send_buffer_bytes: datagram_send_buffer_bytes as usize,
@@ -613,6 +643,8 @@ pub async fn run() -> Result<()> {
         }
         Command::Client {
             listen,
+            tcp_listen,
+            proxy_listen,
             entrances,
             interfaces,
             path_binds,
@@ -629,10 +661,15 @@ pub async fn run() -> Result<()> {
             let rate = client_rate(&policy)?;
             let reporter = stats::Reporter::new("client", stats)?;
             let group_rates = parse_group_rates(&policy.group_rates, rate)?;
+            let mut session_policy = policy.build(rate, group_rates);
+            session_policy.streams = tcp_listen.is_some();
+            session_policy.proxy = proxy_listen.is_some();
             let result = tunnel::client(tunnel::ClientOptions {
                 stats: reporter.metrics.clone(),
                 adaptive_fec_retention,
                 listen,
+                tcp_listen,
+                proxy_listen,
                 entrances,
                 interfaces,
                 path_binds,
@@ -643,7 +680,7 @@ pub async fn run() -> Result<()> {
                 token: token_file,
                 congestion,
                 rotate_source_port: policy.rotate_source_port,
-                policy: policy.build(rate, group_rates),
+                policy: session_policy,
             })
             .await;
             reporter.finish(result).await
@@ -1143,6 +1180,8 @@ mod tests {
 impl PolicyArgs {
     fn build(&self, rate: u64, group_rates: [u64; super::MAX_PATHS]) -> tunnel::Policy {
         tunnel::Policy {
+            streams: false,
+            proxy: false,
             max_message_bytes: usize::from(self.max_message_bytes),
             adaptive: self.adaptive,
             capacity_probe_bps: self.capacity_probe_bps,
@@ -1153,12 +1192,104 @@ impl PolicyArgs {
             fec_repairs: self.fec_repairs,
             small_fec_bytes: self.small_fec_bytes,
             mixed_fec: self.mixed_fec,
-            receiver_feedback: self.receiver_feedback || self.quality_schedule || self.adaptive,
+            receiver_feedback: self.receiver_feedback
+                || self.quality_schedule
+                || self.adaptive
+                || self.fec == super::automatic_fec::AUTO,
             quality_schedule: self.quality_schedule || self.adaptive,
             redundancy: self.redundancy_percent,
             rate,
             block_ms: self.block_ms,
             queue_ms: self.queue_ms,
         }
+    }
+}
+
+#[cfg(test)]
+mod aggregate_cli_tests {
+    use super::*;
+
+    #[test]
+    fn addressed_stream_entry_preserves_defaults_and_accepts_the_historical_profile() {
+        let server = [
+            "braidpath",
+            "server",
+            "--listen",
+            "127.0.0.1:7001",
+            "--cert",
+            "cert.pem",
+            "--key",
+            "key.pem",
+            "--token-file",
+            "token",
+        ];
+        assert!(Cli::try_parse_from(server).is_err());
+        assert!(Cli::try_parse_from(server.into_iter().chain(["--proxy-allow-private"])).is_err());
+        let parsed = Cli::try_parse_from(
+            server
+                .into_iter()
+                .chain(["--proxy", "--proxy-allow-private"]),
+        )
+        .unwrap();
+        let Command::Server {
+            target,
+            tcp_target,
+            proxy,
+            proxy_allow_private,
+            ack_request,
+            datagram_send_buffer_bytes,
+            ..
+        } = parsed.command
+        else {
+            panic!("server")
+        };
+        assert!(target.is_none() && tcp_target.is_none() && proxy && proxy_allow_private);
+        assert_eq!(ack_request, transport::AckRequest::Unchanged);
+        assert_eq!(datagram_send_buffer_bytes, 1200);
+
+        let client = [
+            "braidpath",
+            "client",
+            "--entrance",
+            "127.0.0.1:7001",
+            "--server-name",
+            "localhost",
+            "--ca",
+            "cert.pem",
+            "--token-file",
+            "token",
+        ];
+        let parsed = Cli::try_parse_from(client.into_iter().chain([
+            "--proxy-listen",
+            "127.0.0.1:7080",
+            "--adaptive",
+            "--fec",
+            "auto",
+            "--rate-bps",
+            "auto",
+            "--datagram-send-buffer-bytes",
+            "76800",
+        ]))
+        .unwrap();
+        let Command::Client {
+            tcp_listen,
+            proxy_listen,
+            policy,
+            datagram_send_buffer_bytes,
+            ..
+        } = parsed.command
+        else {
+            panic!("client")
+        };
+        assert!(tcp_listen.is_none() && proxy_listen.is_some());
+        assert_eq!(policy.fec, super::super::automatic_fec::AUTO);
+        assert_eq!(datagram_send_buffer_bytes, 76_800);
+        let rate = client_rate(&policy).unwrap();
+        assert_eq!(rate, super::super::MAX_RATE_BPS);
+        assert!(
+            policy
+                .build(rate, [rate; super::super::MAX_PATHS])
+                .receiver_feedback
+        );
     }
 }

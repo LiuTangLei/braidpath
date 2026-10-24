@@ -3,8 +3,13 @@ use super::{MAX_PATHS, QUEUE};
 use bytes::Bytes;
 use std::{
     collections::{BTreeMap, VecDeque},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+    },
     time::{Duration, Instant},
 };
+use tokio::sync::Notify;
 
 /// A single bulk producer and its repair backlog cannot consume all admission slots.
 /// These are queue limits, not bandwidth reservations; unused service is work-conserving.
@@ -20,6 +25,116 @@ pub struct Pending {
     pub block: Option<u64>,
     /// Actual coding lane; only mixed sessions use this to classify symbols.
     pub small: bool,
+    /// Reliable-stream originals only; released when this original leaves.
+    pub hold: Option<Arc<Hold>>,
+}
+
+/// Locally queued reliable-stream bytes, shared with the stream producer.
+/// This is local backpressure, not delivery evidence or a rate estimate.
+#[derive(Default)]
+pub struct Gauge {
+    queued: AtomicUsize,
+    low_water: AtomicUsize,
+    admitted: AtomicU64,
+    dropped: Mutex<Vec<(u32, u64, u32)>>,
+    sent: Mutex<Vec<StreamAdmission>>,
+    pub notify: Notify,
+}
+/// Actual admission of one stream transmission, before its acknowledgment.
+pub struct StreamAdmission {
+    pub identity: (u32, u64, u32),
+    pub path: u8,
+    pub rtt: Duration,
+    pub at: Instant,
+}
+impl Gauge {
+    pub fn queued(&self) -> usize {
+        self.queued.load(Ordering::Acquire)
+    }
+    /// Total bytes admitted to Quinn.
+    pub fn admitted(&self) -> u64 {
+        self.admitted.load(Ordering::Acquire)
+    }
+    /// Wake the producer once occupancy falls to this level.
+    pub fn set_low_water(&self, bytes: usize) {
+        self.low_water.store(bytes, Ordering::Release);
+    }
+    /// Segments whose original left the queue without Quinn admission.
+    pub fn take_dropped(&self) -> Vec<(u32, u64, u32)> {
+        std::mem::take(&mut *self.dropped.lock().expect("gauge lock"))
+    }
+    pub fn take_sent(&self) -> Vec<StreamAdmission> {
+        std::mem::take(&mut *self.sent.lock().expect("gauge lock"))
+    }
+    pub fn hold(
+        self: &Arc<Self>,
+        stream: u32,
+        start: u64,
+        transmission: u32,
+        bytes: usize,
+        interactive: bool,
+    ) -> Arc<Hold> {
+        self.queued.fetch_add(bytes, Ordering::AcqRel);
+        Arc::new(Hold {
+            gauge: self.clone(),
+            identity: (stream, start, transmission),
+            bytes,
+            interactive,
+            admitted: AtomicBool::new(false),
+        })
+    }
+}
+
+pub struct Hold {
+    gauge: Arc<Gauge>,
+    identity: (u32, u64, u32),
+    bytes: usize,
+    /// The stream has little outstanding data: send it on the earliest path.
+    interactive: bool,
+    admitted: AtomicBool,
+}
+impl Hold {
+    pub fn transmission(&self) -> u32 {
+        self.identity.2
+    }
+    pub fn interactive(&self) -> bool {
+        self.interactive
+    }
+    pub fn admitted(&self, path: u8, rtt: Duration, at: Instant) {
+        if !self.admitted.swap(true, Ordering::AcqRel) {
+            self.gauge
+                .sent
+                .lock()
+                .expect("gauge lock")
+                .push(StreamAdmission {
+                    identity: self.identity,
+                    path,
+                    rtt,
+                    at,
+                });
+        }
+    }
+}
+impl Drop for Hold {
+    fn drop(&mut self) {
+        let gauge = &self.gauge;
+        let admitted = self.admitted.load(Ordering::Acquire);
+        if admitted {
+            gauge
+                .admitted
+                .fetch_add(self.bytes as u64, Ordering::AcqRel);
+        } else {
+            gauge
+                .dropped
+                .lock()
+                .expect("gauge lock")
+                .push(self.identity);
+        }
+        let before = gauge.queued.fetch_sub(self.bytes, Ordering::AcqRel);
+        if !admitted || before - self.bytes <= gauge.low_water.load(Ordering::Acquire) {
+            gauge.notify.notify_one();
+        }
+    }
 }
 
 #[derive(Default)]
@@ -160,6 +275,7 @@ pub struct RepairBudget {
     percent: u8,
     credit: u64,
     maximum: u64,
+    small: Option<Pacer>,
 }
 impl RepairBudget {
     pub fn new(percent: u8) -> Self {
@@ -167,6 +283,25 @@ impl RepairBudget {
             percent,
             credit: 0,
             maximum: 2 * 1200 * 100,
+            small: None,
+        }
+    }
+    pub fn enable_small_rate(&mut self, rate: u64) {
+        self.small = Some(Pacer::new(rate, 2400));
+    }
+    pub fn refill_small(&mut self, now_us: u64) {
+        if let Some(pacer) = &mut self.small {
+            pacer.refill(now_us);
+        }
+    }
+    pub fn small_can_repair(&self, bytes: usize) -> bool {
+        self.small
+            .as_ref()
+            .is_none_or(|pacer| pacer.available(bytes + 80))
+    }
+    pub fn small_repair_admitted(&mut self, bytes: usize) {
+        if let Some(pacer) = &mut self.small {
+            pacer.spend(bytes + 80);
         }
     }
     pub fn original_admitted(&mut self, bytes: usize) {
@@ -181,6 +316,33 @@ impl RepairBudget {
     pub fn repair_admitted(&mut self, bytes: usize) {
         assert!(self.can_repair(bytes));
         self.credit -= bytes as u64 * 100;
+    }
+}
+
+#[cfg(test)]
+mod small_budget_tests {
+    use super::*;
+    #[test]
+    fn small_copy_rate_is_independent_and_idle_credit_is_bounded() {
+        let mut budget = RepairBudget::new(30);
+        budget.enable_small_rate(8000);
+        assert!(!budget.small_can_repair(920));
+        budget.refill_small(1_000_000);
+        assert!(budget.small_can_repair(920));
+        budget.small_repair_admitted(920);
+        budget.original_admitted(100_000);
+        assert!(
+            !budget.small_can_repair(920),
+            "bulk credit cannot fund a small copy"
+        );
+        budget.refill_small(1_000_000_000);
+        for _ in 0..2 {
+            budget.small_repair_admitted(920);
+        }
+        assert!(
+            !budget.small_can_repair(920),
+            "idle cannot accumulate unbounded copies"
+        );
     }
 }
 
@@ -230,17 +392,17 @@ impl ObservationSchedule {
     }
 }
 
-/// Retain one sender timer quantum plus at most one frame's fractional credit.
-/// A fixed two-
-/// datagram bucket otherwise caps a 1 ms wakeup cadence near 19 Mbit/s, even
-/// when the admitted rate is hundreds of Mbit/s. Low-rate/startup credit keeps
-/// its existing byte bound; a rate change never grants tokens by itself.
+/// Retain at most two milliseconds plus one frame's fractional credit.
+/// A nominal 1 ms timer can wake slightly late: retaining exactly 1 ms loses
+/// earned bytes at every such wakeup, even with continuous demand. This small
+/// bound serves up to 2 ms scheduling intervals without unbounded catch-up.
+/// Startup remains bounded; changing a rate never creates tokens.
 pub(super) fn pacing_burst_bytes(rate_bps: u64, minimum_bytes: usize) -> f64 {
     // Maximum repair symbol, feedback header, HTTP mapping and admission cost.
     // The remainder lets a packet that did not fit the previous quantum carry
     // its earned bytes forward instead of rounding every wakeup down to packets.
     let frame_remainder = super::wire::MAX_WIRE + super::quality::HEADER + 9 + 80;
-    (minimum_bytes as f64).max(rate_bps.div_ceil(8000) as f64 + frame_remainder as f64)
+    (minimum_bytes as f64).max(rate_bps.div_ceil(4000) as f64 + frame_remainder as f64)
 }
 
 pub struct Pacer {
@@ -423,18 +585,18 @@ mod tests {
     fn high_rate_credit_remains_bounded_and_rate_changes_grant_no_tokens() {
         let mut pacer = Pacer::for_sender(400_000_000, 2400);
         pacer.refill(1_000_000);
-        assert!(pacer.available(51_144));
+        assert!(pacer.available(101_144));
         assert!(
-            !pacer.available(51_145),
-            "one millisecond plus one frame survives idle"
+            !pacer.available(101_145),
+            "two milliseconds plus one frame is the hard idle bound"
         );
         pacer.set_rate(1_000_000, 8_000_000);
-        assert!(pacer.available(2400));
+        assert!(pacer.available(3144));
         assert!(
-            !pacer.available(2401),
-            "lower rate restores the small bound"
+            !pacer.available(3145),
+            "lower rate restores its two-millisecond bound"
         );
-        pacer.spend(2400);
+        pacer.spend(3144);
         pacer.set_rate(1_000_000, 400_000_000);
         assert!(!pacer.available(1), "raising a rate creates no credit");
         pacer.refill(1_001_000);
@@ -448,6 +610,42 @@ mod tests {
         probe.refill(2_000_000);
         assert!(probe.available(2178));
         assert!(!probe.available(2179));
+    }
+
+    #[test]
+    fn sender_pacers_keep_the_rate_when_a_one_ms_timer_wakes_slightly_late() {
+        const COST: usize = 1135;
+        for rate in [80_000_000, 8_000_000, 20_000_000, 400_000_000] {
+            for cadence in [1000, 1100, 1200, 1500, 2000] {
+                let mut aggregate = Pacer::for_sender(rate, 2400);
+                let mut group = Pacer::for_sender(rate, 2400);
+                let mut business = BusinessPacer::new(rate, [rate; MAX_PATHS], 2400);
+                business.update(0, [(0, rate)]);
+                business.spend(0, 2400);
+                let mut admitted = 0u64;
+                for tick in 1..=100 {
+                    let now = tick * cadence;
+                    aggregate.refill(now);
+                    group.refill(now);
+                    business.update(now, [(0, rate)]);
+                    while aggregate.available(COST)
+                        && group.available(COST)
+                        && business.available(0, COST)
+                    {
+                        aggregate.spend(COST);
+                        group.spend(COST);
+                        business.spend(0, COST);
+                        admitted += COST as u64;
+                    }
+                }
+                let earned = rate * (100 * cadence) / 8_000_000;
+                assert!(
+                    admitted >= earned * 95 / 100,
+                    "rate={rate}, cadence={cadence}: {admitted}/{earned}"
+                );
+                assert!(admitted <= earned, "timer lateness creates no extra credit");
+            }
+        }
     }
 
     #[test]
@@ -741,6 +939,7 @@ mod tests {
             flow: Some(flow),
             block: Some(id / 4),
             small: false,
+            hold: None,
         }
     }
     #[test]
@@ -817,6 +1016,7 @@ mod tests {
                 flow: None,
                 block: Some(id),
                 small: false,
+                hold: None,
             };
             if let Err(rejected) = q.push(repair) {
                 assert_eq!(rejected.block, Some(id));
@@ -867,5 +1067,32 @@ mod tests {
         assert!(group.available(1200));
         group.spend(1200);
         assert!(!group.available(1));
+    }
+
+    #[test]
+    fn stream_holds_release_occupancy_and_report_only_unadmitted_originals() {
+        let gauge = Arc::new(Gauge::default());
+        gauge.set_low_water(1500);
+        let admitted = gauge.hold(3, 0, 1, 1000, false);
+        let dropped = gauge.hold(3, 1000, 2, 1000, false);
+        let clone = dropped.clone();
+        assert_eq!(gauge.queued(), 2000);
+        let at = Instant::now();
+        admitted.admitted(0, Duration::from_millis(20), at);
+        admitted.admitted(1, Duration::from_millis(100), at);
+        let sent = gauge.take_sent();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].identity, (3, 0, 1));
+        assert_eq!(
+            (sent[0].path, sent[0].rtt, sent[0].at),
+            (0, Duration::from_millis(20), at)
+        );
+        drop(admitted);
+        drop(dropped);
+        assert_eq!(gauge.queued(), 1000, "a clone keeps the original queued");
+        assert!(gauge.take_dropped().is_empty());
+        drop(clone);
+        assert_eq!((gauge.queued(), gauge.admitted()), (0, 1000));
+        assert_eq!(gauge.take_dropped(), vec![(3, 1000, 2)]);
     }
 }

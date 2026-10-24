@@ -502,6 +502,7 @@ mod integration_tests {
                                 payload: vec![0],
                             },
                             created: now,
+                            hold: None,
                         })
                         .unwrap();
                     }
@@ -614,13 +615,15 @@ mod integration_tests {
             now,
             &scope,
             128,
+            None,
         ) {}
         assert!(!crate::runtime::tunnel::enqueue_record(
             &tx,
             parts[1].clone(),
             now,
             &scope,
-            128
+            128,
+            None,
         ));
         assert!(crate::runtime::tunnel::enqueue_record(
             &tx,
@@ -631,7 +634,8 @@ mod integration_tests {
             },
             now,
             &scope,
-            128
+            128,
+            None,
         ));
     }
     #[test]

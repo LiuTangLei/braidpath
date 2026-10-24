@@ -12,7 +12,31 @@ const CONTROL_US: u64 = 200_000;
 const PROBE_US: u64 = 500_000;
 const FAST_PROBE_US: u64 = 100_000;
 const BRAKE_US: u64 = 100_000;
+/// One-way transit reports bound the RTT queue signal while this recent.
+const ONE_WAY_FRESH_US: u64 = 1_000_000;
+/// Absorbs the receiver's per-symbol smoothing of one-way transit.
+const ONE_WAY_SLACK_MS: f64 = 2.0;
 const RETRY_GROWTH_US: u64 = 500_000;
+/// A pace at or below this cannot hold a standing queue at a bottleneck that
+/// still serves it. Absolute: remembered service can be stale after a step.
+const LIGHT_BPS: u64 = 1_000_000;
+const LIGHT_WINDOW_US: u64 = 1_000_000;
+/// RTT excess sampled at this pace or lighter is the path's own wander: no
+/// bottleneck worth using queues a path paced like a new one. Its upper
+/// decile over this window, from at least this many samples and at most
+/// this many latency targets, is discounted from queue readings; without new
+/// light samples the discount halves every half-life.
+const WANDER_BPS: u64 = START_BPS;
+const WANDER_WINDOW_US: u64 = 20_000_000;
+const WANDER_SAMPLES: usize = 16;
+const WANDER_CAPACITY: usize = 64;
+const WANDER_QUANTILE: f64 = 0.9;
+const WANDER_TARGETS: f64 = 4.0;
+const WANDER_HALF_LIFE_US: u64 = 60_000_000;
+/// Above the start pace, a pace up to `LIGHT_BPS` also learns wander while its
+/// delivery keeps up with its admission: a bottleneck slower than the pace
+/// queues and underdelivers instead. Such samples discount at most one target.
+const WANDER_KEEP_UP: f64 = 0.85;
 const START_BPS: u64 = 256_000;
 const MIN_BPS: u64 = 64_000;
 const LOSS_WINDOW_US: u64 = 4_000_000;
@@ -29,25 +53,70 @@ const QUEUE_GATED_LOSS_FRACTION: f64 = 0.25;
 /// Queue-gated pacing already treats clear-queue loss as path loss, so its
 /// typical floor may discount up to half of the admitted bytes.
 const QUEUE_GATED_LOSS_FLOOR_MAX: f64 = 0.5;
-/// Three clean monitored increases raise the cautious step from 3% to 24%.
-const CLEAN_GROWTH_STREAK_MAX: u32 = 3;
+/// Random loss is the same at any pace; a policer or a shallow buffer drops
+/// more the faster a path is sent, without building a queue. Queue-gated
+/// pacing tests clear-queue loss this far beyond what the path has shown to
+/// be random: one brake to `LOSS_TEST_SCALE`, then the loss is measured again.
+const LOSS_TEST_EXCESS: f64 = 0.02;
+const LOSS_TEST_SCALE: f64 = 0.75;
+/// Under the brake random loss stays, while a path's own overrun keeps its
+/// delivered rate, so its loss falls to `1 - (1 - held) / LOSS_TEST_SCALE`.
+/// Loss within this fraction of the way from that to the held loss is the
+/// path's own; beyond `LOSS_TEST_RANDOM` it is random; between, no verdict.
+const LOSS_TEST_OWN: f64 = 0.4;
+const LOSS_TEST_RANDOM: f64 = 0.6;
+/// Symbols a test measures after its brake reaches the receiver.
+const LOSS_TEST_SYMBOLS: u64 = 512;
+const LOSS_TEST_US: u64 = 3_000_000;
+/// A path's own drops cap its pace below where they appeared this long.
+const LOSS_CEILING_US: u64 = 10_000_000;
+/// An expired cap rises by `LOSS_CEILING_STEP` this often while the pace
+/// presses against it, so loss reports keep up with each step.
+const LOSS_CEILING_STEP_US: u64 = 2_000_000;
+const LOSS_CEILING_STEP: f64 = 1.1;
+/// A test that found random loss forgives that loss this long.
+const RANDOM_LOSS_US: u64 = 30_000_000;
+/// Paces too slow to matter are not tested.
+const LOSS_TEST_MIN_BPS: u64 = 2_000_000;
+/// Four clean monitored increases raise the cautious step from 3% to 48%,
+/// no faster than the initial search: one false brake early in a transfer
+/// must not leave it seconds below a path it never measured.
+const CLEAN_GROWTH_STREAK_MAX: u32 = 4;
+/// Congestion evidence is the wire rate a path delivered when it braked.
+/// Clean growth to this multiple of that rate, with delivery past
+/// `CONGESTION_EXPIRY_DELIVERY` of it, shows the brake was not its capacity
+/// (an RTT spike at a light pace, for example), so the path searches again
+/// at the initial speed instead of cautious steps sized for a known ceiling.
+const CONGESTION_EXPIRY_GAIN: f64 = 2.0;
+const CONGESTION_EXPIRY_DELIVERY: f64 = 1.5;
 
 /// Finalized loss observed while this path's own queue signal was clear.
 /// The floor is the smallest recent bucket, so a congestion episode can only
 /// lower it. It never describes capacity; it only discounts delivery deficit.
+/// Buckets age in clear-queue time: a queue, which cannot measure the floor,
+/// must not erase it either, or every later report of the same path loss
+/// reads as a delivery shortfall and brakes the path toward the floor pace.
 #[derive(Default)]
 struct LossFloor {
     previous: Option<(u64, u64)>,
     bucket: (u64, u64),
+    /// Clear-queue time at which each bucket closed, and its loss fraction.
     buckets: VecDeque<(u64, f64)>,
+    clear_us: u64,
+    observed_us: Option<u64>,
 }
 
 impl LossFloor {
     fn observe(&mut self, now_us: u64, finalized: Option<(u64, u64)>, clear_queue: bool) {
+        if let Some(previous) = self.observed_us.replace(now_us)
+            && clear_queue
+        {
+            self.clear_us += now_us.saturating_sub(previous);
+        }
         while self
             .buckets
             .front()
-            .is_some_and(|(at, _)| now_us.saturating_sub(*at) > LOSS_FLOOR_AGE_US)
+            .is_some_and(|(at, _)| self.clear_us.saturating_sub(*at) > LOSS_FLOOR_AGE_US)
         {
             self.buckets.pop_front();
         }
@@ -73,7 +142,7 @@ impl LossFloor {
                 self.buckets.pop_front();
             }
             self.buckets
-                .push_back((now_us, self.bucket.1 as f64 / self.bucket.0 as f64));
+                .push_back((self.clear_us, self.bucket.1 as f64 / self.bucket.0 as f64));
             self.bucket = (0, 0);
         }
     }
@@ -98,6 +167,17 @@ impl LossFloor {
         fractions.sort_by(f64::total_cmp);
         fractions[(fractions.len() - 1) / 2].min(QUEUE_GATED_LOSS_FLOOR_MAX)
     }
+}
+
+/// One rate-dependence test of clear-queue loss.
+struct LossTest {
+    from_bps: u64,
+    /// Loss measured while the pace held; then the brake is measured.
+    held_loss: Option<f64>,
+    /// Start of the current phase.
+    started_us: u64,
+    measure_from_us: u64,
+    counts: (u64, u64),
 }
 
 #[derive(Default)]
@@ -289,6 +369,7 @@ pub struct Snapshot {
     #[serde(flatten)]
     pub decision: Decision,
     pub native_service_recoveries: u64,
+    pub baseline_refreshes: u64,
     pub reprobe: reprobe::Snapshot,
     pub probe_service: Option<probe_service::Reference>,
     pub rate_changes: VecDeque<RateChange>,
@@ -315,8 +396,12 @@ pub enum RateReason {
     FastLossBrake,
     LossBrake,
     TransportBlockedBrake,
+    /// Clear-queue loss beyond the path's random loss: is it the pace's own?
+    LossTestBrake,
     ReprobeStart,
     ReprobeRollback,
+    /// Braking did not drain an RTT elevation: it is propagation, not queue.
+    BaselineRefresh,
 }
 
 /// Diagnostic identity of the original selected absolute RTT. Exact numeric
@@ -568,6 +653,12 @@ pub struct ControlSample {
     /// Queue-gated loss experiment: loss-only brakes were held this sample.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub queue_gated_loss_hold: Option<bool>,
+    /// Pace cap after a loss test found the path dropping at a higher pace.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub loss_ceiling_bps: Option<u64>,
+    /// The last loss test: tested pace, loss before and at 3/4 of it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub loss_test: Option<(u64, f64, f64)>,
     /// Local opt-in, never negotiated from an untrusted peer. A native window
     /// is a sending allowance, not measured path capacity.
     pub native_service_guard_enabled: bool,
@@ -593,6 +684,8 @@ pub struct ControlSample {
     pub rtt_source: RttSource,
     pub mixed_min_rtt_ms: Option<f64>,
     pub rtt_excess_ms: f64,
+    /// RTT wander already discounted from `rtt_excess_ms`.
+    pub rtt_wander_ms: f64,
     pub transport_wait_ms: f64,
     pub rtt_fresh: bool,
     pub probe_fresh: bool,
@@ -711,8 +804,10 @@ pub struct Observation {
     pub probe_latest_rtt_ms: Option<f64>,
     pub probe_sample_id: u64,
     pub probe_age_us: Option<u64>,
-    /// Independent clocks make this unsafe as a lone congestion trigger.
-    pub transit_excess_ms: f64,
+    /// Receiver-measured one-way transit of this direction above its own
+    /// minimum, when reported. Independent clocks make this unsafe as a lone
+    /// congestion trigger; it only bounds how much RTT excess is this direction's.
+    pub transit_excess_ms: Option<f64>,
     pub send_queue_bytes: usize,
     pub offered_backlog: bool,
     pub transport_blocked: bool,
@@ -731,6 +826,38 @@ struct DrainReturn {
     drain_bps: Option<f64>,
 }
 
+/// RTT elevation under test after a queue brake. A self-inflicted queue
+/// drains once the pace is below the service it measured; a longer path
+/// does not, and then becomes the new queue reference.
+#[derive(Clone, Copy, Debug)]
+struct StandingDelay {
+    braked_us: u64,
+    /// Pace before the first brake of this episode.
+    pace_before_bps: u64,
+    /// Lowest pace since the brake; any increase ends the test.
+    rate_bps: u64,
+    early_ms: f64,
+    late_ms: f64,
+    samples: u32,
+    last_sample_us: u64,
+    /// Start of a repeated window after an unstable one; the first waits
+    /// for the lower pace to settle.
+    window_start_us: Option<u64>,
+    windows: u8,
+}
+
+/// Minimum RTT excess in two halves of a window paced lightly throughout.
+#[derive(Clone, Copy, Debug)]
+struct LightBaseline {
+    started_us: u64,
+    window_us: u64,
+    last_sample_us: u64,
+    early_ms: f64,
+    late_ms: f64,
+    early_samples: u32,
+    late_samples: u32,
+}
+
 struct GrowthRetry {
     baseline_bps: u64,
     increment_bps: u64,
@@ -745,6 +872,17 @@ pub struct PathController {
     random_loss_service_enabled: bool,
     queue_gated_loss_enabled: bool,
     loss_floor: LossFloor,
+    loss_test: Option<LossTest>,
+    /// When the last test ended: later evidence must not predate it.
+    loss_tested_us: u64,
+    last_loss_test: Option<(u64, f64, f64)>,
+    /// Loss a test found unchanged at a lower pace, and when.
+    random_loss: Option<(f64, u64)>,
+    /// Pace below which a test found the path's own drops, and its expiry.
+    loss_ceiling: Option<(u64, u64)>,
+    /// The session tests loss that most paths share; a test of one path
+    /// would also measure the paths that take up its share.
+    shared_loss: bool,
     /// Raw and compensated cumulative delivered symbol bytes in this generation.
     compensated_delivery: Option<(u64, u64)>,
     source_local_min_rtt_ms: Option<f64>,
@@ -775,6 +913,20 @@ pub struct PathController {
     growth_monitor: Option<GrowthMonitor>,
     growth_retry: Option<GrowthRetry>,
     drain_return: Option<DrainReturn>,
+    standing_delay: Option<StandingDelay>,
+    light_baseline: Option<LightBaseline>,
+    /// Recent light-pace RTT excess samples, oldest first.
+    wander_samples: VecDeque<(u64, f64)>,
+    /// The same above the start pace, each at most one latency target.
+    served_wander_samples: VecDeque<(u64, f64)>,
+    light_since_us: Option<u64>,
+    /// The light pace has shown an excess below the brake threshold, so an
+    /// earlier queue of this path has drained.
+    light_drained: bool,
+    /// Wander learned from the samples, and when.
+    wander_ms: f64,
+    wander_us: u64,
+    baseline_refreshes: u64,
     /// Consecutive growth monitors that settled without a rising RTT or
     /// queue. Each doubles the cautious step; any brake resets it.
     clean_growth_streak: u32,
@@ -795,6 +947,8 @@ pub struct PathController {
     admitted_symbol_bytes: u64,
     /// Bounded cumulative actual (native cost, symbol bytes, symbol count).
     native_admitted: Option<(u64, u64, u64)>,
+    /// The initial native sending window, before BBR's startup expansion.
+    native_startup_window_bytes: Option<u64>,
     /// Actual business measurement start, separate from the control owner clock.
     admission_started_us: Option<u64>,
     allowance_bytes: f64,
@@ -816,6 +970,8 @@ pub struct PathController {
     /// application-limited sample never decreases this exploration reference.
     remembered_bps: f64,
     congestion_seen: bool,
+    /// Highest wire rate delivered at a brake since congestion was established.
+    congestion_delivery_bps: Option<f64>,
     weight_loss: Option<WeightLoss>,
     weight_window: WeightWindow,
     loss_evidence: LossEvidence,
@@ -843,6 +999,12 @@ impl PathController {
             random_loss_service_enabled: false,
             queue_gated_loss_enabled: false,
             loss_floor: LossFloor::default(),
+            loss_test: None,
+            loss_tested_us: 0,
+            last_loss_test: None,
+            random_loss: None,
+            loss_ceiling: None,
+            shared_loss: false,
             compensated_delivery: None,
             source_local_min_rtt_ms: None,
             source_probe_min_rtt_ms: None,
@@ -868,6 +1030,15 @@ impl PathController {
             growth_monitor: None,
             growth_retry: None,
             drain_return: None,
+            standing_delay: None,
+            light_baseline: None,
+            wander_samples: VecDeque::new(),
+            served_wander_samples: VecDeque::new(),
+            light_since_us: None,
+            light_drained: false,
+            wander_ms: 0.0,
+            wander_us: 0,
+            baseline_refreshes: 0,
             clean_growth_streak: 0,
             last_growth_probe: None,
             fast_feedback_seen: false,
@@ -883,6 +1054,7 @@ impl PathController {
             admitted_bytes: 0,
             admitted_symbol_bytes: 0,
             native_admitted: Some((0, 0, 0)),
+            native_startup_window_bytes: None,
             admission_started_us: None,
             allowance_bytes: 0.0,
             wire_per_symbol: 1.0,
@@ -900,6 +1072,7 @@ impl PathController {
             drain_restore_pending: false,
             remembered_bps: 0.0,
             congestion_seen: false,
+            congestion_delivery_bps: None,
             weight_loss: None,
             weight_window: WeightWindow::default(),
             loss_evidence: LossEvidence::default(),
@@ -946,6 +1119,20 @@ impl PathController {
         self.queue_gated_loss_enabled = enabled;
         self.random_loss_service_enabled |= enabled;
         self
+    }
+
+    /// Whether the session is testing or limiting loss that most paths share.
+    pub(crate) fn set_shared_loss(&mut self, shared: bool) {
+        self.shared_loss = shared;
+    }
+
+    /// Reuse this path's qualified evidence from a rejected aggregate trial.
+    /// This seeds only the existing finite loss-test cache, not queue/service
+    /// protections, and must never cross a path generation.
+    pub(crate) fn inherit_random_loss(&mut self, generation: u64, fraction: f64, now_us: u64) {
+        if self.queue_gated_loss_enabled && self.generation == Some(generation) {
+            self.random_loss = Some((fraction, now_us));
+        }
     }
 
     /// Queue delay below which loss-only brakes are held (queue-gated mode).
@@ -1038,6 +1225,7 @@ impl PathController {
                 .min(u128::from(self.maximum_bps)) as u64;
             if native_bps > self.rate_bps {
                 let previous = self.rate_bps;
+                self.native_startup_window_bytes = Some(cwnd_bytes);
                 self.rate_bps = native_bps;
                 self.last_growth_us = observation.now_us;
                 self.last_control.native_startup_cwnd_bytes = Some(cwnd_bytes);
@@ -1389,6 +1577,51 @@ impl PathController {
                 }
             }
         }
+        // RTT excess beyond this direction's one-way excess sits in the reverse
+        // direction: typically replies and ACKs waiting behind the peer's own
+        // bulk queue. Braking this direction cannot drain it, and an ACK
+        // direction braked for it starves the requests that share it. The bound
+        // only lowers the RTT signal, so clock drift cannot create congestion.
+        if self.fast_recovery_enabled
+            && observation
+                .feedback_age_us
+                .is_some_and(|age| age <= ONE_WAY_FRESH_US)
+            && let Some(transit) = observation
+                .transit_excess_ms
+                .filter(|transit| transit.is_finite() && *transit >= 0.0)
+        {
+            rtt_excess = rtt_excess.min(transit + ONE_WAY_SLACK_MS);
+        }
+        if fresh
+            && let Some(rtt) = rtt
+            && let Some((shift, pace_before)) =
+                self.standing_delay(now, rtt, rtt_excess, new_rtt || new_probe, observation)
+        {
+            self.refresh_baseline(shift);
+            rtt_excess = (rtt_excess - shift).max(0.0);
+            let restored = ((pace_before as f64 * 0.9) as u64).min(self.maximum_bps);
+            if restored > self.rate_bps {
+                self.rate_bps = restored;
+                self.last_growth_us = now;
+                rate_reason = RateReason::BaselineRefresh;
+            }
+        } else if fresh
+            && let Some(rtt) = rtt
+            && let Some(shift) =
+                self.light_baseline(now, rtt, rtt_excess, new_rtt || new_probe, observation)
+        {
+            self.refresh_baseline(shift);
+            rtt_excess = (rtt_excess - shift).max(0.0);
+        }
+        let wander = if self.fast_recovery_enabled
+            && fresh
+            && let Some(rtt) = rtt
+        {
+            self.observe_wander(now, rtt, rtt_excess, new_rtt || new_probe, observation)
+        } else {
+            0.0
+        };
+        rtt_excess = (rtt_excess - wander).max(0.0);
         let service_sample = self
             .fast_feedback_seen
             .then(|| self.service_window.latest(now))
@@ -1504,9 +1737,13 @@ impl PathController {
             now.saturating_sub(since) >= BRAKE_US
                 || self.queue_delay_ms >= self.target_ms * 4.0
                 // A sub-target pulse still holds growth but must persist before
-                // braking. At the target, a rising startup probe brakes at once.
+                // braking. A rising startup probe or native RTT can act at the
+                // target, before a complete busy delivery interval exists.
                 || (fast_initial
-                    && new_probe
+                    && (new_probe
+                        || (self.fast_recovery_enabled
+                            && self.native_startup_window_bytes.is_some()
+                            && new_rtt))
                     && queue_rising
                     && self.queue_delay_ms >= self.target_ms)
         } else {
@@ -1727,6 +1964,8 @@ impl PathController {
             rtt_source_baseline_corrections: self.rtt_source_baseline_corrections,
             random_loss_floor,
             queue_gated_loss_hold: self.queue_gated_loss_enabled.then_some(loss_hold),
+            loss_ceiling_bps: self.loss_ceiling.map(|(bps, _)| bps),
+            loss_test: self.last_loss_test,
             native_service_guard_enabled: false,
             native_service_hint_bps: None,
             at_us: now,
@@ -1747,6 +1986,7 @@ impl PathController {
             rtt_source,
             mixed_min_rtt_ms: self.min_rtt_ms,
             rtt_excess_ms: rtt_excess,
+            rtt_wander_ms: wander,
             transport_wait_ms: transport_wait,
             rtt_fresh: fresh,
             probe_fresh,
@@ -1871,6 +2111,18 @@ impl PathController {
                     && (sample.bps == 0.0
                         || positive_settlement_since_us.is_some_and(|since| {
                             admission.started_us.saturating_sub(since) >= service_settle_us
+                        }))
+                    // A sparse, application-limited cohort loses a few symbols
+                    // to random path loss; that delivery is not a capacity.
+                    // Without sustained demand only a collapse is a deficit.
+                    && (!self.fast_recovery_enabled
+                        || sample.bps < admission.bps * 0.5
+                        || self
+                            .backlog_since_us
+                            .is_some_and(|since| since <= admission.started_us)
+                        || admission.wire_bytes.is_some_and(|bytes| {
+                            bytes as f64 * 8_000_000.0 / admission.span_us as f64
+                                >= self.rate_bps as f64 * 0.9
                         }))
                     && sample.bps < admission.bps * 0.85
                     && wire_delivery_bps
@@ -2118,6 +2370,31 @@ impl PathController {
                         })
                 })
             });
+            let current_queue_service = current_queue_service.or_else(|| {
+                (new_delay
+                    && !new_loss
+                    && !delivery_shortfall
+                    && !blocked_pressure
+                    && positive_young
+                    && observation.offered_backlog
+                    && service_sample.is_some_and(|old| {
+                        old.admission.is_some_and(|a| {
+                            a.bps * self.wire_per_symbol < self.rate_bps as f64 * 0.85
+                                && self.backlog_since_us.is_some_and(|since| {
+                                    a.started_us.saturating_add(a.span_us) <= since
+                                })
+                        })
+                    }))
+                .then(|| {
+                    self.backlog_since_us
+                        .and_then(|since| self.service_window.queue_sample(now, since))
+                })
+                .flatten()
+                .filter(|sample| {
+                    now.checked_sub(sample.observed_us)
+                        .is_some_and(|age| age <= CONTROL_US)
+                })
+            });
             let service_hint = current_queue_service
                 .map(|sample| sample.bps * self.wire_per_symbol)
                 .or_else(|| {
@@ -2129,22 +2406,78 @@ impl PathController {
             // A new queue behind offered backlog shows the bottleneck, not the
             // application, limits fresh short-feedback delivery, even while the
             // transport (e.g. its own window) leaves part of this allowance unused.
+            // The sample must have measured the bottleneck: most of its admission
+            // lies inside the backlog, or the queue was observed within one base
+            // RTT of that admission's end. Startup can meet only the
+            // second, since the transport window limits sends before any local
+            // backlog forms. A sample that predates both (sparse traffic, then a
+            // burst) measured the application and would brake to the floor.
             let backlogged_queue_delivery = self.fast_recovery_enabled
                 && self.fast_feedback_seen
                 && new_delay
                 && observation.offered_backlog
                 && self
                     .last_report
-                    .is_some_and(|(_, _, at)| now.saturating_sub(at) <= CONTROL_US);
+                    .is_some_and(|(_, _, at)| now.saturating_sub(at) <= CONTROL_US)
+                && service_sample.is_some_and(|sample| {
+                    sample.admission.is_some_and(|admission| {
+                        let end = admission.started_us.saturating_add(admission.span_us);
+                        self.backlog_since_us.is_some_and(|since| {
+                            end.saturating_sub(since.max(admission.started_us)) * 2
+                                >= admission.span_us
+                        }) || self.delay_since_us.is_some_and(|since| {
+                            // The base RTT bounds how late a queue that admission
+                            // met can first be observed.
+                            since
+                                <= end.saturating_add(
+                                    self.min_rtt_ms.map_or(0, |ms| (ms * 1000.0) as u64),
+                                )
+                        })
+                    })
+                });
+            // Without a qualified service interval, update the original native
+            // window's sending allowance with today's RTT. Keeping the original
+            // RTT (or adopting BBR's expanded startup window) can fill every path
+            // before the first busy receiver report arrives. This only lowers
+            // startup allowance; it grants no capacity memory or burst tokens.
+            let fallback = self.rate_bps as f64 * 0.8;
+            let fallback = if self.fast_recovery_enabled && fast_initial && new_delay {
+                self.native_startup_window_bytes
+                    .zip(local_rtt)
+                    .map_or(fallback, |(window, rtt_ms)| {
+                        fallback.min(window as f64 * 8000.0 / rtt_ms)
+                    })
+            } else {
+                fallback
+            };
             let mut desired = service_hint
                 .filter(|rate| {
+                    // A complete, backlogged paired interval measures service
+                    // even when native startup seeded an unexercised allowance.
+                    // The sparse retained interval cannot grant this authority.
                     *rate > 0.0
-                        && (episode_exercised
-                            || delivery_shortfall
-                            || backlogged_queue_delivery
-                            || *rate >= self.rate_bps as f64)
+                        && (*rate >= self.rate_bps as f64
+                            || ((episode_exercised || delivery_shortfall || backlogged_queue_delivery
+                                || (self.fast_recovery_enabled && current_queue_service.is_some()))
+                                // Current utilization cannot qualify a sparse
+                                // interval from before this backlog/queue.
+                                && (!self.fast_feedback_seen
+                                    || !new_delay
+                                    || current_queue_service.is_some()
+                                    || backlogged_queue_delivery
+                                    || service_sample.is_some_and(|sample| {
+                                        sample.admission.is_some_and(|a| {
+                                            let end = a.started_us.saturating_add(a.span_us);
+                                            let active = end.saturating_sub(
+                                                a.started_us.max(activity_since_us.unwrap_or(a.started_us)),
+                                            );
+                                            active >= CONTROL_US
+                                                && a.bps * a.span_us as f64 / active as f64
+                                                    * self.wire_per_symbol >= self.rate_bps as f64 * 0.85
+                                        })
+                                    }))))
                 })
-                .map_or(self.rate_bps as f64 * 0.8, |rate| rate * drain_fraction);
+                .map_or(fallback, |rate| rate * drain_fraction);
             if delay_pressure
                 && queue_rising
                 && (self.queue_delay_ms - previous_queue > self.target_ms * 0.5
@@ -2195,9 +2528,33 @@ impl PathController {
                 self.congestion_seen |= service_deficit
                     || backlogged_queue
                     || (self.pressure_episode_exercised == Some(true) && capacity_evidence);
+                if self.congestion_seen {
+                    let delivered = self
+                        .latest_delivery_bps
+                        .map_or(0.0, |rate| rate * self.wire_per_symbol)
+                        .max(reduced as f64);
+                    self.congestion_delivery_bps = Some(
+                        self.congestion_delivery_bps
+                            .map_or(delivered, |old| old.max(delivered)),
+                    );
+                }
                 if new_delay {
                     self.braked_queue_ms = Some(self.queue_delay_ms);
                     self.drain_restore_pending = true;
+                    if self.fast_recovery_enabled {
+                        let test = self.standing_delay.get_or_insert(StandingDelay {
+                            braked_us: now,
+                            pace_before_bps: self.rate_bps,
+                            rate_bps: reduced,
+                            early_ms: f64::INFINITY,
+                            late_ms: f64::INFINITY,
+                            samples: 0,
+                            last_sample_us: 0,
+                            window_start_us: None,
+                            windows: 0,
+                        });
+                        test.rate_bps = test.rate_bps.min(reduced);
+                    }
                 }
                 // Only a queue brake measures the bottleneck: its fresh,
                 // backlogged delivery is the drain rate. A positive shortfall
@@ -2929,6 +3286,12 @@ impl PathController {
             // credit. A new control tick cannot reuse a previous clear reply.
             self.last_growth_probe = Some(observation.probe_sample_id);
         }
+        if self.queue_gated_loss_enabled
+            && self.test_clear_queue_loss(now, loss_batch, loss_hold, rtt)
+            && self.rate_bps < previous_rate
+        {
+            rate_reason = RateReason::LossTestBrake;
+        }
         self.rate_bps = self.rate_bps.min(self.maximum_bps).max(1);
         if ordinary_growth
             && self.rate_bps > previous_rate
@@ -2937,6 +3300,21 @@ impl PathController {
         {
             rejected.baseline_bps = self.rate_bps;
             rejected.increment_bps = (self.rate_bps - previous_rate).saturating_mul(2);
+        }
+        if self.fast_recovery_enabled
+            && self.congestion_seen
+            && ordinary_growth
+            && self.rate_bps > previous_rate
+            && self.queue_delay_ms <= self.target_ms * 0.25
+            && self.congestion_delivery_bps.is_some_and(|braked| {
+                self.rate_bps as f64 >= braked * CONGESTION_EXPIRY_GAIN
+                    && self.latest_delivery_bps.is_some_and(|rate| {
+                        rate * self.wire_per_symbol >= braked * CONGESTION_EXPIRY_DELIVERY
+                    })
+            })
+        {
+            self.congestion_seen = false;
+            self.congestion_delivery_bps = None;
         }
         self.record_rate_change(now, previous_rate, rate_reason);
         if ordinary_growth
@@ -2961,8 +3339,136 @@ impl PathController {
             .min(super::outbound::pacing_burst_bytes(self.rate_bps, 2400));
     }
 
+    /// Held clear-queue loss beyond the path's random loss starts one test.
+    /// The pace first holds, so the reports describe it, then brakes to
+    /// `LOSS_TEST_SCALE`. Delivery that holds at the lower pace shows the
+    /// path's own drops and caps the pace below where they appeared; delivery
+    /// that falls with the pace shows random loss, which is forgiven. No test
+    /// runs while the session tests loss most paths share. Returns whether
+    /// this observation lowered the pace.
+    fn test_clear_queue_loss(
+        &mut self,
+        now: u64,
+        batch: Option<(u64, u64)>,
+        loss_hold: bool,
+        rtt_ms: Option<f64>,
+    ) -> bool {
+        if let Some((ceiling, until)) = self.loss_ceiling
+            && now >= until
+        {
+            self.loss_ceiling = (self.rate_bps >= ceiling).then(|| {
+                (
+                    (ceiling as f64 * LOSS_CEILING_STEP) as u64,
+                    now + LOSS_CEILING_STEP_US,
+                )
+            });
+        }
+        self.random_loss = self
+            .random_loss
+            .filter(|(_, at)| now.saturating_sub(*at) < RANDOM_LOSS_US);
+        let random = self.random_loss.map_or(0.0, |(loss, _)| loss);
+        let excessive = |loss: f64| loss > random * 1.5 + LOSS_TEST_EXCESS;
+        // Receiver reports finalize loss after the data's own RTT.
+        let settle_us = rtt_ms
+            .map_or(PROBE_US, |ms| (ms * 3000.0) as u64)
+            .max(300_000);
+        let measure_us = rtt_ms
+            .map_or(PROBE_US, |ms| (ms * 2000.0) as u64)
+            .max(200_000);
+        let before = self.rate_bps;
+        if self.shared_loss && self.loss_test.take().is_some() {
+            self.loss_tested_us = now;
+        }
+        if let Some(test) = self.loss_test.as_mut() {
+            if now >= test.measure_from_us
+                && let Some((expected, lost)) = batch
+            {
+                test.counts.0 += expected;
+                test.counts.1 += lost;
+            }
+            let (expected, lost) = test.counts;
+            let tested_bps = (test.from_bps as f64 * LOSS_TEST_SCALE) as u64;
+            let measured = expected >= LOSS_TEST_SYMBOLS
+                && now.saturating_sub(test.measure_from_us) >= measure_us;
+            let loss = lost as f64 / expected.max(1) as f64;
+            match (measured, test.held_loss) {
+                (true, None) if excessive(loss) => {
+                    test.held_loss = Some(loss);
+                    test.started_us = now;
+                    test.measure_from_us = now + settle_us;
+                    test.counts = (0, 0);
+                    self.rate_bps = self.rate_bps.min(tested_bps);
+                }
+                (true, held) => {
+                    let test = self.loss_test.take().expect("loss test");
+                    self.loss_tested_us = now;
+                    if let Some(held) = held {
+                        self.last_loss_test = Some((test.from_bps, held, loss));
+                        let overrun = (1.0 - (1.0 - held) / LOSS_TEST_SCALE).max(0.0);
+                        let between = (loss - overrun) / (held - overrun).max(1e-6);
+                        if between <= LOSS_TEST_OWN {
+                            self.loss_ceiling = Some(if excessive(loss) {
+                                // Still too many drops: stay at the tested
+                                // pace; the next test goes lower.
+                                (tested_bps, now + LOSS_CEILING_US)
+                            } else {
+                                ((test.from_bps as f64 * 0.9) as u64, now + LOSS_CEILING_US)
+                            });
+                        } else if between >= LOSS_TEST_RANDOM
+                            && loss <= held * 1.2 + LOSS_TEST_EXCESS
+                        {
+                            // The same fraction of a lower pace: the path's loss.
+                            self.random_loss = Some((loss.min(held), now));
+                        }
+                        // Otherwise, or with more loss under the brake, other
+                        // traffic moved the result: no verdict.
+                    }
+                }
+                (false, _) if now.saturating_sub(test.started_us) >= LOSS_TEST_US => {
+                    self.loss_test = None;
+                    self.loss_tested_us = now;
+                }
+                (false, held) => {
+                    let pace = if held.is_some() {
+                        tested_bps
+                    } else {
+                        test.from_bps
+                    };
+                    self.rate_bps = self.rate_bps.min(pace);
+                }
+            }
+        } else if loss_hold
+            && !self.shared_loss
+            && self.rate_bps >= LOSS_TEST_MIN_BPS
+            && batch.is_some()
+            && self
+                .loss_evidence
+                .batches
+                .front()
+                .is_some_and(|(at, _, _)| *at > self.loss_tested_us)
+        {
+            let (expected, lost) = self.loss_evidence.counts();
+            if self.loss_evidence.batches.len() >= 2
+                && expected >= 128
+                && excessive(lost as f64 / expected as f64)
+            {
+                self.loss_test = Some(LossTest {
+                    from_bps: self.rate_bps,
+                    held_loss: None,
+                    started_us: now,
+                    measure_from_us: now + settle_us,
+                    counts: (0, 0),
+                });
+            }
+        }
+        if let Some((ceiling, _)) = self.loss_ceiling {
+            self.rate_bps = self.rate_bps.min(ceiling.max(MIN_BPS));
+        }
+        self.rate_bps < before
+    }
+
     /// 3% per step, doubled for each consecutive clean monitored increase up
-    /// to 24%. The RTT headroom gain limit still applies to the result.
+    /// to 48%. The RTT headroom gain limit still applies to the result.
     fn cautious_gain(&self) -> f64 {
         let streak = if self.fast_recovery_enabled {
             self.clean_growth_streak
@@ -3068,11 +3574,24 @@ impl PathController {
         (young && fast_opportunity) || service_request || phase_repair || monitor_request
     }
 
-    pub fn decision(&self, now_us: u64) -> Decision {
-        let stale = now_us.saturating_sub(self.born_us) >= FRESH_US
+    fn stale(&self, now_us: u64) -> bool {
+        now_us.saturating_sub(self.born_us) >= FRESH_US
             && self
                 .last_evidence_us
-                .is_none_or(|time| now_us.saturating_sub(time) > FRESH_US);
+                .is_none_or(|time| now_us.saturating_sub(time) > FRESH_US)
+    }
+
+    /// Admission checks do not need scheduling weights or diagnostic counters.
+    pub(crate) fn eligible(&self, now_us: u64) -> bool {
+        self.eligible && !self.stale(now_us)
+    }
+
+    pub(crate) fn pacing_bps(&self) -> u64 {
+        self.rate_bps
+    }
+
+    pub fn decision(&self, now_us: u64) -> Decision {
+        let stale = self.stale(now_us);
         let weight_loss = self.weight_loss.and_then(|sample| {
             let age = sample
                 .age_us
@@ -3250,6 +3769,7 @@ impl PathController {
     pub fn snapshot(&self, now_us: u64) -> Snapshot {
         Snapshot {
             native_service_recoveries: self.native_service_recoveries,
+            baseline_refreshes: self.baseline_refreshes,
             decision: self.decision(now_us),
             reprobe: self.reprobe.snapshot(),
             probe_service: self.probe_service.reference(now_us),
@@ -3264,7 +3784,7 @@ impl PathController {
 
     pub fn allow(&mut self, now_us: u64, bytes: usize, queue_age_ms: f64) -> bool {
         self.refill(now_us);
-        self.decision(now_us).eligible
+        self.eligible(now_us)
             && queue_age_ms.is_finite()
             && queue_age_ms >= 0.0
             && queue_age_ms <= self.target_ms
@@ -3380,6 +3900,265 @@ impl PathController {
 
     pub fn reprobe_active(&self) -> bool {
         self.reprobe.active()
+    }
+
+    /// After a queue brake, wait one RTT for the lower pace to reach the path
+    /// and long enough to drain the excess it measured, then compare two
+    /// halves of a further window. An excess that stayed elevated and stable
+    /// is not a queue this sender can drain. Returns that excess.
+    fn standing_delay(
+        &mut self,
+        now: u64,
+        rtt_ms: f64,
+        excess_ms: f64,
+        new_sample: bool,
+        observation: &Observation,
+    ) -> Option<(f64, u64)> {
+        let test = self.standing_delay.as_mut()?;
+        if self.rate_bps > test.rate_bps
+            || observation.transport_blocked
+            || excess_ms <= self.target_ms * 0.25
+        {
+            self.standing_delay = None;
+            return None;
+        }
+        test.rate_bps = self.rate_bps;
+        let rtt_us = (rtt_ms * 1000.0) as u64;
+        let settled = test
+            .window_start_us
+            .unwrap_or(test.braked_us + 2 * rtt_us + 400_000);
+        let window = (2 * rtt_us).max(400_000);
+        // Only RTT of traffic delivered at the lower pace counts, and the
+        // evidence must be continuous: a fresh reply after a pause cannot
+        // complete a window measured before it.
+        let delivered_since_brake = observation.positive_delivery_age_us.is_some_and(|age| {
+            age <= window / 2 && now.checked_sub(age).is_some_and(|at| at > test.braked_us)
+        });
+        if !new_sample || observation.send_queue_bytes > 2400 || !delivered_since_brake {
+            return None;
+        }
+        if now < settled {
+            return None;
+        }
+        if test.samples > 0 && now.saturating_sub(test.last_sample_us) > window / 2 {
+            self.standing_delay = None;
+            return None;
+        }
+        test.last_sample_us = now;
+        if now < settled + window / 2 {
+            test.early_ms = test.early_ms.min(excess_ms);
+        } else {
+            test.late_ms = test.late_ms.min(excess_ms);
+        }
+        test.samples += 1;
+        if now < settled + window || test.samples < 4 || !test.early_ms.is_finite() {
+            return None;
+        }
+        let floor = test.early_ms.min(test.late_ms);
+        // A draining queue falls and a growing one rises; neither is stable.
+        // The half minima tolerate jitter, so the current sample must also
+        // sit near the floor: a queue rising now is not propagation.
+        if floor >= self.target_ms * 0.5
+            && (test.late_ms - test.early_ms).abs() <= (floor * 0.1).clamp(1.0, 5.0)
+            && excess_ms - floor <= (floor * 0.25).max(5.0)
+        {
+            let pace_before = test.pace_before_bps;
+            self.standing_delay = None;
+            return Some((floor, pace_before));
+        }
+        // One unstable window, often a jitter spike, measures again from
+        // now instead of forgetting the pace before the episode's brake.
+        test.windows += 1;
+        if test.windows >= 3 {
+            self.standing_delay = None;
+        } else {
+            test.window_start_us = Some(now);
+            test.early_ms = f64::INFINITY;
+            test.late_ms = f64::INFINITY;
+            test.samples = 0;
+        }
+        None
+    }
+
+    /// A light pace cannot hold a queue at a bottleneck that still serves it,
+    /// so an excess that stays level across a window paced lightly throughout
+    /// is propagation or cross traffic this path cannot drain: a route that
+    /// lengthened after the minimum was sampled, or one that wanders. Without
+    /// this, an excess between the growth gate and the brake keeps a path at
+    /// the floor, and loss is never attributed to a clear queue. A queue that
+    /// this pace still fills rises, and one draining falls; neither is level,
+    /// and the deciding sample must agree too. Evidence must be continuous;
+    /// an underfilled window is discarded so later traffic can retry.
+    fn light_baseline(
+        &mut self,
+        now: u64,
+        rtt_ms: f64,
+        excess_ms: f64,
+        new_sample: bool,
+        observation: &Observation,
+    ) -> Option<f64> {
+        if !self.fast_recovery_enabled
+            || self.rate_bps > LIGHT_BPS
+            || observation.transport_blocked
+            || observation.send_queue_bytes > 2400
+            || self.standing_delay.is_some()
+        {
+            self.light_baseline = None;
+            return None;
+        }
+        if !new_sample {
+            return None;
+        }
+        if self
+            .light_baseline
+            .is_some_and(|test| now.saturating_sub(test.last_sample_us) > test.window_us / 2)
+        {
+            self.light_baseline = None;
+        }
+        let window = ((4.0 * rtt_ms * 1000.0) as u64).max(LIGHT_WINDOW_US);
+        let test = self.light_baseline.get_or_insert(LightBaseline {
+            started_us: now,
+            window_us: window,
+            last_sample_us: now,
+            early_ms: f64::INFINITY,
+            late_ms: f64::INFINITY,
+            early_samples: 0,
+            late_samples: 0,
+        });
+        let window = test.window_us;
+        test.last_sample_us = now;
+        if now.saturating_sub(test.started_us) < window / 2 {
+            test.early_ms = test.early_ms.min(excess_ms);
+            test.early_samples += 1;
+        } else {
+            test.late_ms = test.late_ms.min(excess_ms);
+            test.late_samples += 1;
+        }
+        if now.saturating_sub(test.started_us) < window {
+            return None;
+        }
+        let test = self.light_baseline.take()?;
+        let floor = test.early_ms.min(test.late_ms);
+        (test.early_samples >= 4
+            && test.late_samples >= 4
+            && floor > (self.target_ms * 0.05).max(2.0)
+            && (test.late_ms - test.early_ms).abs() <= (floor * 0.1).clamp(1.0, 5.0)
+            && excess_ms - floor <= (floor * 0.25).clamp(2.0, 5.0))
+        .then_some(floor)
+    }
+
+    /// A light pace cannot hold a queue at a bottleneck that still serves it,
+    /// so once the path has been paced lightly long enough to drain an earlier
+    /// queue, and its excess has fallen below the brake threshold since (a
+    /// queue left by a heavier pace or a capacity drop drains without
+    /// wandering back), its RTT excess is wander: cross traffic or route jitter that
+    /// braking cannot reduce. A level excess is a baseline (`light_baseline`);
+    /// one that moves is not, and without a discount every rise past the brake
+    /// threshold keeps a wandering path at the floor, where braking buys no
+    /// latency. The discount is the upper decile of recent light samples, so
+    /// the latency target still bounds the queue this path adds on top of most
+    /// of its wander; a lower quantile undercounts it, because a light pace
+    /// takes few RTT samples and its smoothed RTT follows the wander less.
+    /// Up to `LIGHT_BPS`, a pace whose delivery keeps up with its admission
+    /// also learns, each sample capped at one target. A heavier pace holds the
+    /// discount, decaying, because its excess includes its own queue. Returns
+    /// the discount now in force.
+    fn observe_wander(
+        &mut self,
+        now: u64,
+        rtt_ms: f64,
+        excess_ms: f64,
+        new_sample: bool,
+        observation: &Observation,
+    ) -> f64 {
+        let start_pace = self.rate_bps <= WANDER_BPS;
+        let served = self.rate_bps <= LIGHT_BPS
+            && self.service_window.latest(now).is_some_and(|sample| {
+                now.saturating_sub(sample.observed_us) <= LIGHT_WINDOW_US
+                    && sample.admission.is_some_and(|admission| {
+                        admission.bps > 0.0 && sample.bps >= admission.bps * WANDER_KEEP_UP
+                    })
+            });
+        let light = (start_pace || served)
+            && !observation.transport_blocked
+            && observation.send_queue_bytes <= 2400;
+        if !light {
+            self.light_since_us = None;
+            self.light_drained = false;
+        }
+        let since = light.then(|| *self.light_since_us.get_or_insert(now));
+        self.light_drained |= light && new_sample && excess_ms <= self.target_ms * 0.5;
+        let settle = ((2.0 * rtt_ms * 1000.0) as u64).max(400_000);
+        for samples in [&mut self.wander_samples, &mut self.served_wander_samples] {
+            while samples
+                .front()
+                .is_some_and(|(at, _)| now.saturating_sub(*at) > WANDER_WINDOW_US)
+            {
+                samples.pop_front();
+            }
+        }
+        if new_sample
+            && self.light_drained
+            && since.is_some_and(|since| now.saturating_sub(since) >= settle)
+        {
+            let (samples, sample) = if start_pace {
+                (&mut self.wander_samples, excess_ms.max(0.0))
+            } else {
+                (
+                    &mut self.served_wander_samples,
+                    excess_ms.clamp(0.0, self.target_ms),
+                )
+            };
+            if samples.len() == WANDER_CAPACITY {
+                samples.pop_front();
+            }
+            samples.push_back((now, sample));
+            let decile = |samples: &VecDeque<(u64, f64)>| {
+                (samples.len() >= WANDER_SAMPLES).then(|| {
+                    let mut excess: Vec<f64> = samples.iter().map(|(_, ms)| *ms).collect();
+                    excess.sort_by(f64::total_cmp);
+                    let rank = ((excess.len() as f64 * WANDER_QUANTILE).ceil() as usize).max(1);
+                    excess[rank - 1]
+                })
+            };
+            let start =
+                decile(&self.wander_samples).map(|ms| ms.min(self.target_ms * WANDER_TARGETS));
+            let wander = start
+                .into_iter()
+                .chain(decile(&self.served_wander_samples))
+                .reduce(f64::max);
+            if let Some(wander) = wander {
+                self.wander_ms = wander;
+                self.wander_us = now;
+            }
+        }
+        let halvings = now.saturating_sub(self.wander_us) as f64 / WANDER_HALF_LIFE_US as f64;
+        self.wander_ms * 0.5_f64.powf(halvings)
+    }
+
+    /// Raise every queue reference by an excess that braking did not drain.
+    fn refresh_baseline(&mut self, shift_ms: f64) {
+        self.wander_ms = (self.wander_ms - shift_ms).max(0.0);
+        for (_, excess) in self
+            .wander_samples
+            .iter_mut()
+            .chain(self.served_wander_samples.iter_mut())
+        {
+            *excess = (*excess - shift_ms).max(0.0);
+        }
+        for minimum in [
+            &mut self.min_rtt_ms,
+            &mut self.source_local_min_rtt_ms,
+            &mut self.source_probe_min_rtt_ms,
+            &mut self.fast_probe_min_rtt_ms,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            *minimum += shift_ms;
+        }
+        self.startup_probe_pressure = None;
+        self.baseline_refreshes += 1;
     }
 
     fn record_brake(&mut self, observation: &Observation) {
@@ -4477,6 +5256,8 @@ mod tests {
                 (now - 800_000, 0.16),
                 (now - 600_000, 0.155),
             ]),
+            clear_us: now,
+            observed_us: Some(now),
         };
         // 15% of the new finalized interval and 81% of admitted symbol bytes.
         sample.finalized_lost = Some(353);
@@ -4559,6 +5340,35 @@ mod tests {
     }
 
     #[test]
+    fn a_queue_cannot_age_out_the_clear_queue_loss_floor() {
+        let mut floor = LossFloor::default();
+        floor.observe(0, Some((0, 0)), true);
+        for index in 1..=3u64 {
+            let (expected, lost) = floor.previous.unwrap();
+            floor.observe(index * 100_000, Some((expected + 512, lost + 51)), true);
+        }
+        assert_eq!(floor.median(), 51.0 / 512.0);
+        // A long queued stretch neither measures nor erases the floor.
+        for second in 1..=30u64 {
+            let (expected, lost) = floor.previous.unwrap();
+            floor.observe(
+                300_000 + second * 1_000_000,
+                Some((expected + 512, lost + 200)),
+                false,
+            );
+        }
+        assert_eq!(floor.median(), 51.0 / 512.0);
+        // Clear-queue time still retires it.
+        let (expected, lost) = floor.previous.unwrap();
+        floor.observe(
+            30_300_000 + LOSS_FLOOR_AGE_US + 1,
+            Some((expected, lost)),
+            true,
+        );
+        assert_eq!(floor.median(), 0.0);
+    }
+
+    #[test]
     fn random_loss_service_is_inert_when_disabled_and_survives_generations() {
         let (mut controller, sample) = random_loss_fixture(false);
         assert!(controller.compensate_delivery(&sample).is_none());
@@ -4574,9 +5384,125 @@ mod tests {
         // Loss beyond the learned floor: random-loss service alone still brakes.
         let (mut controller, mut sample) = random_loss_fixture(true);
         controller.queue_gated_loss_enabled = true;
+        // A test already found this loss unchanged at a lower pace.
+        controller.random_loss = Some((0.1, sample.now_us));
         sample.delivered_bytes = 3_420_000;
         sample.delivered_bps = Some(6_700_000.0);
         (controller, sample)
+    }
+
+    #[test]
+    fn shared_random_loss_avoids_a_duplicate_test_but_extra_loss_still_tests() {
+        let mut c = PathController::new(1_000_000_000, 20).with_queue_gated_loss(true);
+        c.generation = Some(7);
+        c.rate_bps = 100_000_000;
+        let now = 10_000_000;
+        c.inherit_random_loss(7, 0.11, now);
+        c.loss_evidence.batches = VecDeque::from([(now - 100_000, 1_000, 110), (now, 1_000, 110)]);
+        c.test_clear_queue_loss(now, Some((1_000, 110)), true, Some(100.0));
+        assert!(c.loss_test.is_none());
+        assert_eq!(c.rate_bps, 100_000_000);
+        c.loss_evidence.batches =
+            VecDeque::from([(now + 100_000, 1_000, 300), (now + 200_000, 1_000, 300)]);
+        c.test_clear_queue_loss(now + 200_000, Some((1_000, 300)), true, Some(100.0));
+        assert!(c.loss_test.is_some(), "new excess is still investigated");
+    }
+
+    #[test]
+    fn shared_random_loss_expires_and_cannot_cross_generation_or_legacy_mode() {
+        let mut c = PathController::new(1_000_000_000, 20).with_queue_gated_loss(true);
+        c.generation = Some(7);
+        c.inherit_random_loss(8, 0.11, 1_000_000);
+        assert!(c.random_loss.is_none());
+        c.inherit_random_loss(7, 0.11, 1_000_000);
+        assert_eq!(c.random_loss, Some((0.11, 1_000_000)));
+        c.test_clear_queue_loss(1_000_000 + RANDOM_LOSS_US, None, true, Some(100.0));
+        assert!(c.random_loss.is_none());
+        c.queue_gated_loss_enabled = false;
+        c.inherit_random_loss(7, 0.11, 40_000_000);
+        assert!(c.random_loss.is_none());
+        let (mut active, mut sample) = queue_gated_fixture();
+        active.inherit_random_loss(sample.generation, 0.11, sample.now_us);
+        sample.generation += 1;
+        active.observe(&sample);
+        assert!(
+            active.random_loss.is_none(),
+            "a new generation discards the cache"
+        );
+    }
+
+    #[test]
+    fn clear_queue_loss_that_falls_with_the_pace_caps_it_and_random_loss_is_forgiven() {
+        let tested = |held: u64, after: (u64, u64)| {
+            let mut controller = PathController::new(1_000_000_000, 20).with_queue_gated_loss(true);
+            controller.rate_bps = 100_000_000;
+            let now = 10_000_000;
+            let rtt = Some(100.0);
+            controller.loss_evidence.batches =
+                VecDeque::from([(now - 100_000, 1_000, held), (now, 1_000, held)]);
+            // The pace holds until reports describe it.
+            assert!(!controller.test_clear_queue_loss(now, Some((1_000, held)), true, rtt));
+            controller.rate_bps = 120_000_000;
+            controller.test_clear_queue_loss(now + 300_000, Some((1_000, held)), true, rtt);
+            assert_eq!(controller.rate_bps, 100_000_000);
+            assert!(controller.test_clear_queue_loss(now + 500_000, Some((0, 0)), true, rtt));
+            assert_eq!(controller.rate_bps, 75_000_000);
+            // The brake has not reached the receiver yet.
+            controller.rate_bps = 100_000_000;
+            controller.test_clear_queue_loss(now + 600_000, Some((1_000, held)), true, rtt);
+            assert_eq!(controller.rate_bps, 75_000_000);
+            controller.test_clear_queue_loss(now + 800_000, Some(after), true, rtt);
+            assert!(
+                controller.loss_test.is_some(),
+                "two RTTs of reports at the tested pace"
+            );
+            controller.test_clear_queue_loss(now + 1_000_000, Some((0, 0)), true, rtt);
+            assert!(controller.loss_test.is_none());
+            controller.rate_bps = 200_000_000;
+            controller.test_clear_queue_loss(now + 1_100_000, None, true, rtt);
+            controller
+        };
+        let policed = tested(50, (600, 3));
+        assert_eq!(
+            policed.rate_bps, 90_000_000,
+            "capped below the dropping pace"
+        );
+        assert!(policed.random_loss.is_none());
+        // 60% held: an overrun that keeps its delivery loses 47% at 3/4.
+        let reduced = tested(600, (600, 300));
+        assert_eq!(reduced.rate_bps, 75_000_000, "fewer but still excess drops");
+        assert!(reduced.random_loss.is_none());
+        let high_random = tested(600, (600, 340));
+        assert_eq!(
+            high_random.random_loss.map(|(loss, _)| loss),
+            Some(340.0 / 600.0)
+        );
+        // Much more loss at a lower pace: something else moved; no verdict.
+        let moved = tested(200, (600, 330));
+        assert_eq!(moved.rate_bps, 200_000_000);
+        assert!(moved.random_loss.is_none() && moved.loss_ceiling.is_none());
+        let random = tested(50, (600, 30));
+        assert_eq!(random.rate_bps, 200_000_000);
+        assert_eq!(random.random_loss.map(|(loss, _)| loss), Some(0.05));
+        // The same loss later does not test again.
+        let mut random = random;
+        let now = 12_000_000;
+        random.loss_evidence.batches =
+            VecDeque::from([(now - 100_000, 1_000, 50), (now, 1_000, 50)]);
+        random.test_clear_queue_loss(now, Some((1_000, 50)), true, Some(100.0));
+        assert!(random.loss_test.is_none());
+
+        // A held pace whose reports show tolerable loss is not braked.
+        let mut controller = PathController::new(1_000_000_000, 20).with_queue_gated_loss(true);
+        controller.rate_bps = 100_000_000;
+        let now = 10_000_000;
+        controller.loss_evidence.batches =
+            VecDeque::from([(now - 100_000, 1_000, 50), (now, 1_000, 50)]);
+        controller.test_clear_queue_loss(now, Some((1_000, 50)), true, Some(100.0));
+        controller.test_clear_queue_loss(now + 300_000, Some((1_000, 5)), true, Some(100.0));
+        assert!(!controller.test_clear_queue_loss(now + 500_000, Some((0, 0)), true, Some(100.0)));
+        assert!(controller.loss_test.is_none());
+        assert_eq!(controller.rate_bps, 100_000_000);
     }
 
     #[test]
@@ -4810,6 +5736,33 @@ mod tests {
         assert!(!controller.allow(1_000, 1, 0.0));
         assert!(controller.allow(1_001, 50, 0.0));
         assert!(!controller.allow(1_001, 51, 0.0));
+    }
+
+    #[test]
+    fn path_pacing_keeps_the_rate_when_a_one_ms_timer_wakes_slightly_late() {
+        const COST: usize = 1135;
+        for rate in [80_000_000, 8_000_000, 20_000_000, 400_000_000] {
+            for cadence in [1000, 1100, 1200, 1500, 2000] {
+                let mut controller = PathController::new(rate, 20);
+                controller.rate_bps = rate;
+                // The measured window starts after startup credit is spent.
+                controller.tokens = 0.0;
+                let mut admitted = 0u64;
+                for tick in 1..=100 {
+                    let now = tick * cadence;
+                    while controller.allow(now, COST, 0.0) {
+                        controller.admitted(now, COST);
+                        admitted += COST as u64;
+                    }
+                }
+                let earned = rate * (100 * cadence) / 8_000_000;
+                assert!(
+                    admitted >= earned * 95 / 100,
+                    "rate={rate}, cadence={cadence}: {admitted}/{earned}"
+                );
+                assert!(admitted <= earned);
+            }
+        }
     }
 
     fn observation(now_us: u64, rtt_ms: f64) -> Observation {
@@ -6344,7 +7297,7 @@ mod tests {
         assert_eq!(controller.clean_growth_streak, 1);
         assert!((controller.cautious_gain() - 1.06).abs() < 1e-12);
         controller.clean_growth_streak = CLEAN_GROWTH_STREAK_MAX;
-        assert!((controller.cautious_gain() - 1.24).abs() < 1e-12);
+        assert!((controller.cautious_gain() - 1.48).abs() < 1e-12);
         controller.fast_recovery_enabled = false;
         assert_eq!(controller.cautious_gain(), 1.03, "legacy keeps 3%");
 
@@ -7525,6 +8478,13 @@ mod tests {
         /// The transport admits only half of each allowance through step 6.
         TransportLimited,
         TransportLimitedLegacy,
+        /// As `TransportLimited`, but the backlog begins just before the brake
+        /// report, after the interval it pairs with.
+        TransportLimitedLateBacklog,
+        TransportLimitedLateBacklogExercised,
+        /// As `TransportLimitedLateBacklog`, with the queue already observed
+        /// during that interval.
+        TransportLimitedLateBacklogQueued,
         /// Business exercised the allowance, but the queue is empty at the brake sample.
         SampledEmpty,
     }
@@ -7543,7 +8503,17 @@ mod tests {
         let standing_queue = variant == DrainVariant::StandingQueue;
         let limited = matches!(
             variant,
-            DrainVariant::TransportLimited | DrainVariant::TransportLimitedLegacy
+            DrainVariant::TransportLimited
+                | DrainVariant::TransportLimitedLegacy
+                | DrainVariant::TransportLimitedLateBacklog
+                | DrainVariant::TransportLimitedLateBacklogExercised
+                | DrainVariant::TransportLimitedLateBacklogQueued
+        );
+        let late_backlog = matches!(
+            variant,
+            DrainVariant::TransportLimitedLateBacklog
+                | DrainVariant::TransportLimitedLateBacklogExercised
+                | DrainVariant::TransportLimitedLateBacklogQueued
         );
         let (warmup_us, report_delay_us) = timing;
         let mut controller = PathController::new(start_bps * 4, 20);
@@ -7668,6 +8638,15 @@ mod tests {
             }
             if variant == DrainVariant::SampledEmpty && step == 6 {
                 sample.offered_backlog = false;
+            }
+            if late_backlog && step == 6 {
+                controller.backlog_since_us = Some(now - 10_000);
+                if variant == DrainVariant::TransportLimitedLateBacklogExercised {
+                    controller.pressure_episode_exercised = Some(true);
+                }
+                if variant == DrainVariant::TransportLimitedLateBacklogQueued {
+                    controller.delay_since_us = Some(start_us + 400_000);
+                }
             }
             controller.observe(&sample);
             // The standing queue brakes only once a paired interval shows the
@@ -7927,6 +8906,98 @@ mod tests {
         next.probe_rtt_ms = Some(98.0);
         next.probe_latest_rtt_ms = Some(98.0);
         (controller, next)
+    }
+
+    #[test]
+    fn native_startup_uses_current_rtt_to_brake_before_busy_service_is_measurable() {
+        for legacy in [false, true] {
+            let mut controller = PathController::new(400_000_000, 20).with_legacy_recovery(legacy);
+            let mut sample = short_observation_022(0, 20.0);
+            sample.offered_backlog = false;
+            sample.delivered_bytes = 0;
+            sample.admitted_symbols = Some(0);
+            sample.admitted_symbol_bytes = Some(0);
+            controller.observe_native(&sample, None, 240_000, 20_000);
+            for step in 1..=10 {
+                let now = step * 100_000;
+                controller.admitted_symbol(now, 1000, 1000);
+                sample = short_observation_022(now, 20.0);
+                sample.offered_backlog = false;
+                sample.admitted_symbols = Some(step);
+                sample.admitted_symbol_bytes = Some(step * 1000);
+                sample.delivered_bytes = step * 1000;
+                controller.observe_native(&sample, None, 240_000, 20_000);
+            }
+            let remembered = controller.remembered_bps;
+            controller.admitted_symbol(1_100_000, 40_000, 40_000);
+            sample = short_observation_022(1_100_000, 45.0);
+            sample.rtt_ms = 45.0;
+            sample.probe_age_us = None;
+            sample.probe_rtt_ms = None;
+            sample.probe_latest_rtt_ms = None;
+            sample.admitted_symbols = Some(50);
+            sample.admitted_symbol_bytes = Some(50_000);
+            sample.delivered_bytes = 30_000;
+            // BBR has already expanded its window, but no complete busy receiver
+            // interval exists. Reuse the original native window with today's RTT.
+            controller.observe_native(&sample, None, 1_000_000, 45_000);
+            if legacy {
+                assert_eq!(controller.last_brake_us, None);
+                assert_eq!(controller.rate_bps, 96_000_000);
+                continue;
+            }
+            assert_eq!(controller.last_brake_us, Some(1_100_000));
+            assert!(controller.rate_bps <= 240_000 * 8_000_000 / 45_000);
+            assert_eq!(
+                controller.last_control.queue_brake_symbol_delivery_bps,
+                None
+            );
+            assert_eq!(controller.remembered_bps, remembered);
+        }
+    }
+
+    #[test]
+    fn busy_queue_sample_brakes_an_unexercised_native_startup_allowance() {
+        let mut controller = PathController::new(400_000_000, 20);
+        let mut admitted = 0;
+        let mut received = 0;
+        let mut remembered = 0.0;
+        for step in 0..=12 {
+            let now = step * 100_000;
+            let busy = step >= 10;
+            let sent = if step > 10 { 400_000 } else { 1000 };
+            controller.admitted_symbol(now, sent, sent);
+            admitted += sent as u64;
+            received += if step > 10 { 250_000 } else { 1000 };
+            let mut sample = short_observation_022(now, 20.0);
+            sample.offered_backlog = busy;
+            sample.delivered_bytes = received;
+            sample.admitted_symbol_bytes = Some(admitted);
+            sample.admitted_symbols = Some(admitted / 1000);
+            sample.delivered_bps = Some(if step > 10 { 20_000_000.0 } else { 80_000.0 });
+            if step == 12 {
+                remembered = controller.remembered_bps;
+                sample.rtt_ms = 110.0;
+                sample.probe_rtt_ms = Some(110.0);
+                sample.probe_latest_rtt_ms = Some(110.0);
+            }
+            controller.observe_native(&sample, None, 240_000, 20_000);
+        }
+        assert_eq!(controller.last_brake_us, Some(1_200_000));
+        assert_eq!(controller.pressure_episode_exercised, Some(false));
+        assert_eq!(
+            controller.last_control.queue_brake_symbol_delivery_bps,
+            Some(20_000_000.0),
+            "the fresh busy interval measured service independently of startup allowance"
+        );
+        assert!(
+            controller.rate_bps < 20_000_000,
+            "drain the measured queue immediately instead of reducing 96 Mbit/s by only 20%"
+        );
+        assert_eq!(
+            controller.remembered_bps, remembered,
+            "short samples grant no capacity memory"
+        );
     }
 
     #[test]
@@ -8684,7 +9755,12 @@ mod tests {
             .expect("retain measured queue-brake service");
         let before = controller.rate_bps;
         assert_eq!(target.braked_us, 700_000);
-        assert!(target.target_bps > before && target.target_bps <= 900_000);
+        assert!(
+            target.target_bps > before && target.target_bps <= 900_000,
+            "before={before}, target={} changes={}",
+            target.target_bps,
+            serde_json::to_string(&controller.rate_changes).unwrap()
+        );
         controller.observe(&sample);
         assert!(matches!(
             controller.rate_changes.back().unwrap().reason,
@@ -8710,7 +9786,12 @@ mod tests {
         let target = controller.drain_return.unwrap();
         assert_eq!(target.braked_us, 1_000_000);
         let before = controller.rate_bps;
-        assert!(target.target_bps > before && target.target_bps <= 900_000);
+        assert!(
+            target.target_bps > before && target.target_bps <= 900_000,
+            "before={before}, target={} changes={}",
+            target.target_bps,
+            serde_json::to_string(&controller.rate_changes).unwrap()
+        );
         controller.observe(&sample);
         let returned = controller.rate_changes.back().unwrap();
         assert!(matches!(returned.reason, RateReason::DrainReturn));
@@ -8748,6 +9829,19 @@ mod tests {
         assert_eq!(brake(DrainVariant::TransportLimitedLegacy), 750_000);
         // The collapsed fresh delivery, drained at the large-queue fraction.
         assert_eq!(brake(DrainVariant::TransportLimited), 94_000);
+        // An interval before both the backlog and the queue measured the
+        // application: an ordinary 20% brake, not a cut to its delivery.
+        assert_eq!(brake(DrainVariant::TransportLimitedLateBacklog), 750_000);
+        assert_eq!(
+            brake(DrainVariant::TransportLimitedLateBacklogExercised),
+            750_000
+        );
+        // A queue during that interval shows the bottleneck although the
+        // backlog began later, as at startup.
+        assert_eq!(
+            brake(DrainVariant::TransportLimitedLateBacklogQueued),
+            94_000
+        );
     }
 
     #[test]
@@ -9403,6 +10497,8 @@ mod tests {
                 10_000
             } else if mode == "zero" || sparse || inactive {
                 0
+            } else if mode == "lossy_active" {
+                7_000
             } else {
                 1_000
             };
@@ -9421,7 +10517,7 @@ mod tests {
             sample.positive_delivery_age_us = Some(if delivered == 0 { now - 500_000 } else { 0 });
             sample.offered_backlog = mode != "idle"
                 && !(mode == "interrupted" && (6..=7).contains(&step))
-                && !(mode == "empty_active" && step % 2 == 0);
+                && !(matches!(mode, "empty_active" | "lossy_active") && step % 2 == 0);
             if step == 10 {
                 controller.draining_bps = Some((5_000_000.0, now - 100_000));
             }
@@ -9479,6 +10575,18 @@ mod tests {
                 .unwrap()
                 .deficit
         );
+    }
+
+    #[test]
+    fn random_loss_on_application_limited_traffic_is_not_a_service_deficit() {
+        // The same intermittent demand as above, but 70% of the admitted
+        // symbols arrive: loss on a lightly used path, not a lower capacity.
+        let (controller, _) = paired_controller_023("lossy_active");
+        let paired = controller.last_control.service_admission.as_ref().unwrap();
+        assert_eq!(paired.backlog_since_us, None);
+        assert!(!paired.deficit);
+        assert_eq!(controller.rate_bps, 2_000_000);
+        assert!(controller.last_brake_us.is_none());
     }
 
     #[test]
@@ -9814,6 +10922,317 @@ mod tests {
         }
     }
 
+    /// A queue brake at 200 ms, then RTT samples from `rtt(elapsed since the
+    /// brake)` while the sender keeps using its lower allowance.
+    fn after_queue_brake(rtt: impl Fn(u64) -> f64) -> (PathController, u64) {
+        let mut controller = PathController::new(20_000_000, 20);
+        controller.observe(&short_observation_022(0, 80.0));
+        exercise_budget(&mut controller, 0, CONTROL_US);
+        controller.observe(&short_observation_022(200_000, 105.0));
+        assert_eq!(controller.last_brake_us, Some(200_000));
+        let pace_before = controller.rate_changes.back().unwrap().previous_bps;
+        for now in (250_000..=3_000_000).step_by(50_000) {
+            exercise_budget(&mut controller, now - 50_000, 50_000);
+            let ms = rtt(now - 200_000);
+            let mut sample = short_observation_022(now, ms);
+            sample.rtt_ms = ms;
+            controller.observe(&sample);
+        }
+        (controller, pace_before)
+    }
+
+    #[test]
+    fn a_longer_path_that_braking_cannot_drain_becomes_the_queue_reference() {
+        let (controller, pace_before) = after_queue_brake(|_| 105.0);
+        assert_eq!(controller.min_rtt_ms, Some(105.0));
+        assert_eq!(controller.baseline_refreshes, 1);
+        assert!(controller.queue_delay_ms < 1.0);
+        let refresh = controller
+            .rate_changes
+            .iter()
+            .find(|change| matches!(change.reason, RateReason::BaselineRefresh))
+            .expect("the false brake is undone");
+        assert!(refresh.at_us <= 1_500_000, "{}", refresh.at_us);
+        assert_eq!(refresh.pacing_bps, (pace_before as f64 * 0.9) as u64);
+    }
+
+    #[test]
+    fn a_draining_or_growing_queue_keeps_the_original_reference() {
+        // Falling 10 ms per 100 ms: the brake is draining a real queue.
+        let (draining, _) = after_queue_brake(|t| (105.0 - t as f64 / 10_000.0).max(80.0));
+        // Still rising after the brake: the path is losing capacity.
+        let (growing, _) = after_queue_brake(|t| 105.0 + t as f64 / 20_000.0);
+        for controller in [draining, growing] {
+            assert_eq!(controller.min_rtt_ms, Some(80.0));
+            assert_eq!(controller.baseline_refreshes, 0);
+            assert!(
+                !controller
+                    .rate_changes
+                    .iter()
+                    .any(|change| matches!(change.reason, RateReason::BaselineRefresh))
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_recovery_never_refreshes_the_queue_reference() {
+        let mut controller = PathController::new(20_000_000, 20).with_legacy_recovery(true);
+        controller.observe(&short_observation_022(0, 80.0));
+        exercise_budget(&mut controller, 0, CONTROL_US);
+        controller.observe(&short_observation_022(200_000, 105.0));
+        for now in (250_000..=3_000_000).step_by(50_000) {
+            exercise_budget(&mut controller, now - 50_000, 50_000);
+            let mut sample = short_observation_022(now, 105.0);
+            sample.rtt_ms = 105.0;
+            controller.observe(&sample);
+        }
+        assert_eq!(controller.min_rtt_ms, Some(80.0));
+        assert_eq!(controller.baseline_refreshes, 0);
+    }
+
+    fn standing_delay_under_test() -> PathController {
+        let mut controller = PathController::new(20_000_000, 20);
+        controller.rate_bps = 5_000_000;
+        controller.standing_delay = Some(StandingDelay {
+            braked_us: 200_000,
+            pace_before_bps: 20_000_000,
+            rate_bps: 5_000_000,
+            early_ms: f64::INFINITY,
+            late_ms: f64::INFINITY,
+            samples: 0,
+            last_sample_us: 0,
+            window_start_us: None,
+            windows: 0,
+        });
+        controller
+    }
+
+    #[test]
+    fn a_queue_rising_at_the_decision_is_not_a_longer_path() {
+        let mut controller = standing_delay_under_test();
+        for now in [850_000, 900_000, 1_050_000] {
+            let sample = observation(now, 105.0);
+            assert!(
+                controller
+                    .standing_delay(now, 105.0, 25.0, true, &sample)
+                    .is_none()
+            );
+        }
+        let sample = observation(1_400_000, 185.0);
+        let shift = controller.standing_delay(1_400_000, 185.0, 105.0, true, &sample);
+        assert!(shift.is_none(), "{shift:?}");
+    }
+
+    #[test]
+    fn a_jitter_spike_at_the_decision_measures_again_with_the_original_pace() {
+        let mut controller = standing_delay_under_test();
+        let mut decide = |now, excess| {
+            let sample = observation(now, 105.0);
+            controller.standing_delay(now, 105.0, excess, true, &sample)
+        };
+        for now in [850_000, 900_000, 1_050_000] {
+            assert!(decide(now, 25.0).is_none());
+        }
+        assert!(decide(1_250_000, 35.0).is_none(), "the spike is not stable");
+        let mut shift = None;
+        for now in (1_300_000..=1_700_000).step_by(50_000) {
+            shift = shift.or(decide(now, 25.0));
+        }
+        assert_eq!(shift, Some((25.0, 20_000_000)));
+    }
+
+    #[test]
+    fn a_light_window_handles_saturated_rtt_without_deadline_overflow() {
+        let mut c = PathController::new(20_000_000, 20);
+        c.rate_bps = MIN_BPS;
+        for now in [100_000, 600_000, 1_100_000] {
+            let o = observation(now, f64::MAX);
+            assert_eq!(c.light_baseline(now, f64::MAX, 7.5, true, &o), None);
+        }
+    }
+
+    #[test]
+    fn a_level_excess_at_a_light_pace_becomes_the_baseline() {
+        let mut controller = PathController::new(20_000_000, 20);
+        controller.rate_bps = MIN_BPS;
+        let mut shift = None;
+        for (index, now) in (100_000..=1_200_000).step_by(100_000).enumerate() {
+            let excess = if index % 2 == 0 { 7.5 } else { 8.4 };
+            let sample = observation(now, 105.0);
+            shift = shift.or(controller.light_baseline(now, 105.0, excess, true, &sample));
+        }
+        assert_eq!(shift, Some(7.5));
+    }
+
+    fn wander_for(controller: &mut PathController, start: u64, end: u64, excess: &[f64]) -> f64 {
+        let mut wander = 0.0;
+        for (index, now) in (start..end).step_by(100_000).enumerate() {
+            let sample = observation(now, 105.0);
+            wander =
+                controller.observe_wander(now, 105.0, excess[index % excess.len()], true, &sample);
+        }
+        wander
+    }
+
+    #[test]
+    fn a_light_pace_discounts_the_upper_decile_of_its_rtt_wander() {
+        let wander = [0.0, 10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0];
+        let mut controller = PathController::new(20_000_000, 20);
+        controller.rate_bps = MIN_BPS;
+        assert_eq!(
+            wander_for(&mut controller, 100_000, 500_000, &wander),
+            0.0,
+            "an earlier queue may still drain"
+        );
+        let learned = wander_for(&mut controller, 500_000, 4_000_000, &wander);
+        assert!((60.0..=70.0).contains(&learned), "{learned}");
+
+        // A heavier pace adds its own queue: it learns nothing and the
+        // discount decays, halving every half-life.
+        controller.rate_bps = 20_000_000;
+        let held = wander_for(
+            &mut controller,
+            4_000_000,
+            4_000_000 + WANDER_HALF_LIFE_US,
+            &[0.0],
+        );
+        assert!((held - learned / 2.0).abs() < 1.5, "{held} {learned}");
+
+        // A level shift already taken as baseline is not discounted twice.
+        controller.refresh_baseline(10.0);
+        assert!(controller.wander_samples.iter().all(|(_, ms)| *ms <= 60.0));
+
+        let mut wide = PathController::new(20_000_000, 20);
+        wide.rate_bps = MIN_BPS;
+        let capped = wander_for(&mut wide, 100_000, 4_000_000, &[5.0, 100.0, 200.0, 200.0]);
+        assert_eq!(capped, 80.0, "at most four latency targets");
+    }
+
+    /// Wander at a pace above the start pace, with receiver reports every
+    /// 100 ms delivering `delivered` of each admitted byte.
+    fn served_wander(delivered: f64, excess: &[f64]) -> f64 {
+        let mut controller = PathController::new(20_000_000, 20);
+        controller.rate_bps = 512_000;
+        let mut wander = 0.0;
+        for (index, now) in (100_000..6_000_000u64).step_by(100_000).enumerate() {
+            let admitted = now * 64 / 1_000;
+            controller.service_window.observe(
+                index as u64,
+                Some(now),
+                (admitted as f64 * delivered) as u64,
+                now,
+                Some((admitted, admitted / 1_000)),
+            );
+            let sample = observation(now, 105.0);
+            wander =
+                controller.observe_wander(now, 105.0, excess[index % excess.len()], true, &sample);
+        }
+        wander
+    }
+
+    #[test]
+    fn a_served_light_pace_discounts_wander_up_to_one_target() {
+        let wander = served_wander(0.95, &[2.0, 6.0, 10.0, 14.0]);
+        assert!((10.0..=14.0).contains(&wander), "{wander}");
+        assert_eq!(
+            served_wander(0.95, &[5.0, 40.0, 60.0]),
+            20.0,
+            "above the start pace at most one target"
+        );
+        assert_eq!(
+            served_wander(0.7, &[2.0, 6.0, 10.0, 14.0]),
+            0.0,
+            "an underdelivering pace may be building its own queue"
+        );
+    }
+
+    #[test]
+    fn a_heavy_pace_never_learns_rtt_wander() {
+        let mut controller = PathController::new(20_000_000, 20);
+        controller.rate_bps = 2 * LIGHT_BPS;
+        assert_eq!(
+            wander_for(&mut controller, 100_000, 10_000_000, &[0.0, 30.0, 60.0]),
+            0.0
+        );
+    }
+
+    #[test]
+    fn a_light_pace_keeps_the_baseline_for_a_moving_queue_or_a_heavier_pace() {
+        for (rate, slope) in [(MIN_BPS, 10.0), (MIN_BPS, -10.0), (2_000_000, 0.0)] {
+            let mut controller = PathController::new(20_000_000, 20);
+            controller.rate_bps = rate;
+            for now in (100_000..=3_000_000).step_by(100_000) {
+                let excess = 30.0 + slope * now as f64 / 1_000_000.0;
+                let sample = observation(now, 105.0);
+                assert!(
+                    controller
+                        .light_baseline(now, 105.0, excess, true, &sample)
+                        .is_none(),
+                    "rate={rate} slope={slope}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn samples_before_a_pause_cannot_complete_the_window() {
+        let mut controller = standing_delay_under_test();
+        for now in [850_000, 900_000, 950_000, 10_000_000] {
+            let sample = observation(now, 105.0);
+            assert!(
+                controller
+                    .standing_delay(now, 105.0, 25.0, true, &sample)
+                    .is_none()
+            );
+        }
+        assert!(controller.standing_delay.is_none());
+    }
+
+    #[test]
+    fn probe_replies_without_delivery_never_restore_the_pre_brake_pace() {
+        for (rising, steps) in [
+            (
+                false,
+                [
+                    (850_000, 105.0),
+                    (900_000, 105.0),
+                    (950_000, 105.0),
+                    (10_000_000, 105.0),
+                ],
+            ),
+            (
+                true,
+                [
+                    (850_000, 105.0),
+                    (900_000, 105.0),
+                    (1_050_000, 105.0),
+                    (1_400_000, 185.0),
+                ],
+            ),
+        ] {
+            let mut controller =
+                PathController::new(20_000_000, 20).with_rtt_source_baselines(true);
+            controller.observe(&short_observation_022(0, 80.0));
+            let mut standing = standing_delay_under_test();
+            controller.rate_bps = standing.rate_bps;
+            controller.standing_delay = standing.standing_delay.take();
+            for (now, ms) in steps {
+                let mut sample = short_observation_022(now, ms);
+                sample.rtt_ms = ms;
+                sample.probe_sample_id = now;
+                sample.offered_backlog = false;
+                sample.delivered_bytes = 0;
+                sample.delivered_bps = Some(0.0);
+                sample.feedback_age_us = None;
+                sample.positive_delivery_age_us = None;
+                controller.observe(&sample);
+            }
+            assert_eq!(controller.baseline_refreshes, 0, "rising={rising}");
+            assert_eq!(controller.min_rtt_ms, Some(80.0), "rising={rising}");
+            assert_eq!(controller.rate_bps, 5_000_000, "rising={rising}");
+        }
+    }
+
     #[test]
     fn causal_braking_022_requires_post_brake_probe_but_keeps_independent_pressure() {
         for safety in ["none", "severe", "quinn", "transport"] {
@@ -10127,6 +11546,64 @@ mod tests {
             controller.observe(&sample);
         }
         controller
+    }
+
+    fn grown_after_brake(braked: Option<f64>, fast_recovery: bool) -> PathController {
+        let mut controller = PathController::new(20_000_000, 20);
+        controller.fast_recovery_enabled = fast_recovery;
+        let mut sample = observation(0, 80.0);
+        sample.delivery_sample_span_us = 100_000;
+        sample.delivery_report_time_us = Some(100_000_000);
+        sample.delivered_bps = Some(500_000.0);
+        controller.observe(&sample);
+        controller.rate_bps = 500_000;
+        controller.remembered_bps = 500_000.0;
+        controller.congestion_seen = true;
+        controller.congestion_delivery_bps = braked;
+        let mut delivered_bytes = 0;
+        for now in (100_000..=600_000).step_by(100_000) {
+            delivered_bytes += exercise_budget(&mut controller, now - 100_000, 100_000);
+            sample.now_us = now;
+            sample.report_number = now / 100_000 + 1;
+            sample.probe_sample_id = sample.report_number;
+            sample.delivered_bytes = delivered_bytes;
+            sample.delivery_report_time_us = Some(100_000_000 + now);
+            sample.positive_delivery_age_us = Some(0);
+            controller.observe(&sample);
+        }
+        controller
+    }
+
+    #[test]
+    fn clean_growth_past_twice_the_braked_delivery_restarts_the_initial_search() {
+        // A brake at 250 kbit/s delivered, then clean growth to 544 kbit/s
+        // with 500 kbit/s delivered: that brake was not this path's capacity.
+        let expired = grown_after_brake(Some(250_000.0), true);
+        assert_eq!(expired.rate_bps, 544_444);
+        assert!(!expired.congestion_seen);
+        assert_eq!(expired.congestion_delivery_bps, None);
+        // Short of twice the braked delivery, the ceiling still holds.
+        let held = grown_after_brake(Some(300_000.0), true);
+        assert_eq!(held.rate_bps, 544_444);
+        assert!(held.congestion_seen);
+        assert_eq!(held.congestion_delivery_bps, Some(300_000.0));
+        // Without brake evidence, or under legacy recovery, nothing expires.
+        assert!(grown_after_brake(None, true).congestion_seen);
+        assert!(grown_after_brake(Some(250_000.0), false).congestion_seen);
+    }
+
+    #[test]
+    fn a_congested_brake_records_the_delivery_it_could_not_exceed() {
+        let (mut controller, mut sample) = paired_loss_service_fixture();
+        sample.delivered_bytes = 3_500_000;
+        sample.delivered_bps = Some(7_800_000.0);
+        controller.observe(&sample);
+        assert!(controller.congestion_seen);
+        let delivered = controller.latest_delivery_bps.unwrap() * controller.wire_per_symbol;
+        assert_eq!(
+            controller.congestion_delivery_bps,
+            Some(delivered.max(controller.rate_bps as f64))
+        );
     }
 
     #[test]
@@ -12725,7 +14202,7 @@ mod tests {
     }
 
     #[test]
-    fn persistent_idle_rtt_offset_still_blocks_capacity_growth() {
+    fn persistent_idle_rtt_offset_is_discounted_at_the_start_pace() {
         let mut controller = PathController::new(3_000_000, 20);
         controller.observe(&observation(0, 80.0));
         let mut idle = observation(500_000, 140.0);
@@ -12740,11 +14217,12 @@ mod tests {
             active.delivered_bps = Some(bytes as f64 * 16.0);
             controller.observe(&active);
         }
-        // Explicit remaining limitation: this patch does not classify a lasting
-        // RTT offset as propagation or permit discovery through standing delay.
-        assert!(controller.rate_bps <= START_BPS);
+        // The start pace cannot hold a 60 ms queue at a bottleneck that serves
+        // it, so the offset is discounted as this path's own RTT and growth
+        // resumes; the discount never exceeds the offset.
+        assert!(controller.rate_bps > START_BPS);
+        assert!(controller.last_control.rtt_wander_ms <= 60.0);
         assert!(controller.decision(10_500_000).eligible);
-        assert_eq!(controller.health, Health::Degraded);
     }
 
     #[test]
@@ -12932,13 +14410,50 @@ mod tests {
     }
 
     #[test]
+    fn reverse_direction_delay_is_not_this_directions_queue() {
+        // An acknowledgement direction whose replies wait behind the peer's
+        // bulk queue: RTT rises 40 ms while its own one-way transit stays flat.
+        for (transit, braked) in [(Some(0.5), false), (None, true), (Some(40.0), true)] {
+            let mut controller = PathController::new(10_000_000, 20);
+            controller.observe(&observation(0, 80.0));
+            let before = controller.decision(0).pacing_bps;
+            for step in 1..=10 {
+                let now = step * 100_000;
+                let mut sample = observation(now, 120.0);
+                sample.transit_excess_ms = transit;
+                controller.observe(&sample);
+            }
+            let decision = controller.decision(1_000_000);
+            assert_eq!(decision.pacing_bps < before, braked, "{transit:?}");
+            if !braked {
+                assert!(decision.queue_delay_ms <= 0.5 + ONE_WAY_SLACK_MS);
+            }
+        }
+        // A stale one-way report cannot hide the RTT signal.
+        let mut controller = PathController::new(10_000_000, 20);
+        controller.observe(&observation(0, 80.0));
+        let mut sample = observation(100_000, 120.0);
+        sample.transit_excess_ms = Some(0.5);
+        sample.feedback_age_us = Some(ONE_WAY_FRESH_US + 1);
+        controller.observe(&sample);
+        assert!(controller.decision(100_000).queue_delay_ms > 30.0);
+        // The legacy recovery mode keeps the RTT signal.
+        let mut legacy = PathController::new(10_000_000, 20).with_legacy_recovery(true);
+        legacy.observe(&observation(0, 80.0));
+        let mut sample = observation(100_000, 120.0);
+        sample.transit_excess_ms = Some(0.5);
+        legacy.observe(&sample);
+        assert!(legacy.decision(100_000).queue_delay_ms > 30.0);
+    }
+
+    #[test]
     fn clock_drift_diagnostic_cannot_create_congestion_without_rtt_evidence() {
         let mut controller = PathController::new(10_000_000, 20);
         controller.observe(&observation(0, 20.0));
         for seconds in (1..36_000).step_by(100) {
             let now = seconds * 1_000_000;
             let mut sample = observation(now, 20.0);
-            sample.transit_excess_ms = seconds as f64 * 0.05;
+            sample.transit_excess_ms = Some(seconds as f64 * 0.05);
             sample.offered_backlog = false;
             controller.observe(&sample);
             assert!(controller.decision(now).eligible);
@@ -13824,56 +15339,72 @@ mod tests {
     }
 
     #[test]
-    fn long_lived_rtt_step_retains_pressure_until_generation_requalification() {
-        let mut controller = PathController::new(2_000_000, 20).with_rtt_source_baselines(true);
-        controller.observe(&rtt_evidence_observation(0, 20.0, Some((1, 20.0, 0))));
-        let mut delivered = 0;
-        for tick in 1..=600 {
-            let now = tick * CONTROL_US;
-            let bytes = exercise_budget(&mut controller, now - CONTROL_US, CONTROL_US);
-            delivered += bytes;
-            let mut sample = rtt_evidence_observation(now, 60.0, Some((tick + 1, 60.0, 0)));
-            sample.delivered_bytes = delivered;
-            sample.delivered_bps = Some(bytes as f64 * 8_000_000.0 / CONTROL_US as f64);
-            controller.observe(&sample);
-            assert!(controller.decision(now).eligible);
-        }
-        let now = 120_000_000;
-        let retained_rate = controller.rate_bps;
-        let retained_queue = controller.queue_delay_ms;
-        // These observations are compatible with either a propagation change
-        // or a standing queue outside our sender. Time alone cannot tell them
-        // apart, so an automatic baseline reset would erase real pressure too.
-        assert_eq!(controller.source_local_min_rtt_ms, Some(20.0));
-        assert_eq!(controller.source_probe_min_rtt_ms, Some(20.0));
-        assert_eq!(retained_queue, 40.0);
-        assert!(!controller.allow(now, 100, 21.0));
-        controller.tokens = 0.0;
-        let mut duplicate = rtt_evidence_observation(now, 60.0, Some((601, 60.0, 0)));
-        duplicate.delivered_bytes = delivered;
-        controller.observe(&duplicate);
-        assert_eq!(controller.tokens, 0.0);
-        assert!(!controller.allow(now, 1, 0.0));
+    fn long_lived_rtt_step_requires_light_service_before_baseline_refresh() {
+        for queued_bytes in [0, 4096] {
+            let mut controller = PathController::new(2_000_000, 20).with_rtt_source_baselines(true);
+            controller.observe(&rtt_evidence_observation(0, 20.0, Some((1, 20.0, 0))));
+            let mut delivered = 0;
+            for tick in 1..=600 {
+                let now = tick * CONTROL_US;
+                let bytes = exercise_budget(&mut controller, now - CONTROL_US, CONTROL_US);
+                delivered += bytes;
+                let mut sample = rtt_evidence_observation(now, 60.0, Some((tick + 1, 60.0, 0)));
+                sample.delivered_bytes = delivered;
+                sample.delivered_bps = Some(bytes as f64 * 8_000_000.0 / CONTROL_US as f64);
+                sample.send_queue_bytes = queued_bytes;
+                controller.observe(&sample);
+                assert!(controller.decision(now).eligible);
+            }
+            let now = 600 * CONTROL_US;
+            let retained_rate = controller.rate_bps;
+            let retained_queue = controller.queue_delay_ms;
+            let retained_minimum = controller.source_local_min_rtt_ms;
+            // Historical light-service qualification may retire a fixed RTT
+            // offset. Time alone cannot do so with real local backlog: that
+            // case must retain pressure and keep the sender braked.
+            if queued_bytes == 0 {
+                assert!(controller.baseline_refreshes > 0);
+                assert_eq!(controller.source_local_min_rtt_ms, Some(60.0));
+                assert_eq!(controller.source_probe_min_rtt_ms, Some(60.0));
+                assert_eq!(retained_queue, 0.0);
+                assert!(retained_rate > START_BPS);
+            } else {
+                assert_eq!(controller.baseline_refreshes, 0);
+                assert_eq!(controller.source_local_min_rtt_ms, Some(20.0));
+                assert_eq!(controller.source_probe_min_rtt_ms, Some(20.0));
+                assert!(retained_queue >= 40.0);
+                assert!(retained_rate <= START_BPS);
+            }
+            assert!(!controller.allow(now, 100, 21.0));
+            controller.tokens = 0.0;
+            let mut duplicate = rtt_evidence_observation(now, 60.0, Some((601, 60.0, 0)));
+            duplicate.delivered_bytes = delivered;
+            duplicate.send_queue_bytes = queued_bytes;
+            controller.observe(&duplicate);
+            assert_eq!(controller.tokens, 0.0);
+            assert!(!controller.allow(now, 1, 0.0));
 
-        let mut next = rtt_evidence_observation(now + CONTROL_US, 60.0, Some((1, 60.0, 0)));
-        next.generation += 1;
-        next.delivered_bytes = 0;
-        controller.observe(&next);
-        assert_eq!(controller.source_local_min_rtt_ms, Some(60.0));
-        assert_eq!(controller.source_probe_min_rtt_ms, Some(60.0));
-        assert_eq!(controller.queue_delay_ms, 0.0);
-        eprintln!(
-            "long_lived_rtt_evidence: {}",
-            serde_json::json!({
-                "conditions": {"duration_us":now, "initial_rtt_ms":20, "subsequent_rtt_ms":60,
-                    "cause":"not identifiable from these observations", "source_baselines":true},
-                "window_a": {"generation":7, "allowance_bps":retained_rate,
-                    "inferred_queue_ms":retained_queue, "minimum_rtt_ms":20},
-                "window_b": {"generation":8, "allowance_bps":controller.rate_bps,
-                    "inferred_queue_ms":controller.queue_delay_ms, "minimum_rtt_ms":60},
-                "scope":"controller replay; no network throughput or proposed algorithm comparison"
-            })
-        );
+            let mut next = rtt_evidence_observation(now + CONTROL_US, 60.0, Some((1, 60.0, 0)));
+            next.generation += 1;
+            next.delivered_bytes = 0;
+            controller.observe(&next);
+            assert_eq!(controller.source_local_min_rtt_ms, Some(60.0));
+            assert_eq!(controller.source_probe_min_rtt_ms, Some(60.0));
+            assert_eq!(controller.queue_delay_ms, 0.0);
+            eprintln!(
+                "long_lived_rtt_evidence: {}",
+                serde_json::json!({
+                    "conditions": {"duration_us":now, "initial_rtt_ms":20, "subsequent_rtt_ms":60,
+                        "local_queue_bytes":queued_bytes, "source_baselines":true,
+                        "cause":"not established; baseline qualification is controller policy"},
+                    "window_a": {"generation":7, "allowance_bps":retained_rate,
+                        "inferred_queue_ms":retained_queue, "minimum_rtt_ms":retained_minimum},
+                    "window_b": {"generation":8, "allowance_bps":controller.rate_bps,
+                        "inferred_queue_ms":controller.queue_delay_ms, "minimum_rtt_ms":60},
+                    "scope":"controller replay; no network throughput comparison"
+                })
+            );
+        }
     }
 
     #[test]
@@ -14036,6 +15567,67 @@ mod tests {
         assert!(
             b["intervention_applied"].as_bool().unwrap(),
             "candidate was not exercised"
+        );
+    }
+
+    #[test]
+    fn a_light_window_must_not_hide_a_currently_growing_queue() {
+        let mut c = PathController::new(20_000_000, 20);
+        c.rate_bps = MIN_BPS;
+        for now in [
+            100_000, 200_000, 300_000, 400_000, 600_000, 700_000, 800_000, 900_000,
+        ] {
+            let o = observation(now, 107.5);
+            assert_eq!(c.light_baseline(now, 107.5, 7.5, true, &o), None);
+        }
+        let o = observation(1_100_000, 120.0);
+        let shift = c.light_baseline(1_100_000, 120.0, 20.0, true, &o);
+        assert_eq!(
+            shift, None,
+            "current excess rose to 20 ms; old half minima must not refresh: {shift:?}"
+        );
+    }
+
+    #[test]
+    fn a_light_window_must_not_be_completed_after_a_long_pause() {
+        let mut c = PathController::new(20_000_000, 20);
+        c.rate_bps = MIN_BPS;
+        for now in [
+            100_000, 200_000, 300_000, 400_000, 600_000, 700_000, 800_000, 900_000,
+        ] {
+            let o = observation(now, 107.5);
+            assert_eq!(c.light_baseline(now, 107.5, 7.5, true, &o), None);
+        }
+        let mut o = observation(10_000_000, 107.5);
+        o.positive_delivery_age_us = None;
+        o.delivered_bytes = 45_000; // Same cumulative delivered count as the last 900 ms sample.
+        let shift = c.light_baseline(10_000_000, 107.5, 7.5, true, &o);
+        assert_eq!(
+            shift, None,
+            "nine-second gap cannot certify a continuous 1 s window: {shift:?}"
+        );
+    }
+
+    #[test]
+    fn a_sparse_first_half_must_not_poison_later_dense_light_windows() {
+        let mut c = PathController::new(20_000_000, 20);
+        c.rate_bps = MIN_BPS;
+        for now in [100_000, 500_000, 900_000, 1_300_000, 1_700_000] {
+            let o = observation(now, 107.5);
+            assert_eq!(c.light_baseline(now, 107.5, 7.5, true, &o), None);
+        }
+        let mut refreshed = false;
+        for now in (2_000_000..=10_000_000).step_by(100_000) {
+            let o = observation(now, 107.5);
+            if c.light_baseline(now, 107.5, 7.5, true, &o).is_some() {
+                refreshed = true;
+                break;
+            }
+        }
+        assert!(
+            refreshed,
+            "eight seconds of dense stable feedback must replace the underfilled initial half: {:?}",
+            c.light_baseline
         );
     }
 }

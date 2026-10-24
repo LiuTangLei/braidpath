@@ -969,6 +969,8 @@ pub async fn serve(options: ServerOptions) -> Result<()> {
     tracing::info!(node=%state.own.id, "leaderless mesh enabled; client-key.json and server-key.json are in the state directory");
     tunnel::serve_with_mesh(
         tunnel::ServerOptions {
+            tcp_target: None,
+            stream_proxy: None,
             bind: options.listen,
             cert: options.dir.join("cert.pem"),
             key: options.dir.join("key.pem"),

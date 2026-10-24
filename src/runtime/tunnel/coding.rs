@@ -113,6 +113,14 @@ impl Lane {
 }
 
 enum Mode {
+    Automatic {
+        lane: Lane,
+        small: Lane,
+        small_repairs: u8,
+        k: u8,
+        age: Duration,
+        next_block: u64,
+    },
     Legacy {
         encoder: Encoder,
         policy: Policy,
@@ -137,7 +145,16 @@ impl RecordEncoder {
     pub(super) fn new(policy: &Policy) -> Result<Self> {
         policy.validate()?;
         let age = Duration::from_millis(policy.block_ms);
-        let mode = if policy.mixed_fec {
+        let mode = if policy.fec == super::super::automatic_fec::AUTO {
+            Mode::Automatic {
+                lane: Lane::new(1, age, 1)?,
+                small: Lane::new(1, age, 1)?,
+                small_repairs: 1,
+                k: 0,
+                age,
+                next_block: 0,
+            }
+        } else if policy.mixed_fec {
             Mode::Mixed {
                 bulk: Lane::new(policy.fec, age, policy.fec_repairs)?,
                 small: Lane::new(1, age, 1)?,
@@ -159,17 +176,98 @@ impl RecordEncoder {
 
     #[cfg(test)]
     pub(super) fn encode(&mut self, record: &Record, now: Instant) -> Result<Vec<EncodedSymbol>> {
-        self.encode_ingress(record, now, now)
+        self.encode_attempt_ingress(record, now, 1, now)
     }
 
+    #[cfg(test)]
     pub(super) fn encode_ingress(
         &mut self,
         record: &Record,
         now: Instant,
         ingress: Instant,
     ) -> Result<Vec<EncodedSymbol>> {
+        self.encode_attempt_ingress(record, now, 1, ingress)
+    }
+
+    #[cfg(test)]
+    pub(super) fn encode_attempt(
+        &mut self,
+        record: &Record,
+        now: Instant,
+        attempt: u32,
+    ) -> Result<Vec<EncodedSymbol>> {
+        self.encode_attempt_ingress(record, now, attempt, now)
+    }
+
+    pub(super) fn encode_attempt_ingress(
+        &mut self,
+        record: &Record,
+        now: Instant,
+        attempt: u32,
+        ingress: Instant,
+    ) -> Result<Vec<EncodedSymbol>> {
         let fragmented = self.fragments && record.flow & super::messages::FLAG != 0;
         let mut symbols = match &mut self.mode {
+            Mode::Automatic {
+                lane,
+                small,
+                small_repairs,
+                k,
+                next_block,
+                ..
+            } => {
+                // Stream ACKs are control even when selective ranges exceed a
+                // size cutoff. Short records get independent immediate blocks.
+                let control = !fragmented
+                    && (record.payload.len() <= 128
+                        || record.flow
+                            & (super::super::stream::STREAM_FLAG | super::super::stream::ACK_FLAG)
+                            == (super::super::stream::STREAM_FLAG
+                                | super::super::stream::ACK_FLAG));
+                if control {
+                    // A sparse interactive stream cannot amortize a lost tail
+                    // over the next packet. Keep one immediate copy even when
+                    // clean bulk and superseding ACKs need no proactive FEC.
+                    let interactive = super::super::stream::stream_id(record.flow).is_some()
+                        && !super::super::stream::is_ack_flow(record.flow)
+                        && record.payload.len() <= 128;
+                    let recovery = match attempt {
+                        0 | 1 => 0,
+                        2 => 1,
+                        _ => 3,
+                    };
+                    // A continuous transfer supersedes each acknowledgement with
+                    // the next. More copies only add reverse load, which on an
+                    // asymmetric uplink is itself the cause of the loss.
+                    let ack = super::super::stream::is_ack_flow(record.flow);
+                    let protection = if ack {
+                        (*small_repairs).min(1)
+                    } else {
+                        *small_repairs
+                    };
+                    let copies = protection.max(recovery).max(u8::from(interactive));
+                    if copies == 0 {
+                        return Ok(vec![EncodedSymbol {
+                            data: wire::plain(record)?,
+                            small: true,
+                            oldest_ingress: None,
+                        }]);
+                    }
+                    let mut out = small.push(&record.encode()?, now, next_block, true)?;
+                    for _ in 1..copies {
+                        out.push(out.last().expect("k=1 repair").clone());
+                    }
+                    Ok(out)
+                } else if *k == 0 {
+                    Ok(vec![EncodedSymbol {
+                        data: wire::plain(record)?,
+                        small: false,
+                        oldest_ingress: None,
+                    }])
+                } else {
+                    lane.push(&record.encode()?, now, next_block, false)
+                }
+            }
             Mode::Legacy { encoder, policy } => {
                 // Keep the legacy branch and one output collection. Wrapping a
                 // Vec<Bytes> afterwards would add an allocation to every record.
@@ -219,6 +317,9 @@ impl RecordEncoder {
 
     pub(super) fn flush_due(&mut self, now: Instant) -> Result<Vec<EncodedSymbol>> {
         let mut symbols = match &mut self.mode {
+            Mode::Automatic {
+                lane, next_block, ..
+            } => lane.flush_due(now, next_block, false),
             Mode::Legacy { encoder, policy } => Ok::<_, anyhow::Error>(
                 encoder
                     .flush_due(now)
@@ -264,6 +365,47 @@ impl RecordEncoder {
             symbol.oldest_ingress = Some(oldest);
         }
         Ok(())
+    }
+
+    /// Finish the old block before replacing its codec. Global block IDs keep
+    /// increasing across plain intervals and changes of k; in-flight repairs
+    /// retain their original count and cannot collide with later blocks.
+    pub(super) fn set_fec(&mut self, next: u8) -> Result<Vec<EncodedSymbol>> {
+        let Mode::Automatic {
+            lane,
+            k,
+            age,
+            next_block,
+            small_repairs,
+            ..
+        } = &mut self.mode
+        else {
+            anyhow::bail!("fixed FEC encoder cannot change strength");
+        };
+        ensure!(
+            [0, 4, 8, 16, 32].contains(&next),
+            "invalid automatic FEC strength"
+        );
+        *small_repairs = match next {
+            4 => 3,
+            8 | 16 => 2,
+            0 => 0,
+            _ => 1,
+        };
+        if next == *k {
+            return Ok(Vec::new());
+        }
+        let LaneEncoder::Single(encoder) = &mut lane.encoder else {
+            unreachable!()
+        };
+        let shards = encoder.flush().into_iter().collect();
+        let mut out = lane.remap(shards, next_block, false)?;
+        *lane = Lane::new(next.max(1), *age, 1)?;
+        *k = next;
+        // These are repairs of the previous block: retain its admission clock
+        // even when changing the automatic codec flushes it between arrivals.
+        self.stamp_ingress(&mut out, Instant::now())?;
+        Ok(out)
     }
 }
 
@@ -331,6 +473,8 @@ mod tests {
     fn policy(fec: u8, cutoff: u16, mixed: bool) -> Policy {
         Policy {
             max_message_bytes: 1000,
+            streams: false,
+            proxy: false,
             fec_repairs: 1,
             adaptive: false,
             capacity_probe_bps: 0,
@@ -355,6 +499,337 @@ mod tests {
             id,
             payload: vec![id as u8; bytes],
         }
+    }
+
+    #[test]
+    fn automatic_fec_change_preserves_pending_block_ingress() {
+        let mut p = policy(super::super::super::automatic_fec::AUTO, 0, false);
+        p.receiver_feedback = true;
+        let ingress = Instant::now();
+        let mut encoder = RecordEncoder::new(&p).unwrap();
+        assert!(encoder.set_fec(4).unwrap().is_empty());
+        let encoded = encoder
+            .encode_attempt_ingress(
+                &record(1, 1000),
+                ingress + Duration::from_millis(5),
+                1,
+                ingress,
+            )
+            .unwrap();
+        assert_eq!(encoded.len(), 1);
+        assert_eq!(encoded[0].oldest_ingress, Some(ingress));
+        let repairs = encoder.set_fec(8).unwrap();
+        assert_eq!(repairs.len(), 1);
+        assert_eq!(block(&repairs[0]), block(&encoded[0]));
+        assert_eq!(
+            repairs[0].oldest_ingress,
+            Some(ingress),
+            "switching codecs cannot restart a pending repair's admission lifetime"
+        );
+    }
+
+    #[test]
+    fn automatic_small_udp_fragments_remain_on_the_bulk_lane() {
+        let mut p = policy(super::super::super::automatic_fec::AUTO, 0, false);
+        p.receiver_feedback = true;
+        p.max_message_bytes = 2000;
+        let now = Instant::now();
+        let mut encoder = RecordEncoder::new(&p).unwrap();
+        let fragment = Record {
+            flow: super::super::messages::FLAG | 1,
+            ..record(1, 64)
+        };
+        let symbols = encoder.encode(&fragment, now).unwrap();
+        assert_eq!(symbols.len(), 1);
+        assert!(!symbols[0].small);
+        assert_eq!(symbols[0].data[3], 2);
+    }
+
+    #[test]
+    fn automatic_switches_preserve_partial_blocks_and_delayed_repairs() {
+        let mut p = policy(super::super::super::automatic_fec::AUTO, 0, false);
+        p.receiver_feedback = true;
+        let now = Instant::now();
+        let mut encoder = RecordEncoder::new(&p).unwrap();
+        let mut symbols = Vec::new();
+        let mut id = 0;
+        for k in [4, 0, 32, 16, 8, 4, 0] {
+            symbols.extend(encoder.set_fec(k).unwrap());
+            // Both a complete and an unfinished block before the next switch.
+            for _ in 0..k.max(1) + 1 {
+                id += 1;
+                symbols.extend(encoder.encode(&record(id, 1000), now).unwrap());
+            }
+        }
+        let mut receiver = Receiver::with_repair_wait(Duration::from_millis(100));
+        let mut delivered = Vec::new();
+        let mut delayed = Vec::new();
+        let mut repair_ids = std::collections::BTreeSet::new();
+        // Reorder repairs ahead of originals, and lose one original per coded
+        // block, including the partial blocks closed during a mode change.
+        for symbol in symbols.iter().rev() {
+            if symbol.data[3] == 0 && symbol.data[12] == 0 {
+                delayed.push(symbol);
+                continue;
+            }
+            if symbol.data[3] == 1 {
+                assert!(repair_ids.insert(block(symbol)));
+            }
+            delivered.extend(receiver.receive(&symbol.data, now).unwrap());
+        }
+        let mut ids: Vec<_> = delivered.iter().map(|r| r.id).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, (1..=id).collect::<Vec<_>>());
+        assert_eq!(receiver.recovered as usize, delayed.len());
+        assert_eq!(
+            repair_ids.into_iter().collect::<Vec<_>>(),
+            (0..10).collect::<Vec<_>>()
+        );
+        for symbol in delayed {
+            assert!(receiver.receive(&symbol.data, now).unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn automatic_policy_requires_loss_feedback_and_rejects_fixed_lane_options() {
+        let mut p = policy(super::super::super::automatic_fec::AUTO, 0, false);
+        assert!(p.validate().is_err());
+        p.receiver_feedback = true;
+        assert!(p.validate().is_ok());
+        let mut invalid = p.clone();
+        invalid.redundancy = 0;
+        assert!(invalid.validate().is_err());
+        let mut invalid = p.clone();
+        invalid.small_fec_bytes = 128;
+        assert!(invalid.validate().is_err());
+        let mut invalid = p.clone();
+        invalid.mixed_fec = true;
+        assert!(invalid.validate().is_err());
+        p.fec_repairs = 2;
+        assert!(p.validate().is_err());
+    }
+
+    #[test]
+    fn automatic_small_lane_covers_large_acks_and_keeps_bulk_plain_when_clean() {
+        let mut p = policy(super::super::super::automatic_fec::AUTO, 0, false);
+        p.receiver_feedback = true;
+        let now = Instant::now();
+        let mut e = RecordEncoder::new(&p).unwrap();
+        let bulk = e.encode(&record(1, 1000), now).unwrap();
+        assert_eq!(bulk[0].data[3], 2);
+        assert!(!bulk[0].small);
+        let short = e.encode(&record(2, 64), now).unwrap();
+        assert_eq!(short.len(), 2);
+        assert!(short.iter().all(|s| s.small));
+        e.set_fec(4).unwrap();
+        let ack = Record {
+            flow: super::super::super::stream::ack_flow(3),
+            id: 3,
+            payload: vec![0; 538],
+        };
+        let protected = e.encode(&ack, now).unwrap();
+        assert_eq!(protected.len(), 2, "a large ACK is control with one copy");
+        assert!(
+            protected
+                .iter()
+                .all(|s| s.small && block(s) != block(&short[0]))
+        );
+        let protected = e.encode(&record(3, 64), now).unwrap();
+        assert_eq!(protected.len(), 4);
+        let mut receiver = Receiver::with_repair_wait(Duration::from_millis(100));
+        // All three repair copies describe the same k=1 block. Any one works;
+        // the others and the delayed original remain harmless duplicates.
+        assert_eq!(receiver.receive(&protected[1].data, now).unwrap()[0].id, 3);
+        for s in [&protected[2], &protected[3], &protected[0]] {
+            assert!(receiver.receive(&s.data, now).unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn clean_bulk_keeps_one_bounded_copy_for_interactive_stream_data() {
+        let mut p = policy(super::super::super::automatic_fec::AUTO, 0, false);
+        p.receiver_feedback = true;
+        let now = Instant::now();
+        let mut e = RecordEncoder::new(&p).unwrap();
+        e.set_fec(0).unwrap();
+        let data = Record {
+            flow: crate::runtime::stream::data_flow(5),
+            id: 1,
+            payload: vec![7; 77],
+        };
+        let encoded = e.encode(&data, now).unwrap();
+        assert_eq!(
+            encoded.len(),
+            2,
+            "a rare loss must not cost an interactive RTT"
+        );
+        let mut receiver = Receiver::with_repair_wait(Duration::from_millis(100));
+        // The original was lost: its immediate copy delivers the stream data.
+        assert_eq!(receiver.receive(&encoded[1].data, now).unwrap()[0].id, 1);
+        let ack = Record {
+            flow: crate::runtime::stream::ack_flow(5),
+            ..data
+        };
+        assert_eq!(e.encode(&ack, now).unwrap().len(), 1);
+        assert_eq!(e.encode(&record(3, 1000), now).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn qualified_clean_feedback_removes_proactive_copies_but_short_retries_are_protected() {
+        let mut p = policy(super::super::super::automatic_fec::AUTO, 0, false);
+        p.receiver_feedback = true;
+        let now = Instant::now();
+        let mut e = RecordEncoder::new(&p).unwrap();
+        e.set_fec(0).unwrap();
+        let normal = e.encode(&record(1, 64), now).unwrap();
+        assert_eq!(normal.len(), 1);
+        assert_eq!(normal[0].data[3], 2);
+        assert!(normal[0].small, "plain control never funds bulk repair");
+        assert_eq!(e.encode_attempt(&record(2, 64), now, 2).unwrap().len(), 2);
+        assert_eq!(e.encode_attempt(&record(3, 64), now, 3).unwrap().len(), 4);
+        let bulk = e.encode_attempt(&record(4, 1000), now, 3).unwrap();
+        assert_eq!(bulk.len(), 1);
+        assert!(!bulk[0].small);
+    }
+
+    #[test]
+    fn acknowledgements_never_take_more_than_one_copy() {
+        let mut p = policy(super::super::super::automatic_fec::AUTO, 0, false);
+        p.receiver_feedback = true;
+        let now = Instant::now();
+        let mut e = RecordEncoder::new(&p).unwrap();
+        for (k, copies) in [(0, 0), (32, 1), (16, 1), (8, 1), (4, 1)] {
+            e.set_fec(k).unwrap();
+            let ack = Record {
+                flow: crate::runtime::stream::ack_flow(3),
+                id: u64::from(k) + 100,
+                payload: vec![0; 400],
+            };
+            assert_eq!(e.encode(&ack, now).unwrap().len(), 1 + copies, "{k}+1");
+        }
+    }
+
+    #[test]
+    fn interactive_records_keep_two_copies_from_one_percent_loss() {
+        let mut p = policy(super::super::super::automatic_fec::AUTO, 0, false);
+        p.receiver_feedback = true;
+        let now = Instant::now();
+        let mut e = RecordEncoder::new(&p).unwrap();
+        for (k, copies) in [(32, 1), (16, 2), (8, 2), (4, 3)] {
+            e.set_fec(k).unwrap();
+            assert_eq!(
+                e.encode(&record(u64::from(k), 64), now).unwrap().len(),
+                1 + copies,
+                "{k}+1"
+            );
+        }
+    }
+
+    #[test]
+    fn automatic_small_credit_is_per_admitted_original_and_limits_copy_count() {
+        let mut p = policy(super::super::super::automatic_fec::AUTO, 0, false);
+        p.receiver_feedback = true;
+        let now = Instant::now();
+        let mut e = RecordEncoder::new(&p).unwrap();
+        e.set_fec(4).unwrap();
+        let mut queue = outbound::Queue::default();
+        let mut blocks = BTreeMap::new();
+        let metrics = stats::Metrics::new("client").scope("auto-budget", stats::FORWARD);
+        let mut budget = outbound::RepairBudget::new(30);
+        budget.enable_small_rate(1_000_000);
+        budget.refill_small(1_000_000);
+        for s in e.encode(&record(1, 64), now).unwrap() {
+            enqueue_encoded(s, now, &mut queue, &mut blocks, &p, &metrics);
+        }
+        let copy = queue.front(true).unwrap().clone();
+        assert!(!repair_allowed(
+            &p,
+            &budget,
+            &blocks,
+            &copy,
+            copy.data.len() + 30
+        ));
+        let original = queue.pop(false).unwrap();
+        budget_admitted(
+            &p,
+            &mut budget,
+            &mut blocks,
+            &original,
+            original.data.len() + 30,
+            &metrics,
+        );
+        blocks.get_mut(&original.block.unwrap()).unwrap().paths = 1;
+        for _ in 0..3 {
+            let copy = queue.pop(true).unwrap();
+            assert!(small_delivery::applies(&p, &copy));
+            assert!(repair_allowed(
+                &p,
+                &budget,
+                &blocks,
+                &copy,
+                copy.data.len() + 30
+            ));
+            budget_admitted(
+                &p,
+                &mut budget,
+                &mut blocks,
+                &copy,
+                copy.data.len() + 30,
+                &metrics,
+            );
+        }
+        assert!(!repair_allowed(
+            &p,
+            &budget,
+            &blocks,
+            &copy,
+            copy.data.len() + 30
+        ));
+        assert!(
+            !budget.can_repair(1),
+            "small originals never fund bulk repair"
+        );
+    }
+
+    #[test]
+    fn acknowledgment_copies_leave_small_copy_credit_for_stream_data() {
+        let mut p = policy(super::super::super::automatic_fec::AUTO, 0, false);
+        p.receiver_feedback = true;
+        let now = Instant::now();
+        let mut e = RecordEncoder::new(&p).unwrap();
+        e.set_fec(4).unwrap();
+        let mut queue = outbound::Queue::default();
+        let mut blocks = BTreeMap::new();
+        let metrics = stats::Metrics::new("client").scope("ack-reserve", stats::FORWARD);
+        let mut budget = outbound::RepairBudget::new(30);
+        budget.enable_small_rate(1_000_000);
+        budget.refill_small(1_000_000);
+        // Earlier acknowledgment copies spent most of the burst.
+        budget.small_repair_admitted(1320);
+        let mut copies = Vec::new();
+        for (id, flow) in [
+            (1, crate::runtime::stream::ack_flow(5)),
+            (2, crate::runtime::stream::data_flow(6)),
+        ] {
+            let record = Record {
+                flow,
+                id,
+                payload: vec![0; 64],
+            };
+            for s in e.encode(&record, now).unwrap() {
+                enqueue_encoded(s, now, &mut queue, &mut blocks, &p, &metrics);
+            }
+            let original = queue.pop(false).unwrap();
+            budget_admitted(&p, &mut budget, &mut blocks, &original, 94, &metrics);
+            blocks.get_mut(&original.block.unwrap()).unwrap().paths = 1;
+            copies.push(queue.pop(true).unwrap());
+            while queue.pop(true).is_some() {}
+        }
+        let [ack, data] = &copies[..] else {
+            unreachable!()
+        };
+        assert!(!repair_allowed(&p, &budget, &blocks, ack, 94));
+        assert!(repair_allowed(&p, &budget, &blocks, data, 94));
     }
 
     fn block(symbol: &EncodedSymbol) -> u64 {

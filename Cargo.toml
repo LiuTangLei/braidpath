@@ -34,6 +34,11 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 [patch.crates-io]
 # Bound stream fragments by unread extent and coalesce mixed-size contiguous data.
 quinn-proto = { path = "vendor/quinn-proto" }
+# Lock-free connection hints and DATAGRAM admission wakeups.
+quinn = { path = "vendor/quinn" }
+
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", features = ["fs"] }
 
 [dev-dependencies]
 assert_matches = "1"

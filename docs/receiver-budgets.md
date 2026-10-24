@@ -35,9 +35,11 @@ including current/peak block budget, recent block rate, decoder bytes and
 byte-budget retirements. A retired block count is not the number of application
 records lost; completed blocks can also be retired.
 
-The sender's adaptive pressure observation also uses the connection's actual
-empty-buffer allowance instead of assuming a 1200-byte buffer. With an explicit
-larger buffer, occupied bytes are no longer accidentally reported as zero.
+The sender's adaptive pressure observation reports the bytes a path holds
+locally, in its writer and Quinn's datagram buffer together, beyond its 1 ms
+pace budget. Occupancy is measured against the connection's actual empty-buffer
+allowance rather than an assumed 1200-byte buffer, and the budget itself, being
+the intended residence, is not reported as queueing.
 Transport-blocked classification includes feedback and HTTP DATAGRAM framing,
 not just the inner record length. These observations do not raise rate caps,
 disable congestion control or extend the sender queue deadline.

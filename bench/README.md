@@ -111,7 +111,11 @@ own serialization time, without waiting behind earlier accepted packets.
 The existing packet limit still counts propagating packets: check separate
 `policer_drops` and `queue_full_drops` before interpreting a run as a policer
 case. Rate steps settle token credit at the old rate before applying the new
-rate. `--step AT_SECONDS:PATH:RATE_MBPS` changes both directions of a path relative
+rate. `examples/link_lab.rs --shared-forward-mbps R` (and `bench/tcp_lab.py
+--shared-forward-mbps`) additionally drops client-to-server arrivals of every
+path against one direct-drop bucket (`--shared-forward-burst-bytes`, default
+32768), like an access uplink all routes leave through; drops are counted as
+`shared_policer_drops`. This models reverse-load saturation, not a specific network. `--step AT_SECONDS:PATH:RATE_MBPS` changes both directions of a path relative
 to the source launch. `--mode` selects `native-service` (default) or `adaptive`;
 `--rate-bps` defaults to 400000000 and accepts `auto`. The summary adds the
 time-averaged forward capacity and per-second on-time goodput. Timer jitter
@@ -346,3 +350,14 @@ observation goodputs from an approximate common-window value (total useful bytes
 divided by maximum observation duration); slight start offsets prevent treating
 that approximation as exact simultaneous throughput. Host/QUIC datagram counters,
 logical record counts and probe losses are distinct measurement layers.
+
+## Proxy client interoperability
+
+`python3 -m bench.proxy_interop --binary B --tool mihomo|sing-box|xray
+--tool-binary T --outbound socks5|http --output local/...` runs one BraidPath
+client/server pair on loopback with a third-party client chained in front of the
+proxy entrance, and verifies HTTP bodies (by address and by name) and, for the
+SOCKS5 outbound, UDP ASSOCIATE echoes. `summary.json` keeps the tool version,
+each check, and both sides' final stream statistics. It checks protocol
+interoperability only. `python3 -m unittest bench.test_proxy_interop` checks the
+generated configurations and the SOCKS request encoding.

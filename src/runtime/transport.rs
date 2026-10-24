@@ -6,8 +6,12 @@ use quinn::{
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use socket2::{Domain, Protocol, Socket, Type};
 use std::{fs, io::BufReader, net::SocketAddr, path::Path, sync::Arc, time::Duration};
+use tracing::{info, warn};
 
-pub const DEFAULT_DATAGRAM_SEND_BUFFER_BYTES: usize = 1200;
+mod tickets;
+
+pub const MIN_DATAGRAM_SEND_BUFFER_BYTES: usize = 1200;
+pub const DEFAULT_DATAGRAM_SEND_BUFFER_BYTES: usize = MIN_DATAGRAM_SEND_BUFFER_BYTES;
 pub const MAX_DATAGRAM_SEND_BUFFER_BYTES: usize = 76_800;
 const PROXY_STREAM_WINDOW: u32 = 16 * 1024 * 1024;
 const PROXY_CONNECTION_WINDOW: u32 = 32 * 1024 * 1024;
@@ -92,6 +96,61 @@ pub(crate) fn datagram_socket_buffers(socket: socket2::SockRef<'_>, scope: &'sta
 pub(crate) fn authenticated_proxy(connection: &quinn::Connection) {
     connection.set_receive_window(PROXY_CONNECTION_WINDOW.into());
     connection.set_send_window(u64::from(PROXY_CONNECTION_WINDOW));
+}
+
+/// Server resumption tickets held for 0-RTT; each is single use.
+const SERVER_TICKETS: usize = 4096;
+/// Tickets per handshake. Every attempt spends one, including attempts that
+/// fail during an outage, and a client keeps at most eight per server.
+const TICKETS_PER_HANDSHAKE: usize = 4;
+/// Kernel receive buffer requested for endpoint sockets. A bulk path arrives
+/// in paced bursts near line rate; the platform default (768 KiB on macOS)
+/// holds a few milliseconds of them, so a short scheduling gap drops
+/// datagrams that the peer then counts as path loss.
+const SOCKET_RECEIVE_BUFFER_BYTES: usize = 8 * 1024 * 1024;
+/// Smallest request worth making when the platform refuses a larger one.
+const MIN_SOCKET_RECEIVE_BUFFER_BYTES: usize = 1024 * 1024;
+
+pub(crate) fn enlarge_receive_buffer(socket: socket2::SockRef<'_>) {
+    static LIMITED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let mut bytes = SOCKET_RECEIVE_BUFFER_BYTES;
+    while socket.set_recv_buffer_size(bytes).is_err() && bytes > MIN_SOCKET_RECEIVE_BUFFER_BYTES {
+        bytes /= 2;
+    }
+    let granted = socket.recv_buffer_size().ok();
+    // Linux reports twice the granted payload space.
+    if granted.is_some_and(|granted| granted < MIN_SOCKET_RECEIVE_BUFFER_BYTES)
+        && !LIMITED.swap(true, std::sync::atomic::Ordering::Relaxed)
+    {
+        warn!(
+            requested = bytes,
+            granted,
+            "UDP receive buffer is small; bursts may be dropped (raise net.core.rmem_max on Linux)"
+        );
+    }
+    tracing::debug!(requested = bytes, granted, "UDP receive buffer");
+}
+
+fn client_crypto(ca: &Path) -> Result<Arc<QuicClientConfig>> {
+    type Configs = Vec<(Vec<CertificateDer<'static>>, Arc<QuicClientConfig>)>;
+    static CONFIGS: std::sync::Mutex<Configs> = std::sync::Mutex::new(Vec::new());
+    let certificates = certificates(ca)?;
+    let mut configs = CONFIGS.lock().expect("client TLS configurations");
+    if let Some((_, config)) = configs.iter().find(|(c, _)| *c == certificates) {
+        return Ok(config.clone());
+    }
+    let mut roots = rustls::RootCertStore::empty();
+    for cert in certificates.iter().cloned() {
+        roots.add(cert)?;
+    }
+    let mut tls = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    tls.alpn_protocols = vec![b"h3".to_vec()];
+    tls.enable_early_data = true;
+    let config = Arc::new(QuicClientConfig::try_from(tls)?);
+    configs.push((certificates, config.clone()));
+    Ok(config)
 }
 
 pub fn token(path: &Path) -> Result<String> {
@@ -213,6 +272,34 @@ pub fn server_with_datagram_buffer(
     )
 }
 
+pub fn server_tls(cert: &Path, key_path: &Path) -> Result<rustls::ServerConfig> {
+    let mut tls = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certificates(cert)?, key(key_path)?)?;
+    tls.alpn_protocols = vec![b"h3".to_vec(), super::proxy::ALPN.to_vec()];
+    // 0-RTT. rustls accepts early data only with stateful resumption and takes
+    // each ticket out of this store on use, so a replayed first flight cannot
+    // have its early data accepted again. A restart forgets every ticket
+    // unless the store is a journal (see `persistent_server_tls`).
+    tls.max_early_data_size = u32::MAX;
+    tls.session_storage = rustls::server::ServerSessionMemoryCache::new(SERVER_TICKETS);
+    tls.send_tls13_tickets = TICKETS_PER_HANDSHAKE;
+    Ok(tls)
+}
+
+pub fn persistent_server_tls(
+    cert: &Path,
+    key_path: &Path,
+    journal: &Path,
+) -> Result<rustls::ServerConfig> {
+    let mut tls = server_tls(cert, key_path)?;
+    let identity = certificates(cert)?.swap_remove(0);
+    let store = tickets::Journal::open(journal, &identity, SERVER_TICKETS)?;
+    info!(path = %journal.display(), tickets = store.len(), "resumption tickets loaded");
+    tls.session_storage = Arc::new(store);
+    Ok(tls)
+}
+
 pub fn server_with_ack_request(
     bind: SocketAddr,
     cert: &Path,
@@ -241,37 +328,69 @@ pub(crate) fn server_with_proxy(
     ack_request: AckRequest,
     proxy: bool,
 ) -> Result<Endpoint> {
+    server_with_session_config(
+        bind,
+        cert,
+        key_path,
+        congestion,
+        datagram_send_buffer_bytes,
+        ack_request,
+        proxy,
+        None,
+    )
+}
+
+/// Combine aggregate-session tickets with the independently authenticated proxy.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn server_with_session_config(
+    bind: SocketAddr,
+    cert: &Path,
+    key_path: &Path,
+    congestion: Congestion,
+    datagram_send_buffer_bytes: usize,
+    ack_request: AckRequest,
+    proxy: bool,
+    tickets: Option<&Path>,
+) -> Result<Endpoint> {
     ensure!(
-        (DEFAULT_DATAGRAM_SEND_BUFFER_BYTES..=MAX_DATAGRAM_SEND_BUFFER_BYTES)
+        (MIN_DATAGRAM_SEND_BUFFER_BYTES..=MAX_DATAGRAM_SEND_BUFFER_BYTES)
             .contains(&datagram_send_buffer_bytes),
         "datagram send buffer must be 1200..76800 bytes"
     );
-    let mut tls = rustls::ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(certificates(cert)?, key(key_path)?)?;
-    tls.alpn_protocols = vec![b"h3".to_vec(), super::proxy::ALPN.to_vec()];
-    tls.max_early_data_size = 0;
+    let mut tls = match tickets {
+        Some(journal) => persistent_server_tls(cert, key_path, journal).or_else(|error| {
+            warn!(error = %format!("{error:#}"), "resumption tickets kept in memory only");
+            server_tls(cert, key_path)
+        })?,
+        None => server_tls(cert, key_path)?,
+    };
+    // Native proxy requests retain their handshake and authentication boundary.
+    // Aggregate sessions opt into early data only with their ticket journal.
+    if proxy || tickets.is_none() {
+        tls.max_early_data_size = 0;
+    }
     let mut conf = ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(tls)?));
     let mut transport = config(congestion);
     if proxy {
         // The per-stream window cannot be changed after QUIC negotiation.
-        // Keep the aggregate receive/send windows at 256 KiB until proxy auth.
+        // Keep aggregate receive/send windows at 256 KiB until proxy auth.
         transport.stream_receive_window(PROXY_STREAM_WINDOW.into());
     }
     transport.datagram_send_buffer_size(datagram_send_buffer_bytes);
     ack_request.apply(&mut transport);
     conf.transport_config(Arc::new(transport));
+    let socket = std::net::UdpSocket::bind(bind)?;
     if proxy {
-        let socket = std::net::UdpSocket::bind(bind)?;
         datagram_socket_buffers(socket2::SockRef::from(&socket), "proxy");
-        return Ok(Endpoint::new(
-            quinn::EndpointConfig::default(),
-            Some(conf),
-            socket,
-            Arc::new(quinn::TokioRuntime),
-        )?);
+    } else {
+        enlarge_receive_buffer(socket2::SockRef::from(&socket));
     }
-    Ok(Endpoint::server(conf, bind)?)
+    Ok(Endpoint::new(
+        quinn::EndpointConfig::default(),
+        Some(conf),
+        socket,
+        Arc::new(quinn::TokioRuntime),
+    )?)
 }
 pub fn client(
     remote: SocketAddr,
@@ -309,7 +428,28 @@ pub fn client_bound_with_datagram_buffer(
     bind: Option<SocketAddr>,
     datagram_send_buffer_bytes: usize,
 ) -> Result<Endpoint> {
-    client_with_alpn(
+    client_bound_with_ack_request(
+        remote,
+        ca,
+        interface,
+        congestion,
+        bind,
+        datagram_send_buffer_bytes,
+        AckRequest::Unchanged,
+    )
+}
+
+/// A client endpoint requesting the peer ACK cadence for aggregate uploads.
+pub fn client_bound_with_ack_request(
+    remote: SocketAddr,
+    ca: &Path,
+    interface: Option<&str>,
+    congestion: Congestion,
+    bind: Option<SocketAddr>,
+    datagram_send_buffer_bytes: usize,
+    ack_request: AckRequest,
+) -> Result<Endpoint> {
+    client_with_alpn_and_ack(
         remote,
         ca,
         interface,
@@ -317,6 +457,7 @@ pub fn client_bound_with_datagram_buffer(
         bind,
         datagram_send_buffer_bytes,
         b"h3",
+        ack_request,
     )
 }
 
@@ -341,21 +482,49 @@ fn client_with_alpn(
     datagram_send_buffer_bytes: usize,
     alpn: &[u8],
 ) -> Result<Endpoint> {
+    client_with_alpn_and_ack(
+        remote,
+        ca,
+        interface,
+        congestion,
+        bind,
+        datagram_send_buffer_bytes,
+        alpn,
+        AckRequest::Unchanged,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn client_with_alpn_and_ack(
+    remote: SocketAddr,
+    ca: &Path,
+    interface: Option<&str>,
+    congestion: Congestion,
+    bind: Option<SocketAddr>,
+    datagram_send_buffer_bytes: usize,
+    alpn: &[u8],
+    ack_request: AckRequest,
+) -> Result<Endpoint> {
     ensure!(
-        (DEFAULT_DATAGRAM_SEND_BUFFER_BYTES..=MAX_DATAGRAM_SEND_BUFFER_BYTES)
+        (MIN_DATAGRAM_SEND_BUFFER_BYTES..=MAX_DATAGRAM_SEND_BUFFER_BYTES)
             .contains(&datagram_send_buffer_bytes),
         "datagram send buffer must be 1200..76800 bytes"
     );
-    let mut roots = rustls::RootCertStore::empty();
-    for cert in certificates(ca)? {
-        roots.add(cert)?;
-    }
-    let mut tls = rustls::ClientConfig::builder()
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-    tls.alpn_protocols = vec![alpn.to_vec()];
-    tls.enable_early_data = false;
-    let mut conf = ClientConfig::new(Arc::new(QuicClientConfig::try_from(tls)?));
+    let crypto = if alpn == b"h3" {
+        client_crypto(ca)?
+    } else {
+        let mut roots = rustls::RootCertStore::empty();
+        for cert in certificates(ca)? {
+            roots.add(cert)?;
+        }
+        let mut tls = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        tls.alpn_protocols = vec![alpn.to_vec()];
+        tls.enable_early_data = false;
+        Arc::new(QuicClientConfig::try_from(tls)?)
+    };
+    let mut conf = ClientConfig::new(crypto);
     let mut transport = config(congestion);
     if alpn == super::proxy::ALPN {
         transport.stream_receive_window(PROXY_STREAM_WINDOW.into());
@@ -363,6 +532,7 @@ fn client_with_alpn(
         transport.send_window(u64::from(PROXY_CONNECTION_WINDOW));
     }
     transport.datagram_send_buffer_size(datagram_send_buffer_bytes);
+    ack_request.apply(&mut transport);
     conf.transport_config(Arc::new(transport));
     let s = Socket::new(
         if remote.is_ipv4() {
@@ -377,8 +547,39 @@ fn client_with_alpn(
         #[cfg(target_os = "linux")]
         s.bind_device(Some(name.as_bytes()))
             .with_context(|| format!("bind interface {name}"))?;
-        #[cfg(not(target_os = "linux"))]
-        anyhow::bail!("explicit interface binding is currently supported only on Linux: {name}");
+        #[cfg(target_os = "macos")]
+        {
+            // Darwin binds this socket without changing system routes or proxies.
+            let index: std::num::NonZeroU32 = name
+                .strip_prefix("ifindex:")
+                .context("macOS interface must be ifindex:<nonzero index>")?
+                .parse()
+                .context("invalid macOS interface index")?;
+            if remote.is_ipv4() {
+                s.bind_device_by_index_v4(Some(index))
+                    .with_context(|| format!("bind IPv4 endpoint to interface {name}"))?;
+                ensure!(
+                    s.device_index_v4()? == Some(index),
+                    "IPv4 interface binding not retained"
+                );
+            } else {
+                s.bind_device_by_index_v6(Some(index))
+                    .with_context(|| format!("bind IPv6 endpoint to interface {name}"))?;
+                ensure!(
+                    s.device_index_v6()? == Some(index),
+                    "IPv6 interface binding not retained"
+                );
+            }
+            tracing::info!(
+                interface = name,
+                interface_index = index.get(),
+                "endpoint interface binding verified"
+            );
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        anyhow::bail!(
+            "explicit interface binding is currently supported only on Linux and macOS: {name}"
+        );
     }
     let bind: SocketAddr = bind.unwrap_or(
         if remote.is_ipv4() {
@@ -396,6 +597,8 @@ fn client_with_alpn(
     s.set_nonblocking(true)?;
     if alpn == super::proxy::ALPN {
         datagram_socket_buffers(socket2::SockRef::from(&s), "proxy");
+    } else {
+        enlarge_receive_buffer(socket2::SockRef::from(&s));
     }
     let mut endpoint = Endpoint::new(
         quinn::EndpointConfig::default(),

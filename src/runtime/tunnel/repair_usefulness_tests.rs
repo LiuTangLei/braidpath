@@ -4,6 +4,8 @@ use std::collections::BTreeSet;
 fn policy() -> Policy {
     Policy {
         max_message_bytes: 1000,
+        streams: false,
+        proxy: false,
         adaptive: false,
         capacity_probe_bps: 0,
         probe_guided_recovery: false,
@@ -37,6 +39,7 @@ fn fill_flow(queue: &mut outbound::Queue, now: Instant) {
                 flow: Some(1),
                 block: None,
                 small: false,
+                hold: None,
             })
             .unwrap_or_else(|_| panic!("fixture queue full"));
     }
@@ -159,6 +162,7 @@ fn missing_metadata_short_blocks_invalid_headers_and_small_lane_keep_repairs() {
         locally_rejected_originals: 0b111,
         small_repair_limit: 0,
         small_repair_reserved: 0,
+        acknowledgment: false,
     };
     let mut data = vec![0u8; wire::HEADER];
     data[3] = 1;

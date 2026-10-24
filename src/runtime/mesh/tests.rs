@@ -99,6 +99,8 @@ pub(super) async fn server_with_metrics(
 }
 pub(crate) fn policy() -> Policy {
     Policy {
+        streams: false,
+        proxy: false,
         max_message_bytes: 1000,
         adaptive: true,
         capacity_probe_bps: 0,
@@ -151,6 +153,8 @@ async fn delivery(identity: &ClientIdentity, entrances: Vec<SocketAddr>, label: 
     let listen = address();
     let client = Task(tokio::spawn(tunnel::client_with_mesh_exit(
         tunnel::ClientOptions {
+            tcp_listen: None,
+            proxy_listen: None,
             adaptive_fec_retention: false,
             rotate_source_port: false,
             listen,
@@ -1146,6 +1150,8 @@ async fn unresponsive_entrances_do_not_delay_a_healthy_path() {
     fixed.receiver_feedback = false;
     let client = Task(tokio::spawn(tunnel::client_with_mesh_exit(
         tunnel::ClientOptions {
+            tcp_listen: None,
+            proxy_listen: None,
             adaptive_fec_retention: false,
             rotate_source_port: false,
             listen,
@@ -1223,6 +1229,8 @@ async fn running_client_discovers_new_members_and_recovers_restarted_relay() {
     fixed.receiver_feedback = false;
     let client = Task(tokio::spawn(tunnel::client_with_mesh_exit(
         tunnel::ClientOptions {
+            tcp_listen: None,
+            proxy_listen: None,
             adaptive_fec_retention: false,
             rotate_source_port: false,
             listen,
@@ -1405,6 +1413,8 @@ async fn partition_heals_after_both_groups_forget_and_reload_hints() {
         let metrics = stats::Metrics::new("partition-server");
         let task = Task(tokio::spawn(tunnel::serve_with_mesh(
             tunnel::ServerOptions {
+                tcp_target: None,
+                stream_proxy: None,
                 bind: server.own.address,
                 cert: identity.join("cert.pem"),
                 key: identity.join("key.pem"),
