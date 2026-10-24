@@ -87,6 +87,10 @@ pub struct Status {
     pub directly_live_peers: usize,
     pub reconnect_hints: usize,
     pub leases: usize,
+    #[serde(default)]
+    pub active_relay_forward_bytes: u64,
+    #[serde(default)]
+    pub active_relay_return_bytes: u64,
     pub lease_limit: usize,
     pub source_lease_limit: usize,
     pub control_connections: usize,
@@ -100,9 +104,11 @@ impl State {
     pub(super) fn capabilities(&self) -> Capabilities {
         let mut capabilities = Capabilities::default();
         if self.proxy.is_some() {
-            capabilities
-                .features
-                .extend(["proxy-tcp-v1".into(), "proxy-udp-v1".into()]);
+            capabilities.features.extend([
+                "proxy-tcp-v1".into(),
+                "proxy-udp-v1".into(),
+                "proxy-bond-v1".into(),
+            ]);
         }
         capabilities
     }
@@ -115,6 +121,17 @@ impl State {
             .count();
         drop(peers);
         let hints = self.reconnect.lock().expect("hints").len();
+        let (leases, active_relay_forward_bytes, active_relay_return_bytes) = {
+            let leases = self.leases.lock().expect("leases");
+            let (mut forward, mut returning) = (0, 0);
+            for lease in leases.values() {
+                lease.metrics.state(|s| {
+                    forward += s.relay.get(stats::FORWARD).map_or(0, |r| r.forwarded_bytes);
+                    returning += s.relay.get(stats::RETURN).map_or(0, |r| r.forwarded_bytes);
+                });
+            }
+            (leases.len(), forward, returning)
+        };
         Status {
             node: self.own.clone(),
             capabilities: self.capabilities(),
@@ -123,7 +140,9 @@ impl State {
             directly_live_peers: live,
             reconnect_hints: hints,
             // Read-only: inspection does not renew or remove leases.
-            leases: self.leases.lock().expect("leases").len(),
+            leases,
+            active_relay_forward_bytes,
+            active_relay_return_bytes,
             lease_limit: 64,
             source_lease_limit: MAX_SOURCE_LEASES,
             control_connections: CONTROL_CONNECTIONS - self.control_connections.available_permits(),

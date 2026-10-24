@@ -45,6 +45,27 @@ pub(super) async fn serve(mut tcp: TcpStream, pool: Arc<Pool>, exit: &str) -> Re
         reply(&mut tcp, 2, unspecified).await?;
         return Ok(());
     }
+    if command == TCP {
+        let opened = timeout(CONNECT_TIMEOUT, super::bond::open(pool, exit, target)).await;
+        let flow = match opened {
+            Ok(Ok(flow)) => flow,
+            Ok(Err(error)) => {
+                reply(
+                    &mut tcp,
+                    error.downcast_ref::<ReplyError>().map_or(4, |e| e.0),
+                    unspecified,
+                )
+                .await?;
+                return Ok(());
+            }
+            Err(_) => {
+                reply(&mut tcp, 4, unspecified).await?;
+                return Ok(());
+            }
+        };
+        reply(&mut tcp, 0, flow.bound()).await?;
+        return flow.run(tcp).await;
+    }
     let setup = timeout(CONNECT_TIMEOUT, async {
         let conn = timeout(Duration::from_secs(2), pool.get(exit)).await??;
         let (mut send, mut recv) = conn.raw.open_bi().await?;
@@ -53,20 +74,13 @@ pub(super) async fn serve(mut tcp: TcpStream, pool: Arc<Pool>, exit: &str) -> Re
         } else {
             None
         };
-        let mut request = vec![command];
-        if command == TCP {
-            target.encode(&mut request);
-        }
+        let request = [command];
         send.write_all(&request).await?;
         let status = recv.read_u8().await?;
         if status != 0 {
             return Err(ReplyError(if status <= 8 { status } else { 1 }).into());
         }
-        let bound = if command == TCP {
-            Address::read(&mut recv).await?
-        } else {
-            Address::Ip(unspecified)
-        };
+        let bound = Address::Ip(unspecified);
         tracing::debug!(%exit, command, "proxy flow pinned to exit");
         Ok::<_, anyhow::Error>((conn, send, recv, registration, bound))
     })
@@ -87,25 +101,16 @@ pub(super) async fn serve(mut tcp: TcpStream, pool: Arc<Pool>, exit: &str) -> Re
             return Ok(());
         }
     };
-    if command == TCP {
-        let Address::Ip(bound) = bound else {
-            anyhow::bail!("invalid proxy bind address")
-        };
-        reply(&mut tcp, 0, bound).await?;
-        // The Arc keeps the authenticated connection and its UDP dispatcher alive.
-        let _connection = conn;
-        bridge(tcp, send, recv, None).await
-    } else {
-        udp(
-            tcp,
-            conn,
-            send,
-            recv,
-            registration.expect("UDP registration"),
-            target.port(),
-        )
-        .await
-    }
+    let _ = bound;
+    udp(
+        tcp,
+        conn,
+        send,
+        recv,
+        registration.expect("UDP registration"),
+        target.port(),
+    )
+    .await
 }
 
 async fn udp(

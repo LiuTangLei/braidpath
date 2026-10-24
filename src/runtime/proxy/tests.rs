@@ -21,12 +21,12 @@ fn address() -> SocketAddr {
         .local_addr()
         .unwrap()
 }
-async fn start(
+async fn start_metered(
     root: &Path,
     id: &str,
     join: Option<SocketAddr>,
     allow_private: bool,
-) -> (SocketAddr, Task<Result<()>>) {
+) -> (SocketAddr, Task<Result<()>>, stats::Metrics) {
     let at = address();
     let metrics = stats::Metrics::new("test-proxy");
     let task = Task(tokio::spawn(mesh::serve(mesh::ServerOptions {
@@ -50,6 +50,15 @@ async fn start(
     })
     .await
     .unwrap();
+    (at, task, metrics)
+}
+async fn start(
+    root: &Path,
+    id: &str,
+    join: Option<SocketAddr>,
+    allow_private: bool,
+) -> (SocketAddr, Task<Result<()>>) {
+    let (at, task, _) = start_metered(root, id, join, allow_private).await;
     (at, task)
 }
 fn identity(root: &Path, dir: &str) -> mesh::ClientIdentity {
@@ -147,7 +156,13 @@ async fn empty(identity: &mesh::ClientIdentity, at: SocketAddr) {
     timeout(Duration::from_secs(4), async {
         loop {
             let s = identity.status(at).await.unwrap().proxy.unwrap();
-            if s.streams == 0 && s.udp_associations == 0 && s.udp_destinations == 0 {
+            if s.streams == 0
+                && s.tcp_flows == 0
+                && s.buffered_bytes == 0
+                && s.rpc_streams == 0
+                && s.udp_associations == 0
+                && s.udp_destinations == 0
+            {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -245,10 +260,11 @@ async fn separate_tcp_listeners_pin_exits_half_close_and_share_connections() {
     let (mut third, status, _) = socks(listen_a, TCP, Address::Ip(target)).await;
     assert_eq!(status, 0);
     assert_eq!(identity.status(a).await.unwrap().proxy.unwrap().streams, 2);
-    assert_eq!(
-        identity.status(a).await.unwrap().proxy.unwrap().connections,
-        1
-    );
+    // Native connections are pooled by server path, rather than by TCP flow.
+    // With two cluster members this stays bounded by two, even for three flows.
+    let snapshot = identity.status(a).await.unwrap().proxy.unwrap();
+    assert!((1..=2).contains(&snapshot.connections));
+    assert_eq!(snapshot.tcp_flows, 2);
     let payload: Vec<_> = (0..131_072).map(|i| (i % 251) as u8).collect();
     for tcp in [&mut first, &mut second, &mut third] {
         let (mut r, mut w) = tcp.split();
@@ -585,4 +601,337 @@ async fn association_dispatch_is_bounded_and_released_with_its_owner() {
     assert!(registrations[0].recv.try_recv().is_err());
     drop(registrations);
     assert!(router.register(0).is_ok());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn one_tcp_connection_uses_multiple_servers_and_survives_a_relay_stopping() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let root = tempfile::tempdir().unwrap();
+    let root = root.path();
+    let (a, _a, _) = start_metered(root, "a", None, true).await;
+    let (b, relay_b, _mb) = start_metered(root, "b", Some(a), true).await;
+    let (c, _c, _mc) = start_metered(root, "c", Some(a), true).await;
+    let identity = identity(root, "bond-client");
+    let pool = client::Pool::new(
+        identity.clone(),
+        vec![node("a", a), node("b", b), node("c", c)],
+        vec!["a".into()],
+    )
+    .unwrap();
+    timeout(Duration::from_secs(5), async {
+        while pool.test_addresses("a").await.len() < 3 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let (listen, _listener) = local_listener(pool.clone(), "a").await;
+    let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let at = target.local_addr().unwrap();
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let count = accepted.clone();
+    let payload: Vec<u8> = (0..8 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
+    let expected = payload.clone();
+    let target_task = Task(tokio::spawn(async move {
+        let (mut tcp, _) = target.accept().await.unwrap();
+        count.fetch_add(1, Ordering::Relaxed);
+        for data in payload.chunks(64 * 1024) {
+            tcp.write_all(data).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(3)).await;
+        }
+        tcp.shutdown().await.unwrap();
+        let mut upload = Vec::new();
+        tcp.read_to_end(&mut upload).await.unwrap();
+        assert_eq!(upload, b"single-flow-upload");
+        // No second target socket may be opened by record replay or path replacement.
+        assert!(
+            timeout(Duration::from_millis(10), target.accept())
+                .await
+                .is_err()
+        );
+    }));
+    let (mut tcp, status, _) = socks(listen, TCP, Address::Ip(at)).await;
+    assert_eq!(status, 0);
+    let transfer = tokio::spawn(async move {
+        tcp.write_all(b"single-flow-upload").await.unwrap();
+        tcp.shutdown().await.unwrap();
+        let mut received = Vec::new();
+        tcp.read_to_end(&mut received).await.unwrap();
+        received
+    });
+    timeout(Duration::from_secs(5), async {
+        loop {
+            let bs = identity.status(b).await.unwrap();
+            let cs = identity.status(c).await.unwrap();
+            if bs.active_relay_return_bytes > 65536 && cs.active_relay_return_bytes > 65536 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    drop(relay_b);
+    let received = timeout(Duration::from_secs(12), transfer)
+        .await
+        .expect("relay outage reset the logical TCP flow")
+        .unwrap();
+    assert!(
+        received == expected,
+        "payload differs: {} vs {} bytes",
+        received.len(),
+        expected.len()
+    );
+    assert_eq!(accepted.load(Ordering::Relaxed), 1);
+    let relayed = identity.status(c).await.unwrap();
+    assert!(relayed.active_relay_return_bytes > 65536);
+    assert!(relayed.active_relay_forward_bytes > 0);
+    empty(&identity, a).await;
+    drop(target_task);
+    drop(pool);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn aggregate_client_reset_reclaims_tcp_rpc_and_payload_resources() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let root = tempfile::tempdir().unwrap();
+    let root = root.path();
+    let (a, _server) = start(root, "a", None, true).await;
+    let identity = identity(root, "reset-client");
+    let pool = client::Pool::new(identity.clone(), vec![node("a", a)], vec!["a".into()]).unwrap();
+    let (listen, _listener) = local_listener(pool, "a").await;
+    let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let at = target.local_addr().unwrap();
+    let closed = Arc::new(AtomicBool::new(false));
+    let observed = closed.clone();
+    let _target = Task(tokio::spawn(async move {
+        let (mut tcp, _) = target.accept().await.unwrap();
+        let data = vec![42; 65536];
+        loop {
+            if tcp.write_all(&data).await.is_err() {
+                break;
+            }
+        }
+        observed.store(true, Ordering::Release);
+    }));
+    let (tcp, status, _) = socks(listen, TCP, Address::Ip(at)).await;
+    assert_eq!(status, 0);
+    timeout(Duration::from_secs(3), async {
+        loop {
+            let s = identity.status(a).await.unwrap().proxy.unwrap();
+            if s.buffered_bytes > 0 {
+                assert!(s.buffered_bytes <= 64 * 1024 * 1024);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    socket2::SockRef::from(&tcp)
+        .set_linger(Some(Duration::ZERO))
+        .unwrap();
+    drop(tcp);
+    empty(&identity, a).await;
+    timeout(Duration::from_secs(3), async {
+        while !closed.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn data_blackhole_is_quarantined_and_rejoins_the_same_tcp_flow_after_recovery() {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    let root = tempfile::tempdir().unwrap();
+    let root = root.path();
+    let (a, _server) = start(root, "a", None, true).await;
+    let identity = identity(root, "blackhole-client");
+    let pool = client::Pool::new(identity.clone(), vec![node("a", a)], vec!["a".into()]).unwrap();
+    let front = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let via = front.local_addr().unwrap();
+    let back = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    back.connect(a).await.unwrap();
+    let blocked = Arc::new(AtomicBool::new(false));
+    let packets = Arc::new(AtomicU64::new(0));
+    let (fault, count) = (blocked.clone(), packets.clone());
+    let _relay = Task(tokio::spawn(async move {
+        let (mut upstream, mut downstream) = (vec![0; 65536], vec![0; 65536]);
+        let mut peer = None;
+        loop {
+            tokio::select! {
+                r=front.recv_from(&mut upstream)=>{let(n,from)=r.unwrap();peer=Some(from);if !fault.load(Ordering::Acquire){back.send(&upstream[..n]).await.unwrap();count.fetch_add(n as u64,Ordering::Relaxed);}},
+                r=back.recv(&mut downstream)=>{let n=r.unwrap();if !fault.load(Ordering::Acquire)&&let Some(peer)=peer{front.send_to(&downstream[..n],peer).await.unwrap();count.fetch_add(n as u64,Ordering::Relaxed);}}
+            }
+        }
+    }));
+    pool.test_set_routes("a", vec![a, via]);
+    let (listen, _listener) = local_listener(pool.clone(), "a").await;
+    let source = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let at = source.local_addr().unwrap();
+    let (go, wait) = tokio::sync::oneshot::channel();
+    let _source = Task(tokio::spawn(async move {
+        let (mut tcp, _) = source.accept().await.unwrap();
+        let block = vec![71; 65536];
+        for _ in 0..128 {
+            tcp.write_all(&block).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        wait.await.unwrap();
+        for _ in 0..64 {
+            tcp.write_all(&block).await.unwrap();
+        }
+        tcp.shutdown().await.unwrap();
+        let mut upload = Vec::new();
+        tcp.read_to_end(&mut upload).await.unwrap();
+        assert_eq!(upload, b"one-connection");
+    }));
+    let (mut tcp, status, _) = socks(listen, TCP, Address::Ip(at)).await;
+    assert_eq!(status, 0);
+    let transfer = tokio::spawn(async move {
+        tcp.write_all(b"one-connection").await.unwrap();
+        tcp.shutdown().await.unwrap();
+        let mut received = Vec::new();
+        tcp.read_to_end(&mut received).await.unwrap();
+        received
+    });
+    timeout(Duration::from_secs(3), async {
+        while packets.load(Ordering::Relaxed) < 65536 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    blocked.store(true, Ordering::Release);
+    timeout(Duration::from_secs(6), async {
+        while !pool.test_path_failed("a", via) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("blackholed route continued receiving new data work");
+    blocked.store(false, Ordering::Release);
+    timeout(Duration::from_secs(10), async {
+        while pool.test_path_failed("a", via) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("recovered path did not pass its isolated liveness probe");
+    let before = packets.load(Ordering::Relaxed);
+    go.send(()).unwrap();
+    let received = timeout(Duration::from_secs(8), transfer)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(received.len(), 12 * 1024 * 1024);
+    assert!(received.iter().all(|b| *b == 71));
+    assert!(
+        packets.load(Ordering::Relaxed) > before + 65536,
+        "restored path never resumed carrying payload"
+    );
+    empty(&identity, a).await;
+}
+
+#[tokio::test]
+async fn aggregate_shutdown_releases_optional_leases_and_flow_admission_credit() {
+    let root = tempfile::tempdir().unwrap();
+    let root = root.path();
+    let (a, _a) = start(root, "a", None, true).await;
+    let (b, _b) = start(root, "b", Some(a), true).await;
+    let identity = identity(root, "shutdown-client");
+    let pool = client::Pool::new(
+        identity.clone(),
+        vec![node("a", a), node("b", b)],
+        vec!["a".into()],
+    )
+    .unwrap();
+    timeout(Duration::from_secs(3), async {
+        while pool.test_addresses("a").await.len() < 2 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(identity.status(b).await.unwrap().leases, 1);
+    let (listen, listener) = local_listener(pool.clone(), "a").await;
+    let (target, _echo) = echo().await;
+    let (_tcp, status, _) = socks(listen, TCP, Address::Ip(target)).await;
+    assert_eq!(status, 0);
+    drop(listener);
+    timeout(Duration::from_secs(4), pool.shutdown())
+        .await
+        .expect("normal shutdown left flow owners or leases pending");
+    empty(&identity, a).await;
+    assert_eq!(identity.status(b).await.unwrap().leases, 0);
+    assert_eq!(pool.flow_credit.available_permits(), MAX_STREAMS);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn one_tcp_upload_replays_lost_records_without_duplicating_target_bytes() {
+    let root = tempfile::tempdir().unwrap();
+    let root = root.path();
+    let (a, _a) = start(root, "a", None, true).await;
+    let (b, relay_b) = start(root, "b", Some(a), true).await;
+    let (c, _c) = start(root, "c", Some(a), true).await;
+    let identity = identity(root, "upload-replay");
+    let pool = client::Pool::new(
+        identity.clone(),
+        vec![node("a", a), node("b", b), node("c", c)],
+        vec!["a".into()],
+    )
+    .unwrap();
+    timeout(Duration::from_secs(4), async {
+        while pool.test_addresses("a").await.len() < 3 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let (listen, listener) = local_listener(pool.clone(), "a").await;
+    let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let at = target.local_addr().unwrap();
+    let payload: Vec<_> = (0..16 * 1024 * 1024).map(|i| (i % 239) as u8).collect();
+    let expected = payload.clone();
+    let target_task = tokio::spawn(async move {
+        let (mut tcp, _) = target.accept().await.unwrap();
+        let mut received = Vec::new();
+        tcp.read_to_end(&mut received).await.unwrap();
+        assert!(
+            received == expected,
+            "payload differs: {} vs {} bytes",
+            received.len(),
+            expected.len()
+        );
+        tcp.write_all(b"complete").await.unwrap();
+        tcp.shutdown().await.unwrap();
+    });
+    let (mut tcp, status, _) = socks(listen, TCP, Address::Ip(at)).await;
+    assert_eq!(status, 0);
+    let transfer = tokio::spawn(async move {
+        tcp.write_all(&payload).await.unwrap();
+        tcp.shutdown().await.unwrap();
+        let mut response = Vec::new();
+        tcp.read_to_end(&mut response).await.unwrap();
+        assert_eq!(response, b"complete");
+    });
+    timeout(Duration::from_secs(4), async {
+        while identity.status(b).await.unwrap().active_relay_forward_bytes < 65536 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    drop(relay_b);
+    timeout(Duration::from_secs(12), transfer)
+        .await
+        .expect("upload did not move unacknowledged records to surviving paths")
+        .unwrap();
+    target_task.await.unwrap();
+    empty(&identity, a).await;
+    drop(listener);
+    pool.shutdown().await;
+    assert_eq!(identity.status(c).await.unwrap().leases, 0);
 }

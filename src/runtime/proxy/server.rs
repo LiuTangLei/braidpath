@@ -21,9 +21,11 @@ pub struct Server {
     config: ServerConfig,
     token: String,
     exit: String,
-    rate: Rate,
+    rate: Arc<Rate>,
+    bonds: Arc<super::bond::Registry>,
     connections: Arc<Semaphore>,
     streams: Arc<Semaphore>,
+    rpcs: Arc<Semaphore>,
     associations: Arc<Semaphore>,
     destinations: Arc<Semaphore>,
     rejected: AtomicU64,
@@ -35,6 +37,12 @@ pub struct Snapshot {
     pub udp_associations: usize,
     pub udp_destinations: usize,
     pub rejected: u64,
+    #[serde(default)]
+    pub tcp_flows: usize,
+    #[serde(default)]
+    pub buffered_bytes: usize,
+    #[serde(default)]
+    pub rpc_streams: usize,
 }
 impl Server {
     pub fn new(
@@ -55,18 +63,24 @@ impl Server {
             config,
             token,
             exit,
-            rate: Rate::new(rate_bps),
+            rate: Arc::new(Rate::new(rate_bps)),
+            bonds: super::bond::Registry::new(),
             connections: Arc::new(Semaphore::new(MAX_CONNECTIONS)),
             streams: Arc::new(Semaphore::new(MAX_STREAMS)),
+            rpcs: Arc::new(Semaphore::new(MAX_STREAMS * 2)),
             associations: Arc::new(Semaphore::new(MAX_ASSOCIATIONS)),
             destinations: Arc::new(Semaphore::new(1024)),
             rejected: AtomicU64::new(0),
         }))
     }
     pub fn snapshot(&self) -> Snapshot {
+        let (tcp_flows, buffered_bytes) = self.bonds.snapshot();
         Snapshot {
+            tcp_flows,
+            buffered_bytes,
             connections: MAX_CONNECTIONS - self.connections.available_permits(),
-            streams: MAX_STREAMS - self.streams.available_permits(),
+            streams: MAX_STREAMS - self.streams.available_permits() + tcp_flows,
+            rpc_streams: MAX_STREAMS * 2 - self.rpcs.available_permits(),
             udp_associations: MAX_ASSOCIATIONS - self.associations.available_permits(),
             udp_destinations: 1024 - self.destinations.available_permits(),
             rejected: self.rejected.load(Ordering::Relaxed),
@@ -105,7 +119,7 @@ impl Server {
         .await??;
         drop(pending);
         crate::runtime::transport::authenticated_proxy(&conn);
-        conn.set_max_concurrent_bi_streams(64u32.into());
+        conn.set_max_concurrent_bi_streams(256u32.into());
         let router = Arc::new(Router::default());
         let mut tasks = JoinSet::new();
         let mut maintenance = tokio::time::interval(Duration::from_secs(5));
@@ -114,7 +128,7 @@ impl Server {
             tokio::select! {
                 accepted = conn.accept_bi() => {
                     let (send, recv) = accepted?;
-                    let Ok(permit) = self.streams.clone().try_acquire_owned() else {
+                    let Ok(permit) = self.rpcs.clone().try_acquire_owned() else {
                         self.rejected.fetch_add(1, Ordering::Relaxed); drop((send, recv)); continue;
                     };
                     last = Instant::now();
@@ -129,7 +143,7 @@ impl Server {
                 }
                 data = conn.read_datagram() => router.dispatch(data?),
                 _ = tasks.join_next(), if !tasks.is_empty() => { last = Instant::now(); }
-                _ = maintenance.tick() => { if tasks.is_empty() && last.elapsed() >= UDP_IDLE { return Ok(()); } }
+                _ = maintenance.tick() => { if tasks.is_empty() && last.elapsed() >= UDP_IDLE && !self.bonds.owns_connection(conn.stable_id()) { return Ok(()); } }
             }
         }
     }
@@ -141,7 +155,29 @@ impl Server {
         router: Arc<Router>,
     ) -> Result<()> {
         let command = timeout(CONNECT_TIMEOUT, recv.read_u8()).await??;
+        let _logical_permit = if command == TCP || command == UDP {
+            Some(
+                self.streams
+                    .clone()
+                    .try_acquire_owned()
+                    .context("proxy stream limit")?,
+            )
+        } else {
+            None
+        };
         match command {
+            super::bond::OPEN..=super::bond::DOWNLOAD_ACK => {
+                self.bonds
+                    .serve(
+                        command,
+                        &conn,
+                        &mut send,
+                        &mut recv,
+                        self.config.allow_private,
+                        self.rate.clone(),
+                    )
+                    .await
+            }
             TCP => {
                 let target = timeout(CONNECT_TIMEOUT, Address::read(&mut recv)).await??;
                 let connected = timeout(CONNECT_TIMEOUT, async {
@@ -176,7 +212,7 @@ impl Server {
                 let mut response = vec![0];
                 Address::Ip(tcp.local_addr()?).encode(&mut response);
                 timeout(CONNECT_TIMEOUT, send.write_all(&response)).await??;
-                bridge(tcp, send, recv, Some(&self.rate)).await
+                super::legacy::bridge(tcp, send, recv, Some(&self.rate)).await
             }
             UDP => {
                 let _permit = self

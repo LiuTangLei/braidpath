@@ -81,6 +81,13 @@ Current protocol, commands and limits: [experimental runtime](runtime.md). Check
 
 ## M4 — Reliable flows and application adapters
 
+- [x] v0.4.0: replace per-flow single-path proxy TCP with sequenced record RPCs
+  over multiple cooperating server paths to one selected exit and one target TCP
+  socket. Separate acceptance, delivery progress and control quotas; bound record
+  replay/reassembly; preserve half-close; quarantine and probe stalled paths.
+  Focused tests cover upload/download relay loss, recovery, reset, shutdown and
+  abandoned-flow resource reclamation. WAN speedup requires a matched single-TCP
+  measurement; independent concurrent flows do not establish this gate.
 - [x] v0.3.5: scale Quinn's stream span limit with the flow-control-bounded
   unread extent, so loss holes in a 16 MiB proxy window are not treated as a gap
   flood. Gap-flood rejection is retained at the same density. Proxy sockets also

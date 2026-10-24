@@ -1,0 +1,73 @@
+//! One logical TCP flow over independently recoverable, authenticated QUIC paths.
+//! Record RPC acknowledgements are independent of QUIC ACKs and of path identity.
+use super::*;
+use anyhow::Context;
+use bytes::Bytes;
+use std::{
+    collections::BTreeMap,
+    net::SocketAddr,
+    sync::atomic::{AtomicBool, Ordering},
+};
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
+
+mod server;
+mod transfer;
+mod wire;
+pub(crate) use server::Registry;
+pub(crate) use transfer::open;
+pub(crate) use wire::{
+    ACK_FIN, CLOSE, DOWNLOAD_ACK, FIN, Key, OPEN, Operation, PULL, PUT, READ_STATUS, Reply,
+    UPLOAD_STATUS, rpc,
+};
+
+const CHUNK: usize = 128 * 1024;
+const WINDOW: usize = 16 * 1024 * 1024;
+const PIPELINE: usize = WINDOW / CHUNK;
+const HOST_BUFFER: usize = 32 * 1024 * 1024;
+const MAX_FLOWS: usize = 64;
+const PATH_STALL: Duration = Duration::from_secs(4);
+const RESUME_GRACE: Duration = Duration::from_secs(10);
+
+struct Block {
+    sequence: u64,
+    offset: u64,
+    data: Bytes,
+    _credit: OwnedSemaphorePermit,
+}
+struct Signal {
+    changed: Notify,
+    closed: AtomicBool,
+    activity: Mutex<Instant>,
+}
+impl Signal {
+    fn new() -> Self {
+        Self {
+            changed: Notify::new(),
+            closed: AtomicBool::new(false),
+            activity: Mutex::new(Instant::now()),
+        }
+    }
+    fn touch(&self) {
+        *self.activity.lock().expect("flow activity") = Instant::now();
+    }
+    fn check(&self) -> Result<()> {
+        ensure!(
+            !self.closed.load(Ordering::Acquire),
+            "aggregate TCP flow closed"
+        );
+        Ok(())
+    }
+    fn close(&self) {
+        self.closed.store(true, Ordering::Release);
+        self.changed.notify_waiters();
+    }
+    async fn cancelled(&self) {
+        loop {
+            let changed = self.changed.notified();
+            if self.closed.load(Ordering::Acquire) {
+                return;
+            }
+            changed.await;
+        }
+    }
+}

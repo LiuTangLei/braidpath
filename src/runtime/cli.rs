@@ -175,6 +175,9 @@ enum Command {
         /// Override one exit's SOCKS5 address, EXIT=127.0.0.1:PORT; one listener per exit.
         #[arg(long)]
         socks5: Vec<proxy::Listener>,
+        /// Maximum server paths cooperating on each TCP connection (1..8).
+        #[arg(long, default_value_t = 4, value_parser = clap::value_parser!(u8).range(1..=8))]
+        paths: u8,
     },
     /// Discover live distributed servers through any member using a client key.
     Nodes {
@@ -471,6 +474,7 @@ pub async fn run() -> Result<()> {
             exit,
             listen,
             socks5,
+            paths,
         } => {
             let identity = mesh::ClientIdentity::open(dir, &connection_key)?;
             proxy::client(proxy::ClientOptions {
@@ -479,6 +483,7 @@ pub async fn run() -> Result<()> {
                 exits: exit,
                 listen,
                 socks5,
+                paths: usize::from(paths),
             })
             .await
         }

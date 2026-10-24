@@ -5,7 +5,7 @@ client discovery, become a selected exit, or forward encrypted traffic toward
 another exit. The first server only initializes credentials; it has no permanent
 coordination role. Membership converges through authenticated peer exchanges.
 
-## TCP/UDP proxy and multiple exits (v0.3.2)
+## TCP aggregation and selectable exits (v0.4.0)
 
 Enable proxy egress with `--proxy`. A fixed `--target` is optional in this mode;
 provide both options to serve the existing UDP tunnel and the proxy together.
@@ -45,8 +45,31 @@ Port zero requests a separate OS-assigned port for each exit.
 
 Clients discover address updates in the background every 15 seconds;
 new connections use updated addresses while existing connections retain their
-original peer. This is concurrent use of exits by separate flows; one TCP stream
-uses one reliable QUIC stream to one exit.
+original exit. Each TCP connection now uses multiple cooperating server paths
+at the same time. `--paths` controls the maximum number per exit (default four,
+range 1–8); `--paths 1` provides a direct-path comparison. The direct path starts
+immediately; optional relay entrances are allocated and renewed in the background.
+
+A single SOCKS TCP connection maps to exactly one destination TCP connection at
+its chosen exit. Upload and download records are distributed across authenticated
+QUIC connections reaching that exit directly or through other mesh servers. Those
+servers forward encrypted packets; they do not open extra destination connections.
+Records carry sequence numbers and byte offsets. The exit orders and deduplicates
+uploads, and the client orders downloads. Accepted records and cumulative TCP
+progress use separate acknowledgements, so replays do not wait behind later data.
+This aggregation happens within one connection and does not require Clash load
+balancing or multiple browser connections. The selected exit is per flow, without
+introducing a permanent cluster leader.
+
+A stalled path stops receiving new data and outstanding records replay over
+surviving paths. A four-second response deadline detects a silent path; separate
+liveness heartbeats permit a slow destination without falsely declaring a path
+failure. Isolated authenticated probes readmit recovered paths even while the
+application is idle. Native QUIC retransmissions still operate within each path.
+If the exit itself loses its destination TCP state, the flow fails; another exit
+cannot transparently recreate that external TCP connection. New clients require
+`proxy-bond-v1` support on the selected exit. Servers retain the older TCP command
+for rolling upgrades; new clients use the aggregate protocol exclusively.
 
 All local listeners must bind loopback. Their SOCKS5 interface supports CONNECT,
 UDP ASSOCIATE and the no-authentication method; BIND returns command unsupported.
@@ -76,7 +99,7 @@ service model requested for v0.3.2; its wire protocol is not Hysteria 2, so a
 Clash `hysteria2` entry cannot connect to it directly.
 
 The proxy uses ALPN `braidpath-proxy/1` on the existing server UDP port. TCP uses
-QUIC reliability and backpressure, including half-close. UDP uses QUIC DATAGRAM
+bounded record reassembly over reliable QUIC streams, including half-close. UDP uses QUIC DATAGRAM
 with bounded fragmentation (up to 65,507 payload bytes), no retransmission and
 no FEC. SOCKS UDP headers also consume the local operating system's datagram
 limit. SOCKS-level fragments (`FRAG != 0`) are dropped as permitted by
@@ -85,12 +108,26 @@ tunnel and its cooperating relay entrances retain their separate behavior.
 
 Proxy limits and lifecycle:
 
-- Each server admits 64 proxy connections, 256 streams, 64 UDP associations and
-  1,024 UDP destinations in total; each association allows 32 destinations.
-  Each authenticated QUIC connection permits 64 concurrent streams. The client
+- Each server admits 64 proxy connections, 64 aggregate TCP flows, 512 concurrent
+  record RPCs, 256 legacy TCP streams, 64 UDP associations and 1,024 UDP destinations
+  in total; each association allows 32 destinations. Each authenticated QUIC
+  connection permits 256 concurrent streams. The client
   admits 256 local sessions. Up to 32 OS DNS lookups may be in flight; a timed-out
   lookup retains its slot until the resolver actually returns. Pending connections retain the shared server
   admission budget and must authenticate within eight seconds.
+- Aggregate TCP has a 128-record / 16 MiB sequence window per direction and flow.
+  Payload records are at most 128 KiB. Each server has separate 32 MiB application
+  buffer budgets for upload and download, shared across flows. Upload admission
+  fails explicitly if its host buffer is exhausted, rather than indefinitely
+  holding later records while a missing record waits for memory. Download readers
+  wait for delivery credit. RPC data slots, progress queries and control commands
+  have separate quotas so recovery and cleanup remain schedulable under load.
+  These budgets are additional to the bounded QUIC transport buffers.
+- Closing a local flow schedules a bounded close RPC and retains its admission
+  slot until cleanup completes. Client shutdown drains close requests and releases
+  relay leases. The exit retains a flow for a ten-second resume grace after all
+  its observed QUIC paths close; abandoned and idle flows release target sockets,
+  record buffers and worker tasks. Exit progress is preserved across path changes.
 - `--max-rate-bps` caps the combined TCP/UDP proxy payload in both directions,
   across all proxy clients. Burst credit holds 10 ms of traffic, with a 128 KiB
   minimum (12.5 MB at 10 Gbit/s), avoiding refill-credit loss with millisecond
@@ -132,11 +169,15 @@ Proxy limits and lifecycle:
   multicast addresses remain blocked. Proxy access must be explicitly enabled
   on each desired exit.
 
-`mesh-status` advertises `proxy-tcp-v1` / `proxy-udp-v1` only when enabled, and
-includes live proxy connection, stream, association, destination and rejection
-counts. Local tests cover real QUIC/SOCKS sockets, selected and simultaneous
+`mesh-status` advertises `proxy-tcp-v1`, `proxy-bond-v1` and `proxy-udp-v1` only
+when enabled. It includes live aggregate-flow, RPC, retained application-buffer,
+connection, association, destination and rejection counts. Relay status includes
+active forward/return byte totals to verify cooperating paths carry payload. Local tests cover real QUIC/SOCKS sockets, selected and simultaneous
 exits, domain resolution, half-close, fragmented UDP, authentication, destination
-policy, exit failure and resource cleanup. Public-network performance and
+policy, exit failure and resource cleanup. Aggregate regressions verify one target
+connection across multiple server paths, relay loss during upload and download,
+silent-path quarantine and recovery, exact payload delivery, local resets,
+shutdown lease release and abandoned-flow buffer reclamation. Public-network performance and
 application-specific Clash acceptance remain separate validation work.
 
 ## Credentials and startup
