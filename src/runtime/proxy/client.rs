@@ -165,6 +165,13 @@ impl Path {
             _ => &self.control,
         }
     }
+    fn connected(&self) -> bool {
+        self.connection
+            .lock()
+            .expect("proxy connection")
+            .as_ref()
+            .is_some_and(|conn| conn.raw.close_reason().is_none())
+    }
     fn retire(&self) {
         self.retired
             .store(true, std::sync::atomic::Ordering::Release);
@@ -359,6 +366,65 @@ impl Pool {
         *cached = Some(connection.clone());
         Ok(connection)
     }
+    /// Authenticate optional paths before giving them download records. This
+    /// opens no destination socket and never delays SOCKS listener startup.
+    fn prepare_path(&self, id: &str, path: &Arc<Path>) {
+        if path.connected()
+            || path.failed.load(std::sync::atomic::Ordering::Acquire)
+            || path.retired.load(std::sync::atomic::Ordering::Acquire)
+        {
+            return;
+        }
+        let mut task = path.probe.lock().expect("path probe");
+        if task.as_ref().is_some_and(|task| !task.0.is_finished()) {
+            return;
+        }
+        let (identity, token, id, weak, ready) = (
+            self.identity.clone(),
+            self.token.clone(),
+            id.to_owned(),
+            Arc::downgrade(path),
+            self.ready.clone(),
+        );
+        *task = Some(AbortTask(tokio::spawn(async move {
+            let Some(path) = weak.upgrade() else {
+                return;
+            };
+            let _connecting = path.connecting.lock().await;
+            if path.connected() || path.retired.load(std::sync::atomic::Ordering::Acquire) {
+                return;
+            }
+            match Self::authenticate(&identity, &token, path.address, &id).await {
+                Ok(conn) => {
+                    let mut cached = path.connection.lock().expect("proxy connection");
+                    if path.retired.load(std::sync::atomic::Ordering::Acquire) {
+                        return;
+                    }
+                    path.rtt_us.store(
+                        conn.raw.rtt().as_micros() as u64,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                    *path.last_ok.lock().expect("path health") = Some(Instant::now());
+                    *cached = Some(conn);
+                    tracing::debug!(exit=%id, address=%path.address, "aggregate path prepared");
+                }
+                Err(error) => {
+                    path.failed
+                        .store(true, std::sync::atomic::Ordering::Release);
+                    *path.retry_after.lock().expect("path retry") =
+                        Some(Instant::now() + Duration::from_secs(1));
+                    tracing::debug!(exit=%id, address=%path.address, %error, "aggregate path preparation failed");
+                }
+            }
+            ready.notify_waiters();
+        })));
+    }
+    pub(super) async fn prepare_paths(&self, id: &str) -> Result<()> {
+        for path in self.paths(id).await? {
+            self.prepare_path(id, &path);
+        }
+        Ok(())
+    }
     fn probe(&self, id: &str, path: &Arc<Path>) {
         if path.retired.load(std::sync::atomic::Ordering::Acquire)
             || !path.failed.load(std::sync::atomic::Ordering::Acquire)
@@ -479,6 +545,7 @@ impl Pool {
             }
             for path in &paths {
                 self.probe(id, path);
+                self.prepare_path(id, path);
             }
             let rtt = |p: &Arc<Path>| p.rtt_us.load(std::sync::atomic::Ordering::Relaxed);
             let (interactive, avoid) = stream
@@ -518,7 +585,16 @@ impl Pool {
                 // messages to a slow relay just because its bulk queue is empty.
                 paths.sort_by_key(|p| p.rtt_us.load(std::sync::atomic::Ordering::Relaxed));
             }
+            let ready_download = matches!(op, super::bond::Operation::Pull { .. })
+                && paths.iter().any(|path| {
+                    path.connected() && !path.failed.load(std::sync::atomic::Ordering::Acquire)
+                });
             let chosen = paths.into_iter().find_map(|path| {
+                // A cold relay must not hold the next records behind its
+                // handshake while an authenticated path can deliver them now.
+                if ready_download && !path.connected() {
+                    return None;
+                }
                 if path.failed.load(std::sync::atomic::Ordering::Acquire)
                     || path
                         .retry_after
@@ -678,6 +754,9 @@ impl Pool {
             // Apply entrance changes even when all live RPCs are waiting for
             // target data. No new application request is needed to retire a path.
             let paths = Self::cache_paths(slot, routes.updates.borrow().clone());
+            for path in &paths {
+                self.prepare_path(id, path);
+            }
             let samples: Vec<_> = paths
                 .iter()
                 .map(|path| {
@@ -925,7 +1004,7 @@ pub async fn client(options: ClientOptions) -> Result<()> {
     for exit in selected_exits {
         let pool = pool.clone();
         discovery.spawn(async move {
-            let _ = pool.paths(&exit).await;
+            let _ = pool.prepare_paths(&exit).await;
         });
     }
     let mut refresh = tokio::time::interval(Duration::from_secs(15));

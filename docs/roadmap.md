@@ -89,7 +89,10 @@ Current protocol, commands and limits: [experimental runtime](runtime.md). Check
   service window instead of measuring each request's fraction of capacity;
   short buffered bursts cannot replace the sustained estimate. Deterministic
   regressions cover compressed/reordered ACKs, stretched ACKs, idle restart,
-  concurrent service, source pauses, cancellation and path replacement. These
+  concurrent service, source pauses, cancellation and path replacement. Optional
+  paths prepare authenticated connections in the background; an unresponsive cold
+  relay cannot hold downloads while a ready path is available. A regression
+  covers delivery, target-free preparation and shutdown cleanup. These
   implementation checks do not establish a WAN throughput or stability gain.
 
 - [x] v0.4.2: account for queued download work before a response arrives, so

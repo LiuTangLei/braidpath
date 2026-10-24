@@ -982,6 +982,54 @@ async fn queued_download_is_charged_before_the_reply_header_and_cancellation_rec
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn prepared_paths_do_not_open_targets_and_cold_relays_do_not_hold_downloads() {
+    let root = tempfile::tempdir().unwrap();
+    let root = root.path();
+    let (at, _server) = start(root, "a", None, true).await;
+    let identity = identity(root, "prepare-client");
+    let pool = client::Pool::new(identity.clone(), vec![node("a", at)], vec!["a".into()]).unwrap();
+    let blackhole = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let cold = blackhole.local_addr().unwrap();
+    pool.test_set_routes("a", vec![at, cold]);
+    pool.prepare_paths("a").await.unwrap();
+    timeout(Duration::from_secs(2), async {
+        while pool.transport_snapshot("a").len() != 1 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    empty(&identity, at).await;
+    let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = target.local_addr().unwrap();
+    let bytes = 4 * 1024 * 1024;
+    let send = Task(tokio::spawn(async move {
+        let (mut tcp, _) = target.accept().await.unwrap();
+        tcp.write_all(&vec![37; bytes]).await.unwrap();
+        tcp.shutdown().await.unwrap();
+    }));
+    let (listen, listener) = local_listener(pool.clone(), "a").await;
+    // A cold path's four-second connect timeout must not become a data stall.
+    timeout(Duration::from_secs(2), async {
+        let (mut tcp, status, _) = socks(listen, TCP, Address::Ip(address)).await;
+        assert_eq!(status, 0);
+        let mut received = Vec::new();
+        tcp.read_to_end(&mut received).await.unwrap();
+        assert_eq!(received, vec![37; bytes]);
+        tcp.shutdown().await.unwrap();
+    })
+    .await
+    .expect("download waited for an unready optional path");
+    pool.test_set_routes("a", vec![at]);
+    assert_eq!(pool.test_addresses("a").await, [at]);
+    drop(listener);
+    drop(send);
+    pool.shutdown().await;
+    empty(&identity, at).await;
+    assert!(pool.transport_snapshot("a").is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn failed_proxy_relay_is_reported_and_replaced_by_another_server() {
     let root = tempfile::tempdir().unwrap();
     let root = root.path();

@@ -187,6 +187,12 @@ Proxy limits and lifecycle:
   for future source bytes, cancelled work and replaced paths release their
   sampling state. Single-connection WAN goodput, pauses and retransmissions
   remain separate acceptance measurements; the 10 Gbit/s ceiling is unchanged.
+- Optional paths authenticate in the background when their relay leases become
+  available. This opens no destination TCP socket and does not hold up the local
+  SOCKS listeners. Ready download paths are preferred over cold paths so a
+  first-use handshake cannot hold the download head behind later records.
+  Retirement and shutdown cancel pending preparation through the path's task
+  owner; preparation uses the same connection lock as foreground requests.
 - Closing a local flow schedules a bounded close RPC and retains its admission
   slot until cleanup completes. Client shutdown drains close requests and releases
   relay leases. The exit retains a flow for a ten-second resume grace after all
