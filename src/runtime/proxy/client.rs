@@ -120,6 +120,7 @@ struct Path {
     download: Arc<Semaphore>,
     control: Arc<Semaphore>,
     progress: Arc<Semaphore>,
+    rtt_us: std::sync::atomic::AtomicU64,
     retry_after: Mutex<Option<Instant>>,
     failed: std::sync::atomic::AtomicBool,
     probe: Mutex<Option<AbortTask>>,
@@ -133,6 +134,7 @@ impl Path {
             download: Arc::new(Semaphore::new(128)),
             control: Arc::new(Semaphore::new(4)),
             progress: Arc::new(Semaphore::new(128)),
+            rtt_us: std::sync::atomic::AtomicU64::new(200_000),
             retry_after: Mutex::new(None),
             failed: std::sync::atomic::AtomicBool::new(false),
             probe: Mutex::new(None),
@@ -400,7 +402,16 @@ impl Pool {
             for path in &paths {
                 self.probe(id, path);
             }
-            paths.sort_by_key(|p| std::cmp::Reverse(p.permits(&op).available_permits()));
+            if matches!(
+                op,
+                super::bond::Operation::Put { .. } | super::bond::Operation::Pull { .. }
+            ) {
+                paths.sort_by_key(|p| std::cmp::Reverse(p.permits(&op).available_permits()));
+            } else {
+                // Progress gates every data path: do not distribute these small
+                // messages to a slow relay just because its bulk queue is empty.
+                paths.sort_by_key(|p| p.rtt_us.load(std::sync::atomic::Ordering::Relaxed));
+            }
             let chosen = paths.into_iter().find_map(|path| {
                 if path.failed.load(std::sync::atomic::Ordering::Acquire)
                     || path
@@ -427,6 +438,10 @@ impl Pool {
             let mut used_connection = None;
             let result = async {
                 let conn = self.connect(id, &path).await?;
+                path.rtt_us.store(
+                    conn.raw.rtt().as_micros().min(u64::MAX as u128) as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
                 used_connection = Some(conn.clone());
                 super::bond::rpc(&conn.raw, key, &op).await
             }
@@ -474,6 +489,30 @@ impl Pool {
                 }
             }
         }
+    }
+    pub(super) fn transport_snapshot(
+        &self,
+        id: &str,
+    ) -> BTreeMap<SocketAddr, (u64, u64, u64, u64)> {
+        self.slots[id]
+            .paths
+            .lock()
+            .expect("proxy paths")
+            .iter()
+            .filter_map(|(address, path)| {
+                let cached = path.connection.try_lock().ok()?;
+                let stats = cached.as_ref()?.raw.stats().path;
+                Some((
+                    *address,
+                    (
+                        stats.rtt.as_micros().min(u64::MAX as u128) as u64,
+                        stats.cwnd,
+                        stats.sent_packets,
+                        stats.lost_packets,
+                    ),
+                ))
+            })
+            .collect()
     }
     #[cfg(test)]
     pub(super) fn test_path_failed(&self, id: &str, address: SocketAddr) -> bool {

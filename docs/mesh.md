@@ -122,6 +122,9 @@ Proxy limits and lifecycle:
   holding later records while a missing record waits for memory. Download readers
   wait for delivery credit. RPC data slots, progress queries and control commands
   have separate quotas so recovery and cleanup remain schedulable under load.
+  Small progress/control operations prefer the lowest observed QUIC RTT; bulk
+  records use available data slots across paths. Per-flow debug summaries include
+  path payload bytes and cumulative native RTT, congestion window and loss counts.
   These budgets are additional to the bounded QUIC transport buffers.
 - Closing a local flow schedules a bounded close RPC and retains its admission
   slot until cleanup completes. Client shutdown drains close requests and releases
