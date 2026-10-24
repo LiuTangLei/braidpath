@@ -3487,7 +3487,7 @@ async fn serve_with_budgets(
             incoming=endpoint.accept()=>{
                 let Some(incoming)=incoming else{break};
                 let Ok(permit)=pending_connections.clone().try_acquire_owned() else{incoming.refuse();continue};
-                let sessions=sessions.clone(); let secret=secret.clone(); let target=options.target; let settings=ServerSessionSettings{max_rate:options.max_rate,adaptive_fec_retention:options.adaptive_fec_retention,mesh:mesh.clone(),data_connections:data_connections.clone(),proxy:options.proxy.clone(),tcp_budget:tcp_budget.clone(),tcp:tcp::Targets{fixed:options.tcp_target,proxy:options.stream_proxy}}; let metrics=options.stats.clone();
+                let sessions=sessions.clone(); let secret=secret.clone(); let target=options.target; let settings=ServerSessionSettings{max_rate:options.max_rate,adaptive_fec_retention:options.adaptive_fec_retention,mesh:mesh.clone(),data_connections:data_connections.clone(),proxy:options.proxy.clone(),tcp_budget:tcp_budget.clone(),tcp:tcp::Targets{fixed:options.tcp_target,proxy:options.stream_proxy,allow_associations:mesh.is_none() && options.proxy.is_none()}}; let metrics=options.stats.clone();
                 tasks.spawn(async move {
                     let mut diagnostic=stats::ConnectionTrace::new(metrics.clone(),incoming.remote_address(),None,"incoming");
                     let result=server_connection(incoming,permit,sessions,secret,target,settings,metrics,&mut diagnostic).await;

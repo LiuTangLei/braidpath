@@ -664,10 +664,13 @@ impl Sender {
         true
     }
     /// Returns newly released retained bytes and whether the peer reported a
-    /// duplicate, or `None` for an acknowledgment of data never sent.
+    /// duplicate, or `None` for unsent data or an oversized receive window.
     pub fn on_ack(&mut self, ack: &Ack, now: Instant) -> Option<(u64, bool)> {
         let sent_end = self.next + u64::from(self.fin_sent && self.fin == Some(self.next));
-        if ack.cumulative > sent_end || ack.ranges.last().is_some_and(|r| r.1 > sent_end) {
+        if ack.cumulative > sent_end
+            || ack.ranges.last().is_some_and(|r| r.1 > sent_end)
+            || ack.limit > ack.cumulative.saturating_add(MAX_WINDOW)
+        {
             return None;
         }
         self.open_pending = false;
@@ -1123,6 +1126,38 @@ impl Receiver {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn oversized_peer_window_is_rejected_before_credit_changes() {
+        let now = Instant::now();
+        let mut sender = Sender::new(false);
+        for limit in [u64::MAX, MAX_OFFSET, MAX_WINDOW + 1] {
+            assert!(
+                sender
+                    .on_ack(
+                        &Ack {
+                            limit,
+                            ..Default::default()
+                        },
+                        now
+                    )
+                    .is_none()
+            );
+            assert_eq!(sender.limit(), INITIAL_WINDOW);
+        }
+        assert!(
+            sender
+                .on_ack(
+                    &Ack {
+                        limit: MAX_WINDOW,
+                        ..Default::default()
+                    },
+                    now
+                )
+                .is_some()
+        );
+        assert_eq!(sender.limit(), MAX_WINDOW);
+    }
 
     #[test]
     fn short_tail_probe_preserves_original_loss_timer_and_is_used_once() {

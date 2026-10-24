@@ -135,13 +135,32 @@ impl Connector {
             wake: Arc::new(Notify::new()),
             closed: AtomicBool::new(self.is_closed()),
         });
-        if let Some(old) = self.0.active.send_replace(Some(channel.clone())) {
-            old.close();
-        }
+        self.publish_channel(&channel);
         Registration {
             connector: self.clone(),
             channel,
             commands: receiver,
+        }
+    }
+    fn publish_channel(&self, channel: &Arc<Channel>) {
+        if let Some(old) = self.0.active.send_replace(Some(channel.clone())) {
+            old.close();
+        }
+        // close() may have run after the channel captured stopped=false but
+        // before publication. Retire that channel as well as an older one.
+        if self.is_closed() {
+            channel.close();
+            self.0.active.send_if_modified(|active| {
+                if active
+                    .as_ref()
+                    .is_some_and(|current| Arc::ptr_eq(current, channel))
+                {
+                    *active = None;
+                    true
+                } else {
+                    false
+                }
+            });
         }
     }
     pub(crate) async fn open(&self, target: Destination) -> anyhow::Result<Flow> {
@@ -232,6 +251,9 @@ impl Flow {
         self.bound
     }
     pub(crate) async fn run(mut self, tcp: TcpStream) -> anyhow::Result<()> {
+        // Before Attach succeeds, any failure or cancelled channel send must
+        // reset the accepted socket rather than imply a complete empty stream.
+        let _ = socket2::SockRef::from(&tcp).set_linger(Some(Duration::ZERO));
         anyhow::ensure!(
             !self.channel.closed.load(Ordering::Acquire),
             "aggregate flow belongs to a retired generation"
@@ -288,6 +310,9 @@ pub(super) struct Listeners {
 pub(super) struct Targets {
     pub fixed: Option<SocketAddr>,
     pub proxy: Option<proxy::Access>,
+    /// Only standalone legacy entrances use this UDP adapter. Mesh proxies
+    /// retain the native proxy association and host-wide DNS/socket budgets.
+    pub allow_associations: bool,
 }
 
 pub(super) enum Io {
@@ -607,6 +632,7 @@ impl Mux {
         let targets = Targets {
             fixed: targets.fixed.filter(|_| policy.streams),
             proxy: targets.proxy.filter(|_| policy.proxy),
+            allow_associations: targets.allow_associations && policy.proxy,
         };
         (targets.fixed.is_some() || targets.proxy.is_some()).then(|| {
             let mut mux = Self::new(Listeners::default(), targets, policy, scope);
@@ -1057,6 +1083,10 @@ impl Mux {
                     self.stats.udp_datagrams_dropped += 1;
                 }
             }
+            return;
+        }
+        if !self.targets.allow_associations {
+            self.stats.udp_datagrams_dropped += 1;
             return;
         }
         let Some(access) = self.targets.proxy else {
@@ -1605,13 +1635,12 @@ async fn write_loop(
                 let written = tokio::select! {
                     biased;
                     _ = reset.notified() => break false,
-                    written = async { if let Some(rate) = &lease.rate { rate.acquire(data.len()).await; } write.write_all(&data).await } => written,
+                    written = write_payload(id, &mut write, &data, &lease, &events) => written,
                 };
                 if written.is_err() {
                     let _ = events.send(Io::Failed(id));
                     break false;
                 }
-                let _ = events.send(Io::Written(id, data.len()));
             }
             Some(WriteOp::Finish) => break write.shutdown().await.is_ok(),
             None => break false,
@@ -1623,10 +1652,219 @@ async fn write_loop(
     }
 }
 
+async fn write_payload<W: tokio::io::AsyncWrite + Unpin>(
+    id: u32,
+    write: &mut W,
+    data: &[u8],
+    lease: &Lease,
+    events: &mpsc::UnboundedSender<Io>,
+) -> io::Result<()> {
+    // Filling a receive hole can release a contiguous block larger than the
+    // host rate bucket's maximum burst. A whole-block request could never be
+    // granted; bounded chunks also release receive credit as writes progress.
+    for chunk in data.chunks(READ_CHUNK) {
+        if let Some(rate) = &lease.rate {
+            rate.acquire(chunk.len()).await;
+        }
+        write.write_all(chunk).await?;
+        events
+            .send(Io::Written(id, chunk.len()))
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "stream mux ended"))?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::runtime::{MAX_PATHS, stats};
+
+    fn proxy_policy() -> Policy {
+        Policy {
+            max_message_bytes: 1000,
+            streams: false,
+            proxy: true,
+            adaptive: false,
+            capacity_probe_bps: 0,
+            probe_guided_recovery: false,
+            latency_target_ms: 20,
+            group_rates: [10_000_000; MAX_PATHS],
+            receiver_feedback: true,
+            quality_schedule: false,
+            fec: 0,
+            fec_repairs: 1,
+            small_fec_bytes: 0,
+            mixed_fec: false,
+            redundancy: 0,
+            rate: 10_000_000,
+            block_ms: 25,
+            queue_ms: 100,
+        }
+    }
+
+    #[tokio::test]
+    async fn oversized_peer_window_resets_the_flow_without_overflowing_read_credit() {
+        let policy = proxy_policy();
+        let metrics = stats::Metrics::new("client");
+        let mut mux = Mux::new(
+            Listeners::default(),
+            Targets::default(),
+            &policy,
+            metrics.scope("bad-window", stats::FORWARD),
+        );
+        assert!(mux.open(1, false));
+        mux.streams.get_mut(&1).unwrap().reads = Some(Arc::new(Semaphore::new(0)));
+        mux.receive(Record {
+            flow: stream::ack_flow(1),
+            id: 1,
+            payload: Frame::Ack(stream::Ack {
+                limit: u64::MAX,
+                ..Default::default()
+            })
+            .encode(),
+        });
+        assert!(mux.streams.is_empty());
+        assert_eq!(mux.stats.reset_local, 1);
+        assert_eq!(mux.budget.snapshot(), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn a_failed_flow_attach_resets_the_accepted_socket() {
+        for pre_closed in [true, false] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let (client, peer) = tokio::join!(
+                TcpStream::connect(listener.local_addr().unwrap()),
+                listener.accept()
+            );
+            let tcp = client.unwrap();
+            let (mut peer, _) = peer.unwrap();
+            let (commands, receiver) = mpsc::channel(1);
+            drop(receiver);
+            let channel = Arc::new(Channel {
+                commands,
+                wake: Arc::new(Notify::new()),
+                closed: AtomicBool::new(pre_closed),
+            });
+            let budget = Arc::new(Budget::default());
+            let lease = budget.flow().await;
+            let flow = Flow {
+                channel: channel.clone(),
+                id: 1,
+                bound: "0.0.0.0:0".parse().unwrap(),
+                completion: None,
+                _cancel: CancelGuard(Arc::new(Cancel {
+                    cancelled: AtomicBool::new(false),
+                    wake: channel.wake.clone(),
+                })),
+                _lease: lease,
+            };
+            assert!(flow.run(tcp).await.is_err());
+            let error = timeout(Duration::from_secs(1), peer.read(&mut [0; 1]))
+                .await
+                .unwrap()
+                .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::ConnectionReset);
+            assert_eq!(budget.snapshot(), (0, 0));
+        }
+    }
+
+    #[test]
+    fn connector_registration_rechecks_a_close_between_creation_and_publication() {
+        for close_before_publish in [true, false] {
+            let connector = Connector::new(Arc::new(Budget::default()));
+            // The channel captured stopped=false, before the competing close.
+            let (commands, _receiver) = mpsc::channel(1);
+            let channel = Arc::new(Channel {
+                commands,
+                wake: Arc::new(Notify::new()),
+                closed: AtomicBool::new(false),
+            });
+            if close_before_publish {
+                connector.close();
+            }
+            connector.publish_channel(&channel);
+            if !close_before_publish {
+                connector.close();
+            }
+            assert!(connector.is_closed());
+            assert!(channel.closed.load(Ordering::Acquire));
+            assert!(connector.0.active.borrow().is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn production_aggregate_rejects_legacy_udp_associations_before_socket_or_dns_work() {
+        let policy = proxy_policy();
+        let metrics = stats::Metrics::new("server");
+        let budget = Arc::new(Budget::default());
+        let mut mux = Mux::server(
+            Targets {
+                fixed: None,
+                proxy: Some(proxy::Access {
+                    allow_private: true,
+                }),
+                allow_associations: false,
+            },
+            &policy,
+            metrics.scope("no-legacy-udp", stats::RETURN),
+            budget.clone(),
+        )
+        .unwrap();
+        let mut payload = Destination::Ip("127.0.0.1:9".parse().unwrap()).encode();
+        payload.push(7);
+        for id in 1..=128 {
+            mux.receive(Record {
+                flow: associate::FLAG | id,
+                id: u64::from(id),
+                payload: payload.clone(),
+            });
+        }
+        assert!(mux.associations.is_empty());
+        assert!(mux.tasks.is_empty());
+        assert_eq!(mux.stats.udp_associations, 0);
+        assert_eq!(mux.stats.udp_datagrams_dropped, 128);
+        assert_eq!(budget.snapshot(), (0, 0));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reassembled_write_larger_than_rate_burst_makes_bounded_progress() {
+        use tokio::io::AsyncReadExt;
+
+        let budget = Budget::with_rate(Arc::new(crate::runtime::proxy::Rate::new(64_000)));
+        let lease = budget.try_flow().unwrap();
+        let size = READ_CHUNK * 3;
+        let (mut writer, mut reader) = tokio::io::duplex(size);
+        let (events, mut received) = mpsc::unbounded_channel();
+        let task = tokio::spawn(async move {
+            write_payload(1, &mut writer, &vec![7; size], &lease, &events)
+                .await
+                .unwrap();
+        });
+        // The minimum burst grants two chunks. The reassembled block is larger
+        // than that burst, so the third chunk must wait for newly earned credit.
+        for _ in 0..2 {
+            let event = timeout(Duration::from_secs(1), received.recv())
+                .await
+                .expect("initial bounded writes stalled")
+                .unwrap();
+            assert!(matches!(event, Io::Written(1, READ_CHUNK)));
+        }
+        assert!(!task.is_finished());
+        assert!(received.try_recv().is_err());
+        tokio::time::advance(Duration::from_secs(9)).await;
+        timeout(Duration::from_secs(1), task)
+            .await
+            .expect("a block larger than the burst never completed")
+            .unwrap();
+        assert!(matches!(
+            received.recv().await,
+            Some(Io::Written(1, READ_CHUNK))
+        ));
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes).await.unwrap();
+        assert_eq!(bytes, vec![7; size]);
+        assert_eq!(budget.snapshot(), (0, 0));
+    }
 
     #[test]
     fn addressed_stream_ids_survive_data_and_ack_flow_tags() {
