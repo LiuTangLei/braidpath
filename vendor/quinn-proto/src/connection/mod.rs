@@ -948,6 +948,11 @@ impl Connection {
         }
 
         self.app_limited = buf.is_empty() && !congestion_blocked;
+        if self.app_limited {
+            self.path
+                .congestion
+                .on_app_limited(self.path.in_flight.bytes);
+        }
 
         // Send MTU probe if necessary
         if buf.is_empty() && self.state.is_established() {
@@ -1618,6 +1623,14 @@ impl Connection {
         if info.ack_eliciting && self.path.challenge.is_none() {
             // Only pass ACKs to the congestion controller if we are not validating the current
             // path, so as to ignore any ACKs from older paths still coming in.
+            if info.path_generation == self.path.generation() {
+                self.path.congestion.on_packet_acked(
+                    now,
+                    info.time_sent,
+                    info.size.into(),
+                    info.congestion_state,
+                );
+            }
             self.path.congestion.on_ack(
                 now,
                 info.time_sent,

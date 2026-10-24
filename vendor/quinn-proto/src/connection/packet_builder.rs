@@ -223,10 +223,18 @@ impl PacketBuilder {
             false => 0,
         };
 
+        let congestion_state = if ack_eliciting {
+            conn.path
+                .congestion
+                .on_packet_sent(now, conn.path.in_flight.bytes)
+        } else {
+            None
+        };
         let packet = SentPacket {
             path_generation: conn.path.generation(),
             largest_acked: sent.largest_acked,
             time_sent: now,
+            congestion_state,
             size,
             ack_eliciting,
             retransmits: sent.retransmits,

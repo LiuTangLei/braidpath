@@ -57,3 +57,26 @@ marked application-limited may raise the estimate but cannot lower it. Two
 deterministic regressions cover peak expiry and the application-limited rule.
 This corrects filter aging; it does not establish that all WAN loss is caused
 by the estimator or change the configured application bandwidth ceiling.
+
+The delivery estimator now captures delivered-byte and send/ACK clock state for
+individual ACK-eliciting packets, using the flight-sampling model described in
+<https://datatracker.ietf.org/doc/html/draft-cheng-iccrg-delivery-rate-estimation-02>.
+It measures the entire acknowledged delivery interval divided by the larger of
+its send and ACK spans, and retains the send-time application-limited marker.
+This is an independently written local sampling correction, not a BBRv3 upgrade
+or an assertion that the expired experimental draft is a published standard.
+An inline snapshot uses at most 32 bytes, with no per-packet heap allocation or
+separate map; recovery drops it on ACK, loss or packet-space disposal. The native
+sent-packet size budget grows from 128 to 160 bytes and remains checked. Packets
+from another path generation cannot contaminate the sampler after migration.
+
+The first RTT sample establishes the probe clock instead of triggering an
+immediate startup probe. A busy drain phase no longer advances its cycle index
+while retaining the previous gain. Ordinary delivery also ages the extra ACK
+aggregation window; its elapsed-byte arithmetic uses a wide intermediate so a
+long-idle connection cannot overflow. Regressions cover ACK compression after
+an unrelated send burst, stretched and reordered ACKs, idle restart, startup,
+drain-phase retention and ACK-aggregation expiry. Startup window growth also
+compares the current window against its target, correcting a comparison of the
+unitless gain against a byte count that otherwise allowed continued growth
+after the target was reached; a bounded-growth regression covers this.

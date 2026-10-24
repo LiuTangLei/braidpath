@@ -285,6 +285,8 @@ pub(super) struct SentPacket {
     pub(super) path_generation: u64,
     /// The time the packet was sent.
     pub(super) time_sent: Instant,
+    /// Controller delivery snapshot for this exact transmission.
+    pub(super) congestion_state: Option<crate::congestion::PacketState>,
     /// The number of bytes sent in the packet, not including UDP or IP overhead, but including QUIC
     /// framing overhead. Zero if this packet is not counted towards congestion control, i.e. not an
     /// "in flight" packet.
@@ -1114,8 +1116,9 @@ mod test {
 
     #[test]
     fn sent_packet_size() {
-        // The tracking state of sent packets should be minimal, and not grow
-        // over time.
-        assert!(std::mem::size_of::<SentPacket>() <= 128);
+        // The original 128-byte recovery budget plus an inline delivery
+        // snapshot. No packet map or per-packet allocation is added by BBR.
+        assert!(std::mem::size_of::<Option<crate::congestion::PacketState>>() <= 32);
+        assert!(std::mem::size_of::<SentPacket>() <= 160);
     }
 }

@@ -184,17 +184,18 @@ impl Bbr {
         }
 
         if should_advance_gain_cycling {
-            self.current_cycle_offset = (self.current_cycle_offset + 1) % K_PACING_GAIN.len() as u8;
-            self.last_cycle_start = Some(now);
+            let next_offset = (self.current_cycle_offset + 1) % K_PACING_GAIN.len() as u8;
             // Stay in low gain mode until the target BDP is hit.  Low gain mode
             // will be exited immediately when the target BDP is achieved.
             if DRAIN_TO_TARGET
                 && self.pacing_gain < 1.0
-                && (K_PACING_GAIN[self.current_cycle_offset as usize] - 1.0).abs() < f32::EPSILON
+                && (K_PACING_GAIN[next_offset as usize] - 1.0).abs() < f32::EPSILON
                 && in_flight > self.get_target_cwnd(1.0)
             {
                 return;
             }
+            self.current_cycle_offset = next_offset;
+            self.last_cycle_start = Some(now);
             self.pacing_gain = K_PACING_GAIN[self.current_cycle_offset as usize];
         }
     }
@@ -324,7 +325,7 @@ impl Bbr {
         // time.
         if self.is_at_full_bandwidth {
             self.cwnd = target_window.min(self.cwnd + bytes_acked);
-        } else if (self.cwnd_gain < target_window as f32) || (self.acked_bytes < self.init_cwnd) {
+        } else if (self.cwnd < target_window) || (self.acked_bytes < self.init_cwnd) {
             // If the connection is not yet out of startup phase, do not decrease
             // the window.
             self.cwnd += bytes_acked;
@@ -392,23 +393,41 @@ impl Bbr {
 }
 
 impl Controller for Bbr {
-    fn on_sent(&mut self, now: Instant, bytes: u64, last_packet_number: u64) {
+    fn on_sent(&mut self, _now: Instant, _bytes: u64, last_packet_number: u64) {
         self.max_sent_packet_number = last_packet_number;
-        self.max_bandwidth.on_sent(now, bytes);
+    }
+
+    fn on_packet_sent(&mut self, now: Instant, in_flight: u64) -> Option<super::PacketState> {
+        Some(self.max_bandwidth.on_sent(now, in_flight))
+    }
+
+    fn on_packet_acked(
+        &mut self,
+        now: Instant,
+        sent: Instant,
+        bytes: u64,
+        state: Option<super::PacketState>,
+    ) {
+        self.max_bandwidth.on_ack(now, sent, bytes, state);
+    }
+
+    fn on_app_limited(&mut self, in_flight: u64) {
+        self.max_bandwidth.on_app_limited(in_flight);
     }
 
     fn on_ack(
         &mut self,
         now: Instant,
-        sent: Instant,
+        _sent: Instant,
         bytes: u64,
         app_limited: bool,
         rtt: &RttEstimator,
     ) {
-        self.max_bandwidth
-            .on_ack(now, sent, bytes, self.round_count, app_limited);
         self.acked_bytes += bytes;
-        if self.is_min_rtt_expired(now, app_limited) || self.min_rtt > rtt.min() {
+        if self.min_rtt.is_zero() {
+            self.min_rtt = rtt.min();
+            self.probe_rtt_last_started_at = Some(now);
+        } else if self.is_min_rtt_expired(now, app_limited) || self.min_rtt > rtt.min() {
             self.min_rtt = rtt.min();
         }
     }
@@ -421,13 +440,17 @@ impl Controller for Bbr {
         largest_packet_num_acked: Option<u64>,
     ) {
         let bytes_acked = self.max_bandwidth.bytes_acked_this_window();
+        self.max_bandwidth.end_acks(self.round_count);
+        let sample_app_limited = self
+            .max_bandwidth
+            .sample_app_limited()
+            .unwrap_or(app_limited);
         let excess_acked = self.ack_aggregation.update_ack_aggregation_bytes(
             bytes_acked,
             now,
             self.round_count,
             self.max_bandwidth.get_estimate(),
         );
-        self.max_bandwidth.end_acks(self.round_count, app_limited);
         if let Some(largest_acked_packet) = largest_packet_num_acked {
             self.max_acked_packet_number = largest_acked_packet;
         }
@@ -449,7 +472,7 @@ impl Controller for Bbr {
         }
 
         if is_round_start && !self.is_at_full_bandwidth {
-            self.check_if_full_bw_reached(app_limited);
+            self.check_if_full_bw_reached(sample_app_limited);
         }
 
         self.maybe_exit_startup_or_drain(now, in_flight);
@@ -563,11 +586,12 @@ impl AckAggregationState {
     ) -> u64 {
         // Compute how many bytes are expected to be delivered, assuming max
         // bandwidth is correct.
-        let expected_bytes_acked = max_bandwidth
+        let expected_bytes_acked = (u128::from(max_bandwidth)
             * now
                 .saturating_duration_since(self.aggregation_epoch_start_time.unwrap_or(now))
-                .as_micros() as u64
-            / 1_000_000;
+                .as_micros()
+            / 1_000_000)
+            .min(u128::from(u64::MAX)) as u64;
 
         // Reset the current aggregation epoch as soon as the ack arrival rate is
         // less than or equal to the max bandwidth.
@@ -575,6 +599,7 @@ impl AckAggregationState {
             // Reset to start measuring a new aggregation epoch.
             self.aggregation_epoch_bytes = newly_acked_bytes;
             self.aggregation_epoch_start_time = Some(now);
+            self.max_ack_height.update_max(round, 0);
             return 0;
         }
 
@@ -653,3 +678,138 @@ const K_MAX_INITIAL_CONGESTION_WINDOW: u64 = 200;
 
 const PROBE_RTT_BASED_ON_BDP: bool = true;
 const DRAIN_TO_TARGET: bool = true;
+
+#[cfg(test)]
+mod regression_tests {
+    use super::*;
+
+    #[test]
+    fn startup_stops_growing_an_already_satisfied_window() {
+        let mut controller = Bbr::new(Arc::new(BbrConfig::default()), 1200);
+        controller.acked_bytes = controller.init_cwnd;
+        controller.cwnd = controller.get_target_cwnd(controller.cwnd_gain) + 1200;
+        let window = controller.cwnd;
+        for _ in 0..100 {
+            controller.calculate_cwnd(1200, 0);
+        }
+        assert_eq!(controller.cwnd, window);
+    }
+
+    #[test]
+    fn a_long_idle_period_expires_ack_aggregation_without_overflow() {
+        let mut aggregation = AckAggregationState::default();
+        let start = Instant::now();
+        aggregation.update_ack_aggregation_bytes(1200, start, 1, 1_250_000_000);
+        assert_eq!(
+            aggregation.update_ack_aggregation_bytes(
+                1200,
+                start + Duration::from_secs(24 * 3600),
+                20,
+                1_250_000_000
+            ),
+            0
+        );
+        assert_eq!(aggregation.max_ack_height.get(), 0);
+    }
+
+    #[test]
+    fn compressed_acks_do_not_use_a_later_unrelated_send_burst() {
+        let mut controller = Bbr::new(Arc::new(BbrConfig::default()), 1200);
+        let start = Instant::now();
+        let rtt = RttEstimator::new(Duration::from_millis(100));
+        let mut flight = Vec::new();
+        for number in 0..100 {
+            let sent = start + Duration::from_millis(number);
+            let state = controller.on_packet_sent(sent, number * 1200);
+            controller.on_sent(sent, 1200, number);
+            flight.push((sent, state));
+        }
+        // A later send burst must not describe the earlier flight now being ACKed.
+        for number in 100..102 {
+            let sent = start + Duration::from_millis(150) + Duration::from_micros(number - 100);
+            controller.on_packet_sent(sent, number * 1200);
+            controller.on_sent(sent, 1200, number);
+        }
+        for (number, (sent, state)) in flight.into_iter().enumerate() {
+            let now = start + Duration::from_millis(200) + Duration::from_micros(number as u64);
+            controller.on_packet_acked(now, sent, 1200, state);
+            controller.on_ack(now, sent, 1200, false, &rtt);
+            controller.on_end_acks(
+                now,
+                (101 - number as u64) * 1200,
+                false,
+                Some(number as u64),
+            );
+        }
+        let measured = controller.max_bandwidth.get_estimate();
+        assert!(
+            (400_000..=1_500_000).contains(&measured),
+            "compressed ACK estimate: {measured}"
+        );
+    }
+
+    #[test]
+    fn first_rtt_sample_does_not_interrupt_startup_with_a_probe() {
+        let mut controller = Bbr::new(Arc::new(BbrConfig::default()), 1200);
+        let sent = Instant::now();
+        let state = controller.on_packet_sent(sent, 0);
+        controller.on_sent(sent, 1200, 1);
+        let now = sent + Duration::from_millis(100);
+        controller.on_packet_acked(now, sent, 1200, state);
+        controller.on_ack(
+            now,
+            sent,
+            1200,
+            false,
+            &RttEstimator::new(Duration::from_millis(100)),
+        );
+        controller.on_end_acks(now, 0, false, Some(1));
+        assert_eq!(controller.mode, Mode::Startup);
+        assert!(!controller.is_min_rtt_expired(now + Duration::from_secs(9), false));
+        assert!(controller.is_min_rtt_expired(now + Duration::from_secs(11), false));
+    }
+
+    #[test]
+    fn a_busy_drain_phase_does_not_skip_neutral_probe_phases() {
+        let mut controller = Bbr::new(Arc::new(BbrConfig::default()), 1200);
+        let start = Instant::now();
+        controller.mode = Mode::ProbeBw;
+        controller.current_cycle_offset = 1;
+        controller.pacing_gain = K_PACING_GAIN[1];
+        controller.min_rtt = Duration::from_millis(100);
+        controller.last_cycle_start = Some(start);
+        let target = controller.get_target_cwnd(1.0);
+        for round in 2..5 {
+            controller
+                .update_gain_cycle_phase(start + Duration::from_millis(round * 100), target * 2);
+            assert_eq!(controller.current_cycle_offset, 1);
+            assert_eq!(controller.pacing_gain, 0.75);
+        }
+        controller.update_gain_cycle_phase(start + Duration::from_millis(500), target / 2);
+        assert_eq!(controller.current_cycle_offset, 2);
+        assert_eq!(controller.pacing_gain, 1.0);
+    }
+
+    #[test]
+    fn an_ack_burst_does_not_keep_extra_window_after_normal_delivery() {
+        let mut aggregation = AckAggregationState::default();
+        let start = Instant::now();
+        aggregation.update_ack_aggregation_bytes(1_000_000, start, 1, 1_000_000);
+        aggregation.update_ack_aggregation_bytes(
+            1_000_000,
+            start + Duration::from_millis(1),
+            1,
+            1_000_000,
+        );
+        assert!(aggregation.max_ack_height.get() > 1_000_000);
+        for round in 2..=15 {
+            aggregation.update_ack_aggregation_bytes(
+                1000,
+                start + Duration::from_secs(round),
+                round,
+                1_000_000,
+            );
+        }
+        assert_eq!(aggregation.max_ack_height.get(), 0);
+    }
+}

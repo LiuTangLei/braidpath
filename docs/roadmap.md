@@ -1,6 +1,6 @@
 # Roadmap
 
-The initial implementation prioritizes latency and useful throughput, with BBR as the only runtime congestion controller. CPU-efficiency tuning comes later and is not an acceptance gate for the current increment; correctness and bounded queue/memory behavior remain required.
+The initial implementation prioritizes latency and useful throughput, with BBR as the default runtime congestion controller. CPU-efficiency tuning comes later and is not an acceptance gate for the current increment; correctness and bounded queue/memory behavior remain required.
 
 The stages below are ordered by dependency. Each stage produces a usable baseline or an explicit decision before increasing scope. Checked items describe the current source tree; unchecked items are future work. Run records remain local.
 
@@ -80,6 +80,17 @@ Current protocol, commands and limits: [experimental runtime](runtime.md). Check
 **Current increment:** adaptive mode is experimental and opt-in. Round robin, XOR block size 4, 3 ms block closing and the existing 30% repair setting remain unchanged defaults. The source implements the mechanisms above; no sustained WAN, capacity-aggregation or deployment result is implied by a checked implementation item.
 
 ## M4 — Reliable flows and application adapters
+
+- [x] v0.4.3: replace adjacent-ACK BBR sampling with per-packet flight delivery
+  context, retain application-limited samples correctly, and correct initial RTT
+  probing, queue-drain phase advancement and ACK-burst window aging. Inline
+  snapshots are bounded and released with native packet recovery. Proxy clients
+  return to BBR. Download scheduling combines concurrent payloads in one path
+  service window instead of measuring each request's fraction of capacity;
+  short buffered bursts cannot replace the sustained estimate. Deterministic
+  regressions cover compressed/reordered ACKs, stretched ACKs, idle restart,
+  concurrent service, source pauses, cancellation and path replacement. These
+  implementation checks do not establish a WAN throughput or stability gain.
 
 - [x] v0.4.2: account for queued download work before a response arrives, so
   expected-arrival scheduling sees requests awaiting connection/stream admission

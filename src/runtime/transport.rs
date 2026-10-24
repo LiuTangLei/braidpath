@@ -61,6 +61,7 @@ impl ProxyTelemetry {
             sent_packets = stats.path.sent_packets, lost_packets = stats.path.lost_packets,
             lost_bytes = stats.path.lost_bytes, congestion_events = stats.path.congestion_events,
             udp_tx_bytes = stats.udp_tx.bytes, udp_rx_bytes = stats.udp_rx.bytes,
+            pacing_bps = conn.congestion_state().metrics().pacing_rate,
             "proxy transport counters"
         );
     }
@@ -324,9 +325,7 @@ pub(crate) fn proxy_client(remote: SocketAddr, ca: &Path) -> Result<Endpoint> {
         remote,
         ca,
         None,
-        // Proxy uploads need loss-responsive pacing on the shared uplink.
-        // This choice does not change the server's download controller.
-        Congestion::Cubic,
+        Congestion::Bbr,
         None,
         DEFAULT_DATAGRAM_SEND_BUFFER_BYTES,
         super::proxy::ALPN,
@@ -465,8 +464,18 @@ mod tests {
                 });
             let outgoing = outgoing.unwrap();
             let incoming = incoming.unwrap();
-            assert!(outgoing.congestion_state().metrics().ssthresh.is_some());
-            assert!(incoming.congestion_state().metrics().ssthresh.is_none());
+            assert!(
+                outgoing
+                    .congestion_state()
+                    .into_any()
+                    .is::<quinn::congestion::Bbr>()
+            );
+            assert!(
+                incoming
+                    .congestion_state()
+                    .into_any()
+                    .is::<quinn::congestion::Bbr>()
+            );
             authenticated_proxy(&incoming);
             let (mut upload, mut download) = outgoing.open_bi().await.unwrap();
             // Make the stream visible to accept_bi without reading its payload.
@@ -599,7 +608,7 @@ mod tests {
         let (relay, dropped) =
             lossy_relay(server.local_addr().unwrap(), Duration::from_millis(50), 100).await;
         // Keep this assembler regression on a large BBR flight under imposed
-        // non-congestive loss; the proxy default's CUBIC policy is checked above.
+        // non-congestive loss.
         let client = client_with_alpn(
             relay,
             &identity.join("cert.pem"),

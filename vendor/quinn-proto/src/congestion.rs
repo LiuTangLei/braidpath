@@ -19,6 +19,28 @@ pub trait Controller: Send + Sync {
     #[allow(unused_variables)]
     fn on_sent(&mut self, now: Instant, bytes: u64, last_packet_number: u64) {}
 
+    /// Capture delivery state for an ACK-eliciting packet before it enters flight.
+    /// Stored inline with recovery metadata, and discarded with that packet.
+    #[allow(unused_variables)]
+    fn on_packet_sent(&mut self, now: Instant, in_flight: u64) -> Option<PacketState> {
+        None
+    }
+
+    /// Observe a delivered packet using its own send-time state.
+    #[allow(unused_variables)]
+    fn on_packet_acked(
+        &mut self,
+        now: Instant,
+        sent: Instant,
+        bytes: u64,
+        state: Option<PacketState>,
+    ) {
+    }
+
+    /// The sender ran out of data while not congestion blocked.
+    #[allow(unused_variables)]
+    fn on_app_limited(&mut self, in_flight: u64) {}
+
     /// Packet deliveries were confirmed
     ///
     /// `app_limited` indicates whether the connection was blocked on outgoing
@@ -88,6 +110,16 @@ pub trait Controller: Send + Sync {
 
     /// Returns Self for use in down-casting to extract implementation details
     fn into_any(self: Box<Self>) -> Box<dyn Any>;
+}
+
+/// Send-time delivery context for model-based controllers. No payload or heap
+/// allocation is retained, and ACK/loss/discard frees it with recovery metadata.
+#[derive(Debug, Copy, Clone)]
+pub struct PacketState {
+    pub(crate) delivered: u64,
+    pub(crate) delivered_at_ns: u64,
+    pub(crate) first_sent_at_ns: u64,
+    pub(crate) app_limited: bool,
 }
 
 /// Common congestion controller metrics
