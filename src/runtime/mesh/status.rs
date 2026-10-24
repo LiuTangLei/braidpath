@@ -113,7 +113,7 @@ impl State {
             capabilities.features.extend([
                 "proxy-tcp-v1".into(),
                 "proxy-udp-v1".into(),
-                "proxy-bond-v1".into(),
+                "proxy-bond-v2".into(),
             ]);
         }
         capabilities

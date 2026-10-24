@@ -14,7 +14,11 @@ use tokio::{
 };
 
 const DATA_RPCS: usize = 512;
-const RPCS: usize = DATA_RPCS * 2 + 128;
+// Download ranges are short, and each flow keeps at most two future waiters.
+const DOWNLOAD_RPCS: usize = 1024;
+// Each aggregate flow can hold an upload progress wait and a control operation.
+const CONTROL_RPCS: usize = super::bond::MAX_FLOWS * 2 + 128;
+const RPCS: usize = DATA_RPCS + DOWNLOAD_RPCS + CONTROL_RPCS;
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ServerConfig {
@@ -74,7 +78,7 @@ impl Server {
             streams: Arc::new(Semaphore::new(MAX_STREAMS)),
             rpcs: Arc::new(Semaphore::new(RPCS)),
             data_rpcs: Arc::new(Semaphore::new(DATA_RPCS)),
-            downloads: Arc::new(Semaphore::new(DATA_RPCS)),
+            downloads: Arc::new(Semaphore::new(DOWNLOAD_RPCS)),
             associations: Arc::new(Semaphore::new(MAX_ASSOCIATIONS)),
             destinations: Arc::new(Semaphore::new(1024)),
             rejected: AtomicU64::new(0),
@@ -154,9 +158,18 @@ impl Server {
         loop {
             tokio::select! {
                 accepted = conn.accept_bi() => {
-                    let (send, recv) = accepted?;
+                    let (mut send, mut recv) = accepted?;
                     let Ok(permit) = self.rpcs.clone().try_acquire_owned() else {
-                        self.rejected.fetch_add(1, Ordering::Relaxed); drop((send, recv)); continue;
+                        self.rejected.fetch_add(1, Ordering::Relaxed);
+                        // The outer handler budget can fill before the command
+                        // is read. A bounded refusal keeps aggregate clients from
+                        // mistaking overload for a broken transport. Older scalar
+                        // commands also see a nonzero failure status.
+                        let _ = recv.stop(0u32.into());
+                        let _ = timeout(CONNECT_TIMEOUT, super::bond::respond(
+                            &mut send, super::bond::Reply::Failed(super::bond::BUSY),
+                        )).await;
+                        continue;
                     };
                     last = Instant::now();
                     let state = self.clone(); let conn = conn.clone(); let router = router.clone();
@@ -182,7 +195,22 @@ impl Server {
         router: Arc<Router>,
     ) -> Result<()> {
         let command = timeout(CONNECT_TIMEOUT, recv.read_u8()).await??;
-        let _data_permit = self.data_admission(command)?;
+        let bond = (super::bond::OPEN..=super::bond::PULL).contains(&command);
+        let _data_permit = match self.data_admission(command) {
+            Ok(permit) => permit,
+            // Aggregate clients retry a busy reply; dropping the stream would
+            // instead look like a failed path and move all of its records.
+            Err(_) if bond => {
+                self.rejected.fetch_add(1, Ordering::Relaxed);
+                let _ = recv.stop(0u32.into());
+                return super::bond::respond(
+                    &mut send,
+                    super::bond::Reply::Failed(super::bond::BUSY),
+                )
+                .await;
+            }
+            Err(error) => return Err(error),
+        };
         let _logical_permit = if command == TCP || command == UDP {
             Some(
                 self.streams
@@ -194,7 +222,7 @@ impl Server {
             None
         };
         match command {
-            super::bond::OPEN..=super::bond::DOWNLOAD_ACK => {
+            _ if bond => {
                 self.bonds
                     .serve(
                         command,
@@ -348,6 +376,96 @@ async fn packet_parts(data: &[u8]) -> Result<(Address, &[u8])> {
 #[cfg(test)]
 mod admission_tests {
     use super::*;
+    #[tokio::test]
+    async fn exhausted_handler_budgets_reply_busy_and_recover_on_the_same_connection() {
+        use crate::runtime::transport::{self, AckRequest, Congestion};
+        let temp = tempfile::tempdir().unwrap();
+        let identity = temp.path().join("identity");
+        transport::initialize(&identity, "localhost").unwrap();
+        let endpoint = transport::server_with_proxy(
+            "127.0.0.1:0".parse().unwrap(),
+            &identity.join("cert.pem"),
+            &identity.join("key.pem"),
+            Congestion::Bbr,
+            transport::DEFAULT_DATAGRAM_SEND_BUFFER_BYTES,
+            AckRequest::Unchanged,
+            true,
+        )
+        .unwrap();
+        let at = endpoint.local_addr().unwrap();
+        let client = transport::proxy_client(at, &identity.join("cert.pem")).unwrap();
+        let (outgoing, incoming) = tokio::join!(client.connect(at, "localhost").unwrap(), async {
+            endpoint.accept().await.unwrap().await
+        });
+        let conn = outgoing.unwrap();
+        let server = Server::new(
+            ServerConfig::default(),
+            "a".repeat(64),
+            "exit".into(),
+            crate::runtime::MAX_RATE_BPS,
+        )
+        .unwrap();
+        let pending = Arc::new(Semaphore::new(1)).acquire_owned().await.unwrap();
+        let worker = AbortTask(tokio::spawn({
+            let server = server.clone();
+            async move {
+                let _ = server.connection(incoming.unwrap(), pending).await;
+            }
+        }));
+        let (mut send, mut recv) = conn.open_bi().await.unwrap();
+        let mut auth = vec![1];
+        auth.extend("a".repeat(64).bytes());
+        auth.extend(b"\x04exit");
+        send.write_all(&auth).await.unwrap();
+        send.finish().unwrap();
+        assert_eq!(recv.read_to_end(1).await.unwrap(), [0]);
+
+        // Both levels used to reset the RPC, which retired an otherwise good
+        // path. Hold the real admission permits and exercise the wire reply.
+        for budget in [&server.rpcs, &server.data_rpcs] {
+            let held = budget
+                .clone()
+                .try_acquire_many_owned(budget.available_permits() as u32)
+                .unwrap();
+            let mut op = super::super::bond::Operation::Put {
+                sequence: 0,
+                offset: 0,
+                data: bytes::Bytes::from_static(b"body"),
+            };
+            let reply = timeout(
+                Duration::from_secs(2),
+                super::super::bond::rpc(&conn, [7; 32], &mut op, None),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert!(matches!(
+                reply,
+                super::super::bond::Reply::Failed(super::super::bond::BUSY)
+            ));
+            assert!(conn.close_reason().is_none());
+            drop(held);
+            let mut close = super::super::bond::Operation::Close;
+            let reply = timeout(
+                Duration::from_secs(2),
+                super::super::bond::rpc(&conn, [7; 32], &mut close, None),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert!(matches!(reply, super::super::bond::Reply::Accepted));
+        }
+        timeout(Duration::from_secs(2), async {
+            while server.snapshot().rpc_streams != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(server.snapshot().tcp_flows, 0);
+        assert_eq!(server.snapshot().buffered_bytes, 0);
+        drop(worker);
+    }
     #[test]
     fn pending_data_leaves_control_capacity_for_progress_and_reclamation() {
         let server = Server::new(
@@ -365,14 +483,14 @@ mod admission_tests {
         let _downloads = server
             .downloads
             .clone()
-            .try_acquire_many_owned(DATA_RPCS as u32)
+            .try_acquire_many_owned(DOWNLOAD_RPCS as u32)
             .unwrap();
         let _headers = server
             .rpcs
             .clone()
-            .try_acquire_many_owned((DATA_RPCS * 2) as u32)
+            .try_acquire_many_owned((DATA_RPCS + DOWNLOAD_RPCS) as u32)
             .unwrap();
-        assert_eq!(server.rpcs.available_permits(), 128);
+        assert_eq!(server.rpcs.available_permits(), CONTROL_RPCS);
         for command in [TCP, UDP, super::bond::PUT, super::bond::PULL] {
             assert!(server.data_admission(command).is_err());
         }

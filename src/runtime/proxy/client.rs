@@ -113,9 +113,14 @@ pub(super) struct Connection {
     _close: CloseConnection,
     _endpoint: quinn::Endpoint,
 }
+const DOWNLOAD_PERMITS: usize = 512;
+// Records this small are latency-bound; send them on the lowest-RTT path.
+const SMALL_RECORD: usize = 16 * 1024;
 struct Path {
     address: SocketAddr,
-    connection: AsyncMutex<Option<Arc<Connection>>>,
+    connection: Mutex<Option<Arc<Connection>>>,
+    connecting: AsyncMutex<()>,
+    retired: std::sync::atomic::AtomicBool,
     upload: Arc<Semaphore>,
     download: Arc<Semaphore>,
     control: Arc<Semaphore>,
@@ -125,21 +130,29 @@ struct Path {
     retry_after: Mutex<Option<Instant>>,
     failed: std::sync::atomic::AtomicBool,
     probe: Mutex<Option<AbortTask>>,
+    // Health evidence for entrance selection: last completed RPC, and the
+    // native sent/lost packet counters at the previous report.
+    last_ok: Mutex<Option<Instant>>,
+    reported: Mutex<(u64, u64)>,
 }
 impl Path {
     fn new(address: SocketAddr) -> Self {
         Self {
             address,
-            connection: AsyncMutex::new(None),
+            connection: Mutex::new(None),
+            connecting: AsyncMutex::new(()),
+            retired: std::sync::atomic::AtomicBool::new(false),
             upload: Arc::new(Semaphore::new(128)),
-            download: Arc::new(Semaphore::new(512)),
-            control: Arc::new(Semaphore::new(4)),
+            download: Arc::new(Semaphore::new(DOWNLOAD_PERMITS)),
+            control: Arc::new(Semaphore::new(16)),
             progress: Arc::new(Semaphore::new(128)),
             rtt_us: std::sync::atomic::AtomicU64::new(200_000),
             service: Arc::new(super::bond::PathService::default()),
             retry_after: Mutex::new(None),
             failed: std::sync::atomic::AtomicBool::new(false),
             probe: Mutex::new(None),
+            last_ok: Mutex::new(None),
+            reported: Mutex::new((0, 0)),
         }
     }
     fn permits(&self, op: &super::bond::Operation) -> &Arc<Semaphore> {
@@ -148,6 +161,14 @@ impl Path {
             super::bond::Operation::Pull { .. } => &self.download,
             super::bond::Operation::UploadStatus { .. } => &self.progress,
             _ => &self.control,
+        }
+    }
+    fn retire(&self) {
+        self.retired
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.probe.lock().expect("path probe").take();
+        if let Some(conn) = self.connection.lock().expect("proxy connection").take() {
+            conn.raw.close(0u32.into(), b"aggregate path retired");
         }
     }
 }
@@ -251,7 +272,15 @@ impl Pool {
     }
     fn cache_paths(slot: &Slot, addresses: Vec<SocketAddr>) -> Vec<Arc<Path>> {
         let mut paths = slot.paths.lock().expect("proxy paths");
-        paths.retain(|address, _| addresses.contains(address));
+        paths.retain(|address, path| {
+            let keep = addresses.contains(address);
+            // A retired entrance stops forwarding once its lease is released.
+            // Close it now so in-flight records replay without a stall timeout.
+            if !keep {
+                path.retire();
+            }
+            keep
+        });
         addresses
             .into_iter()
             .map(|address| {
@@ -303,19 +332,35 @@ impl Pool {
         Ok(connection)
     }
     async fn connect(&self, id: &str, path: &Path) -> Result<Arc<Connection>> {
-        let mut cached = path.connection.lock().await;
-        if let Some(conn) = &*cached
-            && conn.raw.close_reason().is_none()
+        let _connecting = path.connecting.lock().await;
         {
-            return Ok(conn.clone());
+            let mut cached = path.connection.lock().expect("proxy connection");
+            ensure!(
+                !path.retired.load(std::sync::atomic::Ordering::Acquire),
+                "aggregate path retired"
+            );
+            if let Some(conn) = &*cached
+                && conn.raw.close_reason().is_none()
+            {
+                return Ok(conn.clone());
+            }
+            *cached = None;
         }
-        *cached = None;
         let connection = Self::authenticate(&self.identity, &self.token, path.address, id).await?;
+        let mut cached = path.connection.lock().expect("proxy connection");
+        // Retirement can race with the handshake. Never install a connection
+        // after its entrance lease has been released.
+        ensure!(
+            !path.retired.load(std::sync::atomic::Ordering::Acquire),
+            "aggregate path retired"
+        );
         *cached = Some(connection.clone());
         Ok(connection)
     }
     fn probe(&self, id: &str, path: &Arc<Path>) {
-        if !path.failed.load(std::sync::atomic::Ordering::Acquire) {
+        if path.retired.load(std::sync::atomic::Ordering::Acquire)
+            || !path.failed.load(std::sync::atomic::Ordering::Acquire)
+        {
             return;
         }
         let mut task = path.probe.lock().expect("path probe");
@@ -347,8 +392,12 @@ impl Pool {
                 };
                 match result {
                     Ok(conn) => {
+                        let mut cached = path.connection.lock().expect("proxy connection");
+                        if path.retired.load(std::sync::atomic::Ordering::Acquire) {
+                            break;
+                        }
                         path.service.reset();
-                        *path.connection.lock().await = Some(conn);
+                        *cached = Some(conn);
                         path.failed
                             .store(false, std::sync::atomic::Ordering::Release);
                         *path.retry_after.lock().expect("path retry") = None;
@@ -405,6 +454,7 @@ impl Pool {
         mut stream: Option<&mut super::bond::StreamSink>,
     ) -> Result<super::bond::Reply> {
         let mut failures = 0;
+        let mut busy = 0u32;
         let mut started = Instant::now();
         loop {
             ensure!(
@@ -428,25 +478,39 @@ impl Pool {
             for path in &paths {
                 self.probe(id, path);
             }
+            let rtt = |p: &Arc<Path>| p.rtt_us.load(std::sync::atomic::Ordering::Relaxed);
+            let (interactive, avoid) = stream
+                .as_ref()
+                .map_or((false, None), |sink| (sink.interactive, sink.avoid));
             if let super::bond::Operation::Pull { count, .. } = op {
-                let cost = |path: &Path| {
-                    path.service.cost(
-                        count as usize * super::bond::CHUNK,
-                        Duration::from_micros(
-                            path.rtt_us.load(std::sync::atomic::Ordering::Relaxed),
-                        ),
-                        path.download.available_permits() < 512,
-                    )
-                };
-                paths.sort_by(|a, b| {
-                    cost(a).total_cmp(&cost(b)).then_with(|| {
-                        b.download
-                            .available_permits()
-                            .cmp(&a.download.available_permits())
-                    })
-                });
-            } else if matches!(op, super::bond::Operation::Put { .. }) {
-                paths.sort_by_key(|p| std::cmp::Reverse(p.permits(&op).available_permits()));
+                if interactive {
+                    // A wait for future bytes carries the next interactive reply.
+                    paths.sort_by_key(rtt);
+                } else {
+                    let cost = |path: &Path| {
+                        path.service.cost(
+                            count as usize * super::bond::CHUNK,
+                            Duration::from_micros(
+                                path.rtt_us.load(std::sync::atomic::Ordering::Relaxed),
+                            ),
+                            path.download.available_permits() < DOWNLOAD_PERMITS,
+                        )
+                    };
+                    paths.sort_by(|a, b| {
+                        cost(a).total_cmp(&cost(b)).then_with(|| {
+                            b.download
+                                .available_permits()
+                                .cmp(&a.download.available_permits())
+                        })
+                    });
+                }
+                paths.sort_by_key(|p| avoid == Some(p.address));
+            } else if let super::bond::Operation::Put { data, .. } = &op {
+                if data.len() <= SMALL_RECORD {
+                    paths.sort_by_key(rtt);
+                } else {
+                    paths.sort_by_key(|p| std::cmp::Reverse(p.permits(&op).available_permits()));
+                }
             } else {
                 // Progress gates every data path: do not distribute these small
                 // messages to a slow relay just because its bulk queue is empty.
@@ -484,7 +548,7 @@ impl Pool {
                 );
                 used_connection = Some(conn.clone());
                 if let Some(sink) = stream.as_deref_mut() {
-                    sink.route = path.address;
+                    *sink.route.lock().expect("download route") = path.address;
                     sink.service = Some(path.service.clone());
                 }
                 super::bond::rpc(&conn.raw, key, &mut op, stream.as_deref_mut()).await
@@ -492,7 +556,15 @@ impl Pool {
             .await;
             started = Instant::now();
             match result {
+                Ok(super::bond::Reply::Failed(super::bond::BUSY)) => {
+                    // Exit memory or handler admission is full. The path is
+                    // healthy: release its permit and retry after a backoff.
+                    busy = busy.saturating_add(1);
+                    drop(_permit);
+                    tokio::time::sleep(Duration::from_millis(10 << busy.min(4))).await;
+                }
                 Ok(reply) => {
+                    *path.last_ok.lock().expect("path health") = Some(Instant::now());
                     let mut used = usage.lock().expect("flow usage");
                     let counter = used.entry(path.address).or_default();
                     if let super::bond::Operation::Put { data, .. } = &op
@@ -517,7 +589,7 @@ impl Pool {
                         }
                         return Err(error.context("selected proxy exit shut down"));
                     }
-                    let mut cached = path.connection.lock().await;
+                    let mut cached = path.connection.lock().expect("proxy connection");
                     if let (Some(used), Some(current)) = (&used_connection, &*cached)
                         && !Arc::ptr_eq(used, current)
                     {
@@ -548,10 +620,97 @@ impl Pool {
             }
         }
     }
-    pub(super) fn download_lanes(&self) -> usize {
-        self.path_limit
-            .load(std::sync::atomic::Ordering::Relaxed)
-            .max(4)
+    /// A path stalled behind later arrivals takes no new work for a while,
+    /// unless it is the only usable path. Native failure still needs a timeout.
+    pub(super) fn suspect(&self, id: &str, address: SocketAddr, duration: Duration) {
+        let now = Instant::now();
+        let paths = self.slots[id].paths.lock().expect("proxy paths");
+        let usable = |p: &Path| {
+            !p.failed.load(std::sync::atomic::Ordering::Acquire)
+                && p.retry_after
+                    .lock()
+                    .expect("path retry")
+                    .is_none_or(|at| at <= now)
+        };
+        if !paths.values().any(|p| p.address != address && usable(p)) {
+            return;
+        }
+        if let Some(path) = paths.get(&address).filter(|p| usable(p)) {
+            *path.retry_after.lock().expect("path retry") = Some(now + duration);
+        }
+    }
+    /// Head-of-line re-request delay: several fast-path RTTs, bounded.
+    pub(super) fn hedge_delay(&self, id: &str) -> Duration {
+        let rtt = self.slots[id]
+            .paths
+            .lock()
+            .expect("proxy paths")
+            .values()
+            .filter(|p| !p.failed.load(std::sync::atomic::Ordering::Acquire))
+            .map(|p| p.rtt_us.load(std::sync::atomic::Ordering::Relaxed))
+            .min()
+            .unwrap_or(200_000);
+        (Duration::from_micros(rtt) * 3).clamp(Duration::from_millis(100), Duration::from_secs(1))
+    }
+    /// Feed proxy path evidence to entrance selection, as the tunnel does, so
+    /// a failed or persistently poor relay can be replaced by another server.
+    pub(super) fn report_health(&self) {
+        let now = Instant::now();
+        for slot in self.slots.values() {
+            let Ok(routes) = slot.routes.try_lock() else {
+                continue;
+            };
+            let Some(routes) = routes.as_ref() else {
+                continue;
+            };
+            // Apply entrance changes even when all live RPCs are waiting for
+            // target data. No new application request is needed to retire a path.
+            let paths = Self::cache_paths(slot, routes.updates.borrow().clone());
+            let samples: Vec<_> = paths
+                .iter()
+                .map(|path| {
+                    let failed = path.failed.load(std::sync::atomic::Ordering::Acquire);
+                    let stats = path
+                        .connection
+                        .lock()
+                        .expect("proxy connection")
+                        .as_ref()
+                        .map(|c| c.raw.stats().path);
+                    let mut reported = path.reported.lock().expect("path health");
+                    let loss = stats.map_or(0.0, |stats| {
+                        let sent = stats.sent_packets.saturating_sub(reported.0);
+                        let lost = stats.lost_packets.saturating_sub(reported.1);
+                        *reported = (stats.sent_packets, stats.lost_packets);
+                        if sent == 0 {
+                            0.0
+                        } else {
+                            lost as f64 / sent as f64
+                        }
+                    });
+                    mesh::PathSample {
+                        address: path.address,
+                        group: 0,
+                        delivered: !failed
+                            && path.last_ok.lock().expect("path health").is_some_and(|at| {
+                                now.saturating_duration_since(at) < Duration::from_secs(10)
+                            }),
+                        failed,
+                        rtt_ms: path.rtt_us.load(std::sync::atomic::Ordering::Relaxed) as f64
+                            / 1000.0,
+                        loss,
+                    }
+                })
+                .collect();
+            routes._guard.health().send_replace(mesh::PathHealth {
+                checked: now.into_std(),
+                addresses: samples
+                    .iter()
+                    .filter(|s| !s.failed)
+                    .map(|s| s.address)
+                    .collect(),
+                samples,
+            });
+        }
     }
     pub(super) fn service_snapshot(&self, id: &str) -> BTreeMap<SocketAddr, (u64, usize)> {
         self.slots[id]
@@ -595,6 +754,33 @@ impl Pool {
             .get(&address)
             .is_some_and(|p| p.failed.load(std::sync::atomic::Ordering::Acquire))
     }
+    #[cfg(test)]
+    pub(super) fn set_path_limit(&self, limit: usize) {
+        self.path_limit
+            .store(limit, std::sync::atomic::Ordering::Relaxed);
+    }
+    #[cfg(test)]
+    pub(super) fn test_fail_path(&self, id: &str, address: SocketAddr) {
+        if let Some(path) = self.slots[id].paths.lock().unwrap().get(&address) {
+            path.failed
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
+    #[cfg(test)]
+    pub(super) async fn test_connect_path(
+        &self,
+        id: &str,
+        address: SocketAddr,
+    ) -> quinn::Connection {
+        let path = self
+            .paths(id)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|p| p.address == address)
+            .unwrap();
+        self.connect(id, &path).await.unwrap().raw.clone()
+    }
     pub(super) fn track_cleanup(&self, task: tokio::task::JoinHandle<()>) {
         let mut tasks = self.cleanups.lock().expect("flow cleanup");
         tasks.retain(|task| !task.is_finished());
@@ -635,7 +821,7 @@ impl Pool {
                 .collect();
             for path in paths {
                 path.probe.lock().expect("path probe").take();
-                if let Some(conn) = path.connection.lock().await.take() {
+                if let Some(conn) = path.connection.lock().expect("proxy connection").take() {
                     conn.raw.close(0u32.into(), b"proxy client shutdown");
                 }
             }
@@ -726,10 +912,14 @@ pub async fn client(options: ClientOptions) -> Result<()> {
     }
     let mut refresh = tokio::time::interval(Duration::from_secs(15));
     refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Entrance selection only acts on evidence younger than two seconds.
+    let mut health = tokio::time::interval(Duration::from_secs(1));
+    health.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut shutdown = Shutdown::new();
     loop {
         tokio::select! {
             _ = shutdown.wait() => break,
+            _ = health.tick() => pool.report_health(),
             result = tasks.join_next() => { result.context("proxy listeners stopped")???; bail!("proxy listener stopped"); }
             _ = refresh.tick(), if discovery.is_empty() => {
                 let pool = pool.clone(); let entries = options.connect.clone();

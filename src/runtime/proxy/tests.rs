@@ -640,13 +640,17 @@ async fn one_tcp_connection_uses_multiple_servers_and_survives_a_relay_stopping(
     let count = accepted.clone();
     let payload: Vec<u8> = (0..32 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
     let expected = payload.clone();
+    let (go, wait) = tokio::sync::oneshot::channel();
     let target_task = Task(tokio::spawn(async move {
         let (mut tcp, _) = target.accept().await.unwrap();
         count.fetch_add(1, Ordering::Relaxed);
-        for data in payload.chunks(64 * 1024) {
-            tcp.write_all(data).await.unwrap();
-            tokio::time::sleep(Duration::from_millis(3)).await;
-        }
+        // A backlog at the exit spreads ranges over paths; a source slower
+        // than one path is served by the lowest-RTT path alone. The second
+        // backlog starts only after the relay has stopped.
+        let (head, tail) = payload.split_at(payload.len() / 2);
+        tcp.write_all(head).await.unwrap();
+        wait.await.unwrap();
+        tcp.write_all(tail).await.unwrap();
         tcp.shutdown().await.unwrap();
         let mut upload = Vec::new();
         tcp.read_to_end(&mut upload).await.unwrap();
@@ -680,6 +684,7 @@ async fn one_tcp_connection_uses_multiple_servers_and_survives_a_relay_stopping(
     .await
     .unwrap();
     drop(relay_b);
+    go.send(()).unwrap();
     let received = timeout(Duration::from_secs(12), transfer)
         .await
         .expect("relay outage reset the logical TCP flow")
@@ -782,17 +787,13 @@ async fn data_blackhole_is_quarantined_and_rejoins_the_same_tcp_flow_after_recov
     let (go, wait) = tokio::sync::oneshot::channel();
     let _source = Task(tokio::spawn(async move {
         let (mut tcp, _) = source.accept().await.unwrap();
-        let block = vec![71; 65536];
-        for _ in 0..128 {
-            tcp.write_all(&block).await.unwrap();
-            tokio::time::sleep(Duration::from_millis(2)).await;
-        }
+        // A backlog larger than the record window spreads ranges over both
+        // paths, so the blackholed one holds outstanding work when it fails.
+        let backlog = vec![71; 32 * 1024 * 1024];
+        tcp.write_all(&backlog).await.unwrap();
         wait.await.unwrap();
-        // Advance the bounded live-lane cohorts after probe recovery so the
-        // restored transport can be selected again within this same TCP flow.
-        for _ in 0..512 {
-            tcp.write_all(&block).await.unwrap();
-        }
+        // After probe recovery, a fresh backlog must use the restored path.
+        tcp.write_all(&backlog).await.unwrap();
         tcp.shutdown().await.unwrap();
         let mut upload = Vec::new();
         tcp.read_to_end(&mut upload).await.unwrap();
@@ -836,7 +837,7 @@ async fn data_blackhole_is_quarantined_and_rejoins_the_same_tcp_flow_after_recov
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(received.len(), 40 * 1024 * 1024);
+    assert_eq!(received.len(), 64 * 1024 * 1024);
     assert!(received.iter().all(|b| *b == 71));
     assert!(
         packets.load(Ordering::Relaxed) > before + 65536,
@@ -877,6 +878,58 @@ async fn aggregate_shutdown_releases_optional_leases_and_flow_admission_credit()
     empty(&identity, a).await;
     assert_eq!(identity.status(b).await.unwrap().leases, 0);
     assert_eq!(pool.flow_credit.available_permits(), MAX_STREAMS);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failed_proxy_relay_is_reported_and_replaced_by_another_server() {
+    let root = tempfile::tempdir().unwrap();
+    let root = root.path();
+    let (a, _a) = start(root, "a", None, true).await;
+    let (b, _b) = start(root, "b", Some(a), true).await;
+    let (c, _c) = start(root, "c", Some(a), true).await;
+    let (d, _d) = start(root, "d", Some(a), true).await;
+    let identity = identity(root, "health-client");
+    let pool = client::Pool::new(
+        identity.clone(),
+        vec![node("a", a), node("b", b), node("c", c), node("d", d)],
+        vec!["a".into()],
+    )
+    .unwrap();
+    // The exit plus two relays leaves one server available as a replacement.
+    pool.set_path_limit(3);
+    let original = timeout(Duration::from_secs(5), async {
+        loop {
+            let routes = pool.test_addresses("a").await;
+            if routes.len() == 3 {
+                break routes;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let failed = *original.iter().find(|address| **address != a).unwrap();
+    let connection = pool.test_connect_path("a", failed).await;
+    pool.test_fail_path("a", failed);
+    pool.report_health();
+    timeout(Duration::from_secs(5), async {
+        loop {
+            // The production health tick must apply route updates even without
+            // another RPC calling paths(). Otherwise an idle retired connection
+            // survives and its next records wait for the stall timeout.
+            pool.report_health();
+            if connection.close_reason().is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("failed proxy relay was never replaced");
+    let routes = pool.test_addresses("a").await;
+    assert_eq!(routes.len(), 3);
+    assert!(!routes.contains(&failed));
+    pool.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1075,12 +1128,22 @@ async fn idle_streaming_flows_do_not_starve_an_active_flow_and_all_release() {
             }
         }
     }));
+    // Above the former 64-flow exit limit. An idle flow keeps one future-data
+    // waiter (two while a reply streams), not one per logical lane.
+    let flows = 96;
     let mut idle = Vec::new();
-    for _ in 0..40 {
+    for _ in 0..flows {
         let (tcp, status, _) = socks(listen, TCP, Address::Ip(at)).await;
         assert_eq!(status, 0);
         idle.push(tcp);
     }
+    let held = identity.status(a).await.unwrap().proxy.unwrap();
+    assert_eq!(held.tcp_flows, flows);
+    assert!(
+        held.rpc_streams <= flows * 2,
+        "idle flows hold {} exit handlers",
+        held.rpc_streams
+    );
     let (mut active, status, _) = socks(listen, TCP, Address::Ip(at)).await;
     assert_eq!(status, 0);
     active.write_all(b"PING").await.unwrap();

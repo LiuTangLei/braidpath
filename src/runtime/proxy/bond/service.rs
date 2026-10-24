@@ -43,6 +43,7 @@ impl PathService {
             bytes: 0,
             start: Instant::now(),
             active: records > 1,
+            timed: false,
         }
     }
 }
@@ -53,13 +54,17 @@ pub(crate) struct Delivery {
     bytes: usize,
     start: Instant,
     active: bool,
+    timed: bool,
 }
 impl Delivery {
     pub(crate) fn ready(&mut self, records: usize) {
-        if self.remaining == 0 {
+        // Service starts at the first record header. Backlog reserved when the
+        // request was issued must not count its request RTT as transfer time.
+        if self.remaining == 0 || !self.timed {
             self.start = Instant::now();
             self.bytes = 0;
-            self.active = records > 1;
+            self.active = self.active || records > 1;
+            self.timed = true;
         }
         let bytes = records * CHUNK;
         if bytes > self.remaining {
@@ -81,6 +86,12 @@ impl Delivery {
         }
         self.bytes = 0;
         self.active = false;
+    }
+    /// Reserved records that will not be transferred on this path.
+    pub(crate) fn skip(&mut self, records: usize) {
+        let bytes = (records * CHUNK).min(self.remaining);
+        self.remaining -= bytes;
+        self.service.0.lock().expect("path service").pending -= bytes;
     }
     pub(crate) fn record(&mut self, bytes: usize) {
         self.remaining -= CHUNK;

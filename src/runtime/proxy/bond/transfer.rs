@@ -168,88 +168,106 @@ async fn upload(
     );
     accepted(owner, Operation::Fin { sequence, offset }).await
 }
-struct DownloadLane {
+// Ranges for produced data are small so a slower path never holds a long run
+// of the reorder window. Waits for future data use a short latency-first range.
+const READY_BATCH: u64 = 4;
+const FUTURE_BATCH: u64 = 8;
+// Issue the next future waiter before the current one is exhausted, so a
+// streaming reply does not pay a request round trip between ranges.
+const FUTURE_LOW: u64 = 4;
+const HEDGE_RECORDS: u64 = 4;
+
+type Route = Arc<Mutex<SocketAddr>>;
+type PullResult = (bool, u64, u64, Result<u64>);
+struct Puller {
     pool: Arc<Pool>,
     exit: String,
     key: Key,
     usage: Arc<Mutex<BTreeMap<SocketAddr, (u64, u64)>>>,
-    next: u64,
-    stride: u8,
-    budget: Arc<Semaphore>,
-    acknowledged: Arc<std::sync::atomic::AtomicU64>,
     events: tokio::sync::mpsc::Sender<Incoming>,
 }
-impl DownloadLane {
-    async fn run(mut self) -> Result<()> {
-        loop {
-            let mut credit = self.budget.clone().acquire_many_owned(CHUNK as u32).await?;
-            let extra = (self.budget.available_permits() / CHUNK).min(MAX_BATCH - 1) * CHUNK;
-            if extra > 0 {
-                credit.merge(self.budget.clone().try_acquire_many_owned(extra as u32)?);
-            }
-            let count = (credit.num_permits() / CHUNK) as u8;
-            let mut sink = StreamSink {
-                events: self.events.clone(),
-                credit,
-                next_sequence: self.next,
-                end: None,
-                usage: self.usage.clone(),
-                route: "0.0.0.0:0".parse().expect("constant address"),
-                service: None,
-            };
+impl Puller {
+    #[allow(clippy::too_many_arguments)]
+    fn spawn(
+        &self,
+        set: &mut JoinSet<PullResult>,
+        (start, count): (u64, u64),
+        acknowledged: u64,
+        credit: OwnedSemaphorePermit,
+        interactive: bool,
+        avoid: Option<SocketAddr>,
+        hedge: bool,
+    ) -> Route {
+        let route = Arc::new(Mutex::new(SocketAddr::from(([0, 0, 0, 0], 0))));
+        let mut sink = StreamSink {
+            events: self.events.clone(),
+            credit,
+            next_sequence: start,
+            end: None,
+            usage: self.usage.clone(),
+            route: route.clone(),
+            service: None,
+            interactive,
+            avoid,
+        };
+        let (pool, exit, key, usage) = (
+            self.pool.clone(),
+            self.exit.clone(),
+            self.key,
+            self.usage.clone(),
+        );
+        set.spawn(async move {
             let op = Operation::Pull {
-                sequence: self.next,
-                acknowledged: self.acknowledged.load(Ordering::Acquire),
-                stride: self.stride,
-                count,
+                sequence: start,
+                acknowledged,
+                count: count as u8,
             };
-            match self
-                .pool
-                .call_stream(&self.exit, self.key, op, &self.usage, &mut sink)
-                .await?
-            {
-                Reply::Accepted => {}
-                Reply::Failed(code) => return Err(ReplyError(code).into()),
-                _ => anyhow::bail!("invalid streamed download reply"),
-            }
-            self.next = sink.next_sequence;
-            if sink.end.is_some_and(|(last, _)| self.next >= last) {
-                return Ok(());
-            }
-        }
+            let result = match pool.call_stream(&exit, key, op, &usage, &mut sink).await {
+                Ok(Reply::Accepted) => Ok(sink.next_sequence),
+                Ok(Reply::Failed(code)) => Err(ReplyError(code).into()),
+                Ok(_) => Err(anyhow::anyhow!("invalid streamed download reply")),
+                Err(error) => Err(error),
+            };
+            (hedge, start, count, result)
+        });
+        route
     }
 }
+// One scheduler owns the download sequence space. Each request takes the next
+// contiguous range and its path is chosen by expected arrival, so records
+// follow path capacity instead of a fixed per-lane share. A head record that
+// stalls behind later arrivals is re-requested on another path (KCP-style
+// fast resend at record granularity); duplicates are discarded here.
 async fn download(
     mut tcp: OwnedWriteHalf,
     owner: &Owner,
     activity: Arc<Mutex<Instant>>,
 ) -> Result<()> {
-    let lanes = owner.pool.download_lanes();
-    let acknowledged = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let (events, mut incoming) = tokio::sync::mpsc::channel(PIPELINE + 8);
-    let mut workers = JoinSet::new();
-    for lane in 0..lanes {
-        workers.spawn(
-            DownloadLane {
-                pool: owner.pool.clone(),
-                exit: owner.exit.clone(),
-                key: owner.key,
-                usage: owner.usage.clone(),
-                next: lane as u64,
-                stride: lanes as u8,
-                budget: Arc::new(Semaphore::new((PIPELINE / lanes) * CHUNK)),
-                acknowledged: acknowledged.clone(),
-                events: events.clone(),
-            }
-            .run(),
-        );
-    }
-    drop(events);
+    let (events, mut incoming) = tokio::sync::mpsc::channel(PIPELINE + HEDGE_RECORDS as usize + 8);
+    let puller = Puller {
+        pool: owner.pool.clone(),
+        exit: owner.exit.clone(),
+        key: owner.key,
+        usage: owner.usage.clone(),
+        events,
+    };
+    let budget = Arc::new(Semaphore::new(WINDOW));
+    let hedge_budget = Arc::new(Semaphore::new(HEDGE_RECORDS as usize * CHUNK));
+    let mut pulls = JoinSet::new();
+    let mut requests: BTreeMap<u64, (u64, Route)> = BTreeMap::new();
+    let mut returned = std::collections::BTreeSet::new();
+    let mut hedging = false;
+    let mut stall: Option<(u64, Instant)> = None;
+    // A path that already left a head stalled: later heads on it re-request at once.
+    let mut suspect: Option<(SocketAddr, Instant)> = None;
+    // `next` is the first unassigned record; `known` is the exit's produced
+    // cursor as last reported, so ranges below it carry real backlog.
+    let (mut next, mut known) = (0u64, 0u64);
     let mut acks = JoinSet::new();
     let mut last_ack = 0;
     let mut pending = BTreeMap::new();
     let (mut sequence, mut offset) = (0u64, 0u64);
-    let mut end = None;
+    let mut end: Option<(u64, u64)> = None;
     loop {
         while let Some(Block {
             offset: at,
@@ -258,17 +276,12 @@ async fn download(
             ..
         }) = pending.remove(&sequence)
         {
-            ensure!(
-                end.is_none_or(|(last, _)| sequence < last),
-                "aggregate data past FIN"
-            );
             ensure!(at == offset, "invalid aggregate download offset");
             tcp.write_all(&data).await?;
             offset = offset
                 .checked_add(data.len() as u64)
                 .context("aggregate offset overflow")?;
             sequence += 1;
-            acknowledged.store(sequence, Ordering::Release);
             *activity.lock().expect("flow activity") = Instant::now();
         }
         if let Some((last, bytes)) = end
@@ -310,13 +323,158 @@ async fn download(
                 }
             });
         }
+        loop {
+            let limit = sequence + PIPELINE as u64;
+            let open = end.is_none_or(|(last, _)| next < last);
+            let (start, count, interactive) = if let Some(&first) = returned.first() {
+                let mut count = 1;
+                while count < READY_BATCH && returned.contains(&(first + count)) {
+                    count += 1;
+                }
+                (first, count, false)
+            } else if next < known.min(limit) {
+                (next, (known.min(limit) - next).min(READY_BATCH), false)
+            } else if open && next >= known && next - known < FUTURE_LOW && next < limit {
+                (next, (limit - next).min(FUTURE_BATCH), true)
+            } else {
+                break;
+            };
+            let count = count.min((budget.available_permits() / CHUNK) as u64);
+            if count == 0 {
+                break;
+            }
+            let credit = budget
+                .clone()
+                .try_acquire_many_owned((count as usize * CHUNK) as u32)?;
+            for record in start..start + count {
+                returned.remove(&record);
+            }
+            next = next.max(start + count);
+            let route = puller.spawn(
+                &mut pulls,
+                (start, count),
+                sequence,
+                credit,
+                interactive,
+                None,
+                false,
+            );
+            requests.insert(start, (count, route));
+        }
+        // Later records are buffered while the head is missing: the path
+        // carrying it is slower than its estimate, lossy or silently failing.
+        let stalled = !pending.is_empty() && sequence < known.min(next);
+        stall = match stall {
+            Some((at, since)) if stalled && at == sequence => Some((at, since)),
+            _ => stalled.then(|| (sequence, Instant::now())),
+        };
+        let owner_route = |sequence: u64| {
+            requests
+                .range(..=sequence)
+                .next_back()
+                .filter(|(start, (count, _))| **start + *count > sequence)
+                .map(|(_, (_, route))| *route.lock().expect("download route"))
+        };
+        let hedge_at = stall.filter(|_| !hedging).map(|(at, since)| {
+            let repeat = suspect.is_some_and(|(address, until)| {
+                Instant::now() < until && owner_route(at) == Some(address)
+            });
+            if repeat {
+                since
+            } else {
+                since + owner.pool.hedge_delay(&owner.exit)
+            }
+        });
+        let mut hedge_wait = hedge_at;
+        if let Some(at) = hedge_at
+            && Instant::now() >= at
+        {
+            let mut count = 0;
+            while count < HEDGE_RECORDS
+                && sequence + count < next.min(known)
+                && !pending.contains_key(&(sequence + count))
+            {
+                count += 1;
+            }
+            if count > 0
+                && let Ok(credit) = hedge_budget
+                    .clone()
+                    .try_acquire_many_owned((count as usize * CHUNK) as u32)
+            {
+                let avoid = owner_route(sequence);
+                if let Some(address) = avoid {
+                    let quiet = Duration::from_secs(1);
+                    owner.pool.suspect(&owner.exit, address, quiet);
+                    suspect = Some((address, Instant::now() + quiet));
+                }
+                tracing::debug!(
+                    sequence,
+                    count,
+                    ?avoid,
+                    "re-requesting stalled download head"
+                );
+                puller.spawn(
+                    &mut pulls,
+                    (sequence, count),
+                    sequence,
+                    credit,
+                    false,
+                    avoid,
+                    true,
+                );
+                hedging = true;
+                hedge_wait = None;
+            } else {
+                // Nothing could be re-requested now; wait a full delay again.
+                let now = Instant::now();
+                stall = Some((sequence, now));
+                suspect = None;
+                hedge_wait = Some(now + owner.pool.hedge_delay(&owner.exit));
+            }
+        }
         tokio::select! {
-            event=incoming.recv()=> match event.context("streamed download has a missing record")? {
-                Incoming::Record(record)=>{ensure!(record.sequence>=sequence && end.is_none_or(|(last,_)|record.sequence<last),"unexpected aggregate download sequence");ensure!(pending.insert(record.sequence,record).is_none(),"duplicate aggregate download");},
-                Incoming::End(last,bytes)=>{ensure!(last>=sequence && bytes>=offset && end.is_none_or(|old|old==(last,bytes)),"conflicting aggregate FIN");end=Some((last,bytes));}
+            event = incoming.recv() => match event.context("download requests stopped")? {
+                Incoming::Record(record, produced) => {
+                    known = known.max(produced);
+                    // A replayed or re-requested record that is already held.
+                    if record.sequence >= sequence && !pending.contains_key(&record.sequence) {
+                        ensure!(
+                            end.is_none_or(|(last, _)| record.sequence < last),
+                            "aggregate data past FIN"
+                        );
+                        returned.remove(&record.sequence);
+                        pending.insert(record.sequence, record);
+                    }
+                }
+                Incoming::End(last, bytes) => {
+                    ensure!(
+                        last >= sequence && bytes >= offset && end.is_none_or(|old| old == (last, bytes)),
+                        "conflicting aggregate FIN"
+                    );
+                    end = Some((last, bytes));
+                    known = known.max(last);
+                }
             },
-            Some(result)=workers.join_next(),if !workers.is_empty()=>{result??;},
-            Some(result)=acks.join_next(),if !acks.is_empty()=>{result??;},
+            Some(done) = pulls.join_next() => {
+                let (hedge, start, count, result) = done.context("download request task")?;
+                if hedge {
+                    hedging = false;
+                    if let Err(error) = result {
+                        tracing::debug!(%error, "download head re-request failed");
+                    }
+                } else {
+                    let cursor = result?;
+                    requests.remove(&start);
+                    // Anything not delivered below FIN is assigned again.
+                    for record in cursor.max(sequence)..start + count {
+                        if end.is_none_or(|(last, _)| record < last) && !pending.contains_key(&record) {
+                            returned.insert(record);
+                        }
+                    }
+                }
+            },
+            Some(result) = acks.join_next(), if !acks.is_empty() => { result??; },
+            _ = tokio::time::sleep_until(hedge_wait.unwrap_or_else(Instant::now)), if hedge_wait.is_some() => {},
         }
     }
 }

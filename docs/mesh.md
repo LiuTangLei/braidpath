@@ -5,7 +5,7 @@ client discovery, become a selected exit, or forward encrypted traffic toward
 another exit. The first server only initializes credentials; it has no permanent
 coordination role. Membership converges through authenticated peer exchanges.
 
-## TCP aggregation and selectable exits (v0.4.0)
+## TCP aggregation and selectable exits (v0.4.1)
 
 Enable proxy egress with `--proxy`. A fixed `--target` is optional in this mode;
 provide both options to serve the existing UDP tunnel and the proxy together.
@@ -61,15 +61,33 @@ This aggregation happens within one connection and does not require Clash load
 balancing or multiple browser connections. The selected exit is per flow, without
 introducing a permanent cluster leader.
 
+A single client scheduler assigns contiguous download ranges. Ranges of data the
+exit has already produced go to the path with the earliest expected arrival
+(observed RTT plus queued payload over its measured service rate); a wait for
+future target bytes uses the lowest-RTT path. A path therefore carries a share
+proportional to what it delivers, and a source slower than one path uses one
+path. When later records are buffered behind a missing head record for three
+fast-path RTTs (100 ms–1 s), the head is re-requested on another path, the
+stalled path takes no new work for one second, and further heads stranded on it
+are re-requested at once. Duplicate records are discarded; a replayed range that
+overlaps records already acknowledged skips them. This is record-level fast
+resend in the KCP sense; QUIC still retransmits packets within each path.
+
 A stalled path stops receiving new data and outstanding records replay over
 surviving paths. A four-second response deadline detects a silent path; separate
 liveness heartbeats permit a slow destination without falsely declaring a path
 failure. Isolated authenticated probes readmit recovered paths even while the
 application is idle. Native QUIC retransmissions still operate within each path.
+Each second the client reports per-path failure, completed RPCs, RTT and native
+loss to entrance selection, as the tunnel does, so a failed or persistently poor
+relay can be replaced by another server. The health tick applies entrance changes
+even while all requests wait for target data; retired paths close and late handshakes
+cannot reinstall them, so records replay without waiting for the stall deadline.
 If the exit itself loses its destination TCP state, the flow fails; another exit
 cannot transparently recreate that external TCP connection. New clients require
-`proxy-bond-v1` support on the selected exit. Servers retain the older TCP command
-for rolling upgrades; new clients use the aggregate protocol exclusively.
+`proxy-bond-v2` (v0.4.1) on the selected exit; a v0.4.0 exit rejects the v2
+download request. Servers retain the older TCP command for rolling upgrades;
+new clients use the aggregate protocol exclusively. The TCP proxy has no FEC.
 
 All local listeners must bind loopback. Their SOCKS5 interface supports CONNECT,
 UDP ASSOCIATE and the no-authentication method; BIND returns command unsupported.
@@ -108,8 +126,9 @@ tunnel and its cooperating relay entrances retain their separate behavior.
 
 Proxy limits and lifecycle:
 
-- Each server admits 64 proxy connections, 64 aggregate TCP flows, 1,152 concurrent
-  handlers (512 download lanes, 512 upload/legacy requests, 128 control slots), 256 legacy TCP streams, 64 UDP associations and 1,024 UDP destinations
+- Each server admits 64 proxy connections, 256 aggregate TCP flows, 2,176 concurrent
+  handlers (1,024 download ranges, 512 upload/legacy requests, 640 control and
+  progress slots), 256 legacy TCP streams, 64 UDP associations and 1,024 UDP destinations
   in total; each association allows 32 destinations. Each authenticated QUIC
   connection permits 1,024 concurrent streams. The client
   admits 256 local sessions. Up to 32 OS DNS lookups may be in flight; a timed-out
@@ -117,20 +136,24 @@ Proxy limits and lifecycle:
   admission budget and must authenticate within eight seconds.
 - Aggregate TCP has a 128-record / 16 MiB sequence window per direction and flow.
   Payload records are at most 128 KiB. Each server has separate 32 MiB application
-  buffer budgets for upload and download, shared across flows. Upload admission
-  fails explicitly if its host buffer is exhausted, rather than indefinitely
-  holding later records while a missing record waits for memory. Download readers
-  wait for delivery credit. Downloads use 4–8 logical lanes with independent
-  reserved memory shares. A lane streams up to 32 records before renewing its request;
-  records are delivered as they arrive rather than waiting for a whole batch;
-  a short interactive response returns immediately. Partial replies resume at
-  the first record not yet received. At most one data request per
-  logical lane waits for future target bytes, keeping idle flows from consuming
-  a whole window of server RPC slots. Cumulative TCP delivery ACKs are independent
+  buffer budgets for upload and download, shared across flows and charged by the
+  bytes actually held. Each flow also reserves one record per direction outside
+  those budgets for the upload record at the delivery cursor and the next download
+  record. These allowances keep a stalled consumer or a flow waiting on a missing
+  record from exhausting other flows' progress credit. Concurrent requests for the
+  same flow share its allowance. Other upload records that find the
+  budget full, and requests that find exit handlers full, receive a retryable
+  busy reply; the client backs off without marking the path failed or resetting
+  the connection. Ranges of produced data hold up to four records; future-data
+  waits hold up to eight, and an idle flow keeps one such wait (two while a reply
+  streams). Records are delivered as they arrive rather than waiting for a whole
+  range; a short interactive response returns immediately. Partial replies resume
+  at the first record not yet received. Cumulative TCP delivery ACKs are independent
   of data requests. RPC data slots, progress queries and control commands
   have separate quotas so recovery and cleanup remain schedulable under load.
-  Small progress/control operations prefer the lowest observed QUIC RTT; bulk
-  downloads use observed payload service rate and data-ready backlog across paths,
+  Small progress/control operations and upload records up to 16 KiB prefer the
+  lowest observed QUIC RTT; bulk downloads use observed payload service rate and
+  data-ready backlog across paths,
   rather than treating requests waiting for future target bytes as network load.
   Future-data waits are excluded from service estimates; sender backlog hints
   distinguish available payload from application idle time. Estimates expire for
@@ -191,7 +214,7 @@ Proxy limits and lifecycle:
   multicast addresses remain blocked. Proxy access must be explicitly enabled
   on each desired exit.
 
-`mesh-status` advertises `proxy-tcp-v1`, `proxy-bond-v1` and `proxy-udp-v1` only
+`mesh-status` advertises `proxy-tcp-v1`, `proxy-bond-v2` and `proxy-udp-v1` only
 when enabled. It includes live aggregate-flow, RPC, retained application-buffer,
 connection, association, destination and rejection counts. Relay status includes
 active forward/return byte totals to verify cooperating paths carry payload. Local tests cover real QUIC/SOCKS sockets, selected and simultaneous

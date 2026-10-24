@@ -18,8 +18,8 @@ pub(crate) use server::Registry;
 pub(crate) use service::PathService;
 pub(crate) use transfer::open;
 pub(crate) use wire::{
-    ACK_FIN, CLOSE, DOWNLOAD_ACK, FIN, Incoming, Key, OPEN, Operation, PULL, PUT, Reply,
-    StreamSink, UPLOAD_STATUS, rpc,
+    ACK_FIN, BUSY, CLOSE, DOWNLOAD_ACK, FIN, Incoming, Key, OPEN, Operation, PULL, PUT, Reply,
+    StreamSink, UPLOAD_STATUS, respond, rpc,
 };
 
 pub(super) const CHUNK: usize = 128 * 1024;
@@ -27,7 +27,7 @@ const WINDOW: usize = 16 * 1024 * 1024;
 const PIPELINE: usize = WINDOW / CHUNK;
 const MAX_BATCH: usize = 32;
 const HOST_BUFFER: usize = 32 * 1024 * 1024;
-const MAX_FLOWS: usize = 64;
+pub(crate) const MAX_FLOWS: usize = 256;
 const PATH_STALL: Duration = Duration::from_secs(4);
 const RESUME_GRACE: Duration = Duration::from_secs(10);
 

@@ -81,6 +81,16 @@ Current protocol, commands and limits: [experimental runtime](runtime.md). Check
 
 ## M4 — Reliable flows and application adapters
 
+- [x] v0.4.1: fix aggregate TCP admission and scheduling. Exhausted exit upload
+  memory or handler slots return a retryable busy reply instead of resetting the
+  flow or failing the path; the upload record at the delivery cursor and one
+  download record per flow have reserved credit; download blocks are charged by
+  size. Exit capacity is 256 aggregate flows. Fixed-stride download lanes are
+  replaced by contiguous ranges assigned by expected arrival, latency-first
+  future-data waits, and record-level head re-requests on another path. Proxy
+  paths report health to entrance selection. Local tests cover busy replies,
+  head admission, stalled consumers, 96 idle flows, head re-requests during a
+  blackhole and relay replacement; WAN speedup is not yet measured.
 - [x] v0.4.0: replace per-flow single-path proxy TCP with sequenced record RPCs
   over multiple cooperating server paths to one selected exit and one target TCP
   socket. Separate acceptance, delivery progress and control quotas; bound record
