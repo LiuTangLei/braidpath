@@ -65,6 +65,12 @@ pub trait Controller: Send + Sync {
     /// Number of ack-eliciting bytes that may be in flight
     fn window(&self) -> u64;
 
+    /// Explicit pacing rate in bytes per second, when modeled by the controller.
+    /// Window-based controllers use the pacer's default window/RTT estimate.
+    fn pacing_rate(&self) -> Option<u64> {
+        None
+    }
+
     /// Retrieve implementation-specific metrics used to populate `qlog` traces when they are enabled
     fn metrics(&self) -> ControllerMetrics {
         ControllerMetrics {

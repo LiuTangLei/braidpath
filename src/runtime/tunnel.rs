@@ -2307,6 +2307,9 @@ async fn sender(
                     continue;
                 }
                 let blocked = path.conn.datagram_send_buffer_space() < frame_bytes;
+                #[cfg(test)]
+                let blocked =
+                    blocked || sender_ready_tests::defer_expiry_candidate(front.record_id);
                 if blocked {
                     frontier.add(path.id, is_small, Gate::ApiBuffer);
                     metrics.path(path.id, |p| p.send_buffer_full_attempts += 1);

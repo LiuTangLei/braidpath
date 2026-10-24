@@ -42,3 +42,10 @@ compaction. Overlapping retransmissions could otherwise reappear when an
 application switched from ordered reads to unordered `read_to_end`, falsely
 reporting trailing stream bytes. A regression covers duplicate-only and partially
 unread overlaps. Aggregate TCP framing additionally checks EOF in ordered mode.
+
+The packet pacer consumes BBR's modeled bytes-per-second pacing rate when it is
+available, rather than deriving its rate from BBR's separately inflated in-flight
+window. Controllers without an explicit rate retain window/RTT pacing. The burst
+budget is recomputed and clamped when the modeled rate changes. A deterministic
+regression covers rate-based refilling, reductions and return to window pacing.
+This does not change the application bandwidth ceiling or synthesize ACKs.

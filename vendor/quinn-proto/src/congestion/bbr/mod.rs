@@ -491,6 +491,10 @@ impl Controller for Bbr {
         self.cwnd
     }
 
+    fn pacing_rate(&self) -> Option<u64> {
+        (self.pacing_rate > 0).then_some(self.pacing_rate)
+    }
+
     fn metrics(&self) -> ControllerMetrics {
         ControllerMetrics {
             congestion_window: self.window(),

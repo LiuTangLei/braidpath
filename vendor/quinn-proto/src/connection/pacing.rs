@@ -18,6 +18,7 @@ pub(super) struct Pacer {
     last_mtu: u16,
     tokens: u64,
     prev: Instant,
+    rate: Option<u64>,
 }
 
 impl Pacer {
@@ -30,6 +31,17 @@ impl Pacer {
             last_mtu: mtu,
             tokens: capacity,
             prev: now,
+            rate: None,
+        }
+    }
+
+    /// Preserve the congestion window as an in-flight bound, while a model-based
+    /// controller independently controls the rate at which that window is sent.
+    pub(super) fn set_rate(&mut self, rate: Option<u64>) {
+        let rate = rate.filter(|&rate| rate > 0);
+        if self.rate != rate {
+            self.rate = rate;
+            self.last_window = 0; // Recompute and clamp the burst before sending.
         }
     }
 
@@ -59,7 +71,12 @@ impl Pacer {
         );
 
         if window != self.last_window || mtu != self.last_mtu {
-            self.capacity = optimal_capacity(smoothed_rtt, window, mtu);
+            self.capacity = match self.rate {
+                Some(rate) => ((rate as u128 * BURST_INTERVAL_NANOS / 1_000_000_000)
+                    .min(u64::MAX as u128) as u64)
+                    .clamp(MIN_BURST_SIZE * mtu as u64, MAX_BURST_SIZE * mtu as u64),
+                None => optimal_capacity(smoothed_rtt, window, mtu),
+            };
 
             // Clamp the tokens
             self.tokens = self.capacity.min(self.tokens);
@@ -70,6 +87,20 @@ impl Pacer {
         // if we can already send a packet, there is no need for delay
         if self.tokens >= bytes_to_send {
             return None;
+        }
+
+        if let Some(rate) = self.rate {
+            let elapsed = now.checked_duration_since(self.prev).unwrap_or_default();
+            let refill =
+                (elapsed.as_nanos() * rate as u128 / 1_000_000_000).min(u64::MAX as u128) as u64;
+            self.tokens = self.tokens.saturating_add(refill).min(self.capacity);
+            self.prev = now;
+            if self.tokens >= bytes_to_send {
+                return None;
+            }
+            let missing = bytes_to_send.max(self.capacity) - self.tokens;
+            let nanos = (missing as u128 * 1_000_000_000).div_ceil(rate as u128);
+            return Some(now + Duration::from_nanos(nanos.min(u64::MAX as u128) as u64));
         }
 
         // we disable pacing for extremely large windows
@@ -153,6 +184,35 @@ const MAX_BURST_SIZE: u64 = 256;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn modeled_rate_does_not_send_an_inflated_window_per_rtt() {
+        let now = Instant::now();
+        let rtt = Duration::from_millis(100);
+        let window = 20 * 1024 * 1024;
+        let mut pacer = Pacer::new(rtt, window, 1000, now);
+        pacer.set_rate(Some(10_000_000));
+        for _ in 0..20 {
+            assert_eq!(pacer.delay(rtt, 1000, 1000, window, now), None);
+            pacer.on_transmit(1000);
+        }
+        assert_eq!(pacer.capacity, 20_000);
+        assert_eq!(
+            pacer.delay(rtt, 1000, 1000, window, now),
+            Some(now + Duration::from_millis(2))
+        );
+        let next = now + Duration::from_millis(1);
+        assert_eq!(pacer.delay(rtt, 1000, 1000, window, next), None);
+        assert_eq!(pacer.tokens, 10_000);
+        // A lower model rate immediately clamps saved tokens and burst credit.
+        pacer.set_rate(Some(1_000_000));
+        assert_eq!(pacer.delay(rtt, 1000, 1000, window, next), None);
+        assert_eq!(pacer.capacity, 10_000);
+        assert_eq!(pacer.tokens, 10_000);
+        pacer.set_rate(None);
+        pacer.delay(rtt, 1000, 1000, window, next);
+        assert_eq!(pacer.capacity, optimal_capacity(rtt, window, 1000));
+    }
 
     #[test]
     fn does_not_panic_on_bad_instant() {

@@ -207,6 +207,8 @@ pub(super) fn prime_full_input_turn(
 // Receiving the first 64 records does not imply the actor has polled the
 // deferred 65th record's readiness future. Model a legal scheduler suspension
 // at that exact boundary instead of relying on wall-clock load to hit it.
+// Force that one candidate through readiness: an immediately writable native
+// buffer can otherwise expire it in the same drain turn, bypassing this gate.
 #[derive(Default)]
 struct DeferredExpiryGate {
     reached: tokio::sync::Notify,
@@ -214,6 +216,9 @@ struct DeferredExpiryGate {
 }
 thread_local! {
     static DEFERRED_EXPIRY_GATE: std::cell::RefCell<Option<Arc<DeferredExpiryGate>>> = const { std::cell::RefCell::new(None) };
+}
+pub(super) fn defer_expiry_candidate(record_id: Option<u64>) -> bool {
+    record_id == Some(64) && DEFERRED_EXPIRY_GATE.with(|cell| cell.borrow().is_some())
 }
 pub(super) async fn hold_deferred_expiry(deferred: bool) {
     if deferred {
@@ -239,7 +244,7 @@ async fn full_input_turn_services_old_records(expires: bool, settle: bool) {
     let scope = metrics.scope("full-input", stats::FORWARD);
     let (tx, rx) = mpsc::channel(QUEUE);
     let (stop, stopped) = watch::channel(false);
-    let created = Instant::now() - Duration::from_millis(if expires { 500 } else { 20 });
+    let created = Instant::now() - Duration::from_millis(20);
     if expires {
         // Reuse the real admission clock hook: old heads remain within their
         // unchanged 1000ms lifetime, but this older Input expires at the API.

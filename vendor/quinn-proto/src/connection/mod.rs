@@ -624,6 +624,9 @@ impl Connection {
 
                     // Check whether the next datagram is blocked by pacing
                     let smoothed_rtt = self.path.rtt.get();
+                    self.path
+                        .pacing
+                        .set_rate(self.path.congestion.pacing_rate());
                     if let Some(delay) = self.path.pacing.delay(
                         smoothed_rtt,
                         bytes_to_send,
