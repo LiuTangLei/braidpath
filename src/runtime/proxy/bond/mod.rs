@@ -71,3 +71,21 @@ impl Signal {
         }
     }
 }
+
+// Drain only bytes already available. Small interactive writes never wait for
+// a full record, while bulk TCP reads do not spend one RPC on each short read.
+async fn read_record(tcp: &mut tokio::net::tcp::OwnedReadHalf, buffer: &mut [u8]) -> Result<usize> {
+    let mut n = tcp.read(buffer).await?;
+    if n == 0 {
+        return Ok(0);
+    }
+    while n < buffer.len() {
+        match tcp.try_read(&mut buffer[n..]) {
+            Ok(0) => break,
+            Ok(read) => n += read,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(n)
+}

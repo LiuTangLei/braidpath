@@ -119,7 +119,7 @@ impl Server {
         .await??;
         drop(pending);
         crate::runtime::transport::authenticated_proxy(&conn);
-        conn.set_max_concurrent_bi_streams(256u32.into());
+        conn.set_max_concurrent_bi_streams(512u32.into());
         let router = Arc::new(Router::default());
         let mut tasks = JoinSet::new();
         let mut maintenance = tokio::time::interval(Duration::from_secs(5));

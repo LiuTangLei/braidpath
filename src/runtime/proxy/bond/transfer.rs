@@ -131,7 +131,7 @@ async fn upload(
             status_pending = true;
         }
         tokio::select! {
-            read = tcp.read(&mut buffer), if sequence < delivered.saturating_add(PIPELINE as u64) && jobs.len() < PIPELINE => {
+            read = read_record(&mut tcp, &mut buffer), if sequence < delivered.saturating_add(PIPELINE as u64) && jobs.len() < PIPELINE => {
                 let n = read?; if n == 0 { break; }
                 *activity.lock().expect("flow activity") = Instant::now();
                 let credit = budget.clone().acquire_many_owned(CHUNK as u32).await?;
@@ -161,6 +161,11 @@ async fn upload(
             _ => anyhow::bail!("aggregate upload rejected"),
         }
     }
+    tracing::debug!(
+        records = sequence,
+        bytes = offset,
+        "aggregate upload records delivered"
+    );
     accepted(owner, Operation::Fin { sequence, offset }).await
 }
 enum DownloadEvent {
@@ -198,6 +203,11 @@ async fn download(
             && sequence == final_sequence
         {
             ensure!(offset == final_offset, "invalid aggregate download FIN");
+            tracing::debug!(
+                records = sequence,
+                bytes = offset,
+                "aggregate download records delivered"
+            );
             accepted(owner, Operation::AckFin { sequence, offset }).await?;
             tcp.shutdown().await?;
             return Ok(());

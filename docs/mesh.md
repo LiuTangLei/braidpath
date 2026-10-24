@@ -111,7 +111,7 @@ Proxy limits and lifecycle:
 - Each server admits 64 proxy connections, 64 aggregate TCP flows, 512 concurrent
   record RPCs, 256 legacy TCP streams, 64 UDP associations and 1,024 UDP destinations
   in total; each association allows 32 destinations. Each authenticated QUIC
-  connection permits 256 concurrent streams. The client
+  connection permits 512 concurrent streams. The client
   admits 256 local sessions. Up to 32 OS DNS lookups may be in flight; a timed-out
   lookup retains its slot until the resolver actually returns. Pending connections retain the shared server
   admission budget and must authenticate within eight seconds.

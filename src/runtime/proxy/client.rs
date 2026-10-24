@@ -129,8 +129,8 @@ impl Path {
         Self {
             address,
             connection: AsyncMutex::new(None),
-            upload: Arc::new(Semaphore::new(24)),
-            download: Arc::new(Semaphore::new(24)),
+            upload: Arc::new(Semaphore::new(128)),
+            download: Arc::new(Semaphore::new(128)),
             control: Arc::new(Semaphore::new(4)),
             progress: Arc::new(Semaphore::new(128)),
             retry_after: Mutex::new(None),

@@ -515,7 +515,7 @@ impl Download {
             }
             let credit = budget.clone().acquire_many_owned(CHUNK as u32).await?;
             let mut data = vec![0; CHUNK];
-            let n = tcp.read(&mut data).await?;
+            let n = read_record(&mut tcp, &mut data).await?;
             data.truncate(n);
             if n == 0 {
                 let mut state = self.state.lock().expect("download state");
