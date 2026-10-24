@@ -315,7 +315,7 @@ async fn wait_response(
     let mut heartbeat = tokio::time::interval(Duration::from_secs(1));
     loop {
         tokio::select! {
-            result = &mut work => return Ok(result.unwrap_or(Reply::Failed(1))),
+            result = &mut work => return Ok(match result { Ok(reply) => reply, Err(error) => { tracing::debug!(error=?error, "aggregate operation rejected"); Reply::Failed(1) } }),
             _ = send.stopped() => anyhow::bail!("aggregate request cancelled"),
             _ = heartbeat.tick() => { send.write_all(&[0]).await?; }
         }
@@ -383,7 +383,9 @@ impl Upload {
                 return Ok(state.sequence);
             }
             ensure!(
-                !state.finished && sequence < state.sequence.saturating_add(PIPELINE as u64),
+                !state.finished
+                    && (sequence < state.sequence.saturating_add(PIPELINE as u64)
+                        || (finish && sequence == state.sequence.saturating_add(PIPELINE as u64))),
                 "upload record credit exceeded"
             );
             let offset = match &input {
@@ -688,6 +690,53 @@ mod tests {
         sink.read_to_end(&mut received).await.unwrap();
         assert_eq!(received, b"abcdef");
         assert_eq!(budget.available_permits(), CHUNK * 4);
+    }
+    #[tokio::test]
+    async fn fin_remains_admissible_when_all_data_record_credit_is_in_use() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let tcp = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (mut sink, _) = listener.accept().await.unwrap();
+        let (_, write) = tcp.into_split();
+        let upload = Arc::new(Upload::new(Arc::new(Signal::new())));
+        let budget = Arc::new(Semaphore::new(WINDOW));
+        for sequence in 0..PIPELINE as u64 {
+            upload
+                .insert(sequence, block(sequence, sequence, b"x", &budget).await)
+                .await
+                .unwrap();
+        }
+        assert_eq!(budget.available_permits(), 0);
+        let finish = {
+            let upload = upload.clone();
+            tokio::spawn(async move {
+                upload
+                    .insert(PIPELINE as u64, Input::Fin(PIPELINE as u64))
+                    .await
+            })
+        };
+        tokio::task::yield_now().await;
+        assert!(
+            upload
+                .state
+                .lock()
+                .unwrap()
+                .pending
+                .contains_key(&(PIPELINE as u64))
+        );
+        let reader = tokio::spawn(async move {
+            let mut bytes = Vec::new();
+            sink.read_to_end(&mut bytes).await.unwrap();
+            bytes
+        });
+        upload
+            .write_to(write, Arc::new(Rate::new(crate::runtime::MAX_RATE_BPS)))
+            .await
+            .unwrap();
+        finish.await.unwrap().unwrap();
+        assert_eq!(reader.await.unwrap(), vec![b'x'; PIPELINE]);
+        assert_eq!(budget.available_permits(), WINDOW);
     }
     #[tokio::test]
     async fn download_credit_and_final_offset_reject_unearned_acknowledgements() {
