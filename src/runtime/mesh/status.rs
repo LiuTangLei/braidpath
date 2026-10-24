@@ -91,6 +91,12 @@ pub struct Status {
     pub active_relay_forward_bytes: u64,
     #[serde(default)]
     pub active_relay_return_bytes: u64,
+    #[serde(default)]
+    pub active_relay_budget_dropped: u64,
+    #[serde(default)]
+    pub active_relay_queue_dropped: u64,
+    #[serde(default)]
+    pub active_relay_socket_send_dropped: u64,
     pub lease_limit: usize,
     pub source_lease_limit: usize,
     pub control_connections: usize,
@@ -121,16 +127,21 @@ impl State {
             .count();
         drop(peers);
         let hints = self.reconnect.lock().expect("hints").len();
-        let (leases, active_relay_forward_bytes, active_relay_return_bytes) = {
+        let (leases, relay) = {
             let leases = self.leases.lock().expect("leases");
-            let (mut forward, mut returning) = (0, 0);
+            let mut totals = [0u64; 5];
             for lease in leases.values() {
                 lease.metrics.state(|s| {
-                    forward += s.relay.get(stats::FORWARD).map_or(0, |r| r.forwarded_bytes);
-                    returning += s.relay.get(stats::RETURN).map_or(0, |r| r.forwarded_bytes);
+                    totals[0] += s.relay.get(stats::FORWARD).map_or(0, |r| r.forwarded_bytes);
+                    totals[1] += s.relay.get(stats::RETURN).map_or(0, |r| r.forwarded_bytes);
+                    for direction in s.relay.values() {
+                        totals[2] += direction.budget_dropped;
+                        totals[3] += direction.queue_full_dropped;
+                        totals[4] += direction.socket_send_dropped;
+                    }
                 });
             }
-            (leases.len(), forward, returning)
+            (leases.len(), totals)
         };
         Status {
             node: self.own.clone(),
@@ -141,8 +152,11 @@ impl State {
             reconnect_hints: hints,
             // Read-only: inspection does not renew or remove leases.
             leases,
-            active_relay_forward_bytes,
-            active_relay_return_bytes,
+            active_relay_forward_bytes: relay[0],
+            active_relay_return_bytes: relay[1],
+            active_relay_budget_dropped: relay[2],
+            active_relay_queue_dropped: relay[3],
+            active_relay_socket_send_dropped: relay[4],
             lease_limit: 64,
             source_lease_limit: MAX_SOURCE_LEASES,
             control_connections: CONTROL_CONNECTIONS - self.control_connections.available_permits(),

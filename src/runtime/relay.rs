@@ -4,14 +4,14 @@ use anyhow::{Result, ensure};
 use std::{
     collections::HashMap,
     net::{IpAddr, SocketAddr},
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::Duration,
 };
 use tokio::{
     net::UdpSocket,
     sync::{mpsc, watch},
     task::JoinSet,
-    time::timeout,
+    time::{Instant, timeout},
 };
 use tracing::{debug, info};
 
@@ -36,6 +36,27 @@ fn count(metrics: &Metrics, direction: &str, f: impl FnOnce(&mut stats::RelayDir
             f(s.relay.entry(direction.to_owned()).or_default());
         }
     });
+}
+
+struct Mapping {
+    back: Arc<UdpSocket>,
+    sender: mpsc::Sender<Vec<u8>>,
+    activity: Arc<Mutex<Instant>>,
+}
+fn forward(mapping: &Mapping, data: &[u8], metrics: &Metrics) {
+    *mapping.activity.lock().expect("relay activity") = Instant::now();
+    // Most packets can go directly to the kernel without allocation or a second
+    // task wakeup. Retain the bounded queue only when the socket is backpressured.
+    match mapping.back.try_send(data) {
+        Ok(n) => count(metrics, stats::FORWARD, |d| {
+            d.forwarded += 1;
+            d.forwarded_bytes += n as u64;
+        }),
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+            enqueue(&mapping.sender, data, metrics)
+        }
+        Err(_) => count(metrics, stats::FORWARD, |d| d.socket_send_dropped += 1),
+    }
 }
 
 fn enqueue(sender: &mpsc::Sender<Vec<u8>>, data: &[u8], metrics: &Metrics) {
@@ -148,8 +169,12 @@ async fn run_with_budget(
         options.drop_every == 0 || options.drop_every >= 2,
         "invalid impairment interval"
     );
+    super::transport::datagram_socket_buffers(
+        socket2::SockRef::from(front.as_ref()),
+        "relay-front",
+    );
     let budget = Arc::new(Budget::new(options.rate, host));
-    let mut peers: HashMap<SocketAddr, mpsc::Sender<Vec<u8>>> = HashMap::new();
+    let mut peers: HashMap<SocketAddr, Mapping> = HashMap::new();
     let mut tasks = JoinSet::new();
     let (stop, _) = watch::channel(false);
     let mut b = vec![0; 65536];
@@ -164,7 +189,7 @@ async fn run_with_budget(
     }
     let result:Result<()>=async {loop {tokio::select!{
         _=shutdown.wait()=>break,
-        _=tick.tick()=>{peers.retain(|_,tx|!tx.is_closed());if announce {info!(mappings=peers.len(),packets,"relay statistics");} else {debug!(mappings=peers.len(),packets,"mesh relay statistics");}},
+        _=tick.tick()=>{peers.retain(|_,mapping|!mapping.sender.is_closed());if announce {info!(mappings=peers.len(),packets,"relay statistics");} else {debug!(mappings=peers.len(),packets,"mesh relay statistics");}},
         received=front.recv_from(&mut b)=>{
             let (n,peer)=received?;count(&options.stats,stats::FORWARD,|d|d.received+=1);
             if !options.allow.contains(&peer.ip()){count(&options.stats,stats::FORWARD,|d|d.unauthorized_dropped+=1);continue;}
@@ -172,12 +197,13 @@ async fn run_with_budget(
             packets+=1;
             if options.drop_every>0 && packets.is_multiple_of(options.drop_every){count(&options.stats,stats::FORWARD,|d|d.impairment_dropped+=1);continue;}
             if !budget.take(n){count(&options.stats,stats::FORWARD,|d|d.budget_dropped+=1);continue;}
-            if peers.get(&peer).is_some_and(|tx|tx.is_closed()){peers.remove(&peer);}
+            if peers.get(&peer).is_some_and(|mapping|mapping.sender.is_closed()){peers.remove(&peer);}
             if !peers.contains_key(&peer){
                 if peers.len()>=64{count(&options.stats,stats::FORWARD,|d|d.mapping_limit_dropped+=1);continue;}
-                let mapping=async{let back=UdpSocket::bind(if options.target.is_ipv4(){"0.0.0.0:0"}else{"[::]:0"}).await?;back.connect(options.target).await?;Ok::<_,std::io::Error>(back)}.await;
+                let mapping=async{let back=UdpSocket::bind(if options.target.is_ipv4(){"0.0.0.0:0"}else{"[::]:0"}).await?;super::transport::datagram_socket_buffers(socket2::SockRef::from(&back), "relay-back");back.connect(options.target).await?;Ok::<_,std::io::Error>(Arc::new(back))}.await;
                 let back=match mapping{Ok(back)=>back,Err(error)=>{count(&options.stats,stats::FORWARD,|d|d.mapping_error_dropped+=1);tracing::debug!(%peer,%error,"relay mapping unavailable");continue;}};
-                let (tx,mut rx)=mpsc::channel::<Vec<u8>>(32);peers.insert(peer,tx);
+                let activity = Arc::new(Mutex::new(Instant::now()));
+                let (tx,mut rx)=mpsc::channel::<Vec<u8>>(32);peers.insert(peer,Mapping { back: back.clone(), sender: tx, activity: activity.clone() });
                 let front=front.clone();let budget=budget.clone();let metrics=options.stats.clone();let mut quit=stop.subscribe();
                 tasks.spawn(async move {
                     let mut back_buffer=vec![0;2049];
@@ -192,14 +218,14 @@ async fn run_with_budget(
                                 },Err(e)=>Err(e),
                             }
                         }};
-                        let completed=tokio::select!{_=quit.changed()=>false,r=timeout(Duration::from_secs(30),action)=>matches!(r,Ok(Ok(())))};
+                        let completed=tokio::select!{_=quit.changed()=>false,r=timeout(Duration::from_secs(30),action)=>match r { Ok(Ok(())) => true, Err(_) => activity.lock().expect("relay activity").elapsed() < Duration::from_secs(30), _ => false }};
                         if !completed{break;}
                     }
                     let shutting_down = *quit.borrow();
                     discard_queued(&mut rx, &metrics, shutting_down).await;
                 });
             }
-            enqueue(peers.get(&peer).expect("inserted mapping"), &b[..n], &options.stats);
+            forward(peers.get(&peer).expect("inserted mapping"), &b[..n], &options.stats);
         },
         _=tasks.join_next(),if !tasks.is_empty()=>{}
     }}Ok(())}.await;
@@ -268,6 +294,73 @@ mod tests {
                 assert_eq!(counters.mapping_expired_queue_dropped, u64::from(!shutdown));
             });
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn direct_forwarding_preserves_one_way_mapping_activity_and_idle_cleanup() {
+        // Real sockets, controlled clock; keep timer auto-advance from racing IO.
+        let busy = tokio::spawn(async {
+            loop {
+                tokio::task::yield_now().await;
+            }
+        });
+        let target = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let front = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let address = front.local_addr().unwrap();
+        client.connect(address).await.unwrap();
+        let metrics = Metrics::new("one-way-mapping");
+        let relay = tokio::spawn(run_on_socket(
+            Options {
+                listen: address,
+                target: target.local_addr().unwrap(),
+                allow: vec![address.ip()],
+                rate: 10_000_000_000,
+                drop_every: 0,
+                stats: metrics.clone(),
+            },
+            front,
+            false,
+        ));
+        let mut original = None;
+        for _ in 0..4 {
+            client.send(b"one-way").await.unwrap();
+            let mut buffer = [0; 16];
+            let (n, source) = target.recv_from(&mut buffer).await.unwrap();
+            assert_eq!(&buffer[..n], b"one-way");
+            if let Some(old) = original {
+                assert_eq!(source, old, "active one-way mapping expired");
+            } else {
+                original = Some(source);
+            }
+            tokio::time::advance(Duration::from_secs(20)).await;
+            for _ in 0..8 {
+                tokio::task::yield_now().await;
+            }
+        }
+        metrics.state(|s| {
+            assert_eq!(s.relay[stats::FORWARD].forwarded, 4);
+            assert!(
+                s.relay[stats::FORWARD].queue_enqueued <= 1,
+                "steady forwarding still wakes the queue worker"
+            );
+        });
+        tokio::time::advance(Duration::from_secs(40)).await;
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        // The front map retires closed workers on its next five-second sweep.
+        tokio::time::advance(Duration::from_secs(6)).await;
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        let _reclaimed = UdpSocket::bind(original.unwrap())
+            .await
+            .expect("idle mapping retained its socket");
+        relay.abort();
+        let _ = relay.await;
+        busy.abort();
+        let _ = busy.await;
     }
 
     #[cfg(unix)]

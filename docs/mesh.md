@@ -128,6 +128,14 @@ Proxy limits and lifecycle:
   relay leases. The exit retains a flow for a ten-second resume grace after all
   its observed QUIC paths close; abandoned and idle flows release target sockets,
   record buffers and worker tasks. Exit progress is preserved across path changes.
+- Relay front/back sockets request the same OS-bounded 8 MiB send/receive
+  buffers as the proxy. Writable upstream sockets forward without allocating a
+  per-packet queue item or waking another task; backpressure uses the existing
+  bounded queue. Direct forwarding refreshes one-way mapping activity, while idle
+  mappings still release their sockets. Shared relay rate credit retains 10 ms
+  of traffic (32 KiB minimum), apportioned across active leases, so scheduler
+  intervals do not discard high-rate credit. Status exposes active relay budget,
+  queue-full and socket-send drops alongside payload byte totals.
 - `--max-rate-bps` caps the combined TCP/UDP proxy payload in both directions,
   across all proxy clients. Burst credit holds 10 ms of traffic, with a 128 KiB
   minimum (12.5 MB at 10 Gbit/s), avoiding refill-credit loss with millisecond

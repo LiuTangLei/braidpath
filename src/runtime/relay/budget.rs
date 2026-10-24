@@ -21,10 +21,10 @@ pub(super) struct Bucket {
 impl Bucket {
     fn new(rate: f64, now: Instant) -> Self {
         Self {
-            tokens: BURST,
+            tokens: (rate * 0.010).max(BURST),
             last: now,
             rate,
-            burst: BURST,
+            burst: (rate * 0.010).max(BURST),
         }
     }
     fn refill(&mut self, now: Instant) {
@@ -62,7 +62,7 @@ impl State {
             })
             .count();
         let rate = self.total.rate / active.max(1) as f64;
-        let burst = (BURST / active.max(1) as f64).max(MAX_COST);
+        let burst = (self.total.burst / active.max(1) as f64).max(MAX_COST);
         for share in self.shares.values_mut() {
             share.bucket.refill(now);
             let busy = share
@@ -196,6 +196,35 @@ mod tests {
         bucket.refill(start + Duration::from_millis(500));
         bucket.refill(start + Duration::from_secs(1));
         assert_eq!(bucket.tokens, 0.0);
+    }
+
+    #[test]
+    fn high_rate_credit_survives_millisecond_worker_scheduling_without_exceeding_its_budget() {
+        let host = Arc::new(HostBudget::new(10_000_000_000));
+        let lease = host.register();
+        let mut state = host.0.lock().unwrap();
+        let start = state.total.last;
+        // Ten 1 ms batches at 1 Gbit/s must not be cut to the old 32 KiB burst.
+        // The old fixed burst rejects most of each batch despite a 10 Gbit/s cap.
+        let mut admitted = 0;
+        for ms in 0..10 {
+            for _ in 0..100 {
+                assert!(state.take(lease.id, 1200, start + Duration::from_millis(ms)));
+                admitted += 1248;
+            }
+        }
+        assert_eq!(admitted, 1_248_000);
+        state.total.tokens = 0.0;
+        state.shares.get_mut(&lease.id).unwrap().bucket.tokens = 0.0;
+        let now = start + Duration::from_millis(10);
+        let mut bytes = 0;
+        while state.take(lease.id, 1200, now) {
+            bytes += 1248;
+        }
+        assert!(
+            bytes as f64 <= 1_250_000.0,
+            "new burst manufactured refill credit"
+        );
     }
 
     #[test]

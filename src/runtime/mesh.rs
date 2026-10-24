@@ -217,7 +217,7 @@ impl Lease {
     fn forwarded(&self) -> u64 {
         let mut forwarded = 0;
         self.metrics
-            .state(|s| forwarded = s.relay.get(stats::FORWARD).map_or(0, |d| d.queue_enqueued));
+            .state(|s| forwarded = s.relay.get(stats::FORWARD).map_or(0, |d| d.forwarded));
         forwarded
     }
 }

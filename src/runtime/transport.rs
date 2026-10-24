@@ -13,7 +13,7 @@ const PROXY_STREAM_WINDOW: u32 = 16 * 1024 * 1024;
 const PROXY_CONNECTION_WINDOW: u32 = 32 * 1024 * 1024;
 const PROXY_SOCKET_BUFFER_BYTES: usize = 8 * 1024 * 1024;
 
-fn proxy_socket_buffers(socket: socket2::SockRef<'_>) {
+pub(crate) fn datagram_socket_buffers(socket: socket2::SockRef<'_>, scope: &'static str) {
     // Some platforms reject oversized requests; others accept and clamp them.
     // Leave the platform's buffer intact if even a 1 MiB request is refused.
     let request = |set: &dyn Fn(usize) -> std::io::Result<()>| {
@@ -27,9 +27,10 @@ fn proxy_socket_buffers(socket: socket2::SockRef<'_>) {
     // Record what the OS granted so host-wide UDP drop counters can be
     // compared with this socket's actual limits.
     tracing::info!(
+        scope,
         receive = ?socket.recv_buffer_size().ok(),
         send = ?socket.send_buffer_size().ok(),
-        "proxy UDP socket buffers"
+        "UDP socket buffers"
     );
 }
 
@@ -200,7 +201,7 @@ pub(crate) fn server_with_proxy(
     conf.transport_config(Arc::new(transport));
     if proxy {
         let socket = std::net::UdpSocket::bind(bind)?;
-        proxy_socket_buffers(socket2::SockRef::from(&socket));
+        datagram_socket_buffers(socket2::SockRef::from(&socket), "proxy");
         return Ok(Endpoint::new(
             quinn::EndpointConfig::default(),
             Some(conf),
@@ -332,7 +333,7 @@ fn client_with_alpn(
     s.bind(&bind.into())?;
     s.set_nonblocking(true)?;
     if alpn == super::proxy::ALPN {
-        proxy_socket_buffers(socket2::SockRef::from(&s));
+        datagram_socket_buffers(socket2::SockRef::from(&s), "proxy");
     }
     let mut endpoint = Endpoint::new(
         quinn::EndpointConfig::default(),

@@ -919,6 +919,8 @@ async fn relay_traffic_keeps_a_lease_and_sources_are_capped() {
     let temp = tempfile::tempdir().unwrap();
     let mut state = state(temp.path());
     state.bind = "127.0.0.1:0".parse().unwrap();
+    let target = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    state.own.address = target.local_addr().unwrap();
     let source = "127.0.0.1".parse().unwrap();
     let request = || RelayRequest {
         request: None,
@@ -935,6 +937,25 @@ async fn relay_traffic_keeps_a_lease_and_sources_are_capped() {
     })
     .await
     .expect("relay did not forward");
+    state
+        .leases
+        .lock()
+        .unwrap()
+        .get_mut(&created.lease)
+        .unwrap()
+        .touched = Instant::now() - LEASE_FOR;
+    reap(&mut state.leases.lock().unwrap());
+    assert!(state.leases.lock().unwrap().contains_key(&created.lease));
+    // The next packet takes the direct-send path. Lease liveness must count
+    // successful forwards, rather than depending on queue admissions.
+    app.send_to(b"still-in-use", created.address).await.unwrap();
+    timeout(Duration::from_secs(2), async {
+        while state.leases.lock().unwrap()[&created.lease].forwarded() < 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("direct relay did not forward");
     state
         .leases
         .lock()
