@@ -102,6 +102,12 @@ Proxy limits and lifecycle:
   256 KiB aggregate limit until token and exit authentication succeeds. These
   are bounded flow-control budgets, allocated as needed; QUIC congestion
   control still determines how quickly data can be sent.
+- v0.3.4 coalesces contiguous mixed-size backlogs before enforcing Quinn's
+  stream-fragment limit. This prevents a valid upload under TCP backpressure
+  from closing the entire shared proxy connection; genuine gap-flood protection
+  remains active. Proxy UDP sockets request 8 MiB receive buffers, with smaller
+  requests when a platform refuses that size. The OS may clamp the granted size;
+  system-wide socket limits are not changed.
 - UDP associations close when their SOCKS TCP owner closes, after 60 seconds
   without traffic, or when their QUIC connection closes. UDP destination sockets
   expire after 60 seconds idle. TCP streams expire after 300 seconds idle across

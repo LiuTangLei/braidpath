@@ -81,6 +81,9 @@ Current protocol, commands and limits: [experimental runtime](runtime.md). Check
 
 ## M4 — Reliable flows and application adapters
 
+- [x] v0.3.4: prevent contiguous mixed-size stream backlogs from triggering
+  Quinn's fragment guard, retaining the real gap limit and flow-control budgets.
+  Proxy endpoints request larger UDP receive buffers within OS limits.
 - [x] v0.3.3: 10 Gbit/s default operational ceiling, larger authenticated proxy
   flow-control windows, and rate-proportional burst credit for high-rate traffic.
   Focused local regression checks pass; this does not establish WAN throughput.

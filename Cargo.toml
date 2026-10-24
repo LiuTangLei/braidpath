@@ -1,6 +1,6 @@
 [package]
 name = "braidpath"
-version = "0.3.3"
+version = "0.3.4"
 edition = "2024"
 rust-version = "1.88"
 description = "Experimental FEC-assisted multipath transport over HTTP/3 datagrams"
@@ -31,7 +31,12 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time",
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
+[patch.crates-io]
+# Preserve the stream-fragment bound while accepting mixed-size contiguous data.
+quinn-proto = { path = "vendor/quinn-proto" }
+
 [dev-dependencies]
+assert_matches = "1"
 tokio = { version = "1", features = ["test-util"] }
 
 # Socket integration tests launch the test-profile executable at fixed packet

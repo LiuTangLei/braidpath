@@ -11,6 +11,17 @@ pub const DEFAULT_DATAGRAM_SEND_BUFFER_BYTES: usize = 1200;
 pub const MAX_DATAGRAM_SEND_BUFFER_BYTES: usize = 76_800;
 const PROXY_STREAM_WINDOW: u32 = 16 * 1024 * 1024;
 const PROXY_CONNECTION_WINDOW: u32 = 32 * 1024 * 1024;
+const PROXY_SOCKET_RECEIVE_BYTES: usize = 8 * 1024 * 1024;
+
+fn proxy_socket_receive_buffer(socket: socket2::SockRef<'_>) {
+    let mut requested = PROXY_SOCKET_RECEIVE_BYTES;
+    // Some platforms reject oversized requests; others accept and clamp them.
+    // Leave the platform's buffer intact if even a 1 MiB request is refused.
+    while socket.set_recv_buffer_size(requested).is_err() && requested > 1024 * 1024 {
+        requested /= 2;
+    }
+    tracing::debug!(requested, granted = ?socket.recv_buffer_size().ok(), "proxy UDP receive buffer");
+}
 
 /// Expand shared stream credit only after the proxy token and exit are verified.
 pub(crate) fn authenticated_proxy(connection: &quinn::Connection) {
@@ -177,6 +188,16 @@ pub(crate) fn server_with_proxy(
     transport.datagram_send_buffer_size(datagram_send_buffer_bytes);
     ack_request.apply(&mut transport);
     conf.transport_config(Arc::new(transport));
+    if proxy {
+        let socket = std::net::UdpSocket::bind(bind)?;
+        proxy_socket_receive_buffer(socket2::SockRef::from(&socket));
+        return Ok(Endpoint::new(
+            quinn::EndpointConfig::default(),
+            Some(conf),
+            socket,
+            Arc::new(quinn::TokioRuntime),
+        )?);
+    }
     Ok(Endpoint::server(conf, bind)?)
 }
 pub fn client(
@@ -300,6 +321,9 @@ fn client_with_alpn(
     );
     s.bind(&bind.into())?;
     s.set_nonblocking(true)?;
+    if alpn == super::proxy::ALPN {
+        proxy_socket_receive_buffer(socket2::SockRef::from(&s));
+    }
     let mut endpoint = Endpoint::new(
         quinn::EndpointConfig::default(),
         None,
@@ -372,7 +396,9 @@ mod tests {
             // Make the stream visible to accept_bi without reading its payload.
             upload.write_all(&[1]).await.unwrap();
             let (response, mut request) = incoming.accept_bi().await.unwrap();
-            let payload = vec![7; 512 * 1024];
+            // Hold a backlog above the 5.1 MB mixed-frame failure reproduced
+            // in the assembler regression, in both directions before reads.
+            let payload = vec![7; 6 * 1024 * 1024];
             // Completion requires peer ACKs, not just local write buffering.
             // The old 16 KiB stream / 256 KiB connection windows would stall
             // here in both directions until the application consumed data.
