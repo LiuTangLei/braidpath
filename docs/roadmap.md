@@ -86,6 +86,11 @@ Current protocol, commands and limits: [experimental runtime](runtime.md). Check
   and reply headers. A withheld-response regression covers admission-time
   accounting and cancellation cleanup. Active proxy transports expose bounded
   native counters at info level for matched single-connection investigations.
+  The bundled BBR maximum-bandwidth filter now ages lower delivery samples;
+  deterministic regressions cover peak expiry and application-limited sampling.
+  Proxy uploads use CUBIC after bounded sender-loss comparisons; the mesh-server
+  download policy and UDP-tunnel default remain BBR. This is a directional
+  congestion policy, not a claim of a universal WAN speed gain.
 - [x] v0.4.1: fix aggregate TCP admission and scheduling. Exhausted exit upload
   memory or handler slots return a retryable busy reply instead of resetting the
   flow or failing the path; the upload record at the delivery cursor and one

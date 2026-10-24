@@ -49,3 +49,11 @@ window. Controllers without an explicit rate retain window/RTT pacing. The burst
 budget is recomputed and clamped when the modeled rate changes. A deterministic
 regression covers rate-based refilling, reductions and return to window pacing.
 This does not change the application bandwidth ceiling or synthesize ACKs.
+
+The BBR bandwidth estimator now feeds every non-application-limited delivery
+sample into its ten-round maximum filter. Previously it updated only for a new
+maximum, so lower samples could never expire a stale high estimate. Samples
+marked application-limited may raise the estimate but cannot lower it. Two
+deterministic regressions cover peak expiry and the application-limited rule.
+This corrects filter aging; it does not establish that all WAN loss is caused
+by the estimator or change the configured application bandwidth ceiling.

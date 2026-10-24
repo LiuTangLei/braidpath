@@ -62,7 +62,10 @@ impl BandwidthEstimation {
         };
 
         let bandwidth = send_rate.min(ack_rate);
-        if !app_limited && self.max_filter.get() < bandwidth {
+        // Lower delivery samples must advance the ten-round window, otherwise
+        // a transient high estimate becomes a lifetime maximum. Application-
+        // limited samples cannot lower the model, but may reveal more capacity.
+        if !app_limited || self.max_filter.get() < bandwidth {
             self.max_filter.update_max(round, bandwidth);
         }
     }
@@ -97,5 +100,55 @@ impl Display for BandwidthEstimation {
             "{:.3} MB/s",
             self.get_estimate() as f32 / (1024 * 1024) as f32
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample(estimate: &mut BandwidthEstimation, sent: Instant, round: u64, app_limited: bool) {
+        estimate.on_sent(sent, 1000);
+        estimate.on_ack(
+            sent + Duration::from_millis(100),
+            sent,
+            1000,
+            round,
+            app_limited,
+        );
+        estimate.end_acks(round, app_limited);
+    }
+
+    #[test]
+    fn lower_delivery_samples_expire_an_old_bandwidth_peak() {
+        let mut estimate = BandwidthEstimation::default();
+        let mut now = Instant::now();
+        sample(&mut estimate, now, 0, false);
+        now += Duration::from_millis(1);
+        sample(&mut estimate, now, 1, false);
+        assert_eq!(estimate.get_estimate(), 1_000_000);
+        for round in 2..=12 {
+            now += Duration::from_millis(10);
+            sample(&mut estimate, now, round, false);
+        }
+        assert_eq!(estimate.get_estimate(), 100_000);
+    }
+
+    #[test]
+    fn application_limited_samples_can_raise_but_not_lower_the_model() {
+        let mut estimate = BandwidthEstimation::default();
+        let mut now = Instant::now();
+        sample(&mut estimate, now, 0, false);
+        now += Duration::from_millis(10);
+        sample(&mut estimate, now, 1, false);
+        assert_eq!(estimate.get_estimate(), 100_000);
+        now += Duration::from_millis(1);
+        sample(&mut estimate, now, 2, true);
+        assert_eq!(estimate.get_estimate(), 1_000_000);
+        for round in 3..=20 {
+            now += Duration::from_millis(100);
+            sample(&mut estimate, now, round, true);
+        }
+        assert_eq!(estimate.get_estimate(), 1_000_000);
     }
 }

@@ -168,6 +168,15 @@ Proxy limits and lifecycle:
   lost bytes, and UDP transmit/receive bytes. Idle paths remain quiet. Compare
   counter deltas within the same connection; native UDP bytes include protocol
   overhead and retransmissions and must not be added to SOCKS application bytes.
+- v0.4.2 also corrects the bundled BBR estimator's ten-round filter: lower
+  delivery samples can expire an old peak, while application-limited samples
+  cannot lower the estimate. This lets pacing follow a reduced delivery rate
+  without changing the configured application rate ceiling.
+- Proxy-client sending uses CUBIC from v0.4.2, so sustained upload loss reduces
+  the congestion window. Mesh-server sending retains BBR. These are independent
+  directional policies; neither adds a fixed rate limit nor changes the UDP
+  tunnel's default controller. CUBIC can sacrifice throughput on random loss,
+  so evaluate useful bytes and native retransmissions together on the actual path.
 - Closing a local flow schedules a bounded close RPC and retains its admission
   slot until cleanup completes. Client shutdown drains close requests and releases
   relay leases. The exit retains a flow for a ten-second resume grace after all

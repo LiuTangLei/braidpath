@@ -117,6 +117,7 @@ fn key(path: &Path) -> Result<PrivateKeyDer<'static>> {
 pub enum Congestion {
     #[default]
     Bbr,
+    Cubic,
 }
 
 /// Explicit peer ACK-frequency requests for controlled directional comparisons.
@@ -149,9 +150,16 @@ impl AckRequest {
         }
     }
 }
-pub fn config(_congestion: Congestion) -> TransportConfig {
+pub fn config(congestion: Congestion) -> TransportConfig {
     let mut t = TransportConfig::default();
-    t.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
+    match congestion {
+        Congestion::Bbr => {
+            t.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
+        }
+        Congestion::Cubic => {
+            t.congestion_controller_factory(Arc::new(quinn::congestion::CubicConfig::default()));
+        }
+    }
     t.max_concurrent_bidi_streams(16u32.into());
     t.max_concurrent_uni_streams(8u32.into());
     t.datagram_receive_buffer_size(Some(256 * 1200));
@@ -316,7 +324,9 @@ pub(crate) fn proxy_client(remote: SocketAddr, ca: &Path) -> Result<Endpoint> {
         remote,
         ca,
         None,
-        Congestion::default(),
+        // Proxy uploads need loss-responsive pacing on the shared uplink.
+        // This choice does not change the server's download controller.
+        Congestion::Cubic,
         None,
         DEFAULT_DATAGRAM_SEND_BUFFER_BYTES,
         super::proxy::ALPN,
@@ -455,6 +465,8 @@ mod tests {
                 });
             let outgoing = outgoing.unwrap();
             let incoming = incoming.unwrap();
+            assert!(outgoing.congestion_state().metrics().ssthresh.is_some());
+            assert!(incoming.congestion_state().metrics().ssthresh.is_none());
             authenticated_proxy(&incoming);
             let (mut upload, mut download) = outgoing.open_bi().await.unwrap();
             // Make the stream visible to accept_bi without reading its payload.
@@ -586,7 +598,18 @@ mod tests {
         // proxy transport still delivers every byte in order.
         let (relay, dropped) =
             lossy_relay(server.local_addr().unwrap(), Duration::from_millis(50), 100).await;
-        let client = proxy_client(relay, &identity.join("cert.pem")).unwrap();
+        // Keep this assembler regression on a large BBR flight under imposed
+        // non-congestive loss; the proxy default's CUBIC policy is checked above.
+        let client = client_with_alpn(
+            relay,
+            &identity.join("cert.pem"),
+            None,
+            Congestion::Bbr,
+            None,
+            DEFAULT_DATAGRAM_SEND_BUFFER_BYTES,
+            super::super::proxy::ALPN,
+        )
+        .unwrap();
         tokio::time::timeout(Duration::from_secs(60), async {
             let (outgoing, incoming) =
                 tokio::join!(client.connect(relay, "localhost").unwrap(), async {
