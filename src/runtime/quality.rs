@@ -10,9 +10,71 @@ pub const MAX_FRAME: usize = wire::MAX_WIRE + HEADER;
 pub const INTERVAL_US: u64 = 500_000;
 const DELIVERY_INTERVAL_US: u64 = 100_000;
 const DELIVERY_MIN_BYTES: u64 = 4096;
-const WINDOW: u64 = 512;
+// Keep packet-rate-independent reordering history at normal bulk rates. A
+// 512-packet history lasts only about 4 ms at 1 Gbit/s, despite the 500 ms
+// loss-finalization grace below. Allocate the bounded bitmap only on receipt.
+const WINDOW: u64 = 1 << 20;
 const ENTRY: usize = 49;
 const ENTRY_V2: usize = 65;
+
+#[derive(Clone, Copy, Default)]
+struct Word {
+    number: u64,
+    bits: u64,
+}
+
+/// Tagged ring words avoid allocation per packet and make even an authenticated
+/// far-ahead sequence jump bounded work. Tags retire old words without clearing
+/// the entire allocation. The caller finalizes before reusing a live slot.
+#[derive(Default)]
+struct Seen {
+    words: Vec<Word>,
+    count: u64,
+}
+
+impl Seen {
+    fn insert(&mut self, seq: u64) -> bool {
+        if self.words.is_empty() {
+            self.words.resize((WINDOW / 64) as usize, Word::default());
+        }
+        let number = seq / 64;
+        let word = &mut self.words[(number % (WINDOW / 64)) as usize];
+        if word.number != number {
+            *word = Word { number, bits: 0 };
+        }
+        let bit = 1 << (seq % 64);
+        if word.bits & bit != 0 {
+            return false;
+        }
+        word.bits |= bit;
+        self.count += 1;
+        true
+    }
+
+    fn take_before(&mut self, mut start: u64, end: u64) -> u64 {
+        if end <= start || self.count == 0 {
+            return 0;
+        }
+        if end - start >= WINDOW {
+            return std::mem::take(&mut self.count);
+        }
+        let mut received = 0;
+        while start < end {
+            let number = start / 64;
+            let offset = start % 64;
+            let len = (64 - offset).min(end - start);
+            let mask = (u64::MAX >> (64 - len)) << offset;
+            let word = &mut self.words[(number % (WINDOW / 64)) as usize];
+            if word.number == number {
+                received += u64::from((word.bits & mask).count_ones());
+                word.bits &= !mask;
+            }
+            start += len;
+        }
+        self.count -= received;
+        received
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReportKind {
@@ -91,6 +153,9 @@ pub struct Snapshot {
     pub sender_estimate: Estimate,
     pub late: u64,
     pub duplicates: u64,
+    /// Sequence-space pressure, distinct from the ordinary time-based grace.
+    pub window_forced_finalizations: u64,
+    pub window_forced_symbols: u64,
     pub controls_sent: u64,
     pub controls_received: u64,
     pub invalid_controls: u64,
@@ -103,7 +168,7 @@ pub struct Snapshot {
 }
 pub struct State {
     pub snapshot: Snapshot,
-    seen: BTreeSet<u64>,
+    seen: Seen,
     pending: VecDeque<(u64, u64)>,
     watermark: u64,
     transit_min: Option<i128>,
@@ -121,7 +186,7 @@ impl State {
                 generation,
                 ..Default::default()
             },
-            seen: BTreeSet::new(),
+            seen: Seen::default(),
             pending: VecDeque::new(),
             watermark: 0,
             transit_min: None,
@@ -206,6 +271,11 @@ impl State {
         self.mature(now_us);
         let floor = seq.saturating_sub(WINDOW - 1);
         if floor > self.snapshot.received.expected {
+            self.snapshot.window_forced_finalizations += 1;
+            self.snapshot.window_forced_symbols = self
+                .snapshot
+                .window_forced_symbols
+                .saturating_add(floor - self.snapshot.received.expected);
             self.finalize(floor);
         }
         if seq < self.snapshot.received.expected {
@@ -253,13 +323,7 @@ impl State {
         if end <= self.snapshot.received.expected {
             return;
         }
-        // At a busy receiver the 512-symbol window advances on each packet.
-        // Remove only that prefix rather than walking every retained symbol.
-        let mut received = 0;
-        while self.seen.first().is_some_and(|seq| *seq < end) {
-            self.seen.pop_first();
-            received += 1;
-        }
+        let received = self.seen.take_before(self.snapshot.received.expected, end);
         let r = &mut self.snapshot.received;
         r.expected = end;
         r.received += received;
@@ -528,7 +592,9 @@ mod tests {
         let mut state = State::new(1);
         state.snapshot.received.expected = 98;
         state.snapshot.received.received = 97;
-        state.seen.extend([98, 99, 100, 105]);
+        for seq in [98, 99, 100, 105] {
+            assert!(state.seen.insert(seq));
+        }
         for (end, received, lost, remaining) in [
             (100, 99, 1, vec![100, 105]),
             (105, 100, 5, vec![105]),
@@ -539,8 +605,112 @@ mod tests {
             assert_eq!(state.snapshot.received.expected, end);
             assert_eq!(state.snapshot.received.received, received);
             assert_eq!(state.snapshot.received.lost, lost);
-            assert_eq!(state.seen.iter().copied().collect::<Vec<_>>(), remaining);
+            assert_eq!(state.seen.count, remaining.len() as u64);
+            for seq in remaining {
+                assert!(!state.seen.insert(seq), "retained symbol must stay unique");
+            }
         }
+    }
+
+    #[test]
+    fn high_rate_reordering_does_not_invent_loss_or_raise_automatic_fec() {
+        for missing in [0, 4] {
+            let mut tx = State::new(7);
+            let mut rx = State::new(7);
+            let mut delayed = Vec::new();
+            let payload = vec![0; 1000];
+            for n in 0..600 {
+                let packet = tx.wrap(&payload, n * 20);
+                tx.admitted(payload.len());
+                if n < 4 {
+                    delayed.push(packet);
+                } else if n >= 4 + missing {
+                    rx.receive(&packet, 10_000 + n * 20).unwrap();
+                }
+            }
+            // Four originals arrive within 30 ms, after more than 512 later
+            // symbols. No packet has exhausted the 500 ms grace.
+            assert_eq!(rx.snapshot.received.expected, 0);
+            for (n, packet) in delayed.iter().enumerate() {
+                rx.receive(packet, 30_000 + n as u64 * 20).unwrap();
+            }
+            assert_eq!(rx.snapshot.late, 0);
+            assert_eq!(rx.snapshot.window_forced_finalizations, 0);
+            apply_wire_report(&mut tx, rx.report(0, 600_000), 700_000);
+            assert_eq!(tx.snapshot.sender_estimate.expected, 600);
+            assert_eq!(tx.snapshot.sender_estimate.lost, missing);
+            assert_eq!(rx.seen.count, 0);
+            let snapshot = tx.snapshot_at(700_000);
+            let mut fec = crate::runtime::automatic_fec::Controller::default();
+            fec.observe(700_000, [(0, true, &snapshot)]);
+            assert_eq!(
+                fec.snapshot().data_shards,
+                if missing == 0 { 0 } else { 32 }
+            );
+        }
+    }
+
+    #[test]
+    fn tagged_history_matches_reference_across_wraps_partial_words_and_large_jumps() {
+        use std::collections::BTreeSet;
+        let mut history = Seen::default();
+        let mut reference = BTreeSet::new();
+        let mut start = 0;
+        for base in [0, WINDOW - 70, WINDOW * 2 + 63, WINDOW * 4, u64::MAX - 600] {
+            let before = reference.len();
+            reference.retain(|seq| *seq >= base);
+            assert_eq!(
+                history.take_before(start, base),
+                (before - reference.len()) as u64
+            );
+            start = base;
+            for offset in (0..400).rev() {
+                let seq = base + offset;
+                assert_eq!(history.insert(seq), reference.insert(seq));
+                assert!(!history.insert(seq), "duplicate changes no count");
+            }
+            for end in [base + 1, base + 65, base + 100, base + 399, base + 500] {
+                let before = reference.len();
+                reference.retain(|seq| *seq >= end);
+                assert_eq!(
+                    history.take_before(start, end),
+                    (before - reference.len()) as u64
+                );
+                assert_eq!(history.count, reference.len() as u64);
+                start = end;
+            }
+        }
+        assert_eq!(history.count, 0);
+        assert_eq!(
+            history.words.len() * std::mem::size_of::<Word>(),
+            256 * 1024
+        );
+    }
+
+    #[test]
+    fn sequence_pressure_is_bounded_observable_and_reset_with_generation() {
+        let mut tx = State::new(7);
+        let mut rx = State::new(7);
+        assert!(rx.seen.words.is_empty());
+        for (n, seq) in [0, WINDOW, WINDOW + 1000, u64::MAX - 1]
+            .into_iter()
+            .enumerate()
+        {
+            tx.snapshot.sent_symbols = seq;
+            rx.receive(&tx.wrap(&payload(), 0), n as u64).unwrap();
+            assert!(rx.seen.count <= WINDOW);
+            assert_eq!(rx.seen.words.len(), (WINDOW / 64) as usize);
+        }
+        assert_eq!(rx.snapshot.window_forced_finalizations, 3);
+        assert!(rx.snapshot.window_forced_symbols > WINDOW);
+        rx.mature(INTERVAL_US + 10);
+        assert_eq!(rx.snapshot.received.expected, u64::MAX);
+        assert_eq!(rx.snapshot.received.received, 4);
+        assert_eq!(rx.seen.count, 0);
+        rx = State::new(8);
+        assert!(rx.seen.words.is_empty());
+        assert_eq!(rx.snapshot.window_forced_finalizations, 0);
+        assert_eq!(rx.snapshot.received.expected, 0);
     }
     fn payload() -> Bytes {
         wire::plain(&wire::Record {
@@ -980,7 +1150,7 @@ mod tests {
             a.receive(&data, n * 1000 + 10_000 + (n % 3) * 100).unwrap();
             b.receive(&data, n * 1000 + 90_000_000 + (n % 3) * 100)
                 .unwrap();
-            assert!(a.seen.len() <= 512);
+            assert!(a.seen.count <= WINDOW);
         }
         assert_eq!(
             a.snapshot.received.delay_variation_ms,
