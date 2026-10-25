@@ -1273,6 +1273,7 @@ impl PathController {
             && self.queue_delay_ms <= self.target_ms * 0.25
             && !self.loss_pressure
             && !self.last_control.fast_loss
+            && self.loss_test.is_none()
             && !self.reprobe.active()
             && self.rate_bps >= previous_rate
             && now >= self.growth_not_before_us
@@ -1284,7 +1285,11 @@ impl PathController {
                             .is_some_and(|delivered| delivered > brake)
                     })
             });
-        if eligible && let Some(native_bps) = native_bps.filter(|rate| *rate > self.rate_bps) {
+        let recovery_bps = native_bps.map(|rate| {
+            self.loss_ceiling
+                .map_or(rate, |(ceiling, _)| rate.min(ceiling.max(MIN_BPS)))
+        });
+        if eligible && let Some(native_bps) = recovery_bps.filter(|rate| *rate > self.rate_bps) {
             // At most one doubling per native RTT. Existing admission tokens
             // were integrated at the old rate by observe_native; changing the
             // allowance below grants no instantaneous sending credit.
@@ -4375,6 +4380,60 @@ mod tests {
             Some(100_000_000)
         );
         assert!(controller.rate_bps <= 100_000_000);
+    }
+
+    #[test]
+    fn native_service_keeps_both_loss_test_phases_at_their_tested_rate() {
+        for held_loss in [None, Some(0.1)] {
+            let (mut controller, sample) = native_service_fixture();
+            controller.queue_gated_loss_enabled = true;
+            let from_bps = controller.rate_bps;
+            if held_loss.is_some() {
+                controller.rate_bps = (from_bps as f64 * LOSS_TEST_SCALE) as u64;
+            }
+            let held_bps = controller.rate_bps;
+            controller.loss_test = Some(LossTest {
+                from_bps,
+                held_loss,
+                started_us: sample.now_us,
+                measure_from_us: sample.now_us + 500_000,
+                counts: (0, 0),
+            });
+            controller.observe_native_service(&sample, 200_000, 50_000);
+            assert!(controller.loss_test.is_some());
+            assert_eq!(controller.rate_bps, held_bps, "phase {held_loss:?}");
+            assert_eq!(controller.native_service_recoveries, 0);
+        }
+    }
+
+    #[test]
+    fn native_service_recovers_up_to_a_loss_ceiling_and_releases_an_expired_one() {
+        for expired in [false, true] {
+            let (mut controller, sample) = native_service_fixture();
+            controller.queue_gated_loss_enabled = true;
+            let previous = controller.rate_bps;
+            let ceiling = previous + previous / 2;
+            controller.loss_ceiling = Some((
+                ceiling,
+                if expired {
+                    sample.now_us - 1
+                } else {
+                    sample.now_us + 1_000_000
+                },
+            ));
+            controller.observe_native_service(&sample, 200_000, 50_000);
+            assert!(
+                controller.rate_bps > previous,
+                "recovery below the ceiling remains possible"
+            );
+            if expired {
+                assert!(controller.loss_ceiling.is_none());
+                assert!(controller.rate_bps > ceiling);
+            } else {
+                assert_eq!(controller.rate_bps, ceiling);
+            }
+            assert_eq!(controller.native_service_recoveries, 1);
+        }
     }
 
     #[test]
