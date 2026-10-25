@@ -1,10 +1,17 @@
 # Experimental native service recovery
 
-`--native-service-guard` is a **default-off**, local sender experiment. Enable it
+For UDP-only sessions, `--native-service-guard` is a **default-off**, local sender experiment. Enable it
 explicitly on each endpoint being evaluated. It is active only with adaptive,
 original-only traffic: FEC, small-record FEC, redundancy and independent capacity
 probes must all be zero/off. Other configurations retain the existing controller.
 The peer cannot enable this local option through session negotiation.
+
+Reliable aggregate TCP sessions use the same bounded allowance renewal internally,
+including automatic FEC, without a new command-line option. The fresh-feedback,
+delay, loss, post-brake and native-window safeguards below still apply. Plain UDP
+defaults and `--legacy-recovery` retain their prior behavior. See
+[reliable streams](reliable-streams.md) for native RTT-probe handling and current
+experimental acceptance status.
 
 The experiment lets a new, positive receiver report renew a cautious application
 admission allowance toward the connection's current native congestion window

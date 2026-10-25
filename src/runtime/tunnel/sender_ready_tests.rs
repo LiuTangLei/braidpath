@@ -147,6 +147,52 @@ fn policy() -> Policy {
     }
 }
 
+#[tokio::test]
+async fn reliable_auto_fec_uses_native_service_without_a_udp_default_change() {
+    for reliable in [true, false] {
+        let pair = Pair::connect().await;
+        let paths = Arc::new(Mutex::new(vec![pair.path()]));
+        let mut policy = policy();
+        policy.adaptive = true;
+        policy.proxy = reliable;
+        policy.fec = automatic_fec::AUTO;
+        policy.redundancy = 30;
+        let metrics = stats::Metrics::new("client");
+        metrics.register(
+            "native-service-default",
+            0,
+            2,
+            stats::FORWARD,
+            &pair.outgoing,
+        );
+        let scope = metrics.scope("native-service-default", stats::FORWARD);
+        let (_tx, rx) = mpsc::channel(QUEUE);
+        let (stop, stopped) = watch::channel(false);
+        let task = tokio::spawn(sender(rx, paths, policy, stopped, scope, None));
+        let sample = timeout(Duration::from_secs(2), async {
+            loop {
+                let mut sample = None;
+                metrics.state(|state| {
+                    sample = state.paths.values().find_map(|path| path.adaptive.clone());
+                });
+                if let Some(sample) = sample {
+                    break sample;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        stop.send(true).unwrap();
+        task.await.unwrap();
+        assert_eq!(sample.last_control.native_service_guard_enabled, reliable);
+        assert_eq!(
+            sample.native_service_recoveries, 0,
+            "no native allowance may be borrowed without positive business feedback"
+        );
+    }
+}
+
 fn record(id: u64) -> Record {
     Record {
         flow: 1,

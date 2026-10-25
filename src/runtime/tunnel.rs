@@ -1545,6 +1545,8 @@ async fn sender(
             .with_legacy_recovery(metrics.metrics.legacy_recovery())
     });
     let mut native_probes: [native_probe::Pause; MAX_PATHS] = Default::default();
+    let reliable_native_service =
+        (policy.streams || policy.proxy) && !metrics.metrics.legacy_recovery();
     let burst = if policy.adaptive { 2400 } else { 9600 };
     let mut pacer = outbound::Pacer::for_sender(policy.rate, burst);
     let mut groups: [outbound::Pacer; MAX_PATHS] =
@@ -1791,8 +1793,7 @@ async fn sender(
                 let native_probe = path.conn.probing_rtt_hint();
                 let network_queue = native_rtt.saturating_sub(path.conn.min_rtt_hint())
                     >= Duration::from_micros(policy.latency_target_ms.max(2) * 500);
-                if (policy.streams || policy.proxy)
-                    && !metrics.metrics.legacy_recovery()
+                if reliable_native_service
                     && native_probes[usize::from(path.id)].holds(
                         now_us,
                         snapshot.generation,
@@ -1867,12 +1868,13 @@ async fn sender(
                     .snapshot(at);
                 let cwnd = path.conn.cwnd_hint();
                 let rtt_us = native_rtt.as_micros().min(u128::from(u64::MAX)) as u64;
-                if metrics.metrics.native_service_guard()
-                    && policy.fec == 0
-                    && policy.small_fec_bytes == 0
-                    && policy.redundancy == 0
-                    && policy.capacity_probe_bps == 0
-                    && !policy.probe_guided_recovery
+                if reliable_native_service
+                    || (metrics.metrics.native_service_guard()
+                        && policy.fec == 0
+                        && policy.small_fec_bytes == 0
+                        && policy.redundancy == 0
+                        && policy.capacity_probe_bps == 0
+                        && !policy.probe_guided_recovery)
                 {
                     controllers[usize::from(path.id)].observe_native_service(
                         &observation,

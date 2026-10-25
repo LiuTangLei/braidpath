@@ -957,6 +957,20 @@ impl Default for Receiver {
     }
 }
 impl Receiver {
+    /// A frame can add at most one range node. Later gaps in an overlapping
+    /// frame extend the preceding retained range instead of allocating nodes.
+    pub(crate) fn needs_range(&self, offset: u64, len: usize) -> bool {
+        len > 0
+            && offset > self.cumulative
+            && self
+                .ranges
+                .range(..=offset)
+                .next_back()
+                .is_none_or(|(start, data)| start + (data.len() as u64) < offset)
+    }
+    pub(crate) fn range_count(&self) -> usize {
+        self.ranges.len()
+    }
     /// Unique bytes a frame would add; duplicates never reserve memory twice.
     pub fn additional_bytes(&self, offset: u64, len: usize) -> usize {
         let end = offset + len as u64;
@@ -1181,6 +1195,26 @@ impl Receiver {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn range_slot_prediction_covers_overlaps_bridges_and_head_repairs() {
+        let mut receiver = Receiver::default();
+        let now = Instant::now();
+        let mut state = 7u64;
+        for _ in 0..2048 {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let offset = 1 + (state >> 16) % 4096;
+            let len = (state as usize % 128) + 1;
+            let before = receiver.range_count();
+            let needed = receiver.needs_range(offset, len);
+            receiver.on_data(offset, false, vec![3; len], now).unwrap();
+            assert!(receiver.range_count() <= before + usize::from(needed));
+        }
+        assert!(!receiver.needs_range(0, 8192));
+        receiver.on_data(0, false, vec![3; 8192], now).unwrap();
+        assert_eq!(receiver.range_count(), 0);
+        assert_eq!(receiver.cumulative(), 8192);
+    }
 
     #[test]
     fn a_reopened_route_does_not_inherit_expired_stream_rtt_maxima() {

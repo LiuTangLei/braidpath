@@ -132,16 +132,33 @@ target sees.
 | Spurious repair | A rise in the peer's duplicate count raises the reorder factor by 25%, up to 2; progress decays it toward 1.25. Duplicates explained by the sender's own extra copies (tail probes and head-of-line copies, at most two segments' worth outstanding) do not count. |
 | Local drop | Each stream original carries a hold through the sender queue. If it leaves without Quinn admission (expiry, queue rejection, API error) the stream retransmits it at once instead of waiting for loss detection. |
 | Local backlog | Stream bytes waiting for admission are capped at half the admission lifetime of the measured admission rate, between 8 and 56 records, so stream data does not age out of the adaptive 20 ms sender lifetime. |
-| Windows | 256 KiB initial, then the receiver advertises its share of a 64 MiB session budget, between 256 KiB and 32 MiB per stream. Out-of-order data that continues a held range extends it, so an acknowledgment walks the holes rather than every segment. The sender reads from its local socket only up to the peer limit plus 256 KiB. |
+| Windows | 256 KiB initial, then the receiver advertises its share of a 32 MiB host receive budget among streams retaining bytes, between 256 KiB and 32 MiB per stream. Idle streams do not dilute that window. Out-of-order data that continues a held range extends it, so an acknowledgment walks the holes rather than every segment. The sender reads from its local socket only up to the peer limit plus 256 KiB. |
 | Probes | An empty client stream announces itself with a zero-length segment, repeated until acknowledged, so server-first protocols work. A closed window is probed with zero-length segments. |
 | End | FIN after local EOF, and write shutdown after the peer FIN and all data are written, for full half-close. A stream retires when both directions finish, after acknowledging the peer's FIN; its tombstone answers a repeated FIN with that final acknowledgment rather than RESET, so the peer completes instead of resetting a finished exchange. |
 | Reset | Socket errors, violations, connect failure (10 s), or 30 s without acknowledgment progress send RESET (twice) and close the local socket with RST, never FIN. Frames for a closed stream are answered with RESET. A new session epoch resets all streams. |
-| Limits | 256 concurrent streams per session; 120 s tombstones prevent late frames from reopening a closed stream. |
+| Limits | 256 concurrent streams per host, shared across sessions; 120 s tombstones prevent late frames from reopening a closed stream. |
+
+Each direction shares a 32 MiB retained-byte allowance and 65,536 retained-credit
+slots per host. A flow also keeps 128 KiB and 128 private credit slots for forward
+progress, so other stalled flows cannot prevent its cumulative-hole repair.
+The receiver separately bounds out-of-order range nodes to 65,536 across all
+sessions: FIFO byte credits alone cannot account for those nodes after unrelated
+prefix writes. At that bound new ranges remain unacknowledged; duplicates,
+extensions of existing ranges and cumulative-hole repairs still proceed. Reset
+and cancellation return all slots. Oversized credit and range-slot caches shrink
+as they drain.
 
 Congestion control remains below this layer: Quinn's per-connection BBR and, with
 `--adaptive`, the per-path pacing controllers. The stream layer adds no rate
 controller; it only keeps a short, admitted backlog and repairs loss. Retransmissions
 are new records, so the record-ID window still deduplicates paths and FEC.
+
+Reliable aggregate sessions can renew their application sending allowance toward
+the actual native congestion window divided by RTT, including with automatic FEC.
+Renewal requires a new, fresh positive receiver report, active demand, low delay,
+no current loss pressure and no transport blockage; it cannot override a brake or
+mint burst tokens. Growth is capped at one doubling per native RTT and by the
+configured total/group limits. This allowance is not a capacity measurement.
 
 For reliable aggregate sessions, application pacing observations pause briefly
 while native BBR drains its flight for an RTT probe, then allow two RTTs

@@ -35,7 +35,7 @@ use tokio::{
         TcpListener, TcpStream, UdpSocket,
         tcp::{OwnedReadHalf, OwnedWriteHalf},
     },
-    sync::{Notify, Semaphore, mpsc, oneshot, watch},
+    sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch},
     task::{AbortHandle, JoinSet},
     time::{sleep_until, timeout},
 };
@@ -409,6 +409,7 @@ struct Stream {
     status_header: Vec<u8>,
     send: stream::Sender,
     recv: stream::Receiver,
+    range_slots: Vec<OwnedSemaphorePermit>,
     delivery_blocked_since: Option<Instant>,
     reads: Option<Arc<Semaphore>>,
     granted: u64,
@@ -434,6 +435,7 @@ impl Stream {
             status_header: Vec::new(),
             send: stream::Sender::new(open),
             recv: stream::Receiver::default(),
+            range_slots: Vec::new(),
             delivery_blocked_since: None,
             reads: None,
             granted: 0,
@@ -728,7 +730,7 @@ impl Mux {
             s.lease.clone(),
         ));
         s.reset_writer = Some(reset);
-        for data in s.undelivered.drain(..) {
+        for data in std::mem::take(&mut s.undelivered) {
             let _ = writer.send(WriteOp::Data(data));
         }
         s.reads = Some(reads);
@@ -1325,6 +1327,14 @@ impl Mux {
                 }
                 let s = self.streams.get_mut(&id).expect("stream");
                 let additional = s.recv.additional_bytes(offset, data.len());
+                let range_slot = if s.recv.needs_range(offset, data.len()) {
+                    match self.budget.range_slots.clone().try_acquire_owned() {
+                        Ok(slot) => Some(slot),
+                        Err(_) => return,
+                    }
+                } else {
+                    None
+                };
                 let progress = offset <= s.recv.cumulative()
                     && offset + data.len() as u64 > s.recv.cumulative();
                 let Some(credit) = s.lease.rx.try_take(additional, progress) else {
@@ -1332,6 +1342,14 @@ impl Mux {
                 };
                 match s.recv.on_data(offset, fin, data, now) {
                     Ok(ready) => {
+                        if let Some(slot) = range_slot {
+                            s.range_slots.push(slot);
+                        }
+                        s.range_slots.truncate(s.recv.range_count());
+                        if s.range_slots.capacity() > 256.max(s.range_slots.len().saturating_mul(4))
+                        {
+                            s.range_slots.shrink_to(s.range_slots.len().max(256));
+                        }
                         if tracing::enabled!(tracing::Level::DEBUG) {
                             if !ready.is_empty()
                                 && let Some(started) = s.delivery_blocked_since.take()
@@ -2185,6 +2203,73 @@ mod tests {
             decoder.originals, 1,
             "late records are not counted as new unique records"
         );
+        assert_eq!(budget.snapshot(), (0, 0));
+    }
+
+    #[test]
+    fn range_metadata_remains_charged_after_unrelated_prefix_writes() {
+        let mut budget = Budget::default();
+        budget.range_slots = Arc::new(Semaphore::new(2));
+        let budget = Arc::new(budget);
+        let mut blocked = budget_mux(budget.clone());
+        let mut other = budget_mux(budget.clone());
+        assert!(blocked.open(1, false));
+        assert!(other.open(2, false));
+        for offset in [100, 200] {
+            blocked.receive(incoming(
+                1,
+                Frame::Data {
+                    offset,
+                    fin: false,
+                    data: vec![7],
+                },
+            ));
+        }
+        blocked.receive(incoming(
+            1,
+            Frame::Data {
+                offset: 0,
+                fin: false,
+                data: vec![7; 10],
+            },
+        ));
+        blocked.io(Io::Written(1, 10));
+        // FIFO byte credits can now consist of one partial prefix credit,
+        // but both out-of-order range nodes must still occupy host slots.
+        assert_eq!(blocked.streams[&1].recv.receive_diagnostics().3, 2);
+        other.receive(incoming(
+            2,
+            Frame::Data {
+                offset: 300,
+                fin: false,
+                data: vec![8],
+            },
+        ));
+        assert_eq!(other.streams[&2].recv.additional_bytes(300, 1), 1);
+        assert!(other.streams.contains_key(&2));
+        // Filling the head frees an actual range node without needing a new
+        // slot, so another session can immediately accept its deferred data.
+        blocked.receive(incoming(
+            1,
+            Frame::Data {
+                offset: 10,
+                fin: false,
+                data: vec![7; 90],
+            },
+        ));
+        assert_eq!(blocked.streams[&1].recv.cumulative(), 101);
+        other.receive(incoming(
+            2,
+            Frame::Data {
+                offset: 300,
+                fin: false,
+                data: vec![8],
+            },
+        ));
+        assert_eq!(other.streams[&2].recv.additional_bytes(300, 1), 0);
+        blocked.reset(1, "test cleanup");
+        other.reset(2, "test cleanup");
+        assert_eq!(budget.range_slots.available_permits(), 2);
         assert_eq!(budget.snapshot(), (0, 0));
     }
 

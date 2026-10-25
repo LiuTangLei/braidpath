@@ -9,6 +9,11 @@ use std::{
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 const SHARED: usize = 32 * 1024 * 1024;
 const RESERVED: usize = 128 * 1024;
+// Tiny TCP writes must not turn a byte allowance into millions of credit,
+// range-map or pending-write objects. Ordinary 990-byte frames reach the
+// existing byte limit first. Gap repairs retain private slots per flow.
+const SHARED_RECORDS: usize = 65_536;
+const RESERVED_RECORDS: usize = 128;
 const FLOWS: usize = 256;
 
 struct Pool {
@@ -23,6 +28,9 @@ pub(super) struct Pressure {
     denied: u64,
     waits: u64,
     active: usize,
+    shared_records: usize,
+    records: usize,
+    peak_records: usize,
 }
 impl Default for Pool {
     fn default() -> Self {
@@ -34,6 +42,7 @@ impl Default for Pool {
 }
 pub(crate) struct Budget {
     flows: Arc<Semaphore>,
+    pub(super) range_slots: Arc<Semaphore>,
     tx: Arc<Pool>,
     rx: Arc<Pool>,
     rate: Option<Arc<crate::runtime::proxy::Rate>>,
@@ -47,6 +56,7 @@ impl Budget {
     pub(crate) fn new() -> Self {
         Self {
             flows: Arc::new(Semaphore::new(FLOWS)),
+            range_slots: Arc::new(Semaphore::new(SHARED_RECORDS)),
             tx: Arc::default(),
             rx: Arc::default(),
             rate: None,
@@ -65,10 +75,11 @@ impl Budget {
                 + self.rx.shared.lock().expect("stream budget").held,
         )
     }
-    pub(super) fn pressure(&self) -> (Pressure, Pressure) {
+    pub(super) fn pressure(&self) -> (Pressure, Pressure, usize) {
         (
             *self.tx.shared.lock().expect("stream budget"),
             *self.rx.shared.lock().expect("stream budget"),
+            self.range_slots.available_permits(),
         )
     }
     pub(super) fn receive_window(&self) -> u64 {
@@ -142,10 +153,14 @@ fn release(credits: &mut VecDeque<Credit>, mut bytes: usize) {
             credits.pop_front();
         }
     }
+    if credits.capacity() > 256.max(credits.len().saturating_mul(4)) {
+        credits.shrink_to(credits.len().max(256));
+    }
 }
 pub(super) struct Allowance {
     pool: Arc<Pool>,
     reserved: AtomicUsize,
+    reserved_records: AtomicUsize,
     held: AtomicUsize,
     _flow: Arc<OwnedSemaphorePermit>,
 }
@@ -154,6 +169,7 @@ impl Allowance {
         Self {
             pool,
             reserved: AtomicUsize::new(0),
+            reserved_records: AtomicUsize::new(0),
             held: AtomicUsize::new(0),
             _flow: permit,
         }
@@ -162,8 +178,11 @@ impl Allowance {
         let mut used = self.pool.shared.lock().expect("stream budget");
         let shared = bytes.min(SHARED - used.shared);
         let reserved = bytes - shared;
+        let reserved_record = bytes > 0 && used.shared_records == SHARED_RECORDS;
         if reserved > 0
             && (!progress || reserved > RESERVED - self.reserved.load(Ordering::Relaxed))
+            || reserved_record
+                && (!progress || self.reserved_records.load(Ordering::Relaxed) == RESERVED_RECORDS)
         {
             used.denied += 1;
             return None;
@@ -178,10 +197,20 @@ impl Allowance {
         }
         self.held.store(held + bytes, Ordering::Relaxed);
         self.reserved.fetch_add(reserved, Ordering::Relaxed);
+        if bytes > 0 {
+            used.records += 1;
+            used.peak_records = used.peak_records.max(used.records);
+            if reserved_record {
+                self.reserved_records.fetch_add(1, Ordering::Relaxed);
+            } else {
+                used.shared_records += 1;
+            }
+        }
         Some(Credit {
             allowance: self.clone(),
             shared,
             reserved,
+            record: (bytes > 0).then_some(reserved_record),
         })
     }
     pub async fn take(self: &Arc<Self>, bytes: usize) -> Credit {
@@ -205,6 +234,7 @@ pub(crate) struct Credit {
     allowance: Arc<Allowance>,
     shared: usize,
     reserved: usize,
+    record: Option<bool>,
 }
 impl Credit {
     pub fn len(&self) -> usize {
@@ -224,6 +254,18 @@ impl Credit {
         let mut used = self.allowance.pool.shared.lock().expect("stream budget");
         used.shared -= shared;
         used.held -= bytes;
+        if self.len() == 0
+            && let Some(reserved) = self.record.take()
+        {
+            used.records -= 1;
+            if reserved {
+                self.allowance
+                    .reserved_records
+                    .fetch_sub(1, Ordering::Relaxed);
+            } else {
+                used.shared_records -= 1;
+            }
+        }
         let held = self.allowance.held.load(Ordering::Relaxed) - bytes;
         self.allowance.held.store(held, Ordering::Relaxed);
         if held == 0 {
@@ -245,6 +287,71 @@ impl Drop for Credit {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tiny_records_hit_a_host_metadata_limit_and_keep_per_flow_repair_slots() {
+        let budget = Budget::default();
+        let blocked = budget.try_flow().unwrap();
+        let repairing = budget.try_flow().unwrap();
+        let other = budget.try_flow().unwrap();
+        let held: Vec<_> = (0..65_536)
+            .map(|_| blocked.rx.try_take(1, false).unwrap())
+            .collect();
+        assert_eq!(budget.snapshot(), (3, 65_536));
+        assert!(
+            repairing.rx.try_take(1, false).is_none(),
+            "tiny frames must exhaust metadata before the 32 MiB byte allowance"
+        );
+        // Duplicates need neither bytes nor retained-record metadata, even
+        // when another connection occupies all the shared slots.
+        assert_eq!(repairing.rx.try_take(0, false).unwrap().len(), 0);
+        let repairs: Vec<_> = (0..128)
+            .map(|_| repairing.rx.try_take(1, true).unwrap())
+            .collect();
+        assert!(repairing.rx.try_take(1, true).is_none());
+        let independent = other.rx.try_take(990, true).unwrap();
+        drop(held);
+        assert!(repairing.rx.try_take(990, false).is_some());
+        drop(repairs);
+        drop(independent);
+        drop(blocked);
+        drop(repairing);
+        drop(other);
+        assert_eq!(budget.snapshot(), (0, 0));
+        assert_eq!(budget.pressure().1.records, 0);
+        assert_eq!(budget.pressure().1.shared_records, 0);
+    }
+
+    #[test]
+    fn a_partial_write_does_not_release_its_retained_record_slot() {
+        let budget = Budget::default();
+        let lease = budget.try_flow().unwrap();
+        let mut held: Vec<_> = (0..65_536)
+            .map(|_| lease.rx.try_take(2, false).unwrap())
+            .collect();
+        held[0].truncate(1);
+        assert!(lease.rx.try_take(1, false).is_none());
+        held[0].truncate(0);
+        assert!(lease.rx.try_take(1, false).is_some());
+        drop(held);
+        assert_eq!(budget.snapshot().1, 0);
+        drop(lease);
+        assert_eq!(budget.snapshot(), (0, 0));
+    }
+
+    #[test]
+    fn completed_writes_release_excess_credit_queue_capacity() {
+        let budget = Budget::default();
+        let lease = budget.try_flow().unwrap();
+        for _ in 0..1024 {
+            lease.retain_rx(lease.rx.try_take(1, false).unwrap());
+        }
+        lease.release_rx(1024);
+        let queue = lease.rx_held.lock().unwrap();
+        assert!(queue.is_empty());
+        assert!(queue.capacity() <= 256);
+        assert_eq!(budget.pressure().1.records, 0);
+    }
     #[test]
     fn host_credit_is_shared_and_hole_progress_has_its_own_reserve() {
         let budget = Budget::default();
