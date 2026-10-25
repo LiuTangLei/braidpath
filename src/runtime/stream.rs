@@ -937,6 +937,8 @@ pub struct Receiver {
     ack_due: Option<Instant>,
     ack_now: bool,
     last_ack: Option<Instant>,
+    last_duplicate_ack: Option<Instant>,
+    duplicate_ack_pending: bool,
 }
 impl Default for Receiver {
     fn default() -> Self {
@@ -953,6 +955,8 @@ impl Default for Receiver {
             ack_due: None,
             ack_now: false,
             last_ack: None,
+            last_duplicate_ack: None,
+            duplicate_ack_pending: false,
         }
     }
 }
@@ -1080,8 +1084,19 @@ impl Receiver {
         }
         self.duplicates += duplicate;
         self.unacknowledged += 1;
-        if data.is_empty() || fin || duplicate > 0 {
+        if data.is_empty() || fin {
             self.ack_now = true;
+        } else if duplicate > 0 {
+            // One immediate duplicate report preserves loss-recovery feedback.
+            // A burst of redundant repairs must not bypass ACK spacing for
+            // every segment: each SACK may walk thousands of retained holes.
+            self.duplicate_ack_pending = true;
+            match self.last_duplicate_ack.map(|at| at + ACK_SPACING) {
+                Some(spaced) if now < spaced => {
+                    self.ack_due = Some(self.ack_due.map_or(spaced, |due| due.min(spaced)));
+                }
+                _ => self.ack_now = true,
+            }
         } else if self.unacknowledged >= ACK_EVERY {
             match self.last_ack.map(|at| at + ACK_SPACING) {
                 Some(spaced) if now < spaced => {
@@ -1146,6 +1161,10 @@ impl Receiver {
         self.ack_now = false;
         self.ack_due = None;
         self.last_ack = Some(now);
+        if self.duplicate_ack_pending {
+            self.last_duplicate_ack = Some(now);
+            self.duplicate_ack_pending = false;
+        }
         self.unacknowledged = 0;
         self.advertised = self.advertised.max(self.consumed + window.min(MAX_WINDOW));
         let mut ranges: Vec<(u64, u64)> = Vec::new();
@@ -2084,6 +2103,49 @@ mod tests {
         let again = t0 + ACK_SPACING + Duration::from_millis(1);
         receiver.on_data(0, false, segment.clone(), again).unwrap();
         assert!(receiver.take_ack(again, MAX_WINDOW).is_some());
+    }
+
+    #[test]
+    fn duplicate_repair_bursts_coalesce_feedback_without_delaying_fin_or_probes() {
+        let t0 = Instant::now();
+        let mut receiver = Receiver::default();
+        let segment = vec![1; MAX_SEGMENT];
+        receiver.on_data(0, false, segment.clone(), t0).unwrap();
+        receiver.take_ack(t0 + ACK_DELAY, MAX_WINDOW).unwrap();
+        let first = t0 + ACK_DELAY + Duration::from_micros(1);
+        receiver.on_data(0, false, segment.clone(), first).unwrap();
+        assert!(
+            receiver.take_ack(first, MAX_WINDOW).is_some(),
+            "first duplicate reports immediately"
+        );
+        for i in 1..1000 {
+            let at = first + Duration::from_micros(i);
+            receiver.on_data(0, false, segment.clone(), at).unwrap();
+            assert!(
+                receiver.take_ack(at, MAX_WINDOW).is_none(),
+                "burst must not rebuild and queue a SACK per duplicate"
+            );
+        }
+        let due = first + ACK_SPACING;
+        assert_eq!(receiver.next_deadline(), Some(due));
+        let ack = receiver.take_ack(due, MAX_WINDOW).unwrap();
+        assert_eq!(ack.duplicate_bytes, 1000 * MAX_SEGMENT as u64);
+        assert_eq!(ack.cumulative, MAX_SEGMENT as u64);
+        let now = due + Duration::from_micros(1);
+        receiver.on_data(0, false, segment, now).unwrap();
+        assert!(receiver.take_ack(now, MAX_WINDOW).is_none());
+        receiver
+            .on_data(MAX_SEGMENT as u64, true, Vec::new(), now)
+            .unwrap();
+        assert_eq!(
+            receiver.take_ack(now, MAX_WINDOW).unwrap().cumulative,
+            MAX_SEGMENT as u64 + 1
+        );
+        receiver.on_data(0, false, Vec::new(), now).unwrap();
+        assert!(
+            receiver.take_ack(now, MAX_WINDOW).is_some(),
+            "window probes remain immediate"
+        );
     }
 
     #[test]
