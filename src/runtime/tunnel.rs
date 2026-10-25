@@ -4106,24 +4106,27 @@ struct PathConfig {
 }
 
 enum EntranceUpdates {
-    Addresses(watch::Receiver<Vec<SocketAddr>>),
+    Addresses(watch::Receiver<Vec<SocketAddr>>, mesh::Uplink),
     Routes(watch::Receiver<Vec<mesh::Route>>),
 }
 impl EntranceUpdates {
     fn current(&mut self) -> Vec<mesh::Route> {
         match self {
-            Self::Addresses(rx) => rx
+            Self::Addresses(rx, uplink) => rx
                 .borrow_and_update()
                 .iter()
                 .copied()
-                .map(Into::into)
+                .map(|address| mesh::Route {
+                    address,
+                    uplink: uplink.clone(),
+                })
                 .collect(),
             Self::Routes(rx) => rx.borrow_and_update().clone(),
         }
     }
     async fn changed(&mut self) -> Result<()> {
         match self {
-            Self::Addresses(rx) => rx.changed().await?,
+            Self::Addresses(rx, _) => rx.changed().await?,
             Self::Routes(rx) => rx.changed().await?,
         }
         Ok(())
@@ -4245,7 +4248,7 @@ pub(crate) async fn client_with_health(
 ) -> Result<()> {
     client_inner(
         options,
-        entrances.map(EntranceUpdates::Addresses),
+        entrances.map(|rx| EntranceUpdates::Addresses(rx, mesh::Uplink::default())),
         health,
         None,
     )
@@ -4260,9 +4263,18 @@ pub(crate) async fn client_with_mesh_exit(
     health: Option<watch::Sender<mesh::PathHealth>>,
     exit: String,
 ) -> Result<()> {
+    let mut options = options;
+    ensure!(
+        options.interfaces.len() <= 1,
+        "mesh proxy accepts one uplink interface"
+    );
+    let uplink = mesh::Uplink {
+        interface: entrances.as_ref().and_then(|_| options.interfaces.pop()),
+        ..Default::default()
+    };
     client_inner(
         options,
-        entrances.map(EntranceUpdates::Addresses),
+        entrances.map(|rx| EntranceUpdates::Addresses(rx, uplink)),
         health,
         Some(exit),
     )

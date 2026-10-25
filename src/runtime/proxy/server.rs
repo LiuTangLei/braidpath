@@ -302,7 +302,7 @@ mod admission_tests {
         )
         .unwrap();
         let address = endpoint.local_addr().unwrap();
-        let client = transport::proxy_client(address, &identity.join("cert.pem")).unwrap();
+        let client = transport::proxy_client(address, &identity.join("cert.pem"), None).unwrap();
         let (outgoing, incoming) =
             tokio::join!(client.connect(address, "localhost").unwrap(), async {
                 endpoint.accept().await.unwrap().await

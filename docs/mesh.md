@@ -592,3 +592,9 @@ selection. Portable loopback tests do not certify two independent WANs. A
 physical multi-network acceptance run must record actual source routes, network
 removal/recovery and the time to the first valid application response, with
 run details kept in ignored `local/`.
+
+The proxy client can bind its TCP aggregate and native UDP data sockets with
+`--interface` (a Linux interface name or `ifindex:N` on macOS). This also applies
+to replacement entrances; a failed binding does not fall back to the system
+route. Use this when a local TUN proxy would otherwise capture the transport's
+own UDP sockets. Mesh discovery/control still follows the system route.

@@ -252,6 +252,7 @@ async fn separate_tcp_listeners_pin_exits_half_close_and_share_connections() {
         identity.clone(),
         vec![node("a", a), node("b", b)],
         vec!["a".into(), "b".into()],
+        None,
     )
     .unwrap();
     let (listen_a, _listen_a) = local_listener(pool.clone(), "a").await;
@@ -319,6 +320,7 @@ async fn separate_udp_listeners_pin_exits_fragment_and_release_independently() {
         identity.clone(),
         vec![node("a", at), node("b", b)],
         vec!["a".into(), "b".into()],
+        None,
     )
     .unwrap();
     let (listen, _listen) = local_listener(pool.clone(), "a").await;
@@ -425,7 +427,7 @@ async fn wrong_token_wrong_exit_private_destination_and_unsupported_command_are_
     let root = root.path();
     let (at, _server) = start(root, "a", None, false).await;
     let identity = identity(root, "client");
-    let endpoint = transport::proxy_client(at, &identity.dir.join("cert.pem")).unwrap();
+    let endpoint = transport::proxy_client(at, &identity.dir.join("cert.pem"), None).unwrap();
     for (token, exit) in [
         ("0".repeat(64), "a".to_owned()),
         (
@@ -452,7 +454,13 @@ async fn wrong_token_wrong_exit_private_destination_and_unsupported_command_are_
                 .is_err()
         );
     }
-    let pool = client::Pool::new(identity.clone(), vec![node("a", at)], vec!["a".into()]).unwrap();
+    let pool = client::Pool::new(
+        identity.clone(),
+        vec![node("a", at)],
+        vec!["a".into()],
+        None,
+    )
+    .unwrap();
     let (listen, _listen) = local_listener(pool, "a").await;
     let (target, _echo) = echo().await;
     for address in [
@@ -472,7 +480,13 @@ async fn tcp_connect_failure_is_reported_before_socks_success() {
     let root = tempfile::tempdir().unwrap();
     let (at, _server) = start(root.path(), "a", None, true).await;
     let identity = identity(root.path(), "connect-failure-client");
-    let pool = client::Pool::new(identity.clone(), vec![node("a", at)], vec!["a".into()]).unwrap();
+    let pool = client::Pool::new(
+        identity.clone(),
+        vec![node("a", at)],
+        vec!["a".into()],
+        None,
+    )
+    .unwrap();
     let (listen, _listener) = local_listener(pool.clone(), "a").await;
     let unused = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let target = unused.local_addr().unwrap();
@@ -515,8 +529,13 @@ async fn aggregate_proxy_rejects_bad_credentials_and_wrong_exit_before_target_co
     let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let target_address = target.local_addr().unwrap();
     for (client_identity, exit) in [(bad, "a"), (valid.clone(), "wrong")] {
-        let pool =
-            client::Pool::new(client_identity, vec![node(exit, at)], vec![exit.into()]).unwrap();
+        let pool = client::Pool::new(
+            client_identity,
+            vec![node(exit, at)],
+            vec![exit.into()],
+            None,
+        )
+        .unwrap();
         let (listen, listener) = local_listener(pool.clone(), exit).await;
         let (_, status, _) = timeout(
             Duration::from_secs(8),
@@ -571,7 +590,7 @@ async fn aggregate_proxy_requires_the_advertised_stream_capability() {
             .iter()
             .any(|f| f == "proxy-stream-v2")
     );
-    let pool = client::Pool::new(identity, vec![node("a", at)], vec!["a".into()]).unwrap();
+    let pool = client::Pool::new(identity, vec![node("a", at)], vec!["a".into()], None).unwrap();
     let (listen, _listener) = local_listener(pool.clone(), "a").await;
     let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let (_, code, _) = timeout(
@@ -669,6 +688,7 @@ async fn failed_exit_never_falls_back_and_other_listener_keeps_serving() {
         identity.clone(),
         vec![node("a", a), node("b", b)],
         vec!["a".into(), "b".into()],
+        None,
     )
     .unwrap();
     let (listen_a, _listener_a) = local_listener(pool.clone(), "a").await;
@@ -760,6 +780,7 @@ async fn one_tcp_connection_uses_multiple_servers_and_survives_a_relay_stopping(
         identity.clone(),
         vec![node("a", a), node("b", b), node("c", c)],
         vec!["a".into()],
+        None,
     )
     .unwrap();
     timeout(Duration::from_secs(5), async {
@@ -846,7 +867,8 @@ async fn aggregate_client_reset_reclaims_tcp_and_payload_resources() {
     let root = root.path();
     let (a, _server) = start(root, "a", None, true).await;
     let identity = identity(root, "reset-client");
-    let pool = client::Pool::new(identity.clone(), vec![node("a", a)], vec!["a".into()]).unwrap();
+    let pool =
+        client::Pool::new(identity.clone(), vec![node("a", a)], vec!["a".into()], None).unwrap();
     let (listen, _listener) = local_listener(pool, "a").await;
     let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let at = target.local_addr().unwrap();
@@ -897,7 +919,8 @@ async fn data_blackhole_is_quarantined_and_rejoins_the_same_tcp_flow_after_recov
     let root = root.path();
     let (a, _server, server_metrics) = start_metered(root, "a", None, true).await;
     let identity = identity(root, "blackhole-client");
-    let pool = client::Pool::new(identity.clone(), vec![node("a", a)], vec!["a".into()]).unwrap();
+    let pool =
+        client::Pool::new(identity.clone(), vec![node("a", a)], vec!["a".into()], None).unwrap();
     let front = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let via = front.local_addr().unwrap();
     let back = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -1008,6 +1031,7 @@ async fn aggregate_shutdown_releases_optional_leases_and_flow_admission_credit()
         identity.clone(),
         vec![node("a", a), node("b", b)],
         vec!["a".into()],
+        None,
     )
     .unwrap();
     timeout(Duration::from_secs(3), async {
@@ -1037,7 +1061,13 @@ async fn queued_stream_bytes_are_charged_and_reset_reclaims_them_with_downlink_b
     let root = tempfile::tempdir().unwrap();
     let (at, _server) = start(root.path(), "a", None, true).await;
     let identity = identity(root.path(), "queued-client");
-    let pool = client::Pool::new(identity.clone(), vec![node("a", at)], vec!["a".into()]).unwrap();
+    let pool = client::Pool::new(
+        identity.clone(),
+        vec![node("a", at)],
+        vec!["a".into()],
+        None,
+    )
+    .unwrap();
     let front = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let via = front.local_addr().unwrap();
     let back = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -1113,7 +1143,13 @@ async fn prepared_paths_do_not_open_targets_and_cold_relays_do_not_hold_download
     let root = root.path();
     let (at, _server) = start(root, "a", None, true).await;
     let identity = identity(root, "prepare-client");
-    let pool = client::Pool::new(identity.clone(), vec![node("a", at)], vec!["a".into()]).unwrap();
+    let pool = client::Pool::new(
+        identity.clone(),
+        vec![node("a", at)],
+        vec!["a".into()],
+        None,
+    )
+    .unwrap();
     let blackhole = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let cold = blackhole.local_addr().unwrap();
     pool.test_set_routes("a", vec![at, cold]);
@@ -1168,6 +1204,7 @@ async fn failed_proxy_relay_is_reported_and_replaced_by_another_server() {
         identity.clone(),
         vec![node("a", a), node("b", b), node("c", c), node("d", d)],
         vec!["a".into()],
+        None,
     )
     .unwrap();
     pool.set_path_limit(3);
@@ -1248,6 +1285,7 @@ async fn one_tcp_upload_repairs_loss_without_duplicating_target_bytes() {
         identity.clone(),
         vec![node("a", a), node("b", b), node("c", c)],
         vec!["a".into()],
+        None,
     )
     .unwrap();
     timeout(Duration::from_secs(4), async {
@@ -1342,7 +1380,7 @@ async fn single_tcp_external_route_diagnostic() {
         let root = tempfile::tempdir().unwrap();
         let identity = mesh::ClientIdentity::open(root.path().join("client"), &case.connection_key).unwrap();
         let nodes = identity.discover(case.bootstrap).await.unwrap();
-        let pool = client::Pool::new(identity.clone(), nodes, vec![case.exit.clone()]).unwrap();
+        let pool = client::Pool::new(identity.clone(), nodes, vec![case.exit.clone()], None).unwrap();
         pool.test_set_routes(&case.exit, case.routes);
         let (listen, listener) = local_listener(pool.clone(), &case.exit).await;
         let (mut tcp, status, _) = socks(listen, TCP, Address::Ip(case.target)).await;
@@ -1377,7 +1415,8 @@ async fn live_lanes_deliver_interactive_turns_before_batch_completion_or_tcp_eof
     let root = root.path();
     let (a, _server) = start(root, "a", None, true).await;
     let identity = identity(root, "interactive-lane");
-    let pool = client::Pool::new(identity.clone(), vec![node("a", a)], vec!["a".into()]).unwrap();
+    let pool =
+        client::Pool::new(identity.clone(), vec![node("a", a)], vec!["a".into()], None).unwrap();
     let (listen, listener) = local_listener(pool.clone(), "a").await;
     let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let at = target.local_addr().unwrap();
@@ -1427,7 +1466,8 @@ async fn idle_streaming_flows_do_not_starve_an_active_flow_and_all_release() {
     let root = root.path();
     let (a, _server) = start(root, "a", None, true).await;
     let identity = identity(root, "idle-lanes");
-    let pool = client::Pool::new(identity.clone(), vec![node("a", a)], vec!["a".into()]).unwrap();
+    let pool =
+        client::Pool::new(identity.clone(), vec![node("a", a)], vec!["a".into()], None).unwrap();
     let (listen, listener) = local_listener_capacity(pool.clone(), "a", MAX_STREAMS).await;
     let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let at = target.local_addr().unwrap();

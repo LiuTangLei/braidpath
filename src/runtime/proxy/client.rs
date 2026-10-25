@@ -42,6 +42,7 @@ pub struct ClientOptions {
     pub listen: SocketAddr,
     pub socks5: Vec<Listener>,
     pub paths: usize,
+    pub interface: Option<String>,
 }
 
 pub(super) fn listener_plan(
@@ -196,6 +197,7 @@ struct Slot {
 }
 pub(super) struct Pool {
     identity: mesh::ClientIdentity,
+    interface: Option<String>,
     token: String,
     slots: BTreeMap<String, Slot>,
     nodes: RwLock<Vec<mesh::Node>>,
@@ -210,6 +212,7 @@ impl Pool {
         identity: mesh::ClientIdentity,
         nodes: Vec<mesh::Node>,
         exits: Vec<String>,
+        interface: Option<String>,
     ) -> Result<Arc<Self>> {
         ensure!(
             !exits.is_empty() && exits.len() <= 8,
@@ -243,6 +246,7 @@ impl Pool {
         let token = transport::token(&identity.dir.join("token"))?;
         Ok(Arc::new(Self {
             identity,
+            interface,
             token,
             slots,
             nodes: RwLock::new(nodes),
@@ -323,7 +327,7 @@ impl Pool {
             proxy_listen: None,
             stream_connector: Some(connector.clone()),
             entrances: updates.borrow().clone(),
-            interfaces: vec![],
+            interfaces: self.interface.iter().cloned().collect(),
             path_binds: vec![],
             datagram_send_buffer_bytes: transport::MAX_DATAGRAM_SEND_BUFFER_BYTES,
             path_groups: vec![],
@@ -384,8 +388,9 @@ impl Pool {
         token: &str,
         address: SocketAddr,
         id: &str,
+        interface: Option<&str>,
     ) -> Result<Arc<UdpConnection>> {
-        let endpoint = transport::proxy_client(address, &identity.dir.join("cert.pem"))?;
+        let endpoint = transport::proxy_client(address, &identity.dir.join("cert.pem"), interface)?;
         let connection = timeout(CONNECT_TIMEOUT, async {
             let raw = endpoint.connect(address, &identity.name())?.await?;
             let close = CloseConnection(raw.clone());
@@ -434,8 +439,14 @@ impl Pool {
             }
             *cached = None;
         }
-        let connection =
-            Self::authenticate_udp(&self.identity, &self.token, path.address, id).await?;
+        let connection = Self::authenticate_udp(
+            &self.identity,
+            &self.token,
+            path.address,
+            id,
+            self.interface.as_deref(),
+        )
+        .await?;
         let mut cached = path.connection.lock().expect("proxy connection");
         // Retirement can race with the handshake. Never install a connection
         // after its entrance lease has been released.
@@ -663,7 +674,7 @@ pub async fn client(options: ClientOptions) -> Result<()> {
         nodes.push(result??);
     }
     let selected_exits = options.exits.clone();
-    let pool = Pool::new(options.identity, nodes, options.exits)?;
+    let pool = Pool::new(options.identity, nodes, options.exits, options.interface)?;
     ensure!(
         (1..=crate::runtime::MAX_PATHS).contains(&options.paths),
         "invalid proxy path limit"
@@ -775,6 +786,7 @@ mod lifecycle_tests {
                 incarnation: 0,
             }],
             vec!["exit".into()],
+            None,
         )
         .unwrap()
     }
@@ -835,7 +847,8 @@ mod lifecycle_tests {
         )
         .unwrap();
         let address = server.local_addr().unwrap();
-        let client = transport::proxy_client(address, &pool.identity.dir.join("cert.pem")).unwrap();
+        let client =
+            transport::proxy_client(address, &pool.identity.dir.join("cert.pem"), None).unwrap();
         let (outgoing, incoming) = timeout(Duration::from_secs(3), async {
             tokio::join!(client.connect(address, "localhost").unwrap(), async {
                 server.accept().await.unwrap().await
@@ -953,6 +966,7 @@ mod lifecycle_tests {
             identity.clone(),
             nodes.clone(),
             vec!["a".into(), "b".into()],
+            None,
         )
         .unwrap();
         let mut paths = Vec::new();

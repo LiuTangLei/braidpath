@@ -479,11 +479,15 @@ pub(crate) fn client_bound_with_session_alpn(
     )
 }
 
-pub(crate) fn proxy_client(remote: SocketAddr, ca: &Path) -> Result<Endpoint> {
+pub(crate) fn proxy_client(
+    remote: SocketAddr,
+    ca: &Path,
+    interface: Option<&str>,
+) -> Result<Endpoint> {
     client_with_alpn(
         remote,
         ca,
-        None,
+        interface,
         Congestion::Bbr,
         None,
         DEFAULT_DATAGRAM_SEND_BUFFER_BYTES,
@@ -730,6 +734,24 @@ mod tests {
         server.close(0u32.into(), b"test complete");
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn proxy_uplink_binding_does_not_silently_fall_back_to_system_route() {
+        let temp = tempfile::tempdir().unwrap();
+        initialize(&temp.path().join("identity"), "localhost").unwrap();
+        #[cfg(target_os = "macos")]
+        let missing = "ifindex:0";
+        #[cfg(target_os = "linux")]
+        let missing = "bp-missing0";
+        let address = "127.0.0.1:1".parse().unwrap();
+        let cert = temp.path().join("identity/cert.pem");
+        let unbound = proxy_client(address, &cert, None).unwrap();
+        unbound.close(0u32.into(), b"test complete");
+        let error =
+            proxy_client(address, &cert, Some(missing)).expect_err("invalid binding must fail");
+        assert!(format!("{error:#}").contains("interface"));
+    }
+
     #[tokio::test]
     async fn native_udp_control_streams_progress_with_bounded_windows() {
         let temp = tempfile::tempdir().unwrap();
@@ -746,7 +768,7 @@ mod tests {
         )
         .unwrap();
         let address = server.local_addr().unwrap();
-        let client = proxy_client(address, &identity.join("cert.pem")).unwrap();
+        let client = proxy_client(address, &identity.join("cert.pem"), None).unwrap();
         tokio::time::timeout(Duration::from_secs(5), async {
             let (outgoing, incoming) =
                 tokio::join!(client.connect(address, "localhost").unwrap(), async {

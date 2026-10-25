@@ -773,3 +773,36 @@ fn fragmentation_requires_exact_capability_echo_and_legacy_is_explicit() {
     headers.insert("braidpath-message-bytes", "65535".parse().unwrap());
     assert!(validate_message_echo(&headers, 4096).is_err());
 }
+
+#[tokio::test]
+async fn address_replacement_retains_proxy_uplink_binding() {
+    let first: SocketAddr = "127.0.0.1:10001".parse().unwrap();
+    let replacement: SocketAddr = "127.0.0.1:10002".parse().unwrap();
+    let (tx, rx) = watch::channel(vec![first]);
+    let uplink = mesh::Uplink {
+        interface: Some("ifindex:6".into()),
+        ..Default::default()
+    };
+    let mut updates = Some(EntranceUpdates::Addresses(rx, uplink.clone()));
+    assert_eq!(
+        updates.as_mut().unwrap().current(),
+        vec![mesh::Route {
+            address: first,
+            uplink: uplink.clone()
+        }]
+    );
+    tx.send_replace(vec![replacement, first]);
+    assert_eq!(
+        entrances_changed(&mut updates).await,
+        vec![
+            mesh::Route {
+                address: replacement,
+                uplink: uplink.clone()
+            },
+            mesh::Route {
+                address: first,
+                uplink
+            }
+        ]
+    );
+}

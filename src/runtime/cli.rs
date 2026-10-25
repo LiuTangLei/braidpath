@@ -70,6 +70,11 @@ mod proxy_cli_tests {
             "a=127.0.0.1:2080",
         ];
         assert!(Cli::try_parse_from(client).is_ok());
+        let parsed =
+            Cli::try_parse_from(client.into_iter().chain(["--interface", "ifindex:6"])).unwrap();
+        assert!(
+            matches!(parsed.command, Command::ProxyClient { interface: Some(ref name), .. } if name == "ifindex:6")
+        );
         assert!(
             Cli::try_parse_from(client.into_iter().chain(["--socks5", "b=0.0.0.0:1082"])).is_err()
         );
@@ -178,6 +183,9 @@ enum Command {
         /// Maximum server paths cooperating on each TCP connection (1..8).
         #[arg(long, default_value_t = 4, value_parser = clap::value_parser!(u8).range(1..=8))]
         paths: u8,
+        /// Bind all proxy data paths to an uplink (Linux name; macOS ifindex:N).
+        #[arg(long)]
+        interface: Option<String>,
     },
     /// Discover live distributed servers through any member using a client key.
     Nodes {
@@ -496,6 +504,7 @@ pub async fn run() -> Result<()> {
             listen,
             socks5,
             paths,
+            interface,
         } => {
             let identity = mesh::ClientIdentity::open(dir, &connection_key)?;
             proxy::client(proxy::ClientOptions {
@@ -505,6 +514,7 @@ pub async fn run() -> Result<()> {
                 listen,
                 socks5,
                 paths: usize::from(paths),
+                interface,
             })
             .await
         }
