@@ -50,6 +50,9 @@ const DEAD_AFTER: Duration = Duration::from_secs(30);
 /// Copies sent without a loss declaration may produce up to this many duplicate
 /// bytes that are not evidence of reordering.
 const EXPECTED_DUPLICATES_MAX: u64 = 2 * MAX_SEGMENT as u64;
+/// A persistent SACK hole in a bulk flight may get one bounded extra copy.
+/// Small tails already have their separate probe policy.
+const HEAD_PROBE_MIN_FLIGHT: u64 = 64 * 1024;
 
 const UNKNOWN_PATH: usize = MAX_PATHS;
 
@@ -359,6 +362,9 @@ pub struct Sender {
     tail_probe_due: bool,
     /// The head-of-line segment and the repair to follow with one copy once admitted.
     head_copy: Option<(u64, u32)>,
+    head_probe: Option<(u64, u32, Instant)>,
+    head_probe_due: bool,
+    last_head_probe: Option<Instant>,
     /// Copies awaiting their admission/drop callback. Keep them independently
     /// of segments: the original can be acknowledged while its copy is queued.
     pending_copies: BTreeMap<(u64, u32), u64>,
@@ -406,6 +412,9 @@ impl Sender {
             open_sent: false,
             tail_probe_due: false,
             head_copy: None,
+            head_probe: None,
+            head_probe_due: false,
+            last_head_probe: None,
             pending_copies: BTreeMap::new(),
             expected_duplicates: 0,
         }
@@ -469,6 +478,7 @@ impl Sender {
     }
     pub fn has_transmit(&self) -> bool {
         self.tail_probe_due
+            || self.head_probe_due
             || self.head_copy_ready().is_some()
             || !self.lost.is_empty()
             || (self.next < self.written && self.next < self.limit)
@@ -599,6 +609,19 @@ impl Sender {
             let mut t = self.send_segment(start, end, now, true);
             (t.tail_probe, t.head_copy) = (false, true);
             return Some(t);
+        }
+        if self.head_probe_due {
+            self.head_probe_due = false;
+            if let Some((start, at)) = self.head_probe_deadline()
+                && now >= at
+            {
+                let end = self.segments[&start].end;
+                self.head_probe = None;
+                self.last_head_probe = Some(now);
+                let mut t = self.send_segment(start, end, now, true);
+                (t.tail_probe, t.head_copy) = (false, true);
+                return Some(t);
+            }
         }
         if self.tail_probe_due {
             self.tail_probe_due = false;
@@ -810,6 +833,7 @@ impl Sender {
             self.probe_at = Some(now);
         }
         self.detect_losses(now);
+        self.schedule_head_probe(now);
         Some((released, spurious))
     }
     fn unschedule_delivered(&mut self, start: u64) {
@@ -842,6 +866,45 @@ impl Sender {
             && s.probe_transmission.is_none()
             && !self.lost.contains(&start))
         .then_some((start, s.end))
+    }
+
+    fn head_probe_deadline(&self) -> Option<(u64, Instant)> {
+        let (start, transmission, at) = self.head_probe?;
+        let segment = self.segments.get(&start)?;
+        (start == self.acked
+            && segment.transmissions == transmission
+            && segment.path != UNKNOWN_PATH
+            && segment.probe_transmission.is_none()
+            && !self.lost.contains(&start))
+        .then_some((start, at))
+    }
+
+    fn schedule_head_probe(&mut self, now: Instant) {
+        if self.head_probe_deadline().is_some() {
+            return;
+        }
+        self.head_probe = None;
+        self.head_probe_due = false;
+        let Some((&start, segment)) = self.segments.first_key_value() else {
+            return;
+        };
+        if start != self.acked
+            || self.written - self.base <= HEAD_PROBE_MIN_FLIGHT
+            || segment.transmissions != 1
+            || segment.path == UNKNOWN_PATH
+            || self.lost.contains(&start)
+            || self.rack.is_none_or(|later| later <= segment.sent_at)
+        {
+            return;
+        }
+        let rtt = self.transport_rtt[segment.path].max(Duration::from_millis(1));
+        // Give normal cross-path reordering and a newer cumulative ACK time
+        // to settle. One copy per RTT per stream bounds duplicate traffic even
+        // when successive old ACKs name different holes. The original loss
+        // timer and admission budgets remain intact if either copy is lost.
+        let at = (now + (rtt / 4).clamp(Duration::from_millis(10), Duration::from_millis(50)))
+            .max(self.last_head_probe.map_or(now, |last| last + rtt));
+        self.head_probe = Some((start, segment.transmissions, at));
     }
 
     fn tail_probe_deadline(&self) -> Option<(Instant, u64)> {
@@ -884,6 +947,9 @@ impl Sender {
     }
     pub fn next_deadline(&self, now: Instant) -> Option<Instant> {
         [
+            self.head_probe_deadline()
+                .filter(|_| !self.head_probe_due)
+                .map(|(_, at)| at),
             self.tail_probe_deadline().map(|(at, _)| at),
             self.fresh
                 .iter()
@@ -909,6 +975,8 @@ impl Sender {
     /// Returns true when a window or open probe became due.
     pub fn on_timeout(&mut self, now: Instant) -> bool {
         self.detect_losses(now);
+        let head = self.head_probe_deadline().is_some_and(|(_, at)| now >= at);
+        self.head_probe_due |= head;
         let tail = self.tail_probe_deadline().is_some_and(|(at, _)| now >= at);
         self.tail_probe_due |= tail;
         if !self.needs_probe()
@@ -916,7 +984,7 @@ impl Sender {
                 .probe_at
                 .is_some_and(|at| now < at + self.probe_interval(now))
         {
-            return tail;
+            return tail || head;
         }
         self.probe_due = true;
         if self.open_pending {
@@ -1468,6 +1536,121 @@ mod tests {
         let repair = s.poll_transmit(loss).unwrap();
         assert!(repair.retransmission && !repair.tail_probe);
         assert!(s.tail_probe_deadline().is_none());
+    }
+
+    fn bulk_hole(now: Instant, missing: usize) -> Sender {
+        let mut sender = Sender::new(false);
+        sender.reorder = REORDER_MAX;
+        sender.push(&vec![7; 96 * MAX_SEGMENT]);
+        for i in 0..96 {
+            let at = now + Duration::from_micros(i * 10);
+            let t = sender.poll_transmit(at).unwrap();
+            sender.admitted(t.start, t.transmission, 0, Duration::from_millis(100), at);
+        }
+        sender
+            .on_ack(
+                &Ack {
+                    limit: INITIAL_WINDOW,
+                    ranges: vec![(missing as u64 * MAX_SEGMENT as u64, sender.next)],
+                    ..Default::default()
+                },
+                now + Duration::from_millis(100),
+            )
+            .unwrap();
+        sender
+    }
+
+    #[test]
+    fn persistent_bulk_sack_hole_gets_one_copy_before_the_loss_timer() {
+        let now = Instant::now();
+        let mut sender = bulk_hole(now, 1);
+        let original_timer = sender.fresh_deadline(now, sender.path_threshold(0, now));
+        let (_, probe_at) = sender.head_probe_deadline().unwrap();
+        assert!(probe_at >= now + Duration::from_millis(125));
+        assert!(probe_at < original_timer);
+        assert!(!sender.has_transmit(), "a future probe cannot busy-poll");
+        assert!(sender.on_timeout(probe_at));
+        assert!(sender.has_transmit());
+        assert_eq!(
+            sender.next_deadline(probe_at),
+            Some(original_timer),
+            "a queued probe cannot leave an expired wakeup spinning"
+        );
+        let copy = sender.poll_transmit(probe_at).unwrap();
+        assert!(copy.head_copy && copy.retransmission && !copy.tail_probe);
+        assert_eq!(copy.start, 0);
+        assert!(sender.lost.is_empty());
+        assert_eq!(sender.segments[&0].sent_at, now);
+        assert_eq!(sender.segments[&0].stalls, 0);
+        assert_eq!(sender.next_deadline(probe_at), Some(original_timer));
+        assert!(sender.poll_transmit(probe_at).is_none());
+    }
+
+    #[test]
+    fn a_new_cumulative_ack_cancels_the_bulk_hole_probe() {
+        let now = Instant::now();
+        let mut sender = bulk_hole(now, 1);
+        let (_, probe_at) = sender.head_probe_deadline().unwrap();
+        sender
+            .on_ack(
+                &Ack {
+                    cumulative: sender.next,
+                    limit: sender.next + INITIAL_WINDOW,
+                    ..Default::default()
+                },
+                probe_at - Duration::from_millis(1),
+            )
+            .unwrap();
+        assert!(sender.head_probe_deadline().is_none());
+        assert!(!sender.on_timeout(probe_at));
+        assert!(!sender.has_transmit());
+        assert!(sender.poll_transmit(probe_at).is_none());
+        assert_eq!(sender.retained_from(), sender.written());
+        assert!(sender.pending_copies.is_empty());
+    }
+
+    #[test]
+    fn a_locally_dropped_bulk_probe_keeps_the_original_repair_live() {
+        let now = Instant::now();
+        let mut sender = bulk_hole(now, 1);
+        let (_, at) = sender.head_probe_deadline().unwrap();
+        sender.on_timeout(at);
+        let copy = sender.poll_transmit(at).unwrap();
+        assert!(!sender.locally_dropped(copy.start, copy.transmission));
+        assert!(sender.pending_copies.is_empty());
+        let loss = sender.next_deadline(at).unwrap();
+        sender.on_timeout(loss);
+        let repair = sender.poll_transmit(loss).unwrap();
+        assert!(repair.retransmission && !repair.head_copy);
+        assert_eq!(repair.start, 0);
+    }
+
+    #[test]
+    fn successive_bulk_holes_cannot_probe_faster_than_one_copy_per_rtt() {
+        let now = Instant::now();
+        let mut sender = bulk_hole(now, 2);
+        let (_, at) = sender.head_probe_deadline().unwrap();
+        sender.on_timeout(at);
+        let copy = sender.poll_transmit(at).unwrap();
+        sender.admitted(
+            copy.start,
+            copy.transmission,
+            1,
+            Duration::from_millis(100),
+            at,
+        );
+        sender
+            .on_ack(
+                &Ack {
+                    cumulative: MAX_SEGMENT as u64,
+                    limit: INITIAL_WINDOW,
+                    ..Default::default()
+                },
+                at + Duration::from_millis(1),
+            )
+            .unwrap();
+        let (_, next) = sender.head_probe_deadline().unwrap();
+        assert!(next >= at + Duration::from_millis(100));
     }
 
     #[test]

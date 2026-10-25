@@ -1545,6 +1545,7 @@ async fn sender(
             .with_legacy_recovery(metrics.metrics.legacy_recovery())
     });
     let mut native_probes: [native_probe::Pause; MAX_PATHS] = Default::default();
+    let mut logged_rate_changes = [0u64; MAX_PATHS];
     let reliable_native_service =
         (policy.streams || policy.proxy) && !metrics.metrics.legacy_recovery();
     let burst = if policy.adaptive { 2400 } else { 9600 };
@@ -1784,6 +1785,7 @@ async fn sender(
             .and_then(|schedule| schedule.take_due(now_us))
             .is_some()
         {
+            let bulk_backlog = queue.has_bulk_stream_data();
             for path in paths.iter() {
                 let q = path.quality.lock().expect("quality lock");
                 let snapshot = &q.snapshot;
@@ -1825,6 +1827,7 @@ async fn sender(
                 let send_queue_bytes = path.writer.backlog();
                 let transport_blocked = !path.writer.admits(frame_bytes);
                 let observation = adaptive::Observation {
+                    bulk_backlog,
                     now_us,
                     generation: snapshot.generation,
                     report_number: estimate.report_number,
@@ -2018,9 +2021,32 @@ async fn sender(
                 .flatten()
                 .fold(policy.rate, u64::min);
                 pacer.set_rate(now_us, cap);
+                tracing::debug!(
+                    session = %metrics.session,
+                    direction = metrics.direction,
+                    cap_bps = cap,
+                    forward = ?forward_guard.as_ref().map(forward_guard::Guard::snapshot),
+                    reverse = ?reverse_guard.as_ref().map(reverse_guard::Guard::snapshot),
+                    "application shared pacing changed"
+                );
             }
             for path in paths.iter() {
                 let snapshot = controllers[usize::from(path.id)].snapshot(now_us);
+                if tracing::enabled!(tracing::Level::DEBUG)
+                    && logged_rate_changes[usize::from(path.id)] != snapshot.rate_changes_total
+                {
+                    logged_rate_changes[usize::from(path.id)] = snapshot.rate_changes_total;
+                    tracing::debug!(
+                        session = %metrics.session,
+                        direction = metrics.direction,
+                        path = path.id,
+                        change = ?snapshot.rate_changes.back(),
+                        native_cwnd = path.conn.cwnd_hint(),
+                        sender_backlog = !queue.is_empty(),
+                        transport_queue_bytes = path.writer.backlog(),
+                        "application path pacing changed"
+                    );
+                }
                 metrics.path(path.id, |p| p.adaptive = Some(snapshot));
             }
         }

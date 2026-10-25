@@ -160,6 +160,29 @@ no current loss pressure and no transport blockage; it cannot override a brake o
 mint burst tokens. Growth is capped at one doubling per native RTT and by the
 configured total/group limits. This allowance is not a capacity measurement.
 
+After at least one second without queued business demand, a reliable path can
+restart from its original native window at the current RTT when demand returns.
+This uses neither a retained BBR peak nor new burst tokens. Current delay, loss,
+transport blockage, loss trials and learned loss ceilings still apply. Idle RTT
+brakes therefore do not require a tiny sending allowance to build a new bulk
+delivery sample before the path can participate again.
+ACKs and small status records do not consume that bulk reactivation opportunity.
+
+A bulk stream with later SACKed data can send one extra copy of its persistent
+head hole after a quarter of its path RTT (10–50 ms). A newer cumulative ACK
+cancels the copy, and each stream allows at most one such probe per RTT. This
+does not declare loss or move the original loss timer; a dropped probe leaves
+ordinary recovery live. Existing admission and memory budgets also cover it.
+
+Shared forward-loss trials count paths with qualified finalized data intervals.
+Idle connected paths do not vote against congestion on active routes. At least
+two measured routes are required when multiple routes are connected, and two
+thirds of the measured routes must corroborate the loss.
+If a binding trial lowers both loss and throughput after a startup burst, it can
+make one further trial from the measured post-cut baseline while residual loss
+remains. The follow-up must settle and collect two new qualified cohorts; it
+cannot learn a loss floor or refine again when still inconclusive.
+
 For reliable aggregate sessions, application pacing observations pause briefly
 while native BBR drains its flight for an RTT probe, then allow two RTTs
 (200–500 ms) for in-flight probe replies and receiver reports to settle. One

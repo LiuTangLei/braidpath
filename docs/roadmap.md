@@ -81,6 +81,21 @@ Current protocol, commands and limits: [experimental runtime](runtime.md). Check
 
 ## M4 — Reliable flows and application adapters
 
+### v0.5.2 — Reused-session recovery and bounded hole probes (experimental development)
+
+- Restart an idle reliable path from its original native window when new demand
+  arrives under clear current conditions; retain tested loss ceilings and all
+  admission budgets.
+- Probe persistent bulk SACK head holes with one bounded extra copy per RTT;
+  cancel resolved holes and preserve the original loss timer after a probe drop.
+- Qualify shared loss using measured active paths, while requiring corroboration
+  from at least two routes in a multi-route session.
+- After a binding cut reduces loss but changes its startup delivery reference,
+  permit one fresh, bounded follow-up trial rather than immediately reopening
+  at the old peak. Preserve post-cut watermark and two-cohort validation.
+- Add debug pacing decisions and bounded per-exit diagnostic snapshots outside
+  network workers. Controlled transfer and browser acceptance remain separate.
+
 ### v0.5.1 — Correct measurement and coordinated recovery (experimental development)
 
 - Keep high-rate reordered measurement symbols in a fixed-capacity tagged bitmap;

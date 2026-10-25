@@ -714,11 +714,31 @@ pub async fn client(options: ClientOptions) -> Result<()> {
     // need this periodic retirement check after discovered exit address changes.
     let mut maintenance = tokio::time::interval(Duration::from_secs(1));
     maintenance.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut diagnostics: Option<tokio::task::JoinHandle<()>> = None;
     let mut shutdown = Shutdown::new();
     loop {
         tokio::select! {
             _ = shutdown.wait() => break,
-            _ = maintenance.tick() => pool.retire_stale_udp_paths(),
+            _ = maintenance.tick() => {
+                pool.retire_stale_udp_paths();
+                if tracing::enabled!(tracing::Level::DEBUG)
+                    && diagnostics.as_ref().is_none_or(|task| task.is_finished())
+                {
+                    let metrics: Vec<_> = pool.slots.iter()
+                        .map(|(exit, slot)| (exit.clone(), slot.stream_metrics.clone()))
+                        .collect();
+                    // JSON encoding and debug output must not occupy a network
+                    // worker. One bounded job serves every selected exit; a slow
+                    // sink skips ticks instead of queuing diagnostic work.
+                    diagnostics = Some(tokio::task::spawn_blocking(move || {
+                        for (exit, metrics) in metrics {
+                            if let Ok(snapshot) = metrics.snapshot(false, "observed", None) {
+                                tracing::debug!(%exit, %snapshot, "proxy aggregate statistics");
+                            }
+                        }
+                    }));
+                }
+            },
             result = tasks.join_next() => { result.context("proxy listeners stopped")???; bail!("proxy listener stopped"); }
             _ = refresh.tick(), if discovery.is_empty() => {
                 let pool = pool.clone(); let entries = options.connect.clone();
@@ -732,6 +752,9 @@ pub async fn client(options: ClientOptions) -> Result<()> {
     discovery.abort_all();
     while discovery.join_next().await.is_some() {}
     pool.shutdown().await;
+    if let Some(diagnostics) = diagnostics {
+        let _ = diagnostics.await;
+    }
     Ok(())
 }
 pub(super) async fn listen(

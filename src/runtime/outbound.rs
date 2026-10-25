@@ -151,6 +151,18 @@ impl Queue {
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
+    /// Reliable bulk demand, excluding ACKs and small control/status records.
+    /// Called on observation ticks, never on individual packet admission.
+    pub fn has_bulk_stream_data(&self) -> bool {
+        self.flows.values().any(|queue| {
+            queue.iter().any(|pending| {
+                pending
+                    .hold
+                    .as_ref()
+                    .is_some_and(|hold| !hold.interactive())
+            })
+        })
+    }
     pub fn original_flows(&self) -> usize {
         self.turns.len()
     }
@@ -953,6 +965,24 @@ mod tests {
         assert_eq!(q.pop(false).unwrap().flow, Some(1));
         assert_eq!(q.pop(false).unwrap().flow, Some(2));
         assert_eq!(q.len(), PER_FLOW_LIMIT - 1);
+    }
+    #[test]
+    fn ack_and_status_backlog_do_not_hide_a_bulk_reactivation() {
+        let now = Instant::now();
+        let gauge = Arc::new(Gauge::default());
+        let mut q = Queue::default();
+        assert!(q.push(item(1, 0, now)).is_ok());
+        let mut status = item(2, 1, now);
+        status.hold = Some(gauge.hold(2, 0, 1, status.data.len(), true));
+        assert!(q.push(status).is_ok());
+        assert!(!q.has_bulk_stream_data());
+        let mut bulk = item(3, 2, now);
+        bulk.hold = Some(gauge.hold(3, 0, 1, bulk.data.len(), false));
+        assert!(q.push(bulk).is_ok());
+        assert!(q.has_bulk_stream_data());
+        while q.pop(false).is_some() {}
+        assert!(!q.has_bulk_stream_data());
+        assert_eq!(gauge.queued(), 0);
     }
     fn assert_queue_bound(q: &Queue) {
         assert!(q.len() <= QUEUE);

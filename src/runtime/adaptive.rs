@@ -17,6 +17,7 @@ const ONE_WAY_FRESH_US: u64 = 1_000_000;
 /// Absorbs the receiver's per-symbol smoothing of one-way transit.
 const ONE_WAY_SLACK_MS: f64 = 2.0;
 const RETRY_GROWTH_US: u64 = 500_000;
+const NATIVE_IDLE_RESTART_US: u64 = 1_000_000;
 /// A pace at or below this cannot hold a standing queue at a bottleneck that
 /// still serves it. Absolute: remembered service can be stale after a step.
 const LIGHT_BPS: u64 = 1_000_000;
@@ -382,6 +383,7 @@ pub struct Snapshot {
 #[serde(rename_all = "snake_case")]
 pub enum RateReason {
     NativeStartup,
+    NativeIdleRestart,
     NativeServiceRecovery,
     InitialGrowth,
     KnownServiceRecovery,
@@ -769,6 +771,8 @@ pub struct RateChange {
 
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct Observation {
+    /// Queued reliable bulk data; ACK/control traffic cannot consume an idle restart.
+    pub bulk_backlog: bool,
     pub now_us: u64,
     pub generation: u64,
     pub report_number: u64,
@@ -949,6 +953,8 @@ pub struct PathController {
     native_admitted: Option<(u64, u64, u64)>,
     /// The initial native sending window, before BBR's startup expansion.
     native_startup_window_bytes: Option<u64>,
+    native_initial_window_bytes: Option<u64>,
+    native_idle_since_us: Option<u64>,
     /// Actual business measurement start, separate from the control owner clock.
     admission_started_us: Option<u64>,
     allowance_bytes: f64,
@@ -1055,6 +1061,8 @@ impl PathController {
             admitted_symbol_bytes: 0,
             native_admitted: Some((0, 0, 0)),
             native_startup_window_bytes: None,
+            native_initial_window_bytes: None,
+            native_idle_since_us: None,
             admission_started_us: None,
             allowance_bytes: 0.0,
             wire_per_symbol: 1.0,
@@ -1210,6 +1218,9 @@ impl PathController {
     ) {
         let new_generation = self.generation != Some(observation.generation);
         self.observe_inner(observation, probe);
+        if new_generation {
+            self.native_initial_window_bytes = (cwnd_bytes > 0).then_some(cwnd_bytes);
+        }
         if new_generation
             && cwnd_bytes > 0
             && rtt_us > 0
@@ -1255,6 +1266,53 @@ impl PathController {
                 .min(u128::from(self.maximum_bps)) as u64
         });
         self.last_control.native_service_hint_bps = native_bps;
+        let idle_us = if observation.bulk_backlog && observation.offered_backlog {
+            self.native_idle_since_us
+                .take()
+                .map(|since| now.saturating_sub(since))
+        } else {
+            self.native_idle_since_us.get_or_insert(now);
+            None
+        };
+        // An idle connection can be braked by RTT wander while it carries
+        // only control records. Requiring a new positive business report to
+        // leave that tiny allowance then takes many short response bursts.
+        // On renewed demand, reuse only the ORIGINAL native window, never a
+        // retained BBR startup peak. Native readiness, current delay/loss and
+        // tested loss ceilings still gate the first flight; no tokens are added.
+        if previous_generation == Some(observation.generation)
+            && idle_us.is_some_and(|idle| idle >= NATIVE_IDLE_RESTART_US)
+            && self.decision(now).eligible
+            && self.last_control.rtt_fresh
+            && !observation.transport_blocked
+            && self.queue_delay_ms <= self.target_ms * 0.25
+            && !self.loss_pressure
+            && !self.last_control.fast_loss
+            && observation
+                .loss_sample_rate
+                .is_none_or(|loss| loss <= QUEUE_GATED_LOSS_FLOOR_MAX)
+            && self.loss_test.is_none()
+            && !self.reprobe.active()
+            && self.rate_bps >= previous_rate
+            && let Some(window) = self.native_initial_window_bytes
+            && self.last_brake_us != Some(now)
+            && let Some(native) = native_bps
+        {
+            let restart = (u128::from(window.min(cwnd_bytes)) * 8_000_000 / u128::from(rtt_us))
+                .min(u128::from(native)) as u64;
+            let restart = self
+                .loss_ceiling
+                .map_or(restart, |(ceiling, _)| restart.min(ceiling.max(MIN_BPS)));
+            if restart > self.rate_bps {
+                let previous = self.rate_bps;
+                self.rate_bps = restart;
+                self.last_growth_us = now;
+                self.native_service_recoveries = self.native_service_recoveries.saturating_add(1);
+                self.last_control.native_startup_cwnd_bytes = Some(window.min(cwnd_bytes));
+                self.last_control.native_startup_rtt_us = Some(rtt_us);
+                self.record_rate_change(now, previous, RateReason::NativeIdleRestart);
+            }
+        }
         let fresh_positive = observation
             .positive_delivery_age_us
             .is_some_and(|age| age <= CONTROL_US)
@@ -4274,6 +4332,127 @@ mod tests {
         sample.delivery_sample_span_us = 100_000;
         sample.delivery_report_time_us = Some(100_000);
         (controller, sample)
+    }
+
+    fn idle_native_fixture() -> (PathController, Observation) {
+        let (mut controller, mut sample) = native_service_fixture();
+        sample.offered_backlog = false;
+        sample.bulk_backlog = false;
+        controller.observe_native_service(&sample, 200_000, 50_000);
+        // The measured production state: an old, authenticated idle path has
+        // a small application allowance, while its native window remains open.
+        controller.rate_bps = MIN_BPS;
+        sample.now_us += NATIVE_IDLE_RESTART_US + 1;
+        sample.offered_backlog = true;
+        sample.bulk_backlog = true;
+        (controller, sample)
+    }
+
+    #[test]
+    fn idle_restart_is_not_consumed_by_ack_or_status_backlog() {
+        let (mut controller, mut sample) = idle_native_fixture();
+        sample.bulk_backlog = false;
+        controller.observe_native_service(&sample, 2_000_000, 50_000);
+        assert_eq!(controller.rate_bps, MIN_BPS);
+        sample.now_us += 100_000;
+        sample.bulk_backlog = true;
+        controller.observe_native_service(&sample, 2_000_000, 50_000);
+        assert_eq!(controller.rate_bps, 1_920_000);
+        assert!(matches!(
+            controller.rate_changes.back().unwrap().reason,
+            RateReason::NativeIdleRestart
+        ));
+    }
+
+    #[test]
+    fn idle_native_path_restarts_without_waiting_for_slow_new_delivery() {
+        let (mut controller, sample) = idle_native_fixture();
+        let (mut ordinary, _) = idle_native_fixture();
+        ordinary.observe_native(&sample, None, 2_000_000, 50_000);
+        controller.observe_native_service(&sample, 2_000_000, 50_000);
+        assert_eq!(controller.rate_bps, 1_920_000);
+        assert_eq!(controller.tokens, ordinary.tokens);
+        assert!(matches!(
+            controller.rate_changes.back().unwrap().reason,
+            RateReason::NativeIdleRestart
+        ));
+        let count = controller.native_service_recoveries;
+        controller.observe_native_service(&sample, 2_000_000, 50_000);
+        assert_eq!(controller.native_service_recoveries, count);
+    }
+
+    #[test]
+    fn idle_restart_keeps_current_queue_and_loss_test_guards() {
+        for case in 0..7 {
+            let (mut controller, mut sample) = idle_native_fixture();
+            match case {
+                0 => sample.transport_blocked = true,
+                1 => {
+                    sample.rtt_ms = 200.0;
+                    sample.probe_rtt_ms = Some(200.0);
+                    sample.probe_latest_rtt_ms = Some(200.0);
+                }
+                2 => {
+                    controller.loss_test = Some(LossTest {
+                        from_bps: MIN_BPS,
+                        held_loss: None,
+                        started_us: sample.now_us,
+                        measure_from_us: sample.now_us + 500_000,
+                        counts: (0, 0),
+                    })
+                }
+                3 => controller.native_idle_since_us = Some(sample.now_us - 1),
+                4 => controller.native_initial_window_bytes = None,
+                5 => {
+                    sample.loss_sample_rate = Some(1.0);
+                    sample.loss_rate = 1.0;
+                    sample.feedback_sample_symbols = 1000;
+                    sample.finalized_expected = Some(1000);
+                    sample.finalized_lost = Some(1000);
+                    sample.admitted_symbols = Some(1000);
+                    sample.admitted_symbol_bytes = Some(1_025_000);
+                }
+                6 => {
+                    controller.loss_test = Some(LossTest {
+                        from_bps: MIN_BPS,
+                        held_loss: Some(0.5),
+                        started_us: sample.now_us,
+                        measure_from_us: sample.now_us + 500_000,
+                        counts: (0, 0),
+                    })
+                }
+                _ => unreachable!(),
+            }
+            controller.observe_native_service(&sample, 2_000_000, 50_000);
+            assert!(
+                !controller
+                    .rate_changes
+                    .iter()
+                    .any(|change| matches!(change.reason, RateReason::NativeIdleRestart)),
+                "case {case}"
+            );
+        }
+    }
+
+    #[test]
+    fn idle_native_restart_cannot_bypass_a_tested_loss_ceiling() {
+        let (mut controller, sample) = idle_native_fixture();
+        controller.loss_ceiling = Some((MIN_BPS * 2, sample.now_us + 1_000_000));
+        controller.observe_native_service(&sample, 2_000_000, 50_000);
+        assert_eq!(controller.rate_bps, MIN_BPS * 2);
+    }
+
+    #[test]
+    fn an_idle_queue_brake_does_not_strand_the_next_clear_flight() {
+        let (mut controller, sample) = idle_native_fixture();
+        controller.last_brake_us = Some(sample.now_us - 1);
+        controller.growth_not_before_us = sample.now_us + RETRY_GROWTH_US;
+        controller.observe_native_service(&sample, 2_000_000, 50_000);
+        assert_eq!(controller.rate_bps, 1_920_000);
+        assert!(matches!(
+            controller.rate_changes.back().unwrap().reason,
+            RateReason::NativeIdleRestart
+        ));
     }
 
     #[test]

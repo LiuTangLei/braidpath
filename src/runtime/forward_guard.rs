@@ -127,6 +127,7 @@ enum State {
         before: Window,
         loss_before: f64,
         paths_before: [Option<RandomLoss>; MAX_PATHS],
+        refined: bool,
         windows: u8,
         /// Sums of sent and delivered rates over the measured windows.
         sent: f64,
@@ -410,9 +411,11 @@ impl Guard {
         Some(total)
     }
 
-    /// The loss that at least two thirds of the connected paths reach.
+    /// The loss that at least two thirds of paths with a qualified data
+    /// interval reach. Idle connected routes cannot disprove congestion on
+    /// the routes carrying this flight. Multiple connected routes still need
+    /// at least two measured participants before treating loss as shared.
     fn common_loss(&self) -> Option<f64> {
-        let needed = (self.connected * 2).div_ceil(3).max(1);
         let mut losses: Vec<f64> = self
             .expected
             .iter()
@@ -420,9 +423,10 @@ impl Guard {
             .filter(|(expected, _)| **expected >= MIN_PATH_SYMBOLS)
             .map(|(expected, lost)| lost as f64 / *expected as f64)
             .collect();
-        if losses.len() < needed {
+        if losses.len() < self.connected.clamp(1, 2) {
             return None;
         }
+        let needed = (losses.len() * 2).div_ceil(3).max(1);
         losses.sort_by(|a, b| b.total_cmp(a));
         Some(losses[needed - 1])
     }
@@ -475,6 +479,7 @@ impl Guard {
                             before,
                             loss_before: loss,
                             paths_before: self.window_losses,
+                            refined: false,
                             windows: 0,
                             sent: 0.0,
                             delivered: 0.0,
@@ -490,6 +495,7 @@ impl Guard {
                 before,
                 loss_before,
                 paths_before,
+                refined,
                 windows,
                 mut sent,
                 mut delivered,
@@ -536,9 +542,41 @@ impl Guard {
                         // an over-deep cut or changing traffic is inconclusive,
                         // not evidence that the old loss was rate-independent.
                         self.snapshot.inconclusive += 1;
-                        self.inconclusive_cooldown = true;
-                        self.retest_after_us = now_us.saturating_add(INCONCLUSIVE_RETEST_US);
-                        State::Open
+                        if !refined && loss_under > floor + EXCESS && sent / n >= cap * BINDING {
+                            // A startup burst can make the original delivery
+                            // reference unattainable after its queue drains.
+                            // The cut nevertheless reduced loss while binding.
+                            // Rebase ONE further trial on measured post-cut
+                            // service instead of reopening at the old peak and
+                            // reproducing that overrun. This proves no capacity
+                            // or random-loss floor; the new cut must settle and
+                            // collect its own two qualified cohorts as usual.
+                            let before = Window {
+                                sent: sent / n,
+                                delivered: delivered / n,
+                            };
+                            let fraction = (1.0 - TRIAL_GAIN * (loss_under - floor))
+                                .clamp(TRIAL_MIN, TRIAL_MAX);
+                            self.snapshot.trials += 1;
+                            State::Trial {
+                                cap: (before.sent * fraction)
+                                    .min(cap * TRIAL_MAX)
+                                    .max(MIN_CAP_BPS),
+                                before,
+                                loss_before: loss_under,
+                                paths_before: self.window_losses,
+                                refined: true,
+                                windows: 0,
+                                sent: 0.0,
+                                delivered: 0.0,
+                                measured: 0,
+                                loss_under: 0.0,
+                            }
+                        } else {
+                            self.inconclusive_cooldown = true;
+                            self.retest_after_us = now_us.saturating_add(INCONCLUSIVE_RETEST_US);
+                            State::Open
+                        }
                     } else {
                         self.snapshot.rejected += 1;
                         if cut <= MIN_CUT && sent / n >= cap * BINDING {
@@ -575,6 +613,7 @@ impl Guard {
                         before,
                         loss_before,
                         paths_before,
+                        refined,
                         windows: windows + 1,
                         sent,
                         delivered,
@@ -723,6 +762,49 @@ mod tests {
         }
     }
 
+    fn active_window(d: &mut Drive, loss: [Option<f64>; 4]) {
+        for (counts, loss) in d.counts.iter_mut().zip(loss) {
+            counts.report_time_us = counts.report_time_us.map(|at| at + WINDOW_US);
+            if let Some(loss) = loss {
+                let lost = (1000.0 * loss) as u64;
+                counts.sent_symbols += 1000;
+                counts.expected += 1000;
+                counts.lost += lost;
+                counts.received_bytes += (1000 - lost) * 1025;
+                d.sent += 1000 * 1025;
+            }
+        }
+        d.now_us += WINDOW_US;
+        d.call();
+    }
+
+    #[test]
+    fn idle_connected_paths_cannot_hide_loss_on_both_active_routes() {
+        let mut d = Drive::new();
+        active_window(&mut d, [Some(0.3), Some(0.3), None, None]);
+        assert_eq!(d.guard.cap_bps(), None);
+        active_window(&mut d, [Some(0.3), Some(0.3), None, None]);
+        assert_eq!(d.guard.snapshot().trials, 1);
+        assert!(d.guard.cap_bps().is_some());
+        assert!(d.guard.shared_loss());
+    }
+
+    #[test]
+    fn shared_loss_still_requires_two_measured_routes_and_a_qualified_majority() {
+        for loss in [
+            [Some(0.3), None, None, None],
+            [Some(0.3), Some(0.0), None, None],
+            [Some(0.3), Some(0.3), Some(0.0), Some(0.0)],
+        ] {
+            let mut d = Drive::new();
+            for _ in 0..4 {
+                active_window(&mut d, loss);
+            }
+            assert_eq!(d.guard.snapshot().trials, 0, "{loss:?}");
+            assert_eq!(d.guard.cap_bps(), None);
+        }
+    }
+
     #[test]
     fn an_overrun_shared_bottleneck_is_capped_near_its_rate() {
         let mut d = Drive::new();
@@ -797,6 +879,74 @@ mod tests {
             assert_eq!(d.window([0.3; 4], 100e6), None);
         }
         assert_eq!(d.guard.snapshot().trials, 1);
+    }
+
+    #[test]
+    fn a_drained_startup_burst_can_rebase_one_bound_loss_reducing_trial() {
+        let mut d = Drive::new();
+        for _ in 0..2 {
+            d.window_rates([0.35; 4], 220e6, [160e6 / 4.0; 4]);
+        }
+        let original_cap = d.guard.cap_bps().unwrap() as f64;
+        for _ in 0..2 {
+            d.window_rates([0.15; 4], original_cap * 0.9, [120e6 / 4.0; 4]);
+        }
+        let refined_cap = d.guard.cap_bps().expect("keep a bounded follow-up") as f64;
+        assert!(refined_cap < original_cap);
+        assert!(matches!(d.guard.state, State::Trial { refined: true, .. }));
+        assert_eq!(d.guard.snapshot().inconclusive, 1);
+        assert_eq!(d.guard.snapshot().trials, 2);
+        assert_eq!(d.guard.snapshot().floor, 0.0);
+        assert!(d.guard.take_random_loss().iter().all(Option::is_none));
+        for _ in 0..2 {
+            d.window_rates([0.02; 4], refined_cap, [115e6 / 4.0; 4]);
+        }
+        assert_eq!(d.guard.snapshot().confirmed, 1);
+        assert!(d.guard.cap_bps().is_some());
+    }
+
+    #[test]
+    fn an_ambiguous_followup_cannot_refine_forever_or_learn_a_floor() {
+        let mut d = Drive::new();
+        for _ in 0..2 {
+            d.window_rates([0.35; 4], 220e6, [160e6 / 4.0; 4]);
+        }
+        let cap = d.guard.cap_bps().unwrap() as f64;
+        for _ in 0..2 {
+            d.window_rates([0.15; 4], cap * 0.9, [120e6 / 4.0; 4]);
+        }
+        let cap = d.guard.cap_bps().unwrap() as f64;
+        for _ in 0..2 {
+            d.window_rates([0.10; 4], cap, [90e6 / 4.0; 4]);
+        }
+        assert_eq!(d.guard.cap_bps(), None);
+        assert_eq!(d.guard.snapshot().trials, 2);
+        assert_eq!(d.guard.snapshot().inconclusive, 2);
+        assert_eq!(d.guard.snapshot().floor, 0.0);
+        assert!(d.guard.take_random_loss().iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn a_refined_trial_must_wait_for_its_own_admission_prefix() {
+        let mut d = Drive::new();
+        for _ in 0..2 {
+            d.window_rates([0.35; 4], 220e6, [160e6 / 4.0; 4]);
+        }
+        let cap = d.guard.cap_bps().unwrap() as f64;
+        d.window_rates([0.15; 4], cap * 0.9, [120e6 / 4.0; 4]);
+        for counts in &mut d.counts {
+            counts.sent_symbols += 20_000;
+        }
+        d.window_rates([0.15; 4], cap * 0.9, [120e6 / 4.0; 4]);
+        assert!(matches!(d.guard.state, State::Trial { refined: true, .. }));
+        let cap = d.guard.cap_bps().unwrap() as f64;
+        for _ in 0..8 {
+            d.window_rates([0.02; 4], cap, [115e6 / 4.0; 4]);
+        }
+        assert!(d.guard.snapshot().settling);
+        assert_eq!(d.guard.snapshot().confirmed, 0);
+        assert_eq!(d.guard.snapshot().rejected, 0);
+        assert_eq!(d.guard.snapshot().floor, 0.0);
     }
 
     #[test]
