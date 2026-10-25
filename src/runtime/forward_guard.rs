@@ -9,9 +9,11 @@
 //!
 //! This guard decides over the aggregate instead. Onset uses the forward loss
 //! that at least two thirds of the measured paths reach, so loss confined to
-//! one or two routes cannot move it. Delivery is the measured send rate less
-//! the aggregate finalized loss; the peer's byte reports arrive too unevenly
-//! for half-second windows. A trial caps the aggregate pacer below the
+//! one or two routes cannot move it. Delivery comes from the peer's unique
+//! byte counts over its own report intervals. Current local admissions and
+//! delayed finalized loss need not describe the same cohort, so multiplying
+//! them can falsely confirm a low cap after startup or a pace change.
+//! A trial caps the aggregate pacer below the
 //! measured rate by three quarters of the loss above the learned floor, within
 //! 10% to 40%, and compares delivery before and under the cap. Rate-independent
 //! loss loses the same fraction of a lower rate, so delivery falls with the
@@ -91,6 +93,10 @@ pub struct Counts {
     pub sent_symbols: u64,
     pub expected: u64,
     pub lost: u64,
+    /// Unique received symbol bytes, independent of FEC recovery.
+    pub received_bytes: u64,
+    /// Receiver-local time of that byte report; never a sender timestamp.
+    pub report_time_us: Option<u64>,
 }
 
 /// A same-generation loss observation under a rejected aggregate trial.
@@ -100,16 +106,16 @@ pub(crate) struct RandomLoss {
     pub fraction: f64,
 }
 
-/// One window: the measured send rate and the aggregate loss reported for it.
+/// Local admission and independently measured peer delivery rates.
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct Window {
     sent: f64,
-    loss: f64,
+    delivered: f64,
 }
 
 impl Window {
     fn delivered(self) -> f64 {
-        self.sent * (1.0 - self.loss)
+        self.delivered
     }
 }
 
@@ -156,9 +162,13 @@ pub struct Snapshot {
     pub releases: u64,
     /// Forward loss of the last decided window that most routes reach, before FEC.
     pub forward_loss: Option<f64>,
-    /// Aggregate send rate of the last window and its delivery net of loss.
+    /// Local symbol admission rate and last qualified peer delivery rate.
     pub sent_bps: u64,
     pub delivered_bps: u64,
+    /// Delivery in the current receiver-clock window, absent for incomplete,
+    /// stale or changed-generation byte baselines.
+    pub receiver_delivery_bps: Option<u64>,
+    pub delivery_unavailable_windows: u64,
     /// Rate-independent forward loss learned from a rejected trial.
     pub floor: f64,
     /// Loss a kept cap tolerates as independent of its rate.
@@ -168,6 +178,7 @@ pub struct Snapshot {
 
 pub struct Guard {
     last: [Option<Counts>; MAX_PATHS],
+    delivery_start: [Option<Counts>; MAX_PATHS],
     settlement: Option<Settlement>,
     window_losses: [Option<RandomLoss>; MAX_PATHS],
     learned_losses: [Option<RandomLoss>; MAX_PATHS],
@@ -188,6 +199,7 @@ impl Default for Guard {
     fn default() -> Self {
         Self {
             last: [None; MAX_PATHS],
+            delivery_start: [None; MAX_PATHS],
             settlement: None,
             window_losses: [None; MAX_PATHS],
             learned_losses: [None; MAX_PATHS],
@@ -254,6 +266,7 @@ impl Guard {
         for (id, present) in present.iter().enumerate() {
             if !present {
                 self.last[id] = None;
+                self.delivery_start[id] = None;
                 self.expected[id] = 0;
                 self.lost[id] = 0;
             }
@@ -298,9 +311,15 @@ impl Guard {
             }
             *slot = Some(counts);
         }
+        if !ready {
+            // A cut must not be judged on byte progress from before its
+            // admission watermark. Refresh this baseline while it settles.
+            self.delivery_start = self.last;
+        }
         let Some(start) = self.window_start_us else {
             self.window_start_us = Some(now_us);
             self.sent_at_start = sent_bytes;
+            self.delivery_start = self.last;
             return false;
         };
         let elapsed = now_us.saturating_sub(start);
@@ -314,14 +333,14 @@ impl Guard {
         }
         let sent = sent_bytes.saturating_sub(self.sent_at_start) as f64 * 8e6 / elapsed as f64;
         let common = self.common_loss();
-        let (expected, lost) = (
-            self.expected.iter().sum::<u64>(),
-            self.lost.iter().sum::<u64>(),
-        );
-        let window = common.map(|_| Window {
-            sent,
-            loss: lost as f64 / expected.max(1) as f64,
-        });
+        let delivered = self.receiver_delivery(paths);
+        self.snapshot.receiver_delivery_bps = delivered.map(|rate| rate as u64);
+        if delivered.is_none() {
+            self.snapshot.delivery_unavailable_windows += 1;
+        }
+        let window = common
+            .zip(delivered)
+            .map(|(_, delivered)| Window { sent, delivered });
         self.window_losses = std::array::from_fn(|id| {
             (self.expected[id] >= MIN_PATH_SYMBOLS)
                 .then(|| {
@@ -336,6 +355,7 @@ impl Guard {
         self.lost = [0; MAX_PATHS];
         self.window_start_us = Some(now_us);
         self.sent_at_start = sent_bytes;
+        self.delivery_start = self.last;
         let before = self.snapshot.cap_bps;
         self.snapshot.sent_bps = sent as u64;
         if let Some(window) = window {
@@ -366,6 +386,26 @@ impl Guard {
             _ => None,
         };
         self.snapshot.cap_bps != before
+    }
+
+    fn receiver_delivery(&self, paths: &[(usize, Counts)]) -> Option<f64> {
+        if paths.is_empty() {
+            return None;
+        }
+        let mut total = 0.0;
+        for &(id, counts) in paths {
+            let start = self.delivery_start.get(id).copied().flatten()?;
+            if start.generation != counts.generation {
+                return None;
+            }
+            let bytes = counts.received_bytes.checked_sub(start.received_bytes)?;
+            let elapsed = counts.report_time_us?.checked_sub(start.report_time_us?)?;
+            if elapsed == 0 {
+                return None;
+            }
+            total += bytes as f64 * 8e6 / elapsed as f64;
+        }
+        Some(total)
     }
 
     /// The loss that at least two thirds of the connected paths reach.
@@ -419,9 +459,7 @@ impl Guard {
                                 let sent = window.sent + previous.sent;
                                 Window {
                                     sent: sent / 2.0,
-                                    loss: 1.0
-                                        - (window.delivered() + previous.delivered())
-                                            / sent.max(1.0),
+                                    delivered: (window.delivered() + previous.delivered()) / 2.0,
                                 }
                             }
                             None => window,
@@ -465,7 +503,13 @@ impl Guard {
                     let n = f64::from(measured);
                     let cut = sent / n / before.sent.max(1.0);
                     let kept = delivered / n / before.delivered().max(1.0);
-                    if sent / n > cap * (1.0 + UNBOUND) {
+                    if sent / n > cap * (1.0 + UNBOUND)
+                        || before.delivered() > before.sent * (1.0 + UNBOUND)
+                        || delivered > sent * (1.0 + UNBOUND)
+                    {
+                        // Receiver progress can lead current admissions while
+                        // older in-flight traffic drains. Those windows cannot
+                        // establish either capacity or rate-independent loss.
                         self.snapshot.inconclusive += 1;
                         self.retest_after_us = now_us.saturating_add(INCONCLUSIVE_RETEST_US);
                         State::Open
@@ -482,6 +526,13 @@ impl Guard {
                             excess: false,
                             decreased_from: None,
                         }
+                    } else if loss_under + EXCESS < loss_before {
+                        // Delivery fell, but loss also improved substantially:
+                        // an over-deep cut or changing traffic is inconclusive,
+                        // not evidence that the old loss was rate-independent.
+                        self.snapshot.inconclusive += 1;
+                        self.retest_after_us = now_us.saturating_add(INCONCLUSIVE_RETEST_US);
+                        State::Open
                     } else {
                         self.snapshot.rejected += 1;
                         if cut <= MIN_CUT && sent / n >= cap * BINDING {
@@ -502,7 +553,7 @@ impl Guard {
                                 }
                             });
                         }
-                        self.snapshot.floor = self.snapshot.floor.max(loss_before);
+                        self.snapshot.floor = self.snapshot.floor.max(loss_before.min(loss_under));
                         self.retest_after_us = now_us.saturating_add(RETEST_US);
                         State::Open
                     }
@@ -617,6 +668,8 @@ mod tests {
                     sent_symbols: 0,
                     expected: 0,
                     lost: 0,
+                    received_bytes: 0,
+                    report_time_us: Some(1_000_000),
                 }; 4],
             };
             drive.call();
@@ -629,10 +682,26 @@ mod tests {
         }
 
         fn window(&mut self, losses: [f64; 4], sent_bps: f64) -> Option<u64> {
-            for (counts, loss) in self.counts.iter_mut().zip(losses) {
+            self.window_rates(
+                losses,
+                sent_bps,
+                losses.map(|loss| sent_bps * (1.0 - loss) / 4.0),
+            )
+        }
+
+        fn window_rates(
+            &mut self,
+            losses: [f64; 4],
+            sent_bps: f64,
+            delivered: [f64; 4],
+        ) -> Option<u64> {
+            for ((counts, loss), received_bps) in self.counts.iter_mut().zip(losses).zip(delivered)
+            {
                 counts.sent_symbols += 1000;
                 counts.expected += 1000;
                 counts.lost += (1000.0 * loss).round() as u64;
+                counts.received_bytes += (received_bps * WINDOW_US as f64 / 8e6) as u64;
+                counts.report_time_us = counts.report_time_us.map(|at| at + WINDOW_US);
             }
             self.now_us += WINDOW_US;
             self.sent += (sent_bps * WINDOW_US as f64 / 8e6) as u64;
@@ -909,6 +978,8 @@ mod tests {
             sent_symbols: 10_000,
             expected: 0,
             lost: 0,
+            received_bytes: 0,
+            report_time_us: Some(1_000_000),
         };
         for _ in 0..5 {
             d.window([0.3; 4], cap as f64);
@@ -958,7 +1029,7 @@ mod tests {
             for c in &mut d.counts {
                 c.sent_symbols = c.expected + 4_000;
             }
-            d.window([measured_loss; 4], rate);
+            d.window_rates([measured_loss; 4], rate, [rate.min(90e6) * 0.89 / 4.0; 4]);
             cap = rate;
             if i > 60 {
                 assert!(rate < 115e6, "sawtooth escaped: {rate}");
@@ -971,6 +1042,67 @@ mod tests {
         assert!(d.guard.snapshot().confirmed > 0);
         assert!(measured_loss < 0.25);
         assert!(cap > 75e6, "must keep useful throughput: {cap}");
+    }
+
+    #[test]
+    fn delayed_loss_and_changed_admission_cannot_falsely_confirm_a_low_cap() {
+        let mut d = Drive::new();
+        // The loss report describes older traffic; local admission has already
+        // slowed while the peer still receives the preceding faster cohort.
+        d.window_rates([0.4; 4], 800e6, [700e6 / 4.0; 4]);
+        let cap = d.window_rates([0.4; 4], 500e6, [650e6 / 4.0; 4]).unwrap() as f64;
+        assert_eq!(d.guard.snapshot().delivered_bps, 650_000_000);
+        for _ in 0..2 {
+            d.window_rates([0.0; 4], cap, [cap / 4.0; 4]);
+        }
+        // Actual delivery fell substantially under the trial. Inferring it as
+        // current admissions * old loss would claim that it was preserved.
+        assert_eq!(d.guard.snapshot().confirmed, 0);
+        assert_eq!(d.guard.snapshot().inconclusive, 1);
+        assert_eq!(d.guard.snapshot().floor, 0.0);
+        assert_eq!(d.guard.cap_bps(), None);
+    }
+
+    #[test]
+    fn receiver_delivery_uses_each_receivers_interval_and_rejects_invalid_baselines() {
+        let mut d = Drive::new();
+        for (id, counts) in d.counts.iter_mut().enumerate() {
+            counts.report_time_us = Some(1_000_000 + id as u64 * 90_000_000);
+        }
+        d.guard.delivery_start = std::array::from_fn(|id| d.counts.get(id).copied());
+        d.window([0.1; 4], 80e6);
+        assert_eq!(d.guard.snapshot().receiver_delivery_bps, Some(72_000_000));
+        let baseline = d.guard.last;
+        d.window([0.1; 4], 80e6);
+        d.guard.delivery_start = baseline;
+        for case in 0..4 {
+            let mut paths: Vec<_> = d.counts.iter().copied().enumerate().collect();
+            match case {
+                0 => paths[1].1.report_time_us = None,
+                1 => paths[1].1.report_time_us = Some(0),
+                2 => paths[1].1.received_bytes = 0,
+                3 => paths[1].1.generation += 1,
+                _ => unreachable!(),
+            }
+            assert_eq!(d.guard.receiver_delivery(&paths), None);
+        }
+    }
+
+    #[test]
+    fn missing_receiver_clock_cannot_be_replaced_by_inferred_delivery() {
+        let mut d = Drive::new();
+        d.counts[1].report_time_us = None;
+        for _ in 0..3 {
+            assert_eq!(d.window([0.4; 4], 100e6), None);
+        }
+        assert_eq!(d.guard.snapshot().trials, 0);
+        assert_eq!(d.guard.snapshot().delivery_unavailable_windows, 3);
+        d.counts[1].report_time_us = Some(10_000_000);
+        // The first complete report establishes a new byte baseline.
+        d.window([0.4; 4], 100e6);
+        assert_eq!(d.guard.snapshot().receiver_delivery_bps, None);
+        d.window([0.4; 4], 100e6);
+        assert_eq!(d.guard.snapshot().receiver_delivery_bps, Some(60_000_000));
     }
     #[test]
     fn qualified_random_loss_trial_does_not_wait_for_an_extra_timer() {
@@ -1051,6 +1183,8 @@ mod tests {
             counts.sent_symbols += symbols;
             counts.expected += symbols;
             counts.lost += symbols * 11 / 100;
+            counts.received_bytes += (cap * 0.89 * TRIAL_WINDOW_US as f64 / 8e6 / 4.0) as u64;
+            counts.report_time_us = counts.report_time_us.map(|at| at + TRIAL_WINDOW_US);
         }
         d.now_us += TRIAL_WINDOW_US;
         d.sent += (cap * TRIAL_WINDOW_US as f64 / 8e6) as u64;

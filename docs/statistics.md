@@ -268,6 +268,26 @@ With source-port rotation or automatic recovery enabled, logical path counters r
 
 ## Adaptive control and successful admission
 
+Each session direction's `forward_guard` reports the shared-loss aggregate cap.
+`sent_bps` is local admitted symbol service; `delivered_bps` is the last qualified
+peer byte-delivery rate. The latter is calculated from each path's cumulative
+unique pre-FEC bytes and its receiver-local report interval, then summed. It is
+not current local sending multiplied by a delayed loss fraction. The current
+`receiver_delivery_bps` is null when a clock/byte baseline is missing, unchanged,
+regressed or belongs to another generation; `delivery_unavailable_windows`
+counts such windows. Loss quorum, post-cut admission watermarks, trial bounds,
+operator caps and conservative growth after a confirmed limit still apply.
+A trial with inconsistent send/delivery windows, or reduced delivery accompanied
+by substantially improved loss, is inconclusive and cannot teach a random-loss
+floor. These rates count symbols, including FEC, rather than TCP goodput.
+
+Native-window service recovery respects both phases of a per-path loss trial
+and any resulting pace ceiling. It may recover below a live ceiling, and resume
+normal recovery once that ceiling expires; it cannot repeatedly raise a trial's
+fixed rate between observations. `adaptive.rate_changes` and `last_control` are
+available through periodic JSONL statistics; increasing the normal log level
+does not emit every rate-change reason.
+
 In adaptive mode each path normally sends a small authenticated probe every 500 ms, including during application idleness or probe-only operation after health evidence becomes stale. After short byte feedback has been observed, an eligible fresh path with business backlog and sufficiently young, low-RTT probe evidence uses a 100 ms request interval during both initial and cautious operation, as qualified below. At most four request nonces and one pending reply per path are retained. Replies must match an admitted nonce, generation and three-second age limit; rejected/replayed replies do not refresh the path. `probes_sent`, `replies_received`, `probe_rtt_ms`, `probe_rtt_latest_ms` and `probe_updated_us` describe this local-clock RTT evidence. The latest RTT sample and reply counter distinguish fresh observations from the diagnostic RTT EWMA. `symbols.probes_admitted` includes requests and replies and uses the same bounded budgets. Faster attempts do not bypass Quinn or the aggregate/group limits.
 
 Each path's `adaptive` decision reports `state`, `eligible`, `pacing_bps`, `weight`, `queue_delay_ms`, `probe_due` and `observed_delivery_bps`. Queue delay is an RTT-excess/transport-pressure estimate, not a direct one-way measurement. Cross-host transit drift alone does not trigger an adaptive congestion response. `pacing_bps` is a controller allowance, while observed delivery remains a separate measurement. Growth requires at least 90% actual use of that allowance, with receiver delivery corroborating the initial search. Decisions use the latest finalized `sample_loss_rate` and `sample_symbols`; repeated old loss EWMAs do not create new congestion events. Ordinary congestion reduces pacing while recent positive path evidence keeps the path eligible. `delivered_updated_us` records local receipt of feedback whose unique delivered bytes advance; a new report containing only finalized losses does not refresh this evidence. Health requires positive delivery evidence or a valid probe reply. Missing fresh evidence causes probe-only operation, and a sufficiently sampled all-loss interval with no recent positive proof can stop business earlier. New positive evidence resumes the retained allowance in the same generation. A new connection generation resets the controller.

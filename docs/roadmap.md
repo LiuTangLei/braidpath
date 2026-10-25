@@ -81,6 +81,17 @@ Current protocol, commands and limits: [experimental runtime](runtime.md). Check
 
 ## M4 — Reliable flows and application adapters
 
+### v0.5.1 — Correct measurement and coordinated recovery (experimental development)
+
+- Keep high-rate reordered measurement symbols in a fixed-capacity tagged bitmap;
+  expose sequence-pressure finalizations separately from the normal loss grace.
+- Keep native-window recovery within active loss trials and learned pace ceilings.
+- Judge shared-loss trials using receiver-clock byte progress. Delayed finalized
+  loss is not multiplied by current local admissions to infer delivery; changing
+  or incomplete windows cannot establish a random-loss floor.
+- FEC strength and wire profiles are unchanged. Throughput and stability remain
+  subject to separate bounded WAN acceptance; no release claim follows from tests.
+
 ### v0.5.0 — Aggregate DATAGRAM TCP (experimental development)
 
 - [x] Keep leaderless mesh membership, authentication, exit selection and one

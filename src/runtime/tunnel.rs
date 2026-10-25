@@ -1989,6 +1989,8 @@ async fn sender(
                                 sent_symbols: q.snapshot.sent_symbols,
                                 expected: estimate.expected,
                                 lost: estimate.lost,
+                                received_bytes: estimate.received_bytes,
+                                report_time_us: estimate.report_time_us,
                             },
                         )
                     })
