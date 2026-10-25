@@ -1657,14 +1657,32 @@ async fn write_loop(
     events: mpsc::UnboundedSender<Io>,
     lease: Arc<Lease>,
 ) {
+    let mut pending = None;
     let finished = loop {
         let op = tokio::select! {
             biased;
             _ = reset.notified() => break false,
-            op = ops.recv() => op,
+            op = async { match pending.take() {
+                Some(op) => Some(op),
+                None => ops.recv().await,
+            } } => op,
         };
         match op {
-            Some(WriteOp::Data(data)) => {
+            Some(WriteOp::Data(mut data)) => {
+                // Drain only bytes already ready, at most one write chunk.
+                // Never wait for another frame or move bytes across FIN.
+                while data.len() < READ_CHUNK {
+                    match ops.try_recv() {
+                        Ok(WriteOp::Data(next)) if next.len() <= READ_CHUNK - data.len() => {
+                            data.extend_from_slice(&next);
+                        }
+                        Ok(next) => {
+                            pending = Some(next);
+                            break;
+                        }
+                        Err(_) => break,
+                    }
+                }
                 let started = tracing::enabled!(tracing::Level::DEBUG).then(Instant::now);
                 let written = tokio::select! {
                     biased;
@@ -1723,6 +1741,75 @@ async fn write_payload<W: tokio::io::AsyncWrite + Unpin>(
 mod tests {
     use super::*;
     use crate::runtime::{MAX_PATHS, stats};
+
+    #[tokio::test]
+    async fn ready_write_batches_coalesce_without_delaying_or_crossing_fin() {
+        for finish_before_tail in [false, true] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let (client, accepted) = tokio::join!(
+                TcpStream::connect(listener.local_addr().unwrap()),
+                listener.accept()
+            );
+            let mut peer = client.unwrap();
+            let (_read, write) = accepted.unwrap().0.into_split();
+            let budget = Arc::new(Budget::default());
+            let lease = budget.try_flow().unwrap();
+            let (ops, input) = mpsc::unbounded_channel();
+            let (events, mut output) = mpsc::unbounded_channel();
+            let expected = if finish_before_tail {
+                vec![7; 512]
+            } else {
+                vec![7; READ_CHUNK]
+            };
+            let total = expected.len() + usize::from(finish_before_tail) * 512;
+            lease.retain_rx(lease.rx.try_take(total, false).unwrap());
+            if finish_before_tail {
+                ops.send(WriteOp::Data(vec![7; 512])).unwrap();
+                ops.send(WriteOp::Finish).unwrap();
+                ops.send(WriteOp::Data(vec![9; 512])).unwrap();
+            } else {
+                for _ in 0..READ_CHUNK / 512 {
+                    ops.send(WriteOp::Data(vec![7; 512])).unwrap();
+                }
+                ops.send(WriteOp::Finish).unwrap();
+            }
+            drop(ops);
+            let task = tokio::spawn(write_loop(
+                1,
+                write,
+                input,
+                Arc::new(Notify::new()),
+                events,
+                lease.clone(),
+            ));
+            let mut received = Vec::new();
+            timeout(Duration::from_secs(3), peer.read_to_end(&mut received))
+                .await
+                .unwrap()
+                .unwrap();
+            task.await.unwrap();
+            assert_eq!(received, expected);
+            let mut batches = 0;
+            while let Ok(event) = output.try_recv() {
+                let Io::Written(1, n) = event else {
+                    panic!("unexpected write event")
+                };
+                lease.release_rx(n);
+                batches += 1;
+            }
+            assert_eq!(
+                batches, 1,
+                "already queued small frames should make one bounded write batch"
+            );
+            assert_eq!(
+                budget.snapshot().1,
+                total - expected.len(),
+                "only written bytes release credit"
+            );
+            drop(lease);
+            assert_eq!(budget.snapshot(), (0, 0));
+        }
+    }
 
     fn proxy_policy() -> Policy {
         Policy {

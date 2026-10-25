@@ -245,26 +245,40 @@ impl Rtt {
         self.first_sample.get_or_insert(now);
         // Two adjacent windows keep the slowest active path visible: with
         // multipath, segments routed over it are often the last to arrive.
-        if self
+        let age = self
             .window_start
-            .is_none_or(|start| now.saturating_duration_since(start) >= RTT_WINDOW)
-        {
-            self.high = [rtt, self.high[0]];
+            .map(|start| now.saturating_duration_since(start));
+        if age.is_none_or(|age| age >= RTT_WINDOW) {
+            self.high = [
+                rtt,
+                if age.is_some_and(|age| age < RTT_WINDOW * 2) {
+                    self.high[0]
+                } else {
+                    Duration::ZERO
+                },
+            ];
             self.window_start = Some(now);
         } else {
             self.high[0] = self.high[0].max(rtt);
         }
     }
-    fn observed_high(&self) -> Option<Duration> {
-        self.observed_max()
+    fn observed_high(&self, now: Instant) -> Option<Duration> {
+        self.observed_max(now)
             .zip(self.smoothed)
             .map(|(high, s)| high.max(s + 4 * self.variation))
     }
     /// The largest sample of the two recent windows, without the variance
     /// bound. The first sample's variance is half the RTT, so the bound
     /// alone would make a new stream wait three RTTs.
-    fn observed_max(&self) -> Option<Duration> {
-        self.smoothed.map(|_| self.high[0].max(self.high[1]))
+    fn observed_max(&self, now: Instant) -> Option<Duration> {
+        let age = now.saturating_duration_since(self.window_start?);
+        if age < RTT_WINDOW {
+            Some(self.high[0].max(self.high[1]))
+        } else if age < RTT_WINDOW * 2 {
+            Some(self.high[0])
+        } else {
+            None
+        }
     }
 
     /// The windowed maximum, or the variance bound while few samples exist.
@@ -274,7 +288,7 @@ impl Rtt {
         let Some(smoothed) = self.smoothed else {
             return INITIAL_RTT;
         };
-        let observed = self.observed_high().unwrap_or(smoothed);
+        let observed = self.observed_high(now).unwrap_or(smoothed);
         if self
             .first_sample
             .is_some_and(|at| now.saturating_duration_since(at) < INITIAL_RTT)
@@ -475,7 +489,7 @@ impl Sender {
         // here. Stream samples additionally cover the ACK's return route and
         // receiver scheduling.
         self.transport_rtt[path]
-            .max(self.path_rtt[path].observed_max().unwrap_or_default())
+            .max(self.path_rtt[path].observed_max(now).unwrap_or_default())
             .mul_f64(self.reorder)
             + Duration::from_millis(2)
     }
@@ -1169,6 +1183,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_reopened_route_does_not_inherit_expired_stream_rtt_maxima() {
+        let at = Instant::now();
+        let mut sender = Sender::new(false);
+        sender.path_rtt[0].sample(Duration::from_millis(500), at);
+        sender.transport_rtt[0] = Duration::from_millis(110);
+        assert!(
+            sender.path_threshold(0, at + Duration::from_secs(3)) < Duration::from_millis(150),
+            "an idle/reopened route must use its current native RTT instead of an expired stream sample"
+        );
+        sender.path_rtt[0].sample(Duration::from_millis(110), at + Duration::from_secs(3));
+        assert_eq!(
+            sender.path_rtt[0].observed_max(at + Duration::from_secs(3)),
+            Some(Duration::from_millis(110)),
+            "the first ACK after idle must not rotate an expired sample back into the window"
+        );
+    }
+
+    #[test]
     fn delayed_sack_ranges_do_not_replace_the_newest_route_rtt_sample() {
         let start = Instant::now();
         let mut sender = Sender::new(false);
@@ -1190,7 +1222,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            sender.path_rtt[0].observed_max(),
+            sender.path_rtt[0].observed_max(at),
             Some(Duration::from_millis(110)),
             "older bytes in one cumulative/SACK batch must not turn acknowledgment aggregation into path delay"
         );
@@ -1225,14 +1257,17 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            sender.path_rtt[0].observed_max(),
+            sender.path_rtt[0].observed_max(at),
             Some(Duration::from_millis(210))
         );
         assert_eq!(
-            sender.path_rtt[1].observed_max(),
+            sender.path_rtt[1].observed_max(at),
             Some(Duration::from_millis(110))
         );
-        assert_eq!(sender.rtt.observed_max(), Some(Duration::from_millis(110)));
+        assert_eq!(
+            sender.rtt.observed_max(at),
+            Some(Duration::from_millis(110))
+        );
     }
 
     #[test]

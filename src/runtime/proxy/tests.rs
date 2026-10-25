@@ -1257,6 +1257,14 @@ async fn one_tcp_upload_repairs_loss_without_duplicating_target_bytes() {
     })
     .await
     .unwrap();
+    pool.prepare_stream("a").await.unwrap();
+    timeout(Duration::from_secs(3), async {
+        while pool.transport_snapshot("a").len() != 3 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("upload paths did not authenticate before fault injection");
     let (listen, listener) = local_listener(pool.clone(), "a").await;
     let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let at = target.local_addr().unwrap();
