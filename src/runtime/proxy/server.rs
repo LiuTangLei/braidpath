@@ -13,13 +13,6 @@ use tokio::{
     time::timeout,
 };
 
-const DATA_RPCS: usize = 512;
-// Download ranges are short, and each flow keeps at most two future waiters.
-const DOWNLOAD_RPCS: usize = 1024;
-// Each aggregate flow can hold an upload progress wait and a control operation.
-const CONTROL_RPCS: usize = super::bond::MAX_FLOWS * 2 + 128;
-const RPCS: usize = DATA_RPCS + DOWNLOAD_RPCS + CONTROL_RPCS;
-
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ServerConfig {
     pub allow_private: bool,
@@ -29,13 +22,9 @@ pub struct Server {
     token: String,
     exit: String,
     rate: Arc<Rate>,
-    bonds: Arc<super::bond::Registry>,
     stream_budget: Arc<crate::runtime::tunnel::tcp::Budget>,
     connections: Arc<Semaphore>,
     streams: Arc<Semaphore>,
-    rpcs: Arc<Semaphore>,
-    data_rpcs: Arc<Semaphore>,
-    downloads: Arc<Semaphore>,
     associations: Arc<Semaphore>,
     destinations: Arc<Semaphore>,
     rejected: AtomicU64,
@@ -52,7 +41,7 @@ pub struct Snapshot {
     #[serde(default)]
     pub buffered_bytes: usize,
     #[serde(default)]
-    pub rpc_streams: usize,
+    pub control_streams: usize,
 }
 impl Server {
     pub fn new(
@@ -77,12 +66,8 @@ impl Server {
             exit,
             rate,
             stream_budget,
-            bonds: super::bond::Registry::new(),
             connections: Arc::new(Semaphore::new(MAX_CONNECTIONS)),
             streams: Arc::new(Semaphore::new(MAX_STREAMS)),
-            rpcs: Arc::new(Semaphore::new(RPCS)),
-            data_rpcs: Arc::new(Semaphore::new(DATA_RPCS)),
-            downloads: Arc::new(Semaphore::new(DOWNLOAD_RPCS)),
             associations: Arc::new(Semaphore::new(MAX_ASSOCIATIONS)),
             destinations: Arc::new(Semaphore::new(1024)),
             rejected: AtomicU64::new(0),
@@ -92,39 +77,16 @@ impl Server {
         self.stream_budget.clone()
     }
     pub fn snapshot(&self) -> Snapshot {
-        let (legacy_flows, legacy_buffered) = self.bonds.snapshot();
-        let (stream_flows, stream_buffered) = self.stream_budget.snapshot();
-        let tcp_flows = legacy_flows + stream_flows;
-        let buffered_bytes = legacy_buffered + stream_buffered;
+        let (tcp_flows, buffered_bytes) = self.stream_budget.snapshot();
         Snapshot {
             tcp_flows,
             buffered_bytes,
             connections: MAX_CONNECTIONS - self.connections.available_permits(),
             streams: MAX_STREAMS - self.streams.available_permits() + tcp_flows,
-            rpc_streams: RPCS - self.rpcs.available_permits(),
+            control_streams: MAX_STREAMS - self.streams.available_permits(),
             udp_associations: MAX_ASSOCIATIONS - self.associations.available_permits(),
             udp_destinations: 1024 - self.destinations.available_permits(),
             rejected: self.rejected.load(Ordering::Relaxed),
-        }
-    }
-    fn data_admission(&self, command: u8) -> Result<Option<OwnedSemaphorePermit>> {
-        if command == super::bond::PULL {
-            return Ok(Some(
-                self.downloads
-                    .clone()
-                    .try_acquire_owned()
-                    .context("proxy download RPC limit")?,
-            ));
-        }
-        if matches!(command, TCP | UDP | super::bond::PUT) {
-            Ok(Some(
-                self.data_rpcs
-                    .clone()
-                    .try_acquire_owned()
-                    .context("proxy data RPC limit")?,
-            ))
-        } else {
-            Ok(None)
         }
     }
     pub(crate) async fn connection(
@@ -159,8 +121,7 @@ impl Server {
         })
         .await??;
         drop(pending);
-        crate::runtime::transport::authenticated_proxy(&conn);
-        conn.set_max_concurrent_bi_streams(1024u32.into());
+        conn.set_max_concurrent_bi_streams(((MAX_ASSOCIATIONS + 8) as u32).into());
         let router = Arc::new(Router::default());
         let mut tasks = JoinSet::new();
         let mut maintenance = tokio::time::interval(Duration::from_secs(5));
@@ -170,16 +131,16 @@ impl Server {
             tokio::select! {
                 accepted = conn.accept_bi() => {
                     let (mut send, mut recv) = accepted?;
-                    let Ok(permit) = self.rpcs.clone().try_acquire_owned() else {
+                    let Ok(permit) = self.streams.clone().try_acquire_owned() else {
                         self.rejected.fetch_add(1, Ordering::Relaxed);
-                        // The outer handler budget can fill before the command
-                        // is read. A bounded refusal keeps aggregate clients from
-                        // mistaking overload for a broken transport. Older scalar
-                        // commands also see a nonzero failure status.
+                        // Bound handlers before spawning; refuse only this
+                        // request so a healthy native UDP connection survives.
                         let _ = recv.stop(0u32.into());
-                        let _ = timeout(CONNECT_TIMEOUT, super::bond::respond(
-                            &mut send, super::bond::Reply::Failed(super::bond::BUSY),
-                        )).await;
+                        let _ = timeout(CONNECT_TIMEOUT, async {
+                            send.write_all(&[1]).await?;
+                            send.finish()?;
+                            Ok::<_, anyhow::Error>(())
+                        }).await;
                         continue;
                     };
                     last = Instant::now();
@@ -196,7 +157,7 @@ impl Server {
                 _ = tasks.join_next(), if !tasks.is_empty() => { last = Instant::now(); }
                 _ = maintenance.tick() => {
                     telemetry.report(&conn, "server", &self.exit);
-                    if tasks.is_empty() && last.elapsed() >= UDP_IDLE && !self.bonds.owns_connection(conn.stable_id()) { return Ok(()); }
+                    if tasks.is_empty() && last.elapsed() >= UDP_IDLE { return Ok(()); }
                 }
             }
         }
@@ -209,81 +170,7 @@ impl Server {
         router: Arc<Router>,
     ) -> Result<()> {
         let command = timeout(CONNECT_TIMEOUT, recv.read_u8()).await??;
-        let bond = (super::bond::OPEN..=super::bond::PULL).contains(&command);
-        let _data_permit = match self.data_admission(command) {
-            Ok(permit) => permit,
-            // Aggregate clients retry a busy reply; dropping the stream would
-            // instead look like a failed path and move all of its records.
-            Err(_) if bond => {
-                self.rejected.fetch_add(1, Ordering::Relaxed);
-                let _ = recv.stop(0u32.into());
-                return super::bond::respond(
-                    &mut send,
-                    super::bond::Reply::Failed(super::bond::BUSY),
-                )
-                .await;
-            }
-            Err(error) => return Err(error),
-        };
-        let _logical_permit = if command == TCP || command == UDP {
-            Some(
-                self.streams
-                    .clone()
-                    .try_acquire_owned()
-                    .context("proxy stream limit")?,
-            )
-        } else {
-            None
-        };
         match command {
-            _ if bond => {
-                self.bonds
-                    .serve(
-                        command,
-                        &conn,
-                        &mut send,
-                        &mut recv,
-                        self.config.allow_private,
-                        self.rate.clone(),
-                    )
-                    .await
-            }
-            TCP => {
-                let target = timeout(CONNECT_TIMEOUT, Address::read(&mut recv)).await??;
-                let connected = timeout(CONNECT_TIMEOUT, async {
-                    let addresses = target.resolve(self.config.allow_private).await?;
-                    Ok::<_, anyhow::Error>(TcpStream::connect(addresses.as_slice()).await?)
-                })
-                .await;
-                let tcp = match connected {
-                    Ok(Ok(tcp)) => tcp,
-                    result => {
-                        let code = match &result {
-                            Ok(Err(error)) => error
-                                .downcast_ref::<ReplyError>()
-                                .map(|e| e.0)
-                                .unwrap_or_else(|| {
-                                    if error.downcast_ref::<std::io::Error>().is_some_and(|e| {
-                                        e.kind() == std::io::ErrorKind::ConnectionRefused
-                                    }) {
-                                        5
-                                    } else {
-                                        4
-                                    }
-                                }),
-                            _ => 4,
-                        };
-                        timeout(CONNECT_TIMEOUT, send.write_all(&[code])).await??;
-                        send.finish()?;
-                        return Err(ReplyError(code).into());
-                    }
-                };
-                tcp.set_nodelay(true)?;
-                let mut response = vec![0];
-                Address::Ip(tcp.local_addr()?).encode(&mut response);
-                timeout(CONNECT_TIMEOUT, send.write_all(&response)).await??;
-                super::legacy::bridge(tcp, send, recv, Some(&self.rate)).await
-            }
             UDP => {
                 let _permit = self
                     .associations
@@ -390,9 +277,17 @@ async fn packet_parts(data: &[u8]) -> Result<(Address, &[u8])> {
 #[cfg(test)]
 mod admission_tests {
     use super::*;
-    #[tokio::test]
-    async fn exhausted_handler_budgets_reply_busy_and_recover_on_the_same_connection() {
-        use crate::runtime::transport::{self, AckRequest, Congestion};
+    use crate::runtime::transport::{self, AckRequest, Congestion};
+
+    struct Fixture {
+        server: Arc<Server>,
+        connection: quinn::Connection,
+        _server: quinn::Endpoint,
+        _client: quinn::Endpoint,
+        _worker: AbortTask,
+    }
+
+    async fn fixture() -> Fixture {
         let temp = tempfile::tempdir().unwrap();
         let identity = temp.path().join("identity");
         transport::initialize(&identity, "localhost").unwrap();
@@ -406,14 +301,17 @@ mod admission_tests {
             true,
         )
         .unwrap();
-        let at = endpoint.local_addr().unwrap();
-        let client = transport::proxy_client(at, &identity.join("cert.pem")).unwrap();
-        let (outgoing, incoming) = tokio::join!(client.connect(at, "localhost").unwrap(), async {
-            endpoint.accept().await.unwrap().await
-        });
-        let conn = outgoing.unwrap();
+        let address = endpoint.local_addr().unwrap();
+        let client = transport::proxy_client(address, &identity.join("cert.pem")).unwrap();
+        let (outgoing, incoming) =
+            tokio::join!(client.connect(address, "localhost").unwrap(), async {
+                endpoint.accept().await.unwrap().await
+            });
+        let connection = outgoing.unwrap();
         let server = Server::new(
-            ServerConfig::default(),
+            ServerConfig {
+                allow_private: true,
+            },
             "a".repeat(64),
             "exit".into(),
             crate::runtime::MAX_RATE_BPS,
@@ -426,98 +324,95 @@ mod admission_tests {
                 let _ = server.connection(incoming.unwrap(), pending).await;
             }
         }));
-        let (mut send, mut recv) = conn.open_bi().await.unwrap();
+        let (mut send, mut recv) = connection.open_bi().await.unwrap();
         let mut auth = vec![1];
         auth.extend("a".repeat(64).bytes());
         auth.extend(b"\x04exit");
         send.write_all(&auth).await.unwrap();
         send.finish().unwrap();
         assert_eq!(recv.read_to_end(1).await.unwrap(), [0]);
-
-        // Both levels used to reset the RPC, which retired an otherwise good
-        // path. Hold the real admission permits and exercise the wire reply.
-        for budget in [&server.rpcs, &server.data_rpcs] {
-            let held = budget
-                .clone()
-                .try_acquire_many_owned(budget.available_permits() as u32)
-                .unwrap();
-            let mut op = super::super::bond::Operation::Put {
-                sequence: 0,
-                offset: 0,
-                data: bytes::Bytes::from_static(b"body"),
-            };
-            let reply = timeout(
-                Duration::from_secs(2),
-                super::super::bond::rpc(&conn, [7; 32], &mut op, None),
-            )
-            .await
-            .unwrap()
-            .unwrap();
-            assert!(matches!(
-                reply,
-                super::super::bond::Reply::Failed(super::super::bond::BUSY)
-            ));
-            assert!(conn.close_reason().is_none());
-            drop(held);
-            let mut close = super::super::bond::Operation::Close;
-            let reply = timeout(
-                Duration::from_secs(2),
-                super::super::bond::rpc(&conn, [7; 32], &mut close, None),
-            )
-            .await
-            .unwrap()
-            .unwrap();
-            assert!(matches!(reply, super::super::bond::Reply::Accepted));
+        Fixture {
+            server,
+            connection,
+            _server: endpoint,
+            _client: client,
+            _worker: worker,
         }
+    }
+
+    async fn udp_control(connection: &quinn::Connection) {
+        let (mut send, mut recv) = connection.open_bi().await.unwrap();
+        send.write_all(&[UDP]).await.unwrap();
+        let mut status = [1];
+        recv.read_exact(&mut status).await.unwrap();
+        assert_eq!(status, [0]);
+        send.finish().unwrap();
+        assert!(recv.read_to_end(0).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn exhausted_native_handlers_refuse_one_request_and_recover_the_same_connection() {
+        let fixture = fixture().await;
+        let held = fixture
+            .server
+            .streams
+            .clone()
+            .try_acquire_many_owned(MAX_STREAMS as u32)
+            .unwrap();
+        let (mut send, mut recv) = fixture.connection.open_bi().await.unwrap();
+        send.write_all(&[UDP]).await.unwrap();
+        let _ = send.finish();
+        let response = timeout(Duration::from_secs(2), recv.read_to_end(1))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(response, [1]);
+        assert!(fixture.connection.close_reason().is_none());
+        assert_eq!(fixture.server.snapshot().rejected, 1);
+        drop(held);
+        timeout(Duration::from_secs(2), udp_control(&fixture.connection))
+            .await
+            .unwrap();
         timeout(Duration::from_secs(2), async {
-            while server.snapshot().rpc_streams != 0 {
+            while fixture.server.snapshot().control_streams != 0 {
                 tokio::task::yield_now().await;
             }
         })
         .await
         .unwrap();
-        assert_eq!(server.snapshot().tcp_flows, 0);
-        assert_eq!(server.snapshot().buffered_bytes, 0);
-        drop(worker);
+        assert_eq!(fixture.server.snapshot().udp_associations, 0);
+        assert_eq!(fixture.server.snapshot().buffered_bytes, 0);
     }
-    #[test]
-    fn pending_data_leaves_control_capacity_for_progress_and_reclamation() {
-        let server = Server::new(
-            ServerConfig::default(),
-            "a".repeat(64),
-            "exit".into(),
-            crate::runtime::MAX_RATE_BPS,
-        )
-        .unwrap();
-        let _data = server
-            .data_rpcs
-            .clone()
-            .try_acquire_many_owned(DATA_RPCS as u32)
-            .unwrap();
-        let _downloads = server
-            .downloads
-            .clone()
-            .try_acquire_many_owned(DOWNLOAD_RPCS as u32)
-            .unwrap();
-        let _headers = server
-            .rpcs
-            .clone()
-            .try_acquire_many_owned((DATA_RPCS + DOWNLOAD_RPCS) as u32)
-            .unwrap();
-        assert_eq!(server.rpcs.available_permits(), CONTROL_RPCS);
-        for command in [TCP, UDP, super::bond::PUT, super::bond::PULL] {
-            assert!(server.data_admission(command).is_err());
+
+    #[tokio::test]
+    async fn removed_tcp_and_bond_commands_cannot_open_targets_or_disable_udp() {
+        let fixture = fixture().await;
+        let target = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        for command in [TCP, 16, 17, 25] {
+            let (mut send, mut recv) = fixture.connection.open_bi().await.unwrap();
+            let mut request = vec![command];
+            if command == TCP {
+                Address::Ip(target.local_addr().unwrap()).encode(&mut request);
+            }
+            send.write_all(&request).await.unwrap();
+            let _ = send.finish();
+            assert_eq!(
+                timeout(Duration::from_secs(2), recv.read_to_end(1))
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                [7]
+            );
+            assert!(fixture.connection.close_reason().is_none());
         }
-        for command in [
-            super::bond::OPEN,
-            super::bond::CLOSE,
-            super::bond::FIN,
-            super::bond::ACK_FIN,
-            super::bond::DOWNLOAD_ACK,
-            super::bond::UPLOAD_STATUS,
-        ] {
-            let _header = server.rpcs.clone().try_acquire_owned().unwrap();
-            assert!(server.data_admission(command).unwrap().is_none());
-        }
+        assert!(
+            timeout(Duration::from_millis(30), target.accept())
+                .await
+                .is_err()
+        );
+        timeout(Duration::from_secs(2), udp_control(&fixture.connection))
+            .await
+            .unwrap();
+        assert_eq!(fixture.server.snapshot().tcp_flows, 0);
     }
 }

@@ -341,7 +341,7 @@ fn proxy_cli_creates_one_socks_endpoint_per_exit_with_remote_half_close() {
         assert_eq!(status["proxy"]["connections"], 0);
         assert_eq!(status["proxy"]["tcp_flows"], 0);
         assert_eq!(status["proxy"]["buffered_bytes"], 0);
-        assert_eq!(status["proxy"]["rpc_streams"], 0);
+        assert_eq!(status["proxy"]["control_streams"], 0);
     }
     #[cfg(unix)]
     {

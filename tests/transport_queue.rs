@@ -138,10 +138,11 @@ async fn bounded_transport_queue_preserves_maximum_plain_and_repair_frames() {
 
     // No await here: the current-thread transport driver cannot drain the queue
     // between admission and the capacity check. The default buffer is only a
-    // ceiling (each path's writer bounds what it holds there), and the
-    // published hint follows the accepted frame.
+    // single-record ceiling; aggregate profiles explicitly request the larger
+    // throughput buffer. The published hint follows the accepted frame.
     let empty = outgoing.datagram_send_buffer_space();
-    assert!(empty <= transport::DEFAULT_DATAGRAM_SEND_BUFFER_BYTES && empty >= 8 * plain.len());
+    assert!(empty <= transport::DEFAULT_DATAGRAM_SEND_BUFFER_BYTES && empty >= plain.len());
+    assert!(empty < 2 * plain.len());
     assert_eq!(outgoing.datagram_send_buffer_space_hint(), empty);
     outgoing.send_datagram(plain.clone()).unwrap();
     let space = outgoing.datagram_send_buffer_space();
@@ -206,8 +207,9 @@ async fn server_datagram_send_buffer_override_reaches_reverse_connection_without
             .is_err()
         );
     }
-    // Zero is the default ceiling.
-    for bytes in [0, 1200, 9600] {
+    // Zero selects the single-record default. Explicit throughput profiles
+    // retain their independently bounded larger queues.
+    for bytes in [0, 1200, 9600, transport::MAX_DATAGRAM_SEND_BUFFER_BYTES] {
         let server = if bytes == 0 {
             transport::server(
                 "127.0.0.1:0".parse().unwrap(),
@@ -256,9 +258,9 @@ async fn server_datagram_send_buffer_override_reaches_reverse_connection_without
             server_conn.send_datagram(record.clone()).unwrap();
             admitted += 1;
         }
-        if bytes == 0 {
+        if bytes == transport::MAX_DATAGRAM_SEND_BUFFER_BYTES {
             assert_eq!(admitted, records.len());
-        } else if bytes == 1200 {
+        } else if bytes == 0 || bytes == 1200 {
             assert_eq!(admitted, 1);
         } else {
             assert!(admitted >= 8 && admitted < records.len());

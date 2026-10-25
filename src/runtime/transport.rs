@@ -13,8 +13,6 @@ mod tickets;
 pub const MIN_DATAGRAM_SEND_BUFFER_BYTES: usize = 1200;
 pub const DEFAULT_DATAGRAM_SEND_BUFFER_BYTES: usize = MIN_DATAGRAM_SEND_BUFFER_BYTES;
 pub const MAX_DATAGRAM_SEND_BUFFER_BYTES: usize = 76_800;
-const PROXY_STREAM_WINDOW: u32 = 16 * 1024 * 1024;
-const PROXY_CONNECTION_WINDOW: u32 = 32 * 1024 * 1024;
 const PROXY_SOCKET_BUFFER_BYTES: usize = 8 * 1024 * 1024;
 
 /// Low-frequency native counters for active proxy transports. Payload and
@@ -90,12 +88,6 @@ pub(crate) fn datagram_socket_buffers(socket: socket2::SockRef<'_>, scope: &'sta
         send = ?socket.send_buffer_size().ok(),
         "UDP socket buffers"
     );
-}
-
-/// Expand shared stream credit only after the proxy token and exit are verified.
-pub(crate) fn authenticated_proxy(connection: &quinn::Connection) {
-    connection.set_receive_window(PROXY_CONNECTION_WINDOW.into());
-    connection.set_send_window(u64::from(PROXY_CONNECTION_WINDOW));
 }
 
 /// Server resumption tickets held for 0-RTT; each is single use.
@@ -375,11 +367,6 @@ pub(crate) fn server_with_session_config(
     }
     let mut conf = ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(tls)?));
     let mut transport = config(congestion);
-    if proxy {
-        // The per-stream window cannot be changed after QUIC negotiation.
-        // Keep aggregate receive/send windows at 256 KiB until proxy auth.
-        transport.stream_receive_window(PROXY_STREAM_WINDOW.into());
-    }
     transport.datagram_send_buffer_size(datagram_send_buffer_bytes);
     ack_request.apply(&mut transport);
     conf.transport_config(Arc::new(transport));
@@ -557,11 +544,6 @@ fn client_with_alpn_and_ack(
     };
     let mut conf = ClientConfig::new(crypto);
     let mut transport = config(congestion);
-    if alpn == super::proxy::ALPN {
-        transport.stream_receive_window(PROXY_STREAM_WINDOW.into());
-        transport.receive_window(PROXY_CONNECTION_WINDOW.into());
-        transport.send_window(u64::from(PROXY_CONNECTION_WINDOW));
-    }
     transport.datagram_send_buffer_size(datagram_send_buffer_bytes);
     ack_request.apply(&mut transport);
     conf.transport_config(Arc::new(transport));
@@ -749,7 +731,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn proxy_streams_acknowledge_large_flight_before_application_reads() {
+    async fn native_udp_control_streams_progress_with_bounded_windows() {
         let temp = tempfile::tempdir().unwrap();
         let identity = temp.path().join("identity");
         initialize(&identity, "localhost").unwrap();
@@ -765,64 +747,51 @@ mod tests {
         .unwrap();
         let address = server.local_addr().unwrap();
         let client = proxy_client(address, &identity.join("cert.pem")).unwrap();
-        tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::time::timeout(Duration::from_secs(5), async {
             let (outgoing, incoming) =
                 tokio::join!(client.connect(address, "localhost").unwrap(), async {
                     server.accept().await.unwrap().await
                 });
             let outgoing = outgoing.unwrap();
             let incoming = incoming.unwrap();
-            assert!(
-                outgoing
-                    .congestion_state()
-                    .into_any()
-                    .is::<quinn::congestion::Bbr>()
-            );
-            assert!(
-                incoming
-                    .congestion_state()
-                    .into_any()
-                    .is::<quinn::congestion::Bbr>()
-            );
-            authenticated_proxy(&incoming);
             let (mut upload, mut download) = outgoing.open_bi().await.unwrap();
-            // Make the stream visible to accept_bi without reading its payload.
             upload.write_all(&[1]).await.unwrap();
             let (response, mut request) = incoming.accept_bi().await.unwrap();
-            // Hold a backlog above the 5.1 MB mixed-frame failure reproduced
-            // in the assembler regression, in both directions before reads.
-            let payload = vec![7; 6 * 1024 * 1024];
-            // Completion requires peer ACKs, not just local write buffering.
-            // The old 16 KiB stream / 256 KiB connection windows would stall
-            // here in both directions until the application consumed data.
-            let send = |mut stream: quinn::SendStream, data: Vec<u8>| async move {
+            let payload = vec![7; 64 * 1024];
+            let write = |mut stream: quinn::SendStream, data: Vec<u8>| async move {
                 stream.write_all(&data).await.unwrap();
                 stream.finish().unwrap();
                 assert_eq!(stream.stopped().await.unwrap(), None);
             };
-            tokio::join!(
-                send(upload, payload.clone()),
-                send(response, payload.clone())
+            let ((), (), received, returned) = tokio::join!(
+                write(upload, payload.clone()),
+                write(response, payload.clone()),
+                request.read_to_end(payload.len() + 1),
+                download.read_to_end(payload.len())
             );
-            let received = request.read_to_end(payload.len() + 1).await.unwrap();
+            let received = received.unwrap();
             assert_eq!(received[0], 1);
             assert_eq!(&received[1..], payload);
-            assert_eq!(download.read_to_end(payload.len()).await.unwrap(), payload);
+            assert_eq!(returned.unwrap(), payload);
         })
         .await
-        .expect("proxy flow-control windows blocked outstanding data");
+        .expect("small control windows did not make bidirectional progress");
         client.close(0u32.into(), b"test complete");
         server.close(0u32.into(), b"test complete");
     }
 
     /// Delay both directions by `delay` and drop roughly `loss_per_mille` of
-    /// client datagrams once the handshake has had room to complete. The loss
-    /// pattern is a fixed hash of the datagram index, so runs are repeatable.
+    /// client datagrams after the caller explicitly arms loss. The first armed
+    /// datagram is always dropped; later drops use a fixed hash of their index.
     async fn lossy_relay(
         server: SocketAddr,
         delay: Duration,
         loss_per_mille: u64,
-    ) -> (SocketAddr, Arc<std::sync::atomic::AtomicU64>) {
+    ) -> (
+        SocketAddr,
+        Arc<std::sync::atomic::AtomicU64>,
+        Arc<std::sync::atomic::AtomicBool>,
+    ) {
         use std::collections::VecDeque;
         use tokio::{net::UdpSocket, sync::mpsc, time::Instant};
         // Forward each queued datagram once its delay has elapsed.
@@ -855,19 +824,26 @@ mod tests {
         let (to_client, client_queue) = mpsc::unbounded_channel();
         let peer = Arc::new(std::sync::Mutex::new(None));
         let dropped = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let armed = Arc::new(std::sync::atomic::AtomicBool::new(false));
         {
             let (front, peer, dropped) = (front.clone(), peer.clone(), dropped.clone());
+            let armed = armed.clone();
             tokio::spawn(async move {
                 let mut buf = vec![0; 65_536];
+                let mut first_armed = true;
                 for index in 0u64.. {
                     let Ok((n, from)) = front.recv_from(&mut buf).await else {
                         return;
                     };
                     *peer.lock().unwrap() = Some(from);
                     let hash = index.wrapping_mul(0x9E37_79B9_7F4A_7C15).rotate_left(29);
-                    if index >= 64 && hash % 1000 < loss_per_mille {
-                        dropped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        continue;
+                    if armed.load(std::sync::atomic::Ordering::Acquire) {
+                        let lose = first_armed || hash % 1000 < loss_per_mille;
+                        first_armed = false;
+                        if lose {
+                            dropped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            continue;
+                        }
                     }
                     let _ = to_server.send((Instant::now() + delay, buf[..n].to_vec()));
                 }
@@ -890,12 +866,12 @@ mod tests {
                 let _ = front.try_send_to(data, to);
             }
         }));
-        (address, dropped)
+        (address, dropped, armed)
     }
 
     // Single-threaded and modest in size so parallel timing tests keep their CPU.
     #[tokio::test]
-    async fn proxy_upload_recovers_from_loss_across_a_large_stream_window() {
+    async fn native_udp_control_stream_recovers_loss_with_small_windows() {
         let temp = tempfile::tempdir().unwrap();
         let identity = temp.path().join("identity");
         initialize(&identity, "localhost").unwrap();
@@ -909,14 +885,13 @@ mod tests {
             true,
         )
         .unwrap();
-        // Non-congestive loss on a long flight keeps many holes open in one
-        // stream while retransmissions catch up. The dense-hole bound itself
-        // is covered by the assembler regressions; this checks the whole
-        // proxy transport still delivers every byte in order.
-        let (relay, dropped) =
+        // Native UDP control streams keep small flow-control windows. Their
+        // framing must still make progress through loss without expanding
+        // receive credit for the removed reliable-stream TCP data plane.
+        let (relay, dropped, armed) =
             lossy_relay(server.local_addr().unwrap(), Duration::from_millis(50), 100).await;
-        // Keep this assembler regression on a large BBR flight under imposed
-        // non-congestive loss.
+        // The handshake completes without loss; control payload then crosses
+        // the small sliding window with explicitly armed impairment.
         let client = client_with_alpn(
             relay,
             &identity.join("cert.pem"),
@@ -934,11 +909,12 @@ mod tests {
                 });
             let outgoing = outgoing.unwrap();
             let incoming = incoming.unwrap();
-            authenticated_proxy(&incoming);
             let (mut upload, _download) = outgoing.open_bi().await.unwrap();
             upload.write_all(&[1]).await.unwrap();
             let (_response, mut request) = incoming.accept_bi().await.unwrap();
-            let payload: Vec<u8> = (0..8 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
+            assert_eq!(dropped.load(std::sync::atomic::Ordering::Relaxed), 0);
+            armed.store(true, std::sync::atomic::Ordering::Release);
+            let payload: Vec<u8> = (0..64 * 1024).map(|i| (i % 251) as u8).collect();
             let expected = payload.clone();
             let send = tokio::spawn(async move {
                 upload.write_all(&payload).await.unwrap();

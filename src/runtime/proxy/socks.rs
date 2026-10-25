@@ -1,5 +1,5 @@
 use super::{
-    client::{Connection, Pool},
+    client::{Pool, UdpConnection},
     protocol::*,
     *,
 };
@@ -72,25 +72,20 @@ pub(super) async fn serve(mut tcp: TcpStream, pool: Arc<Pool>, exit: &str) -> Re
         return flow.run(tcp).await;
     }
     let setup = timeout(CONNECT_TIMEOUT, async {
-        let conn = timeout(Duration::from_secs(2), pool.get(exit)).await??;
+        let conn = timeout(Duration::from_secs(2), pool.udp_connection(exit)).await??;
         let (mut send, mut recv) = conn.raw.open_bi().await?;
-        let registration = if command == UDP {
-            Some(conn.router.register(send.id().index())?)
-        } else {
-            None
-        };
-        let request = [command];
+        let registration = conn.router.register(send.id().index())?;
+        let request = [UDP];
         send.write_all(&request).await?;
         let status = recv.read_u8().await?;
         if status != 0 {
             return Err(ReplyError(if status <= 8 { status } else { 1 }).into());
         }
-        let bound = Address::Ip(unspecified);
-        tracing::debug!(%exit, command, "proxy flow pinned to exit");
-        Ok::<_, anyhow::Error>((conn, send, recv, registration, bound))
+        tracing::debug!(%exit, "UDP association pinned to exit");
+        Ok::<_, anyhow::Error>((conn, send, recv, registration))
     })
     .await;
-    let (conn, send, recv, registration, bound) = match setup {
+    let (conn, send, recv, registration) = match setup {
         Ok(Ok(value)) => value,
         Ok(Err(error)) => {
             reply(
@@ -106,21 +101,12 @@ pub(super) async fn serve(mut tcp: TcpStream, pool: Arc<Pool>, exit: &str) -> Re
             return Ok(());
         }
     };
-    let _ = bound;
-    udp(
-        tcp,
-        conn,
-        send,
-        recv,
-        registration.expect("UDP registration"),
-        target.port(),
-    )
-    .await
+    udp(tcp, conn, send, recv, registration, target.port()).await
 }
 
 async fn udp(
     mut tcp: TcpStream,
-    conn: Arc<Connection>,
+    conn: Arc<UdpConnection>,
     mut send: quinn::SendStream,
     mut control: quinn::RecvStream,
     mut registration: Registration,

@@ -18,7 +18,7 @@ BraidPath is a Rust multipath transport project combining **forward error correc
 
 > **Status: experimental v0.5.0 development.** TCP proxying now uses the aggregate DATAGRAM engine while retaining main's mesh discovery, authentication, exit selection and local SOCKS5 listeners. One local TCP connection becomes one destination TCP connection at its selected exit. Byte-offset selective acknowledgments, fine-grained repair across surviving paths and automatic FEC provide reliability above the shared scheduler; TCP payload does not use per-path reliable QUIC streams. Each exit has its own SOCKS5 port for Clash. The TCP profile uses ALPN `braidpath-stream/2` and capability `proxy-stream-v2`; upgrade clients and servers together. SOCKS UDP retains the native `braidpath-proxy/1` profile without FEC. The default maximum is four cooperating paths and the operational ceiling remains 10 Gbit/s. See the [proxy and distributed-server guide](docs/mesh.md). WAN throughput, stability and single-connection multipath gain require separate acceptance; shared links and exit capacity still bound useful throughput.
 
-The changes remain an isolated integration candidate. The production SOCKS5 entrance has not passed its performance gate, so integration into `main`, removal of the old bond implementation and deployment remain on hold. Data-plane preservation, front-end integration and multipath gain have separate acceptance gates.
+The aggregate SOCKS5 backend passed its bounded single-path performance gate. The former bond RPC implementation and TCP compatibility bridge are removed. Single-connection multipath gain and deployment acceptance remain separate; this development build is not a public release.
 
 ## One interface works. Several can contribute.
 

@@ -98,11 +98,15 @@ Current protocol, commands and limits: [experimental runtime](runtime.md). Check
   enforce cancellation, half-close, explicit session termination and old-generation
   isolation. Bound replay controls and closed-stream history independently of
   output backpressure.
-- [ ] Complete release acceptance for the final integrated frontend, including
-  byte integrity, disrupted-path recovery, cancellation and resource reclamation.
-- [ ] Validate WAN throughput, longest stalls and variation using matched single
-  TCP connections. Measure useful multipath gain separately from single-path
-  transport performance; no linear scaling is assumed.
+- [x] Validate byte integrity, disrupted-path recovery, cancellation and resource
+  reclamation through the integrated frontend; remove obsolete TCP RPC state.
+- [x] Pass the registered paired single-path WAN gate for goodput, longest stalls
+  and variation. Native allowance renewal avoids a second startup bottleneck;
+  bounded RTT-probe pauses avoid treating native flight drains as new capacity.
+- [x] Bound retained-credit and out-of-order range metadata across sessions;
+  preserve hole progress and reclaim drained caches.
+- [ ] Measure useful multipath gain separately from single-path transport
+  performance; no linear scaling is assumed. Complete deployment acceptance.
 
 ### Earlier proxy iterations — historical, superseded TCP architecture
 

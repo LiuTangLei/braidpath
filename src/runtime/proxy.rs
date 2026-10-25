@@ -10,9 +10,7 @@ use tokio::{
     time::Instant,
 };
 
-mod bond;
 mod client;
-mod legacy;
 mod protocol;
 mod server;
 mod socks;
@@ -23,7 +21,6 @@ pub use server::{Server, ServerConfig, Snapshot};
 pub(crate) const ALPN: &[u8] = b"braidpath-proxy/1";
 pub(crate) const STREAM_CAPABILITY: &str = "proxy-stream-v2";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
-const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 const UDP_IDLE: Duration = Duration::from_secs(60);
 const MAX_CONNECTIONS: usize = 64;
 const MAX_STREAMS: usize = 256;

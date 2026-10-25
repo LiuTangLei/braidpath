@@ -173,7 +173,7 @@ async fn empty(identity: &mesh::ClientIdentity, at: SocketAddr) {
             if s.streams == 0
                 && s.tcp_flows == 0
                 && s.buffered_bytes == 0
-                && s.rpc_streams == 0
+                && s.control_streams == 0
                 && s.udp_associations == 0
                 && s.udp_destinations == 0
             {
@@ -1117,7 +1117,7 @@ async fn prepared_paths_do_not_open_targets_and_cold_relays_do_not_hold_download
     let blackhole = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let cold = blackhole.local_addr().unwrap();
     pool.test_set_routes("a", vec![at, cold]);
-    pool.prepare_paths("a").await.unwrap();
+    pool.prepare_stream("a").await.unwrap();
     timeout(Duration::from_secs(2), async {
         while pool.transport_snapshot("a").len() != 1 {
             tokio::time::sleep(Duration::from_millis(5)).await;
@@ -1212,7 +1212,7 @@ async fn failed_proxy_relay_is_reported_and_replaced_by_another_server() {
             let mut reply = [0; 1024];
             tcp.read_exact(&mut reply).await.unwrap();
             assert_eq!(reply, [71; 1024]);
-            pool.report_health();
+            pool.retire_stale_udp_paths();
             let routes = pool.test_addresses("a").await;
             if routes.len() == 3
                 && routes.iter().any(|p| !original.contains(p))
@@ -1440,8 +1440,7 @@ async fn idle_streaming_flows_do_not_starve_an_active_flow_and_all_release() {
             }
         }
     }));
-    // Above the former 64-flow exit limit. An idle flow keeps one future-data
-    // waiter (two while a reply streams), not one per logical lane.
+    // Above the former 64-flow limit; idle byte streams use no per-path RPCs.
     let flows = 96;
     let mut idle = Vec::new();
     for _ in 0..flows {
@@ -1451,10 +1450,9 @@ async fn idle_streaming_flows_do_not_starve_an_active_flow_and_all_release() {
     }
     let held = identity.status(a).await.unwrap().proxy.unwrap();
     assert_eq!(held.tcp_flows, flows);
-    assert!(
-        held.rpc_streams <= flows * 2,
-        "idle flows hold {} exit handlers",
-        held.rpc_streams
+    assert_eq!(
+        held.control_streams, 0,
+        "TCP flows must not occupy native UDP handlers"
     );
     let (mut active, status, _) = socks(listen, TCP, Address::Ip(at)).await;
     assert_eq!(status, 0);

@@ -106,6 +106,12 @@ are charged, while the virtual FIN byte is not. RX charges only newly retained
 bytes and releases them after a local write or header consumption. Duplicate
 frames do not add credit, and rejected future ranges never enter SACK state.
 Idle flows retain admission ownership without preallocating shared data credit.
+Retained-credit metadata is separately limited to 65,536 shared slots per
+direction plus 128 private slots per flow. Out-of-order range nodes have a
+separate 65,536-node host limit; consuming FIFO byte credit does not release
+unrelated range-node ownership. The low-frequency budget diagnostic includes
+record occupancy/peaks and free range slots. `proxy.control_streams` counts
+native UDP handlers; TCP aggregation does not consume them.
 
 Cancellation, half-close and explicit session termination have different
 lifecycle events. A half-close can retain receive bytes while the sending side

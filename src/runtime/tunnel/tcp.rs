@@ -29,8 +29,10 @@ use std::{
     },
     time::{Duration, Instant},
 };
+#[cfg(test)]
+use tokio::io::AsyncReadExt;
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::AsyncWriteExt,
     net::{
         TcpListener, TcpStream, UdpSocket,
         tcp::{OwnedReadHalf, OwnedWriteHalf},
@@ -890,10 +892,10 @@ impl Mux {
         match wake {
             Wake::Io(event) => self.io(event),
             Wake::Accept(Ok((tcp, _))) => {
-                if let Some(id) = self.next_id(false) {
-                    if self.open(id, true) {
-                        self.attach(id, tcp);
-                    }
+                if let Some(id) = self.next_id(false)
+                    && self.open(id, true)
+                {
+                    self.attach(id, tcp);
                 }
             }
             Wake::ProxyAccept(Ok((mut tcp, _))) => {
