@@ -93,6 +93,11 @@ pub trait Controller: Send + Sync {
         None
     }
 
+    /// Whether the controller is intentionally draining flight for an RTT probe.
+    fn is_probing_rtt(&self) -> bool {
+        false
+    }
+
     /// Retrieve implementation-specific metrics used to populate `qlog` traces when they are enabled
     fn metrics(&self) -> ControllerMetrics {
         ControllerMetrics {

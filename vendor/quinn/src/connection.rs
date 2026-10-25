@@ -555,6 +555,12 @@ impl Connection {
         self.0.shared.hints.cwnd.load(Ordering::Relaxed)
     }
 
+    /// Whether BBR was probing RTT when the driver last published its hints.
+    /// Other controllers report false; no connection lock is taken.
+    pub fn probing_rtt_hint(&self) -> bool {
+        self.0.shared.hints.probing_rtt.load(Ordering::Relaxed)
+    }
+
     /// ACK frames received and ACK-eliciting frames sent, as last published.
     ///
     /// The second value includes datagram, stream and ping frames. The values
@@ -1062,6 +1068,7 @@ struct Hints {
     rtt_us: AtomicU64,
     min_rtt_us: AtomicU64,
     cwnd: AtomicU64,
+    probing_rtt: AtomicBool,
     acks: AtomicU64,
     eliciting: AtomicU64,
 }
@@ -1316,6 +1323,10 @@ impl State {
             .min_rtt_us
             .store(micros(stats.path.min_rtt), Ordering::Relaxed);
         hints.cwnd.store(stats.path.cwnd, Ordering::Relaxed);
+        hints.probing_rtt.store(
+            self.inner.congestion_state().is_probing_rtt(),
+            Ordering::Relaxed,
+        );
         hints.eliciting.store(
             stats.frame_tx.datagram + stats.frame_tx.stream + stats.frame_tx.ping,
             Ordering::Relaxed,

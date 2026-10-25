@@ -518,6 +518,10 @@ impl Controller for Bbr {
         (self.pacing_rate > 0).then_some(self.pacing_rate)
     }
 
+    fn is_probing_rtt(&self) -> bool {
+        self.mode == Mode::ProbeRtt
+    }
+
     fn metrics(&self) -> ControllerMetrics {
         ControllerMetrics {
             congestion_window: self.window(),
@@ -682,6 +686,16 @@ const DRAIN_TO_TARGET: bool = true;
 #[cfg(test)]
 mod regression_tests {
     use super::*;
+
+    #[test]
+    fn native_rtt_probe_hint_tracks_the_actual_controller_phase() {
+        let mut controller = Bbr::new(Arc::new(BbrConfig::default()), 1200);
+        assert!(!controller.is_probing_rtt());
+        controller.mode = Mode::ProbeRtt;
+        assert!(controller.is_probing_rtt());
+        controller.mode = Mode::ProbeBw;
+        assert!(!controller.is_probing_rtt());
+    }
 
     #[test]
     fn startup_stops_growing_an_already_satisfied_window() {

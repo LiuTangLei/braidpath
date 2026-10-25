@@ -80,3 +80,8 @@ drain-phase retention and ACK-aggregation expiry. Startup window growth also
 compares the current window against its target, correcting a comparison of the
 unitless gain against a byte count that otherwise allowed continued growth
 after the target was reached; a bounded-growth regression covers this.
+
+The controller interface also exposes whether BBR is currently in its native
+RTT-probe phase. Other controllers return false. This is phase telemetry only;
+it does not change BBR's probe timing, pacing, loss response or flight window.
+Quinn publishes the flag with its existing lock-free connection hints.

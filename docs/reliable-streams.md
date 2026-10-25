@@ -143,6 +143,16 @@ Congestion control remains below this layer: Quinn's per-connection BBR and, wit
 controller; it only keeps a short, admitted backlog and repairs loss. Retransmissions
 are new records, so the record-ID window still deduplicates paths and FEC.
 
+For reliable aggregate sessions, application pacing observations pause briefly
+while native BBR drains its flight for an RTT probe, then allow two RTTs
+(200–500 ms) for in-flight probe replies and receiver reports to settle. One
+episode can pause observations for at most 750 ms. A native RTT rise of at least
+half the configured queue-delay target overrides this pause. Native congestion
+control, liveness, packet deadlines, FEC and byte-stream recovery continue during
+the pause. UDP-only sessions and `--legacy-recovery` keep their existing behavior.
+This avoids treating the native controller's deliberate service dip as a new
+application capacity ceiling; WAN performance acceptance remains pending.
+
 ## Statistics
 
 The sending direction's JSON contains `tcp_streams`: opened, completed, local and

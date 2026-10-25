@@ -57,6 +57,7 @@ mod local_delivery;
 pub(crate) mod messages;
 #[cfg(test)]
 mod mixed_fec_tests;
+mod native_probe;
 mod path_health;
 mod proxy;
 #[cfg(test)]
@@ -1543,6 +1544,7 @@ async fn sender(
             .with_queue_gated_loss(metrics.metrics.queue_gated_loss())
             .with_legacy_recovery(metrics.metrics.legacy_recovery())
     });
+    let mut native_probes: [native_probe::Pause; MAX_PATHS] = Default::default();
     let burst = if policy.adaptive { 2400 } else { 9600 };
     let mut pacer = outbound::Pacer::for_sender(policy.rate, burst);
     let mut groups: [outbound::Pacer; MAX_PATHS] =
@@ -1786,6 +1788,32 @@ async fn sender(
                 let estimate = &snapshot.sender_estimate;
                 let at = quality_time(path);
                 let native_rtt = path.conn.rtt_hint();
+                let native_probe = path.conn.probing_rtt_hint();
+                let network_queue = native_rtt.saturating_sub(path.conn.min_rtt_hint())
+                    >= Duration::from_micros(policy.latency_target_ms.max(2) * 500);
+                if (policy.streams || policy.proxy)
+                    && !metrics.metrics.legacy_recovery()
+                    && native_probes[usize::from(path.id)].holds(
+                        now_us,
+                        snapshot.generation,
+                        native_probe,
+                        native_rtt,
+                        network_queue,
+                    )
+                {
+                    // The native controller still limits every packet. Its own
+                    // flight drain is not evidence of a new network capacity.
+                    // Keep safety decisions for a real native RTT rise, and
+                    // never pause for more than 750 ms in one probe episode.
+                    tracing::debug!(
+                        path = path.id,
+                        native_probe,
+                        pacing_bps = controllers[usize::from(path.id)].pacing_bps(),
+                        cwnd = path.conn.cwnd_hint(),
+                        "native RTT probe holds application observation"
+                    );
+                    continue;
+                }
                 let frame_bytes = wire::MAX_WIRE
                     + if policy.receiver_feedback {
                         quality::HEADER

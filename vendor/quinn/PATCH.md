@@ -12,6 +12,7 @@ every accepted datagram, a few values that can be read without the lock:
 - `Connection::datagram_send_buffer_space_hint`
 - `Connection::max_datagram_size_hint`
 - `Connection::rtt_hint`, `min_rtt_hint`, `cwnd_hint`
+- `Connection::probing_rtt_hint` reports the native BBR RTT-probe phase, without changing congestion control.
 - `Connection::liveness_hint` (received ACK and transmitted eliciting-frame counts)
 
 `Connection::datagrams_drained` resolves when the published send buffer space
