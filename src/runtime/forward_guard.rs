@@ -191,6 +191,7 @@ pub struct Guard {
     /// Onset of the last three windows, newest in the lowest bit.
     onset_windows: u8,
     retest_after_us: u64,
+    inconclusive_cooldown: bool,
     state: State,
     snapshot: Snapshot,
 }
@@ -211,6 +212,7 @@ impl Default for Guard {
             previous: None,
             onset_windows: 0,
             retest_after_us: 0,
+            inconclusive_cooldown: false,
             state: State::Open,
             snapshot: Snapshot::default(),
         }
@@ -446,13 +448,15 @@ impl Guard {
                 let onset = loss.is_some_and(|loss| {
                     loss >= ONSET_LOSS.max(floor + FLOOR_MARGIN)
                         && (now_us >= self.retest_after_us
-                            || loss >= floor * RETEST_LOSS + FLOOR_MARGIN)
+                            || (!self.inconclusive_cooldown
+                                && loss >= floor * RETEST_LOSS + FLOOR_MARGIN))
                 }) && sent >= MIN_TRIGGER_BPS;
                 self.onset_windows = (self.onset_windows << 1 | u8::from(onset)) & 0b111;
                 match report {
                     // Two of three windows: one noisy report cannot hide it.
                     Some((loss, window)) if onset && self.onset_windows.count_ones() >= 2 => {
                         self.onset_windows = 0;
+                        self.inconclusive_cooldown = false;
                         self.snapshot.trials += 1;
                         let before = match self.previous {
                             Some(previous) => {
@@ -511,6 +515,7 @@ impl Guard {
                         // older in-flight traffic drains. Those windows cannot
                         // establish either capacity or rate-independent loss.
                         self.snapshot.inconclusive += 1;
+                        self.inconclusive_cooldown = true;
                         self.retest_after_us = now_us.saturating_add(INCONCLUSIVE_RETEST_US);
                         State::Open
                     } else if kept >= cut + HELD * (1.0 - cut) {
@@ -531,6 +536,7 @@ impl Guard {
                         // an over-deep cut or changing traffic is inconclusive,
                         // not evidence that the old loss was rate-independent.
                         self.snapshot.inconclusive += 1;
+                        self.inconclusive_cooldown = true;
                         self.retest_after_us = now_us.saturating_add(INCONCLUSIVE_RETEST_US);
                         State::Open
                     } else {
@@ -560,6 +566,7 @@ impl Guard {
                 } else if windows >= TRIAL_WINDOWS {
                     // Missing post-cut reports cannot establish random loss.
                     self.snapshot.inconclusive += 1;
+                    self.inconclusive_cooldown = true;
                     self.retest_after_us = now_us.saturating_add(INCONCLUSIVE_RETEST_US);
                     State::Open
                 } else {
@@ -1061,6 +1068,31 @@ mod tests {
         assert_eq!(d.guard.snapshot().inconclusive, 1);
         assert_eq!(d.guard.snapshot().floor, 0.0);
         assert_eq!(d.guard.cap_bps(), None);
+    }
+
+    #[test]
+    fn inconclusive_trial_keeps_its_cooldown_even_without_a_random_loss_floor() {
+        let mut d = Drive::new();
+        d.window([0.3; 4], 100e6);
+        d.window([0.3; 4], 100e6).unwrap();
+        // The sender did not follow the trial, so no capacity or random-loss
+        // conclusion is possible. A zero floor must not bypass its retry wait.
+        for _ in 0..2 {
+            d.window([0.3; 4], 100e6);
+        }
+        assert_eq!(d.guard.snapshot().inconclusive, 1);
+        assert_eq!(d.guard.snapshot().floor, 0.0);
+        let trials = d.guard.snapshot().trials;
+        for _ in 0..9 {
+            assert_eq!(d.window([0.3; 4], 100e6), None);
+            assert_eq!(d.guard.snapshot().trials, trials);
+        }
+        d.window([0.3; 4], 100e6);
+        assert!(
+            d.window([0.3; 4], 100e6).is_some(),
+            "fresh onset may retry after cooling"
+        );
+        assert_eq!(d.guard.snapshot().trials, trials + 1);
     }
 
     #[test]

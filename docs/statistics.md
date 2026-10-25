@@ -279,7 +279,9 @@ counts such windows. Loss quorum, post-cut admission watermarks, trial bounds,
 operator caps and conservative growth after a confirmed limit still apply.
 A trial with inconsistent send/delivery windows, or reduced delivery accompanied
 by substantially improved loss, is inconclusive and cannot teach a random-loss
-floor. These rates count symbols, including FEC, rather than TCP goodput.
+floor. Its five-second retry wait also applies when no random-loss floor has
+been learned; the larger-loss shortcut remains available after a conclusive
+random-loss rejection. These rates count symbols, including FEC, rather than TCP goodput.
 
 Native-window service recovery respects both phases of a per-path loss trial
 and any resulting pace ceiling. It may recover below a live ceiling, and resume
