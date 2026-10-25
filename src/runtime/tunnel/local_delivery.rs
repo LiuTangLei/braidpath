@@ -990,7 +990,7 @@ mod tests {
         let repair = frames.next().unwrap();
         assert!(frames.next().is_none());
         let mut decoder = wire::Receiver::with_repair_wait(Duration::from_secs(1));
-        let decoded = super::super::receive_records(&mut decoder, &scope, 1, &data);
+        let decoded = super::super::receive_records(&mut decoder, &scope, 1, &data, None);
         assert_eq!(decoded.len(), 1);
         for record in decoded {
             output.send(&socket, destination, record, 1, decoded_now());
@@ -999,8 +999,8 @@ mod tests {
         assert_eq!(counters(&scope).udp_delivery.pending_records, 1);
         // Poll/register readiness, then cancel the wait exactly as select does.
         poll_pending(&mut output).await;
-        assert!(super::super::receive_records(&mut decoder, &scope, 2, &repair).is_empty());
-        assert!(super::super::receive_records(&mut decoder, &scope, 1, &data).is_empty());
+        assert!(super::super::receive_records(&mut decoder, &scope, 2, &repair, None).is_empty());
+        assert!(super::super::receive_records(&mut decoder, &scope, 1, &data, None).is_empty());
         assert_eq!(decoder.duplicates, 1);
         assert_eq!(counters(&scope).records.udp_target_delivered, 0);
         socket.release();
@@ -1016,7 +1016,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(&received[..len], original.payload.as_slice());
-        assert!(super::super::receive_records(&mut decoder, &scope, 1, &data).is_empty());
+        assert!(super::super::receive_records(&mut decoder, &scope, 1, &data, None).is_empty());
         assert!(
             timeout(Duration::from_millis(20), target.recv(&mut received))
                 .await

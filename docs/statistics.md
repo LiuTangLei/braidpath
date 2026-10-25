@@ -339,3 +339,22 @@ expiry/drop counts. Hole releases and local writes taking at least 20 ms emit a
 debug event with duration and byte count, without payload or destination data.
 These observations identify wait stages; they do not establish WAN performance
 or the origin of packet loss.
+
+For reliable streams, an ACK supplies at most one RTT sample for each original
+route: the newest newly acknowledged transmission that was never retransmitted.
+Older bytes retired by the same cumulative/SACK batch do not add samples. Native
+QUIC RTT remains a lower bound for that route's loss timer.
+
+Further stream receive credit is shared across the host's flows currently
+retaining RX bytes, including writer-owned bytes in other sessions. Idle sockets
+keep their flow admission without reducing an active transfer's window. Existing
+advertised credit is not revoked; retained memory remains subject to the host
+budget and each flow's progress reserve.
+
+`records.late_stream_records_received` counts decoded records older than the
+record-ID history that were handed to a still-admitted reliable stream. The
+stream's byte offsets, final size and receive window decide whether those bytes
+are useful or duplicate. These late handoffs do not increment the decoder's
+new-unique-original or recovered-record counters, and packet tracing labels them
+`late_stream`. They do not extend record history, admit an unknown/closed stream,
+or relax UDP record deduplication.

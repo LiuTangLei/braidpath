@@ -274,8 +274,6 @@ impl Flow {
 
 const MAX_STREAMS: usize = 256;
 const MAX_CONTROL: usize = 2 * MAX_STREAMS;
-/// Receive memory shared by all streams of one session.
-const RECEIVE_BUDGET: u64 = 64 * 1024 * 1024;
 const READ_CHUNK: usize = 64 * 1024;
 /// Local read-ahead beyond the peer's window, so sending never waits on a read.
 const READ_AHEAD: u64 = 256 * 1024;
@@ -577,6 +575,9 @@ pub(super) struct Mux {
 }
 
 impl Mux {
+    pub(super) fn accepts_late(&self, flow: u32) -> bool {
+        stream::stream_id(flow).is_some_and(|id| self.streams.contains_key(&id))
+    }
     fn new(listeners: Listeners, targets: Targets, policy: &Policy, scope: Scope) -> Self {
         let (events_tx, events) = mpsc::unbounded_channel();
         let now = Instant::now();
@@ -695,8 +696,7 @@ impl Mux {
     }
 
     fn window(&self) -> u64 {
-        (RECEIVE_BUDGET / self.streams.len().max(1) as u64)
-            .clamp(stream::INITIAL_WINDOW, stream::MAX_WINDOW)
+        self.budget.receive_window()
     }
 
     fn attach(&mut self, id: u32, tcp: TcpStream) {
@@ -1947,6 +1947,158 @@ mod tests {
             id: 1,
             payload: frame.encode(),
         }
+    }
+
+    #[test]
+    fn idle_connections_do_not_reduce_a_downloads_advertised_window() {
+        let budget = Arc::new(Budget::default());
+        let mut mux = budget_mux(budget.clone());
+        for id in 1..=97 {
+            assert!(mux.open(id, false));
+        }
+        for offset in 0..16 {
+            mux.receive(incoming(
+                1,
+                Frame::Data {
+                    offset,
+                    fin: false,
+                    data: vec![7],
+                },
+            ));
+        }
+        mux.io(Io::Written(1, 16));
+        let (tx, mut rx) = mpsc::channel(8);
+        let scope = mux.scope.clone();
+        mux.flush(&mut Out {
+            tx: &tx,
+            next_id: &mut 0,
+            scope: &scope,
+            small_threshold: 0,
+        });
+        let item = rx.try_recv().expect("download progress ACK");
+        assert_eq!(item.record.flow, stream::ack_flow(1));
+        let Some(Frame::Ack(ack)) = Frame::decode(&item.record.payload) else {
+            panic!("expected ACK")
+        };
+        assert_eq!(
+            ack.limit - ack.cumulative,
+            stream::MAX_WINDOW,
+            "96 idle sockets must not reduce the active download to a small flight"
+        );
+        drop(mux);
+        assert_eq!(budget.snapshot(), (0, 0));
+    }
+
+    #[test]
+    fn advertised_windows_share_the_host_budget_between_receiving_flows() {
+        let budget = Arc::new(Budget::default());
+        let mut mux = budget_mux(budget.clone());
+        for id in 1..=99 {
+            assert!(mux.open(id, false));
+        }
+        for id in 1..=3 {
+            for offset in 0..16 {
+                mux.receive(incoming(
+                    id,
+                    Frame::Data {
+                        offset,
+                        fin: false,
+                        data: vec![7],
+                    },
+                ));
+            }
+        }
+        let (tx, mut rx) = mpsc::channel(8);
+        let scope = mux.scope.clone();
+        mux.flush(&mut Out {
+            tx: &tx,
+            next_id: &mut 0,
+            scope: &scope,
+            small_threshold: 0,
+        });
+        let mut limits = Vec::new();
+        while let Ok(item) = rx.try_recv() {
+            let Some(Frame::Ack(ack)) = Frame::decode(&item.record.payload) else {
+                panic!("expected ACK")
+            };
+            limits.push(ack.limit);
+        }
+        assert_eq!(limits.len(), 3);
+        assert!(
+            limits.iter().all(|n| *n == (32 * 1024 * 1024) / 3),
+            "{limits:?}"
+        );
+        let mut other_session = budget_mux(budget.clone());
+        assert!(other_session.open(100, false));
+        other_session.receive(incoming(
+            100,
+            Frame::Data {
+                offset: 0,
+                fin: false,
+                data: vec![1],
+            },
+        ));
+        assert_eq!(mux.window(), 8 * 1024 * 1024);
+        assert_eq!(
+            other_session.window(),
+            mux.window(),
+            "sessions share host receive credit"
+        );
+        drop(other_session);
+        assert_eq!(mux.window(), (32 * 1024 * 1024) / 3);
+        drop(mux);
+        assert_eq!(budget.snapshot(), (0, 0));
+    }
+
+    #[test]
+    fn late_record_delivery_requires_a_still_admitted_stream() {
+        let budget = Arc::new(Budget::default());
+        let mut mux = budget_mux(budget.clone());
+        assert!(mux.open(1, false));
+        let scope = mux.scope.clone();
+        let mut decoder = crate::runtime::wire::Receiver::default();
+        let advance = Record {
+            flow: 0,
+            id: 1_000_000,
+            payload: vec![1],
+        };
+        decoder
+            .receive(
+                &crate::runtime::wire::plain(&advance).unwrap(),
+                Instant::now(),
+            )
+            .unwrap();
+        let packet = crate::runtime::wire::plain(&incoming(
+            1,
+            Frame::Data {
+                offset: 0,
+                fin: false,
+                data: vec![7],
+            },
+        ))
+        .unwrap();
+        for _ in 0..2 {
+            let records =
+                super::super::receive_records(&mut decoder, &scope, 0, &packet, Some(&mux));
+            assert_eq!(records.len(), 1);
+            for record in records {
+                mux.receive(record);
+            }
+        }
+        assert_eq!(mux.streams[&1].recv.cumulative(), 1);
+        assert_eq!(mux.streams[&1].recv.duplicates(), 1);
+        assert_eq!(mux.streams[&1].undelivered.concat(), [7]);
+        drop(mux.close(1).unwrap());
+        assert!(
+            super::super::receive_records(&mut decoder, &scope, 0, &packet, Some(&mux)).is_empty(),
+            "a late opener must not recreate a completed or reset stream"
+        );
+        assert_eq!(decoder.late_stream_records, 2);
+        assert_eq!(
+            decoder.originals, 1,
+            "late records are not counted as new unique records"
+        );
+        assert_eq!(budget.snapshot(), (0, 0));
     }
 
     #[test]

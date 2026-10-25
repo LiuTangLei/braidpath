@@ -1059,23 +1059,17 @@ impl Pool {
     }
     #[cfg(test)]
     pub(super) fn test_path_failed(&self, id: &str, address: SocketAddr) -> bool {
-        if self.slots[id]
-            .stream_active
-            .load(std::sync::atomic::Ordering::Acquire)
-            && let Some(health) = self.slots[id].stream_health.lock().unwrap().as_ref()
-        {
-            return health
-                .borrow()
-                .samples
-                .iter()
-                .any(|sample| sample.address == address && sample.failed);
-        }
-        self.slots[id]
-            .paths
-            .lock()
-            .unwrap()
-            .get(&address)
-            .is_some_and(|p| p.failed.load(std::sync::atomic::Ordering::Acquire))
+        let health = self.slots[id].stream_health.lock().unwrap();
+        let Some(health) = health.as_ref() else {
+            return true;
+        };
+        // Missing evidence during startup or reconnect is not a healthy path.
+        health
+            .borrow()
+            .samples
+            .iter()
+            .find(|sample| sample.address == address)
+            .is_none_or(|sample| sample.failed)
     }
     #[cfg(test)]
     pub(super) fn set_path_limit(&self, limit: usize) {

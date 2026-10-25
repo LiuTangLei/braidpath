@@ -895,7 +895,7 @@ async fn data_blackhole_is_quarantined_and_rejoins_the_same_tcp_flow_after_recov
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     let root = tempfile::tempdir().unwrap();
     let root = root.path();
-    let (a, _server) = start(root, "a", None, true).await;
+    let (a, _server, server_metrics) = start_metered(root, "a", None, true).await;
     let identity = identity(root, "blackhole-client");
     let pool = client::Pool::new(identity.clone(), vec![node("a", a)], vec!["a".into()]).unwrap();
     let front = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -916,6 +916,19 @@ async fn data_blackhole_is_quarantined_and_rejoins_the_same_tcp_flow_after_recov
         }
     }));
     pool.test_set_routes("a", vec![a, via]);
+    assert!(
+        pool.test_path_failed("a", via),
+        "an unpublished path is not ready"
+    );
+    pool.prepare_stream("a").await.unwrap();
+    timeout(Duration::from_secs(3), async {
+        while pool.test_path_failed("a", via) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("both paths must be authenticated before the fault");
+
     let (listen, _listener) = local_listener(pool.clone(), "a").await;
     let source = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let at = source.local_addr().unwrap();
@@ -976,7 +989,10 @@ async fn data_blackhole_is_quarantined_and_rejoins_the_same_tcp_flow_after_recov
     assert!(received.iter().all(|b| *b == 71));
     assert!(
         packets.load(Ordering::Relaxed) > before + 65536,
-        "restored path never resumed carrying payload"
+        "restored path never resumed carrying payload; server paths={}",
+        server_metrics
+            .snapshot(false, "recovery-diagnostic", None)
+            .unwrap()["stats"]["paths"]
     );
     empty(&identity, a).await;
 }

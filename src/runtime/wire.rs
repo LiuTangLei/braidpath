@@ -18,6 +18,13 @@ pub struct Record {
     pub id: u64,
     pub payload: Vec<u8>,
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RecordDisposition {
+    New,
+    Duplicate,
+    LateStream,
+}
 impl Record {
     pub fn encode(&self) -> Result<Vec<u8>> {
         ensure!(
@@ -200,6 +207,7 @@ pub struct Receiver {
     pub recovered: u64,
     pub duplicates: u64,
     pub invalid: u64,
+    pub late_stream_records: u64,
 }
 impl Default for Receiver {
     fn default() -> Self {
@@ -232,6 +240,7 @@ impl Receiver {
             recovered: 0,
             duplicates: 0,
             invalid: 0,
+            late_stream_records: 0,
         }
     }
 
@@ -335,7 +344,19 @@ impl Receiver {
         &mut self,
         b: &[u8],
         now: Instant,
-        mut observe: impl FnMut(&Record, bool, bool),
+        observe: impl FnMut(&Record, bool, RecordDisposition),
+    ) -> Result<Vec<Record>> {
+        self.receive_with_late(b, now, |_| false, observe)
+    }
+
+    /// Only an existing reliable flow may opt out of the record age window.
+    /// In particular, an old opener must never recreate a retired flow.
+    pub(crate) fn receive_with_late(
+        &mut self,
+        b: &[u8],
+        now: Instant,
+        accepts_late: impl Fn(u32) -> bool,
+        mut observe: impl FnMut(&Record, bool, RecordDisposition),
     ) -> Result<Vec<Record>> {
         ensure!(
             self.dual_repairs || b.get(3) != Some(&3),
@@ -497,9 +518,18 @@ impl Receiver {
             while self.delivered.first().is_some_and(|id| *id < floor) {
                 self.delivered.pop_first();
             }
+            if record.id < floor && accepts_late(record.flow) {
+                // The byte-stream receiver, with its own flow control and
+                // byte-offset deduplication, owns late delivery decisions.
+                // Do not extend record history or claim a new unique record.
+                self.late_stream_records += 1;
+                observe(&record, repaired, RecordDisposition::LateStream);
+                out.push(record);
+                continue;
+            }
             if record.id < floor || !self.delivered.insert(record.id) {
                 self.duplicates += 1;
-                observe(&record, repaired, true);
+                observe(&record, repaired, RecordDisposition::Duplicate);
                 continue;
             }
             if repaired {
@@ -507,7 +537,7 @@ impl Receiver {
             } else {
                 self.originals += 1
             }
-            observe(&record, repaired, false);
+            observe(&record, repaired, RecordDisposition::New);
             out.push(record);
         }
         Ok(out)
@@ -769,7 +799,13 @@ mod tests {
             .unwrap();
         assert_eq!(recovered, [record]);
         assert!(duplicate.is_empty());
-        assert_eq!(observed, [(9, 71, true, false), (9, 71, false, true)]);
+        assert_eq!(
+            observed,
+            [
+                (9, 71, true, RecordDisposition::New),
+                (9, 71, false, RecordDisposition::Duplicate)
+            ]
+        );
         assert_eq!(
             (receiver.recovered, receiver.originals, receiver.duplicates),
             (1, 0, 1)
@@ -1115,6 +1151,79 @@ mod tests {
             receiver
                 .receive(&frame(0, 0, 0, &[0; 11]), now + Duration::from_secs(3))
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn negotiated_stream_bytes_survive_the_record_window_without_duplicate_application_data() {
+        use super::super::stream::{self, Frame};
+        let at = Instant::now();
+        let mut receiver = Receiver::default();
+        let advance = Record {
+            flow: stream::ack_flow(1),
+            id: MESSAGE_WINDOW + 1,
+            payload: Frame::Ack(Default::default()).encode(),
+        };
+        receiver.receive(&plain(&advance).unwrap(), at).unwrap();
+        let late = Record {
+            flow: stream::data_flow(1),
+            id: 0,
+            payload: Frame::Data {
+                offset: 0,
+                fin: false,
+                data: b"late".to_vec(),
+            }
+            .encode(),
+        };
+        let mut bytes = stream::Receiver::default();
+        let mut delivered = Vec::new();
+        for _ in 0..2 {
+            let records = receiver
+                .receive_with_late(
+                    &plain(&late).unwrap(),
+                    at,
+                    |flow| flow == stream::data_flow(1),
+                    |_, _, _| {},
+                )
+                .unwrap();
+            assert_eq!(
+                records,
+                vec![late.clone()],
+                "late TCP data belongs to byte-level deduplication"
+            );
+            for record in records {
+                let Frame::Data { offset, fin, data } = Frame::decode(&record.payload).unwrap()
+                else {
+                    panic!("data")
+                };
+                delivered.extend(bytes.on_data(offset, fin, data, at).unwrap());
+            }
+        }
+        assert_eq!(delivered, b"late");
+        assert_eq!(bytes.duplicates(), 4);
+        assert_eq!(receiver.late_stream_records, 2);
+        assert_eq!(
+            receiver.delivered.len(),
+            1,
+            "late IDs do not expand record history"
+        );
+        let udp = Record {
+            flow: 1,
+            ..late.clone()
+        };
+        assert!(
+            receiver
+                .receive(&plain(&udp).unwrap(), at)
+                .unwrap()
+                .is_empty()
+        );
+        let mut unnegotiated = Receiver::default();
+        unnegotiated.receive(&plain(&advance).unwrap(), at).unwrap();
+        assert!(
+            unnegotiated
+                .receive(&plain(&late).unwrap(), at)
+                .unwrap()
+                .is_empty()
         );
     }
 

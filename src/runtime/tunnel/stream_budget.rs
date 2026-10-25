@@ -22,6 +22,7 @@ pub(super) struct Pressure {
     peak: usize,
     denied: u64,
     waits: u64,
+    active: usize,
 }
 impl Default for Pool {
     fn default() -> Self {
@@ -68,6 +69,13 @@ impl Budget {
         (
             *self.tx.shared.lock().expect("stream budget"),
             *self.rx.shared.lock().expect("stream budget"),
+        )
+    }
+    pub(super) fn receive_window(&self) -> u64 {
+        let active = self.rx.shared.lock().expect("stream budget").active.max(1);
+        (SHARED as u64 / active as u64).clamp(
+            crate::runtime::stream::INITIAL_WINDOW,
+            crate::runtime::stream::MAX_WINDOW,
         )
     }
     pub(super) fn try_flow(&self) -> Option<Arc<Lease>> {
@@ -138,6 +146,7 @@ fn release(credits: &mut VecDeque<Credit>, mut bytes: usize) {
 pub(super) struct Allowance {
     pool: Arc<Pool>,
     reserved: AtomicUsize,
+    held: AtomicUsize,
     _flow: Arc<OwnedSemaphorePermit>,
 }
 impl Allowance {
@@ -145,6 +154,7 @@ impl Allowance {
         Self {
             pool,
             reserved: AtomicUsize::new(0),
+            held: AtomicUsize::new(0),
             _flow: permit,
         }
     }
@@ -161,6 +171,12 @@ impl Allowance {
         used.shared += shared;
         used.held += bytes;
         used.peak = used.peak.max(used.held);
+        // Accessed under this pool's mutex, including Credit::release.
+        let held = self.held.load(Ordering::Relaxed);
+        if held == 0 && bytes > 0 {
+            used.active += 1;
+        }
+        self.held.store(held + bytes, Ordering::Relaxed);
         self.reserved.fetch_add(reserved, Ordering::Relaxed);
         Some(Credit {
             allowance: self.clone(),
@@ -208,6 +224,11 @@ impl Credit {
         let mut used = self.allowance.pool.shared.lock().expect("stream budget");
         used.shared -= shared;
         used.held -= bytes;
+        let held = self.allowance.held.load(Ordering::Relaxed) - bytes;
+        self.allowance.held.store(held, Ordering::Relaxed);
+        if held == 0 {
+            used.active -= 1;
+        }
         self.allowance
             .reserved
             .fetch_sub(reserved, Ordering::Relaxed);

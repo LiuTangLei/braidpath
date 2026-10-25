@@ -253,6 +253,7 @@ pub enum Reason {
     InvalidSymbol,
     Stale,
     Duplicate,
+    LateStream,
     Budget,
     LocallyUnrecoverable,
     NoDiversePath,

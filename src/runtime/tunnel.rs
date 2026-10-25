@@ -3055,7 +3055,13 @@ async fn adaptive_retention_timer_expires_without_another_packet() {
     assert!(decoder.next_retention_deadline().is_none());
 }
 
-fn receive_records(decoder: &mut Receiver, metrics: &Scope, pid: u8, data: &[u8]) -> Vec<Record> {
+fn receive_records(
+    decoder: &mut Receiver,
+    metrics: &Scope,
+    pid: u8,
+    data: &[u8],
+    streams: Option<&tcp::Mux>,
+) -> Vec<Record> {
     let before = (
         decoder.original_packets,
         decoder.originals,
@@ -3064,31 +3070,42 @@ fn receive_records(decoder: &mut Receiver, metrics: &Scope, pid: u8, data: &[u8]
         decoder.stale,
     );
     let repairs_before = decoder.repair_packets;
+    let late_before = decoder.late_stream_records;
     metrics.trace_symbol(trace::Stage::PeerSymbolReceived, data, None, None, None);
-    let result = decoder.receive_observed(data, Instant::now(), |record, repaired, duplicate| {
-        metrics.trace_with(|context, capture| {
-            let mut event = trace::Event::new(
-                context,
-                if duplicate {
-                    trace::Stage::RecordDuplicate
-                } else {
-                    trace::Stage::RecordDecoded
-                },
-            );
-            stats::trace_symbol_fields(&mut event, data, capture);
-            // The triggering repair's block is real, but its decoded record is
-            // known only after successful reconstruction/record validation.
-            event.record = Some(trace::RecordKey {
-                flow: record.flow,
-                record_id: record.id,
+    let result = decoder.receive_with_late(
+        data,
+        Instant::now(),
+        |flow| streams.is_some_and(|mux| mux.accepts_late(flow)),
+        |record, repaired, disposition| {
+            let duplicate = disposition == wire::RecordDisposition::Duplicate;
+            metrics.trace_with(|context, capture| {
+                let mut event = trace::Event::new(
+                    context,
+                    if duplicate {
+                        trace::Stage::RecordDuplicate
+                    } else {
+                        trace::Stage::RecordDecoded
+                    },
+                );
+                stats::trace_symbol_fields(&mut event, data, capture);
+                // The triggering repair's block is real, but its decoded record is
+                // known only after successful reconstruction/record validation.
+                event.record = Some(trace::RecordKey {
+                    flow: record.flow,
+                    record_id: record.id,
+                });
+                event.bytes.payload = u32::try_from(record.payload.len()).ok();
+                event.probe = capture.probe_identity(&record.payload);
+                event.recovered = Some(repaired);
+                event.reason = match disposition {
+                    wire::RecordDisposition::Duplicate => Some(trace::Reason::Duplicate),
+                    wire::RecordDisposition::LateStream => Some(trace::Reason::LateStream),
+                    wire::RecordDisposition::New => None,
+                };
+                event
             });
-            event.bytes.payload = u32::try_from(record.payload.len()).ok();
-            event.probe = capture.probe_identity(&record.payload);
-            event.recovered = Some(repaired);
-            event.reason = duplicate.then_some(trace::Reason::Duplicate);
-            event
-        });
-    });
+        },
+    );
     let invalid = u64::from(result.is_err());
     if invalid > 0 {
         decoder.invalid += 1;
@@ -3118,6 +3135,7 @@ fn receive_records(decoder: &mut Receiver, metrics: &Scope, pid: u8, data: &[u8]
     }
     metrics.update(|d| {
         d.records.repair_symbols_received += decoder.repair_packets - repairs_before;
+        d.records.late_stream_records_received += decoder.late_stream_records - late_before;
         d.records.original_packets_received += delta.0;
         d.records.original_records_delivered += delta.1;
         d.records.fec_records_recovered += delta.2;
@@ -3255,14 +3273,14 @@ async fn session_loop(
                     for path in p.iter() { telemetry[usize::from(path.id)].report(&path.conn,"server","local"); }
                 }
                 for path in p.iter(){let stats=path.conn.stats();info!(path=path.id,rtt_ms=path.conn.rtt_hint().as_secs_f64()*1000.0,tx_packets=stats.udp_tx.datagrams,rx_packets=stats.udp_rx.datagrams,tx_bytes=stats.udp_tx.bytes,rx_bytes=stats.udp_rx.bytes,lost=stats.path.lost_packets,cwnd=stats.path.cwnd,"server path statistics");}
-                info!(paths=p.len(),flows=flows.len(),originals=decoder.originals,recovered=decoder.recovered,duplicates=decoder.duplicates,invalid=decoder.invalid,dropped,ingress_drops=session.ingress_drops.load(Ordering::Relaxed),"server session");
+                info!(paths=p.len(),flows=flows.len(),originals=decoder.originals,recovered=decoder.recovered,duplicates=decoder.duplicates,late_stream_records=decoder.late_stream_records,invalid=decoder.invalid,dropped,ingress_drops=session.ingress_drops.load(Ordering::Relaxed),"server session");
             },
             _=retention_deadline(&decoder)=>{decoder.expire_adaptive(Instant::now());publish_retention(&decoder,&session.forward);},
             _=messages::deadline(&messages)=>{messages.expire(Instant::now()); publish_messages(&mut messages, &session.forward);},
             completed=delivery.ready()=>dropped+=completed,
             e=events.recv()=>match e {
                 Some(Event::Wire(pid,data))=>{
-                    let records=receive_records(&mut decoder,&session.forward,pid,&data);
+                    let records=receive_records(&mut decoder,&session.forward,pid,&data,streams.as_ref());
                     let decoded=Instant::now();
                     for r in records {
                         if let Some(mux)=streams.as_mut() && (stream::stream_id(r.flow).is_some() || associate::is_flow(r.flow)) {mux.receive(r);continue}
@@ -3367,6 +3385,7 @@ async fn session_loop(
     info!(
         originals = decoder.originals,
         recovered = decoder.recovered,
+        late_stream_records = decoder.late_stream_records,
         dropped,
         "server session stopped"
     );
@@ -4601,7 +4620,7 @@ async fn client_session(
                 }
                 if now_us.saturating_sub(last_stats)>=2_000_000 {
                     last_stats=now_us;
-                    info!(live,configured=configs.iter().filter(|c|c.enabled).count(),originals=decoder.originals,recovered=decoder.recovered,duplicates=decoder.duplicates,invalid=decoder.invalid,drops,"client path status");
+                    info!(live,configured=configs.iter().filter(|c|c.enabled).count(),originals=decoder.originals,recovered=decoder.recovered,duplicates=decoder.duplicates,late_stream_records=decoder.late_stream_records,invalid=decoder.invalid,drops,"client path status");
                 }
             },
             rebuilt=rejoin_rx.recv()=>{
@@ -4669,7 +4688,7 @@ async fn client_session(
             },
             data=wire_rx.recv()=>{
                 let Some((pid,data))=data else {bail!("all receivers ended")};
-                let records=receive_records(&mut decoder,&returning,pid,&data);
+                let records=receive_records(&mut decoder,&returning,pid,&data,streams.as_ref());
                 let decoded=Instant::now();
                 for record in records {
                     if let Some(mux)=streams.as_mut() && (stream::stream_id(record.flow).is_some() || associate::is_flow(record.flow)) {mux.receive(record);continue}
@@ -4730,6 +4749,12 @@ async fn client_session(
         s.drain_incomplete |= !joined;
     });
     options.stats.retire_session(&sid);
+    info!(
+        originals = decoder.originals,
+        recovered = decoder.recovered,
+        late_stream_records = decoder.late_stream_records,
+        "client session receiver stopped"
+    );
     result
 }
 

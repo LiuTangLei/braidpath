@@ -730,18 +730,33 @@ impl Sender {
             }
         }
         let progressed = !delivered.is_empty() || cumulative > self.acked || raised;
+        let mut newest_sample: Option<Instant> = None;
+        let mut path_samples: [Option<Instant>; MAX_PATHS] = [None; MAX_PATHS];
         for segment in delivered {
             if segment.transmissions == 1 {
-                let sample = now.saturating_duration_since(segment.sent_at);
-                self.rtt.sample(sample, now);
+                newest_sample =
+                    Some(newest_sample.map_or(segment.sent_at, |at| at.max(segment.sent_at)));
                 if segment.path != UNKNOWN_PATH {
-                    self.path_rtt[segment.path].sample(sample, now);
+                    let sample = &mut path_samples[segment.path];
+                    *sample = Some(sample.map_or(segment.sent_at, |at| at.max(segment.sent_at)));
                 }
             }
             self.rack = Some(
                 self.rack
                     .map_or(segment.sent_at, |r| r.max(segment.sent_at)),
             );
+        }
+        // One ACK can retire old, previously omitted SACK ranges together
+        // with newly received bytes. Older members measure acknowledgment
+        // aggregation, not the current route RTT. Preserve Karn's rule and
+        // sample only the newest original transmission on each route.
+        if let Some(at) = newest_sample {
+            self.rtt.sample(now.saturating_duration_since(at), now);
+        }
+        for (path, at) in path_samples.into_iter().enumerate() {
+            if let Some(at) = at {
+                self.path_rtt[path].sample(now.saturating_duration_since(at), now);
+            }
         }
         let reported = ack.duplicate_bytes.saturating_sub(self.peer_duplicates);
         let expected = reported.min(self.expected_duplicates);
@@ -1152,6 +1167,73 @@ impl Receiver {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn delayed_sack_ranges_do_not_replace_the_newest_route_rtt_sample() {
+        let start = Instant::now();
+        let mut sender = Sender::new(false);
+        sender.push(&vec![7; 3 * MAX_SEGMENT]);
+        for delay in [0, 180, 190] {
+            let at = start + Duration::from_millis(delay);
+            let t = sender.poll_transmit(at).unwrap();
+            sender.admitted(t.start, t.transmission, 0, Duration::from_millis(110), at);
+        }
+        let at = start + Duration::from_millis(300);
+        sender
+            .on_ack(
+                &Ack {
+                    cumulative: (3 * MAX_SEGMENT) as u64,
+                    limit: INITIAL_WINDOW,
+                    ..Default::default()
+                },
+                at,
+            )
+            .unwrap();
+        assert_eq!(
+            sender.path_rtt[0].observed_max(),
+            Some(Duration::from_millis(110)),
+            "older bytes in one cumulative/SACK batch must not turn acknowledgment aggregation into path delay"
+        );
+        assert!(sender.path_threshold(0, at) < Duration::from_millis(150));
+    }
+
+    #[test]
+    fn a_shared_ack_keeps_the_newest_sample_for_each_original_route() {
+        let start = Instant::now();
+        let mut sender = Sender::new(false);
+        sender.push(&vec![7; 4 * MAX_SEGMENT]);
+        for (delay, path, rtt) in [(0, 0, 300), (90, 0, 210), (180, 1, 120), (190, 1, 110)] {
+            let at = start + Duration::from_millis(delay);
+            let t = sender.poll_transmit(at).unwrap();
+            sender.admitted(
+                t.start,
+                t.transmission,
+                path,
+                Duration::from_millis(rtt),
+                at,
+            );
+        }
+        let at = start + Duration::from_millis(300);
+        sender
+            .on_ack(
+                &Ack {
+                    cumulative: (4 * MAX_SEGMENT) as u64,
+                    limit: INITIAL_WINDOW,
+                    ..Default::default()
+                },
+                at,
+            )
+            .unwrap();
+        assert_eq!(
+            sender.path_rtt[0].observed_max(),
+            Some(Duration::from_millis(210))
+        );
+        assert_eq!(
+            sender.path_rtt[1].observed_max(),
+            Some(Duration::from_millis(110))
+        );
+        assert_eq!(sender.rtt.observed_max(), Some(Duration::from_millis(110)));
+    }
 
     #[test]
     fn oversized_peer_window_is_rejected_before_credit_changes() {

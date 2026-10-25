@@ -89,6 +89,8 @@ impl Wait {
 }
 #[derive(Clone, Default, Serialize)]
 pub struct Records {
+    /// Accepted beyond record-ID history; byte-stream dedup decides uniqueness.
+    pub late_stream_records_received: u64,
     pub messages_admission_dropped: u64,
     pub messages_reassembled: u64,
     pub message_reassembly_dropped: u64,
