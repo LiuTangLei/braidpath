@@ -215,6 +215,7 @@ struct Rtt {
     high: [Duration; 2],
     window_start: Option<Instant>,
     first_sample: Option<Instant>,
+    newest_transmission: Option<Instant>,
 }
 impl Default for Rtt {
     fn default() -> Self {
@@ -225,10 +226,20 @@ impl Default for Rtt {
             high: [Duration::ZERO; 2],
             window_start: None,
             first_sample: None,
+            newest_transmission: None,
         }
     }
 }
 impl Rtt {
+    fn sample_transmission(&mut self, sent_at: Instant, now: Instant) {
+        // A bounded SACK can report previously omitted, older ranges in a
+        // later ACK. They release bytes but cannot supersede a measurement
+        // from a newer original on this same route.
+        if self.newest_transmission.is_none_or(|at| sent_at > at) {
+            self.newest_transmission = Some(sent_at);
+            self.sample(now.saturating_duration_since(sent_at), now);
+        }
+    }
     fn sample(&mut self, rtt: Duration, now: Instant) {
         match self.smoothed {
             None => {
@@ -765,11 +776,11 @@ impl Sender {
         // aggregation, not the current route RTT. Preserve Karn's rule and
         // sample only the newest original transmission on each route.
         if let Some(at) = newest_sample {
-            self.rtt.sample(now.saturating_duration_since(at), now);
+            self.rtt.sample_transmission(at, now);
         }
         for (path, at) in path_samples.into_iter().enumerate() {
             if let Some(at) = at {
-                self.path_rtt[path].sample(now.saturating_duration_since(at), now);
+                self.path_rtt[path].sample_transmission(at, now);
             }
         }
         let reported = ack.duplicate_bytes.saturating_sub(self.peer_duplicates);
@@ -1280,6 +1291,69 @@ mod tests {
             "older bytes in one cumulative/SACK batch must not turn acknowledgment aggregation into path delay"
         );
         assert!(sender.path_threshold(0, at) < Duration::from_millis(150));
+    }
+
+    #[test]
+    fn later_ack_of_older_sack_ranges_cannot_reinflate_route_rtt() {
+        let start = Instant::now();
+        let mut sender = Sender::new(false);
+        sender.push(&vec![7; 3 * MAX_SEGMENT]);
+        for delay in [0, 180, 190] {
+            let at = start + Duration::from_millis(delay);
+            let t = sender.poll_transmit(at).unwrap();
+            sender.admitted(t.start, t.transmission, 0, Duration::from_millis(110), at);
+        }
+        sender
+            .on_ack(
+                &Ack {
+                    ranges: vec![(2 * MAX_SEGMENT as u64, 3 * MAX_SEGMENT as u64)],
+                    limit: INITIAL_WINDOW,
+                    ..Default::default()
+                },
+                start + Duration::from_millis(300),
+            )
+            .unwrap();
+        let later = start + Duration::from_millis(800);
+        sender
+            .on_ack(
+                &Ack {
+                    cumulative: 3 * MAX_SEGMENT as u64,
+                    limit: INITIAL_WINDOW,
+                    ..Default::default()
+                },
+                later,
+            )
+            .unwrap();
+        assert_eq!(
+            sender.path_rtt[0].observed_max(later),
+            Some(Duration::from_millis(110))
+        );
+        assert_eq!(
+            sender.rtt.observed_max(later),
+            Some(Duration::from_millis(110))
+        );
+        assert!(sender.path_threshold(0, later) < Duration::from_millis(150));
+        // A real newer original still reports a changed route; this is not
+        // a clamp or an override of native congestion/liveness detection.
+        sender.push(&vec![8; MAX_SEGMENT]);
+        let sent = start + Duration::from_millis(810);
+        let t = sender.poll_transmit(sent).unwrap();
+        sender.admitted(t.start, t.transmission, 0, Duration::from_millis(300), sent);
+        let now = sent + Duration::from_millis(300);
+        sender
+            .on_ack(
+                &Ack {
+                    cumulative: 4 * MAX_SEGMENT as u64,
+                    limit: INITIAL_WINDOW,
+                    ..Default::default()
+                },
+                now,
+            )
+            .unwrap();
+        assert_eq!(
+            sender.path_rtt[0].observed_max(now),
+            Some(Duration::from_millis(300))
+        );
     }
 
     #[test]
