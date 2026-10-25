@@ -275,6 +275,13 @@ async fn separate_tcp_listeners_pin_exits_half_close_and_share_connections() {
                 .iter()
                 .any(|f| f == "proxy-stream-v2")
         );
+        assert!(s.capabilities.features.iter().any(|f| f == "proxy-udp-v1"));
+        assert!(
+            !s.capabilities
+                .features
+                .iter()
+                .any(|f| matches!(f.as_str(), "proxy-tcp-v1" | "proxy-bond-v2"))
+        );
         assert_eq!(s.proxy.unwrap().streams, 1);
     }
     let (mut third, status, _) = socks(listen_a, TCP, Address::Ip(target)).await;

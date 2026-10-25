@@ -122,9 +122,7 @@ impl State {
         let mut capabilities = Capabilities::default();
         if self.proxy.is_some() {
             capabilities.features.extend([
-                "proxy-tcp-v1".into(),
                 "proxy-udp-v1".into(),
-                "proxy-bond-v2".into(),
                 crate::runtime::proxy::STREAM_CAPABILITY.into(),
             ]);
         }
