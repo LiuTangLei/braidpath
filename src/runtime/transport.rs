@@ -385,13 +385,7 @@ pub(crate) fn server_with_session_config(
     conf.transport_config(Arc::new(transport));
     let socket = std::net::UdpSocket::bind(bind)?;
     if proxy {
-        // Aggregate DATAGRAMs are paced before kernel admission. Preserve the
-        // platform send queue used by the historical data plane rather than
-        // adding another multi-megabyte queue below that pacing boundary.
-        enlarge_receive_buffer(socket2::SockRef::from(&socket));
-        let options = socket2::SockRef::from(&socket);
-        tracing::info!(scope="aggregate", receive=?options.recv_buffer_size().ok(),
-            send=?options.send_buffer_size().ok(), "UDP socket buffers");
+        datagram_socket_buffers(socket2::SockRef::from(&socket), "proxy");
     } else {
         enlarge_receive_buffer(socket2::SockRef::from(&socket));
     }
