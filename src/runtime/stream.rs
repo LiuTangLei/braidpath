@@ -172,7 +172,7 @@ impl Frame {
     }
 }
 
-#[derive(Clone, Default, Serialize)]
+#[derive(Clone, Debug, Default, Serialize)]
 pub struct Snapshot {
     pub opened: u64,
     pub completed: u64,
@@ -409,6 +409,24 @@ impl Sender {
     }
     pub fn limit(&self) -> u64 {
         self.limit
+    }
+    /// Low-frequency diagnostics, outside the per-packet recovery path.
+    pub(crate) fn recovery_diagnostics(&self, now: Instant) -> impl std::fmt::Debug {
+        (
+            self.reorder,
+            self.buffer.len(),
+            self.buffer.capacity(),
+            self.segments.first_key_value().map(|(start, segment)| {
+                (
+                    *start,
+                    segment.path,
+                    segment.transmissions,
+                    segment.stalls,
+                    now.saturating_duration_since(segment.sent_at).as_millis(),
+                    self.path_threshold(segment.path, now).as_millis(),
+                )
+            }),
+        )
     }
     /// Lowest data offset still retained for retransmission.
     pub fn retained_from(&self) -> u64 {
@@ -926,6 +944,14 @@ impl Receiver {
     }
     pub fn cumulative(&self) -> u64 {
         self.cumulative
+    }
+    pub(crate) fn receive_diagnostics(&self) -> (u64, u64, u64, usize) {
+        (
+            self.cumulative,
+            self.consumed,
+            self.out_of_order,
+            self.ranges.len(),
+        )
     }
     /// Accept a data frame; returns in-order bytes now ready for the application.
     pub fn on_data(

@@ -324,3 +324,18 @@ contains the base record ID, payload length, fragment count/index and, on
 reassembly completion or drop, the received fragment bitmap. No payload is stored.
 An expiry bitmap locates the missing fragments; sender and receiver traces are
 still needed to distinguish local rejection, transport loss and late arrival.
+
+Aggregate TCP diagnostics can be enabled with the existing tracing filter
+`braidpath::runtime::tunnel::tcp=debug`. The adapter publishes at most one
+`stream mux progress` sample per 500 ms per session, alongside existing stream
+progress. Budget pressure reports current shared/held bytes, retained-byte peak,
+failed credit requests and distinct reader waits; it does not count kernel or
+coding memory. Sender recovery details contain reordering multiplier, retained
+buffer length/capacity and the oldest outstanding segment's offset, path,
+transmissions, stalls, age and repair threshold in milliseconds. Receiver details
+are cumulative bytes, application-consumed bytes, out-of-order bytes and range
+count. Coding samples distinguish original and repair admission bytes and local
+expiry/drop counts. Hole releases and local writes taking at least 20 ms emit a
+debug event with duration and byte count, without payload or destination data.
+These observations identify wait stages; they do not establish WAN performance
+or the origin of packet loss.

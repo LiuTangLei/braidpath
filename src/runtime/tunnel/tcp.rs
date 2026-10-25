@@ -411,6 +411,7 @@ struct Stream {
     status_header: Vec<u8>,
     send: stream::Sender,
     recv: stream::Receiver,
+    delivery_blocked_since: Option<Instant>,
     reads: Option<Arc<Semaphore>>,
     granted: u64,
     writer: Option<mpsc::UnboundedSender<WriteOp>>,
@@ -435,6 +436,7 @@ impl Stream {
             status_header: Vec::new(),
             send: stream::Sender::new(open),
             recv: stream::Receiver::default(),
+            delivery_blocked_since: None,
             reads: None,
             granted: 0,
             writer: None,
@@ -1330,6 +1332,20 @@ impl Mux {
                 };
                 match s.recv.on_data(offset, fin, data, now) {
                     Ok(ready) => {
+                        if tracing::enabled!(tracing::Level::DEBUG) {
+                            if !ready.is_empty()
+                                && let Some(started) = s.delivery_blocked_since.take()
+                                && now.saturating_duration_since(started)
+                                    >= Duration::from_millis(20)
+                            {
+                                debug!(stream=id, blocked_ms=now.saturating_duration_since(started).as_secs_f64()*1000.0,
+                                    released_bytes=ready.len(), receive=?s.recv.receive_diagnostics(),
+                                    "stream receive hole released");
+                            }
+                            if s.recv.receive_diagnostics().2 > 0 {
+                                s.delivery_blocked_since.get_or_insert(now);
+                            }
+                        }
                         s.lease.retain_rx(credit);
                         self.arrived(id, ready);
                     }
@@ -1503,9 +1519,24 @@ impl Mux {
                 .map(|s| s.recv.duplicates())
                 .sum::<u64>();
         let snapshot = self.stats.clone();
-        self.scope
-            .update(|d| d.tcp_streams = Some(snapshot.clone()));
+        self.scope.update(|d| {
+            d.tcp_streams = Some(snapshot.clone());
+            // Automatic FEC snapshots belong only to the session, not the
+            // aggregate scope also visited by update(). Log that scope once.
+            if tracing::enabled!(tracing::Level::DEBUG)
+                && let Some(fec) = &d.automatic_fec
+            {
+                debug!(fec=?fec,
+                    original_bytes=d.symbols.originals_quinn_admitted_bytes,
+                    repair_bytes=d.symbols.repairs_quinn_admitted_bytes,
+                    originals_expired=d.symbols.originals_expired_dropped,
+                    originals_ingress_expired=d.symbols.originals_ingress_expired_dropped,
+                    originals_queue_dropped=d.symbols.originals_queue_full_dropped,
+                    "stream sender coding progress");
+            }
+        });
         if tracing::enabled!(tracing::Level::DEBUG) {
+            debug!(stats=?self.stats, budget=?self.budget.pressure(), "stream mux progress");
             for (id, s) in &self.streams {
                 debug!(
                     stream = id,
@@ -1518,6 +1549,8 @@ impl Mux {
                     pending_io = self.events.len(),
                     local_queued_bytes = self.gauge.queued(),
                     recovery = ?s.send.recovery_state(),
+                    recovery_detail = ?s.send.recovery_diagnostics(now),
+                    receive = ?s.recv.receive_diagnostics(),
                     next_deadline_ms = ?s.send.next_deadline(now).map(|at| at.saturating_duration_since(now).as_millis()),
                     "stream progress"
                 );
@@ -1632,6 +1665,7 @@ async fn write_loop(
         };
         match op {
             Some(WriteOp::Data(data)) => {
+                let started = tracing::enabled!(tracing::Level::DEBUG).then(Instant::now);
                 let written = tokio::select! {
                     biased;
                     _ = reset.notified() => break false,
@@ -1640,6 +1674,17 @@ async fn write_loop(
                 if written.is_err() {
                     let _ = events.send(Io::Failed(id));
                     break false;
+                }
+                if let Some(started) = started
+                    && started.elapsed() >= Duration::from_millis(20)
+                {
+                    debug!(
+                        stream = id,
+                        blocked_ms = started.elapsed().as_secs_f64() * 1000.0,
+                        bytes = data.len(),
+                        rate_limited = lease.rate.is_some(),
+                        "stream local write delayed"
+                    );
                 }
             }
             Some(WriteOp::Finish) => break write.shutdown().await.is_ok(),

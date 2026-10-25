@@ -12,13 +12,21 @@ const RESERVED: usize = 128 * 1024;
 const FLOWS: usize = 256;
 
 struct Pool {
-    shared: Mutex<(usize, usize)>,
+    shared: Mutex<Pressure>,
     notify: Notify,
+}
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct Pressure {
+    shared: usize,
+    held: usize,
+    peak: usize,
+    denied: u64,
+    waits: u64,
 }
 impl Default for Pool {
     fn default() -> Self {
         Self {
-            shared: Mutex::new((0, 0)),
+            shared: Mutex::default(),
             notify: Notify::new(),
         }
     }
@@ -52,8 +60,14 @@ impl Budget {
     pub(crate) fn snapshot(&self) -> (usize, usize) {
         (
             FLOWS - self.flows.available_permits(),
-            self.tx.shared.lock().expect("stream budget").1
-                + self.rx.shared.lock().expect("stream budget").1,
+            self.tx.shared.lock().expect("stream budget").held
+                + self.rx.shared.lock().expect("stream budget").held,
+        )
+    }
+    pub(super) fn pressure(&self) -> (Pressure, Pressure) {
+        (
+            *self.tx.shared.lock().expect("stream budget"),
+            *self.rx.shared.lock().expect("stream budget"),
         )
     }
     pub(super) fn try_flow(&self) -> Option<Arc<Lease>> {
@@ -136,15 +150,17 @@ impl Allowance {
     }
     pub fn try_take(self: &Arc<Self>, bytes: usize, progress: bool) -> Option<Credit> {
         let mut used = self.pool.shared.lock().expect("stream budget");
-        let shared = bytes.min(SHARED - used.0);
+        let shared = bytes.min(SHARED - used.shared);
         let reserved = bytes - shared;
         if reserved > 0
             && (!progress || reserved > RESERVED - self.reserved.load(Ordering::Relaxed))
         {
+            used.denied += 1;
             return None;
         }
-        used.0 += shared;
-        used.1 += bytes;
+        used.shared += shared;
+        used.held += bytes;
+        used.peak = used.peak.max(used.held);
         self.reserved.fetch_add(reserved, Ordering::Relaxed);
         Some(Credit {
             allowance: self.clone(),
@@ -153,12 +169,17 @@ impl Allowance {
         })
     }
     pub async fn take(self: &Arc<Self>, bytes: usize) -> Credit {
+        let mut waiting = false;
         loop {
             let notified = self.pool.notify.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
             if let Some(credit) = self.try_take(bytes, true) {
                 return credit;
+            }
+            if !waiting {
+                self.pool.shared.lock().expect("stream budget").waits += 1;
+                waiting = true;
             }
             notified.await;
         }
@@ -185,8 +206,8 @@ impl Credit {
         self.reserved -= reserved;
         self.shared -= shared;
         let mut used = self.allowance.pool.shared.lock().expect("stream budget");
-        used.0 -= shared;
-        used.1 -= bytes;
+        used.shared -= shared;
+        used.held -= bytes;
         self.allowance
             .reserved
             .fetch_sub(reserved, Ordering::Relaxed);
@@ -213,6 +234,9 @@ mod tests {
         let repair = other.rx.try_take(RESERVED, true).unwrap();
         assert!(other.rx.try_take(1, true).is_none());
         assert_eq!(budget.snapshot(), (2, SHARED + RESERVED));
+        let pressure = budget.pressure().1;
+        assert_eq!(pressure.peak, SHARED + RESERVED);
+        assert_eq!(pressure.denied, 2);
         drop(repair);
         drop(held);
         drop(blocked);
