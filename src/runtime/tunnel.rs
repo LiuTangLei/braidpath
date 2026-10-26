@@ -59,6 +59,7 @@ pub(crate) mod messages;
 mod mixed_fec_tests;
 mod native_probe;
 mod path_health;
+mod payload;
 mod proxy;
 #[cfg(test)]
 mod repair_usefulness_tests;
@@ -261,6 +262,7 @@ struct OutPath {
     /// connection lock itself.
     writer: Arc<writer::Writer>,
     stream: u64,
+    stream_payload: usize,
     quality: Arc<Mutex<quality::State>>,
     capacity_probe: Arc<Mutex<capacity_probe::State>>,
     capacity_probe_enabled: bool,
@@ -274,6 +276,21 @@ impl OutPath {
     }
 }
 type Paths = Arc<Mutex<Vec<OutPath>>>;
+
+fn stream_payload_limit(paths: &Paths, feedback: bool) -> usize {
+    paths
+        .lock()
+        .expect("paths lock")
+        .iter()
+        .filter(|path| path.open())
+        .filter_map(|path| {
+            path.conn
+                .max_datagram_size_hint()
+                .map(|size| payload::record_limit(size, path.stream, feedback, path.stream_payload))
+        })
+        .min()
+        .unwrap_or(MAX_PAYLOAD)
+}
 
 fn trace_path(scope: &Scope, stage: trace::Stage, path: trace::PathKey) {
     scope.trace_with(|context, _| {
@@ -349,7 +366,8 @@ fn trace_http(
         if let Ok(payload) = wire::http_payload(data, stream) {
             if !feedback {
                 stats::trace_symbol_fields(&mut event, payload, capture);
-            } else if (quality::HEADER + wire::HEADER..=quality::MAX_FRAME).contains(&payload.len())
+            } else if (quality::HEADER + wire::HEADER..=quality::MAX_STREAM_FRAME)
+                .contains(&payload.len())
                 && payload.starts_with(b"BQ1D")
             {
                 stats::trace_symbol_fields(&mut event, &payload[quality::HEADER..], capture);
@@ -1817,12 +1835,17 @@ async fn sender(
                     );
                     continue;
                 }
-                let frame_bytes = wire::MAX_WIRE
-                    + if policy.receiver_feedback {
-                        quality::HEADER
-                    } else {
-                        0
-                    }
+                let record_bytes = if policy.streams || policy.proxy {
+                    payload::record_limit(
+                        path.conn.max_datagram_size_hint().unwrap_or(0),
+                        path.stream,
+                        policy.receiver_feedback,
+                        path.stream_payload,
+                    )
+                } else {
+                    MAX_PAYLOAD
+                };
+                let frame_bytes = payload::wire_limit(record_bytes, policy.receiver_feedback)
                     + wire::http_datagram_overhead(path.stream).expect("admitted stream");
                 let send_queue_bytes = path.writer.backlog();
                 let transport_blocked = !path.writer.admits(frame_bytes);
@@ -3290,7 +3313,12 @@ async fn session_loop(
         Duration::from_millis(session.policy.queue_ms),
         session.adaptive_fec_retention,
     )
-    .with_dual_repairs(session.policy.fec_repairs == 2);
+    .with_dual_repairs(session.policy.fec_repairs == 2)
+    .with_stream_payload(if session.policy.streams || session.policy.proxy {
+        super::MAX_STREAM_PAYLOAD
+    } else {
+        MAX_PAYLOAD
+    });
     let mut messages = messages::Reassembly::new(
         session.policy.max_message_bytes,
         session.policy.admission_lifetime(),
@@ -3320,6 +3348,10 @@ async fn session_loop(
         }
         if let Some(mux) = streams.as_mut() {
             mux.service_io();
+            mux.set_payload_limit(stream_payload_limit(
+                &session.paths,
+                session.policy.receiver_feedback,
+            ));
             mux.flush(&mut tcp::Out {
                 tx: &tx,
                 next_id: &mut next_id,
@@ -3791,7 +3823,7 @@ async fn server_connection(
         }
     };
     diagnostic.succeeded();
-    let mut joined: Option<(String, Arc<Session>, u8, u64, u64)> = None;
+    let mut joined: Option<(String, Arc<Session>, u8, u64, u64, usize)> = None;
     let mut request: Option<h3::server::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>> = None;
     // Our clients send their first request within their 8-second (data) or
     // 4-second (control) attempt deadline. Unclassified connections hold the
@@ -3938,6 +3970,7 @@ async fn server_connection(
                                 let (streams,proxy)=session_profile(stream_transport,streams,proxy)?;
                                 ensure!(!streams || tcp.fixed.is_some(),"TCP streams are not enabled on this server");
                                 ensure!(!proxy || tcp.proxy.is_some(),"proxy streams are not enabled on this server");
+                                let stream_payload=payload::negotiate(req.headers(),streams || proxy)?;
                                 let policy=Policy{max_message_bytes,streams,proxy,
             fec_repairs,small_fec_bytes,mixed_fec,probe_guided_recovery,capacity_probe_bps,adaptive:quality_schedule==Some("adaptive"),latency_target_ms,group_rates,quality_schedule:quality_schedule.is_some(),receiver_feedback:feedback.is_some(),fec:parse_fec(header("braidpath-fec")?).map_err(anyhow::Error::msg)?,redundancy:header("braidpath-redundancy")?.parse()?,rate,block_ms:header("braidpath-block-ms")?.parse()?,queue_ms:header("braidpath-queue-ms")?.parse()?};policy.validate()?;
                                 if policy.fec==automatic_fec::AUTO {ensure!(req.headers().get_all("braidpath-auto-small").iter().count()==1 && req.headers().get("braidpath-auto-small").is_some_and(|v|v=="1"),"automatic small protection not negotiated");}
@@ -3970,7 +4003,7 @@ async fn server_connection(
                                             let mut generations=session.generations.lock().expect("generation lock");
                                             scheduler::admit_generation(&mut generations[usize::from(pid)],generation)?;
                                             if let Some(i)=existing {paths.remove(i).conn.close(0u32.into(),b"path rejoined");}
-                                            paths.push(OutPath{id:pid,group,conn:conn.clone(),writer:writer::Writer::spawn(&conn),stream:stream_id,quality:Arc::new(Mutex::new(quality::State::new(generation))),capacity_probe:Arc::new(Mutex::new(capacity_probe::State::new(generation))),capacity_probe_enabled:capacity_probe_bps>0,epoch:Instant::now(),probe_reply:Arc::new(Mutex::new(None))});
+                                            paths.push(OutPath{id:pid,group,conn:conn.clone(),writer:writer::Writer::spawn(&conn),stream:stream_id,stream_payload,quality:Arc::new(Mutex::new(quality::State::new(generation))),capacity_probe:Arc::new(Mutex::new(capacity_probe::State::new(generation))),capacity_probe_enabled:capacity_probe_bps>0,epoch:Instant::now(),probe_reply:Arc::new(Mutex::new(None))});
                                             *session.empty_since.lock().expect("empty time lock")=None;
                                         }
                                         Some(session)
@@ -3991,8 +4024,9 @@ async fn server_connection(
                                 let trace_key=trace::PathKey{path_id:pid,generation,connection_id:conn.stable_id() as u64};
                                 trace_path(&session.forward,trace::Stage::PathOpened,trace_key);
                                 trace_path(&session.returning,trace::Stage::PathOpened,trace_key);
-                                joined=Some((sid,session,pid,stream_id,generation));
-                                let mut response=Response::builder().status(200).header("braidpath-version","1").header("braidpath-max-payload",MAX_PAYLOAD);if max_message_bytes > MAX_PAYLOAD {response=response.header("braidpath-message-bytes",max_message_bytes);}
+                                joined=Some((sid,session,pid,stream_id,generation,stream_payload));
+                                let mut response=Response::builder().status(200).header("braidpath-version","1").header("braidpath-max-payload",MAX_PAYLOAD);if req.headers().contains_key(payload::HEADER){response=response.header(payload::HEADER,stream_payload);}
+                                if max_message_bytes > MAX_PAYLOAD {response=response.header("braidpath-message-bytes",max_message_bytes);}
                                 if feedback.is_some(){response=response.header("braidpath-feedback","2");}
                                 if let Some(state)=&mesh {response=response.header("braidpath-exit",state.node_id());}
                                 if small_fec_bytes>0 {response=response.header("braidpath-small-fec-bytes",small_fec_bytes);}
@@ -4011,11 +4045,11 @@ async fn server_connection(
                             },
                             data=conn.read_datagram()=>{
                                 let data=data?;
-                                if let Some((_,session,pid,stream,generation))=&joined {
+                                if let Some((_,session,pid,stream,generation,stream_payload))=&joined {
                                     let trace_key=trace::PathKey{path_id:*pid,generation:*generation,connection_id:conn.stable_id() as u64};
                                     trace_http(&session.forward,trace::Stage::PeerHttpReceived,&data,*stream,session.policy.receiver_feedback,trace_key,None);
                                     session.forward.path(*pid,|p|p.http_datagrams_received+=1);
-                                    if let Ok(payload)=wire::http_payload(&data,*stream) && payload.len()<=(if session.policy.receiver_feedback{quality::MAX_FRAME}else{wire::MAX_WIRE}) {
+                                    if let Ok(payload)=wire::http_payload(&data,*stream) && payload.len()<=payload::wire_limit(*stream_payload,session.policy.receiver_feedback) {
                                         match measured_payload(&session.paths,*pid,payload,session.policy.receiver_feedback,&session.returning,session.observation_notify.as_deref()) {
                                         Ok(Some(payload))=>{if let Err(error)=session.events.try_send(Event::Wire(*pid,payload)){if let Event::Wire(_,payload)=rejected_item(&error){session.forward.trace_symbol(trace::Stage::SymbolDropped,payload,Some(trace_key),Some(data.len()),Some(queue_trace_reason(QueueLayer::Receiver,&error)));}session.ingress_drops.fetch_add(1,Ordering::Relaxed);queue_error(&session.forward,QueueLayer::Receiver,&error,Some(*pid));}},Ok(None)=>{},Err(_)=>{trace_http(&session.forward,trace::Stage::SymbolDropped,&data,*stream,session.policy.receiver_feedback,trace_key,Some(trace::Reason::InvalidHttp));session.forward.path(*pid,|p|p.invalid_http_datagrams_dropped+=1);}}
                                     } else {trace_http(&session.forward,trace::Stage::SymbolDropped,&data,*stream,session.policy.receiver_feedback,trace_key,Some(trace::Reason::InvalidHttp));session.forward.path(*pid,|p|p.invalid_http_datagrams_dropped+=1);session.forward.update(|d|d.records.invalid_symbols_dropped+=1);}
@@ -4041,7 +4075,7 @@ async fn server_connection(
     diagnostic.finish(result.as_ref().err());
     let owner_stopped = stream_owner_stopped(stream_transport, conn.close_reason().as_ref());
     conn.close(0u32.into(), b"request closed");
-    if let Some((sid, session, pid, _, generation)) = joined {
+    if let Some((sid, session, pid, _, generation, _)) = joined {
         let trace_key = trace::PathKey {
             path_id: pid,
             generation,
@@ -4093,6 +4127,7 @@ struct Rejoined {
     endpoint: quinn::Endpoint,
     conn: quinn::Connection,
     stream: u64,
+    stream_payload: usize,
     driver: H3Client,
     request: H3Request,
     send: H3Send,
@@ -4536,7 +4571,12 @@ async fn client_session(
         Duration::from_millis(options.policy.queue_ms),
         options.adaptive_fec_retention,
     )
-    .with_dual_repairs(options.policy.fec_repairs == 2);
+    .with_dual_repairs(options.policy.fec_repairs == 2)
+    .with_stream_payload(if options.policy.streams || options.policy.proxy {
+        super::MAX_STREAM_PAYLOAD
+    } else {
+        MAX_PAYLOAD
+    });
     publish_retention(&decoder, &returning);
     let mut messages = messages::Reassembly::new(
         options.policy.max_message_bytes,
@@ -4561,6 +4601,7 @@ async fn client_session(
     let result:Result<()>=async {loop {
         if let Some(mux)=streams.as_mut() {
             mux.service_io();
+            mux.set_payload_limit(stream_payload_limit(&paths, options.policy.receiver_feedback));
             mux.flush(&mut tcp::Out{tx:&tx,next_id:&mut next_id,scope:&forward,small_threshold});
         }
         tokio::select! {
@@ -4678,8 +4719,8 @@ async fn client_session(
                                 connected=timeout(Duration::from_secs(8),
                                     connect_path(&endpoint,config.remote,&name,&token,&sid,id as u8,config.group,generation,rejoin,&policy,exit.as_deref(),&mut diagnostic))=>connected??
                             };
-                            let (conn,stream,driver,request,send)=connected;
-                            Ok(Some(Rejoined{endpoint,conn,stream,driver,request,send}))
+                            let (conn,stream,driver,request,send,stream_payload)=connected;
+                            Ok(Some(Rejoined{endpoint,conn,stream,stream_payload,driver,request,send}))
                         }.await;
                         let attempt=match attempt {
                             Ok(None)=>return,
@@ -4724,21 +4765,21 @@ async fn client_session(
                             let mut active=paths.lock().expect("paths lock");
                             for old in active.iter().filter(|p|p.id==pid) {old.conn.close(0u32.into(),b"path replaced");}
                             active.retain(|p|p.id!=pid);
-                            active.push(OutPath{id:pid,group:configs[id].group,conn:value.conn.clone(),stream:value.stream,
+                            active.push(OutPath{id:pid,group:configs[id].group,conn:value.conn.clone(),stream:value.stream,stream_payload:value.stream_payload,
                                 writer:writer::Writer::spawn(&value.conn),
                                 quality:Arc::new(Mutex::new(quality::State::new(generation))),capacity_probe:Arc::new(Mutex::new(capacity_probe::State::new(generation))),capacity_probe_enabled:options.policy.capacity_probe_bps>0,epoch:Instant::now(),
                                 probe_reply:Arc::new(Mutex::new(None))});
                         }
                         if let Some(old)=endpoints[id].replace(value.endpoint) {old.close(0u32.into(),b"path replaced");}
                         tasks.spawn(drive_client_path(value.conn,value.stream,value.driver,value.request,value.send,diagnostic,pid,generation,
-                            wire_tx.clone(),ingress_drops.clone(),returning.clone(),forward.clone(),paths.clone(),options.policy.receiver_feedback,observation_notify.clone()));
+                            wire_tx.clone(),ingress_drops.clone(),returning.clone(),forward.clone(),paths.clone(),options.policy.receiver_feedback,value.stream_payload,observation_notify.clone()));
                         has_session=true;
                         if recover_paths && !announced {
                             options.stats.readiness(true,configs.iter().filter(|c|c.enabled).count());
                             announced=true;
                             info!(listen=%socket.local_addr()?,paths=paths.lock().expect("paths lock").len(),congestion=?options.congestion,"UDP client ready");
                         }
-                        info!(path=pid,generation,replacing,"client path ready");
+                        info!(path=pid,generation,replacing,stream_payload=value.stream_payload,"client path ready");
                     },
                     Err(error)=>{
                         rotations[id].connection_failed(now_us);
@@ -4852,6 +4893,7 @@ async fn drive_client_path(
     measurement_scope: Scope,
     path_view: Paths,
     feedback: bool,
+    stream_payload: usize,
     observation_notify: Option<Arc<Notify>>,
 ) {
     // Dropping the last SendRequest closes the HTTP/3 connection.
@@ -4870,7 +4912,7 @@ async fn drive_client_path(
                             Ok(d)=>{
                                 trace_http(&returning,trace::Stage::PeerHttpReceived,&d,stream,feedback,trace_key,None);
                                 returning.path(pid,|p|p.http_datagrams_received+=1);
-                                if let Ok(p)=wire::http_payload(&d,stream) && p.len()<=(if feedback{quality::MAX_FRAME}else{wire::MAX_WIRE}) {
+                                if let Ok(p)=wire::http_payload(&d,stream) && p.len()<=payload::wire_limit(stream_payload,feedback) {
                                     match measured_payload(&path_view,pid,p,feedback,&measurement_scope,observation_notify.as_deref()) {Ok(Some(p))=>{if let Err(error)=tx.try_send((pid,p)){returning.trace_symbol(trace::Stage::SymbolDropped,&rejected_item(&error).1,Some(trace_key),Some(d.len()),Some(queue_trace_reason(QueueLayer::Receiver,&error)));ingress_drops.fetch_add(1,Ordering::Relaxed);queue_error(&returning,QueueLayer::Receiver,&error,Some(pid));}},Ok(None)=>{},Err(_)=>{trace_http(&returning,trace::Stage::SymbolDropped,&d,stream,feedback,trace_key,Some(trace::Reason::InvalidHttp));returning.path(pid,|p|p.invalid_http_datagrams_dropped+=1);}}
                                 }else{trace_http(&returning,trace::Stage::SymbolDropped,&d,stream,feedback,trace_key,Some(trace::Reason::InvalidHttp));returning.path(pid,|p|p.invalid_http_datagrams_dropped+=1);returning.update(|d|d.records.invalid_symbols_dropped+=1);}
                             },
@@ -4921,7 +4963,7 @@ async fn connect_path(
     policy: &Policy,
     exit: Option<&str>,
     diagnostic: &mut stats::ConnectionTrace,
-) -> Result<(quinn::Connection, u64, H3Client, H3Request, H3Send)> {
+) -> Result<(quinn::Connection, u64, H3Client, H3Request, H3Send, usize)> {
     macro_rules! admit {
         ($conn:expr) => {
             admit_path(
@@ -4978,7 +5020,7 @@ async fn admit_path(
     policy: &Policy,
     exit: Option<&str>,
     diagnostic: &mut stats::ConnectionTrace,
-) -> Result<(quinn::Connection, u64, H3Client, H3Request, H3Send)> {
+) -> Result<(quinn::Connection, u64, H3Client, H3Request, H3Send, usize)> {
     diagnostic.enter("http3", "datagram_capacity");
     ensure!(
         conn.max_datagram_size().is_some_and(|n| n
@@ -5078,6 +5120,9 @@ async fn admit_path(
         req = req
             .header("braidpath-capacity-probe-bps", policy.capacity_probe_bps)
             .header("braidpath-capacity-probe-format", capacity_probe::FORMAT);
+    }
+    if policy.streams || policy.proxy {
+        req = req.header(payload::HEADER, super::MAX_STREAM_PAYLOAD);
     }
     let req = req.body(())?;
     // Sent without waiting for peer SETTINGS, so that 0-RTT saves its round trip.
@@ -5218,8 +5263,16 @@ async fn admit_path(
             .get("braidpath-capacity-probe-format")
             .and_then(|v| v.to_str().ok()),
     )?;
+    let stream_payload = payload::negotiate(response.headers(), policy.streams || policy.proxy)?;
     diagnostic.admitted();
-    Ok((conn, stream.id().into_inner(), driver, stream, send))
+    Ok((
+        conn,
+        stream.id().into_inner(),
+        driver,
+        stream,
+        send,
+        stream_payload,
+    ))
 }
 
 pub async fn get(remote: SocketAddr, name: &str, ca: &std::path::Path) -> Result<String> {

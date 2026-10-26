@@ -1251,7 +1251,8 @@ impl Scope {
 /// Read only observed wire fields. Invalid frames retain byte counts, without fabricated IDs.
 pub(super) fn trace_symbol_fields(event: &mut trace::Event, data: &[u8], capture: &trace::Trace) {
     event.bytes.wire = u32::try_from(data.len()).ok();
-    if !(wire::HEADER..=wire::MAX_WIRE).contains(&data.len()) || data[..3] != [b'B', b'P', 1] {
+    if !(wire::HEADER..=wire::MAX_STREAM_WIRE).contains(&data.len()) || data[..3] != [b'B', b'P', 1]
+    {
         return;
     }
     let block = u64::from_be_bytes(data[4..12].try_into().expect("validated wire header"));

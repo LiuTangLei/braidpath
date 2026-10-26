@@ -317,6 +317,69 @@ async fn separate_tcp_listeners_pin_exits_half_close_and_share_connections() {
 }
 
 #[tokio::test]
+async fn socks_tcp_negotiates_larger_records_without_changing_byte_budgets() {
+    let root = tempfile::tempdir().unwrap();
+    let (at, _server, metrics) = start_metered(root.path(), "a", None, true).await;
+    let identity = identity(root.path(), "large-stream-client");
+    let pool = client::Pool::new(
+        identity.clone(),
+        vec![node("a", at)],
+        vec!["a".into()],
+        None,
+    )
+    .unwrap();
+    let (listen, _listener) = local_listener(pool.clone(), "a").await;
+    let (target, _echo) = echo().await;
+    let (mut tcp, status, _) = socks(listen, TCP, Address::Ip(target)).await;
+    assert_eq!(status, 0);
+    let expected: Vec<u8> = (0..524_288).map(|i| (i % 251) as u8).collect();
+    let (mut read, mut write) = tcp.split();
+    let send = async {
+        write.write_all(&expected).await.unwrap();
+        write.shutdown().await.unwrap();
+    };
+    let receive = async {
+        let mut received = Vec::new();
+        read.read_to_end(&mut received).await.unwrap();
+        received
+    };
+    let (_, received) = timeout(Duration::from_secs(8), async {
+        tokio::join!(send, receive)
+    })
+    .await
+    .unwrap();
+    assert!(
+        received.len() == expected.len() + 3
+            && received.starts_with(&expected)
+            && received.ends_with(b"FIN"),
+        "echo byte integrity/half-close mismatch: {} bytes",
+        received.len()
+    );
+    empty(&identity, at).await;
+    timeout(Duration::from_secs(2), async {
+        loop {
+            let mut largest = 0;
+            metrics.state(|state| {
+                for directions in state.sessions.values() {
+                    for direction in directions.values() {
+                        if let Some(streams) = &direction.tcp_streams {
+                            largest = largest.max(streams.max_data_segment_bytes);
+                        }
+                    }
+                }
+            });
+            if largest > crate::runtime::stream::MAX_SEGMENT as u64 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("new peers did not publish larger stream records");
+    assert_eq!(pool.stream_budget.snapshot(), (0, 0));
+}
+
+#[tokio::test]
 async fn separate_udp_listeners_pin_exits_fragment_and_release_independently() {
     let root = tempfile::tempdir().unwrap();
     let root = root.path();

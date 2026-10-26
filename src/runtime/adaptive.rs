@@ -2973,7 +2973,7 @@ impl PathController {
                                         && admission.symbols < 8
                                         && u128::from(admission.symbol_bytes)
                                             <= u128::from(admission.symbols)
-                                                * super::wire::MAX_WIRE as u128
+                                                * super::wire::MAX_STREAM_WIRE as u128
                                         && admission.bps * self.wire_per_symbol
                                             >= self.rate_bps as f64 * 0.9
                                         && activity_since_us

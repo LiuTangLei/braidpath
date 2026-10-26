@@ -567,6 +567,7 @@ pub(super) struct Mux {
     gauge: Arc<Gauge>,
     lifetime: Duration,
     drain: Drain,
+    payload_limit: usize,
     blocked_until: Option<Instant>,
     accept_paused_until: Option<Instant>,
     stats: stream::Snapshot,
@@ -603,6 +604,7 @@ impl Mux {
             gauge: Arc::new(Gauge::default()),
             lifetime: policy.admission_lifetime(),
             drain: Drain::new(now),
+            payload_limit: crate::runtime::MAX_PAYLOAD,
             blocked_until: None,
             accept_paused_until: None,
             stats: stream::Snapshot::default(),
@@ -1479,6 +1481,10 @@ impl Mux {
         }
     }
 
+    pub(super) fn set_payload_limit(&mut self, limit: usize) {
+        self.payload_limit = limit;
+    }
+
     fn pump(&mut self, out: &mut Out, now: Instant) {
         if self.blocked_until.is_some_and(|at| now < at) {
             return;
@@ -1492,7 +1498,7 @@ impl Mux {
         // before it reaches the sender's existing per-flow fair queue. The
         // reserve is at most two maximum segments plus one tiny frame;
         // bulk keeps the original limit and all wire budgets remain shared.
-        while self.gauge.queued() < limit + 2 * stream::MAX_SEGMENT && idle < self.turns.len() {
+        while self.gauge.queued() < limit + 2 * self.payload_limit && idle < self.turns.len() {
             let id = self.turns.pop_front().expect("turn");
             self.turns.push_back(id);
             let s = self.streams.get_mut(&id).expect("stream turn");
@@ -1500,10 +1506,16 @@ impl Mux {
                 idle += 1;
                 continue;
             }
-            let Some(t) = s.send.poll_transmit(now) else {
+            let before_splits = s.send.pmtu_splits;
+            let Some(t) = s.send.poll_transmit_sized(now, self.payload_limit) else {
                 idle += 1;
                 continue;
             };
+            self.stats.pmtu_splits += s.send.pmtu_splits - before_splits;
+            if let Frame::Data { data, .. } = &t.frame {
+                self.stats.max_data_segment_bytes =
+                    self.stats.max_data_segment_bytes.max(data.len() as u64);
+            }
             idle = 0;
             let payload = t.frame.encode();
             let interactive = s.send.written() - s.send.retained_from() <= INTERACTIVE_BYTES;

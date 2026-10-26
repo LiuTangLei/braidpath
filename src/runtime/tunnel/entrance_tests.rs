@@ -405,7 +405,7 @@ async fn connection_budgets_isolate_control_data_and_pending_admission() {
         Some(0),
         "test",
     );
-    let (joined, _, mut driver, _request, mut send) = connect_path(
+    let (joined, _, mut driver, _request, mut send, _) = connect_path(
         &endpoint,
         address,
         "braidpath.mesh",

@@ -9,6 +9,15 @@ use std::{
 
 pub const HEADER: usize = 13;
 pub const MAX_WIRE: usize = HEADER + 12 + MAX_PAYLOAD + 2;
+pub const MAX_STREAM_WIRE: usize = HEADER + 12 + super::MAX_STREAM_PAYLOAD + 2;
+
+fn payload_limit(flow: u32) -> usize {
+    if super::stream::stream_id(flow).is_some() {
+        super::MAX_STREAM_PAYLOAD
+    } else {
+        MAX_PAYLOAD
+    }
+}
 const BLOCK_WINDOW: u64 = 256;
 const MESSAGE_WINDOW: u64 = 8192;
 
@@ -28,8 +37,8 @@ pub enum RecordDisposition {
 impl Record {
     pub fn encode(&self) -> Result<Vec<u8>> {
         ensure!(
-            self.payload.len() <= MAX_PAYLOAD,
-            "UDP message exceeds {MAX_PAYLOAD} bytes"
+            self.payload.len() <= payload_limit(self.flow),
+            "record payload exceeds its flow limit"
         );
         let mut out = Vec::with_capacity(12 + self.payload.len());
         out.extend(self.flow.to_be_bytes());
@@ -40,13 +49,12 @@ impl Record {
     /// Validate a record and read routing/accounting fields without copying its payload.
     pub fn decode_identity(b: &[u8]) -> Result<(u32, u64)> {
         ensure!(
-            (12..=12 + MAX_PAYLOAD).contains(&b.len()),
+            (12..=12 + super::MAX_STREAM_PAYLOAD).contains(&b.len()),
             "invalid record length"
         );
-        Ok((
-            u32::from_be_bytes(b[..4].try_into()?),
-            u64::from_be_bytes(b[4..12].try_into()?),
-        ))
+        let flow = u32::from_be_bytes(b[..4].try_into()?);
+        ensure!(b.len() <= 12 + payload_limit(flow), "record payload limit");
+        Ok((flow, u64::from_be_bytes(b[4..12].try_into()?)))
     }
     pub fn decode(b: &[u8]) -> Result<Self> {
         let (flow, id) = Self::decode_identity(b)?;
@@ -91,7 +99,7 @@ fn frame(kind: u8, block: u64, index: u8, body: &[u8]) -> Bytes {
 }
 fn decode(b: &[u8]) -> Result<Option<Shard>> {
     ensure!(
-        (HEADER..=MAX_WIRE).contains(&b.len()) && b[..3] == [b'B', b'P', 1],
+        (HEADER..=MAX_STREAM_WIRE).contains(&b.len()) && b[..3] == [b'B', b'P', 1],
         "invalid frame"
     );
     let block = u64::from_be_bytes(b[4..12].try_into()?);
@@ -186,6 +194,7 @@ pub fn http_payload(b: &[u8], stream: u64) -> Result<&[u8]> {
 }
 
 pub struct Receiver {
+    stream_payload: usize,
     blocks: BTreeMap<u64, Option<(Decoder, Instant)>>,
     // Exact occupancy, maintained at the same mutations as retained_bytes.
     // Publishing per-arrival telemetry must not scan the entire block window.
@@ -215,12 +224,21 @@ impl Default for Receiver {
     }
 }
 impl Receiver {
+    pub(crate) fn with_stream_payload(mut self, maximum: usize) -> Self {
+        self.stream_payload = maximum.clamp(MAX_PAYLOAD, super::MAX_STREAM_PAYLOAD);
+        if self.stream_payload > MAX_PAYLOAD && self.budget.is_none() {
+            self.budget = Some(super::receiver_budget::Controller::default());
+        }
+        self
+    }
+
     /// Bound reconstruction by time since the first local arrival for a block.
     /// This is not a cross-machine or application delivery deadline: authenticated
     /// originals remain eligible within the independent record-ID window after
     /// their decoder expires. A zero wait disables reconstruction.
     pub fn with_repair_wait(repair_wait: Duration) -> Self {
         Self {
+            stream_payload: MAX_PAYLOAD,
             blocks: BTreeMap::new(),
             live_decoders: 0,
             repair_wait,
@@ -361,6 +379,10 @@ impl Receiver {
         ensure!(
             self.dual_repairs || b.get(3) != Some(&3),
             "unnegotiated dual repair"
+        );
+        ensure!(
+            b.len() <= HEADER + 12 + self.stream_payload + 2,
+            "unnegotiated record size"
         );
         let decoded = decode(b)?;
         if matches!(decoded, Some(Shard::Repair { .. } | Shard::RepairQ { .. })) {
@@ -513,6 +535,10 @@ impl Receiver {
         }
         let mut out = Vec::new();
         for (record, repaired) in deliveries {
+            ensure!(
+                record.payload.len() <= self.stream_payload,
+                "unnegotiated record payload"
+            );
             self.highest_message = self.highest_message.max(record.id);
             let floor = self.highest_message.saturating_sub(MESSAGE_WINDOW - 1);
             while self.delivered.first().is_some_and(|id| *id < floor) {
@@ -548,6 +574,119 @@ impl Receiver {
 mod tests {
     use super::*;
     use crate::fec::Encoder;
+
+    #[test]
+    fn large_record_decoder_pressure_keeps_the_fixed_byte_budget() {
+        let now = Instant::now();
+        let mut receiver = Receiver::with_repair_wait(Duration::from_secs(10))
+            .with_stream_payload(super::super::MAX_STREAM_PAYLOAD);
+        for block in 0..220 {
+            for index in 0..32 {
+                let record = Record {
+                    flow: super::super::stream::data_flow(1),
+                    id: block * 32 + u64::from(index),
+                    payload: vec![index; super::super::MAX_STREAM_PAYLOAD],
+                };
+                let symbol = shard(Shard::Data {
+                    block,
+                    index,
+                    payload: record.encode().unwrap(),
+                });
+                receiver.receive(&symbol, now).unwrap();
+                assert!(receiver.retained_bytes <= super::super::receiver_budget::MAX_BYTES);
+            }
+        }
+        assert!(
+            receiver.live_decoders < 220,
+            "byte pressure did not retire old decoders"
+        );
+        assert!(receiver.retained_bytes > 6 * 1024 * 1024);
+        assert_cached_occupancy(&receiver);
+        receiver.expire_blocks(now + Duration::from_secs(11));
+        assert_eq!(receiver.retained_bytes, 0);
+        assert_eq!(receiver.live_decoders, 0);
+    }
+
+    #[test]
+    fn negotiated_large_dual_repairs_recover_two_missing_records() {
+        let now = Instant::now();
+        let records: Vec<_> = (0..4)
+            .map(|id| Record {
+                flow: super::super::stream::data_flow(1),
+                id,
+                payload: vec![id as u8; super::super::MAX_STREAM_PAYLOAD],
+            })
+            .collect();
+        let mut encoder = crate::fec::DualEncoder::new(4, Duration::from_millis(3)).unwrap();
+        let mut symbols = Vec::new();
+        for record in &records {
+            symbols.extend(
+                encoder
+                    .push(&record.encode().unwrap(), now)
+                    .unwrap()
+                    .into_iter()
+                    .map(shard),
+            );
+        }
+        assert_eq!(symbols.len(), 6);
+        let mut receiver = Receiver::with_repair_wait(Duration::from_millis(3))
+            .with_dual_repairs(true)
+            .with_stream_payload(super::super::MAX_STREAM_PAYLOAD);
+        let mut received = Vec::new();
+        for symbol in &symbols[2..] {
+            received.extend(receiver.receive(symbol, now).unwrap());
+        }
+        received.sort_by_key(|record| record.id);
+        assert_eq!(received, records);
+        assert_eq!(receiver.recovered, 2);
+        receiver.expire_blocks(now + Duration::from_secs(1));
+        assert_eq!(receiver.retained_bytes, 0);
+    }
+
+    #[test]
+    fn negotiated_large_stream_records_recover_with_bounded_fec() {
+        let now = Instant::now();
+        let records: Vec<_> = (0..4)
+            .map(|id| Record {
+                flow: super::super::stream::data_flow(1),
+                id,
+                payload: vec![id as u8; super::super::MAX_STREAM_PAYLOAD],
+            })
+            .collect();
+        let mut encoder = Encoder::new(4, Duration::from_millis(3)).unwrap();
+        let mut symbols = Vec::new();
+        for record in &records {
+            symbols.extend(
+                encoder
+                    .push(&record.encode().unwrap(), now)
+                    .unwrap()
+                    .into_iter()
+                    .map(shard),
+            );
+        }
+        assert_eq!(symbols.len(), 5);
+        let mut legacy = Receiver::default();
+        assert!(legacy.receive(&symbols[0], now).is_err());
+        assert_eq!(legacy.retained_bytes, 0);
+        let mut receiver = Receiver::with_repair_wait(Duration::from_millis(3))
+            .with_stream_payload(super::super::MAX_STREAM_PAYLOAD);
+        let mut received = Vec::new();
+        for i in [0, 2, 3, 4] {
+            received.extend(receiver.receive(&symbols[i], now).unwrap());
+        }
+        received.sort_by_key(|record| record.id);
+        assert_eq!(received, records);
+        assert_eq!(receiver.recovered, 1);
+        assert!(receiver.retained_bytes <= super::super::receiver_budget::MAX_BYTES);
+        receiver.expire_blocks(now + Duration::from_secs(1));
+        assert_eq!(receiver.retained_bytes, 0);
+        let udp = Record {
+            flow: 1,
+            id: 0,
+            payload: vec![0; MAX_PAYLOAD + 1],
+        };
+        assert!(udp.encode().is_err());
+    }
 
     fn assert_cached_occupancy(receiver: &Receiver) {
         let live = receiver.blocks.values().flatten().count();

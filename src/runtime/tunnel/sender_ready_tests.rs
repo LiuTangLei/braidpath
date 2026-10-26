@@ -62,6 +62,7 @@ impl Pair {
             conn: self.outgoing.clone(),
             writer: writer::Writer::spawn(&self.outgoing),
             stream: 0,
+            stream_payload: MAX_PAYLOAD,
             quality: Arc::new(Mutex::new(quality::State::new(7))),
             capacity_probe: Arc::new(Mutex::new(capacity_probe::State::new(7))),
             capacity_probe_enabled: false,
@@ -85,6 +86,41 @@ impl Pair {
             "a cancelled/expired attempt or duplicate entered the real connection",
         );
     }
+}
+
+#[tokio::test]
+async fn negotiated_stream_fec_fits_real_quic_datagrams_and_legacy_paths() {
+    let pair = Pair::connect().await;
+    let mut path = pair.path();
+    path.stream_payload = crate::runtime::MAX_STREAM_PAYLOAD;
+    let paths = Arc::new(Mutex::new(vec![path.clone()]));
+    let limit = stream_payload_limit(&paths, true);
+    assert!(limit > MAX_PAYLOAD && limit <= crate::runtime::MAX_STREAM_PAYLOAD);
+    let now = Instant::now();
+    let mut encoder = crate::fec::Encoder::new(4, Duration::from_millis(3)).unwrap();
+    let mut state = quality::State::new(7);
+    let mut symbols = Vec::new();
+    for id in 0..4 {
+        let record = Record {
+            flow: super::super::stream::data_flow(1),
+            id,
+            payload: vec![id as u8; limit],
+        };
+        symbols.extend(encoder.push(&record.encode().unwrap(), now).unwrap());
+    }
+    assert_eq!(symbols.len(), 5);
+    for symbol in symbols {
+        let symbol = wire::shard(symbol);
+        let frame = wire::http_datagram(path.stream, &state.wrap(&symbol, 0)).unwrap();
+        assert!(frame.len() <= path.conn.max_datagram_size().unwrap());
+        path.conn.send_datagram(frame.clone()).unwrap();
+        state.admitted(symbol.len());
+        assert_eq!(pair.receive().await, frame);
+    }
+    let mut legacy = path;
+    legacy.stream_payload = MAX_PAYLOAD;
+    paths.lock().unwrap().push(legacy);
+    assert_eq!(stream_payload_limit(&paths, true), MAX_PAYLOAD);
 }
 
 #[derive(Default)]

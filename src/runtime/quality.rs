@@ -7,6 +7,7 @@ use std::collections::{BTreeSet, VecDeque};
 
 pub const HEADER: usize = 28;
 pub const MAX_FRAME: usize = wire::MAX_WIRE + HEADER;
+pub const MAX_STREAM_FRAME: usize = wire::MAX_STREAM_WIRE + HEADER;
 pub const INTERVAL_US: u64 = 500_000;
 const DELIVERY_INTERVAL_US: u64 = 100_000;
 const DELIVERY_MIN_BYTES: u64 = 4096;
@@ -259,7 +260,7 @@ impl State {
     }
     pub fn receive<'a>(&mut self, b: &'a [u8], now_us: u64) -> Result<&'a [u8]> {
         ensure!(
-            (HEADER + wire::HEADER..=MAX_FRAME).contains(&b.len()) && &b[..4] == b"BQ1D",
+            (HEADER + wire::HEADER..=MAX_STREAM_FRAME).contains(&b.len()) && &b[..4] == b"BQ1D",
             "invalid measurement frame"
         );
         ensure!(

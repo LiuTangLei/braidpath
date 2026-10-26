@@ -49,7 +49,7 @@ const MAX_PTO: Duration = Duration::from_secs(2);
 const DEAD_AFTER: Duration = Duration::from_secs(30);
 /// Copies sent without a loss declaration may produce up to this many duplicate
 /// bytes that are not evidence of reordering.
-const EXPECTED_DUPLICATES_MAX: u64 = 2 * MAX_SEGMENT as u64;
+const EXPECTED_DUPLICATES_MAX: u64 = 2 * (super::MAX_STREAM_PAYLOAD - DATA_HEADER) as u64;
 /// A persistent SACK hole in a bulk flight may get one bounded extra copy.
 /// Small tails already have their separate probe policy.
 const HEAD_PROBE_MIN_FLIGHT: u64 = 64 * 1024;
@@ -177,6 +177,8 @@ impl Frame {
 
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct Snapshot {
+    pub max_data_segment_bytes: u64,
+    pub pmtu_splits: u64,
     pub opened: u64,
     pub completed: u64,
     pub reset_local: u64,
@@ -314,6 +316,7 @@ impl Rtt {
     }
 }
 
+#[derive(Clone)]
 struct Segment {
     end: u64,
     path: usize,
@@ -335,6 +338,7 @@ struct Segment {
 /// back off. Each segment has its own timer, so a tail loss never waits for an
 /// exponentially backed-off connection timer.
 pub struct Sender {
+    pub(crate) pmtu_splits: u64,
     buffer: VecDeque<u8>,
     base: u64,
     written: u64,
@@ -386,6 +390,7 @@ impl Sender {
     /// `open` makes an empty stream announce itself with a zero-length segment.
     pub fn new(open: bool) -> Self {
         Self {
+            pmtu_splits: 0,
             buffer: VecDeque::new(),
             base: 0,
             written: 0,
@@ -595,8 +600,39 @@ impl Sender {
             head_copy: false,
         }
     }
+    /// Split only a selected oversized flight record. Already queued callbacks
+    /// retain their old transmission IDs and cannot retime these new children.
+    fn split_for_payload(&mut self, start: u64, maximum: usize) -> bool {
+        let segment = &self.segments[&start];
+        let data_end = segment.end - u64::from(self.fin.is_some_and(|f| segment.end == f + 1));
+        if data_end - start <= maximum as u64 {
+            return false;
+        }
+        if !self.lost.remove(&start) {
+            self.unschedule(start);
+        }
+        let tail = self.segments[&start].clone();
+        let cut = start + maximum as u64;
+        self.segments.get_mut(&start).expect("segment").end = cut;
+        self.segments.insert(cut, tail);
+        self.pmtu_splits += 1;
+        self.lost.insert(start);
+        self.lost.insert(cut);
+        self.head_copy = self.head_copy.filter(|(offset, _)| *offset != start);
+        self.head_probe = self.head_probe.filter(|(offset, _, _)| *offset != start);
+        true
+    }
+
     pub fn poll_transmit(&mut self, now: Instant) -> Option<Transmit> {
+        self.poll_transmit_sized(now, MAX_PAYLOAD)
+    }
+
+    pub(crate) fn poll_transmit_sized(&mut self, now: Instant, payload: usize) -> Option<Transmit> {
+        let maximum = payload.clamp(DATA_HEADER + 1, super::MAX_STREAM_PAYLOAD) - DATA_HEADER;
         if let Some(start) = self.lost.pop_first() {
+            if self.split_for_payload(start, maximum) {
+                return self.poll_transmit_sized(now, payload);
+            }
             let end = self.segments[&start].end;
             let t = self.send_segment(start, end, now, false);
             if start == self.acked {
@@ -605,6 +641,9 @@ impl Sender {
             return Some(t);
         }
         if let Some((start, end)) = self.head_copy_ready() {
+            if self.split_for_payload(start, maximum) {
+                return self.poll_transmit_sized(now, payload);
+            }
             self.head_copy = None;
             let mut t = self.send_segment(start, end, now, true);
             (t.tail_probe, t.head_copy) = (false, true);
@@ -615,6 +654,9 @@ impl Sender {
             if let Some((start, at)) = self.head_probe_deadline()
                 && now >= at
             {
+                if self.split_for_payload(start, maximum) {
+                    return self.poll_transmit_sized(now, payload);
+                }
                 let end = self.segments[&start].end;
                 self.head_probe = None;
                 self.last_head_probe = Some(now);
@@ -628,6 +670,9 @@ impl Sender {
             if let Some((at, start)) = self.tail_probe_deadline()
                 && now >= at
             {
+                if self.split_for_payload(start, maximum) {
+                    return self.poll_transmit_sized(now, payload);
+                }
                 let end = self.segments[&start].end;
                 return Some(self.send_segment(start, end, now, true));
             }
@@ -635,7 +680,7 @@ impl Sender {
         if self.next < self.written && self.next < self.limit {
             let len = (self.written - self.next)
                 .min(self.limit - self.next)
-                .min(MAX_SEGMENT as u64);
+                .min(maximum as u64);
             let start = self.next;
             self.next += len;
             let fin = self.fin == Some(self.next);
@@ -750,9 +795,8 @@ impl Sender {
                 break;
             }
             if segment.end > cumulative {
-                // Boundaries are stable across retransmission, so a valid peer
-                // never acknowledges part of a segment. Keep the unacknowledged
-                // tail retransmittable rather than trust that.
+                // PMTU resegmentation can acknowledge only part of a retained
+                // record. Keep its unacknowledged tail retransmittable.
                 let lost = self.lost.remove(&start);
                 if !lost {
                     self.unschedule(start);
@@ -1293,6 +1337,66 @@ impl Receiver {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mtu_reduction_repairs_old_flights_with_late_callbacks_and_fin() {
+        for deliver_old in [false, true] {
+            let now = Instant::now();
+            let mut sender = Sender::new(false);
+            let mut receiver = Receiver::default();
+            let bytes: Vec<u8> = (0..12_345).map(|i| (i % 251) as u8).collect();
+            sender.push(&bytes);
+            sender.finish();
+            let mut old = Vec::new();
+            while let Some(t) = sender.poll_transmit_sized(now, 1400) {
+                sender.admitted(t.start, t.transmission, 0, INITIAL_RTT, now);
+                old.push(t);
+            }
+            assert!(old.iter().any(|t| t.frame.encode().len() == 1400));
+            for t in &old {
+                sender.mark_lost(t.start);
+            }
+            let later = now + Duration::from_millis(10);
+            let mut ready = Vec::new();
+            let first = sender.poll_transmit_sized(later, 700).unwrap();
+            assert!(first.frame.encode().len() <= 700);
+            let current = sender.segments[&first.start].transmissions;
+            // A send/drop callback for the old large record cannot replace
+            // the split child's current timer or declare that child lost.
+            sender.admitted(old[0].start, old[0].transmission, 1, INITIAL_RTT, later);
+            assert!(!sender.locally_dropped(old[0].start, old[0].transmission));
+            assert_eq!(sender.segments[&first.start].transmissions, current);
+            if let Frame::Data { offset, fin, data } = first.frame {
+                ready.extend(receiver.on_data(offset, fin, data, later).unwrap());
+            }
+            if deliver_old {
+                // The old large record may arrive after its smaller repair.
+                for t in old.iter().rev() {
+                    if let Frame::Data { offset, fin, data } = &t.frame {
+                        ready.extend(
+                            receiver
+                                .on_data(*offset, *fin, data.clone(), later)
+                                .unwrap(),
+                        );
+                    }
+                }
+            }
+            while let Some(t) = sender.poll_transmit_sized(later, 700) {
+                assert!(t.frame.encode().len() <= 700);
+                sender.admitted(t.start, t.transmission, 1, INITIAL_RTT, later);
+                if let Frame::Data { offset, fin, data } = t.frame {
+                    ready.extend(receiver.on_data(offset, fin, data, later).unwrap());
+                }
+            }
+            assert_eq!(ready, bytes);
+            assert!(sender.pmtu_splits > 0);
+            let ack = receiver.take_ack(later + ACK_SPACING, MAX_WINDOW).unwrap();
+            sender.on_ack(&ack, later + ACK_SPACING).unwrap();
+            assert!(sender.finished());
+            assert_eq!(sender.recovery_state(), (bytes.len() as u64, 0, 0, 0, 0));
+            assert!(sender.buffer.is_empty());
+        }
+    }
 
     #[test]
     fn range_slot_prediction_covers_overlaps_bridges_and_head_repairs() {

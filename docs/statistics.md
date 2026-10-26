@@ -83,6 +83,7 @@ Session/direction `tcp_streams` snapshots include:
 | `opened`, `completed`, `reset_local`, `reset_peer`, `rejected`, `active` | Reliable-flow lifecycle in this mux scope |
 | `bytes_from_application`, `bytes_to_application` | Local socket payload read and successful local socket writes; not proof that a remote application consumed the bytes |
 | `segments_sent`, `retransmitted_segments`, `retransmitted_bytes` | Stream-engine segment attempts and repairs; retries can use another path |
+| `max_data_segment_bytes`, `pmtu_splits` | Largest generated stream data segment and retained-segment splits after a lower path budget; generation is not proof of wire admission |
 | `tail_probes_queued`, `head_copies_queued`, `local_drop_retransmits` | Bounded extra copies and repairs following local admission failure |
 | `acks_sent`, `acks_received`, `probe_timeouts`, `spurious_retransmit_reports` | Stream acknowledgment/recovery events, distinct from QUIC ACKs and packet loss |
 | `duplicate_bytes_received`, `pending_io_events`, `local_sender_queued_bytes` | Duplicate stream bytes and currently owned mux/input backlog |

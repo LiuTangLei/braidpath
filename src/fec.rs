@@ -13,7 +13,7 @@ use std::{
 mod dual;
 pub use dual::DualEncoder;
 
-pub const MAX_PAYLOAD: usize = 1200;
+pub const MAX_PAYLOAD: usize = crate::runtime::MAX_STREAM_PAYLOAD + 12;
 pub const MAX_DATA_SHARDS: usize = 32;
 
 #[derive(Debug, Clone, PartialEq, Eq)]

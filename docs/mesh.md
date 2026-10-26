@@ -86,6 +86,18 @@ rolling TCP compatibility path are replaced; there is no user-facing transport
 switch or automatic fallback to that profile. Mesh credentials and membership
 remain usable, and ordinary UDP-tunnel operation keeps its existing profile.
 
+Reliable sessions additionally negotiate `braidpath-stream-payload`, bounded at
+1,400 record-payload bytes. The existing `braidpath-max-payload: 1000` remains
+the legacy UDP limit; a peer without the new header keeps 1,000-byte stream
+records. No additional command-line option is required. The sender uses the
+common safe size of its connected paths, deducting HTTP mapping, measurement,
+record and FEC overhead from Quinn's current DATAGRAM limit. PMTU changes do
+not change byte offsets: oversized unacknowledged stream segments are split
+when repaired, including FIN and late original-packet handling. Decoder state
+for large records remains subject to a fixed 8 MiB byte budget. These protocol
+checks do not establish a WAN speedup; throughput and tail stalls need matched
+single-TCP measurements.
+
 All local listeners must bind loopback. Their SOCKS5 interface supports CONNECT,
 UDP ASSOCIATE and the no-authentication method; BIND returns command unsupported.
 The remote link requires the existing pinned certificate and client token, and

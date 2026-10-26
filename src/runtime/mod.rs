@@ -24,6 +24,8 @@ pub mod tunnel;
 pub mod wire;
 
 pub const MAX_PAYLOAD: usize = 1000;
+/// Absolute bound for negotiated reliable stream records; UDP keeps MAX_PAYLOAD.
+pub const MAX_STREAM_PAYLOAD: usize = 1400;
 pub const MAX_MESSAGE: usize = 4096;
 pub const MAX_PATHS: usize = 8;
 pub const QUEUE: usize = 256;
