@@ -81,6 +81,18 @@ Current protocol, commands and limits: [experimental runtime](runtime.md). Check
 
 ## M4 — Reliable flows and application adapters
 
+### v0.5.4 — Negotiated reliable record sizing (experimental development)
+
+- Negotiate larger TCP records while preserving legacy peer and raw UDP limits.
+- Fit records to connected paths' current QUIC DATAGRAM budgets, including HTTP,
+  measurement and FEC overhead; split oversized retained repairs after a smaller
+  budget, preserving byte offsets, FIN and stale-callback safety.
+- Bound large-record decoder state by 8 MiB and expose segment-size/split counters.
+- Limit native fast recovery to measured congestion delivery; ordinary monitored
+  growth and the existing congestion brakes remain active.
+- Integrity, failure recovery and resource tests pass. WAN gain and browser
+  acceptance remain distinct from implementation and deployment status.
+
 ### v0.5.3 - Symmetric reliable receive bursts (experimental development)
 
 - Match reliable server receive queues to the existing bounded client queue;
