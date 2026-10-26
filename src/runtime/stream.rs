@@ -189,6 +189,12 @@ pub struct Snapshot {
     pub pending_io_events: u64,
     /// Reliable-stream bytes held in the local sender queue.
     pub local_sender_queued_bytes: u64,
+    /// Retained stream bytes, including unsent bytes and ACK-waiting data.
+    pub send_retained_bytes: u64,
+    pub send_unsent_bytes: u64,
+    pub send_window_blocked_streams: u64,
+    pub receive_buffered_bytes: u64,
+    pub receive_out_of_order_bytes: u64,
     pub bytes_from_application: u64,
     pub bytes_to_application: u64,
     pub segments_sent: u64,
@@ -467,6 +473,16 @@ impl Sender {
             }),
         )
     }
+    /// Read-only gauges, excluding FIN's virtual sequence byte.
+    pub(crate) fn pending_data(&self) -> (u64, u64, bool) {
+        let unsent = self.written.saturating_sub(self.next);
+        (
+            self.written.saturating_sub(self.base),
+            unsent,
+            unsent > 0 && self.next >= self.limit,
+        )
+    }
+
     /// Lowest data offset still retained for retransmission.
     pub fn retained_from(&self) -> u64 {
         self.base
@@ -1337,6 +1353,28 @@ impl Receiver {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transfer_gauges_distinguish_ack_retention_from_peer_window_blockage() {
+        let mut sender = Sender::new(false);
+        let data = vec![0; sender.limit() as usize * 2];
+        sender.push(&data);
+        let now = Instant::now();
+        assert_eq!(
+            sender.pending_data(),
+            (data.len() as u64, data.len() as u64, false)
+        );
+        while sender.poll_transmit(now).is_some() {}
+        let (retained, unsent, blocked) = sender.pending_data();
+        assert_eq!(retained, data.len() as u64);
+        assert!(unsent > 0 && unsent < retained);
+        assert!(blocked);
+        assert_eq!(
+            sender.pending_data(),
+            (retained, unsent, blocked),
+            "sampling cannot mutate recovery"
+        );
+    }
 
     #[test]
     fn mtu_reduction_repairs_old_flights_with_late_callbacks_and_fin() {

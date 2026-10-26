@@ -81,6 +81,17 @@ Current protocol, commands and limits: [experimental runtime](runtime.md). Check
 
 ## M4 — Reliable flows and application adapters
 
+### v0.5.7 — Transfer attribution (experimental development)
+
+- Group native path and application counters on common sampling boundaries,
+  including startup, idle baselines, path replacements and the final tail.
+- Diagnose receive/send queue pressure and TCP extension deltas without modifying
+  services, global limits, nstat history or the original low-latency chain.
+- Reject incomplete legacy windows instead of understating startup loss or
+  overstating byte efficiency. Record the target and connection mode explicitly.
+- Keep congestion, FEC, repair and scheduling behavior from v0.5.6. Fixed-source
+  evidence determines subsequent throughput changes; browser acceptance is separate.
+
 ### v0.5.6 — Shared-uplink upload control (experimental development)
 
 - Match finalized loss to bounded, generation-scoped admission cohorts, so

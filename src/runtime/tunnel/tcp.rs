@@ -1574,6 +1574,20 @@ impl Mux {
         self.stats.active = self.streams.len() as u64;
         self.stats.pending_io_events = self.events.len() as u64;
         self.stats.local_sender_queued_bytes = self.gauge.queued() as u64;
+        let mut gauges = [0u64; 5];
+        for stream in self.streams.values() {
+            let (retained, unsent, blocked) = stream.send.pending_data();
+            gauges[0] += retained;
+            gauges[1] += unsent;
+            gauges[2] += u64::from(blocked);
+            gauges[3] += stream.recv.buffered();
+            gauges[4] += stream.recv.receive_diagnostics().2;
+        }
+        self.stats.send_retained_bytes = gauges[0];
+        self.stats.send_unsent_bytes = gauges[1];
+        self.stats.send_window_blocked_streams = gauges[2];
+        self.stats.receive_buffered_bytes = gauges[3];
+        self.stats.receive_out_of_order_bytes = gauges[4];
         self.stats.duplicate_bytes_received = self.closed_duplicates
             + self
                 .streams
@@ -1583,6 +1597,7 @@ impl Mux {
         let snapshot = self.stats.clone();
         self.scope.update(|d| {
             d.tcp_streams = Some(snapshot.clone());
+            d.tcp_streams_sampled_at = Some(now);
             // Automatic FEC snapshots belong only to the session, not the
             // aggregate scope also visited by update(). Log that scope once.
             if tracing::enabled!(tracing::Level::DEBUG)

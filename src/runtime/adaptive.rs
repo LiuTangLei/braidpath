@@ -3892,6 +3892,12 @@ impl PathController {
         }
     }
 
+    pub(crate) fn last_rate_event(&self) -> Option<(u64, RateReason)> {
+        self.rate_changes
+            .back()
+            .map(|change| (change.at_us, change.reason))
+    }
+
     pub(crate) fn random_loss_diagnostics(&self, now_us: u64) -> Option<(f64, &'static str)> {
         self.random_loss
             .filter(|(_, at)| now_us.saturating_sub(*at) < RANDOM_LOSS_US)

@@ -281,6 +281,8 @@ pub struct Direction {
     /// Reliable TCP stream counters, published by this endpoint's stream adapter.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tcp_streams: Option<super::stream::Snapshot>,
+    #[serde(skip)]
+    pub(crate) tcp_streams_sampled_at: Option<Instant>,
     #[serde(skip_serializing_if = "Ids::is_empty")]
     pub quinn_admitted_record_ids: Ids,
     #[serde(skip_serializing_if = "Ids::is_empty")]

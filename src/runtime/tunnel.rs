@@ -65,6 +65,7 @@ mod proxy;
 mod repair_usefulness_tests;
 mod small_delivery;
 pub(crate) mod tcp;
+mod telemetry;
 mod writer;
 pub use proxy::Access as ProxyAccess;
 pub(crate) use proxy::Destination as StreamTarget;
@@ -1583,6 +1584,7 @@ async fn sender(
     });
     let mut native_probes: [native_probe::Pause; MAX_PATHS] = Default::default();
     let mut logged_rate_changes = [0u64; MAX_PATHS];
+    let mut transfer_telemetry = telemetry::Schedule::default();
     let mut next_sender_log_us = 0u64;
     let mut logged_guard = forward_guard::Snapshot::default();
     let reliable_native_service =
@@ -1801,6 +1803,17 @@ async fn sender(
             account_expired(&expired, now, &metrics);
         }
         let paths = shared_paths.lock().expect("paths lock");
+        if policy.streams || policy.proxy {
+            transfer_telemetry.observe(
+                now_us,
+                queue.len(),
+                &paths,
+                &controllers,
+                &metrics,
+                forward_guard.as_ref(),
+                fec_control.as_ref(),
+            );
+        }
         // Paths that stopped acknowledging carry no data, unless every open
         // path has: then nothing is gained by withholding it.
         let silent = {
@@ -2965,6 +2978,18 @@ async fn sender(
         waiting = next_wait.map(WaitingSend::new);
     }
     drop(waiting);
+    if policy.streams || policy.proxy {
+        telemetry::publish(
+            epoch.elapsed().as_micros().min(u128::from(u64::MAX)) as u64,
+            "shutdown",
+            queue.len(),
+            &shared_paths.lock().expect("paths lock"),
+            &controllers,
+            &metrics,
+            forward_guard.as_ref(),
+            fec_control.as_ref(),
+        );
+    }
     for repair in [false, true] {
         while let Some(pending) = queue.pop(repair) {
             metrics.trace_symbol(

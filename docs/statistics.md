@@ -426,3 +426,41 @@ DATAGRAM send-buffer space. A full application pacing allowance in the path
 writer is not native backpressure; its excess remains in the separate queue
 delay observation. Five-second server path rows include `writer_backlog_bytes`
 and `native_datagram_space_bytes` alongside the application pace.
+
+
+### Common-window transfer evidence (v0.5.7)
+
+`transfer snapshot` emits a single schema-1 JSON `frame` with every current path's
+connection/generation, cumulative native packet/UDP byte counters, symbol admissions,
+writer/native buffer state, pacing and last rate-change reason. The same frame
+contains the session's stream counters, sender queue, forward guard and FEC state.
+Stream counters are cached by the adapter, so `streams_sample_age_us` records
+their age; a common log frame does not make separate actors atomic. Byte-efficiency
+ratios are estimates, best read between quiescent baseline and tail frames.
+Frames appear on path changes, activity start, each active second, a tail after
+one idle second, shutdown, and every 30 idle seconds for a preceding baseline.
+Idle checks do not allocate or serialize until a frame is due. Path counters are
+sampled sequentially inside one actor turn; they are not exact packet cohorts.
+
+`python3 -m bench.transfer_evidence` reads these frames offline. Ratios require an
+unchanged session, direction and path-generation set and matching cumulative
+boundaries. Legacy independent transport logs instead require a sample before
+startup and after the tail on **every expected connection**. Missing coverage or
+counter resets are explicit; truncated observations cannot be exported as full
+transfer totals, and legacy logs cannot produce a precisely aligned application/
+UDP ratio. QUIC-declared loss is not independently measured physical packet loss.
+Application/UDP byte ratio is not capacity utilization and excludes IP/UDP headers.
+
+`python3 -m bench.passive_capture` records private planned target and connection
+mode, samples owned service sockets and reads `/proc/net/netstat` without changing
+nstat history. Actual target/mode must be recorded with the manual result. TCP
+extension deltas remain separate host-level intervals so they cannot accidentally
+be summed once per socket. Socket drops, receive/send queues and interval receive-
+window limitation are retained alongside candidate causes; an empty receive queue
+alone cannot prove an upstream physical-link or remote-server limit.
+
+Stream gauges distinguish `send_retained_bytes` (including ACK-waiting bytes),
+`send_unsent_bytes`, `send_window_blocked_streams`, `receive_buffered_bytes` and
+`receive_out_of_order_bytes`. Empty writer/kernel queues therefore cannot hide a
+full reliable-stream window. These are gauges, never subtracted as cumulative
+counters; publication reads them without changing stream recovery or flow control.
