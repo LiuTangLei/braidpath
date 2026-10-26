@@ -1343,9 +1343,20 @@ impl PathController {
                             .is_some_and(|delivered| delivered > brake)
                     })
             });
+        // BBR's window can stay several times above a bottleneck that a
+        // queue brake has measured. Doubling toward it rebuilds the queue
+        // that the brake drained, and the next brake cuts deeper. Native
+        // service restores only measured congestion delivery; growth beyond
+        // it remains with the monitored ordinary paths.
+        let measured_bps = self
+            .congestion_delivery_bps
+            .filter(|_| self.fast_recovery_enabled && self.congestion_seen)
+            .map(|rate| (rate as u64).max(MIN_BPS));
         let recovery_bps = native_bps.map(|rate| {
-            self.loss_ceiling
-                .map_or(rate, |(ceiling, _)| rate.min(ceiling.max(MIN_BPS)))
+            let rate = self
+                .loss_ceiling
+                .map_or(rate, |(ceiling, _)| rate.min(ceiling.max(MIN_BPS)));
+            measured_bps.map_or(rate, |measured| rate.min(measured))
         });
         if eligible && let Some(native_bps) = recovery_bps.filter(|rate| *rate > self.rate_bps) {
             // At most one doubling per native RTT. Existing admission tokens
@@ -4637,6 +4648,79 @@ mod tests {
         assert!(controller.rate_bps < recovered);
         assert!(controller.last_brake_us.is_some());
         assert_eq!(controller.native_service_recoveries, 1);
+    }
+
+    #[test]
+    fn native_service_restores_only_measured_congestion_delivery() {
+        for legacy in [false, true] {
+            let (mut ordinary, sample) = native_service_fixture();
+            ordinary.fast_recovery_enabled = !legacy;
+            ordinary.observe_native(&sample, None, 2_000_000, 50_000);
+            let before = ordinary.rate_bps;
+            let measured = before + before / 4;
+            let (mut controller, _) = native_service_fixture();
+            controller.fast_recovery_enabled = !legacy;
+            controller.congestion_delivery_bps = Some(measured as f64);
+            // The native window claims the 100 Mbit/s maximum.
+            controller.observe_native_service(&sample, 2_000_000, 50_000);
+            assert_eq!(controller.native_service_recoveries, 1, "legacy {legacy}");
+            let expected = if legacy { before * 2 } else { measured };
+            assert_eq!(controller.rate_bps, expected, "legacy {legacy}");
+        }
+        let (mut controller, sample) = native_service_fixture();
+        controller.congestion_delivery_bps = Some(controller.rate_bps as f64);
+        controller.observe_native_service(&sample, 2_000_000, 50_000);
+        assert_eq!(controller.native_service_recoveries, 0);
+    }
+
+    #[test]
+    fn native_service_cannot_double_past_a_measured_queue_brake() {
+        fn report(controller: &mut PathController, sample: &mut Observation, now: u64, rtt: f64) {
+            let admitted = exercise_budget(controller, sample.now_us, now - sample.now_us);
+            sample.now_us = now;
+            sample.report_number += 1;
+            sample.delivered_bytes += admitted;
+            sample.delivered_bps = Some(admitted as f64 * 80.0);
+            sample.delivery_report_time_us = Some(now);
+            sample.rtt_ms = rtt;
+            sample.probe_rtt_ms = Some(rtt);
+            sample.probe_latest_rtt_ms = Some(rtt);
+            sample.probe_sample_id += 1;
+            // The native window claims the 100 Mbit/s maximum throughout.
+            controller.observe_native_service(sample, 2_000_000, (rtt * 1000.0) as u64);
+        }
+        let run = |unmeasured: bool| {
+            let (mut controller, mut sample) = native_service_fixture();
+            controller.observe_native_service(&sample, 200_000, 50_000);
+            for now in [200_000, 300_000, 400_000] {
+                report(&mut controller, &mut sample, now, 150.0);
+            }
+            assert!(controller.last_brake_us.is_some());
+            let measured = controller.congestion_delivery_bps.expect("measured brake");
+            assert!(measured > controller.rate_bps as f64);
+            if unmeasured {
+                controller.congestion_delivery_bps = None;
+            }
+            // The queue has drained, and every report is new positive delivery.
+            for now in (500_000..=3_000_000).step_by(100_000) {
+                report(&mut controller, &mut sample, now, 50.0);
+            }
+            let peak = controller
+                .rate_changes
+                .iter()
+                .filter(|change| {
+                    matches!(change.reason, RateReason::NativeServiceRecovery)
+                        && change.at_us > 400_000
+                })
+                .map(|change| change.pacing_bps)
+                .max();
+            (measured, peak, controller.rate_bps)
+        };
+        let (measured, peak, _) = run(true);
+        assert!(peak.is_some_and(|peak| peak as f64 > measured));
+        let (measured, peak, rate) = run(false);
+        assert!(peak.is_none_or(|peak| peak as f64 <= measured));
+        assert!(rate as f64 >= measured);
     }
 
     #[test]
