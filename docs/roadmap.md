@@ -81,6 +81,17 @@ Current protocol, commands and limits: [experimental runtime](runtime.md). Check
 
 ## M4 — Reliable flows and application adapters
 
+### v0.5.3 - Symmetric reliable receive bursts (experimental development)
+
+- Match reliable server receive queues to the existing bounded client queue;
+  keep raw UDP latency queues and all sender admission limits unchanged.
+- Include session identity, application pacing, byte progress and receiver
+  overflow counters in ordinary status observations. Detailed debug snapshots
+  remain optional; idle stream progress does not generate extra rows.
+- Regression covers a four-reader burst, finite queue capacity, ordered draining,
+  channel closure and preservation of the raw UDP queue budget. Browser speed
+  and stability still require separate acceptance.
+
 ### v0.5.2 — Reused-session recovery and bounded hole probes (experimental development)
 
 - Restart an idle reliable path from its original native window when new demand

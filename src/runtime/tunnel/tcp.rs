@@ -41,7 +41,7 @@ use tokio::{
     task::{AbortHandle, JoinSet},
     time::{sleep_until, timeout},
 };
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 #[path = "stream_budget.rs"]
 mod stream_budget;
@@ -573,6 +573,7 @@ pub(super) struct Mux {
     closed_duplicates: u64,
     scope: Scope,
     published: Instant,
+    reported: (u64, u64, u64, u64),
     associations: HashMap<u32, Association>,
     next_association: u32,
     datagrams: VecDeque<(u32, Vec<u8>)>,
@@ -608,6 +609,7 @@ impl Mux {
             closed_duplicates: 0,
             scope,
             published: now,
+            reported: (0, 0, 0, 0),
             associations: HashMap::new(),
             next_association: 0,
             datagrams: VecDeque::new(),
@@ -1525,6 +1527,34 @@ impl Mux {
                 };
             }
         }
+    }
+
+    /// Scalar counters only, on the existing slow status tick. Idle sessions
+    /// stay silent, and a closed stream publishes its final byte counters.
+    pub(super) fn report_progress(&mut self) {
+        let current = (
+            self.stats.bytes_from_application,
+            self.stats.bytes_to_application,
+            self.stats.retransmitted_bytes,
+            self.stats.reset_local + self.stats.reset_peer,
+        );
+        if self.streams.is_empty() && current == self.reported {
+            return;
+        }
+        self.reported = current;
+        info!(
+            session = %self.scope.session,
+            direction = self.scope.direction,
+            active = self.streams.len(),
+            app_read_bytes = current.0,
+            app_written_bytes = current.1,
+            retransmitted_bytes = current.2,
+            resets = current.3,
+            pending_io = self.events.len(),
+            queued_bytes = self.gauge.queued(),
+            duplicate_bytes = self.stats.duplicate_bytes_received,
+            "stream transfer progress"
+        );
     }
 
     fn publish(&mut self, now: Instant) {

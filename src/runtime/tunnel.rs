@@ -35,7 +35,7 @@ use tokio::{
 use tracing::{info, warn};
 
 const MAX_FLOWS: usize = 64;
-/// Datagrams the client's paths may hand its session before it reads them:
+/// Datagrams reliable paths may hand their session before it reads them:
 /// about 50 ms of a bulk download. One session task decodes every path, and a
 /// shallower queue overflows during a brief stall of that task, turning a
 /// local delay into stream retransmissions an RTT later.
@@ -3235,6 +3235,12 @@ struct Session {
 }
 type Sessions = Arc<Mutex<HashMap<String, Arc<Session>>>>;
 
+fn session_events(streams: bool, proxy: bool) -> (mpsc::Sender<Event>, mpsc::Receiver<Event>) {
+    // Reliable uploads have the same burst and repair behavior as downloads.
+    // Keep their receive budget symmetric; raw latency UDP retains its queue.
+    mpsc::channel(if streams || proxy { WIRE_QUEUE } else { QUEUE })
+}
+
 // Session loops are detached from connection handlers. Stop them even if the
 // owning server future is cancelled before its normal shutdown path runs.
 struct ServerLifetime {
@@ -3330,8 +3336,9 @@ async fn session_loop(
                 if session.policy.streams || session.policy.proxy {
                     for path in p.iter() { telemetry[usize::from(path.id)].report(&path.conn,"server","local"); }
                 }
-                for path in p.iter(){let stats=path.conn.stats();info!(path=path.id,rtt_ms=path.conn.rtt_hint().as_secs_f64()*1000.0,tx_packets=stats.udp_tx.datagrams,rx_packets=stats.udp_rx.datagrams,tx_bytes=stats.udp_tx.bytes,rx_bytes=stats.udp_rx.bytes,lost=stats.path.lost_packets,cwnd=stats.path.cwnd,"server path statistics");}
-                info!(paths=p.len(),flows=flows.len(),originals=decoder.originals,recovered=decoder.recovered,duplicates=decoder.duplicates,late_stream_records=decoder.late_stream_records,invalid=decoder.invalid,dropped,ingress_drops=session.ingress_drops.load(Ordering::Relaxed),"server session");
+                for path in p.iter(){let stats=path.conn.stats();let mut app_pacing_bps=None;session.returning.path(path.id,|p|app_pacing_bps=p.adaptive.as_ref().map(|a|a.decision.pacing_bps));info!(session=%session.forward.session,path=path.id,?app_pacing_bps,rtt_ms=path.conn.rtt_hint().as_secs_f64()*1000.0,tx_packets=stats.udp_tx.datagrams,rx_packets=stats.udp_rx.datagrams,tx_bytes=stats.udp_tx.bytes,rx_bytes=stats.udp_rx.bytes,lost=stats.path.lost_packets,cwnd=stats.path.cwnd,"server path statistics");}
+                info!(session=%session.forward.session,paths=p.len(),flows=flows.len(),originals=decoder.originals,recovered=decoder.recovered,duplicates=decoder.duplicates,late_stream_records=decoder.late_stream_records,invalid=decoder.invalid,dropped,ingress_drops=session.ingress_drops.load(Ordering::Relaxed),"server session");
+                if let Some(mux)=streams.as_mut(){mux.report_progress();}
             },
             _=retention_deadline(&decoder)=>{decoder.expire_adaptive(Instant::now());publish_retention(&decoder,&session.forward);},
             _=messages::deadline(&messages)=>{messages.expire(Instant::now()); publish_messages(&mut messages, &session.forward);},
@@ -3948,7 +3955,7 @@ async fn server_connection(
                                             session.clone()
                                         } else {
                                             ensure!(map.len()<16,"session limit");
-                                            let (tx,rx)=mpsc::channel(QUEUE);let (stop,_)=watch::channel(false);
+                                            let (tx,rx)=session_events(policy.streams,policy.proxy);let (stop,_)=watch::channel(false);
                                             let observation_notify=policy.adaptive.then(||Arc::new(Notify::new()));
                                             let session=Arc::new(Session{adaptive_fec_retention,generations:Mutex::new([None;MAX_PATHS]),empty_since:Mutex::new(Some(Instant::now())),events:tx,paths:Arc::new(Mutex::new(Vec::new())),stop,policy,observation_notify,ingress_drops:Arc::new(AtomicU64::new(0)),forward:metrics.scope(&sid,stats::FORWARD),returning:metrics.scope(&sid,stats::RETURN),finished:tokio::sync::Notify::new(),done:std::sync::atomic::AtomicBool::new(false)});
                                             map.insert(sid.clone(),session.clone());
@@ -4690,7 +4697,8 @@ async fn client_session(
                 }
                 if now_us.saturating_sub(last_stats)>=2_000_000 {
                     last_stats=now_us;
-                    info!(live,configured=configs.iter().filter(|c|c.enabled).count(),originals=decoder.originals,recovered=decoder.recovered,duplicates=decoder.duplicates,late_stream_records=decoder.late_stream_records,invalid=decoder.invalid,drops,"client path status");
+                    info!(session=%sid,live,configured=configs.iter().filter(|c|c.enabled).count(),originals=decoder.originals,recovered=decoder.recovered,duplicates=decoder.duplicates,late_stream_records=decoder.late_stream_records,invalid=decoder.invalid,drops,ingress_drops=ingress_drops.load(Ordering::Relaxed),"client path status");
+                    if let Some(mux)=streams.as_mut(){mux.report_progress();}
                 }
             },
             rebuilt=rejoin_rx.recv()=>{
@@ -5297,6 +5305,64 @@ mod sender_clock_tests {
 #[cfg(test)]
 mod stream_profile_tests {
     use super::*;
+
+    #[test]
+    fn reliable_server_ingress_keeps_a_bounded_four_path_burst() {
+        for (streams, proxy) in [(true, false), (false, true), (true, true)] {
+            let (tx, mut rx) = session_events(streams, proxy);
+            // Four QUIC readers may each run one ready burst before the
+            // decoder actor gets CPU. The previous 256-slot queue lost 75%.
+            for id in 0..1024u32 {
+                tx.try_send(Event::Wire(
+                    (id % 4) as u8,
+                    Bytes::copy_from_slice(&id.to_be_bytes()),
+                ))
+                .unwrap_or_else(|_| {
+                    panic!("a bounded ready burst must not create local packet loss")
+                });
+            }
+            assert_eq!(tx.max_capacity(), WIRE_QUEUE);
+            for id in 1024..WIRE_QUEUE as u32 {
+                assert!(
+                    tx.try_send(Event::Wire(
+                        (id % 4) as u8,
+                        Bytes::copy_from_slice(&id.to_be_bytes()),
+                    ))
+                    .is_ok()
+                );
+            }
+            assert!(matches!(
+                tx.try_send(Event::Wire(0, Bytes::new())),
+                Err(mpsc::error::TrySendError::Full(_))
+            ));
+            for id in 0..WIRE_QUEUE as u32 {
+                let Event::Wire(path, data) = rx.try_recv().unwrap() else {
+                    panic!("unexpected event")
+                };
+                assert_eq!(path, (id % 4) as u8);
+                assert_eq!(data.as_ref(), id.to_be_bytes());
+            }
+            assert_eq!(tx.capacity(), WIRE_QUEUE);
+            rx.close();
+            assert!(matches!(
+                tx.try_send(Event::Wire(0, Bytes::new())),
+                Err(mpsc::error::TrySendError::Closed(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn raw_udp_server_ingress_retains_its_latency_queue_budget() {
+        let (tx, _rx) = session_events(false, false);
+        assert_eq!(tx.max_capacity(), QUEUE);
+        for _ in 0..QUEUE {
+            assert!(tx.try_send(Event::Wire(0, Bytes::new())).is_ok());
+        }
+        assert!(matches!(
+            tx.try_send(Event::Wire(0, Bytes::new())),
+            Err(mpsc::error::TrySendError::Full(_))
+        ));
+    }
 
     fn peer_close(code: u32, reason: &'static [u8]) -> quinn::ConnectionError {
         quinn::ConnectionError::ApplicationClosed(quinn::ApplicationClose {

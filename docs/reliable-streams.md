@@ -160,6 +160,15 @@ no current loss pressure and no transport blockage; it cannot override a brake o
 mint burst tokens. Growth is capped at one doubling per native RTT and by the
 configured total/group limits. This allowance is not a capacity measurement.
 
+Reliable server sessions use the same bounded 4096-datagram receive queue as
+clients. Four ready path readers can therefore hand off a short burst without
+turning local actor scheduling into packet loss. Raw UDP server sessions retain
+their existing 256-event latency budget; sender admission queues are unchanged.
+Normal status ticks identify sessions and report application bytes, stream
+retransmitted bytes, pending local I/O and queued sender bytes while active.
+Server path ticks include the application pacing allowance alongside native
+QUIC counters. Idle stream diagnostics remain silent after their final totals.
+
 After at least one second without queued business demand, a reliable path can
 restart from its original native window at the current RTT when demand returns.
 This uses neither a retained BBR peak nor new burst tokens. Current delay, loss,
