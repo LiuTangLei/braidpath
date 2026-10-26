@@ -1312,6 +1312,14 @@ fn business_ready_candidates(
     })
 }
 
+fn transport_pressure(path: &OutPath, frame_bytes: usize) -> bool {
+    // Writer occupancy is the application's own pacing, not native capacity.
+    // Treating that deliberate wait as QUIC backpressure prevents recovery
+    // from increasing the very rate that sizes the writer's allowance.
+    // Real queued excess is still measured separately by Writer::backlog.
+    path.conn.datagram_send_buffer_space_hint() < frame_bytes
+}
+
 fn transport_ready_candidates(
     candidates: &[(u8, i32)],
     paths: &[OutPath],
@@ -1848,7 +1856,7 @@ async fn sender(
                 let frame_bytes = payload::wire_limit(record_bytes, policy.receiver_feedback)
                     + wire::http_datagram_overhead(path.stream).expect("admitted stream");
                 let send_queue_bytes = path.writer.backlog();
-                let transport_blocked = !path.writer.admits(frame_bytes);
+                let transport_blocked = transport_pressure(path, frame_bytes);
                 let observation = adaptive::Observation {
                     bulk_backlog,
                     now_us,
@@ -3368,7 +3376,7 @@ async fn session_loop(
                 if session.policy.streams || session.policy.proxy {
                     for path in p.iter() { telemetry[usize::from(path.id)].report(&path.conn,"server","local"); }
                 }
-                for path in p.iter(){let stats=path.conn.stats();let mut app_pacing_bps=None;session.returning.path(path.id,|p|app_pacing_bps=p.adaptive.as_ref().map(|a|a.decision.pacing_bps));info!(session=%session.forward.session,path=path.id,?app_pacing_bps,rtt_ms=path.conn.rtt_hint().as_secs_f64()*1000.0,tx_packets=stats.udp_tx.datagrams,rx_packets=stats.udp_rx.datagrams,tx_bytes=stats.udp_tx.bytes,rx_bytes=stats.udp_rx.bytes,lost=stats.path.lost_packets,cwnd=stats.path.cwnd,"server path statistics");}
+                for path in p.iter(){let stats=path.conn.stats();let mut app_pacing_bps=None;session.returning.path(path.id,|p|app_pacing_bps=p.adaptive.as_ref().map(|a|a.decision.pacing_bps));info!(session=%session.forward.session,path=path.id,?app_pacing_bps,rtt_ms=path.conn.rtt_hint().as_secs_f64()*1000.0,tx_packets=stats.udp_tx.datagrams,rx_packets=stats.udp_rx.datagrams,tx_bytes=stats.udp_tx.bytes,rx_bytes=stats.udp_rx.bytes,lost=stats.path.lost_packets,cwnd=stats.path.cwnd,writer_backlog_bytes=path.writer.backlog(),native_datagram_space_bytes=path.conn.datagram_send_buffer_space_hint(),"server path statistics");}
                 info!(session=%session.forward.session,paths=p.len(),flows=flows.len(),originals=decoder.originals,recovered=decoder.recovered,duplicates=decoder.duplicates,late_stream_records=decoder.late_stream_records,invalid=decoder.invalid,dropped,ingress_drops=session.ingress_drops.load(Ordering::Relaxed),"server session");
                 if let Some(mux)=streams.as_mut(){mux.report_progress();}
             },

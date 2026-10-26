@@ -125,6 +125,32 @@ async fn negotiated_stream_fec_fits_real_quic_datagrams_and_legacy_paths() {
 
 #[derive(Default)]
 struct Wakes(AtomicUsize);
+
+#[tokio::test]
+async fn paced_writer_occupancy_is_not_native_transport_pressure() {
+    let pair = Pair::connect().await;
+    let path = pair.path();
+    path.writer.set_pace(128_000);
+    // The current-thread executor cannot drain the writer during this check.
+    assert!(path.writer.send(Bytes::from_static(FILLER)));
+    assert!(!path.writer.admits(FILLER.len()));
+    assert!(path.conn.datagram_send_buffer_space_hint() >= FILLER.len());
+    assert!(
+        !transport_pressure(&path, FILLER.len()),
+        "our application pacing queue must not inhibit native service recovery"
+    );
+    for _ in 0..100 {
+        if path.conn.datagram_send_buffer_space_hint() < FILLER.len() {
+            break;
+        }
+        path.conn.send_datagram(Bytes::from_static(FILLER)).unwrap();
+    }
+    assert!(path.conn.datagram_send_buffer_space_hint() < FILLER.len());
+    assert!(
+        transport_pressure(&path, FILLER.len()),
+        "actual native buffer pressure still inhibits growth"
+    );
+}
 impl Wake for Wakes {
     fn wake(self: Arc<Self>) {
         self.0.fetch_add(1, Ordering::Relaxed);

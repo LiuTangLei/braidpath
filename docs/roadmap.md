@@ -81,6 +81,15 @@ Current protocol, commands and limits: [experimental runtime](runtime.md). Check
 
 ## M4 — Reliable flows and application adapters
 
+### v0.5.5 — Native transport pressure (experimental development)
+
+- Distinguish an occupied application pacing allowance from native QUIC
+  DATAGRAM buffer pressure so the local allowance does not inhibit its own
+  recovery. Keep writer admission, queued-excess and congestion safety checks.
+- Publish writer backlog and native DATAGRAM space in existing server path logs.
+- Regression covers paced-only occupancy and genuinely full native buffers;
+  manual throughput acceptance remains pending.
+
 ### v0.5.4 — Negotiated reliable record sizing (experimental development)
 
 - Negotiate larger TCP records while preserving legacy peer and raw UDP limits.

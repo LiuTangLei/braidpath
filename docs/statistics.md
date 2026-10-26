@@ -387,3 +387,9 @@ are useful or duplicate. These late handoffs do not increment the decoder's
 new-unique-original or recovered-record counters, and packet tracing labels them
 `late_stream`. They do not extend record history, admit an unknown/closed stream,
 or relax UDP record deduplication.
+
+The adaptive observation `transport_blocked` describes insufficient native QUIC
+DATAGRAM send-buffer space. A full application pacing allowance in the path
+writer is not native backpressure; its excess remains in the separate queue
+delay observation. Five-second server path rows include `writer_backlog_bytes`
+and `native_datagram_space_bytes` alongside the application pace.
