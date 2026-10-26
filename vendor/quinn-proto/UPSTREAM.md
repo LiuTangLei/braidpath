@@ -85,3 +85,5 @@ The controller interface also exposes whether BBR is currently in its native
 RTT-probe phase. Other controllers return false. This is phase telemetry only;
 it does not change BBR's probe timing, pacing, loss response or flight window.
 Quinn publishes the flag with its existing lock-free connection hints.
+
+The maximum DATAGRAM size also respects the configured send-buffer payload capacity, including metadata overhead. This keeps PMTU-sized records sendable with small local buffers; the existing too-large regression checks the advertised limit.

@@ -1357,6 +1357,7 @@ struct SendAccounting<'a> {
     budget: &'a mut outbound::RepairBudget,
     scheduler: &'a mut scheduler::Scheduler,
     controllers: &'a mut [adaptive::PathController; MAX_PATHS],
+    forward_guard: &'a mut Option<forward_guard::Guard>,
     pacer: &'a mut outbound::Pacer,
     groups: &'a mut [outbound::Pacer; MAX_PATHS],
     business: &'a mut Option<outbound::BusinessPacer>,
@@ -1453,10 +1454,19 @@ impl SendAccounting<'_> {
             update_business_pacer(self.business, self.paths, self.controllers, now_us);
         }
         if self.policy.receiver_feedback {
-            path.quality
-                .lock()
-                .expect("quality lock")
-                .admitted(sent.data.len());
+            let mut quality = path.quality.lock().expect("quality lock");
+            if let Some(guard) = self.forward_guard.as_mut() {
+                guard.admitted(
+                    usize::from(path.id),
+                    quality.snapshot.generation,
+                    quality.snapshot.sent_symbols,
+                    sent.data.len(),
+                    now_us,
+                    sent.hold.as_ref().is_some_and(|hold| !hold.interactive())
+                        || !self.queue.is_empty(),
+                );
+            }
+            quality.admitted(sent.data.len());
         }
         budget_admitted(
             self.policy,
@@ -1569,9 +1579,12 @@ async fn sender(
             .with_random_loss_service(metrics.metrics.random_loss_service())
             .with_queue_gated_loss(metrics.metrics.queue_gated_loss())
             .with_legacy_recovery(metrics.metrics.legacy_recovery())
+            .with_shared_uplink_service(metrics.direction == stats::FORWARD)
     });
     let mut native_probes: [native_probe::Pause; MAX_PATHS] = Default::default();
     let mut logged_rate_changes = [0u64; MAX_PATHS];
+    let mut next_sender_log_us = 0u64;
+    let mut logged_guard = forward_guard::Snapshot::default();
     let reliable_native_service =
         (policy.streams || policy.proxy) && !metrics.metrics.legacy_recovery();
     let burst = if policy.adaptive { 2400 } else { 9600 };
@@ -1700,6 +1713,7 @@ async fn sender(
                     budget: &mut budget,
                     scheduler: &mut scheduler,
                     controllers: &mut controllers,
+                    forward_guard: &mut forward_guard,
                     pacer: &mut pacer,
                     groups: &mut groups,
                     business: &mut business,
@@ -1811,6 +1825,72 @@ async fn sender(
             .and_then(|schedule| schedule.take_due(now_us))
             .is_some()
         {
+            let mut cap_changed = false;
+            if let Some(guard) = forward_guard.as_mut() {
+                if metrics.direction == stats::FORWARD {
+                    let native: Vec<_> = paths
+                        .iter()
+                        .map(|path| {
+                            let stats = path.conn.stats();
+                            let generation = path
+                                .quality
+                                .lock()
+                                .expect("quality lock")
+                                .snapshot
+                                .generation;
+                            (
+                                usize::from(path.id),
+                                generation,
+                                stats.path.sent_packets,
+                                stats.path.lost_packets,
+                            )
+                        })
+                        .collect();
+                    guard.observe_native(now_us, &native, queue.has_bulk_stream_data());
+                }
+                let mut sent_bytes = 0u64;
+                let counts: Vec<_> = paths
+                    .iter()
+                    .map(|path| {
+                        let q = path.quality.lock().expect("quality lock");
+                        sent_bytes = sent_bytes.saturating_add(q.snapshot.sent_bytes);
+                        let estimate = &q.snapshot.sender_estimate;
+                        (
+                            usize::from(path.id),
+                            forward_guard::Counts {
+                                generation: q.snapshot.generation,
+                                sent_symbols: q.snapshot.sent_symbols,
+                                expected: estimate.expected,
+                                lost: estimate.lost,
+                                received_bytes: estimate.received_bytes,
+                                report_time_us: estimate.report_time_us,
+                            },
+                        )
+                    })
+                    .collect();
+                cap_changed |= guard.observe(now_us, &counts, sent_bytes);
+                let snapshot = guard.snapshot();
+                if snapshot.trials != logged_guard.trials
+                    || snapshot.confirmed != logged_guard.confirmed
+                    || snapshot.rejected != logged_guard.rejected
+                    || snapshot.inconclusive != logged_guard.inconclusive
+                    || snapshot.decreases != logged_guard.decreases
+                    || snapshot.releases != logged_guard.releases
+                    || (snapshot.floor - logged_guard.floor).abs() >= 0.01
+                {
+                    info!(session = %metrics.session, direction = metrics.direction,
+                        guard = ?snapshot, "forward guard transition");
+                    logged_guard = snapshot.clone();
+                }
+                metrics.publish_forward_guard(snapshot);
+                let learned = guard.take_random_loss();
+                for (id, controller) in controllers.iter_mut().enumerate() {
+                    controller.set_shared_loss(guard.shared_loss());
+                    if let Some(loss) = learned[id] {
+                        controller.inherit_random_loss(loss.generation, loss.fraction, now_us);
+                    }
+                }
+            }
             let bulk_backlog = queue.has_bulk_stream_data();
             for path in paths.iter() {
                 let q = path.quality.lock().expect("quality lock");
@@ -1985,7 +2065,6 @@ async fn sender(
                 &mut reprobe_cursor,
                 now_us,
             );
-            let mut cap_changed = false;
             if let Some(guard) = reverse_guard.as_mut() {
                 let mut sent_bytes = 0u64;
                 let counts: Vec<_> = paths
@@ -2006,37 +2085,6 @@ async fn sender(
                 if guard.observe(now_us, &counts, sent_bytes) {
                     cap_changed = true;
                     metrics.publish_reverse_guard(guard.snapshot());
-                }
-            }
-            if let Some(guard) = forward_guard.as_mut() {
-                let mut sent_bytes = 0u64;
-                let counts: Vec<_> = paths
-                    .iter()
-                    .map(|path| {
-                        let q = path.quality.lock().expect("quality lock");
-                        sent_bytes = sent_bytes.saturating_add(q.snapshot.sent_bytes);
-                        let estimate = &q.snapshot.sender_estimate;
-                        (
-                            usize::from(path.id),
-                            forward_guard::Counts {
-                                generation: q.snapshot.generation,
-                                sent_symbols: q.snapshot.sent_symbols,
-                                expected: estimate.expected,
-                                lost: estimate.lost,
-                                received_bytes: estimate.received_bytes,
-                                report_time_us: estimate.report_time_us,
-                            },
-                        )
-                    })
-                    .collect();
-                cap_changed |= guard.observe(now_us, &counts, sent_bytes);
-                metrics.publish_forward_guard(guard.snapshot());
-                let learned = guard.take_random_loss();
-                for (id, controller) in controllers.iter_mut().enumerate() {
-                    controller.set_shared_loss(guard.shared_loss());
-                    if let Some(loss) = learned[id] {
-                        controller.inherit_random_loss(loss.generation, loss.fraction, now_us);
-                    }
                 }
             }
             if cap_changed {
@@ -2061,8 +2109,28 @@ async fn sender(
                     "application shared pacing changed"
                 );
             }
+            let log_sender = now_us >= next_sender_log_us && !queue.is_empty();
+            if log_sender {
+                next_sender_log_us = now_us.saturating_add(5_000_000);
+                info!(session = %metrics.session, direction = metrics.direction,
+                    forward = ?forward_guard.as_ref().map(forward_guard::Guard::snapshot),
+                    bulk_backlog = queue.has_bulk_stream_data(), "sender guard statistics");
+            }
             for path in paths.iter() {
                 let snapshot = controllers[usize::from(path.id)].snapshot(now_us);
+                if log_sender {
+                    info!(session = %metrics.session, direction = metrics.direction, path = path.id,
+                        app_pacing_bps = snapshot.decision.pacing_bps,
+                        writer_backlog_bytes = path.writer.backlog(),
+                        native_datagram_space_bytes = path.conn.datagram_send_buffer_space_hint(),
+                        queue_gated_loss_hold = ?snapshot.last_control.queue_gated_loss_hold,
+                        random_loss_floor = ?snapshot.last_control.random_loss_floor,
+                        random_loss_decision = ?controllers[usize::from(path.id)].random_loss_diagnostics(now_us),
+                        loss_ceiling_bps = ?snapshot.last_control.loss_ceiling_bps,
+                        loss_test = ?snapshot.last_control.loss_test,
+                        rate_reason = ?snapshot.rate_changes.back().map(|change| change.reason),
+                        "sender path statistics");
+                }
                 if tracing::enabled!(tracing::Level::DEBUG)
                     && logged_rate_changes[usize::from(path.id)] != snapshot.rate_changes_total
                 {
@@ -2103,6 +2171,10 @@ async fn sender(
                 feedback.iter().map(|(id, active, s)| (*id, *active, s)),
             );
             let snapshot = control.snapshot();
+            if changed.is_some() {
+                info!(session = %metrics.session, direction = metrics.direction,
+                    fec = ?snapshot, "automatic FEC changed");
+            }
             if let Some(k) = changed.or_else(|| snapshot.loss_rate.map(|_| snapshot.data_shards)) {
                 match encoder.set_fec(k) {
                     Ok(symbols) => {
@@ -2835,6 +2907,7 @@ async fn sender(
                 budget: &mut budget,
                 scheduler: &mut scheduler,
                 controllers: &mut controllers,
+                forward_guard: &mut forward_guard,
                 pacer: &mut pacer,
                 groups: &mut groups,
                 business: &mut business,

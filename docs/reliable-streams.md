@@ -276,6 +276,16 @@ own runtime rate cap. Duplex totals must not be compared with a single-direction
 capacity denominator. Every requested path must authenticate in one session before
 the workload starts; `path-ready.json` retains that evidence.
 
+`--chunk-bytes N` (upload only) sends one block, waits for a one-byte receipt
+from the target, and then sends the next block on the same TCP connection. A
+partial final block is acknowledged too; the final digest still verifies all
+bytes. `chunk_seconds` records complete block/receipt times and
+`target_chunk_completions` records target-side byte watermarks and UTC Unix
+milliseconds. This workload can expose application-limited gaps between blocks.
+Use `--shared-forward-mbps` to place one direct-drop bucket before all paths.
+Match `--datagram-send-buffer-bytes` on both roles to the configuration being
+compared (the mesh proxy uses 76,800 bytes); plain-client defaults differ.
+
 Probes are closed-loop, with one request outstanding and a minimum interval;
 they do not maintain a fixed offered request rate under delay. Each attempt's
 start, completion and outcome are retained in `probe-attempts.json`. A request

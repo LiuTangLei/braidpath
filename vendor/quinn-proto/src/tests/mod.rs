@@ -2432,6 +2432,8 @@ fn datagram_larger_than_send_buffer_is_too_large() {
     client_config.transport_config(transport_config.into());
     let (client_ch, _) = pair.connect_with(client_config);
 
+    assert_eq!(pair.client_datagrams(client_ch).max_size(), Some(1));
+
     assert_matches!(
         pair.client_datagrams(client_ch)
             .send(Bytes::from_static(&[0; 2]), true),

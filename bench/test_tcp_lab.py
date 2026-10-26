@@ -158,6 +158,18 @@ class Transfer(unittest.TestCase):
                 self.assertEqual(result["received_bytes"], len(data))
                 self.assertIsNone(target.error)
 
+    def test_chunk_upload_waits_for_each_receipt_and_verifies_partial_last_block(self):
+        data = payload(300_017, 3)
+        target = Target("up", data, chunk_bytes=100_000)
+        target.start()
+        result = transfer(target.address, "up", data, 10, chunk_bytes=100_000)
+        target.join(5)
+        self.assertTrue(result["exact"])
+        self.assertIsNone(target.error)
+        self.assertEqual(len(result["chunk_seconds"]), 4)
+        self.assertEqual([c["received_bytes"] for c in target.chunk_completions],
+                         [100_000, 200_000, 300_000, 300_017])
+
     def test_socks_handshake_is_sent_before_the_transfer(self):
         listener = socket.create_server(("127.0.0.1", 0))
         seen = []

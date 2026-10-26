@@ -92,7 +92,9 @@ impl Datagrams<'_> {
             .max_datagram_frame_size?
             .into_inner()
             .saturating_sub(Datagram::SIZE_BOUND as u64);
-        Some(limit.min(max_size as u64) as usize)
+        let buffer_payload = self.conn.config.datagram_send_buffer_size
+            .saturating_sub(size_of::<Datagram>());
+        Some((limit.min(max_size as u64) as usize).min(buffer_payload))
     }
 
     /// Receive an unreliable, unordered datagram

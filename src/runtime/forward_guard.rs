@@ -38,6 +38,7 @@
 //! congestion control, and remains a heuristic rather than a capacity proof.
 use super::MAX_PATHS;
 use serde::Serialize;
+use std::collections::VecDeque;
 
 /// Each decision spans one window of finalized forward symbols.
 const WINDOW_US: u64 = 500_000;
@@ -106,6 +107,91 @@ pub(crate) struct RandomLoss {
     pub fraction: f64,
 }
 
+// Admission runs are bounded by count, not traffic volume. A busy run is
+// split every 100 ms, so partial finalized prefixes can be interpolated without
+// retaining per-packet allocations. Missing/evicted history cannot qualify loss.
+const HISTORY_RUNS: usize = 512;
+const RUN_US: u64 = 100_000;
+const IDLE_GAP_US: u64 = 5_000;
+
+#[derive(Clone, Copy)]
+struct AdmissionRun {
+    start: u64,
+    end: u64,
+    from_us: u64,
+    to_us: u64,
+    bytes: u64,
+    backlogged: bool,
+}
+
+#[derive(Default)]
+struct Admissions {
+    generation: Option<u64>,
+    runs: VecDeque<AdmissionRun>,
+}
+
+#[derive(Clone, Copy, Default)]
+struct Cohort {
+    bytes: f64,
+    span_us: f64,
+    symbols: u64,
+    backlogged: u64,
+}
+
+impl Admissions {
+    fn record(&mut self, generation: u64, run: AdmissionRun) {
+        if self.generation != Some(generation) {
+            self.generation = Some(generation);
+            self.runs.clear();
+        }
+        if let Some(last) = self.runs.back_mut()
+            && last.end == run.start
+            && last.backlogged == run.backlogged
+            && run.to_us.saturating_sub(last.from_us) <= RUN_US
+            && run.from_us.saturating_sub(last.to_us) <= IDLE_GAP_US
+        {
+            last.end = run.end;
+            last.to_us = run.to_us;
+            last.bytes += run.bytes;
+            return;
+        }
+        if self.runs.len() == HISTORY_RUNS {
+            self.runs.pop_front();
+        }
+        self.runs.push_back(run);
+    }
+
+    fn cohort(&mut self, generation: u64, start: u64, end: u64) -> Option<Cohort> {
+        if self.generation != Some(generation) || end <= start {
+            return None;
+        }
+        while self.runs.front().is_some_and(|run| run.end <= start) {
+            self.runs.pop_front();
+        }
+        let mut next = start;
+        let mut cohort = Cohort::default();
+        for run in &self.runs {
+            if run.start > next {
+                return None;
+            }
+            let stop = end.min(run.end);
+            let n = stop.saturating_sub(next);
+            let fraction = n as f64 / (run.end - run.start) as f64;
+            cohort.bytes += run.bytes as f64 * fraction;
+            cohort.span_us += run.to_us.saturating_sub(run.from_us) as f64 * fraction;
+            cohort.symbols += n;
+            if run.backlogged {
+                cohort.backlogged += n;
+            }
+            next = stop;
+            if next == end {
+                return Some(cohort);
+            }
+        }
+        None
+    }
+}
+
 /// Local admission and independently measured peer delivery rates.
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct Window {
@@ -170,6 +256,15 @@ pub struct Snapshot {
     /// stale or changed-generation byte baselines.
     pub receiver_delivery_bps: Option<u64>,
     pub delivery_unavailable_windows: u64,
+    /// Admission rate of the finalized cohort, excluding application-idle gaps.
+    pub cohort_sent_bps: Option<u64>,
+    pub backlogged_fraction: Option<f64>,
+    pub cohort_unavailable_windows: u64,
+    pub nonbinding_windows: u64,
+    pub shared_loss: bool,
+    pub recent_common_loss: Option<f64>,
+    /// Early congestion hint only; never teaches floors or confirms a trial.
+    pub native_common_loss: Option<f64>,
     /// Rate-independent forward loss learned from a rejected trial.
     pub floor: f64,
     /// Loss a kept cap tolerates as independent of its rate.
@@ -186,6 +281,9 @@ pub struct Guard {
     expected: [u64; MAX_PATHS],
     lost: [u64; MAX_PATHS],
     connected: usize,
+    admissions: [Admissions; MAX_PATHS],
+    cohorts: [Cohort; MAX_PATHS],
+    cohort_missing: [bool; MAX_PATHS],
     window_start_us: Option<u64>,
     sent_at_start: u64,
     previous: Option<Window>,
@@ -193,6 +291,9 @@ pub struct Guard {
     onset_windows: u8,
     retest_after_us: u64,
     inconclusive_cooldown: bool,
+    recent_common_loss: Option<f64>,
+    native_last: [Option<(u64, u64, u64)>; MAX_PATHS],
+    native_window_us: Option<u64>,
     state: State,
     snapshot: Snapshot,
 }
@@ -208,12 +309,18 @@ impl Default for Guard {
             expected: [0; MAX_PATHS],
             lost: [0; MAX_PATHS],
             connected: 0,
+            admissions: std::array::from_fn(|_| Admissions::default()),
+            cohorts: [Cohort::default(); MAX_PATHS],
+            cohort_missing: [false; MAX_PATHS],
             window_start_us: None,
             sent_at_start: 0,
             previous: None,
             onset_windows: 0,
             retest_after_us: 0,
             inconclusive_cooldown: false,
+            recent_common_loss: None,
+            native_last: [None; MAX_PATHS],
+            native_window_us: None,
             state: State::Open,
             snapshot: Snapshot::default(),
         }
@@ -223,12 +330,97 @@ impl Default for Guard {
 /// Local admission watermarks avoid comparing sender and receiver clocks.
 struct Settlement {
     started_us: u64,
+    minimum_us: u64,
     marks: [Option<Counts>; MAX_PATHS],
 }
 
 impl Guard {
+    /// Record only successful admission, in the same sequence space as quality.
+    pub(crate) fn admitted(
+        &mut self,
+        id: usize,
+        generation: u64,
+        symbol: u64,
+        bytes: usize,
+        now_us: u64,
+        backlogged: bool,
+    ) {
+        let Some(history) = self.admissions.get_mut(id) else {
+            return;
+        };
+        let from_us = history
+            .runs
+            .back()
+            .filter(|run| {
+                history.generation == Some(generation)
+                    && run.backlogged == backlogged
+                    && now_us.saturating_sub(run.to_us) <= IDLE_GAP_US
+            })
+            .map_or(now_us, |run| run.to_us);
+        history.record(
+            generation,
+            AdmissionRun {
+                start: symbol,
+                end: symbol + 1,
+                from_us,
+                to_us: now_us,
+                bytes: bytes as u64,
+                backlogged,
+            },
+        );
+    }
+
     pub fn snapshot(&self) -> Snapshot {
         self.snapshot.clone()
+    }
+
+    /// Native packet-loss hints arrive before the receiver's deliberate loss
+    /// finalization grace. They only hold rapid native-window growth while
+    /// most busy paths lose packets; the cohort/receiver test still owns every
+    /// cap and random-loss verdict.
+    pub(crate) fn observe_native(
+        &mut self,
+        now_us: u64,
+        paths: &[(usize, u64, u64, u64)],
+        backlogged: bool,
+    ) {
+        if self
+            .native_window_us
+            .is_some_and(|at| now_us.saturating_sub(at) < TRIAL_WINDOW_US)
+        {
+            return;
+        }
+        let connected = paths.len();
+        let mut losses = Vec::with_capacity(connected);
+        let mut present = [false; MAX_PATHS];
+        for &(id, generation, sent, lost) in paths {
+            let Some(slot) = self.native_last.get_mut(id) else {
+                continue;
+            };
+            present[id] = true;
+            if let Some((old_generation, old_sent, old_lost)) = *slot
+                && old_generation == generation
+                && sent >= old_sent
+                && lost >= old_lost
+                && sent - old_sent >= MIN_PATH_SYMBOLS
+            {
+                losses
+                    .push((lost - old_lost).min(sent - old_sent) as f64 / (sent - old_sent) as f64);
+            }
+            *slot = Some((generation, sent, lost));
+        }
+        for (id, present) in present.iter().enumerate() {
+            if !present {
+                self.native_last[id] = None;
+            }
+        }
+        self.native_window_us = Some(now_us);
+        self.snapshot.native_common_loss = if backlogged && losses.len() >= connected.clamp(1, 2) {
+            losses.sort_by(|a, b| b.total_cmp(a));
+            Some(losses[(losses.len() * 2).div_ceil(3) - 1])
+        } else {
+            None
+        };
     }
 
     /// Consumed once so periodic observations cannot renew a path's cache.
@@ -243,7 +435,15 @@ impl Guard {
     /// Whether loss that most paths share is being tested or limited here;
     /// per-path loss tests cannot attribute it meanwhile.
     pub fn shared_loss(&self) -> bool {
-        self.state != State::Open || self.onset_windows != 0
+        self.state != State::Open
+            || self.onset_windows != 0
+            || self
+                .snapshot
+                .native_common_loss
+                .is_some_and(|loss| loss >= ONSET_LOSS.max(self.snapshot.floor + FLOOR_MARGIN))
+            || self
+                .recent_common_loss
+                .is_some_and(|loss| loss >= ONSET_LOSS.max(self.snapshot.floor + FLOOR_MARGIN))
     }
 
     /// `paths` are cumulative forward counts by path id; `sent_bytes` is this
@@ -258,6 +458,13 @@ impl Guard {
                 continue;
             }
             present[id] = true;
+            if self.last[id].is_some_and(|old| old.generation != counts.generation) {
+                self.expected[id] = 0;
+                self.lost[id] = 0;
+                self.cohorts[id] = Cohort::default();
+                self.cohort_missing[id] = false;
+                self.delivery_start[id] = None;
+            }
             if let Some(wait) = self.settlement.as_mut()
                 && wait.marks[id].is_none_or(|mark| mark.generation != counts.generation)
             {
@@ -272,18 +479,16 @@ impl Guard {
                 self.delivery_start[id] = None;
                 self.expected[id] = 0;
                 self.lost[id] = 0;
+                self.cohorts[id] = Cohort::default();
+                self.cohort_missing[id] = false;
+                self.admissions[id] = Admissions::default();
             }
         }
         // A provisional trial can finish as soon as its post-cut evidence is
         // complete. Kept caps still cool down before the next decrease: their
         // feedback may describe a queue that has not yet drained.
-        let settle_us = if matches!(self.state, State::Trial { .. }) {
-            0
-        } else {
-            SETTLE_US
-        };
         let ready = self.settlement.as_ref().is_none_or(|wait| {
-            now_us.saturating_sub(wait.started_us) >= settle_us
+            now_us.saturating_sub(wait.started_us) >= wait.minimum_us
                 && paths
                     .iter()
                     .filter(|(id, _)| *id < MAX_PATHS)
@@ -311,6 +516,18 @@ impl Guard {
                 let expected = counts.expected - old.expected;
                 self.expected[id] += expected;
                 self.lost[id] += (counts.lost - old.lost).min(expected);
+                if expected > 0 {
+                    if let Some(cohort) =
+                        self.admissions[id].cohort(counts.generation, old.expected, counts.expected)
+                    {
+                        self.cohorts[id].bytes += cohort.bytes;
+                        self.cohorts[id].span_us += cohort.span_us;
+                        self.cohorts[id].symbols += cohort.symbols;
+                        self.cohorts[id].backlogged += cohort.backlogged;
+                    } else {
+                        self.cohort_missing[id] = true;
+                    }
+                }
             }
             *slot = Some(counts);
         }
@@ -326,6 +543,9 @@ impl Guard {
             return false;
         };
         let elapsed = now_us.saturating_sub(start);
+        self.recent_common_loss = self.common_loss();
+        self.snapshot.recent_common_loss = self.recent_common_loss;
+        self.snapshot.shared_loss = self.shared_loss();
         let complete_trial_cohort = ready
             && matches!(self.state, State::Trial { .. })
             && elapsed >= TRIAL_WINDOW_US
@@ -341,9 +561,41 @@ impl Guard {
         if delivered.is_none() {
             self.snapshot.delivery_unavailable_windows += 1;
         }
+        // Finalized loss can arrive while the application is idle. Match its
+        // sequence prefix to the state and rate at admission, not today's send
+        // window. Peer byte delivery remains independently clocked; it is never
+        // inferred by multiplying this rate by delayed loss.
+        let mut cohort_rate = 0.0;
+        let mut symbols = 0;
+        let mut backlogged = 0;
+        let mut qualified = true;
+        for id in 0..MAX_PATHS {
+            if self.expected[id] < MIN_PATH_SYMBOLS {
+                continue;
+            }
+            let c = self.cohorts[id];
+            symbols += c.symbols;
+            backlogged += c.backlogged;
+            qualified &= !self.cohort_missing[id]
+                && c.symbols == self.expected[id]
+                && c.span_us > 0.0
+                && c.backlogged as f64 >= c.symbols as f64 * 0.9;
+            cohort_rate += c.bytes * 8e6 / c.span_us.max(1.0);
+        }
+        qualified &= symbols > 0;
+        self.snapshot.backlogged_fraction =
+            (symbols > 0).then(|| backlogged as f64 / symbols as f64);
+        self.snapshot.cohort_sent_bps = qualified.then_some(cohort_rate as u64);
+        if !qualified {
+            self.snapshot.cohort_unavailable_windows += 1;
+        }
         let window = common
             .zip(delivered)
-            .map(|(_, delivered)| Window { sent, delivered });
+            .filter(|_| qualified)
+            .map(|(_, delivered)| Window {
+                sent: cohort_rate,
+                delivered,
+            });
         self.window_losses = std::array::from_fn(|id| {
             (self.expected[id] >= MIN_PATH_SYMBOLS)
                 .then(|| {
@@ -356,6 +608,8 @@ impl Guard {
         });
         self.expected = [0; MAX_PATHS];
         self.lost = [0; MAX_PATHS];
+        self.cohorts = [Cohort::default(); MAX_PATHS];
+        self.cohort_missing = [false; MAX_PATHS];
         self.window_start_us = Some(now_us);
         self.sent_at_start = sent_bytes;
         self.delivery_start = self.last;
@@ -365,20 +619,25 @@ impl Guard {
             self.snapshot.delivered_bps = window.delivered() as u64;
         }
         self.decide(now_us, common.zip(window), sent);
-        self.previous = window;
+        if let Some(window) = window {
+            self.previous = Some(window);
+        }
         (self.snapshot.cap_bps, self.snapshot.cap_floor) = match self.state {
             State::Open => (None, None),
             State::Trial { cap, .. } => (Some(cap as u64), None),
             State::Limited { cap, floor, .. } => (Some(cap as u64), Some(floor)),
         };
-        if self
-            .snapshot
-            .cap_bps
-            .is_some_and(|cap| before.is_none_or(|old| cap < old))
-        {
+        if self.snapshot.cap_bps.is_some_and(|cap| before != Some(cap)) {
             // Discard every report interval that may straddle this rate change.
             self.settlement = Some(Settlement {
                 started_us: now_us,
+                minimum_us: if matches!(self.state, State::Trial { .. })
+                    || before.is_some_and(|old| self.snapshot.cap_bps.is_some_and(|cap| cap > old))
+                {
+                    0
+                } else {
+                    SETTLE_US
+                },
                 marks: self.last,
             });
             self.previous = None;
@@ -388,6 +647,7 @@ impl Guard {
             State::Limited { peak, .. } => Some((peak * (1.0 - PLATEAU)) as u64),
             _ => None,
         };
+        self.snapshot.shared_loss = self.shared_loss();
         self.snapshot.cap_bps != before
     }
 
@@ -454,8 +714,10 @@ impl Guard {
                         && (now_us >= self.retest_after_us
                             || (!self.inconclusive_cooldown
                                 && loss >= floor * RETEST_LOSS + FLOOR_MARGIN))
-                }) && sent >= MIN_TRIGGER_BPS;
-                self.onset_windows = (self.onset_windows << 1 | u8::from(onset)) & 0b111;
+                }) && report.is_some_and(|(_, window)| window.sent >= MIN_TRIGGER_BPS);
+                if report.is_some() {
+                    self.onset_windows = (self.onset_windows << 1 | u8::from(onset)) & 0b111;
+                }
                 match report {
                     // Two of three windows: one noisy report cannot hide it.
                     Some((loss, window)) if onset && self.onset_windows.count_ones() >= 2 => {
@@ -503,7 +765,9 @@ impl Guard {
                 mut loss_under,
             } => {
                 // observe() admits only post-cut finalized intervals after settlement.
-                if let Some((loss, window)) = report {
+                if let Some((loss, window)) = report
+                    && window.sent >= cap * BINDING
+                {
                     sent += window.sent;
                     delivered += window.delivered();
                     loss_under = loss_under.max(loss);
@@ -524,7 +788,18 @@ impl Guard {
                         self.inconclusive_cooldown = true;
                         self.retest_after_us = now_us.saturating_add(INCONCLUSIVE_RETEST_US);
                         State::Open
-                    } else if kept >= cut + HELD * (1.0 - cut) {
+                    } else if kept >= cut + HELD * (1.0 - cut)
+                        || (loss_under <= floor + EXCESS / 2.0
+                            && loss_before >= loss_under + 2.0 * EXCESS
+                            && cut <= MIN_CUT
+                            && kept >= cut * (1.0 + EXCESS))
+                    {
+                        // A binding cut that eliminates excess loss and
+                        // improves delivery per admitted byte is useful even
+                        // when envelope cost makes the real cut deeper than
+                        // intended. Reopening it recreates the measured overrun.
+                        // Independent delivery must still beat the actual cut;
+                        // changed/leading byte cohorts fail the checks above.
                         self.snapshot.confirmed += 1;
                         // Loss under the trial cap may still include the
                         // overrun; a decrease that leaves it unchanged
@@ -597,17 +872,24 @@ impl Guard {
                                 }
                             });
                         }
-                        self.snapshot.floor = self.snapshot.floor.max(loss_before.min(loss_under));
+                        if cut <= MIN_CUT && sent / n >= cap * BINDING {
+                            self.snapshot.floor =
+                                self.snapshot.floor.max(loss_before.min(loss_under));
+                        }
                         self.retest_after_us = now_us.saturating_add(RETEST_US);
                         State::Open
                     }
                 } else if windows >= TRIAL_WINDOWS {
-                    // Missing post-cut reports cannot establish random loss.
+                    // Unexercised/missing cohorts cannot establish random loss.
+                    // Retry on fresh qualified demand without a five-second blackout.
                     self.snapshot.inconclusive += 1;
-                    self.inconclusive_cooldown = true;
-                    self.retest_after_us = now_us.saturating_add(INCONCLUSIVE_RETEST_US);
+                    self.inconclusive_cooldown = false;
+                    self.retest_after_us = now_us;
                     State::Open
                 } else {
+                    if report.is_none_or(|(_, window)| window.sent < cap * BINDING) {
+                        self.snapshot.nonbinding_windows += 1;
+                    }
                     State::Trial {
                         cap,
                         before,
@@ -630,7 +912,9 @@ impl Guard {
                 mut excess,
                 mut decreased_from,
             } => {
-                if let Some((loss, window)) = report {
+                if let Some((loss, window)) = report
+                    && window.sent >= cap * BINDING
+                {
                     if let Some((from, previous_sent)) = decreased_from.take()
                         && window.sent <= previous_sent * MIN_CUT
                         && loss >= from - EXCESS / 2.0
@@ -701,6 +985,8 @@ mod tests {
         now_us: u64,
         sent: u64,
         counts: [Counts; 4],
+        admitted_at_us: u64,
+        admitted_bytes: u64,
     }
 
     impl Drive {
@@ -709,6 +995,8 @@ mod tests {
                 guard: Guard::default(),
                 now_us: 1_000_000,
                 sent: 0,
+                admitted_at_us: 1_000_000,
+                admitted_bytes: 0,
                 counts: [Counts {
                     generation: 7,
                     sent_symbols: 0,
@@ -723,6 +1011,31 @@ mod tests {
         }
 
         fn call(&mut self) -> bool {
+            let last_us = self.admitted_at_us;
+            let bytes = self.sent.saturating_sub(self.admitted_bytes) / 4;
+            for (id, c) in self.counts.iter().enumerate() {
+                let history = &mut self.guard.admissions[id];
+                let start = history
+                    .runs
+                    .back()
+                    .filter(|_| history.generation == Some(c.generation))
+                    .map_or(0, |run| run.end);
+                if c.sent_symbols > start {
+                    history.record(
+                        c.generation,
+                        AdmissionRun {
+                            start,
+                            end: c.sent_symbols,
+                            from_us: last_us,
+                            to_us: self.now_us,
+                            bytes,
+                            backlogged: true,
+                        },
+                    );
+                }
+            }
+            self.admitted_at_us = self.now_us;
+            self.admitted_bytes = self.sent;
             let paths: Vec<_> = self.counts.iter().copied().enumerate().collect();
             self.guard.observe(self.now_us, &paths, self.sent)
         }
@@ -1115,7 +1428,13 @@ mod tests {
         }
         d.call();
         d.window([0.11; 4], cap as f64);
-        assert!(!d.guard.snapshot().settling);
+        assert!(
+            d.guard
+                .settlement
+                .as_ref()
+                .is_none_or(|wait| wait.minimum_us == 0 && wait.started_us == d.now_us),
+            "the old cut settled; only a fresh growth watermark may remain"
+        );
         assert!(d.guard.snapshot().cap_floor.unwrap() < 0.12);
     }
 
@@ -1357,9 +1676,184 @@ mod tests {
         for _ in 0..2 {
             d.window([0.11; 4], 1e6);
         }
-        assert_eq!(d.guard.snapshot().rejected, 1);
+        assert_eq!(d.guard.snapshot().rejected, 0);
+        assert_eq!(d.guard.snapshot().floor, 0.0);
         assert!(d.guard.take_random_loss().iter().all(Option::is_none));
     }
+    #[test]
+    fn a_binding_cut_that_eliminates_loss_and_improves_efficiency_keeps_the_cap() {
+        let mut d = Drive::new();
+        for _ in 0..2 {
+            d.window_rates([0.1; 4], 134e6, [120e6 / 4.0; 4]);
+        }
+        let cap = d.guard.cap_bps().unwrap();
+        for _ in 0..2 {
+            d.window_rates([0.0; 4], 106e6, [106e6 / 4.0; 4]);
+        }
+        assert_eq!(d.guard.cap_bps(), Some(cap));
+        assert_eq!(d.guard.snapshot().confirmed, 1);
+        assert_eq!(d.guard.snapshot().floor, 0.0);
+    }
+
+    #[test]
+    fn block_upload_cohorts_survive_idle_gaps_and_delayed_feedback() {
+        for (burst, busy, gap) in [(250e6_f64, 3, 1), (200e6, 3, 2), (250e6, 2, 1)] {
+            for delay in [1, 2] {
+                for phase in 0..busy + gap {
+                    let mut guard = Guard::default();
+                    let mut now = 1_000_000;
+                    let mut sent = 0;
+                    let mut counts = [Counts {
+                        generation: 7,
+                        sent_symbols: 0,
+                        expected: 0,
+                        lost: 0,
+                        received_bytes: 0,
+                        report_time_us: Some(now),
+                    }; 4];
+                    guard.observe(
+                        now,
+                        &counts.into_iter().enumerate().collect::<Vec<_>>(),
+                        sent,
+                    );
+                    let mut pending = VecDeque::new();
+                    let mut late_sent = 0.0;
+                    let mut late_lost = 0.0;
+                    for step in 0..120 {
+                        let backlogged = (step + phase) % (busy + gap) < busy;
+                        let rate = if backlogged {
+                            guard.cap_bps().map_or(burst, |cap| burst.min(cap as f64))
+                        } else {
+                            2e6
+                        };
+                        let passed = rate.min(130e6);
+                        let loss = 1.0 - passed / rate;
+                        let bytes = (rate * WINDOW_US as f64 / 8e6 / 4.0) as u64;
+                        let symbols = (bytes / 1400).max(1);
+                        for (id, c) in counts.iter_mut().enumerate() {
+                            guard.admissions[id].record(
+                                c.generation,
+                                AdmissionRun {
+                                    start: c.sent_symbols,
+                                    end: c.sent_symbols + symbols,
+                                    from_us: now,
+                                    to_us: now + WINDOW_US,
+                                    bytes,
+                                    backlogged,
+                                },
+                            );
+                            c.sent_symbols += symbols;
+                        }
+                        pending.push_back((
+                            symbols,
+                            (symbols as f64 * loss).round() as u64,
+                            (passed * WINDOW_US as f64 / 8e6 / 4.0) as u64,
+                        ));
+                        if pending.len() > delay {
+                            let (expected, lost, received) = pending.pop_front().unwrap();
+                            for c in &mut counts {
+                                c.expected += expected;
+                                c.lost += lost;
+                                c.received_bytes += received;
+                            }
+                        }
+                        for c in &mut counts {
+                            c.report_time_us = c.report_time_us.map(|at| at + WINDOW_US);
+                        }
+                        sent += bytes * 4;
+                        now += WINDOW_US;
+                        guard.observe(
+                            now,
+                            &counts.into_iter().enumerate().collect::<Vec<_>>(),
+                            sent,
+                        );
+                        let snapshot = guard.snapshot();
+                        let case = (burst, busy, gap, delay, phase, step);
+                        assert_eq!(
+                            snapshot.floor, 0.0,
+                            "false random floor: {case:?} {snapshot:?}"
+                        );
+                        if let Some(cap) = guard.cap_bps() {
+                            assert!(
+                                cap >= 65_000_000,
+                                "idle collapsed the cap: {case:?} {snapshot:?}"
+                            );
+                        }
+                        if step >= 60 && backlogged {
+                            late_sent += rate;
+                            late_lost += rate - passed;
+                        }
+                    }
+                    let snapshot = guard.snapshot();
+                    let case = (burst, busy, gap, delay, phase);
+                    assert!(
+                        snapshot.confirmed > 0,
+                        "never limited: {case:?} {snapshot:?}"
+                    );
+                    assert!(
+                        late_lost / late_sent <= 0.05,
+                        "excess loss: {case:?} {} {snapshot:?}",
+                        late_lost / late_sent
+                    );
+                    let cap = guard.cap_bps().expect("short idle must retain the cap");
+                    assert!(
+                        (117_000_000..=136_500_000).contains(&cap),
+                        "wrong cap: {case:?} {snapshot:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn native_common_loss_holds_growth_without_granting_capacity_or_random_loss() {
+        let mut g = Guard::default();
+        let baseline = (0..4).map(|id| (id, 7, 1_000, 0)).collect::<Vec<_>>();
+        g.observe_native(0, &baseline, true);
+        let lost = (0..4).map(|id| (id, 7, 2_000, 200)).collect::<Vec<_>>();
+        g.observe_native(100_000, &lost, true);
+        assert!(g.shared_loss());
+        assert_eq!(g.cap_bps(), None);
+        assert_eq!(g.snapshot.floor, 0.0);
+        assert!(g.take_random_loss().iter().all(Option::is_none));
+        let clean = (0..4).map(|id| (id, 7, 3_000, 200)).collect::<Vec<_>>();
+        g.observe_native(200_000, &clean, true);
+        assert!(!g.shared_loss());
+        let idle = (0..4).map(|id| (id, 7, 4_000, 500)).collect::<Vec<_>>();
+        g.observe_native(300_000, &idle, false);
+        assert!(
+            !g.shared_loss(),
+            "idle cannot classify a shared native flight"
+        );
+        let one = (0..4)
+            .map(|id| (id, 7, 5_000, if id == 0 { 900 } else { 500 }))
+            .collect::<Vec<_>>();
+        g.observe_native(400_000, &one, true);
+        assert!(
+            !g.shared_loss(),
+            "a single lossy route is not a common bottleneck"
+        );
+    }
+
+    #[test]
+    fn admission_history_is_bounded_and_cannot_cross_generations_or_missing_prefixes() {
+        let mut guard = Guard::default();
+        for symbol in 0..HISTORY_RUNS as u64 + 10 {
+            guard.admitted(0, 7, symbol, 1400, symbol * RUN_US, true);
+        }
+        let history = &mut guard.admissions[0];
+        assert_eq!(history.runs.len(), HISTORY_RUNS);
+        assert!(
+            history.cohort(7, 0, 20).is_none(),
+            "evicted prefix is unknown"
+        );
+        assert!(history.cohort(8, 20, 30).is_none());
+        assert!(history.cohort(7, 20, 30).is_some());
+        guard.admitted(0, 8, 0, 1400, 100_000_000, true);
+        assert_eq!(guard.admissions[0].runs.len(), 1);
+        assert!(guard.admissions[0].cohort(7, 20, 30).is_none());
+    }
+
     fn trial_tick(d: &mut Drive, cap: f64, symbols: u64) {
         for counts in &mut d.counts {
             counts.sent_symbols += symbols;

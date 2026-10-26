@@ -400,6 +400,8 @@ pub enum RateReason {
     TransportBlockedBrake,
     /// Clear-queue loss beyond the path's random loss: is it the pace's own?
     LossTestBrake,
+    /// Most busy routes lose packets; measured service cannot sustain the allowance.
+    SharedLossBrake,
     ReprobeStart,
     ReprobeRollback,
     /// Braking did not drain an RTT elevation: it is propagation, not queue.
@@ -882,11 +884,13 @@ pub struct PathController {
     last_loss_test: Option<(u64, f64, f64)>,
     /// Loss a test found unchanged at a lower pace, and when.
     random_loss: Option<(f64, u64)>,
+    random_loss_from_guard: bool,
     /// Pace below which a test found the path's own drops, and its expiry.
     loss_ceiling: Option<(u64, u64)>,
     /// The session tests loss that most paths share; a test of one path
     /// would also measure the paths that take up its share.
     shared_loss: bool,
+    shared_uplink_service: bool,
     /// Raw and compensated cumulative delivered symbol bytes in this generation.
     compensated_delivery: Option<(u64, u64)>,
     source_local_min_rtt_ms: Option<f64>,
@@ -1009,8 +1013,10 @@ impl PathController {
             loss_tested_us: 0,
             last_loss_test: None,
             random_loss: None,
+            random_loss_from_guard: false,
             loss_ceiling: None,
             shared_loss: false,
+            shared_uplink_service: true,
             compensated_delivery: None,
             source_local_min_rtt_ms: None,
             source_probe_min_rtt_ms: None,
@@ -1129,17 +1135,28 @@ impl PathController {
         self
     }
 
+    /// Early native-service intervention is scoped to the observed client uplink.
+    pub(crate) fn with_shared_uplink_service(mut self, enabled: bool) -> Self {
+        self.shared_uplink_service = enabled;
+        self
+    }
+
     /// Whether the session is testing or limiting loss that most paths share.
     pub(crate) fn set_shared_loss(&mut self, shared: bool) {
         self.shared_loss = shared;
+        if shared {
+            self.random_loss = None;
+        }
     }
 
     /// Reuse this path's qualified evidence from a rejected aggregate trial.
     /// This seeds only the existing finite loss-test cache, not queue/service
     /// protections, and must never cross a path generation.
     pub(crate) fn inherit_random_loss(&mut self, generation: u64, fraction: f64, now_us: u64) {
-        if self.queue_gated_loss_enabled && self.generation == Some(generation) {
+        if self.queue_gated_loss_enabled && !self.shared_loss && self.generation == Some(generation)
+        {
             self.random_loss = Some((fraction, now_us));
+            self.random_loss_from_guard = true;
         }
     }
 
@@ -1281,6 +1298,7 @@ impl PathController {
         // retained BBR startup peak. Native readiness, current delay/loss and
         // tested loss ceilings still gate the first flight; no tokens are added.
         if previous_generation == Some(observation.generation)
+            && (!self.shared_loss || !self.shared_uplink_service)
             && idle_us.is_some_and(|idle| idle >= NATIVE_IDLE_RESTART_US)
             && self.decision(now).eligible
             && self.last_control.rtt_fresh
@@ -1323,7 +1341,37 @@ impl PathController {
             && previous_report.is_some_and(|(number, bytes, _)| {
                 observation.report_number > number && observation.delivered_bytes > bytes
             });
+        if self.shared_loss
+            && self.shared_uplink_service
+            && observation.bulk_backlog
+            && observation.offered_backlog
+            && fresh_positive
+            && new_positive
+            && observation.delivery_sample_span_us >= 100_000
+            && self
+                .last_brake_us
+                .is_none_or(|at| now.saturating_sub(at) >= rtt_us.max(100_000))
+            && let Some(delivered) = observation
+                .delivered_bps
+                .filter(|rate| rate.is_finite() && *rate > MIN_BPS as f64)
+        {
+            // Holding the NEXT doubling is too late if the existing allowance
+            // already overruns a shallow shared uplink. Return toward fresh
+            // independent delivery, at most 30% per RTT. This is not a random
+            // loss verdict, and a report from an idle block cannot collapse the
+            // allowance in one observation. Existing monitored growth remains.
+            let service = delivered * self.wire_per_symbol;
+            if service * 1.1 < self.rate_bps as f64 {
+                let previous = self.rate_bps;
+                self.rate_bps = (service * 1.03).max(previous as f64 * 0.7) as u64;
+                self.congestion_seen = true;
+                self.congestion_delivery_bps = Some(service.max(self.rate_bps as f64));
+                self.record_brake(observation);
+                self.record_rate_change(now, previous, RateReason::SharedLossBrake);
+            }
+        }
         let eligible = self.decision(now).eligible
+            && (!self.shared_loss || !self.shared_uplink_service)
             && observation.offered_backlog
             && fresh_positive
             && new_positive
@@ -1377,11 +1425,14 @@ impl PathController {
     ) {
         let now = observation.now_us;
         if self.generation != Some(observation.generation) {
+            let shared_loss = self.shared_loss;
             *self = Self::new(self.maximum_bps, self.target_ms as u64)
                 .with_rtt_source_baselines(self.rtt_source_baselines_enabled)
                 .with_random_loss_service(self.random_loss_service_enabled)
                 .with_queue_gated_loss(self.queue_gated_loss_enabled)
-                .with_legacy_recovery(!self.fast_recovery_enabled);
+                .with_legacy_recovery(!self.fast_recovery_enabled)
+                .with_shared_uplink_service(self.shared_uplink_service);
+            self.shared_loss = shared_loss;
             self.generation = Some(observation.generation);
             self.born_us = now;
             self.last_control_us = now;
@@ -3493,6 +3544,7 @@ impl PathController {
                         {
                             // The same fraction of a lower pace: the path's loss.
                             self.random_loss = Some((loss.min(held), now));
+                            self.random_loss_from_guard = false;
                         }
                         // Otherwise, or with more loss under the brake, other
                         // traffic moved the result: no verdict.
@@ -3838,6 +3890,21 @@ impl PathController {
         } else {
             configured
         }
+    }
+
+    pub(crate) fn random_loss_diagnostics(&self, now_us: u64) -> Option<(f64, &'static str)> {
+        self.random_loss
+            .filter(|(_, at)| now_us.saturating_sub(*at) < RANDOM_LOSS_US)
+            .map(|(loss, _)| {
+                (
+                    loss,
+                    if self.random_loss_from_guard {
+                        "forward_guard"
+                    } else {
+                        "per_path_test"
+                    },
+                )
+            })
     }
 
     pub fn snapshot(&self, now_us: u64) -> Snapshot {
@@ -4490,8 +4557,45 @@ mod tests {
     }
 
     #[test]
+    fn shared_loss_brakes_an_already_excessive_native_allowance_to_observed_service() {
+        let (mut controller, mut sample) = native_service_fixture();
+        controller.congestion_seen = false;
+        controller.rate_bps = 80_000_000;
+        sample.bulk_backlog = true;
+        sample.delivered_bps = Some(10_000_000.0);
+        controller.set_shared_loss(true);
+        controller.observe_native_service(&sample, 2_000_000, 50_000);
+        assert!(
+            (10_000_000..=60_000_000).contains(&controller.rate_bps),
+            "{}",
+            controller.rate_bps
+        );
+        assert!(controller.congestion_seen);
+        let held = controller.rate_bps;
+        // Repeated control observations cannot keep cutting on the same report.
+        sample.now_us += 1_000;
+        controller.observe_native_service(&sample, 2_000_000, 50_000);
+        assert_eq!(controller.rate_bps, held);
+    }
+
+    #[test]
+    fn download_keeps_native_service_behavior_during_a_shared_guard_episode() {
+        let (mut controller, mut sample) = native_service_fixture();
+        controller.shared_uplink_service = false;
+        controller.set_shared_loss(true);
+        sample.bulk_backlog = true;
+        let previous = controller.rate_bps;
+        controller.observe_native_service(&sample, 200_000, 50_000);
+        assert!(controller.rate_bps > previous);
+        assert!(matches!(
+            controller.rate_changes.back().unwrap().reason,
+            RateReason::NativeServiceRecovery
+        ));
+    }
+
+    #[test]
     fn native_service_requires_new_positive_fresh_unblocked_demand_and_no_pressure() {
-        for case in 0..11 {
+        for case in 0..12 {
             let (mut controller, mut sample) = native_service_fixture();
             match case {
                 0 => sample.offered_backlog = false,
@@ -4512,6 +4616,7 @@ mod tests {
                 8 => controller.growth_not_before_us = sample.now_us + 1,
                 9 => controller.last_brake_us = Some(sample.now_us - 1),
                 10 => controller.last_growth_us = sample.now_us - 49_999,
+                11 => controller.set_shared_loss(true),
                 _ => unreachable!(),
             }
             controller.observe_native_service(&sample, 200_000, 50_000);
@@ -5728,6 +5833,22 @@ mod tests {
             VecDeque::from([(now + 100_000, 1_000, 300), (now + 200_000, 1_000, 300)]);
         c.test_clear_queue_loss(now + 200_000, Some((1_000, 300)), true, Some(100.0));
         assert!(c.loss_test.is_some(), "new excess is still investigated");
+    }
+
+    #[test]
+    fn shared_congestion_invalidates_and_blocks_per_path_random_loss_credit() {
+        let (mut controller, sample) = queue_gated_fixture();
+        assert!(controller.random_loss.is_some());
+        controller.set_shared_loss(true);
+        assert!(controller.random_loss.is_none());
+        controller.inherit_random_loss(sample.generation, 0.11, sample.now_us);
+        assert!(controller.random_loss.is_none());
+        controller.set_shared_loss(false);
+        controller.inherit_random_loss(sample.generation, 0.11, sample.now_us);
+        assert_eq!(
+            controller.random_loss_diagnostics(sample.now_us),
+            Some((0.11, "forward_guard"))
+        );
     }
 
     #[test]

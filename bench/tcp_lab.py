@@ -64,6 +64,8 @@ def parse_args(argv=None):
     parser.add_argument("--use-path", type=int, action="append",
                         help="client entrance subset by emulator path index; default all")
     parser.add_argument("--bytes", type=int, default=16 * 1024 * 1024)
+    parser.add_argument("--chunk-bytes", type=int, default=0,
+                        help="upload a block, wait for a one-byte target receipt, then send the next")
     parser.add_argument("--direction", choices=("up", "down", "both"), default="up")
     parser.add_argument("--entrance", choices=("fixed", "socks5"), default="fixed")
     parser.add_argument("--connections", type=int, default=1)
@@ -88,6 +90,8 @@ def parse_args(argv=None):
         parser.error("evidence must be under local/")
     if not 65_536 <= args.bytes <= 512 * 1024 * 1024 or not 1 <= len(args.path) <= 4:
         parser.error("bounded bytes/path count exceeded")
+    if args.chunk_bytes and (not 1 <= args.chunk_bytes <= args.bytes or args.direction != "up"):
+        parser.error("chunk-bytes needs an upload and must be between 1 and bytes")
     if not 0 <= args.loss_percent <= 50:
         parser.error("loss must be 0..50 percent")
     if not 0 <= args.loss_max_datagram_bytes <= 65_535:
@@ -127,9 +131,11 @@ class Target(threading.Thread):
 
     For uploads it records the longest pause between received chunks."""
 
-    def __init__(self, direction, data, connections=1, timeout=120):
+    def __init__(self, direction, data, connections=1, timeout=120, chunk_bytes=0):
         super().__init__(daemon=True)
         self.direction, self.data, self.connections = direction, data, connections
+        self.chunk_bytes = chunk_bytes
+        self.chunk_completions = []
         self.listener = socket.create_server(("127.0.0.1", 0))
         self.listener.settimeout(timeout)
         self.timeout = timeout
@@ -159,7 +165,8 @@ class Target(threading.Thread):
             with conn:
                 if self.direction == "up":
                     digest, count, last = hashlib.sha256(), 0, None
-                    while chunk := conn.recv(1 << 16):
+                    while chunk := conn.recv(min(1 << 16, self.chunk_bytes - count % self.chunk_bytes)
+                                             if self.chunk_bytes else 1 << 16):
                         now = time.monotonic()
                         if last is not None and now - last > self.max_gap_seconds:
                             self.max_gap_seconds = now - last
@@ -167,6 +174,10 @@ class Target(threading.Thread):
                         last = now
                         digest.update(chunk)
                         count += len(chunk)
+                        if self.chunk_bytes and (count % self.chunk_bytes == 0 or count == len(self.data)):
+                            self.chunk_completions.append({"received_bytes": count,
+                                                           "unix_ms": round(time.time() * 1000)})
+                            conn.sendall(b"\x01")
                     conn.sendall(DIGEST.pack(digest.digest(), count))
                 else:
                     conn.sendall(self.data)
@@ -362,11 +373,12 @@ def socks_connect(conn, address, deadline=None):
         raise RuntimeError(f"SOCKS5 CONNECT failed: {reply!r}")
 
 
-def transfer(address, direction, data, limit, socks_target=None):
+def transfer(address, direction, data, limit, socks_target=None, chunk_bytes=0):
     host, port = address.rsplit(":", 1)
     conn = socket.create_connection((host, int(port)), timeout=limit)
     started = time.monotonic()
     setup, gap = None, None
+    chunk_seconds = []
     deadline = started + limit
 
     def remaining():
@@ -381,7 +393,17 @@ def transfer(address, direction, data, limit, socks_target=None):
             setup = time.monotonic() - started
         if direction == "up":
             remaining()
-            conn.sendall(data)
+            if chunk_bytes:
+                for start in range(0, len(data), chunk_bytes):
+                    chunk_started = time.monotonic()
+                    remaining()
+                    conn.sendall(memoryview(data)[start:start + chunk_bytes])
+                    remaining()
+                    if conn.recv(1) != b"\x01":
+                        raise RuntimeError("missing upload block receipt")
+                    chunk_seconds.append(time.monotonic() - chunk_started)
+            else:
+                conn.sendall(data)
             conn.shutdown(socket.SHUT_WR)
             reply = b""
             while len(reply) < DIGEST.size:
@@ -410,6 +432,7 @@ def transfer(address, direction, data, limit, socks_target=None):
             exact = digest.digest() == hashlib.sha256(data).digest() and count == len(data)
     return {"elapsed_seconds": elapsed, "exact": exact, "received_bytes": count,
             "proxy_setup_seconds": setup, "max_gap_seconds": gap,
+            "chunk_seconds": chunk_seconds,
             "goodput_mbps": len(data) * 8 / elapsed / 1e6 if exact else 0.0}
 
 
@@ -452,6 +475,7 @@ def run(args):
         "lab_sha256": hashlib.sha256(args.lab_binary.read_bytes()).hexdigest(),
         "paths": args.path, "bytes_per_connection": args.bytes, "connections": args.connections,
         "direction": args.direction, "seed": args.seed, "events": args.event,
+        "chunk_bytes": args.chunk_bytes,
         "shared_forward_mbps": args.shared_forward_mbps,
         "shared_forward_burst_bytes": args.shared_forward_burst_bytes,
     })
@@ -473,7 +497,8 @@ def run(args):
         cert, key, token = (identity / name for name in ("cert.pem", "key.pem", "token"))
         data = payload(args.bytes, args.seed)
         directions = ["up", "down"] if args.direction == "both" else [args.direction]
-        targets = {direction: Target(direction, data, args.connections, args.timeout_seconds)
+        targets = {direction: Target(direction, data, args.connections, args.timeout_seconds,
+                                     chunk_bytes=args.chunk_bytes)
                    for direction in directions}
         for target in targets.values():
             target.start()
@@ -551,7 +576,8 @@ def run(args):
             direction = jobs[index]
             try:
                 result = transfer(tcp_listen, direction, data, args.timeout_seconds,
-                                  targets[direction].address if args.entrance == "socks5" else None)
+                                  targets[direction].address if args.entrance == "socks5" else None,
+                                  chunk_bytes=args.chunk_bytes)
                 result["error"] = None
             except (OSError, RuntimeError) as error:
                 result = {"exact": False, "received_bytes": 0, "goodput_mbps": 0.0,
@@ -585,6 +611,8 @@ def run(args):
         # The end of the longest upload gap, to align with role sample_unix_ms.
         widest = max(targets.values(), key=lambda t: t.max_gap_seconds, default=None)
         result["target_max_gap_end_unix_ms"] = widest and widest.max_gap_end_unix_ms
+        result["target_chunk_completions"] = {
+            direction: target.chunk_completions for direction, target in targets.items()}
         result["by_direction"] = {
             direction: {"exact": all(r["exact"] for r in results if r["direction"] == direction),
                         "received_bytes": sum(r["received_bytes"] for r in results

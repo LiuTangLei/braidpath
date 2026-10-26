@@ -631,6 +631,7 @@ impl Accounting {
             budget: &mut self.budget,
             scheduler: &mut self.scheduler,
             controllers: &mut self.controllers,
+            forward_guard: &mut None,
             pacer: &mut self.pacer,
             groups: &mut self.groups,
             business: &mut self.business,

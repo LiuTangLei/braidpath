@@ -81,6 +81,18 @@ Current protocol, commands and limits: [experimental runtime](runtime.md). Check
 
 ## M4 — Reliable flows and application adapters
 
+### v0.5.6 — Shared-uplink upload control (experimental development)
+
+- Match finalized loss to bounded, generation-scoped admission cohorts, so
+  block-upload idle gaps cannot teach a random-loss floor or collapse a cap.
+- Require binding trial evidence, preserve short idle gaps, and wait for fresh
+  feedback after growth. Native common-loss hints only protect early service;
+  receiver/finalized feedback still owns aggregate cap and floor decisions.
+- Expose sender path/guard/FEC decisions and add a block/receipt upload workload
+  to the shared-policer laboratory. Keep failed and intermediate measurements.
+- Respect the local DATAGRAM send-buffer capacity when advertising record size.
+- Public-network upload/download and low-stall acceptance remain pending.
+
 ### v0.5.5 — Native transport pressure (experimental development)
 
 - Distinguish an occupied application pacing allowance from native QUIC

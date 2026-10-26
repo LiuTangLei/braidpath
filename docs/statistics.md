@@ -270,19 +270,52 @@ With source-port rotation or automatic recovery enabled, logical path counters r
 ## Adaptive control and successful admission
 
 Each session direction's `forward_guard` reports the shared-loss aggregate cap.
-`sent_bps` is local admitted symbol service; `delivered_bps` is the last qualified
-peer byte-delivery rate. The latter is calculated from each path's cumulative
-unique pre-FEC bytes and its receiver-local report interval, then summed. It is
-not current local sending multiplied by a delayed loss fraction. The current
-`receiver_delivery_bps` is null when a clock/byte baseline is missing, unchanged,
-regressed or belongs to another generation; `delivery_unavailable_windows`
-counts such windows. Loss quorum, post-cut admission watermarks, trial bounds,
-operator caps and conservative growth after a confirmed limit still apply.
-A trial with inconsistent send/delivery windows, or reduced delivery accompanied
-by substantially improved loss, is inconclusive and cannot teach a random-loss
-floor. Its five-second retry wait also applies when no random-loss floor has
-been learned; the larger-loss shortcut remains available after a conclusive
-random-loss rejection. These rates count symbols, including FEC, rather than TCP goodput.
+`sent_bps` is current local admitted symbol service. `cohort_sent_bps` instead
+matches finalized sequence intervals to bounded admission runs, including their
+original backlog state, bytes and sender-local span. Runs cover at most 100 ms
+and are interpolated when a feedback prefix cuts through one; rates are estimates,
+not independent capacity measurements. A path retains at most 512 runs. Missing
+history, changed generations and intervals with less than 90% backlogged symbols
+cannot qualify a decision. `backlogged_fraction` and
+`cohort_unavailable_windows` expose this qualification. No packet format changes.
+
+`delivered_bps` remains the last qualified peer byte-delivery rate, calculated
+from cumulative unique pre-FEC bytes over each receiver-local report interval.
+`receiver_delivery_bps` is null for incomplete, unchanged or invalid baselines;
+`delivery_unavailable_windows` counts these windows. It is never inferred by
+multiplying current admissions by delayed loss. Receiver byte and finalized loss
+reports have different horizons; inconsistent comparisons remain inconclusive.
+All these rates count symbols, including FEC, rather than TCP goodput.
+
+A trial only judges observations that exercised at least 80% of its cap;
+`nonbinding_windows` counts skipped observations. Application-limited trials
+cannot learn or export a random-loss floor. Exhausting a trial without qualified
+demand opens it without a five-second retry blackout. Inconsistent qualified
+send/delivery comparisons retain that retry wait. Unknown intervals do not erase
+onset evidence. Kept caps survive short application idle gaps, and only qualified,
+binding intervals can decrease them or teach a cap floor. Growth also waits for
+feedback beyond its admission watermark, avoiding repeated increases on the
+same earlier clean flight. Recent common loss also holds native-window service
+renewal and invalidates per-path random-loss credit before a trial is confirmed;
+positive byte feedback alone cannot keep doubling allowances into shared loss.
+`native_common_loss` supplies an earlier hold from sampled QUIC packet counters
+on a qualified majority of busy paths. This hint alone cannot set an aggregate cap, confirm
+a trial or teach a floor; delayed finalized cohorts still own those decisions.
+The early native hint and service intervention apply to client uploads; download
+paths retain the previous native-service behavior. While upload common loss holds,
+a fresh positive receiver report with bulk backlog can
+also return an already excessive native application allowance toward measured
+service. `shared_loss_brake` cuts at most 30% per native RTT (at least 100 ms),
+records the admission barrier and uses the existing monitored recovery. Repeated
+old reports and application-idle observations cannot apply this brake.
+Operator limits, path-generation checks and the existing loss quorum remain in force.
+
+Both senders log guard decision transitions and automatic FEC changes at info.
+With pending data, five-second `sender guard statistics` and `sender path
+statistics` lines expose cap/floor/trial counters, qualification, application pace,
+writer backlog, native DATAGRAM space, queue-gated loss holds, random-loss cache
+source (`per_path_test` or `forward_guard`), loss-test ceiling and latest rate
+reason. Idle senders do not produce periodic rows.
 
 Native-window service recovery respects both phases of a per-path loss trial
 and any resulting pace ceiling. It may recover below a live ceiling, and resume
