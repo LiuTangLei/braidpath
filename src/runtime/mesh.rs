@@ -241,6 +241,7 @@ impl Drop for AbortTask {
 }
 pub struct State {
     proxy: Option<Arc<super::proxy::Server>>,
+    fixed_tcp: bool,
     own: Node,
     _directory_lock: Option<Arc<fs::File>>,
     bind: SocketAddr,
@@ -828,14 +829,15 @@ pub struct ServerOptions {
     pub join: Option<SocketAddr>,
     pub join_key: Option<PathBuf>,
     pub target: Option<SocketAddr>,
+    pub tcp_target: Option<SocketAddr>,
     pub proxy: Option<super::proxy::ServerConfig>,
     pub rate: u64,
     pub stats: stats::Metrics,
 }
 pub async fn serve(options: ServerOptions) -> Result<()> {
     ensure!(
-        options.target.is_some() || options.proxy.is_some(),
-        "enable a UDP tunnel target or proxy service"
+        options.target.is_some() || options.tcp_target.is_some() || options.proxy.is_some(),
+        "enable a UDP target, a fixed TCP target, or proxy service"
     );
     ensure!(
         (64_000..=super::MAX_RATE_BPS).contains(&options.rate),
@@ -870,6 +872,7 @@ pub async fn serve(options: ServerOptions) -> Result<()> {
         .transpose()?;
     let state = Arc::new(State {
         proxy: proxy.clone(),
+        fixed_tcp: options.tcp_target.is_some(),
         own,
         _directory_lock: Some(Arc::new(directory_lock)),
         bind: options.listen,
@@ -969,7 +972,7 @@ pub async fn serve(options: ServerOptions) -> Result<()> {
     tracing::info!(node=%state.own.id, "leaderless mesh enabled; client-key.json and server-key.json are in the state directory");
     tunnel::serve_with_mesh(
         tunnel::ServerOptions {
-            tcp_target: None,
+            tcp_target: options.tcp_target,
             stream_proxy: options.proxy.map(|config| tunnel::ProxyAccess {
                 allow_private: config.allow_private,
             }),

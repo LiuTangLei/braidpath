@@ -71,6 +71,7 @@ pub(super) async fn server_with_metrics(
         advertise: listen,
         relay_ports: None,
         target: Some(target),
+        tcp_target: None,
         proxy: None,
         rate: 10_000_000,
         join: join.as_ref().map(|(a, _)| *a),
@@ -345,6 +346,7 @@ async fn mesh_survives_bootstrap_loss_and_selects_any_exit_through_peers() {
 pub(crate) fn state(root: &Path) -> State {
     State {
         proxy: None,
+        fixed_tcp: false,
         _directory_lock: None,
         own: Node {
             id: "own".into(),

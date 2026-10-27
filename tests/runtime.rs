@@ -173,6 +173,245 @@ fn port() -> String {
 }
 
 #[test]
+fn mesh_fixed_tcp_discovers_relays_preserves_one_target_and_releases_leases() {
+    mesh_fixed_tcp_fixture(false);
+}
+
+#[test]
+fn mesh_fixed_tcp_keeps_the_same_target_socket_when_bootstrap_relay_stops() {
+    mesh_fixed_tcp_fixture(true);
+}
+
+fn mesh_fixed_tcp_fixture(stop_relay: bool) {
+    use std::io::{Read, Write};
+    use std::net::{Shutdown, TcpListener, TcpStream};
+    let _serial = socket_fixture();
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    let _evidence = FailureEvidence(root.to_owned());
+    let target = TcpListener::bind("127.0.0.1:0").unwrap();
+    let target_addr = target.local_addr().unwrap().to_string();
+    target.set_nonblocking(true).unwrap();
+    // A different fixed target on the bootstrap must never receive the flow.
+    let decoy = TcpListener::bind("127.0.0.1:0").unwrap();
+    decoy.set_nonblocking(true).unwrap();
+    let decoy_addr = decoy.local_addr().unwrap().to_string();
+    let exit_addr = port();
+    let mut exit = launch(
+        &args(&[
+            "mesh-server",
+            "--dir",
+            root.join("exit").to_str().unwrap(),
+            "--id",
+            "exit",
+            "--listen",
+            &exit_addr,
+            "--advertise",
+            &exit_addr,
+            "--tcp-target",
+            &target_addr,
+        ]),
+        root,
+        "fixed-exit",
+    );
+    ready(&mut exit, "HTTP/3 server ready");
+    let relay_addr = port();
+    let mut relay = launch(
+        &args(&[
+            "mesh-server",
+            "--dir",
+            root.join("relay").to_str().unwrap(),
+            "--id",
+            "relay",
+            "--listen",
+            &relay_addr,
+            "--advertise",
+            &relay_addr,
+            "--tcp-target",
+            &decoy_addr,
+            "--join",
+            &exit_addr,
+            "--join-key",
+            root.join("exit/server-key.json").to_str().unwrap(),
+        ]),
+        root,
+        "fixed-relay",
+    );
+    ready(&mut relay, "HTTP/3 server ready");
+    let key = root.join("exit/client-key.json");
+    let target_worker = thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(25);
+        let mut socket = loop {
+            match target.accept() {
+                Ok((socket, _)) => break socket,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(Instant::now() < deadline, "fixed target was not connected");
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(e) => panic!("accept target: {e}"),
+            }
+        };
+        socket.set_nonblocking(false).unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        socket
+            .set_write_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let mut buf = [0; 4096];
+        loop {
+            let n = socket.read(&mut buf).unwrap();
+            if n == 0 {
+                break;
+            }
+            socket.write_all(&buf[..n]).unwrap();
+        }
+        socket.write_all(b"after FIN").unwrap();
+        socket.shutdown(Shutdown::Write).unwrap();
+        assert!(
+            target.accept().is_err(),
+            "one local flow opened multiple target sockets"
+        );
+    });
+    let mut client = launch(
+        &args(&[
+            "mesh-client",
+            "--connect",
+            &relay_addr,
+            "--connection-key",
+            key.to_str().unwrap(),
+            "--dir",
+            root.join("client").to_str().unwrap(),
+            "--exit",
+            "exit",
+            "--listen",
+            "127.0.0.1:0",
+            "--tcp-listen",
+            "127.0.0.1:0",
+            "--adaptive",
+            "--quality-schedule",
+            "--fec",
+            "0",
+            "--redundancy-percent",
+            "0",
+            "--stats-jsonl",
+            root.join("client.jsonl").to_str().unwrap(),
+            "--stats-interval-ms",
+            "100",
+        ]),
+        root,
+        "fixed-client",
+    );
+    ready(&mut client, "UDP client ready");
+    let deadline = Instant::now() + Duration::from_secs(12);
+    let log = loop {
+        let text = fs::read_to_string(&client.log).unwrap();
+        if text
+            .lines()
+            .filter(|l| l.contains("client path ready"))
+            .count()
+            >= 2
+        {
+            break text;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "automatic relay did not join: {text}"
+        );
+        thread::sleep(Duration::from_millis(20));
+    };
+    let address = log
+        .lines()
+        .find(|l| l.contains("TCP listener bound"))
+        .unwrap()
+        .split_whitespace()
+        .find_map(|p| p.strip_prefix("listen="))
+        .unwrap();
+    let mut socket = TcpStream::connect(address).unwrap();
+    socket.set_nodelay(true).unwrap();
+    socket
+        .set_read_timeout(Some(Duration::from_secs(8)))
+        .unwrap();
+    socket
+        .set_write_timeout(Some(Duration::from_secs(8)))
+        .unwrap();
+    for request in [b"small request".as_slice(), b"second request"] {
+        socket.write_all(request).unwrap();
+        let mut reply = vec![0; request.len()];
+        socket.read_exact(&mut reply).unwrap();
+        assert_eq!(reply, request);
+    }
+    if stop_relay {
+        relay.child.kill().unwrap();
+        relay.child.wait().unwrap();
+        socket.write_all(b"same flow after relay stop").unwrap();
+        let mut reply = [0; 26];
+        socket.read_exact(&mut reply).unwrap();
+        assert_eq!(&reply, b"same flow after relay stop");
+    }
+    socket.shutdown(Shutdown::Write).unwrap();
+    let mut tail = Vec::new();
+    socket.read_to_end(&mut tail).unwrap();
+    assert_eq!(tail, b"after FIN");
+    target_worker.join().unwrap();
+    assert!(decoy.accept().is_err(), "bootstrap was used as the exit");
+    let status = |at: &str| {
+        let output = run(&args(&[
+            "mesh-status",
+            "--connect",
+            at,
+            "--connection-key",
+            key.to_str().unwrap(),
+            "--dir",
+            root.join("inspect").to_str().unwrap(),
+        ]));
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice::<Value>(&output.stdout).unwrap()
+    };
+    let before = status(if stop_relay { &exit_addr } else { &relay_addr });
+    assert_eq!(before["leases"], usize::from(!stop_relay), "{before}");
+    assert!(
+        before["proxy"].is_null(),
+        "fixed targets must not enable proxy access"
+    );
+    assert!(
+        before["capabilities"]["features"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v == "fixed-tcp-stream-v2")
+    );
+    // Verify normal shutdown releases the automatically allocated relay lease.
+    #[cfg(unix)]
+    {
+        assert!(
+            Command::new("kill")
+                .args(["-TERM", &client.child.id().to_string()])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let deadline = Instant::now() + Duration::from_secs(8);
+        loop {
+            if let Some(code) = client.child.try_wait().unwrap() {
+                assert!(code.success());
+                break;
+            }
+            assert!(Instant::now() < deadline, "mesh client did not shut down");
+            thread::sleep(Duration::from_millis(20));
+        }
+        if !stop_relay {
+            let after = status(&relay_addr);
+            assert_eq!(after["leases"], 0, "{after}");
+        }
+    }
+}
+
+#[test]
 fn proxy_cli_creates_one_socks_endpoint_per_exit_with_remote_half_close() {
     use std::io::{Read, Write};
     use std::net::{Shutdown, TcpListener, TcpStream};

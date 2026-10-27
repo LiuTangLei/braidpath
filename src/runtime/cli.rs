@@ -79,6 +79,59 @@ mod proxy_cli_tests {
             Cli::try_parse_from(client.into_iter().chain(["--socks5", "b=0.0.0.0:1082"])).is_err()
         );
     }
+
+    #[test]
+    fn mesh_fixed_tcp_does_not_require_or_enable_private_proxy_access() {
+        let server = [
+            "braidpath",
+            "mesh-server",
+            "--dir",
+            "state",
+            "--id",
+            "a",
+            "--listen",
+            "127.0.0.1:4433",
+            "--advertise",
+            "127.0.0.1:4433",
+            "--tcp-target",
+            "127.0.0.1:8443",
+        ];
+        let parsed = Cli::try_parse_from(server).unwrap();
+        assert!(matches!(
+            parsed.command,
+            Command::MeshServer {
+                tcp_target: Some(_),
+                target: None,
+                proxy: false,
+                proxy_allow_private: false,
+                ..
+            }
+        ));
+        assert!(Cli::try_parse_from(server.into_iter().chain(["--proxy-allow-private"])).is_err());
+        let parsed = Cli::try_parse_from([
+            "braidpath",
+            "mesh-client",
+            "--connect",
+            "127.0.0.1:4433",
+            "--connection-key",
+            "client-key.json",
+            "--dir",
+            "client",
+            "--exit",
+            "b",
+            "--tcp-listen",
+            "127.0.0.1:9443",
+            "--adaptive",
+        ])
+        .unwrap();
+        assert!(matches!(
+            parsed.command,
+            Command::MeshClient {
+                tcp_listen: Some(_),
+                ..
+            }
+        ));
+    }
 }
 
 #[cfg(test)]
@@ -145,8 +198,12 @@ enum Command {
         /// Relay UDP port or inclusive range (up to 1024 ports); otherwise OS-assigned.
         #[arg(long)]
         relay_ports: Option<mesh::RelayPorts>,
-        #[arg(long, required_unless_present = "proxy")]
+        /// Fixed UDP destination for datagram flows.
+        #[arg(long, required_unless_present_any = ["tcp_target", "proxy"])]
         target: Option<SocketAddr>,
+        /// Fixed TCP destination; clients cannot select another destination.
+        #[arg(long)]
+        tcp_target: Option<SocketAddr>,
         /// Enable authenticated TCP/UDP proxy egress on the same QUIC port.
         #[arg(long)]
         proxy: bool,
@@ -219,6 +276,9 @@ enum Command {
         exit: String,
         #[arg(long, default_value = "127.0.0.1:7000")]
         listen: SocketAddr,
+        /// Forward local TCP connections to the selected exit's fixed --tcp-target.
+        #[arg(long)]
+        tcp_listen: Option<SocketAddr>,
         /// Linux uplink interface; repeat for independent networks.
         #[arg(long = "interface")]
         interfaces: Vec<String>,
@@ -470,6 +530,7 @@ pub async fn run() -> Result<()> {
             advertise,
             relay_ports,
             target,
+            tcp_target,
             proxy,
             proxy_allow_private,
             join,
@@ -485,6 +546,7 @@ pub async fn run() -> Result<()> {
                 advertise,
                 relay_ports,
                 target,
+                tcp_target,
                 proxy: proxy.then_some(proxy::ServerConfig {
                     allow_private: proxy_allow_private,
                 }),
@@ -548,6 +610,7 @@ pub async fn run() -> Result<()> {
             dir,
             exit,
             listen,
+            tcp_listen,
             interfaces,
             source_ips,
             policy,
@@ -555,7 +618,8 @@ pub async fn run() -> Result<()> {
         } => {
             let rate = client_rate(&policy)?;
             let group_rates = parse_group_rates(&policy.group_rates, rate)?;
-            let session_policy = policy.build(rate, group_rates);
+            let mut session_policy = policy.build(rate, group_rates);
+            session_policy.streams = tcp_listen.is_some();
             session_policy.validate()?;
             let identity = mesh::ClientIdentity::open(dir, &connection_key)?;
             let count = interfaces.len().max(source_ips.len()).max(1);
@@ -588,7 +652,7 @@ pub async fn run() -> Result<()> {
                 tunnel::ClientOptions {
                     stream_connector: None,
                     listen,
-                    tcp_listen: None,
+                    tcp_listen,
                     proxy_listen: None,
                     entrances,
                     interfaces: vec![],

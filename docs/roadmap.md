@@ -81,6 +81,18 @@ Current protocol, commands and limits: [experimental runtime](runtime.md). Check
 
 ## M4 — Reliable flows and application adapters
 
+### v0.5.8 — Fixed-target TCP mesh entry (experimental development)
+
+- Expose the existing fixed-target aggregate TCP engine through `mesh-server
+  --tcp-target` and `mesh-client --tcp-listen`.
+- Reuse standard member discovery, exit binding, relay leases and path health;
+  advertise the optional `fixed-tcp-stream-v2` capability without the target address.
+- Keep fixed destinations separate from addressed proxy permission. Preserve
+  existing UDP/proxy CLI defaults and congestion, repair and scheduling behavior.
+- Cover bootstrap-through-another-member, one target socket, half-close, relay
+  interruption and graceful lease cleanup with real loopback processes. WAN
+  small-request latency and application TLS acceptance remain deployment checks.
+
 ### v0.5.7 — Transfer attribution (experimental development)
 
 - Group native path and application counters on common sampling boundaries,

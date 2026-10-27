@@ -120,6 +120,9 @@ pub struct Status {
 impl State {
     pub(super) fn capabilities(&self) -> Capabilities {
         let mut capabilities = Capabilities::default();
+        if self.fixed_tcp {
+            capabilities.features.push("fixed-tcp-stream-v2".into());
+        }
         if self.proxy.is_some() {
             capabilities.features.extend([
                 "proxy-udp-v1".into(),
@@ -246,6 +249,33 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("exit-binding")
+        );
+    }
+
+    #[test]
+    fn fixed_tcp_capability_does_not_advertise_proxy_access_or_target_address() {
+        let root = tempfile::tempdir().unwrap();
+        let mut state = super::super::tests::state(root.path());
+        assert!(
+            !state
+                .capabilities()
+                .features
+                .iter()
+                .any(|f| f == "fixed-tcp-stream-v2")
+        );
+        state.fixed_tcp = true;
+        let capabilities = state.capabilities();
+        assert!(
+            capabilities
+                .features
+                .iter()
+                .any(|f| f == "fixed-tcp-stream-v2")
+        );
+        assert!(capabilities.require_proxy_stream().is_err());
+        assert!(
+            !serde_json::to_string(&state.status())
+                .unwrap()
+                .contains("tcp_target")
         );
     }
     #[tokio::test]

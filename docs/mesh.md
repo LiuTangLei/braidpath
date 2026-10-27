@@ -5,6 +5,67 @@ client discovery, become a selected exit, or forward encrypted traffic toward
 another exit. The first server only initializes credentials; it has no permanent
 coordination role. Membership converges through authenticated peer exchanges.
 
+## Fixed-target TCP over the mesh (v0.5.8)
+
+Use `mesh-server --tcp-target IP:PORT` on the selected exit and
+`mesh-client --tcp-listen IP:PORT` on the client. This reuses the standard mesh
+control plane and aggregate reliable byte-stream engine, with no SOCKS handshake
+or separate relay list. Existing mesh members can supply encrypted relay
+entrances without enabling TCP targets or proxy egress themselves.
+
+```sh
+# Selected exit; the server operator configures this fixed destination.
+braidpath mesh-server --dir local/node-a --id node-a \
+  --listen 0.0.0.0:4433 --advertise 192.0.2.10:4433 \
+  --tcp-target 127.0.0.1:8443
+
+# Another member; reuse an existing member when one is already running.
+braidpath mesh-server --dir local/node-b --id node-b \
+  --listen 0.0.0.0:4433 --advertise 192.0.2.20:4433 \
+  --tcp-target 127.0.0.1:8443 \
+  --join 192.0.2.10:4433 --join-key local/server-key.json
+
+# Bootstrap through b, select a; no --entrance addresses are required.
+braidpath mesh-client --connect 192.0.2.20:4433 \
+  --connection-key local/client-key.json --dir local/tcp-client --exit node-a \
+  --listen 127.0.0.1:0 --tcp-listen 127.0.0.1:9443 \
+  --adaptive --quality-schedule --fec auto
+```
+
+The application connects directly to `127.0.0.1:9443`. Each accepted TCP
+connection opens exactly one target TCP socket at node-a; cooperating paths
+share its byte offsets and repair state. Application TLS, including mutual
+TLS, remains end to end and is forwarded as opaque bytes. The exit fixes the
+destination; the client cannot name another. `--proxy` and
+`--proxy-allow-private` are unnecessary: a loopback fixed target does not grant
+access to other private addresses or ports. Existing client-key holders can
+use the configured target; this does not add per-user target authorization.
+
+`--target`, `--tcp-target` and `--proxy` may coexist; at least one service is
+required. Adding a fixed target does not enable addressed proxy streams. Only
+exits using the new fixed-target mesh option and clients using the new listener
+option need that CLI capability; other members can retain their relay
+configuration. `mesh-status` advertises `fixed-tcp-stream-v2` when configured,
+without exposing the target address. Existing keys, discovery, relay allocation,
+renewal/release, health feedback and member replacement are reused. A relay
+failure can preserve the same target socket over surviving paths; loss of the
+selected exit or target socket still fails the flow.
+
+The existing eight-path budget is shared across uplinks for `mesh-client`.
+The direct exit path starts first and other entrances join asynchronously;
+the client need not wait for every member to be reachable. The local UDP
+listener is retained for compatibility (`--listen ...:0` chooses an unused UDP
+port); without a server `--target`, no fixed UDP destination is enabled. Keep
+the unauthenticated local TCP listener on loopback, or protect it at the host
+boundary.
+
+`--adaptive` enables the existing queue control; `--quality-schedule` directs
+small records to eligible paths expected to arrive earlier. Neither multiple
+paths nor the queue-delay target guarantees a lower propagation RTT or a
+latency SLA. Measure small-request first-byte/tail latency, errors and recovery
+with the same bootstrap, exit and target. Local integrity tests do not establish
+WAN latency or throughput.
+
 ## TCP aggregation and selectable exits (v0.5.0, experimental)
 
 Enable proxy egress with `--proxy`. A fixed `--target` is optional in this mode;

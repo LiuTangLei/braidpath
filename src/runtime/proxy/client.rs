@@ -828,6 +828,7 @@ mod lifecycle_tests {
             advertise: address,
             relay_ports: None,
             target: None,
+            tcp_target: None,
             proxy: Some(ServerConfig {
                 allow_private: true,
             }),
