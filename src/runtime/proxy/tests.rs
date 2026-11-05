@@ -34,6 +34,7 @@ async fn start_metered(
         id: id.into(),
         listen: at,
         advertise: at,
+        advertise_alternate: None,
         relay_ports: None,
         target: None,
         tcp_target: None,
@@ -132,6 +133,7 @@ fn node(id: &str, address: SocketAddr) -> mesh::Node {
     mesh::Node {
         id: id.into(),
         address,
+        alternate: None,
         incarnation: 0,
     }
 }
@@ -637,6 +639,7 @@ async fn aggregate_proxy_requires_the_advertised_stream_capability() {
         id: "a".into(),
         listen: at,
         advertise: at,
+        advertise_alternate: None,
         relay_ports: None,
         target: Some(address()),
         tcp_target: None,

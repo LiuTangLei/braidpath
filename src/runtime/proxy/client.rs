@@ -208,6 +208,28 @@ pub(super) struct Pool {
     shutdown_complete: tokio::sync::Notify,
 }
 impl Pool {
+    fn uplink(&self) -> mesh::Uplink {
+        mesh::Uplink {
+            interface: self.interface.clone(),
+            ..mesh::Uplink::default()
+        }
+    }
+
+    async fn direct_address(&self, id: &str) -> Result<SocketAddr> {
+        let slot = self.slots.get(id).context("exit not selected")?;
+        let node = slot.node.read().expect("proxy node").clone();
+        if node.alternate.is_none() {
+            return Ok(node.address);
+        }
+        let (updates, _) = self.route_watch(id).await?;
+        let address = updates
+            .borrow()
+            .first()
+            .copied()
+            .context("no direct route")?;
+        Ok(address)
+    }
+
     pub(super) fn new(
         identity: mesh::ClientIdentity,
         nodes: Vec<mesh::Node>,
@@ -273,7 +295,10 @@ impl Pool {
         if routes.is_none() {
             let nodes = self.nodes.read().expect("proxy nodes").clone();
             let limit = self.path_limit.load(std::sync::atomic::Ordering::Relaxed);
-            let (_, guard) = self.identity.entrances(nodes, id, limit).await?;
+            let (_, guard) = self
+                .identity
+                .entrances_on(nodes, id, limit, &self.uplink())
+                .await?;
             ensure!(
                 !self.closed.load(std::sync::atomic::Ordering::Acquire),
                 "proxy client stopped"
@@ -300,8 +325,8 @@ impl Pool {
         if let Some(old) = aggregate.take() {
             old.shutdown().await;
         }
-        let address = slot.node.read().expect("proxy node").address;
-        let status = self.identity.status(address).await?;
+        let address = self.direct_address(id).await?;
+        let status = self.identity.status_on(address, &self.uplink()).await?;
         ensure!(status.node.id == id, "proxy exit identity changed");
         status.capabilities.require_proxy_stream()?;
         // This reporter owns the entrance health channel for this exit. Native
@@ -463,7 +488,7 @@ impl Pool {
             "proxy client stopped"
         );
         let slot = self.slots.get(id).context("exit not selected")?;
-        let address = slot.node.read().expect("proxy node").address;
+        let address = self.direct_address(id).await?;
         let path = slot
             .paths
             .lock()
@@ -475,12 +500,12 @@ impl Pool {
     }
     pub(super) fn retire_stale_udp_paths(&self) {
         for slot in self.slots.values() {
-            let current = slot.node.read().expect("proxy node").address;
+            let current = slot.node.read().expect("proxy node").clone();
             slot.paths
                 .lock()
                 .expect("proxy paths")
                 .retain(|address, path| {
-                    if *address == current {
+                    if current.addresses().any(|current| *address == current) {
                         true
                     } else {
                         path.retire();
@@ -806,6 +831,7 @@ mod lifecycle_tests {
             vec![mesh::Node {
                 id: "exit".into(),
                 address: "127.0.0.1:1".parse().unwrap(),
+                alternate: None,
                 incarnation: 0,
             }],
             vec!["exit".into()],
@@ -826,6 +852,7 @@ mod lifecycle_tests {
             id: id.into(),
             listen: address,
             advertise: address,
+            advertise_alternate: None,
             relay_ports: None,
             target: None,
             tcp_target: None,

@@ -333,6 +333,7 @@ pub(crate) fn server_with_proxy(
         ack_request,
         proxy,
         None,
+        false,
     )
 }
 
@@ -347,6 +348,7 @@ pub(crate) fn server_with_session_config(
     ack_request: AckRequest,
     proxy: bool,
     tickets: Option<&Path>,
+    dual_stack: bool,
 ) -> Result<Endpoint> {
     ensure!(
         (MIN_DATAGRAM_SEND_BUFFER_BYTES..=MAX_DATAGRAM_SEND_BUFFER_BYTES)
@@ -370,7 +372,14 @@ pub(crate) fn server_with_session_config(
     transport.datagram_send_buffer_size(datagram_send_buffer_bytes);
     ack_request.apply(&mut transport);
     conf.transport_config(Arc::new(transport));
-    let socket = std::net::UdpSocket::bind(bind)?;
+    let socket = if dual_stack {
+        let socket = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
+        socket.set_only_v6(false)?;
+        socket.bind(&bind.into())?;
+        socket.into()
+    } else {
+        std::net::UdpSocket::bind(bind)?
+    };
     if proxy {
         datagram_socket_buffers(socket2::SockRef::from(&socket), "proxy");
     } else {

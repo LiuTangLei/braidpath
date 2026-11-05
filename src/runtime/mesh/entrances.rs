@@ -122,16 +122,28 @@ impl Entrances {
             .find(|n| n.id == exit)
             .context("selected exit not found")?
             .clone();
+        let control = Arc::new(Control::bound(
+            &identity.dir.join("cert.pem"),
+            nodes
+                .iter()
+                .any(|n| n.address.is_ipv6() && n.alternate.is_none()),
+            uplink,
+        )?);
+        let direct = control
+            .best_address(&selected, &identity.auth, None)
+            .await
+            .or_else(|| {
+                selected
+                    .addresses()
+                    .find(|address| control.supports(*address))
+            });
         let (health, observed) = watch::channel(PathHealth::default());
         let directory = Directory {
             health: observed,
-            control: Arc::new(Control::bound(
-                &identity.dir.join("cert.pem"),
-                nodes.iter().any(|n| n.address.is_ipv6()),
-                uplink,
-            )?),
+            control,
             auth: identity.auth.clone(),
             selected,
+            direct,
             cache: identity.cache.clone(),
             known,
             nodes,
@@ -183,6 +195,7 @@ struct Directory {
     control: Arc<Control>,
     auth: String,
     selected: Node,
+    direct: Option<SocketAddr>,
     cache: discovery::Cache,
     nodes: Vec<Node>,
     known: Vec<Node>,
@@ -192,6 +205,11 @@ struct Directory {
     discovery_cursor: usize,
     allocation_cursor: usize,
     explorer: selection::Explorer,
+}
+
+struct Discovery {
+    nodes: Vec<Node>,
+    preferred: Option<(Node, SocketAddr)>,
 }
 
 pub(super) fn validate_nodes(nodes: &[Node]) -> Result<()> {
@@ -204,7 +222,7 @@ pub(super) fn validate_nodes(nodes: &[Node]) -> Result<()> {
     for node in nodes {
         node.validate()?;
         ensure!(
-            ids.insert(&node.id) && addresses.insert(node.address),
+            ids.insert(&node.id) && node.addresses().all(|address| addresses.insert(address)),
             "duplicate member"
         );
     }
@@ -213,7 +231,7 @@ pub(super) fn validate_nodes(nodes: &[Node]) -> Result<()> {
 
 impl Directory {
     fn addresses(&self) -> Vec<SocketAddr> {
-        std::iter::once(self.selected.address)
+        std::iter::once(self.direct.unwrap_or(self.selected.address))
             .chain(self.leases.values().map(|lease| lease.reply.address))
             .collect()
     }
@@ -308,10 +326,15 @@ impl Directory {
                 }
                 Some(result) = discovery.join_next() => {
                     match result {
-                        Ok(Some(nodes)) => {
+                        Ok(Some(Discovery { nodes, preferred })) => {
                             let previous_exit = self.selected.clone();
                             for allocation in self.apply_nodes(nodes) {
                                 self.start_release(&mut releases, allocation);
+                            }
+                            if let Some((node, address)) = preferred
+                                && node == self.selected
+                            {
+                                self.direct = Some(address);
                             }
                             if self.selected != previous_exit {
                                 self.explorer.reset();
@@ -464,6 +487,9 @@ impl Directory {
         self.known = known;
         if let Some(selected) = nodes.iter().find(|node| node.id == self.selected.id) {
             self.selected = selected.clone();
+            self.direct = self
+                .direct
+                .filter(|address| selected.addresses().any(|a| a == *address));
         }
         let mut retired = Vec::new();
         self.requests.retain(|id, allocation| {
@@ -486,7 +512,7 @@ impl Directory {
         retired
     }
 
-    fn discovery(&mut self) -> impl Future<Output = Option<Vec<Node>>> + Send + 'static {
+    fn discovery(&mut self) -> impl Future<Output = Option<Discovery>> + Send + 'static {
         // Rotate the discovery entry so the original bootstrap is never a
         // dependency. Only a failed request triggers bounded parallel fallback.
         let mut candidates = self.known.clone();
@@ -496,6 +522,7 @@ impl Directory {
         let control = self.control.clone();
         let auth = self.auth.clone();
         let exit = self.selected.id.clone();
+        let current = self.direct;
         async move {
             let query = |address: SocketAddr| {
                 let control = control.clone();
@@ -512,19 +539,36 @@ impl Directory {
                     Ok::<_, anyhow::Error>(nodes)
                 }
             };
-            if let Ok(nodes) = query(preferred.address).await {
-                return Some(nodes);
-            }
-            let mut pending = JoinSet::new();
-            for node in candidates {
-                pending.spawn(query(node.address));
-            }
-            while let Some(result) = pending.join_next().await {
-                if let Ok(Ok(nodes)) = result {
-                    return Some(nodes);
+            let nodes = 'discovered: {
+                for address in preferred.addresses().filter(|a| control.supports(*a)) {
+                    if let Ok(nodes) = query(address).await {
+                        break 'discovered nodes;
+                    }
                 }
-            }
-            None
+                let mut pending = JoinSet::new();
+                for address in candidates
+                    .iter()
+                    .flat_map(Node::addresses)
+                    .filter(|a| control.supports(*a))
+                {
+                    pending.spawn(query(address));
+                }
+                while let Some(result) = pending.join_next().await {
+                    if let Ok(Ok(nodes)) = result {
+                        break 'discovered nodes;
+                    }
+                }
+                return None;
+            };
+            let node = nodes
+                .iter()
+                .find(|node| node.id == exit)
+                .expect("selected exit");
+            let preferred = control
+                .best_address(node, &auth, current)
+                .await
+                .map(|address| (node.clone(), address));
+            Some(Discovery { nodes, preferred })
         }
     }
 
@@ -604,6 +648,7 @@ impl Directory {
             .nodes
             .iter()
             .filter(|n| n.id != self.selected.id && !self.leases.contains_key(&n.id))
+            .filter(|n| self.control.supports(n.address))
             .filter(|n| self.explorer.available(&n.id, Instant::now()))
             .cloned()
             .collect::<Vec<_>>();
@@ -634,7 +679,8 @@ impl Directory {
 
 fn validate_reply(node: &Node, reply: &RelayReply) -> Result<()> {
     ensure!(
-        reply.address.ip() == node.address.ip()
+        node.addresses()
+            .any(|address| address.ip() == reply.address.ip())
             && reply.address.port() != 0
             && reply.lease.len() == 32
             && reply.lease.bytes().all(|b| b.is_ascii_hexdigit()),
@@ -652,6 +698,7 @@ async fn allocate(control: &Control, auth: &str, node: &Node, exit: &str) -> Res
             exit: Node {
                 id: exit.into(),
                 address: node.address,
+                alternate: None,
                 incarnation: 0,
             },
             request: format!("{:032x}", rand::random::<u128>()),
@@ -832,6 +879,7 @@ mod tests {
         let available = Node {
             id: "available".into(),
             address: endpoint.local_addr().unwrap(),
+            alternate: None,
             incarnation: 0,
         };
         let silent_exit = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -839,11 +887,13 @@ mod tests {
         let selected = Node {
             id: "exit".into(),
             address: silent_exit.local_addr().unwrap(),
+            alternate: None,
             incarnation: 0,
         };
         let unavailable_node = Node {
             id: "unavailable".into(),
             address: unavailable.local_addr().unwrap(),
+            alternate: None,
             incarnation: 0,
         };
         let reply_address = SocketAddr::from(([127, 0, 0, 1], 21001));
@@ -910,6 +960,7 @@ mod tests {
             control: Arc::new(Control::new(&dir.join("cert.pem"), false).unwrap()),
             auth: format!("Bearer {}", transport::token(&dir.join("token")).unwrap()),
             selected: selected.clone(),
+            direct: None,
             cache: discovery::Cache::open(dir),
             nodes: vec![selected.clone(), available],
             known: vec![selected],
@@ -984,6 +1035,7 @@ mod tests {
             0,
             Node {
                 id: "blackhole".into(),
+                alternate: None,
                 incarnation: 0,
                 address: blackhole.local_addr().unwrap(),
             },
@@ -1146,6 +1198,7 @@ mod tests {
         let unavailable = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let relay_node = Node {
             id: "relay".into(),
+            alternate: None,
             incarnation: 0,
             address: unavailable.local_addr().unwrap(),
         };
@@ -1180,6 +1233,7 @@ mod tests {
             control: Arc::new(Control::new(&identity.dir.join("cert.pem"), false).unwrap()),
             auth: identity.auth.clone(),
             selected,
+            direct: None,
             cache: identity.cache.clone(),
             nodes: nodes.clone(),
             known: nodes,
@@ -1330,6 +1384,7 @@ mod tests {
             .clone();
         let unavailable_node = Node {
             id: "unavailable".into(),
+            alternate: None,
             incarnation: 0,
             address: unavailable.local_addr().unwrap(),
         };
@@ -1340,6 +1395,7 @@ mod tests {
             control: Arc::new(Control::new(&identity.dir.join("cert.pem"), false).unwrap()),
             auth: identity.auth.clone(),
             selected,
+            direct: None,
             cache: identity.cache.clone(),
             nodes,
             known,
@@ -1405,6 +1461,7 @@ mod tests {
         let nodes: Vec<_> = (0..MAX_NODES)
             .map(|i| Node {
                 id: format!("node_{i:02}"),
+                alternate: None,
                 incarnation: 0,
                 address: SocketAddr::from(([127, 0, 0, 1], 10000 + i as u16)),
             })
@@ -1414,6 +1471,7 @@ mod tests {
             control: Arc::new(Control::new(&dir.join("cert.pem"), false).unwrap()),
             auth: String::new(),
             selected: nodes[0].clone(),
+            direct: None,
             cache: discovery::Cache::open(dir.clone()),
             nodes: nodes.clone(),
             known: nodes.clone(),
@@ -1443,6 +1501,7 @@ mod tests {
         // A full cache evicts an old hint for a current member.
         let extra = Node {
             id: "extra".into(),
+            alternate: None,
             incarnation: 0,
             address: "127.0.0.1:20001".parse().unwrap(),
         };

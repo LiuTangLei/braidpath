@@ -70,7 +70,7 @@ pub(super) fn add(hints: &[Hint], departed: &[Node], now: u64) -> Vec<Hint> {
         if !hint.expired(now)
             && !next
                 .iter()
-                .any(|h| h.node.id == hint.node.id || h.node.address == hint.node.address)
+                .any(|h| h.node.id == hint.node.id || h.node.shares_address(&hint.node))
         {
             next.push(hint.clone());
         }
@@ -90,7 +90,7 @@ pub(super) fn useful(hints: &[Hint], own: &Node, members: &[&Node], now: u64) ->
             !hint.expired(now)
                 && std::iter::once(own)
                     .chain(members.iter().copied())
-                    .all(|n| n.id != hint.node.id && n.address != hint.node.address)
+                    .all(|n| n.id != hint.node.id && !n.shares_address(&hint.node))
         })
         .cloned()
         .collect()

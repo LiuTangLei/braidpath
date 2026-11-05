@@ -195,6 +195,7 @@ mod tests {
         Node {
             id: id.to_string(),
             address: SocketAddr::from(([127, 0, 0, 1], 10000 + id as u16)),
+            alternate: None,
             incarnation: 1,
         }
     }

@@ -92,6 +92,25 @@ pub(super) struct Control {
     peers: std::sync::Mutex<BTreeMap<SocketAddr, Slot>>,
     capacity: usize,
 }
+
+fn select_address(
+    samples: [Option<(SocketAddr, Duration)>; 2],
+    current: Option<SocketAddr>,
+) -> Option<SocketAddr> {
+    let samples = samples.into_iter().flatten();
+    let incumbent = samples.clone().any(|(address, _)| Some(address) == current);
+    samples
+        .min_by_key(|(address, rtt)| {
+            // Avoid moving a working path on small, transient RTT changes.
+            if incumbent && Some(*address) != current {
+                *rtt + Duration::from_millis(5)
+            } else {
+                *rtt
+            }
+        })
+        .map(|(address, _)| address)
+}
+
 impl Control {
     pub(super) fn new(ca: &Path, ipv6: bool) -> Result<Self> {
         Self::bound(ca, ipv6, &super::Uplink::default())
@@ -115,17 +134,21 @@ impl Control {
         let v6 = if uplink.bind.is_none_or(|ip| ip.is_ipv6()) {
             match endpoint("[::1]:1".parse()?) {
                 Ok(e) => Some(e),
-                Err(e) if ipv6 => return Err(e),
+                Err(e) if ipv6 && v4.is_none() => return Err(e),
                 Err(_) => None,
             }
         } else {
             None
         };
+        ensure!(
+            v4.is_some() || v6.is_some(),
+            "no control endpoint for uplink"
+        );
         Ok(Self {
             v4,
             v6,
             peers: std::sync::Mutex::new(BTreeMap::new()),
-            capacity: MAX_NODES,
+            capacity: MAX_NODES * 2,
         })
     }
 
@@ -144,7 +167,7 @@ impl Control {
 
     pub(super) fn server(ca: &Path, ipv6: bool) -> Result<Self> {
         let mut control = Self::new(ca, ipv6)?;
-        control.capacity += super::hints::RECONNECT_BATCH;
+        control.capacity += super::hints::RECONNECT_BATCH * 2;
         Ok(control)
     }
 
@@ -215,6 +238,52 @@ impl Control {
         path: &str,
         body: Option<Vec<u8>>,
     ) -> Result<T> {
+        self.request_with_rtt(address, auth, path, body)
+            .await
+            .map(|(value, _)| value)
+    }
+
+    pub(super) fn supports(&self, address: SocketAddr) -> bool {
+        if address.is_ipv4() {
+            self.v4.is_some()
+        } else {
+            self.v6.is_some()
+        }
+    }
+
+    pub(super) async fn best_address(
+        &self,
+        node: &super::Node,
+        auth: &str,
+        current: Option<SocketAddr>,
+    ) -> Option<SocketAddr> {
+        let probe = |address| async move {
+            if !self.supports(address) {
+                return None;
+            }
+            let (status, rtt) = tokio::time::timeout(
+                Duration::from_secs(2),
+                self.request_with_rtt::<super::Status>(address, auth, "/mesh/status", None),
+            )
+            .await
+            .ok()?
+            .ok()?;
+            (status.node == *node).then_some((address, rtt))
+        };
+        let Some(alternate) = node.alternate else {
+            return self.supports(node.address).then_some(node.address);
+        };
+        let (primary, secondary) = tokio::join!(probe(node.address), probe(alternate));
+        select_address([primary, secondary], current)
+    }
+
+    async fn request_with_rtt<T: DeserializeOwned>(
+        &self,
+        address: SocketAddr,
+        auth: &str,
+        path: &str,
+        body: Option<Vec<u8>>,
+    ) -> Result<(T, Duration)> {
         ensure!(
             body.as_ref().is_none_or(|data| data.len() <= MAX_BODY),
             "mesh request too large"
@@ -229,11 +298,9 @@ impl Control {
             if connection.is_none() {
                 connection = Some(self.connect(address).await?);
             }
-            connection
-                .as_mut()
-                .expect("connected control peer")
-                .request(auth, path, body)
-                .await
+            let connection = connection.as_mut().expect("connected control peer");
+            let value = connection.request(auth, path, body).await?;
+            Ok::<_, anyhow::Error>((value, connection.raw.0.rtt()))
         })
         .await?;
         // A complete, bounded HTTP rejection is still a healthy connection.
@@ -255,6 +322,26 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::{sync::mpsc, task::JoinSet, time::timeout};
+
+    #[test]
+    fn dual_stack_selection_prefers_measured_rtt_and_drops_unreachable_incumbent() {
+        let v4 = "127.0.0.1:4433".parse().unwrap();
+        let v6 = "[::1]:4433".parse().unwrap();
+        let sample = |address, millis| Some((address, Duration::from_millis(millis)));
+        assert_eq!(
+            select_address([sample(v6, 40), sample(v4, 25)], None),
+            Some(v4)
+        );
+        assert_eq!(
+            select_address([sample(v6, 15), sample(v4, 25)], None),
+            Some(v6)
+        );
+        assert_eq!(
+            select_address([sample(v6, 20), sample(v4, 23)], Some(v4)),
+            Some(v4)
+        );
+        assert_eq!(select_address([None, sample(v4, 25)], Some(v6)), Some(v4));
+    }
 
     struct Server {
         _dir: tempfile::TempDir,
@@ -503,7 +590,7 @@ mod tests {
         let server = Server::new(Some(StatusCode::OK));
         let control =
             Control::server(&server._dir.path().join("identity/cert.pem"), false).unwrap();
-        for port in 1..=MAX_NODES + super::super::hints::RECONNECT_BATCH {
+        for port in 1..=2 * (MAX_NODES + super::super::hints::RECONNECT_BATCH) {
             control
                 .slot(SocketAddr::from(([127, 0, 0, 1], port as u16)))
                 .unwrap();
@@ -515,14 +602,14 @@ mod tests {
     async fn destination_cache_is_bounded() {
         let server = Server::new(Some(StatusCode::OK));
         let control = server.control();
-        for port in 1..=MAX_NODES {
+        for port in 1..=MAX_NODES * 2 {
             control
                 .slot(SocketAddr::from(([127, 0, 0, 1], port as u16)))
                 .unwrap();
         }
         assert!(
             control
-                .slot(SocketAddr::from(([127, 0, 0, 1], MAX_NODES as u16 + 1)))
+                .slot(SocketAddr::from(([127, 0, 0, 1], MAX_NODES as u16 * 2 + 1)))
                 .is_err()
         );
         assert!(control.slot(SocketAddr::from(([127, 0, 0, 1], 1))).is_ok());

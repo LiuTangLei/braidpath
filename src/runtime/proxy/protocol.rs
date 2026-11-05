@@ -129,7 +129,7 @@ impl Address {
         Ok(addresses)
     }
 }
-pub(super) fn permitted(ip: IpAddr, allow_private: bool) -> bool {
+pub(crate) fn permitted(ip: IpAddr, allow_private: bool) -> bool {
     match ip {
         IpAddr::V6(ip) => {
             if let Some(v4) = ip.to_ipv4_mapped() {

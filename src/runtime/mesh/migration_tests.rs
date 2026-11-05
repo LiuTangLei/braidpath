@@ -4,6 +4,7 @@ fn node(id: &str, port: u16, incarnation: u64) -> Node {
     Node {
         id: id.into(),
         address: SocketAddr::from(([127, 0, 0, 1], port)),
+        alternate: None,
         incarnation,
     }
 }

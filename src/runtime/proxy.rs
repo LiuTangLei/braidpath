@@ -16,6 +16,7 @@ mod server;
 mod socks;
 pub use client::{ClientOptions, Listener, client};
 pub(crate) use protocol::ReplyError;
+pub(super) use protocol::permitted;
 pub use server::{Server, ServerConfig, Snapshot};
 
 pub(crate) const ALPN: &[u8] = b"braidpath-proxy/1";

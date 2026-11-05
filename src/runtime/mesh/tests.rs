@@ -14,6 +14,57 @@ pub(crate) fn address() -> SocketAddr {
         .local_addr()
         .unwrap()
 }
+
+#[tokio::test]
+async fn dual_stack_discovery_and_ipv4_bound_client_use_the_same_exit() {
+    let root = tempfile::tempdir().unwrap();
+    let ipv4 = address();
+    let ipv6 = SocketAddr::new(std::net::Ipv6Addr::LOCALHOST.into(), ipv4.port());
+    let listen = SocketAddr::new(std::net::Ipv6Addr::UNSPECIFIED.into(), ipv4.port());
+    let dir = root.path().join("dual");
+    let metrics = stats::Metrics::new("test-dual-stack");
+    let _server = Task(tokio::spawn(serve(ServerOptions {
+        dir: dir.clone(),
+        id: "dual".into(),
+        listen,
+        advertise: ipv6,
+        advertise_alternate: Some(ipv4),
+        relay_ports: None,
+        target: Some(address()),
+        tcp_target: None,
+        proxy: None,
+        rate: 10_000_000,
+        join: None,
+        join_key: None,
+        stats: metrics.clone(),
+    })));
+    timeout(Duration::from_secs(5), async {
+        while !metrics.is_ready() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let identity =
+        ClientIdentity::open(root.path().join("client"), &dir.join("client-key.json")).unwrap();
+    let nodes = identity.discover(ipv4).await.unwrap();
+    assert_eq!(nodes, identity.discover(ipv6).await.unwrap());
+    assert_eq!(nodes[0].addresses().collect::<Vec<_>>(), vec![ipv6, ipv4]);
+    let uplink = Uplink {
+        bind: Some(std::net::Ipv4Addr::LOCALHOST.into()),
+        ..Uplink::default()
+    };
+    let nodes = identity
+        .discover_on(&[ipv4, ipv6], "dual", std::slice::from_ref(&uplink))
+        .await
+        .unwrap();
+    let (routes, guard) = identity
+        .entrances_on(nodes, "dual", 1, &uplink)
+        .await
+        .unwrap();
+    assert_eq!(routes, vec![ipv4]);
+    guard.shutdown().await;
+}
 pub(super) async fn wait_nodes(
     identity: &ClientIdentity,
     at: SocketAddr,
@@ -69,6 +120,7 @@ pub(super) async fn server_with_metrics(
         id: id.into(),
         listen,
         advertise: listen,
+        advertise_alternate: None,
         relay_ports: None,
         target: Some(target),
         tcp_target: None,
@@ -250,6 +302,7 @@ async fn mesh_survives_bootstrap_loss_and_selects_any_exit_through_peers() {
         sender: Node {
             id: "intruder".into(),
             address: address(),
+            alternate: None,
             incarnation: 0,
         },
         nodes: vec![],
@@ -351,6 +404,7 @@ pub(crate) fn state(root: &Path) -> State {
         own: Node {
             id: "own".into(),
             address: "127.0.0.1:10000".parse().unwrap(),
+            alternate: None,
             incarnation: 0,
         },
         bind: "127.0.0.1:10000".parse().unwrap(),
@@ -373,6 +427,7 @@ fn node(id: &str, port: u16) -> Node {
     Node {
         id: id.into(),
         address: SocketAddr::from(([127, 0, 0, 1], port)),
+        alternate: None,
         incarnation: 0,
     }
 }
@@ -524,6 +579,7 @@ async fn failed_restart_cache_write_does_not_commit_membership_and_can_retry() {
     let peer = Node {
         id: "peer".into(),
         address: "127.0.0.1:10001".parse().unwrap(),
+        alternate: None,
         incarnation: 0,
     };
     fs::create_dir(temp.path().join("peers.json")).unwrap();
@@ -1002,6 +1058,7 @@ async fn membership_outage_preserves_owned_lease_and_udp_delivery() {
     let exit = Node {
         id: "exit".into(),
         address: target.local_addr().unwrap(),
+        alternate: None,
         incarnation: 0,
     };
     state
@@ -1375,6 +1432,7 @@ async fn partition_heals_after_both_groups_forget_and_reload_hints() {
         .map(|i| Node {
             id: format!("node_{i}"),
             address: address(),
+            alternate: None,
             incarnation: 0,
         })
         .collect();

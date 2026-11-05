@@ -188,7 +188,11 @@ impl State {
 }
 impl ClientIdentity {
     pub async fn status(&self, address: SocketAddr) -> Result<Status> {
-        Control::new(&self.dir.join("cert.pem"), address.is_ipv6())?
+        self.status_on(address, &Uplink::default()).await
+    }
+
+    pub(crate) async fn status_on(&self, address: SocketAddr, uplink: &Uplink) -> Result<Status> {
+        Control::bound(&self.dir.join("cert.pem"), address.is_ipv6(), uplink)?
             .request(address, &self.auth, "/mesh/status", None)
             .await
     }

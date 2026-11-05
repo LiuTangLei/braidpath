@@ -5,6 +5,21 @@ client discovery, become a selected exit, or forward encrypted traffic toward
 another exit. The first server only initializes credentials; it has no permanent
 coordination role. Membership converges through authenticated peer exchanges.
 
+## Dual-stack public endpoints (v0.5.9)
+
+When both public addresses can reach the same node's UDP port, use
+`--listen [::]:PORT --advertise IPV4:PORT --advertise-alternate [IPV6]:PORT`.
+Either address family can be the primary advertisement. A node with one public
+address continues to use just `--advertise`. Check reachability of the service
+and configured relay ports on both address families before advertising them.
+
+Fixed TCP and SOCKS clients probe both advertised direct endpoints on their
+selected uplink. They choose the reachable endpoint with the lower authenticated
+QUIC RTT and periodically recheck it. An established choice stays in place
+when the RTT difference is below 5 ms. An unavailable family does not prevent
+use of the other family. Upgrade the participating mesh processes before
+enabling the second advertisement.
+
 ## Fixed-target TCP over the mesh (v0.5.8)
 
 Use `mesh-server --tcp-target IP:PORT` on the selected exit and

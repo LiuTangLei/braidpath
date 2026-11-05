@@ -83,7 +83,7 @@ impl NetworkSlot {
         self.retry_at = Instant::now() + Duration::from_secs(2);
         let nodes: Vec<_> = nodes
             .iter()
-            .filter(|n| self.uplink.supports(n.address))
+            .filter(|n| n.addresses().any(|address| self.uplink.supports(address)))
             .cloned()
             .collect();
         if !nodes.iter().any(|n| n.id == exit) {
@@ -208,7 +208,7 @@ impl ClientIdentity {
                             .cache
                             .known()
                             .iter()
-                            .map(|n| n.address)
+                            .flat_map(Node::addresses)
                             .filter(|a| uplink.supports(*a) && !entries.contains(a))
                             .collect();
                         if cached.is_empty() {

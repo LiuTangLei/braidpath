@@ -150,7 +150,7 @@ pub(super) fn open_server(
         );
     }
     node.validate()?;
-    let moved = identity.node.address != node.address;
+    let moved = (identity.node.address, identity.node.alternate) != (node.address, node.alternate);
     if moved {
         identity.node.incarnation = identity
             .node
@@ -158,6 +158,7 @@ pub(super) fn open_server(
             .checked_add(1)
             .context("node incarnation exhausted")?;
         identity.node.address = node.address;
+        identity.node.alternate = node.alternate;
     }
     let node_path = dir.join("node.json");
     let derived = if node_path.try_exists()? {
@@ -203,6 +204,7 @@ mod tests {
         Node {
             id: "node".into(),
             address: "127.0.0.1:4433".parse().unwrap(),
+            alternate: None,
             incarnation: 0,
         }
     }

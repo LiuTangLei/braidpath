@@ -3673,6 +3673,7 @@ async fn serve_with_budgets(
         ack_request,
         options.proxy.is_some(),
         Some(&options.key.with_extension("tickets")),
+        mesh.as_deref().is_some_and(mesh::State::dual_stack),
     )?;
     let secret = Arc::new(format!("Bearer {}", transport::token(&options.token)?));
     let sessions: Sessions = Arc::new(Mutex::new(HashMap::new()));

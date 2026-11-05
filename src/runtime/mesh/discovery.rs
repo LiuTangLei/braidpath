@@ -17,7 +17,7 @@ pub(super) fn merge_known(previous: &[Node], incoming: &[Node]) -> Result<Vec<No
         {
             // Prefer the already-authenticated newer incarnation over another
             // stale record claiming its address; keep the result unambiguous.
-            merged.retain(|id, other| *id == node.id || other.address != node.address);
+            merged.retain(|id, other| *id == node.id || !other.shares_address(node));
             merged.insert(node.id.clone(), node.clone());
         }
     }
@@ -25,7 +25,7 @@ pub(super) fn merge_known(previous: &[Node], incoming: &[Node]) -> Result<Vec<No
         if merged.len() >= MAX_NODES {
             break;
         }
-        if !merged.contains_key(&node.id) && !merged.values().any(|n| n.address == node.address) {
+        if !merged.contains_key(&node.id) && !merged.values().any(|n| n.shares_address(node)) {
             merged.insert(node.id.clone(), node.clone());
         }
     }
@@ -203,8 +203,8 @@ impl ClientIdentity {
         let alternatives: Vec<_> = self
             .cache
             .known()
-            .into_iter()
-            .map(|node| node.address)
+            .iter()
+            .flat_map(Node::addresses)
             .filter(|address| !entries.contains(address))
             .collect();
         if alternatives.is_empty() {
@@ -287,6 +287,7 @@ mod tests {
             .map(|i| Node {
                 id: format!("node_{i:02}"),
                 address: SocketAddr::from(([127, 0, 0, 1], 10000 + i as u16)),
+                alternate: None,
                 incarnation: 2,
             })
             .collect();
@@ -315,6 +316,7 @@ mod tests {
         let node = Node {
             id: "exit".into(),
             address: "127.0.0.1:10000".parse().unwrap(),
+            alternate: None,
             incarnation: 1,
         };
         cache.remember(std::slice::from_ref(&node)).unwrap();
@@ -360,6 +362,7 @@ mod tests {
         let initial = Node {
             id: "exit".into(),
             address: "127.0.0.1:10000".parse().unwrap(),
+            alternate: None,
             incarnation: 0,
         };
         cache.remember(std::slice::from_ref(&initial)).unwrap();
@@ -414,6 +417,7 @@ mod tests {
         .unwrap();
         let node = Node {
             id: id.into(),
+            alternate: None,
             incarnation: 0,
             address: endpoint.local_addr().unwrap(),
         };

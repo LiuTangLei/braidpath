@@ -195,6 +195,9 @@ enum Command {
         /// Reachable address, with the same UDP port exposed by --listen.
         #[arg(long)]
         advertise: SocketAddr,
+        /// Public endpoint of the other address family on the same UDP port.
+        #[arg(long, requires = "advertise")]
+        advertise_alternate: Option<SocketAddr>,
         /// Relay UDP port or inclusive range (up to 1024 ports); otherwise OS-assigned.
         #[arg(long)]
         relay_ports: Option<mesh::RelayPorts>,
@@ -528,6 +531,7 @@ pub async fn run() -> Result<()> {
             id,
             listen,
             advertise,
+            advertise_alternate,
             relay_ports,
             target,
             tcp_target,
@@ -538,12 +542,16 @@ pub async fn run() -> Result<()> {
             max_rate_bps,
             stats,
         } => {
+            if let Some(alternate) = advertise_alternate {
+                mesh::validate_public_dual_stack(advertise, alternate)?;
+            }
             let reporter = stats::Reporter::new("mesh-server", stats)?;
             let result = mesh::serve(mesh::ServerOptions {
                 dir,
                 id,
                 listen,
                 advertise,
+                advertise_alternate,
                 relay_ports,
                 target,
                 tcp_target,

@@ -60,6 +60,8 @@ pub(crate) const CONTROL_IDLE: Duration = Duration::from_secs(60);
 pub struct Node {
     pub id: String,
     pub address: SocketAddr,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alternate: Option<SocketAddr>,
     // Persisted locally and advanced only when the advertised address changes.
     // Zero is the legacy wire format; unchanged nodes can still be discovered
     // by older peers while a cluster is upgraded.
@@ -70,11 +72,21 @@ fn is_zero(value: &u64) -> bool {
     *value == 0
 }
 impl Node {
+    pub fn addresses(&self) -> impl Iterator<Item = SocketAddr> + '_ {
+        std::iter::once(self.address).chain(self.alternate)
+    }
+
+    fn shares_address(&self, other: &Self) -> bool {
+        self.addresses()
+            .any(|address| other.addresses().any(|other| other == address))
+    }
+
     pub(super) fn supersedes(&self, previous: &Node) -> bool {
         self.id == previous.id
             && (self.incarnation > previous.incarnation
                 || (self.incarnation == previous.incarnation
-                    && (self.address == previous.address || self.incarnation == 0)))
+                    && ((self.address, self.alternate) == (previous.address, previous.alternate)
+                        || self.incarnation == 0)))
     }
     fn validate(&self) -> Result<()> {
         ensure!(
@@ -92,6 +104,15 @@ impl Node {
                 && !self.address.ip().is_multicast(),
             "node requires a reachable unicast address"
         );
+        if let Some(alternate) = self.alternate {
+            ensure!(
+                alternate.is_ipv4() != self.address.is_ipv4()
+                    && alternate.port() == self.address.port()
+                    && !alternate.ip().is_unspecified()
+                    && !alternate.ip().is_multicast(),
+                "alternate address must use the other address family and the same UDP port"
+            );
+        }
         Ok(())
     }
 }
@@ -303,6 +324,10 @@ impl State {
     pub(crate) fn node_id(&self) -> &str {
         &self.own.id
     }
+
+    pub(crate) fn dual_stack(&self) -> bool {
+        self.own.alternate.is_some()
+    }
     fn known(&self) -> Vec<Node> {
         let mut nodes = vec![self.own.clone()];
         nodes.extend(
@@ -346,7 +371,7 @@ impl State {
                 Admission::Reject("record conflicts with the local node")
             };
         }
-        if node.address == own.address {
+        if node.shares_address(own) {
             return Admission::Reject("record reuses the local address");
         }
         if peers.get(&node.id).is_some_and(|p| p.node == *node) {
@@ -360,7 +385,7 @@ impl State {
         }
         let conflicts: Vec<_> = peers
             .values()
-            .filter(|p| p.node.id == node.id || p.node.address == node.address)
+            .filter(|p| p.node.id == node.id || p.node.shares_address(node))
             .collect();
         // A persisted address update supersedes the same node immediately.
         // Other IDs still cannot take an address a live member currently owns.
@@ -555,17 +580,20 @@ impl State {
             .collect()
     }
     async fn sync_peer(&self, control: &Control, peer: Node, body: Vec<u8>) {
-        let result: Result<Exchange> = control
-            .request(peer.address, &self.member_auth, "/mesh/sync", Some(body))
-            .await;
-        match result {
-            Ok(reply) if reply.sender == peer => {
+        for address in peer.addresses() {
+            let result: Result<Exchange> = control
+                .request(address, &self.member_auth, "/mesh/sync", Some(body.clone()))
+                .await;
+            if let Ok(reply) = result
+                && reply.sender == peer
+            {
                 if let Err(error) = self.merge(reply, true).await {
                     tracing::warn!(%error, "membership rejected");
                 }
+                return;
             }
-            _ => tracing::debug!(node=%peer.id, "peer sync unavailable"),
         }
+        tracing::debug!(node=%peer.id, "peer sync unavailable");
     }
     pub(crate) fn control_permit(&self) -> Option<OwnedSemaphorePermit> {
         self.control_connections.clone().try_acquire_owned().ok()
@@ -628,18 +656,31 @@ impl State {
         );
         // Bind synchronously so allocation is atomic with respect to the lease
         // limit without holding a lock across an await.
+        let ingress = self
+            .own
+            .addresses()
+            .find(|address| address.is_ipv4() == source.is_ipv4())
+            .unwrap_or(self.own.address);
+        let bind = if self.dual_stack() && ingress.is_ipv4() {
+            std::net::Ipv4Addr::UNSPECIFIED.into()
+        } else {
+            self.bind.ip()
+        };
         let socket = match self.relay_ports {
-            Some(ports) => ports.bind(self.bind.ip())?,
-            None => std::net::UdpSocket::bind(SocketAddr::new(self.bind.ip(), 0))?,
+            Some(ports) => ports.bind(bind)?,
+            None => std::net::UdpSocket::bind(SocketAddr::new(bind, 0))?,
         };
         socket.set_nonblocking(true)?;
         let socket = Arc::new(UdpSocket::from_std(socket)?);
-        let address = SocketAddr::new(self.own.address.ip(), socket.local_addr()?.port());
+        let address = SocketAddr::new(ingress.ip(), socket.local_addr()?.port());
         let id = transport::hex(&rand::random::<[u8; 16]>());
         let metrics = stats::Metrics::new("mesh-relay");
         let options = relay::Options {
             listen: socket.local_addr()?,
-            target: target.address,
+            target: target
+                .addresses()
+                .find(|address| address.is_ipv4() == ingress.is_ipv4())
+                .unwrap_or(target.address),
             allow: vec![source],
             rate: self.rate,
             drop_every: 0,
@@ -746,6 +787,7 @@ impl State {
         stream: &mut h3::server::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
         source: IpAddr,
     ) -> Result<bool> {
+        let source = source.to_canonical();
         let path = request.uri().path();
         if !self.authorized(request) {
             stream
@@ -825,6 +867,7 @@ pub struct ServerOptions {
     pub id: String,
     pub listen: SocketAddr,
     pub advertise: SocketAddr,
+    pub advertise_alternate: Option<SocketAddr>,
     pub relay_ports: Option<RelayPorts>,
     pub join: Option<SocketAddr>,
     pub join_key: Option<PathBuf>,
@@ -834,6 +877,19 @@ pub struct ServerOptions {
     pub rate: u64,
     pub stats: stats::Metrics,
 }
+
+pub(crate) fn validate_public_dual_stack(primary: SocketAddr, alternate: SocketAddr) -> Result<()> {
+    ensure!(
+        [primary, alternate].into_iter().all(|address| {
+            super::proxy::permitted(address.ip(), false)
+                && !matches!(address.ip(), IpAddr::V4(ip) if ip.is_documentation() || ip.octets()[..3] == [192, 0, 0])
+                && !matches!(address.ip(), IpAddr::V6(ip) if ip.segments()[..2] == [0x2001, 0xdb8] || ip.to_ipv4_mapped().is_some())
+        }),
+        "dual-stack advertisement requires public IPv4 and IPv6 addresses"
+    );
+    Ok(())
+}
+
 pub async fn serve(options: ServerOptions) -> Result<()> {
     ensure!(
         options.target.is_some() || options.tcp_target.is_some() || options.proxy.is_some(),
@@ -846,13 +902,23 @@ pub async fn serve(options: ServerOptions) -> Result<()> {
     let own = Node {
         id: options.id,
         address: options.advertise,
+        alternate: options.advertise_alternate,
         incarnation: 0,
     };
     own.validate()?;
-    ensure!(
-        options.listen.is_ipv4() == options.advertise.is_ipv4(),
-        "listen and advertise address families differ"
-    );
+    if own.alternate.is_some() {
+        ensure!(
+            options.listen.is_ipv6()
+                && options.listen.ip().is_unspecified()
+                && options.listen.port() == own.address.port(),
+            "dual-stack advertisement requires a [::] listener on the advertised UDP port"
+        );
+    } else {
+        ensure!(
+            options.listen.is_ipv4() == options.advertise.is_ipv4(),
+            "listen and advertise address families differ"
+        );
+    }
     let (key, own, directory_lock) = storage::open_server(
         &options.dir,
         &own,
@@ -906,7 +972,10 @@ pub async fn serve(options: ServerOptions) -> Result<()> {
         &options.dir.join("cert.pem"),
         options.listen.is_ipv6()
             || options.join.is_some_and(|a| a.is_ipv6())
-            || state.known().iter().any(|n| n.address.is_ipv6()),
+            || state
+                .known()
+                .iter()
+                .any(|node| node.addresses().any(|address| address.is_ipv6())),
     )?);
     if let Some(seed) = options.join {
         let joined = async {
@@ -919,7 +988,7 @@ pub async fn serve(options: ServerOptions) -> Result<()> {
                 )
                 .await?;
             ensure!(
-                exchange.sender.address == seed,
+                exchange.sender.addresses().any(|address| address == seed),
                 "join endpoint differs from advertised address"
             );
             state.merge(exchange, true).await
@@ -1027,6 +1096,16 @@ impl ClientIdentity {
         limit: usize,
     ) -> Result<(Vec<SocketAddr>, Entrances)> {
         Entrances::start(self, nodes, exit, limit, Duration::from_secs(15)).await
+    }
+
+    pub(crate) async fn entrances_on(
+        &self,
+        nodes: Vec<Node>,
+        exit: &str,
+        limit: usize,
+        uplink: &Uplink,
+    ) -> Result<(Vec<SocketAddr>, Entrances)> {
+        Entrances::start_bound(self, nodes, exit, limit, Duration::from_secs(15), uplink).await
     }
 }
 
