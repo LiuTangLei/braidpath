@@ -72,7 +72,7 @@ pub(super) async fn serve(mut tcp: TcpStream, pool: Arc<Pool>, exit: &str) -> Re
         return flow.run(tcp).await;
     }
     let setup = timeout(CONNECT_TIMEOUT, async {
-        let conn = timeout(Duration::from_secs(2), pool.udp_connection(exit)).await??;
+        let conn = pool.udp_connection(exit).await?;
         let (mut send, mut recv) = conn.raw.open_bi().await?;
         let registration = conn.router.register(send.id().index())?;
         let request = [UDP];

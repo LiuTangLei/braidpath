@@ -1213,6 +1213,75 @@ async fn queued_stream_bytes_are_charged_and_reset_reclaims_them_with_downlink_b
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn socks_tcp_and_udp_connect_when_only_a_mesh_relay_can_reach_the_exit() {
+    let root = tempfile::tempdir().unwrap();
+    let (exit, _exit) = start(root.path(), "a", None, true).await;
+    let (relay, _relay) = start(root.path(), "b", Some(exit), true).await;
+    let identity = identity(root.path(), "relay-only");
+    // The client sees an unresponsive direct endpoint. The relay's own
+    // authenticated directory still has the reachable address for exit a.
+    let blackhole = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let direct = blackhole.local_addr().unwrap();
+    let pool = client::Pool::new(
+        identity.clone(),
+        vec![node("a", direct), node("b", relay)],
+        vec!["a".into()],
+        None,
+    )
+    .unwrap();
+    let (listen, _listener) = local_listener(pool.clone(), "a").await;
+    let (target, _echo) = echo().await;
+    let (mut tcp, status, _) = socks(listen, TCP, Address::Ip(target)).await;
+    assert_eq!(status, 0);
+    tcp.write_all(b"over mesh").await.unwrap();
+    let mut response = [0; 9];
+    timeout(Duration::from_secs(2), tcp.read_exact(&mut response))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(&response, b"over mesh");
+
+    let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let (udp_control, status, bound) =
+        socks(listen, UDP, Address::Ip(udp.local_addr().unwrap())).await;
+    assert_eq!(status, 0);
+    let Address::Ip(bound) = bound else { panic!() };
+    let destination = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let mut request = vec![0, 0, 0];
+    Address::Ip(destination.local_addr().unwrap()).encode(&mut request);
+    request.extend(b"datagram");
+    udp.send_to(&request, bound).await.unwrap();
+    timeout(Duration::from_secs(2), async {
+        let mut response = [0; 64];
+        let (n, peer) = destination.recv_from(&mut response).await.unwrap();
+        assert_eq!(&response[..n], b"datagram");
+        destination.send_to(&response[..n], peer).await.unwrap();
+        let (n, _) = udp.recv_from(&mut response).await.unwrap();
+        assert_eq!(&response[..n], request);
+    })
+    .await
+    .unwrap();
+
+    let routes = pool.test_addresses("a").await;
+    assert_eq!(routes.len(), 2);
+    assert_eq!(routes[0], direct);
+    assert_eq!(
+        pool.transport_snapshot("a").into_keys().collect::<Vec<_>>(),
+        vec![routes[1]]
+    );
+    assert!(
+        identity
+            .status(relay)
+            .await
+            .unwrap()
+            .active_relay_forward_bytes
+            > 0
+    );
+    drop((tcp, udp_control));
+    pool.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn prepared_paths_do_not_open_targets_and_cold_relays_do_not_hold_downloads() {
     let root = tempfile::tempdir().unwrap();
     let root = root.path();

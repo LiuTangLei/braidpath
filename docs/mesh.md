@@ -123,8 +123,10 @@ Clients discover address updates in the background every 15 seconds;
 new connections use updated addresses while existing connections retain their
 original exit. Each TCP connection now uses multiple cooperating server paths
 at the same time. `--paths` controls the maximum number per exit (default four,
-range 1–8); `--paths 1` provides a direct-path comparison. The direct path starts
-immediately; optional relay entrances are allocated and renewed in the background.
+range 1–8); `--paths 1` uses only the direct path. Relay entrances are allocated
+and renewed in the background. With relays enabled, a new SOCKS TCP connection
+can authenticate and reach its chosen exit through a relay when the direct
+route is unavailable.
 
 A single SOCKS TCP connection maps to exactly one destination TCP connection at
 its chosen exit. Each exit reuses one aggregate session across its authenticated
@@ -180,7 +182,9 @@ The remote link requires the existing pinned certificate and client token, and
 authenticates the requested exit ID before accepting destinations. There is no
 public unauthenticated SOCKS port. Domains are sent to the selected exit for
 resolution; both IPv4 and IPv6 destinations are supported. UDP prefers IPv4 when
-DNS provides both families; an explicit IPv6 destination uses IPv6.
+DNS provides both families; an explicit IPv6 destination uses IPv6. A new UDP
+association can start through an authenticated relay and stays on that route
+for the life of the association.
 
 For [Clash/Mihomo SOCKS5 nodes](https://wiki.metacubex.one/en/config/proxies/socks/),
 merge these entries into the application's existing configuration:

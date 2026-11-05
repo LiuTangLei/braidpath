@@ -117,7 +117,7 @@ pub(super) struct UdpConnection {
 struct UdpPath {
     address: SocketAddr,
     connection: Mutex<Option<Arc<UdpConnection>>>,
-    connecting: AsyncMutex<()>,
+    #[cfg(test)]
     retired: std::sync::atomic::AtomicBool,
 }
 impl UdpPath {
@@ -125,11 +125,12 @@ impl UdpPath {
         Self {
             address,
             connection: Mutex::new(None),
-            connecting: AsyncMutex::new(()),
+            #[cfg(test)]
             retired: std::sync::atomic::AtomicBool::new(false),
         }
     }
     fn retire(&self) {
+        #[cfg(test)]
         self.retired
             .store(true, std::sync::atomic::Ordering::Release);
         if let Some(conn) = self.connection.lock().expect("proxy connection").take() {
@@ -141,6 +142,49 @@ struct Routes {
     _guard: mesh::Entrances,
     updates: tokio::sync::watch::Receiver<Vec<SocketAddr>>,
 }
+
+// Relay leases arrive asynchronously. A failed direct probe must not prevent
+// the same SOCKS request from using a lease that becomes available.
+async fn first_route<T, F>(
+    mut updates: tokio::sync::watch::Receiver<Vec<SocketAddr>>,
+    dial: impl Fn(SocketAddr) -> F,
+) -> Result<T>
+where
+    T: Send + 'static,
+    F: Future<Output = Result<T>> + Send + 'static,
+{
+    // Leave time in the SOCKS handshake budget for opening the target stream.
+    timeout(Duration::from_secs(5), async {
+        let mut attempted = BTreeSet::new();
+        let mut pending = JoinSet::new();
+        loop {
+            {
+                let current = updates.borrow_and_update();
+                attempted.retain(|address| current.contains(address));
+                for &address in current.iter() {
+                    if attempted.insert(address) {
+                        let attempt = dial(address);
+                        pending.spawn(async move { (address, attempt.await) });
+                    }
+                }
+            }
+            tokio::select! {
+                change = updates.changed() => change.context("SOCKS routes stopped")?,
+                Some(attempt) = pending.join_next() => {
+                    let (address, result) = attempt?;
+                    match result {
+                        Ok(value) if updates.borrow().contains(&address) => return Ok(value),
+                        Ok(_) => {}
+                        Err(error) => tracing::debug!(%address, %error, "SOCKS route unavailable"),
+                    }
+                }
+            }
+        }
+    })
+    .await
+    .context("no reachable SOCKS route")?
+}
+
 struct Aggregate {
     connector: tunnel::tcp::Connector,
     task: Option<tokio::task::JoinHandle<Result<()>>>,
@@ -183,7 +227,7 @@ async fn stop_slot(aggregate: Option<Aggregate>, routes: Option<Routes>, paths: 
 }
 
 struct Slot {
-    node: RwLock<mesh::Node>,
+    udp_setup: AsyncMutex<()>,
     paths: Mutex<BTreeMap<SocketAddr, Arc<UdpPath>>>,
     routes: AsyncMutex<Option<Routes>>,
     aggregate: AsyncMutex<Option<Aggregate>>,
@@ -215,21 +259,6 @@ impl Pool {
         }
     }
 
-    async fn direct_address(&self, id: &str) -> Result<SocketAddr> {
-        let slot = self.slots.get(id).context("exit not selected")?;
-        let node = slot.node.read().expect("proxy node").clone();
-        if node.alternate.is_none() {
-            return Ok(node.address);
-        }
-        let (updates, _) = self.route_watch(id).await?;
-        let address = updates
-            .borrow()
-            .first()
-            .copied()
-            .context("no direct route")?;
-        Ok(address)
-    }
-
     pub(super) fn new(
         identity: mesh::ClientIdentity,
         nodes: Vec<mesh::Node>,
@@ -243,15 +272,14 @@ impl Pool {
         let mut slots = BTreeMap::new();
         for exit in &exits {
             ensure!(!slots.contains_key(exit), "duplicate proxy exit: {exit}");
-            let node = nodes
-                .iter()
-                .find(|n| n.id == *exit)
-                .with_context(|| format!("proxy exit not discovered: {exit}"))?
-                .clone();
+            ensure!(
+                nodes.iter().any(|n| n.id == *exit),
+                "proxy exit not discovered: {exit}"
+            );
             slots.insert(
                 exit.clone(),
                 Slot {
-                    node: RwLock::new(node),
+                    udp_setup: AsyncMutex::new(()),
                     paths: Mutex::new(BTreeMap::new()),
                     routes: AsyncMutex::new(None),
                     aggregate: AsyncMutex::new(None),
@@ -325,13 +353,21 @@ impl Pool {
         if let Some(old) = aggregate.take() {
             old.shutdown().await;
         }
-        let address = self.direct_address(id).await?;
-        let status = self.identity.status_on(address, &self.uplink()).await?;
-        ensure!(status.node.id == id, "proxy exit identity changed");
-        status.capabilities.require_proxy_stream()?;
         // This reporter owns the entrance health channel for this exit. Native
         // UDP remains lazy and must not overwrite aggregate-path evidence.
         let (updates, health) = self.route_watch(id).await?;
+        let status = first_route(updates.clone(), |address| {
+            let identity = self.identity.clone();
+            let uplink = self.uplink();
+            let exit = id.to_owned();
+            async move {
+                let status = identity.status_on(address, &uplink).await?;
+                ensure!(status.node.id == exit, "proxy exit identity changed");
+                Ok(status)
+            }
+        })
+        .await?;
+        status.capabilities.require_proxy_stream()?;
         #[cfg(test)]
         let updates = {
             *slot.stream_health.lock().expect("stream health") = Some(health.clone());
@@ -449,63 +485,58 @@ impl Pool {
         .await??;
         Ok(connection)
     }
-    async fn connect_udp(&self, id: &str, path: &UdpPath) -> Result<Arc<UdpConnection>> {
-        let _connecting = path.connecting.lock().await;
-        {
-            let mut cached = path.connection.lock().expect("proxy connection");
-            ensure!(
-                !path.retired.load(std::sync::atomic::Ordering::Acquire),
-                "UDP exit connection retired"
-            );
-            if let Some(conn) = &*cached
-                && conn.raw.close_reason().is_none()
-            {
-                return Ok(conn.clone());
-            }
-            *cached = None;
-        }
-        let connection = Self::authenticate_udp(
-            &self.identity,
-            &self.token,
-            path.address,
-            id,
-            self.interface.as_deref(),
-        )
-        .await?;
-        let mut cached = path.connection.lock().expect("proxy connection");
-        // Retirement can race with the handshake. Never install a connection
-        // after its entrance lease has been released.
-        ensure!(
-            !path.retired.load(std::sync::atomic::Ordering::Acquire),
-            "UDP exit connection retired"
-        );
-        *cached = Some(connection.clone());
-        Ok(connection)
-    }
     pub(super) async fn udp_connection(&self, id: &str) -> Result<Arc<UdpConnection>> {
+        let slot = self.slots.get(id).context("exit not selected")?;
+        let _setup = slot.udp_setup.lock().await;
+        let (updates, _) = self.route_watch(id).await?;
+        {
+            let paths = slot.paths.lock().expect("proxy paths");
+            for address in updates.borrow().iter() {
+                if let Some(path) = paths.get(address)
+                    && let Some(conn) = path.connection.lock().expect("proxy connection").as_ref()
+                    && conn.raw.close_reason().is_none()
+                {
+                    return Ok(conn.clone());
+                }
+            }
+        }
+        let (address, conn) = first_route(updates.clone(), |address| {
+            let identity = self.identity.clone();
+            let token = self.token.clone();
+            let exit = id.to_owned();
+            let interface = self.interface.clone();
+            async move {
+                let conn =
+                    Self::authenticate_udp(&identity, &token, address, &exit, interface.as_deref())
+                        .await?;
+                Ok((address, conn))
+            }
+        })
+        .await?;
+        let mut paths = slot.paths.lock().expect("proxy paths");
         ensure!(
             !self.closed.load(std::sync::atomic::Ordering::Acquire),
             "proxy client stopped"
         );
-        let slot = self.slots.get(id).context("exit not selected")?;
-        let address = self.direct_address(id).await?;
-        let path = slot
-            .paths
-            .lock()
-            .expect("proxy paths")
-            .entry(address)
-            .or_insert_with(|| Arc::new(UdpPath::new(address)))
-            .clone();
-        self.connect_udp(id, &path).await
+        ensure!(updates.borrow().contains(&address), "UDP route retired");
+        let path = Arc::new(UdpPath::new(address));
+        *path.connection.lock().expect("proxy connection") = Some(conn.clone());
+        paths.insert(path.address, path);
+        Ok(conn)
     }
     pub(super) fn retire_stale_udp_paths(&self) {
         for slot in self.slots.values() {
-            let current = slot.node.read().expect("proxy node").clone();
+            let Ok(routes) = slot.routes.try_lock() else {
+                continue;
+            };
+            let Some(routes) = routes.as_ref() else {
+                continue;
+            };
             slot.paths
                 .lock()
                 .expect("proxy paths")
                 .retain(|address, path| {
-                    if current.addresses().any(|current| *address == current) {
+                    if routes.updates.borrow().contains(address) {
                         true
                     } else {
                         path.retire();
@@ -624,14 +655,6 @@ impl Pool {
         updates.borrow().clone()
     }
     fn refresh(&self, nodes: Vec<mesh::Node>) {
-        for node in &nodes {
-            if let Some(slot) = self.slots.get(&node.id) {
-                let mut current = slot.node.write().expect("proxy node");
-                if node.incarnation >= current.incarnation {
-                    *current = node.clone();
-                }
-            }
-        }
         *self.nodes.write().expect("proxy nodes") = nodes;
     }
 }
@@ -1073,7 +1096,9 @@ mod lifecycle_tests {
                 connector,
                 task: Some(task),
             });
-            let path = Arc::new(super::UdpPath::new(slot.node.read().unwrap().address));
+            let path = Arc::new(super::UdpPath::new(
+                nodes.iter().find(|node| node.id == exit).unwrap().address,
+            ));
             slot.paths
                 .lock()
                 .unwrap()
