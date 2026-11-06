@@ -209,6 +209,11 @@ TCP and SOCKS UDP use different profiles on the server's existing UDP port.
 TCP uses `braidpath-stream/2` and the aggregate reliable-flow engine, including
 half-close. SOCKS UDP retains ALPN `braidpath-proxy/1`, QUIC DATAGRAM transport,
 bounded fragmentation up to 65,507 payload bytes, and no retransmission or FEC.
+The SOCKS TCP control connection authorizes the association. UDP payloads
+remain separate datagrams across the mesh and are sent from a UDP socket at the
+selected exit. Every proxy after that exit must also support UDP. Verify chained
+outbounds with an application-level round trip, such as an HTTP/3 request,
+before enabling UDP in their client profiles.
 SOCKS UDP headers also consume the local operating system's datagram limit.
 SOCKS-level fragments (`FRAG != 0`) are dropped as permitted by
 [RFC 1928](https://www.rfc-editor.org/rfc/rfc1928.txt). The existing fixed-target

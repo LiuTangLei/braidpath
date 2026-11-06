@@ -1247,17 +1247,33 @@ async fn socks_tcp_and_udp_connect_when_only_a_mesh_relay_can_reach_the_exit() {
     assert_eq!(status, 0);
     let Address::Ip(bound) = bound else { panic!() };
     let destination = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    let mut request = vec![0, 0, 0];
-    Address::Ip(destination.local_addr().unwrap()).encode(&mut request);
-    request.extend(b"datagram");
-    udp.send_to(&request, bound).await.unwrap();
+    let payloads = [vec![0x61; 1200], vec![0x62; 1370]];
+    let requests = payloads.each_ref().map(|payload| {
+        let mut request = vec![0, 0, 0];
+        Address::Ip(destination.local_addr().unwrap()).encode(&mut request);
+        request.extend(payload);
+        request
+    });
+    for request in &requests {
+        udp.send_to(request, bound).await.unwrap();
+    }
     timeout(Duration::from_secs(2), async {
-        let mut response = [0; 64];
-        let (n, peer) = destination.recv_from(&mut response).await.unwrap();
-        assert_eq!(&response[..n], b"datagram");
-        destination.send_to(&response[..n], peer).await.unwrap();
-        let (n, _) = udp.recv_from(&mut response).await.unwrap();
-        assert_eq!(&response[..n], request);
+        let mut response = [0; 1500];
+        let mut received = Vec::new();
+        for _ in &payloads {
+            let (n, peer) = destination.recv_from(&mut response).await.unwrap();
+            received.push(response[..n].to_vec());
+            destination.send_to(&response[..n], peer).await.unwrap();
+        }
+        received.sort_unstable();
+        assert_eq!(received, payloads);
+        let mut received = Vec::new();
+        for _ in &requests {
+            let (n, _) = udp.recv_from(&mut response).await.unwrap();
+            received.push(response[..n].to_vec());
+        }
+        received.sort_unstable();
+        assert_eq!(received, requests);
     })
     .await
     .unwrap();
