@@ -1564,13 +1564,24 @@ async fn one_tcp_upload_repairs_loss_without_duplicating_target_bytes() {
         tcp.read_to_end(&mut response).await.unwrap();
         assert_eq!(response, b"complete");
     });
+    let mut last_status_error = None;
     timeout(Duration::from_secs(4), async {
-        while identity.status(b).await.unwrap().active_relay_forward_bytes < 65536 {
+        loop {
+            // A transient control-stream reset is not evidence that the relay
+            // carried the upload. Wait for a successful counter read within
+            // the original deadline before injecting the fault.
+            match identity.status(b).await {
+                Ok(status) if status.active_relay_forward_bytes >= 65536 => break,
+                Ok(_) => {}
+                Err(error) => last_status_error = Some(error.to_string()),
+            }
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
     })
     .await
-    .unwrap();
+    .unwrap_or_else(|_| {
+        panic!("relay upload was not observed; last status error: {last_status_error:?}")
+    });
     drop(relay_b);
     timeout(Duration::from_secs(12), transfer)
         .await

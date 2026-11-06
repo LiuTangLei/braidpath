@@ -81,7 +81,7 @@ async fn measure_raw(conn: &quinn::Connection, router: &Arc<Router>) -> Result<Q
         received: rtts.len(),
         rtt: rtts.get(rtts.len() / 2).copied().unwrap_or(grace),
     };
-    tracing::info!(peer = %conn.remote_address(), sent = COUNT, received = quality.received,
+    tracing::info!(peer = %conn.remote_address(), expected = COUNT, sent = sent.len(), received = quality.received,
         rtt_us = quality.rtt.as_micros() as u64, "UDP route health probe");
     Ok(quality)
 }
