@@ -184,7 +184,17 @@ public unauthenticated SOCKS port. Domains are sent to the selected exit for
 resolution; both IPv4 and IPv6 destinations are supported. UDP prefers IPv4 when
 DNS provides both families; an explicit IPv6 destination uses IPv6. A new UDP
 association can start through an authenticated relay and stays on that route
-for the life of the association.
+for the life of the association. Before choosing a native UDP connection, the
+client races bounded, authenticated datagram echo probes on the available paths.
+It prefers a path that returns every probe over one that merely completes its
+reliable handshake first. The probes cover small and larger datagrams, require
+no external destination, and are included in the exit's rate budget. A healthy
+result is cached for 60 seconds; a new association rechecks an expired result.
+If every reachable path has loss, the best measured partial result remains
+usable instead of requiring a perfect or direct path. Existing associations are
+not interrupted by these admission checks. This is path selection, not a
+guarantee of loss-free UDP after admission. Upgrade both client and selected exit
+to a build with UDP health probes before using this admission behavior.
 
 For [Clash/Mihomo SOCKS5 nodes](https://wiki.metacubex.one/en/config/proxies/socks/),
 merge these entries into the application's existing configuration:

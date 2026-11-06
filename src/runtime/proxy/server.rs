@@ -153,7 +153,19 @@ impl Server {
                         }
                     });
                 }
-                data = conn.read_datagram() => router.dispatch(data?),
+                data = conn.read_datagram() => {
+                    let data = data?;
+                    if health::is_probe(&data) {
+                        if self.rate.delay(data.len() * 2).is_none() {
+                            // Do not evict application datagrams to answer a probe.
+                            if conn.datagram_send_buffer_space() >= data.len() {
+                                let _ = timeout(Duration::from_millis(20), conn.send_datagram_wait(data)).await;
+                            }
+                        }
+                    } else {
+                        router.dispatch(data);
+                    }
+                },
                 _ = tasks.join_next(), if !tasks.is_empty() => { last = Instant::now(); }
                 _ = maintenance.tick() => {
                     telemetry.report(&conn, "server", &self.exit);

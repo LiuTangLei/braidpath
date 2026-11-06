@@ -110,6 +110,7 @@ pub(super) fn listener_plan(
 pub(super) struct UdpConnection {
     pub(super) raw: quinn::Connection,
     pub(super) router: Arc<Router>,
+    healthy_until: Mutex<Instant>,
     _reader: AbortTask,
     _close: CloseConnection,
     _endpoint: quinn::Endpoint,
@@ -477,6 +478,7 @@ impl Pool {
             Ok::<_, anyhow::Error>(Arc::new(UdpConnection {
                 raw,
                 router,
+                healthy_until: Mutex::new(Instant::now()),
                 _reader: reader,
                 _close: close,
                 _endpoint: endpoint,
@@ -489,30 +491,84 @@ impl Pool {
         let slot = self.slots.get(id).context("exit not selected")?;
         let _setup = slot.udp_setup.lock().await;
         let (updates, _) = self.route_watch(id).await?;
-        {
+        #[cfg(test)]
+        let (_test_owner, updates) =
+            if let Some(addresses) = slot.test_routes.lock().unwrap().clone() {
+                let (sender, receiver) = tokio::sync::watch::channel(addresses);
+                (Some(sender), receiver)
+            } else {
+                (None, updates)
+            };
+        let cached = {
             let paths = slot.paths.lock().expect("proxy paths");
-            for address in updates.borrow().iter() {
+            updates.borrow().iter().find_map(|address| {
                 if let Some(path) = paths.get(address)
                     && let Some(conn) = path.connection.lock().expect("proxy connection").as_ref()
                     && conn.raw.close_reason().is_none()
                 {
-                    return Ok(conn.clone());
+                    return Some(conn.clone());
                 }
+                None
+            })
+        };
+        if let Some(conn) = cached {
+            let valid = *conn.healthy_until.lock().expect("UDP health deadline") > Instant::now();
+            if valid || health::measure(&conn).await.is_ok_and(|q| q.complete()) {
+                if !valid {
+                    *conn.healthy_until.lock().expect("UDP health deadline") =
+                        Instant::now() + health::VALID_FOR;
+                }
+                return Ok(conn);
             }
+            // New associations should not repeatedly rediscover this expired,
+            // lossy cache entry before reaching a healthier one. Existing flows
+            // retain their own Arc and are not closed by this removal.
+            slot.paths.lock().expect("proxy paths").retain(|_, path| {
+                path.connection
+                    .lock()
+                    .expect("proxy connection")
+                    .as_ref()
+                    .is_none_or(|cached| !Arc::ptr_eq(cached, &conn))
+            });
         }
+        // A fast reliable-stream handshake says nothing about loss of native
+        // datagrams. Race measured paths, retaining the best partial result if
+        // every reachable route has loss; imperfect connectivity still works.
+        type Candidate = (health::Quality, SocketAddr, Arc<UdpConnection>);
+        let fallback: Arc<Mutex<Option<Candidate>>> = Arc::new(Mutex::new(None));
         let (address, conn) = first_route(updates.clone(), |address| {
             let identity = self.identity.clone();
             let token = self.token.clone();
             let exit = id.to_owned();
             let interface = self.interface.clone();
+            let fallback = fallback.clone();
             async move {
                 let conn =
                     Self::authenticate_udp(&identity, &token, address, &exit, interface.as_deref())
                         .await?;
-                Ok((address, conn))
+                let quality = health::measure(&conn).await?;
+                if quality.complete() {
+                    *conn.healthy_until.lock().expect("UDP health deadline") = Instant::now() + health::VALID_FOR;
+                    return Ok((address, conn));
+                }
+                if quality.received > 0 {
+                    let mut best = fallback.lock().expect("UDP partial routes");
+                    if best.as_ref().is_none_or(|(q, _, _)| quality.better_than(*q)) {
+                        *best = Some((quality, address, conn));
+                    }
+                }
+                bail!("UDP route lost health probes")
             }
         })
-        .await?;
+        .await.or_else(|error| {
+            let Some((quality, address, conn)) = fallback.lock().expect("UDP partial routes").take() else {
+                return Err(error);
+            };
+            ensure!(updates.borrow().contains(&address) && conn.raw.close_reason().is_none(), "UDP fallback route retired");
+            tracing::warn!(%address, received = quality.received, "using best reachable UDP route with measured loss");
+            *conn.healthy_until.lock().expect("UDP health deadline") = Instant::now() + Duration::from_secs(5);
+            Ok((address, conn))
+        })?;
         let mut paths = slot.paths.lock().expect("proxy paths");
         ensure!(
             !self.closed.load(std::sync::atomic::Ordering::Acquire),

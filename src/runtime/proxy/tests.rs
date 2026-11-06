@@ -1352,6 +1352,80 @@ async fn prepared_paths_do_not_open_targets_and_cold_relays_do_not_hold_download
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn udp_prefers_complete_datagram_delivery_over_a_faster_lossy_handshake() {
+    async fn entrance(target: SocketAddr, loss: bool) -> (SocketAddr, Task<()>) {
+        let front = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let address = front.local_addr().unwrap();
+        let back = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        back.connect(target).await.unwrap();
+        let task = Task(tokio::spawn(async move {
+            let (mut up, mut down) = (vec![0; 65536], vec![0; 65536]);
+            let mut peer = None;
+            let mut small = 0;
+            loop {
+                tokio::select! {
+                    r = front.recv_from(&mut up) => {
+                        let (n, source) = r.unwrap();
+                        peer = Some(source);
+                        back.send(&up[..n]).await.unwrap();
+                    }
+                    r = back.recv(&mut down) => {
+                        let n = r.unwrap();
+                        if loss && n > 100 && down[0] & 0x80 == 0 {
+                            small += 1;
+                            if small % 3 == 0 { continue; }
+                        }
+                        if !loss && n > 100 { tokio::time::sleep(Duration::from_millis(15)).await; }
+                        if let Some(peer) = peer { front.send_to(&down[..n], peer).await.unwrap(); }
+                    }
+                }
+            }
+        }));
+        (address, task)
+    }
+    let root = tempfile::tempdir().unwrap();
+    let (at, _server) = start(root.path(), "a", None, true).await;
+    let pool = client::Pool::new(
+        identity(root.path(), "udp-health-client"),
+        vec![node("a", at)],
+        vec!["a".into()],
+        None,
+    )
+    .unwrap();
+    let (lossy, _lossy) = entrance(at, true).await;
+    let (healthy, _healthy) = entrance(at, false).await;
+    pool.test_set_routes("a", vec![lossy, healthy]);
+    let selected = timeout(Duration::from_secs(4), pool.udp_connection("a"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(selected.raw.remote_address(), healthy);
+    let again = pool.udp_connection("a").await.unwrap();
+    assert!(
+        Arc::ptr_eq(&selected, &again),
+        "healthy cache should not probe for every flow"
+    );
+    pool.shutdown().await;
+
+    // With only an imperfect relay available, keep usable UDP rather than
+    // requiring a directly reachable or completely loss-free exit.
+    let pool = client::Pool::new(
+        identity(root.path(), "udp-partial-client"),
+        vec![node("a", at)],
+        vec!["a".into()],
+        None,
+    )
+    .unwrap();
+    pool.test_set_routes("a", vec![lossy]);
+    let selected = timeout(Duration::from_secs(7), pool.udp_connection("a"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(selected.raw.remote_address(), lossy);
+    pool.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn failed_proxy_relay_is_reported_and_replaced_by_another_server() {
     let root = tempfile::tempdir().unwrap();
     let root = root.path();

@@ -11,6 +11,7 @@ use tokio::{
 };
 
 mod client;
+mod health;
 mod protocol;
 mod server;
 mod socks;
