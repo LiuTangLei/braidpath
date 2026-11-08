@@ -745,8 +745,21 @@ async fn plain_interactive_waits_for_fast_credit_instead_of_entering_a_slow_queu
             &policy,
             Duration::ZERO
         ),
+        vec![(0, 1)],
+        "interactive response chunks must not fall back into a slow queue when fast-path credit is temporarily exhausted"
+    );
+    front.hold = Some(gauge.hold(1, 0, 1, 1000, false));
+    assert_eq!(
+        latency_candidates(
+            eligible.to_vec(),
+            &paths,
+            &front,
+            false,
+            &policy,
+            Duration::ZERO
+        ),
         eligible,
-        "large startup chunks keep every route even while their stream has little outstanding data"
+        "bulk streams retain every eligible route"
     );
     front.hold = None;
     front.data = Bytes::from(vec![7; 100]);

@@ -975,7 +975,13 @@ impl Sender {
         if s.path == UNKNOWN_PATH
             || s.transmissions != 1
             || s.probe_transmission.is_some()
-            || s.end - start > 128
+            // A sparse HTTPS response can occupy a full negotiated segment.
+            // It still has no following packet to reveal loss with a SACK.
+            // Keep the one-segment/one-probe bound, including the FIN byte.
+            || s.end - start > super::MAX_STREAM_PAYLOAD as u64
+            // A lone SACK hole below delivered data is not a tail. Its RACK
+            // and bounded head-probe policy already control recovery.
+            || s.end < self.written
             || self.next < self.written
         {
             return None;
@@ -1678,6 +1684,55 @@ mod tests {
         let repair = s.poll_transmit(loss).unwrap();
         assert!(repair.retransmission && !repair.tail_probe);
         assert!(s.tail_probe_deadline().is_none());
+    }
+
+    #[test]
+    fn full_segment_tail_probe_is_bounded_and_cancelled_by_ack() {
+        for bytes in [1032, super::super::MAX_STREAM_PAYLOAD - DATA_HEADER] {
+            for acknowledged in [false, true] {
+                let now = Instant::now();
+                let mut sender = Sender::new(false);
+                sender.push(&vec![7; bytes]);
+                let original = sender
+                    .poll_transmit_sized(now, super::super::MAX_STREAM_PAYLOAD)
+                    .unwrap();
+                assert!(sender.tail_probe_deadline().is_none());
+                sender.admitted(0, original.transmission, 0, Duration::from_millis(90), now);
+                let loss = sender.fresh_deadline(now, sender.path_threshold(0, now));
+                let (probe_at, _) = sender.tail_probe_deadline().unwrap();
+                assert!(probe_at >= now + Duration::from_millis(90) && probe_at < loss);
+                if acknowledged {
+                    sender
+                        .on_ack(
+                            &Ack {
+                                cumulative: bytes as u64,
+                                limit: INITIAL_WINDOW,
+                                ..Default::default()
+                            },
+                            now + Duration::from_millis(90),
+                        )
+                        .unwrap();
+                    assert!(sender.tail_probe_deadline().is_none());
+                    sender.on_timeout(probe_at);
+                    assert!(sender.poll_transmit(probe_at).is_none());
+                } else {
+                    sender.on_timeout(probe_at);
+                    let probe = sender
+                        .poll_transmit_sized(probe_at, super::super::MAX_STREAM_PAYLOAD)
+                        .unwrap();
+                    assert!(probe.tail_probe && probe.retransmission);
+                    sender.admitted(
+                        0,
+                        probe.transmission,
+                        1,
+                        Duration::from_millis(90),
+                        probe_at,
+                    );
+                    assert_eq!(sender.next_deadline(probe_at), Some(loss));
+                    assert!(sender.poll_transmit(probe_at).is_none());
+                }
+            }
+        }
     }
 
     fn bulk_hole(now: Instant, missing: usize) -> Sender {
@@ -2678,7 +2733,9 @@ mod tests {
     fn admission_restarts_the_clock_and_stale_copies_cannot_move_it() {
         let t0 = Instant::now();
         let mut sender = Sender::new(false);
-        sender.push(&[1; 200]);
+        // Leave unsent data so this checks the normal loss/admission clock,
+        // independently of the earlier single-segment tail probe.
+        sender.push(&[1; 2 * MAX_SEGMENT]);
         let t = sender.poll_transmit(t0).unwrap();
         let at = t0 + Duration::from_millis(90);
         sender.admitted(t.start, t.transmission, 0, Duration::from_millis(20), at);
