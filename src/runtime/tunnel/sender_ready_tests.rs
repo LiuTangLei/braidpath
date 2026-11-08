@@ -821,6 +821,95 @@ async fn plain_interactive_waits_for_fast_credit_instead_of_entering_a_slow_queu
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn reliable_small_retry_escapes_repeated_local_expiry() {
+    let fast = Pair::connect().await;
+    let slow = Pair::connect().await;
+    let mut slow_path = slow.path();
+    slow_path.id = 1;
+    slow_path.quality.lock().unwrap().snapshot.sender_estimate = quality::Estimate {
+        updated_us: Some(0),
+        delay_variation_ms: 500.0,
+        ..Default::default()
+    };
+    let paths = [fast.path(), slow_path];
+    // AUTO's ordinary lane must recover too. Independently coded small
+    // records retain their separate policy and readiness tests below.
+    for (bytes, fec) in [(100, 0), (240, automatic_fec::AUTO), (1000, 0)] {
+        let mut policy = policy();
+        policy.adaptive = true;
+        policy.latency_target_ms = 5;
+        policy.fec = fec;
+        policy.redundancy = 0;
+        policy.small_fec_bytes = 0;
+        let lifetime = policy.admission_lifetime();
+        let mut controllers =
+            std::array::from_fn(|_| adaptive::PathController::new(policy.rate, 5));
+        let gauge = Arc::new(outbound::Gauge::default());
+        let mut sender = stream::Sender::new(false);
+        sender.push(&vec![7; bytes]);
+        let mut queue = outbound::Queue::default();
+        let start = Instant::now();
+        let mut admitted = false;
+        for attempt in 0..3 {
+            let now = start + lifetime * attempt;
+            let now_us = (lifetime * attempt).as_micros() as u64;
+            let tx = sender.poll_transmit(now).unwrap();
+            let data = Bytes::from(tx.frame.encode());
+            let size = data.len();
+            let pending = outbound::Pending {
+                data,
+                created: now,
+                record_id: Some(u64::from(attempt)),
+                flow: Some(stream::data_flow(1)),
+                block: (fec == automatic_fec::AUTO).then_some(1),
+                small: false,
+                hold: Some(gauge.hold(1, tx.start, tx.transmission, size, true)),
+            };
+            // Keep the healthy-looking fast path without pacing credit.
+            controllers[0].admitted(now_us, 2400);
+            let candidates = latency_candidates(
+                vec![(0, 1), (1, 1)],
+                &paths,
+                &pending,
+                false,
+                &policy,
+                Duration::ZERO,
+            );
+            let ready = business_ready_candidates(
+                &candidates,
+                &paths,
+                &mut controllers,
+                now_us,
+                size,
+                0.0,
+                None,
+            );
+            if !ready.is_empty() {
+                assert_eq!(attempt, 1, "one expiry must release the fallback");
+                assert_eq!(ready, vec![(1, 1)]);
+                pending
+                    .hold
+                    .as_ref()
+                    .unwrap()
+                    .admitted(1, Duration::from_millis(100), now);
+                admitted = true;
+                break;
+            }
+            assert!(queue.push(pending).is_ok());
+            drop(queue.expire(now + lifetime, lifetime));
+            let dropped = gauge.take_dropped();
+            assert_eq!(dropped, vec![(1, tx.start, tx.transmission)]);
+            assert!(sender.locally_dropped(tx.start, tx.transmission));
+        }
+        assert!(
+            admitted,
+            "{bytes}B record repeated local expiry instead of using the ready fallback"
+        );
+        assert!(gauge.take_dropped().is_empty());
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn adaptive_small_readiness_ignores_fast_peer_without_current_packet_credit() {
     let fast = Pair::connect().await;
     let slow = Pair::connect().await;

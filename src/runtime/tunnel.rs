@@ -1266,19 +1266,20 @@ fn latency_candidates(
         || front
             .flow
             .is_none_or(|flow| stream::stream_id(flow).is_none())
+        || front
+            .hold
+            .as_ref()
+            .is_some_and(|hold| hold.transmission() > 1)
         || (front.data.len() > LATENCY_RECORD_BYTES
-            && !front
-                .hold
-                .as_ref()
-                .is_some_and(|hold| hold.interactive() && hold.transmission() == 1))
+            && !front.hold.as_ref().is_some_and(|hold| hold.interactive()))
     {
         return candidates;
     }
     // Rank healthy paths before checking transient packet credit. A token gap
     // on an idle route must not send an interactive record into a long queue.
     // An unready head rotates normally, so other flows keep making progress.
-    // Larger interactive records get this preference only on their original
-    // attempt. Reapplying it after local expiry would renew the admission clock
+    // Reliable records get this preference only on their original attempt,
+    // regardless of size. Reapplying it after local expiry renews the clock
     // without ever releasing a credit-starved fast path's slower fallbacks.
     let eligible = candidates.iter().fold(0, |mask, (id, _)| mask | (1 << id));
     let timely = small_delivery::latency_mask(
