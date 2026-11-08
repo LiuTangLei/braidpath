@@ -981,7 +981,7 @@ impl Sender {
             || s.end - start > super::MAX_STREAM_PAYLOAD as u64
             // A lone SACK hole below delivered data is not a tail. Its RACK
             // and bounded head-probe policy already control recovery.
-            || s.end < self.written
+            || s.end < self.next + u64::from(self.fin_sent && self.fin == Some(self.next))
             || self.next < self.written
         {
             return None;
@@ -1016,7 +1016,9 @@ impl Sender {
             self.head_probe_deadline()
                 .filter(|_| !self.head_probe_due)
                 .map(|(_, at)| at),
-            self.tail_probe_deadline().map(|(at, _)| at),
+            self.tail_probe_deadline()
+                .filter(|_| !self.tail_probe_due)
+                .map(|(at, _)| at),
             self.fresh
                 .iter()
                 .enumerate()
@@ -1733,6 +1735,115 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn deferred_tail_probe_does_not_leave_an_expired_wakeup() {
+        let now = Instant::now();
+        let mut sender = Sender::new(false);
+        sender.push(&vec![7; 1032]);
+        let original = sender
+            .poll_transmit_sized(now, super::super::MAX_STREAM_PAYLOAD)
+            .unwrap();
+        sender.admitted(0, original.transmission, 0, Duration::from_millis(90), now);
+        let (probe_at, _) = sender.tail_probe_deadline().unwrap();
+        let loss_at = sender.fresh_deadline(now, sender.path_threshold(0, now));
+        sender.on_timeout(probe_at);
+        // The mux may defer polling this stream while its shared byte budget
+        // is occupied. Readiness must survive without a past timer spinning.
+        assert!(sender.has_transmit());
+        assert_eq!(
+            sender.next_deadline(probe_at + Duration::from_millis(1)),
+            Some(loss_at)
+        );
+        let probe = sender
+            .poll_transmit_sized(probe_at, super::super::MAX_STREAM_PAYLOAD)
+            .unwrap();
+        assert!(probe.tail_probe && probe.start == 0);
+    }
+
+    #[test]
+    fn sack_of_a_separate_fin_does_not_turn_a_data_hole_into_a_tail() {
+        let now = Instant::now();
+        let mut sender = Sender::new(false);
+        sender.push(&[7; 200]);
+        let data = sender.poll_transmit(now).unwrap();
+        sender.admitted(0, data.transmission, 0, Duration::from_millis(90), now);
+        sender.finish();
+        let fin = sender.poll_transmit(now).unwrap();
+        assert_eq!(fin.start, 200);
+        sender.admitted(
+            fin.start,
+            fin.transmission,
+            0,
+            Duration::from_millis(90),
+            now,
+        );
+        sender
+            .on_ack(
+                &Ack {
+                    ranges: vec![(200, 201)],
+                    limit: INITIAL_WINDOW,
+                    ..Default::default()
+                },
+                now + Duration::from_millis(90),
+            )
+            .unwrap();
+        assert_eq!(sender.segments.len(), 1);
+        assert!(sender.tail_probe_deadline().is_none());
+
+        let mut combined = Sender::new(false);
+        combined.push(&[7; 200]);
+        combined.finish();
+        let data_fin = combined.poll_transmit(now).unwrap();
+        combined.admitted(0, data_fin.transmission, 0, Duration::from_millis(90), now);
+        assert!(combined.tail_probe_deadline().is_some());
+    }
+
+    #[test]
+    fn delayed_single_segment_admission_starts_both_tail_and_loss_clocks() {
+        let now = Instant::now();
+        let mut sender = Sender::new(false);
+        sender.push(&[7; 200]);
+        let original = sender.poll_transmit(now).unwrap();
+        assert!(sender.tail_probe_deadline().is_none());
+        let admitted = now + Duration::from_millis(90);
+        sender.admitted(
+            0,
+            original.transmission,
+            0,
+            Duration::from_millis(20),
+            admitted,
+        );
+        let probe_at = admitted + Duration::from_millis(20).mul_f64(1.125) + ACK_DELAY;
+        let loss_at = sender.fresh_deadline(admitted, sender.path_threshold(0, admitted));
+        assert_eq!(sender.next_deadline(admitted), Some(probe_at));
+        sender.admitted(
+            0,
+            original.transmission,
+            1,
+            Duration::from_secs(1),
+            admitted,
+        );
+        assert_eq!(sender.next_deadline(admitted), Some(probe_at));
+        sender.on_timeout(probe_at);
+        let probe = sender.poll_transmit(probe_at).unwrap();
+        assert!(probe.tail_probe && probe.retransmission && probe.start == 0);
+        sender.admitted(
+            0,
+            probe.transmission,
+            1,
+            Duration::from_millis(80),
+            probe_at,
+        );
+        sender.admitted(
+            0,
+            original.transmission,
+            0,
+            Duration::from_millis(1),
+            probe_at,
+        );
+        assert_eq!(sender.next_deadline(probe_at), Some(loss_at));
     }
 
     fn bulk_hole(now: Instant, missing: usize) -> Sender {
@@ -2749,6 +2860,7 @@ mod tests {
         );
         sender.on_timeout(deadline);
         let repair = sender.poll_transmit(deadline).unwrap();
+        assert!(repair.start == 0 && repair.retransmission && !repair.tail_probe);
         sender.admitted(
             repair.start,
             repair.transmission,
