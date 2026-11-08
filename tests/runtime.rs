@@ -930,16 +930,19 @@ fn four_connection_profile(native_service_guard: bool, rtt_source_baselines: boo
         if let Some(v) = last
             && let Some(paths) = v["stats"]["paths"].as_object()
             && paths.len() == 4
+            // Registration and local-socket annotation are separate updates.
+            // Wait for a complete snapshot before checking socket uniqueness.
+            && let Some(sockets) = paths
+                .values()
+                .map(|p| p["local_socket"].as_str())
+                .collect::<Option<BTreeSet<_>>>()
         {
             assert!(paths.values().all(|p| p["authenticated"] == true));
             let ids: BTreeSet<_> = paths
                 .values()
                 .map(|p| p["connection_id"].as_u64().unwrap())
                 .collect();
-            let sockets: BTreeSet<_> = paths
-                .values()
-                .map(|p| p["local_socket"].as_str().unwrap())
-                .collect();
+
             assert_eq!(ids.len(), 4);
             assert_eq!(sockets.len(), 4);
             assert!(paths.values().all(|p| p["peer_socket"] == server_addr));
