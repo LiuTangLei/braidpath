@@ -1259,6 +1259,8 @@ fn latency_candidates(
     repair: bool,
     policy: &Policy,
     age: Duration,
+    controllers: &mut [adaptive::PathController; MAX_PATHS],
+    now_us: u64,
 ) -> Vec<(u8, i32)> {
     if !policy.adaptive
         || repair
@@ -1275,20 +1277,40 @@ fn latency_candidates(
     {
         return candidates;
     }
-    // Rank healthy paths before checking transient packet credit. A token gap
-    // on an idle route must not send an interactive record into a long queue.
+    // A short credit gap must not send an interactive record into a long
+    // queue. For larger first-flight chunks, compare the actual credit wait
+    // too: a depleted fast path can arrive later than a ready alternate.
     // An unready head rotates normally, so other flows keep making progress.
     // An original that expired without admission must release the fallback,
     // including small records. Network probes and losses are distinct: small
     // records retain their timely-path preference, while larger interactive
     // records keep the existing first-attempt-only preference.
     let eligible = candidates.iter().fold(0, |mask, (id, _)| mask | (1 << id));
-    let timely = small_delivery::latency_mask(
-        paths,
-        eligible,
-        policy.admission_lifetime().saturating_sub(age),
-        policy.latency_target_ms,
-    );
+    let remaining = policy.admission_lifetime().saturating_sub(age);
+    let timely = if front.data.len() > LATENCY_RECORD_BYTES {
+        let mut waits = [f64::INFINITY; MAX_PATHS];
+        let payload = front.data.len()
+            + if policy.receiver_feedback {
+                quality::HEADER
+            } else {
+                0
+            };
+        for path in paths.iter().filter(|path| eligible & (1 << path.id) != 0) {
+            if let Ok(mapping) = wire::http_datagram_overhead(path.stream) {
+                waits[usize::from(path.id)] = controllers[usize::from(path.id)]
+                    .admission_wait_ms(now_us, payload + mapping + 80);
+            }
+        }
+        small_delivery::latency_mask_with_wait(
+            paths,
+            eligible,
+            remaining,
+            policy.latency_target_ms,
+            &waits,
+        )
+    } else {
+        small_delivery::latency_mask(paths, eligible, remaining, policy.latency_target_ms)
+    };
     candidates.retain(|(id, _)| timely & (1 << id) != 0);
     candidates
 }
@@ -2590,7 +2612,16 @@ async fn sender(
             } else {
                 Vec::new()
             };
-            let candidates = latency_candidates(candidates, &paths, &front, repair, &policy, age);
+            let candidates = latency_candidates(
+                candidates,
+                &paths,
+                &front,
+                repair,
+                &policy,
+                age,
+                &mut controllers,
+                now_us,
+            );
             let before_allowance = candidates
                 .iter()
                 .fold(0u8, |mask, (id, _)| mask | (1 << id));

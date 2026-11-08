@@ -675,6 +675,93 @@ impl Accounting {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn interactive_first_flight_accounts_for_credit_wait() {
+    let fast = Pair::connect().await;
+    let alternate = Pair::connect().await;
+    let mut path1 = alternate.path();
+    path1.id = 1;
+    path1.quality.lock().unwrap().snapshot.sender_estimate = quality::Estimate {
+        updated_us: Some(0),
+        delay_variation_ms: 15.0,
+        ..Default::default()
+    };
+    let paths = [fast.path(), path1];
+    let mut policy = policy();
+    policy.adaptive = true;
+    policy.fec = 0;
+    policy.small_fec_bytes = 0;
+    policy.latency_target_ms = 5;
+    let mut controllers = std::array::from_fn(|_| adaptive::PathController::new(policy.rate, 5));
+    controllers[0].admitted(0, 2400);
+    let gauge = Arc::new(outbound::Gauge::default());
+    let front = outbound::Pending {
+        data: Bytes::from(vec![7; 1000]),
+        created: Instant::now(),
+        record_id: Some(1),
+        flow: Some(stream::data_flow(1)),
+        block: None,
+        small: false,
+        hold: Some(gauge.hold(1, 0, 1, 1000, true, false)),
+    };
+    let selected = latency_candidates(
+        vec![(0, 1), (1, 1)],
+        &paths,
+        &front,
+        false,
+        &policy,
+        Duration::ZERO,
+        &mut controllers,
+        0,
+    );
+    assert_eq!(selected, vec![(1, 1)]);
+    assert_eq!(
+        business_ready_candidates(&selected, &paths, &mut controllers, 0, 1000, 0.0, None),
+        vec![(1, 1)],
+    );
+    assert!(
+        !controllers[0].allow(0, 1000, 0.0),
+        "ranking grants no credit"
+    );
+    let mut small_probe = front.clone();
+    small_probe.data = Bytes::from(vec![7; 100]);
+    small_probe.hold = Some(gauge.hold(1, 0, 2, 100, true, false));
+    assert_eq!(
+        latency_candidates(
+            vec![(0, 1), (1, 1)],
+            &paths,
+            &small_probe,
+            false,
+            &policy,
+            Duration::ZERO,
+            &mut controllers,
+            0,
+        ),
+        vec![(0, 1)],
+        "small network probes keep their original timing mask",
+    );
+    controllers[1].admitted(0, 2400);
+    assert!(
+        business_ready_candidates(&selected, &paths, &mut controllers, 0, 1000, 0.0, None)
+            .is_empty(),
+        "the selected alternate still has to pass actual admission",
+    );
+    assert_eq!(
+        latency_candidates(
+            vec![(0, 1), (1, 1)],
+            &paths,
+            &front,
+            false,
+            &policy,
+            Duration::ZERO,
+            &mut controllers,
+            100_000,
+        ),
+        vec![(0, 1)],
+        "normal credit refill restores the fast path preference",
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn plain_interactive_waits_for_fast_credit_instead_of_entering_a_slow_queue() {
     let fast = Pair::connect().await;
     let slow = Pair::connect().await;
@@ -711,6 +798,8 @@ async fn plain_interactive_waits_for_fast_credit_instead_of_entering_a_slow_queu
         false,
         &policy,
         Duration::ZERO,
+        &mut controllers,
+        0,
     );
     assert!(
         business_ready_candidates(&timely, &paths, &mut controllers, 0, 100, 0.0, None).is_empty(),
@@ -728,7 +817,9 @@ async fn plain_interactive_waits_for_fast_credit_instead_of_entering_a_slow_queu
             &front,
             false,
             &policy,
-            Duration::ZERO
+            Duration::ZERO,
+            &mut controllers,
+            0,
         ),
         vec![(1, 1)],
         "an ineligible fast path cannot suppress the remaining live route"
@@ -743,7 +834,9 @@ async fn plain_interactive_waits_for_fast_credit_instead_of_entering_a_slow_queu
             &front,
             false,
             &policy,
-            Duration::ZERO
+            Duration::ZERO,
+            &mut controllers,
+            0,
         ),
         vec![(0, 1)],
         "interactive response chunks must not fall back into a slow queue when fast-path credit is temporarily exhausted"
@@ -756,6 +849,8 @@ async fn plain_interactive_waits_for_fast_credit_instead_of_entering_a_slow_queu
         false,
         &policy,
         Duration::ZERO,
+        &mut controllers,
+        0,
     );
     assert_eq!(
         retry_candidates, eligible,
@@ -783,7 +878,9 @@ async fn plain_interactive_waits_for_fast_credit_instead_of_entering_a_slow_queu
             &front,
             false,
             &policy,
-            Duration::ZERO
+            Duration::ZERO,
+            &mut controllers,
+            0,
         ),
         eligible,
         "bulk streams retain every eligible route"
@@ -798,7 +895,9 @@ async fn plain_interactive_waits_for_fast_credit_instead_of_entering_a_slow_queu
             &front,
             false,
             &policy,
-            Duration::ZERO
+            Duration::ZERO,
+            &mut controllers,
+            0,
         ),
         eligible,
         "ordinary UDP keeps its work-conserving ready-path selection"
@@ -813,7 +912,9 @@ async fn plain_interactive_waits_for_fast_credit_instead_of_entering_a_slow_queu
             &front,
             false,
             &policy,
-            Duration::ZERO
+            Duration::ZERO,
+            &mut controllers,
+            0,
         ),
         eligible,
         "the opt-in small-record FEC policy keeps its separate loss and readiness rules"
@@ -869,6 +970,7 @@ async fn small_network_probe_keeps_timely_path_preference() {
         block: None,
         small: false,
     };
+    let mut controllers = std::array::from_fn(|_| adaptive::PathController::new(policy.rate, 5));
     assert_eq!(
         latency_candidates(
             vec![(0, 1), (1, 1)],
@@ -876,7 +978,9 @@ async fn small_network_probe_keeps_timely_path_preference() {
             &pending,
             false,
             &policy,
-            Duration::ZERO
+            Duration::ZERO,
+            &mut controllers,
+            0,
         ),
         vec![(0, 1)],
         "network recovery must not be confused with a local unadmitted retry"
@@ -937,6 +1041,8 @@ async fn reliable_small_retry_escapes_repeated_local_expiry() {
                 false,
                 &policy,
                 Duration::ZERO,
+                &mut controllers,
+                0,
             );
             let ready = business_ready_candidates(
                 &candidates,

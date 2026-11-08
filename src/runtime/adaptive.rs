@@ -3967,6 +3967,18 @@ impl PathController {
             && self.tokens >= bytes as f64
     }
 
+    /// Estimate only the local pacing wait. This refills ordinary elapsed-time
+    /// credit exactly like `allow`; it neither reserves nor grants any tokens.
+    pub(crate) fn admission_wait_ms(&mut self, now_us: u64, bytes: usize) -> f64 {
+        self.refill(now_us);
+        if !self.eligible(now_us)
+            || bytes as f64 > super::outbound::pacing_burst_bytes(self.rate_bps, 2400)
+        {
+            return f64::INFINITY;
+        }
+        (bytes as f64 - self.tokens).max(0.0) * 8000.0 / self.rate_bps.max(1) as f64
+    }
+
     pub fn admitted(&mut self, now_us: u64, bytes: usize) {
         self.admitted_symbol(now_us, bytes, bytes);
     }

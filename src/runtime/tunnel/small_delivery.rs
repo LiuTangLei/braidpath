@@ -120,10 +120,33 @@ pub(super) fn latency_mask(
     remaining: Duration,
     target_ms: u64,
 ) -> u8 {
+    latency_mask_with_wait(
+        paths,
+        eligible,
+        remaining,
+        target_ms,
+        &[0.0; super::MAX_PATHS],
+    )
+}
+
+pub(super) fn latency_mask_with_wait(
+    paths: &[OutPath],
+    eligible: u8,
+    remaining: Duration,
+    target_ms: u64,
+    waits_ms: &[f64; super::MAX_PATHS],
+) -> u8 {
     let estimates: Vec<_> = paths
         .iter()
         .filter(|path| eligible & (1 << path.id) != 0 && path.open())
-        .map(estimate)
+        .filter_map(|path| {
+            let wait = waits_ms[usize::from(path.id)];
+            wait.is_finite().then(|| {
+                let mut estimate = estimate(path);
+                estimate.delay_ms += wait;
+                estimate
+            })
+        })
         .collect();
     let slack = (target_ms.min(20) as f64).min(remaining.as_secs_f64() * 1000.0);
     timing_mask(&estimates, slack)
