@@ -169,6 +169,16 @@ impl Queue {
             })
         })
     }
+    /// TLS/data-sized reliable records can start an idle path before a flow
+    /// accumulates a bulk window. Use pre-coding size so FEC padding cannot
+    /// turn a small status/control record into startup demand.
+    pub fn has_startup_stream_data(&self) -> bool {
+        self.flows.values().any(|queue| {
+            queue
+                .iter()
+                .any(|pending| pending.hold.as_ref().is_some_and(|hold| hold.bytes > 320))
+        })
+    }
     pub fn original_flows(&self) -> usize {
         self.turns.len()
     }
@@ -990,6 +1000,24 @@ mod tests {
         assert!(!q.has_bulk_stream_data());
         assert_eq!(gauge.queued(), 0);
     }
+    #[test]
+    fn interactive_tls_backlog_can_restart_but_status_and_padding_cannot() {
+        let now = Instant::now();
+        let gauge = Arc::new(Gauge::default());
+        let mut q = Queue::default();
+        let mut status = item(1, 0, now);
+        status.data = Bytes::from(vec![0; 1200]);
+        status.hold = Some(gauge.hold(1, 0, 1, 100, true, false));
+        q.push(status)
+            .unwrap_or_else(|_| panic!("status admission"));
+        assert!(!q.has_startup_stream_data());
+        let mut tls = item(2, 1, now);
+        tls.hold = Some(gauge.hold(2, 0, 1, 1000, true, false));
+        q.push(tls).unwrap_or_else(|_| panic!("TLS admission"));
+        assert!(q.has_startup_stream_data());
+        assert!(!q.has_bulk_stream_data());
+    }
+
     fn assert_queue_bound(q: &Queue) {
         assert!(q.len() <= QUEUE);
     }

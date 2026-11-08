@@ -1914,6 +1914,7 @@ async fn sender(
                 }
             }
             let bulk_backlog = queue.has_bulk_stream_data();
+            let startup_backlog = queue.has_startup_stream_data();
             for path in paths.iter() {
                 let q = path.quality.lock().expect("quality lock");
                 let snapshot = &q.snapshot;
@@ -1961,6 +1962,7 @@ async fn sender(
                 let transport_blocked = transport_pressure(path, frame_bytes);
                 let observation = adaptive::Observation {
                     bulk_backlog,
+                    startup_backlog,
                     now_us,
                     generation: snapshot.generation,
                     report_number: estimate.report_number,

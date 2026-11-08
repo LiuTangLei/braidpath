@@ -775,6 +775,8 @@ pub struct RateChange {
 pub struct Observation {
     /// Queued reliable bulk data; ACK/control traffic cannot consume an idle restart.
     pub bulk_backlog: bool,
+    /// Reliable interactive records larger than control/status traffic.
+    pub startup_backlog: bool,
     pub now_us: u64,
     pub generation: u64,
     pub report_number: u64,
@@ -959,6 +961,7 @@ pub struct PathController {
     native_startup_window_bytes: Option<u64>,
     native_initial_window_bytes: Option<u64>,
     native_idle_since_us: Option<u64>,
+    native_restart_until_us: Option<u64>,
     /// Actual business measurement start, separate from the control owner clock.
     admission_started_us: Option<u64>,
     allowance_bytes: f64,
@@ -1069,6 +1072,7 @@ impl PathController {
             native_startup_window_bytes: None,
             native_initial_window_bytes: None,
             native_idle_since_us: None,
+            native_restart_until_us: None,
             admission_started_us: None,
             allowance_bytes: 0.0,
             wire_per_symbol: 1.0,
@@ -1283,14 +1287,28 @@ impl PathController {
                 .min(u128::from(self.maximum_bps)) as u64
         });
         self.last_control.native_service_hint_bps = native_bps;
-        let idle_us = if observation.bulk_backlog && observation.offered_backlog {
-            self.native_idle_since_us
+        let startup_demand = observation.offered_backlog
+            && (observation.bulk_backlog || observation.startup_backlog);
+        if startup_demand {
+            if self
+                .native_idle_since_us
                 .take()
-                .map(|since| now.saturating_sub(since))
+                .is_some_and(|since| now.saturating_sub(since) >= NATIVE_IDLE_RESTART_US)
+            {
+                // A first-flight block must not consume the only restart.
+                // Retain it for one second, never throughout sustained demand.
+                self.native_restart_until_us = Some(now.saturating_add(NATIVE_IDLE_RESTART_US));
+            }
         } else {
             self.native_idle_since_us.get_or_insert(now);
-            None
-        };
+            self.native_restart_until_us = None;
+        }
+        if self
+            .native_restart_until_us
+            .is_some_and(|until| now > until)
+        {
+            self.native_restart_until_us = None;
+        }
         // An idle connection can be braked by RTT wander while it carries
         // only control records. Requiring a new positive business report to
         // leave that tiny allowance then takes many short response bursts.
@@ -1299,7 +1317,8 @@ impl PathController {
         // tested loss ceilings still gate the first flight; no tokens are added.
         if previous_generation == Some(observation.generation)
             && (!self.shared_loss || !self.shared_uplink_service)
-            && idle_us.is_some_and(|idle| idle >= NATIVE_IDLE_RESTART_US)
+            && startup_demand
+            && self.native_restart_until_us.is_some()
             && self.decision(now).eligible
             && self.last_control.rtt_fresh
             && !observation.transport_blocked
@@ -1316,6 +1335,7 @@ impl PathController {
             && self.last_brake_us != Some(now)
             && let Some(native) = native_bps
         {
+            self.native_restart_until_us = None;
             let restart = (u128::from(window.min(cwnd_bytes)) * 8_000_000 / u128::from(rtt_us))
                 .min(u128::from(native)) as u64;
             let restart = self
@@ -4463,6 +4483,59 @@ mod tests {
         let count = controller.native_service_recoveries;
         controller.observe_native_service(&sample, 2_000_000, 50_000);
         assert_eq!(controller.native_service_recoveries, count);
+    }
+
+    #[test]
+    fn idle_restart_survives_a_brief_native_block() {
+        let (mut controller, mut sample) = idle_native_fixture();
+        sample.transport_blocked = true;
+        controller.observe_native_service(&sample, 2_000_000, 50_000);
+        assert!(
+            !controller
+                .rate_changes
+                .iter()
+                .any(|change| matches!(change.reason, RateReason::NativeIdleRestart))
+        );
+        sample.now_us += 100_000;
+        sample.transport_blocked = false;
+        controller.observe_native_service(&sample, 2_000_000, 50_000);
+        assert!(
+            controller
+                .rate_changes
+                .iter()
+                .any(|change| matches!(change.reason, RateReason::NativeIdleRestart)),
+            "a transient native block consumed the idle restart"
+        );
+    }
+
+    #[test]
+    fn idle_restart_accepts_interactive_first_flight_without_bulk() {
+        let (mut controller, mut sample) = idle_native_fixture();
+        sample.bulk_backlog = false;
+        sample.startup_backlog = true;
+        controller.observe_native_service(&sample, 2_000_000, 50_000);
+        assert_eq!(controller.rate_bps, 1_920_000);
+        assert!(matches!(
+            controller.rate_changes.back().unwrap().reason,
+            RateReason::NativeIdleRestart
+        ));
+    }
+
+    #[test]
+    fn idle_restart_deferred_credit_expires_without_bypassing_congestion() {
+        let (mut controller, mut sample) = idle_native_fixture();
+        sample.transport_blocked = true;
+        controller.observe_native_service(&sample, 2_000_000, 50_000);
+        sample.now_us += NATIVE_IDLE_RESTART_US + 1;
+        sample.transport_blocked = false;
+        controller.observe_native_service(&sample, 2_000_000, 50_000);
+        assert!(
+            !controller
+                .rate_changes
+                .iter()
+                .any(|change| matches!(change.reason, RateReason::NativeIdleRestart))
+        );
+        assert_eq!(controller.native_restart_until_us, None);
     }
 
     #[test]
