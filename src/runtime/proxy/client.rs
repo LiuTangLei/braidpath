@@ -43,7 +43,7 @@ pub struct ClientOptions {
     pub socks5: Vec<Listener>,
     pub paths: usize,
     pub interface: Option<String>,
-    pub experimental_socks5_early_reply: bool,
+    pub socks5_early_reply: bool,
 }
 
 pub(super) fn listener_plan(
@@ -810,7 +810,7 @@ pub async fn client(options: ClientOptions) -> Result<()> {
             pool.clone(),
             exit,
             permits.clone(),
-            options.experimental_socks5_early_reply,
+            options.socks5_early_reply,
         ));
     }
     let mut discovery = JoinSet::new();

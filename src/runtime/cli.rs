@@ -69,7 +69,25 @@ mod proxy_cli_tests {
             "--socks5",
             "a=127.0.0.1:2080",
         ];
-        assert!(Cli::try_parse_from(client).is_ok());
+        for (args, wait) in [
+            (&[][..], false),
+            (&["--experimental-socks5-early-reply"][..], false),
+            (&["--socks5-wait-for-connect"][..], true),
+            (
+                &[
+                    "--experimental-socks5-early-reply",
+                    "--socks5-wait-for-connect",
+                ][..],
+                true,
+            ),
+        ] {
+            let parsed =
+                Cli::try_parse_from(client.into_iter().chain(args.iter().copied())).unwrap();
+            assert!(matches!(
+                parsed.command,
+                Command::ProxyClient { socks5_wait_for_connect, .. } if socks5_wait_for_connect == wait
+            ));
+        }
         let parsed =
             Cli::try_parse_from(client.into_iter().chain(["--interface", "ifindex:6"])).unwrap();
         assert!(
@@ -246,8 +264,11 @@ enum Command {
         /// Bind all proxy data paths to an uplink (Linux name; macOS ifindex:N).
         #[arg(long)]
         interface: Option<String>,
-        /// Reply to SOCKS5 CONNECT before the exit confirms the destination.
+        /// Wait for the exit's bound address or SOCKS5 failure before replying to CONNECT.
         #[arg(long)]
+        socks5_wait_for_connect: bool,
+        /// Compatibility flag from the early-reply experiment.
+        #[arg(long, hide = true)]
         experimental_socks5_early_reply: bool,
     },
     /// Discover live distributed servers through any member using a client key.
@@ -578,7 +599,8 @@ pub async fn run() -> Result<()> {
             socks5,
             paths,
             interface,
-            experimental_socks5_early_reply,
+            socks5_wait_for_connect,
+            ..
         } => {
             let identity = mesh::ClientIdentity::open(dir, &connection_key)?;
             proxy::client(proxy::ClientOptions {
@@ -589,7 +611,7 @@ pub async fn run() -> Result<()> {
                 socks5,
                 paths: usize::from(paths),
                 interface,
-                experimental_socks5_early_reply,
+                socks5_early_reply: !socks5_wait_for_connect,
             })
             .await
         }

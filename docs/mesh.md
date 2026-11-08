@@ -196,16 +196,17 @@ not interrupted by these admission checks. This is path selection, not a
 guarantee of loss-free UDP after admission. Upgrade both client and selected exit
 to a build with UDP health probes before using this admission behavior.
 
-On high-RTT paths, `proxy-client --experimental-socks5-early-reply` can pipeline
-the application's first TCP bytes with the destination request. It sends
-SOCKS5 CONNECT success with a bound address of `0.0.0.0:0` once the first
-destination record enters an authenticated path's QUIC send queue. If the exit
-refuses the destination or its status times out, the local connection resets.
-The client reads at most 16 KiB of application data before the exit confirms
-the connection. This can help protocols whose client sends the first bytes.
-Use the default mode when clients need the exit's bound address or a specific
-SOCKS5 failure code. The option is local to the client and applies only to
-CONNECT.
+By default, `proxy-client` pipelines the application's first TCP bytes with
+the destination request. It sends SOCKS5 CONNECT success with a bound address
+of `0.0.0.0:0` once the first destination record enters an authenticated
+path's QUIC send queue. If the exit refuses the destination or its status
+times out, the local connection resets. The client reads at most 16 KiB of
+application data before the exit confirms the connection.
+
+Set `--socks5-wait-for-connect` for clients that need the exit's bound address
+or a specific SOCKS5 failure code. It applies to CONNECT on all listeners in
+that client process and takes precedence over the legacy
+`--experimental-socks5-early-reply` flag.
 
 For [Clash/Mihomo SOCKS5 nodes](https://wiki.metacubex.one/en/config/proxies/socks/),
 merge these entries into the application's existing configuration:
