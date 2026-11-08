@@ -748,6 +748,33 @@ async fn plain_interactive_waits_for_fast_credit_instead_of_entering_a_slow_queu
         vec![(0, 1)],
         "interactive response chunks must not fall back into a slow queue when fast-path credit is temporarily exhausted"
     );
+    front.hold = Some(gauge.hold(1, 0, 2, 1000, true));
+    let retry_candidates = latency_candidates(
+        eligible.to_vec(),
+        &paths,
+        &front,
+        false,
+        &policy,
+        Duration::ZERO,
+    );
+    assert_eq!(
+        retry_candidates, eligible,
+        "an expired or lost interactive record must not repeatedly exclude the available fallback"
+    );
+    controllers[0].admitted(10_000, 2400);
+    assert_eq!(
+        business_ready_candidates(
+            &retry_candidates,
+            &paths,
+            &mut controllers,
+            10_000,
+            1000,
+            0.0,
+            None,
+        ),
+        vec![(1, 1)],
+        "a large-record retry can use the ready slow path while fast credit remains exhausted"
+    );
     front.hold = Some(gauge.hold(1, 0, 1, 1000, false));
     assert_eq!(
         latency_candidates(
