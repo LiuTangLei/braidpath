@@ -43,6 +43,7 @@ pub struct ClientOptions {
     pub socks5: Vec<Listener>,
     pub paths: usize,
     pub interface: Option<String>,
+    pub experimental_socks5_early_reply: bool,
 }
 
 pub(super) fn listener_plan(
@@ -441,9 +442,14 @@ impl Pool {
         });
         Ok(connector)
     }
-    pub(super) async fn open_stream(&self, id: &str, target: Address) -> Result<tunnel::tcp::Flow> {
+    pub(super) async fn open_stream(
+        &self,
+        id: &str,
+        target: Address,
+        early_reply: bool,
+    ) -> Result<tunnel::tcp::Flow> {
         let connector = self.prepare_stream(id).await?;
-        connector.open(target.into()).await
+        connector.open(target.into(), early_reply).await
     }
     async fn authenticate_udp(
         identity: &mesh::ClientIdentity,
@@ -799,7 +805,13 @@ pub async fn client(options: ClientOptions) -> Result<()> {
     let mut tasks = JoinSet::new();
     for (listener, exit) in listeners {
         tracing::info!(address=%listener.local_addr()?, %exit, "SOCKS5 proxy ready");
-        tasks.spawn(listen(listener, pool.clone(), exit, permits.clone()));
+        tasks.spawn(listen(
+            listener,
+            pool.clone(),
+            exit,
+            permits.clone(),
+            options.experimental_socks5_early_reply,
+        ));
     }
     let mut discovery = JoinSet::new();
     // Prepare optional entrances without delaying the direct SOCKS listener or
@@ -866,6 +878,7 @@ pub(super) async fn listen(
     pool: Arc<Pool>,
     exit: String,
     permits: Arc<Semaphore>,
+    early_reply: bool,
 ) -> Result<()> {
     let mut tasks = JoinSet::new();
     loop {
@@ -877,7 +890,7 @@ pub(super) async fn listen(
                 let pool = pool.clone(); let exit = exit.clone();
                 tasks.spawn(async move {
                     let _permit = permit;
-                    if let Err(error) = super::socks::serve(tcp, pool, &exit).await { tracing::debug!(%error, %exit, "SOCKS5 client closed"); }
+                    if let Err(error) = super::socks::serve(tcp, pool, &exit, early_reply).await { tracing::debug!(%error, %exit, "SOCKS5 client closed"); }
                 });
             }
             _ = tasks.join_next(), if !tasks.is_empty() => {}

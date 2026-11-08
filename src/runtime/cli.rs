@@ -246,6 +246,9 @@ enum Command {
         /// Bind all proxy data paths to an uplink (Linux name; macOS ifindex:N).
         #[arg(long)]
         interface: Option<String>,
+        /// Reply to SOCKS5 CONNECT before the exit confirms the destination.
+        #[arg(long)]
+        experimental_socks5_early_reply: bool,
     },
     /// Discover live distributed servers through any member using a client key.
     Nodes {
@@ -575,6 +578,7 @@ pub async fn run() -> Result<()> {
             socks5,
             paths,
             interface,
+            experimental_socks5_early_reply,
         } => {
             let identity = mesh::ClientIdentity::open(dir, &connection_key)?;
             proxy::client(proxy::ClientOptions {
@@ -585,6 +589,7 @@ pub async fn run() -> Result<()> {
                 socks5,
                 paths: usize::from(paths),
                 interface,
+                experimental_socks5_early_reply,
             })
             .await
         }

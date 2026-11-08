@@ -33,7 +33,7 @@ const IPV6: u8 = 4;
 pub(super) const MAX_HEADER: usize = 1 + 1 + 255 + 2;
 const MAX_HTTP_HEAD: usize = 8 * 1024;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+pub(super) const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Server policy for client-named destinations.
 #[derive(Clone, Copy, Debug)]

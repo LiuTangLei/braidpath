@@ -12,7 +12,12 @@ async fn reply(tcp: &mut TcpStream, status: u8, bound: SocketAddr) -> Result<()>
     tcp.write_all(&response).await?;
     Ok(())
 }
-pub(super) async fn serve(mut tcp: TcpStream, pool: Arc<Pool>, exit: &str) -> Result<()> {
+pub(super) async fn serve(
+    mut tcp: TcpStream,
+    pool: Arc<Pool>,
+    exit: &str,
+    early_reply: bool,
+) -> Result<()> {
     let (command, target) = timeout(CONNECT_TIMEOUT, async {
         ensure!(tcp.read_u8().await? == 5, "SOCKS version must be 5");
         let count = tcp.read_u8().await? as usize;
@@ -46,7 +51,7 @@ pub(super) async fn serve(mut tcp: TcpStream, pool: Arc<Pool>, exit: &str) -> Re
         return Ok(());
     }
     if command == TCP {
-        let opened = timeout(CONNECT_TIMEOUT, pool.open_stream(exit, target)).await;
+        let opened = timeout(CONNECT_TIMEOUT, pool.open_stream(exit, target, early_reply)).await;
         let flow = match opened {
             Ok(Ok(flow)) => flow,
             Ok(Err(error)) => {
@@ -68,6 +73,10 @@ pub(super) async fn serve(mut tcp: TcpStream, pool: Arc<Pool>, exit: &str) -> Re
                 return Ok(());
             }
         };
+        if early_reply {
+            // Once success is visible, abandonment must reset the socket.
+            socket2::SockRef::from(&tcp).set_linger(Some(Duration::ZERO))?;
+        }
         reply(&mut tcp, 0, flow.bound()).await?;
         return flow.run(tcp).await;
     }

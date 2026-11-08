@@ -83,6 +83,7 @@ impl Drop for CancelGuard {
 enum Command {
     Open {
         target: Destination,
+        early_reply: bool,
         lease: Arc<Lease>,
         cancel: Arc<Cancel>,
         reply: oneshot::Sender<Result<(u32, SocketAddr), u8>>,
@@ -165,7 +166,11 @@ impl Connector {
             });
         }
     }
-    pub(crate) async fn open(&self, target: Destination) -> anyhow::Result<Flow> {
+    pub(crate) async fn open(
+        &self,
+        target: Destination,
+        early_reply: bool,
+    ) -> anyhow::Result<Flow> {
         let mut generation = self.0.active.subscribe();
         let channel = loop {
             anyhow::ensure!(!self.is_closed(), "aggregate connector closed");
@@ -198,6 +203,7 @@ impl Connector {
             .commands
             .send(Command::Open {
                 target,
+                early_reply,
                 lease: lease.clone(),
                 cancel,
                 reply,
@@ -279,6 +285,7 @@ const MAX_CONTROL: usize = 2 * MAX_STREAMS;
 const READ_CHUNK: usize = 64 * 1024;
 /// Local read-ahead beyond the peer's window, so sending never waits on a read.
 const READ_AHEAD: u64 = 256 * 1024;
+const EARLY_OPEN_BYTES: u64 = 16 * 1024;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const TOMBSTONE: Duration = Duration::from_secs(120);
 const MAX_TOMBSTONES: usize = 4096;
@@ -422,6 +429,8 @@ struct Stream {
     tasks: Vec<AbortHandle>,
     /// Client: the server's status byte has not arrived yet.
     status_pending: bool,
+    early_reply: bool,
+    early_status_deadline: Option<Instant>,
     /// Server: destination header bytes received so far.
     header: Option<Vec<u8>>,
     /// Server: the destination failed; only the status and FIN remain to send.
@@ -447,6 +456,8 @@ impl Stream {
             write_finished: false,
             tasks: Vec::new(),
             status_pending: false,
+            early_reply: false,
+            early_status_deadline: None,
             header: None,
             refused: false,
         }
@@ -490,7 +501,10 @@ impl Stream {
     /// Let the reader take bytes up to the peer window plus local read-ahead.
     fn grant_reads(&mut self) {
         let Some(reads) = &self.reads else { return };
-        let target = self.send.limit() + READ_AHEAD;
+        let mut target = self.send.limit() + READ_AHEAD;
+        if self.early_status_deadline.is_some() {
+            target = target.min(EARLY_OPEN_BYTES);
+        }
         if target > self.granted {
             reads.add_permits((target - self.granted) as usize);
             self.granted = target;
@@ -655,9 +669,13 @@ impl Mux {
     fn deadline(&self, now: Instant) -> Instant {
         let mut at = self.published + PUBLISH_EVERY;
         for s in self.streams.values() {
-            for deadline in [s.send.next_deadline(now), s.recv.next_deadline()]
-                .into_iter()
-                .flatten()
+            for deadline in [
+                s.send.next_deadline(now),
+                s.recv.next_deadline(),
+                s.early_status_deadline,
+            ]
+            .into_iter()
+            .flatten()
             {
                 at = at.min(deadline);
             }
@@ -690,7 +708,10 @@ impl Mux {
         let registration = self.registration.as_ref().map(|r| r.channel.clone());
         let queue_waiting = !self.datagrams.is_empty()
             || !self.control.is_empty()
-            || self.streams.values().any(|s| s.send.has_transmit());
+            || self
+                .streams
+                .values()
+                .any(|s| s.send.has_transmit() || (s.early_reply && s.open_reply.is_some()));
         tokio::select! {
             biased;
             Some(event) = self.events.recv() => Wake::Io(event),
@@ -791,6 +812,7 @@ impl Mux {
         match command {
             Command::Open {
                 target,
+                early_reply,
                 lease,
                 cancel,
                 reply,
@@ -814,13 +836,14 @@ impl Mux {
                 stream.open_reply = Some(reply);
                 stream.completion = Some(done);
                 stream.status_pending = true;
+                stream.early_reply = early_reply;
                 if !stream.push(&target.encode()) {
                     self.reset(id, "destination header budget exhausted");
                 }
             }
             Command::Attach(id, tcp) => {
                 let valid = self.streams.get(&id).is_some_and(|s| {
-                    !s.status_pending
+                    (!s.status_pending || s.early_status_deadline.is_some())
                         && s.cancel
                             .as_ref()
                             .is_none_or(|c| !c.cancelled.load(Ordering::Acquire))
@@ -1259,8 +1282,10 @@ impl Mux {
                     ready = s.status_header.split_off(used);
                     s.status_header.clear();
                     s.status_pending = false;
+                    s.early_status_deadline = None;
                     s.recv.consumed(used as u64, window);
                     s.lease.release_rx(used);
+                    s.grant_reads();
                     if let Some(reply) = s.open_reply.take() {
                         let _ = reply.send(Ok((id, bound)));
                     }
@@ -1286,6 +1311,17 @@ impl Mux {
             if let Some(s) = self.streams.get_mut(&id) {
                 s.send
                     .admitted(start, transmission, sent.path, sent.rtt, sent.at);
+                // A published session can still have no usable path. Reply only
+                // after the first destination record was admitted by Quinn.
+                if start == 0
+                    && s.early_reply
+                    && let Some(reply) = s.open_reply.take()
+                {
+                    s.early_status_deadline = Some(sent.at + proxy::CONNECT_TIMEOUT + sent.rtt * 2);
+                    if reply.send(Ok((id, SocketAddr::from(([0; 4], 0))))).is_err() {
+                        self.reset(id, "aggregate open abandoned");
+                    }
+                }
             }
         }
     }
@@ -1405,7 +1441,9 @@ impl Mux {
             if s.send.on_timeout(now) {
                 self.stats.probe_timeouts += 1;
             }
-            if s.send.failed(now) {
+            if s.early_status_deadline.is_some_and(|at| now >= at) {
+                failed.push((*id, "proxy destination status timed out"));
+            } else if s.send.failed(now) {
                 failed.push((*id, "peer stopped acknowledging"));
             } else if s.refused && s.send.finished() {
                 failed.push((*id, "proxy destination refused"));
@@ -2566,7 +2604,7 @@ mod tests {
         .unwrap();
         let target = Destination::Ip("127.0.0.1:1".parse().unwrap());
         let clone = connector.clone();
-        let request = tokio::spawn(async move { clone.open(target).await });
+        let request = tokio::spawn(async move { clone.open(target, false).await });
         while budget.snapshot().0 == 0 {
             tokio::task::yield_now().await;
         }
@@ -2579,6 +2617,7 @@ mod tests {
                 .commands
                 .try_send(Command::Open {
                     target: Destination::Ip("127.0.0.1:1".parse().unwrap()),
+                    early_reply: false,
                     lease: filler.clone(),
                     cancel: Arc::new(Cancel {
                         cancelled: AtomicBool::new(true),
@@ -2619,7 +2658,7 @@ mod tests {
         let clone = connector.clone();
         let request = tokio::spawn(async move {
             clone
-                .open(Destination::Ip("127.0.0.1:1".parse().unwrap()))
+                .open(Destination::Ip("127.0.0.1:1".parse().unwrap()), false)
                 .await
         });
         while budget.snapshot().0 == 0 {
@@ -2673,7 +2712,7 @@ mod tests {
         .unwrap();
         let request = tokio::spawn(async move {
             connector
-                .open(Destination::Ip("127.0.0.1:1".parse().unwrap()))
+                .open(Destination::Ip("127.0.0.1:1".parse().unwrap()), false)
                 .await
         });
         while budget.snapshot().0 == 0 {
@@ -2694,6 +2733,200 @@ mod tests {
         assert!(mux.streams.is_empty());
         drop(mux);
         assert_eq!(budget.snapshot(), (0, 0));
+    }
+
+    async fn early_addressed_flow(
+        budget: &Arc<Budget>,
+        metrics: &stats::Metrics,
+    ) -> (Mux, Flow, u64) {
+        let connector = Connector::new(budget.clone());
+        let mut mux = Mux::client(
+            Listeners::default(),
+            &test_policy(),
+            metrics.scope("early", stats::FORWARD),
+            Some(connector.clone()),
+        )
+        .unwrap();
+        let target = Destination::Ip("127.0.0.1:1".parse().unwrap());
+        let header_len = target.encode().len() as u64;
+        let request = tokio::spawn(async move { connector.open(target, true).await });
+        timeout(Duration::from_secs(1), async {
+            while mux.streams.is_empty() {
+                mux.service_commands();
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            !request.is_finished(),
+            "an enqueued header is not an admitted send"
+        );
+        let id = *mux.streams.keys().next().unwrap();
+        let sent = mux.gauge.hold(id, 0, 1, header_len as usize, true);
+        sent.admitted(0, Duration::from_millis(150), Instant::now());
+        drop(sent);
+        mux.admissions();
+        let flow = timeout(Duration::from_secs(1), request)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(flow.bound(), SocketAddr::from(([0; 4], 0)));
+        assert_eq!(flow.id, id);
+        (mux, flow, header_len)
+    }
+
+    #[tokio::test]
+    async fn early_addressed_open_pipelines_bytes_and_resets_on_refusal() {
+        let budget = Arc::new(Budget::default());
+        let metrics = stats::Metrics::new("early-open-test");
+        let (mut mux, flow, header_len) = early_addressed_flow(&budget, &metrics).await;
+        let id = flow.id;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (application, accepted) = tokio::join!(
+            TcpStream::connect(listener.local_addr().unwrap()),
+            listener.accept()
+        );
+        let mut application = application.unwrap();
+        let running = tokio::spawn(flow.run(accepted.unwrap().0));
+        let first_bytes = b"first application bytes";
+        application.write_all(first_bytes).await.unwrap();
+        application.shutdown().await.unwrap();
+        timeout(Duration::from_secs(1), async {
+            while mux.streams[&id].send.written() == header_len {
+                mux.service_io();
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(mux.streams[&id].status_pending);
+        assert_eq!(
+            mux.streams[&id].send.written(),
+            header_len + first_bytes.len() as u64
+        );
+        mux.receive(incoming(
+            id,
+            Frame::Data {
+                offset: 0,
+                fin: true,
+                data: vec![proxy::REFUSED],
+            },
+        ));
+        assert!(running.await.unwrap().is_err());
+        let error = timeout(Duration::from_secs(1), application.read(&mut [0; 1]))
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::ConnectionReset);
+        assert!(mux.streams.is_empty());
+        assert_eq!(budget.snapshot(), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn early_addressed_open_resets_when_refused_before_attach() {
+        let budget = Arc::new(Budget::default());
+        let metrics = stats::Metrics::new("early-refusal-test");
+        let (mut mux, flow, _) = early_addressed_flow(&budget, &metrics).await;
+        mux.receive(incoming(
+            flow.id,
+            Frame::Data {
+                offset: 0,
+                fin: true,
+                data: vec![proxy::REFUSED],
+            },
+        ));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (application, accepted) = tokio::join!(
+            TcpStream::connect(listener.local_addr().unwrap()),
+            listener.accept()
+        );
+        let running = tokio::spawn(flow.run(accepted.unwrap().0));
+        timeout(Duration::from_secs(1), async {
+            while !running.is_finished() {
+                mux.service_commands();
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(running.await.unwrap().is_err());
+        mux.service_commands();
+        let error = timeout(
+            Duration::from_secs(1),
+            application.unwrap().read(&mut [0; 1]),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::ConnectionReset);
+        assert_eq!(budget.snapshot(), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn early_addressed_open_limits_pending_upload_and_preserves_response_fin() {
+        let budget = Arc::new(Budget::default());
+        let metrics = stats::Metrics::new("early-open-window-test");
+        let (mut mux, flow, header_len) = early_addressed_flow(&budget, &metrics).await;
+        let id = flow.id;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (application, accepted) = tokio::join!(
+            TcpStream::connect(listener.local_addr().unwrap()),
+            listener.accept()
+        );
+        let mut application = application.unwrap();
+        let running = tokio::spawn(flow.run(accepted.unwrap().0));
+        let upload = vec![42; EARLY_OPEN_BYTES as usize + 1];
+        application.write_all(&upload).await.unwrap();
+        application.shutdown().await.unwrap();
+        timeout(Duration::from_secs(1), async {
+            while mux.streams[&id].send.written() < header_len + EARLY_OPEN_BYTES {
+                mux.service_io();
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(mux.streams[&id].granted, EARLY_OPEN_BYTES);
+        assert_eq!(
+            mux.streams[&id].send.written(),
+            header_len + EARLY_OPEN_BYTES
+        );
+
+        let mut response = vec![proxy::OK];
+        response.extend(Destination::Ip("127.0.0.1:1234".parse().unwrap()).encode());
+        let body = vec![17; 4096];
+        response.extend(&body);
+        mux.receive(incoming(
+            id,
+            Frame::Data {
+                offset: 0,
+                fin: true,
+                data: response,
+            },
+        ));
+        timeout(Duration::from_secs(1), async {
+            while mux.streams[&id].send.written() < header_len + upload.len() as u64 {
+                mux.service_io();
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let mut received = Vec::new();
+        timeout(
+            Duration::from_secs(1),
+            application.read_to_end(&mut received),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(received, body);
+        running.abort();
+        let _ = running.await;
+        mux.service_commands();
+        assert!(mux.streams.is_empty());
     }
 
     #[test]
