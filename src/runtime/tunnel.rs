@@ -1256,14 +1256,12 @@ fn latency_candidates(
     mut candidates: Vec<(u8, i32)>,
     paths: &[OutPath],
     front: &outbound::Pending,
-    repair: bool,
     policy: &Policy,
     age: Duration,
     controllers: &mut [adaptive::PathController; MAX_PATHS],
     now_us: u64,
 ) -> Vec<(u8, i32)> {
     if !policy.adaptive
-        || repair
         || small_delivery::applies(policy, front)
         || front
             .flow
@@ -2612,16 +2610,19 @@ async fn sender(
             } else {
                 Vec::new()
             };
-            let candidates = latency_candidates(
-                candidates,
-                &paths,
-                &front,
-                repair,
-                &policy,
-                age,
-                &mut controllers,
-                now_us,
-            );
+            let candidates = if repair {
+                candidates
+            } else {
+                latency_candidates(
+                    candidates,
+                    &paths,
+                    &front,
+                    &policy,
+                    age,
+                    &mut controllers,
+                    now_us,
+                )
+            };
             let before_allowance = candidates
                 .iter()
                 .fold(0u8, |mask, (id, _)| mask | (1 << id));
