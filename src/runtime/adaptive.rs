@@ -1306,9 +1306,21 @@ impl PathController {
         if self
             .native_restart_until_us
             .is_some_and(|until| now > until)
+            || self.last_brake_us == Some(now)
+            || self.loss_pressure
+            || self.last_control.fast_loss
+            || observation
+                .loss_sample_rate
+                .is_some_and(|loss| loss > QUEUE_GATED_LOSS_FLOOR_MAX)
         {
             self.native_restart_until_us = None;
         }
+        // Idle restart and ordinary native recovery share the same measured
+        // congestion ceiling. A retained native window is not new capacity.
+        let measured_bps = self
+            .congestion_delivery_bps
+            .filter(|_| self.fast_recovery_enabled && self.congestion_seen)
+            .map(|rate| (rate as u64).max(MIN_BPS));
         // An idle connection can be braked by RTT wander while it carries
         // only control records. Requiring a new positive business report to
         // leave that tiny allowance then takes many short response bursts.
@@ -1341,6 +1353,7 @@ impl PathController {
             let restart = self
                 .loss_ceiling
                 .map_or(restart, |(ceiling, _)| restart.min(ceiling.max(MIN_BPS)));
+            let restart = measured_bps.map_or(restart, |measured| restart.min(measured));
             if restart > self.rate_bps {
                 let previous = self.rate_bps;
                 self.rate_bps = restart;
@@ -1416,10 +1429,6 @@ impl PathController {
         // that the brake drained, and the next brake cuts deeper. Native
         // service restores only measured congestion delivery; growth beyond
         // it remains with the monitored ordinary paths.
-        let measured_bps = self
-            .congestion_delivery_bps
-            .filter(|_| self.fast_recovery_enabled && self.congestion_seen)
-            .map(|rate| (rate as u64).max(MIN_BPS));
         let recovery_bps = native_bps.map(|rate| {
             let rate = self
                 .loss_ceiling
@@ -4329,6 +4338,9 @@ impl PathController {
     }
 
     fn record_brake(&mut self, observation: &Observation) {
+        // A deferred first flight predates this congestion evidence. Clearing
+        // only on the next recovery tick could undo the brake after it clears.
+        self.native_restart_until_us = None;
         self.clean_growth_streak = 0;
         self.last_brake_us = Some(observation.now_us);
         self.last_brake_admitted_symbols = self
@@ -4506,6 +4518,63 @@ mod tests {
                 .any(|change| matches!(change.reason, RateReason::NativeIdleRestart)),
             "a transient native block consumed the idle restart"
         );
+    }
+
+    #[test]
+    fn idle_restart_deferred_credit_is_cancelled_by_a_later_brake() {
+        let (mut controller, mut sample) = idle_native_fixture();
+        sample.transport_blocked = true;
+        controller.observe_native_service(&sample, 2_000_000, 50_000);
+        assert!(controller.native_restart_until_us.is_some());
+
+        sample.now_us += 100_000;
+        controller.record_brake(&sample);
+        sample.now_us += 100_000;
+        sample.transport_blocked = false;
+        controller.observe_native_service(&sample, 2_000_000, 50_000);
+        assert_eq!(controller.native_restart_until_us, None);
+        assert!(
+            !controller
+                .rate_changes
+                .iter()
+                .any(|change| matches!(change.reason, RateReason::NativeIdleRestart)),
+            "deferred startup must not undo an intervening brake"
+        );
+    }
+
+    #[test]
+    fn idle_restart_restores_only_measured_congestion_delivery() {
+        let (mut controller, sample) = idle_native_fixture();
+        let (mut ordinary, _) = idle_native_fixture();
+        let measured = MIN_BPS * 2;
+        controller.congestion_delivery_bps = Some(measured as f64);
+        ordinary.congestion_delivery_bps = Some(measured as f64);
+        ordinary.observe_native(&sample, None, 2_000_000, 50_000);
+        controller.observe_native_service(&sample, 2_000_000, 50_000);
+        assert_eq!(controller.rate_bps, measured);
+        assert_eq!(controller.tokens, ordinary.tokens);
+        assert!(matches!(
+            controller.rate_changes.back().unwrap().reason,
+            RateReason::NativeIdleRestart
+        ));
+    }
+
+    #[test]
+    fn idle_restart_deferred_credit_is_cancelled_by_loss() {
+        let (mut controller, mut sample) = idle_native_fixture();
+        sample.transport_blocked = true;
+        controller.observe_native_service(&sample, 2_000_000, 50_000);
+        assert!(controller.native_restart_until_us.is_some());
+        sample.now_us += 100_000;
+        sample.loss_sample_rate = Some(1.0);
+        sample.loss_rate = 1.0;
+        sample.feedback_sample_symbols = 1000;
+        sample.finalized_expected = Some(1000);
+        sample.finalized_lost = Some(1000);
+        sample.admitted_symbols = Some(1000);
+        sample.admitted_symbol_bytes = Some(1_025_000);
+        controller.observe_native_service(&sample, 2_000_000, 50_000);
+        assert_eq!(controller.native_restart_until_us, None);
     }
 
     #[test]
