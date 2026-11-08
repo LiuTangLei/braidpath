@@ -73,6 +73,7 @@ impl Gauge {
         transmission: u32,
         bytes: usize,
         interactive: bool,
+        local_retry: bool,
     ) -> Arc<Hold> {
         self.queued.fetch_add(bytes, Ordering::AcqRel);
         Arc::new(Hold {
@@ -80,6 +81,7 @@ impl Gauge {
             identity: (stream, start, transmission),
             bytes,
             interactive,
+            local_retry,
             admitted: AtomicBool::new(false),
         })
     }
@@ -91,6 +93,7 @@ pub struct Hold {
     bytes: usize,
     /// The stream has little outstanding data: send it on the earliest path.
     interactive: bool,
+    local_retry: bool,
     admitted: AtomicBool,
 }
 impl Hold {
@@ -99,6 +102,9 @@ impl Hold {
     }
     pub fn interactive(&self) -> bool {
         self.interactive
+    }
+    pub fn local_retry(&self) -> bool {
+        self.local_retry
     }
     pub fn admitted(&self, path: u8, rtt: Duration, at: Instant) {
         if !self.admitted.swap(true, Ordering::AcqRel) {
@@ -973,11 +979,11 @@ mod tests {
         let mut q = Queue::default();
         assert!(q.push(item(1, 0, now)).is_ok());
         let mut status = item(2, 1, now);
-        status.hold = Some(gauge.hold(2, 0, 1, status.data.len(), true));
+        status.hold = Some(gauge.hold(2, 0, 1, status.data.len(), true, false));
         assert!(q.push(status).is_ok());
         assert!(!q.has_bulk_stream_data());
         let mut bulk = item(3, 2, now);
-        bulk.hold = Some(gauge.hold(3, 0, 1, bulk.data.len(), false));
+        bulk.hold = Some(gauge.hold(3, 0, 1, bulk.data.len(), false, false));
         assert!(q.push(bulk).is_ok());
         assert!(q.has_bulk_stream_data());
         while q.pop(false).is_some() {}
@@ -1103,8 +1109,8 @@ mod tests {
     fn stream_holds_release_occupancy_and_report_only_unadmitted_originals() {
         let gauge = Arc::new(Gauge::default());
         gauge.set_low_water(1500);
-        let admitted = gauge.hold(3, 0, 1, 1000, false);
-        let dropped = gauge.hold(3, 1000, 2, 1000, false);
+        let admitted = gauge.hold(3, 0, 1, 1000, false, false);
+        let dropped = gauge.hold(3, 1000, 2, 1000, false, false);
         let clone = dropped.clone();
         assert_eq!(gauge.queued(), 2000);
         let at = Instant::now();

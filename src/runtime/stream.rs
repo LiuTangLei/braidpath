@@ -206,6 +206,8 @@ pub struct Snapshot {
     pub head_copies_queued: u64,
     /// Retransmissions caused by an original leaving the local sender queue unsent.
     pub local_drop_retransmits: u64,
+    /// Small stream frames requeued after leaving the local queue unsent.
+    pub local_small_retry_frames: u64,
     pub probe_timeouts: u64,
     pub spurious_retransmit_reports: u64,
     pub duplicate_bytes_received: u64,
@@ -333,6 +335,7 @@ struct Segment {
     /// Backed-off deadline while stalled; otherwise timed from `sent_at`.
     deadline: Option<Instant>,
     probe_transmission: Option<u32>,
+    local_retry_pending: bool,
 }
 
 /// One reliable sending half. Data offsets start at zero.
@@ -390,6 +393,8 @@ pub struct Transmit {
     pub retransmission: bool,
     pub tail_probe: bool,
     pub head_copy: bool,
+    /// This attempt replaces an original that never reached native admission.
+    pub local_retry: bool,
 }
 
 impl Sender {
@@ -577,6 +582,7 @@ impl Sender {
             stalls: 0,
             deadline: None,
             probe_transmission: None,
+            local_retry_pending: false,
         });
         if !probe && segment.transmissions > 0 {
             let stalled = progress.is_none_or(|at| at <= segment.sent_at);
@@ -584,6 +590,7 @@ impl Sender {
         }
         segment.transmissions += 1;
         let transmission = segment.transmissions;
+        let local_retry = !probe && std::mem::take(&mut segment.local_retry_pending);
         if probe {
             // A probe is a bounded additional copy, not a loss declaration.
             // Preserve the original timer, route and failure/backoff evidence.
@@ -614,6 +621,7 @@ impl Sender {
             retransmission: transmission > 1,
             tail_probe: probe,
             head_copy: false,
+            local_retry,
         }
     }
     /// Split only a selected oversized flight record. Already queued callbacks
@@ -726,6 +734,7 @@ impl Sender {
                 retransmission: false,
                 tail_probe: false,
                 head_copy: false,
+                local_retry: false,
             });
         }
         None
@@ -762,6 +771,7 @@ impl Sender {
         self.transport_rtt[path] = rtt.max(Duration::from_millis(1));
         let threshold = self.path_threshold(path, at);
         let segment = self.segments.get_mut(&start).expect("admitted segment");
+        segment.local_retry_pending = false;
         segment.path = path;
         segment.sent_at = at;
         if segment.stalls == 0 {
@@ -787,6 +797,10 @@ impl Sender {
         {
             return false;
         }
+        self.segments
+            .get_mut(&start)
+            .expect("current segment")
+            .local_retry_pending = true;
         self.mark_lost(start);
         true
     }
@@ -2895,7 +2909,7 @@ mod tests {
             "already queued"
         );
         let second = sender.poll_transmit(t0).unwrap();
-        assert!(second.retransmission);
+        assert!(second.retransmission && second.local_retry);
         assert!(
             !sender.locally_dropped(first.start, first.transmission),
             "stale report"

@@ -1556,10 +1556,18 @@ impl Mux {
             }
             idle = 0;
             let payload = t.frame.encode();
+            self.stats.local_small_retry_frames +=
+                u64::from(t.local_retry && payload.len() <= super::LATENCY_RECORD_BYTES);
             let interactive = s.send.written() - s.send.retained_from() <= INTERACTIVE_BYTES;
             let hold = (t.transmission > 0).then(|| {
-                self.gauge
-                    .hold(id, t.start, t.transmission, payload.len(), interactive)
+                self.gauge.hold(
+                    id,
+                    t.start,
+                    t.transmission,
+                    payload.len(),
+                    interactive,
+                    t.local_retry,
+                )
             });
             if !out.enqueue(stream::data_flow(id), payload, hold) {
                 // The unadmitted hold reports this transmission as dropped.
@@ -2763,7 +2771,7 @@ mod tests {
             "an enqueued header is not an admitted send"
         );
         let id = *mux.streams.keys().next().unwrap();
-        let sent = mux.gauge.hold(id, 0, 1, header_len as usize, true);
+        let sent = mux.gauge.hold(id, 0, 1, header_len as usize, true, false);
         sent.admitted(0, Duration::from_millis(150), Instant::now());
         drop(sent);
         mux.admissions();
@@ -3010,7 +3018,7 @@ mod tests {
             .push(&vec![7; READ_CHUNK]);
         mux.streams.get_mut(&2).unwrap().send.push(&[9; 64]);
         // These represent bulk records already waiting on actual admission.
-        let held = mux.gauge.hold(1, 0, 1, MIN_QUEUED, false);
+        let held = mux.gauge.hold(1, 0, 1, MIN_QUEUED, false, false);
         let (tx, mut rx) = mpsc::channel(32);
         let mut next_id = 0;
         let mut out = Out {

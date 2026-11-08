@@ -735,7 +735,7 @@ async fn plain_interactive_waits_for_fast_credit_instead_of_entering_a_slow_queu
     );
     front.data = Bytes::from(vec![7; 1000]);
     let gauge = Arc::new(outbound::Gauge::default());
-    front.hold = Some(gauge.hold(1, 0, 1, 1000, true));
+    front.hold = Some(gauge.hold(1, 0, 1, 1000, true, false));
     assert_eq!(
         latency_candidates(
             eligible.to_vec(),
@@ -748,7 +748,7 @@ async fn plain_interactive_waits_for_fast_credit_instead_of_entering_a_slow_queu
         vec![(0, 1)],
         "interactive response chunks must not fall back into a slow queue when fast-path credit is temporarily exhausted"
     );
-    front.hold = Some(gauge.hold(1, 0, 2, 1000, true));
+    front.hold = Some(gauge.hold(1, 0, 2, 1000, true, false));
     let retry_candidates = latency_candidates(
         eligible.to_vec(),
         &paths,
@@ -775,7 +775,7 @@ async fn plain_interactive_waits_for_fast_credit_instead_of_entering_a_slow_queu
         vec![(1, 1)],
         "a large-record retry can use the ready slow path while fast credit remains exhausted"
     );
-    front.hold = Some(gauge.hold(1, 0, 1, 1000, false));
+    front.hold = Some(gauge.hold(1, 0, 1, 1000, false, false));
     assert_eq!(
         latency_candidates(
             eligible.to_vec(),
@@ -817,6 +817,69 @@ async fn plain_interactive_waits_for_fast_credit_instead_of_entering_a_slow_queu
         ),
         eligible,
         "the opt-in small-record FEC policy keeps its separate loss and readiness rules"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn small_network_probe_keeps_timely_path_preference() {
+    let fast = Pair::connect().await;
+    let slow = Pair::connect().await;
+    let mut slower = slow.path();
+    slower.id = 1;
+    slower.quality.lock().unwrap().snapshot.sender_estimate = quality::Estimate {
+        updated_us: Some(0),
+        delay_variation_ms: 500.0,
+        ..Default::default()
+    };
+    let paths = [fast.path(), slower];
+    let mut policy = policy();
+    policy.adaptive = true;
+    policy.fec = 0;
+    policy.small_fec_bytes = 0;
+    let gauge = Arc::new(outbound::Gauge::default());
+    let now = Instant::now();
+    let mut sender = stream::Sender::new(false);
+    sender.push(&[7; 100]);
+    let original = sender.poll_transmit(now).unwrap();
+    sender.admitted(
+        original.start,
+        original.transmission,
+        0,
+        Duration::from_millis(80),
+        now,
+    );
+    let deadline = sender.next_deadline(now).unwrap();
+    sender.on_timeout(deadline);
+    let probe = sender.poll_transmit(deadline).unwrap();
+    assert!(probe.tail_probe && !probe.local_retry);
+    let data = Bytes::from(probe.frame.encode());
+    let pending = outbound::Pending {
+        hold: Some(gauge.hold(
+            1,
+            probe.start,
+            probe.transmission,
+            data.len(),
+            true,
+            probe.local_retry,
+        )),
+        data,
+        created: deadline,
+        record_id: Some(1),
+        flow: Some(stream::data_flow(1)),
+        block: None,
+        small: false,
+    };
+    assert_eq!(
+        latency_candidates(
+            vec![(0, 1), (1, 1)],
+            &paths,
+            &pending,
+            false,
+            &policy,
+            Duration::ZERO
+        ),
+        vec![(0, 1)],
+        "network recovery must not be confused with a local unadmitted retry"
     );
 }
 
@@ -863,7 +926,7 @@ async fn reliable_small_retry_escapes_repeated_local_expiry() {
                 flow: Some(stream::data_flow(1)),
                 block: (fec == automatic_fec::AUTO).then_some(1),
                 small: false,
-                hold: Some(gauge.hold(1, tx.start, tx.transmission, size, true)),
+                hold: Some(gauge.hold(1, tx.start, tx.transmission, size, true, tx.local_retry)),
             };
             // Keep the healthy-looking fast path without pacing credit.
             controllers[0].admitted(now_us, 2400);
