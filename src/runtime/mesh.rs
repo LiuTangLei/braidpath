@@ -797,6 +797,15 @@ impl State {
             return Ok(false);
         }
         let result: Result<Vec<u8>> = async {
+            if request.method() == Method::GET {
+                // Consume FIN before dropping the receive half. An unread
+                // Quinn stream sends STOP_SENDING(0), which can race the
+                // client's request.finish() even for an empty GET.
+                ensure!(
+                    read_body(stream).await?.is_empty(),
+                    "mesh GET body must be empty"
+                );
+            }
             match (request.method(), path) {
                 (&Method::GET, "/mesh/info") => Ok(serde_json::to_vec(&self.capabilities())?),
                 (&Method::GET, "/mesh/status") => Ok(serde_json::to_vec(&self.status())?),

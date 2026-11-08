@@ -1001,6 +1001,7 @@ async fn data_blackhole_is_quarantined_and_rejoins_the_same_tcp_flow_after_recov
     let via = front.local_addr().unwrap();
     let back = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     back.connect(a).await.unwrap();
+    let relay_peer = back.local_addr().unwrap().to_string();
     let blocked = Arc::new(AtomicBool::new(false));
     let packets = Arc::new(AtomicU64::new(0));
     let (fault, count) = (blocked.clone(), packets.clone());
@@ -1078,7 +1079,20 @@ async fn data_blackhole_is_quarantined_and_rejoins_the_same_tcp_flow_after_recov
     })
     .await
     .expect("recovered path did not pass its isolated liveness probe");
-    let before = packets.load(Ordering::Relaxed);
+    let payload_symbols = || {
+        let snapshot = server_metrics
+            .snapshot(false, "recovery-diagnostic", None)
+            .unwrap();
+        snapshot["stats"]["paths"]
+            .as_object()
+            .unwrap()
+            .values()
+            .find(|path| path["peer_socket"].as_str() == Some(relay_peer.as_str()))
+            .expect("authenticated relay path")["quinn_admitted_originals"]
+            .as_u64()
+            .unwrap()
+    };
+    let before = payload_symbols();
     go.send(()).unwrap();
     let received = timeout(Duration::from_secs(8), transfer)
         .await
@@ -1087,7 +1101,9 @@ async fn data_blackhole_is_quarantined_and_rejoins_the_same_tcp_flow_after_recov
     assert_eq!(received.len(), 64 * 1024 * 1024);
     assert!(received.iter().all(|b| *b == 71));
     assert!(
-        packets.load(Ordering::Relaxed) > before + 65536,
+        // Count payload symbols, excluding control/probe bytes. A restored
+        // path can still be rate-limited while the healthy path finishes.
+        payload_symbols() > before,
         "restored path never resumed carrying payload; server paths={}",
         server_metrics
             .snapshot(false, "recovery-diagnostic", None)

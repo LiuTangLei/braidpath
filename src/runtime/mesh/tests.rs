@@ -16,6 +16,62 @@ pub(crate) fn address() -> SocketAddr {
 }
 
 #[tokio::test]
+async fn control_get_waits_for_request_fin_before_dropping_receive_stream() {
+    let root = tempfile::tempdir().unwrap();
+    let at = address();
+    let _server = server(root.path(), "a", at, address(), None).await;
+    let identity = ClientIdentity::open(
+        root.path().join("client"),
+        &root.path().join("a/client-key.json"),
+    )
+    .unwrap();
+    let endpoint = transport::client(
+        at,
+        &identity.dir.join("cert.pem"),
+        None,
+        transport::Congestion::default(),
+    )
+    .unwrap();
+    let raw = endpoint.connect(at, NAME).unwrap().await.unwrap();
+    let (mut driver, mut sender) = h3::client::new(h3_quinn::Connection::new(raw.clone()))
+        .await
+        .unwrap();
+    let _driver = Task(tokio::spawn(async move { driver.wait_idle().await }));
+    timeout(Duration::from_secs(3), async {
+        for path in ["/mesh/nodes", "/mesh/info", "/mesh/status"] {
+            let mut stream = sender
+                .send_request(
+                    Request::builder()
+                        .uri(format!("https://{NAME}{path}"))
+                        .header("authorization", &identity.auth)
+                        .body(())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            // Deliberately separate HEADERS from FIN. Dropping an unread
+            // Quinn receive stream sends STOP_SENDING(0) to this request.
+            assert!(
+                timeout(Duration::from_millis(30), stream.recv_response())
+                    .await
+                    .is_err(),
+                "control GET completed before its request FIN"
+            );
+            stream.finish().await.unwrap();
+            assert_eq!(stream.recv_response().await.unwrap().status(), 200);
+            let mut body = Vec::new();
+            while let Some(mut part) = stream.recv_data().await.unwrap() {
+                body.extend(part.copy_to_bytes(part.remaining()));
+            }
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap();
+        }
+    })
+    .await
+    .unwrap();
+    raw.close(0u32.into(), b"test complete");
+}
+
+#[tokio::test]
 async fn dual_stack_discovery_and_ipv4_bound_client_use_the_same_exit() {
     let root = tempfile::tempdir().unwrap();
     let ipv4 = address();
