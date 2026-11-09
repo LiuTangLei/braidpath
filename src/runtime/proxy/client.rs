@@ -801,7 +801,7 @@ pub async fn client(options: ClientOptions) -> Result<()> {
             listener.exit,
         ));
     }
-    let permits = Arc::new(Semaphore::new(MAX_STREAMS));
+    let permits = Arc::new(Semaphore::new(crate::runtime::tunnel::tcp::MAX_TCP_FLOWS));
     let mut tasks = JoinSet::new();
     for (listener, exit) in listeners {
         tracing::info!(address=%listener.local_addr()?, %exit, "SOCKS5 proxy ready");

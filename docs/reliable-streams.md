@@ -136,7 +136,7 @@ target sees.
 | Probes | An empty client stream announces itself with a zero-length segment, repeated until acknowledged, so server-first protocols work. A closed window is probed with zero-length segments. |
 | End | FIN after local EOF, and write shutdown after the peer FIN and all data are written, for full half-close. A stream retires when both directions finish, after acknowledging the peer's FIN; its tombstone answers a repeated FIN with that final acknowledgment rather than RESET, so the peer completes instead of resetting a finished exchange. |
 | Reset | Socket errors, violations, connect failure (10 s), or 30 s without acknowledgment progress send RESET (twice) and close the local socket with RST, never FIN. Frames for a closed stream are answered with RESET. A new session epoch resets all streams. |
-| Limits | 256 concurrent streams per host, shared across sessions; 120 s tombstones prevent late frames from reopening a closed stream. |
+| Limits | 512 concurrent streams per host, shared across sessions; 120 s tombstones prevent late frames from reopening a closed stream. |
 
 Each direction shares a 32 MiB retained-byte allowance and 65,536 retained-credit
 slots per host. A flow also keeps 128 KiB and 128 private credit slots for forward

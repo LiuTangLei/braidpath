@@ -132,7 +132,7 @@ impl Connector {
         self.0.stop.notify_waiters();
     }
     fn register(&self) -> Registration {
-        let (commands, receiver) = mpsc::channel(MAX_STREAMS * 2);
+        let (commands, receiver) = mpsc::channel(MAX_TCP_FLOWS * 2);
         let channel = Arc::new(Channel {
             commands,
             wake: Arc::new(Notify::new()),
@@ -280,8 +280,10 @@ impl Flow {
     }
 }
 
-const MAX_STREAMS: usize = 256;
-const MAX_CONTROL: usize = 2 * MAX_STREAMS;
+/// Host TCP admission limit. The proxy listener and retained-byte budgets
+/// use the same count so concurrent CONNECTs do not hit a lower front-door cap.
+pub(crate) const MAX_TCP_FLOWS: usize = 512;
+const MAX_CONTROL: usize = 2 * MAX_TCP_FLOWS;
 const READ_CHUNK: usize = 64 * 1024;
 /// Local read-ahead beyond the peer's window, so sending never waits on a read.
 const READ_AHEAD: u64 = 256 * 1024;
@@ -701,8 +703,8 @@ impl Mux {
     pub(super) async fn wake(&mut self) -> Wake {
         let now = Instant::now();
         let deadline = tokio::time::Instant::from_std(self.deadline(now));
-        let accepting =
-            self.streams.len() < MAX_STREAMS && self.accept_paused_until.is_none_or(|at| now >= at);
+        let accepting = self.streams.len() < MAX_TCP_FLOWS
+            && self.accept_paused_until.is_none_or(|at| now >= at);
         let fixed = self.listeners.fixed.clone().filter(|_| accepting);
         let proxy = self.listeners.proxy.clone().filter(|_| accepting);
         let registration = self.registration.as_ref().map(|r| r.channel.clone());
@@ -779,7 +781,7 @@ impl Mux {
         self.stats.opened += 1;
     }
     fn service_commands(&mut self) {
-        for _ in 0..MAX_STREAMS * 2 {
+        for _ in 0..MAX_TCP_FLOWS * 2 {
             let command = self
                 .registration
                 .as_mut()
@@ -1028,7 +1030,7 @@ impl Mux {
                 }
             }
             Io::Proxied(tcp, request) => {
-                if self.streams.len() >= MAX_STREAMS {
+                if self.streams.len() >= MAX_TCP_FLOWS {
                     self.stats.rejected += 1;
                     self.tasks
                         .spawn(refuse(tcp, request.kind, proxy::GENERAL_FAILURE));
@@ -1196,7 +1198,7 @@ impl Mux {
             self.queue_control(stream::data_flow(id), Frame::Reset.encode());
             return false;
         }
-        if self.streams.len() >= MAX_STREAMS {
+        if self.streams.len() >= MAX_TCP_FLOWS {
             self.stats.rejected += 1;
             self.remember_closed(id, now, None);
             self.queue_control(stream::data_flow(id), Frame::Reset.encode());
@@ -2446,7 +2448,7 @@ mod tests {
         let budget = Arc::new(Budget::default());
         let mut mux = budget_mux(budget.clone());
         mux.targets.fixed = Some("127.0.0.1:1".parse().unwrap());
-        for id in 1..=MAX_STREAMS as u32 {
+        for id in 1..=MAX_TCP_FLOWS as u32 {
             assert!(mux.open(id, false));
         }
         mux.receive(incoming(
@@ -2470,7 +2472,7 @@ mod tests {
         .unwrap();
         let scope = mux.scope.clone();
         let mut next_id = 0;
-        let first = MAX_STREAMS as u32 + 1;
+        let first = MAX_TCP_FLOWS as u32 + 1;
         let last = first + MAX_TOMBSTONES as u32 + MAX_CONTROL as u32;
         for id in first..=last {
             assert!(!mux.accept_stream(id, Instant::now()));

@@ -14,7 +14,7 @@ const RESERVED: usize = 128 * 1024;
 // existing byte limit first. Gap repairs retain private slots per flow.
 const SHARED_RECORDS: usize = 65_536;
 const RESERVED_RECORDS: usize = 128;
-const FLOWS: usize = 256;
+use super::MAX_TCP_FLOWS;
 
 struct Pool {
     shared: Mutex<Pressure>,
@@ -55,7 +55,7 @@ impl Default for Budget {
 impl Budget {
     pub(crate) fn new() -> Self {
         Self {
-            flows: Arc::new(Semaphore::new(FLOWS)),
+            flows: Arc::new(Semaphore::new(MAX_TCP_FLOWS)),
             range_slots: Arc::new(Semaphore::new(SHARED_RECORDS)),
             tx: Arc::default(),
             rx: Arc::default(),
@@ -70,7 +70,7 @@ impl Budget {
     }
     pub(crate) fn snapshot(&self) -> (usize, usize) {
         (
-            FLOWS - self.flows.available_permits(),
+            MAX_TCP_FLOWS - self.flows.available_permits(),
             self.tx.shared.lock().expect("stream budget").held
                 + self.rx.shared.lock().expect("stream budget").held,
         )
