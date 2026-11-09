@@ -34,6 +34,7 @@
 //! timer. Kept-cap decreases also wait at least two seconds. Only subsequent
 //! report intervals enter decisions. An unchanged
 //! loss raises the floor only if the actual sending rate also fell by 5%.
+//! A cut that leaves the loss unchanged clears its old overrun threshold.
 //! This bounds the aggregate pacer, not individual path clocks or native
 //! congestion control, and remains a heuristic rather than a capacity proof.
 use super::MAX_PATHS;
@@ -226,7 +227,7 @@ enum State {
         floor: f64,
         slack_windows: u32,
         /// Rate the latest decrease cut from.
-        peak: f64,
+        peak: Option<f64>,
         /// The previous window's loss was beyond the floor.
         excess: bool,
         /// Loss before the latest decrease, to check that it fell.
@@ -644,7 +645,7 @@ impl Guard {
         }
         self.snapshot.settling = self.settlement.is_some();
         self.snapshot.growth_threshold_bps = match self.state {
-            State::Limited { peak, .. } => Some((peak * (1.0 - PLATEAU)) as u64),
+            State::Limited { peak, .. } => peak.map(|rate| (rate * (1.0 - PLATEAU)) as u64),
             _ => None,
         };
         self.snapshot.shared_loss = self.shared_loss();
@@ -808,7 +809,7 @@ impl Guard {
                             cap,
                             floor: loss_under.min(floor),
                             slack_windows: 0,
-                            peak: before.sent,
+                            peak: Some(before.sent),
                             excess: false,
                             decreased_from: None,
                         }
@@ -921,6 +922,11 @@ impl Guard {
                     {
                         // A lower rate lost as much: this loss is the path's.
                         floor = floor.max(loss);
+                        if (loss - from).abs() <= EXCESS / 2.0 {
+                            // The cut measured no rate-dependent loss. Do not
+                            // keep probing around its stale overrun rate.
+                            peak = None;
+                        }
                     }
                     if loss < floor {
                         floor += (loss - floor) * FLOOR_FOLLOW;
@@ -935,7 +941,7 @@ impl Guard {
                     if beyond && (excess || loss > floor + 2.0 * EXCESS) {
                         self.snapshot.decreases += 1;
                         decreased_from = Some((loss, sent));
-                        peak = base;
+                        peak = Some(base);
                         cap = (sent * (1.0 - loss) / (1.0 - floor).max(0.05))
                             .clamp(base * MAX_CUT, base * MIN_CUT)
                             .max(MIN_CAP_BPS);
@@ -943,7 +949,7 @@ impl Guard {
                         // Grow only a cap that binds; one far above the rate
                         // the sender reaches would no longer describe the link.
                         // Near the rate that overran last, grow slowly.
-                        cap *= if cap >= peak * (1.0 - PLATEAU) {
+                        cap *= if peak.is_some_and(|rate| cap >= rate * (1.0 - PLATEAU)) {
                             PLATEAU_INCREASE
                         } else {
                             INCREASE
@@ -1301,6 +1307,39 @@ mod tests {
     }
 
     #[test]
+    fn unchanged_loss_after_a_binding_cut_discards_the_old_overrun_rate() {
+        let mut guard = Guard::default();
+        guard.state = State::Limited {
+            cap: 10.5e6,
+            floor: 0.13,
+            slack_windows: 0,
+            peak: Some(10.9e6),
+            excess: true,
+            decreased_from: Some((0.15, 12e6)),
+        };
+        guard.decide(
+            2_000_000,
+            Some((
+                0.15,
+                Window {
+                    sent: 10.5e6,
+                    delivered: 8.925e6,
+                },
+            )),
+            10.5e6,
+        );
+        let State::Limited {
+            cap, peak, floor, ..
+        } = guard.state
+        else {
+            panic!("the existing cap must still protect the next probe");
+        };
+        assert_eq!(peak, None);
+        assert_eq!(floor, 0.15);
+        assert_eq!(cap, 10.5e6 * INCREASE);
+    }
+
+    #[test]
     fn one_noisy_window_neither_starts_nor_cuts() {
         let mut d = Drive::new();
         for _ in 0..10 {
@@ -1366,7 +1405,7 @@ mod tests {
             cap: 120e6,
             floor: 0.11,
             slack_windows: 0,
-            peak: 100e6,
+            peak: Some(100e6),
             excess: false,
             decreased_from: None,
         };
@@ -1384,7 +1423,7 @@ mod tests {
             cap: 100e6,
             floor: 0.11,
             slack_windows: 0,
-            peak: 150e6,
+            peak: Some(150e6),
             excess: false,
             decreased_from: None,
         };
@@ -1406,7 +1445,7 @@ mod tests {
             cap: 100e6,
             floor: 0.11,
             slack_windows: 0,
-            peak: 150e6,
+            peak: Some(150e6),
             excess: false,
             decreased_from: None,
         };
@@ -1477,7 +1516,7 @@ mod tests {
             cap: 100e6,
             floor: 0.11,
             slack_windows: 0,
-            peak: 150e6,
+            peak: Some(150e6),
             excess: false,
             decreased_from: None,
         };
