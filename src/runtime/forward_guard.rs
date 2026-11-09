@@ -1308,14 +1308,16 @@ mod tests {
 
     #[test]
     fn unchanged_loss_after_a_binding_cut_discards_the_old_overrun_rate() {
-        let mut guard = Guard::default();
-        guard.state = State::Limited {
-            cap: 10.5e6,
-            floor: 0.13,
-            slack_windows: 0,
-            peak: Some(10.9e6),
-            excess: true,
-            decreased_from: Some((0.15, 12e6)),
+        let mut guard = Guard {
+            state: State::Limited {
+                cap: 10.5e6,
+                floor: 0.13,
+                slack_windows: 0,
+                peak: Some(10.9e6),
+                excess: true,
+                decreased_from: Some((0.15, 12e6)),
+            },
+            ..Guard::default()
         };
         guard.decide(
             2_000_000,

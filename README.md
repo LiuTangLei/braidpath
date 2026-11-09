@@ -10,9 +10,9 @@ BraidPath is a Rust multipath transport project combining **forward error correc
 
 “Braid” means weaving several imperfect paths into a more resilient connection.
 
-> **Current release: v0.6.1.** TCP proxying uses the aggregate DATAGRAM engine with byte-offset selective acknowledgments, cross-path repair and automatic FEC. Each exit provides a local SOCKS5 listener. Native SOCKS5 UDP supports IPv4 and IPv6 destinations and selects paths using authenticated datagram probes. The default is four cooperating paths. Upgrade clients and servers together; see the [proxy and distributed-server guide](docs/mesh.md).
+> **Current release: v0.6.2.** TCP proxying uses the aggregate DATAGRAM engine with byte-offset selective acknowledgments, cross-path repair and automatic FEC. Each exit provides a local SOCKS5 listener. Native SOCKS5 UDP supports IPv4 and IPv6 destinations and selects paths using authenticated datagram probes. The default is four cooperating paths. Upgrade clients and servers together; see the [proxy and distributed-server guide](docs/mesh.md).
 
-Version 0.6.1 improves interactive TCP startup, accounts for pacing wait when selecting paths, and repairs isolated tail loss with bounded probes. Idle recovery preserves measured congestion limits, and expired local retries can use alternative paths. See the [release notes](docs/releases/v0.6.1.md).
+Version 0.6.2 increases the TCP proxy admission limit, coalesces acknowledgments for established bulk streams during concurrent load, and improves recovery after a rate cut leaves loss unchanged. See the [release notes](docs/releases/v0.6.2.md).
 
 Fixed-target TCP also supports standard mesh discovery and relay leases: use `mesh-server --tcp-target` and `mesh-client --tcp-listen`. This requires no private-network proxy permission; see the [fixed-target guide](docs/mesh.md#fixed-target-tcp-over-the-mesh-v058).
 
