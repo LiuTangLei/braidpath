@@ -1098,6 +1098,7 @@ pub struct Receiver {
     ack_due: Option<Instant>,
     ack_now: bool,
     last_ack: Option<Instant>,
+    ack_spacing: Duration,
     last_duplicate_ack: Option<Instant>,
     duplicate_ack_pending: bool,
 }
@@ -1116,12 +1117,19 @@ impl Default for Receiver {
             ack_due: None,
             ack_now: false,
             last_ack: None,
+            ack_spacing: ACK_SPACING,
             last_duplicate_ack: None,
             duplicate_ack_pending: false,
         }
     }
 }
 impl Receiver {
+    /// Limit reverse traffic when many established downloads are active.
+    /// FIN, open probes, and window updates keep their immediate ACKs.
+    pub(crate) fn set_bulk_ack_spacing(&mut self, shared: bool) {
+        self.ack_spacing = if shared { ACK_SPACING * 4 } else { ACK_SPACING };
+    }
+
     /// A frame can add at most one range node. Later gaps in an overlapping
     /// frame extend the preceding retained range instead of allocating nodes.
     pub(crate) fn needs_range(&self, offset: u64, len: usize) -> bool {
@@ -1252,14 +1260,14 @@ impl Receiver {
             // A burst of redundant repairs must not bypass ACK spacing for
             // every segment: each SACK may walk thousands of retained holes.
             self.duplicate_ack_pending = true;
-            match self.last_duplicate_ack.map(|at| at + ACK_SPACING) {
+            match self.last_duplicate_ack.map(|at| at + self.ack_spacing) {
                 Some(spaced) if now < spaced => {
                     self.ack_due = Some(self.ack_due.map_or(spaced, |due| due.min(spaced)));
                 }
                 _ => self.ack_now = true,
             }
         } else if self.unacknowledged >= ACK_EVERY {
-            match self.last_ack.map(|at| at + ACK_SPACING) {
+            match self.last_ack.map(|at| at + self.ack_spacing) {
                 Some(spaced) if now < spaced => {
                     self.ack_due = Some(self.ack_due.map_or(spaced, |due| due.min(spaced)));
                 }
@@ -1268,7 +1276,7 @@ impl Receiver {
         } else {
             // While acknowledgements flow, the delay timer keeps the same spacing.
             let delayed = self.last_ack.map_or(now + ACK_DELAY, |at| {
-                (now + ACK_DELAY).max(at + ACK_SPACING)
+                (now + ACK_DELAY).max(at + self.ack_spacing)
             });
             self.ack_due.get_or_insert(delayed);
         }
@@ -2682,6 +2690,31 @@ mod tests {
         let again = t0 + ACK_SPACING + Duration::from_millis(1);
         receiver.on_data(0, false, segment.clone(), again).unwrap();
         assert!(receiver.take_ack(again, MAX_WINDOW).is_some());
+    }
+
+    #[test]
+    fn shared_bulk_spacing_coalesces_data_acks_but_preserves_window_updates() {
+        let t0 = Instant::now();
+        let mut receiver = Receiver::default();
+        receiver.set_bulk_ack_spacing(true);
+        receiver.on_data(0, false, Vec::new(), t0).unwrap();
+        assert!(receiver.take_ack(t0, INITIAL_WINDOW).is_some());
+
+        let now = t0 + Duration::from_millis(1);
+        for i in 0..ACK_EVERY {
+            receiver.on_data(u64::from(i), false, vec![0], now).unwrap();
+        }
+        assert_eq!(receiver.next_deadline(), Some(t0 + 4 * ACK_SPACING));
+        assert!(
+            receiver
+                .take_ack(t0 + ACK_SPACING, INITIAL_WINDOW)
+                .is_none()
+        );
+
+        receiver.consumed(u64::from(ACK_EVERY), MAX_WINDOW);
+        let ack = receiver.take_ack(now, MAX_WINDOW).unwrap();
+        assert_eq!(ack.cumulative, u64::from(ACK_EVERY));
+        assert_eq!(ack.limit, MAX_WINDOW + u64::from(ACK_EVERY));
     }
 
     #[test]

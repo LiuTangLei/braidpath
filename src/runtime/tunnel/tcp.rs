@@ -1367,7 +1367,10 @@ impl Mux {
                 if !self.streams.contains_key(&id) && !self.accept_stream(id, now) {
                     return;
                 }
+                let many_streams = self.streams.len() >= 32;
                 let s = self.streams.get_mut(&id).expect("stream");
+                s.recv
+                    .set_bulk_ack_spacing(many_streams && s.recv.cumulative() >= INTERACTIVE_BYTES);
                 let additional = s.recv.additional_bytes(offset, data.len());
                 let range_slot = if s.recv.needs_range(offset, data.len()) {
                     match self.budget.range_slots.clone().try_acquire_owned() {
