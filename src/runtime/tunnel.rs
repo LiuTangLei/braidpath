@@ -1644,6 +1644,8 @@ async fn sender(
     let mut repair_turn = false;
     let mut tick = interval(Duration::from_millis(1));
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut idle_tick = interval(Duration::from_millis(5));
+    idle_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let lifetime = policy.admission_lifetime();
     let mut waiting: Option<WaitingSend> = None;
     let mut liveness: [liveness::Liveness; MAX_PATHS] = Default::default();
@@ -1658,12 +1660,20 @@ async fn sender(
         if *stop.borrow() {
             break;
         }
+        // Leave input and feedback event-driven. Pending records, repairs and
+        // feedback retries still use the regular pacing clock.
+        let idle = (policy.streams || policy.proxy)
+            && queue.is_empty()
+            && waiting.is_none()
+            && pending_feedback.is_none()
+            && encoder.automatic_is_idle();
         let event = tokio::select! {
             biased;
             _=stop.changed()=>SenderEvent::Stop,
             _=async { observation_notify.as_ref().expect("adaptive observation notify").notified().await },
                 if policy.adaptive && observation_notify.is_some()=>SenderEvent::Evidence,
-            _=tick.tick()=>SenderEvent::Tick,
+            _=tick.tick(), if !idle=>SenderEvent::Tick,
+            _=idle_tick.tick(), if idle=>SenderEvent::Tick,
             ready=poll_fn(|cx| {
                 let Some(wait) = waiting.as_mut() else {
                     return Poll::Pending;

@@ -315,6 +315,12 @@ impl RecordEncoder {
         Ok(symbols)
     }
 
+    /// Only an empty automatic encoder can use the relaxed sender heartbeat.
+    pub(super) fn automatic_is_idle(&self) -> bool {
+        matches!(&self.mode, Mode::Automatic { lane, small, .. }
+            if lane.active.is_none() && small.active.is_none())
+    }
+
     pub(super) fn flush_due(&mut self, now: Instant) -> Result<Vec<EncodedSymbol>> {
         let mut symbols = match &mut self.mode {
             Mode::Automatic {
@@ -499,6 +505,29 @@ mod tests {
             id,
             payload: vec![id as u8; bytes],
         }
+    }
+
+    #[test]
+    fn automatic_encoder_remains_active_until_the_partial_block_is_flushed() {
+        let mut p = policy(super::super::super::automatic_fec::AUTO, 0, false);
+        p.receiver_feedback = true;
+        let now = Instant::now();
+        let mut encoder = RecordEncoder::new(&p).unwrap();
+        encoder.set_fec(4).unwrap();
+        assert!(encoder.automatic_is_idle());
+
+        encoder.encode(&record(1, 1000), now).unwrap();
+        assert!(!encoder.automatic_is_idle());
+        encoder.encode(&record(2, 32), now).unwrap();
+        assert!(!encoder.automatic_is_idle());
+
+        assert!(encoder.flush_due(now).unwrap().is_empty());
+        assert!(!encoder.automatic_is_idle());
+        let repairs = encoder
+            .flush_due(now + Duration::from_millis(p.block_ms))
+            .unwrap();
+        assert_eq!(repairs.len(), 1);
+        assert!(encoder.automatic_is_idle());
     }
 
     #[test]
