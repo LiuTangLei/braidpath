@@ -1641,6 +1641,9 @@ async fn sender(
         (policy.adaptive && !metrics.metrics.legacy_recovery()).then(reverse_guard::Guard::default);
     let mut forward_guard =
         (policy.adaptive && !metrics.metrics.legacy_recovery()).then(forward_guard::Guard::default);
+    let mut delivery_pacer =
+        (policy.adaptive && reliable_native_service && metrics.direction == stats::RETURN)
+            .then(forward_guard::DeliveryPacer::default);
     let mut repair_turn = false;
     let mut tick = interval(Duration::from_millis(1));
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -1910,6 +1913,27 @@ async fn sender(
                         )
                     })
                     .collect();
+                if let Some(delivery) = delivery_pacer.as_mut() {
+                    let mut initial_window = 0;
+                    let mut queued_paths = 0;
+                    for path in paths.iter() {
+                        let controller = &controllers[usize::from(path.id)];
+                        initial_window = initial_window.max(controller.native_initial_window());
+                        queued_paths += usize::from(
+                            controller.decision(now_us).queue_delay_ms
+                                >= policy.latency_target_ms as f64 * 0.5,
+                        );
+                    }
+                    cap_changed |= delivery.observe(
+                        now_us,
+                        &counts,
+                        pacer.spent_bytes(),
+                        initial_window,
+                        (policy.rate, guard.cap_bps()),
+                        queued_paths,
+                    );
+                    guard.set_recovery_ceiling(delivery.recovery_ceiling(now_us));
+                }
                 cap_changed |= guard.observe(now_us, &counts, sent_bytes);
                 let snapshot = guard.snapshot();
                 if snapshot.trials != logged_guard.trials
@@ -2139,6 +2163,9 @@ async fn sender(
                     forward_guard
                         .as_ref()
                         .and_then(forward_guard::Guard::cap_bps),
+                    delivery_pacer
+                        .as_ref()
+                        .and_then(forward_guard::DeliveryPacer::cap_bps),
                 ]
                 .into_iter()
                 .flatten()
@@ -2158,6 +2185,7 @@ async fn sender(
                 next_sender_log_us = now_us.saturating_add(5_000_000);
                 info!(session = %metrics.session, direction = metrics.direction,
                     forward = ?forward_guard.as_ref().map(forward_guard::Guard::snapshot),
+                    delivery_cap_bps = ?delivery_pacer.as_ref().and_then(forward_guard::DeliveryPacer::cap_bps),
                     bulk_backlog = queue.has_bulk_stream_data(), "sender guard statistics");
             }
             for path in paths.iter() {

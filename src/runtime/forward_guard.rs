@@ -101,6 +101,141 @@ pub struct Counts {
     pub report_time_us: Option<u64>,
 }
 
+/// Short return-path pacing envelope. The loss guard below still owns its
+/// longer trials and can impose a lower cap. This controller never adds credit.
+#[derive(Default)]
+pub(super) struct DeliveryPacer {
+    sample: Option<(u64, u64, [Option<Counts>; MAX_PATHS])>,
+    cap: Option<u64>,
+    clean_service: Option<(u64, f64)>,
+    delivery_deficit: bool,
+}
+
+impl DeliveryPacer {
+    const SAMPLE_US: u64 = 250_000;
+
+    pub(super) fn cap_bps(&self) -> Option<u64> {
+        self.cap
+    }
+
+    pub(super) fn recovery_ceiling(&self, now: u64) -> Option<f64> {
+        self.clean_service
+            .filter(|(at, _)| now.saturating_sub(*at) <= 30_000_000)
+            .map(|(_, rate)| rate)
+    }
+
+    /// Cold start shares one native flight across routes. Once receiving,
+    /// grow from new delivered bytes only when the sender exercises the cap.
+    pub(super) fn observe(
+        &mut self,
+        now: u64,
+        paths: &[(usize, Counts)],
+        sent: u64,
+        initial_window: u64,
+        (limit, loss_cap): (u64, Option<u64>),
+        queued_paths: usize,
+    ) -> bool {
+        if paths.len() < 2 || initial_window == 0 {
+            self.sample = None;
+            self.clean_service = None;
+            self.delivery_deficit = false;
+            return self.cap.take().is_some();
+        }
+        let previous = self.cap;
+        let start = (initial_window * 8_000_000 / Self::SAMPLE_US).min(limit);
+        let cap = *self.cap.get_or_insert(start);
+        let current = || {
+            let mut current = [None; MAX_PATHS];
+            for &(id, value) in paths {
+                current[id] = Some(value);
+            }
+            (now, sent, current)
+        };
+        let Some((at, before, counts)) = self.sample else {
+            self.sample = Some(current());
+            return previous != self.cap;
+        };
+        if paths.len() != counts.iter().flatten().count()
+            || paths
+                .iter()
+                .any(|&(id, value)| counts[id].is_none_or(|old| old.generation != value.generation))
+        {
+            self.sample = Some(current());
+            self.clean_service = None;
+            self.delivery_deficit = false;
+            return previous != self.cap;
+        }
+        let elapsed = now.saturating_sub(at);
+        if elapsed < Self::SAMPLE_US {
+            return previous != self.cap;
+        }
+        let sent_bps = (sent.saturating_sub(before) as f64) * 8e6 / elapsed as f64;
+        let delivered = receiver_delivery(&counts, paths);
+        if delivered.is_none() && elapsed < 2 * Self::SAMPLE_US {
+            return previous != self.cap;
+        }
+        self.sample = Some(current());
+        let effective = cap.min(loss_cap.unwrap_or(cap));
+        let severe = sent_bps >= effective as f64 * 0.80
+            && delivered.is_some_and(|rate| rate < sent_bps * 0.55);
+        let sustained_deficit = severe && self.delivery_deficit;
+        self.delivery_deficit = severe && !sustained_deficit;
+        if let Some(delivered) = delivered {
+            // Feedback counts received symbol bytes; the sending bucket also
+            // includes HTTP/QUIC headers and protocol feedback.
+            let clean = queued_paths < 2 && (sent_bps * 0.80..=sent_bps).contains(&delivered);
+            if clean
+                && delivered > 0.0
+                && self
+                    .recovery_ceiling(now)
+                    .is_none_or(|rate| delivered >= rate * 0.98)
+            {
+                self.clean_service = Some((now, delivered));
+            }
+            if sustained_deficit
+                || (sent_bps >= cap as f64 * 0.80
+                    && queued_paths >= 2
+                    && delivered < sent_bps * 0.80)
+            {
+                // Two large binding deficits also cover a shallow policer,
+                // which can discard packets without growing either queue.
+                let reduced = (delivered * 1.15) as u64;
+                self.cap =
+                    Some(reduced.clamp((effective / 2).max(start / 8).min(effective), effective));
+            } else if sent_bps >= cap as f64 * 0.80
+                && queued_paths < 2
+                && (sent_bps * 0.78..=sent_bps * 1.07).contains(&delivered)
+            {
+                self.cap = Some((cap + cap / 5).min(limit));
+            }
+        }
+        previous != self.cap
+    }
+}
+
+fn receiver_delivery(
+    baseline: &[Option<Counts>; MAX_PATHS],
+    paths: &[(usize, Counts)],
+) -> Option<f64> {
+    if paths.is_empty() {
+        return None;
+    }
+    let mut total = 0.0;
+    for &(id, counts) in paths {
+        let start = baseline.get(id).copied().flatten()?;
+        if start.generation != counts.generation {
+            return None;
+        }
+        let bytes = counts.received_bytes.checked_sub(start.received_bytes)?;
+        let elapsed = counts.report_time_us?.checked_sub(start.report_time_us?)?;
+        if elapsed == 0 {
+            return None;
+        }
+        total += bytes as f64 * 8e6 / elapsed as f64;
+    }
+    Some(total)
+}
+
 /// A same-generation loss observation under a rejected aggregate trial.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct RandomLoss {
@@ -297,6 +432,7 @@ pub struct Guard {
     native_window_us: Option<u64>,
     state: State,
     snapshot: Snapshot,
+    recovery_ceiling: Option<f64>,
 }
 
 impl Default for Guard {
@@ -324,6 +460,7 @@ impl Default for Guard {
             native_window_us: None,
             state: State::Open,
             snapshot: Snapshot::default(),
+            recovery_ceiling: None,
         }
     }
 }
@@ -431,6 +568,10 @@ impl Guard {
 
     pub fn cap_bps(&self) -> Option<u64> {
         self.snapshot.cap_bps
+    }
+
+    pub(super) fn set_recovery_ceiling(&mut self, ceiling: Option<f64>) {
+        self.recovery_ceiling = ceiling;
     }
 
     /// Whether loss that most paths share is being tested or limited here;
@@ -653,23 +794,7 @@ impl Guard {
     }
 
     fn receiver_delivery(&self, paths: &[(usize, Counts)]) -> Option<f64> {
-        if paths.is_empty() {
-            return None;
-        }
-        let mut total = 0.0;
-        for &(id, counts) in paths {
-            let start = self.delivery_start.get(id).copied().flatten()?;
-            if start.generation != counts.generation {
-                return None;
-            }
-            let bytes = counts.received_bytes.checked_sub(start.received_bytes)?;
-            let elapsed = counts.report_time_us?.checked_sub(start.report_time_us?)?;
-            if elapsed == 0 {
-                return None;
-            }
-            total += bytes as f64 * 8e6 / elapsed as f64;
-        }
-        Some(total)
+        receiver_delivery(&self.delivery_start, paths)
     }
 
     /// The loss that at least two thirds of paths with a qualified data
@@ -949,11 +1074,22 @@ impl Guard {
                         // Grow only a cap that binds; one far above the rate
                         // the sender reaches would no longer describe the link.
                         // Near the rate that overran last, grow slowly.
-                        cap *= if peak.is_some_and(|rate| cap >= rate * (1.0 - PLATEAU)) {
-                            PLATEAU_INCREASE
-                        } else {
-                            INCREASE
-                        };
+                        let ordinary = cap
+                            * if peak.is_some_and(|rate| cap >= rate * (1.0 - PLATEAU)) {
+                                PLATEAU_INCREASE
+                            } else {
+                                INCREASE
+                            };
+                        // A recent clean receiver rate supports returning to
+                        // known service, one settled increase at a time. The
+                        // next window still has to earn a further increase.
+                        cap = self
+                            .recovery_ceiling
+                            .filter(|_| {
+                                (window.sent * 0.9..=window.sent * (1.0 + UNBOUND))
+                                    .contains(&window.delivered)
+                            })
+                            .map_or(ordinary, |ceiling| ordinary.max((cap * 1.20).min(ceiling)));
                     }
                     excess = beyond;
                 }
@@ -983,6 +1119,97 @@ impl Guard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn delivery_pacing_bounds_the_first_flight_and_grows_after_queue_drain() {
+        let mut pacing = DeliveryPacer::default();
+        let mut paths = [0, 1].map(|id| {
+            (
+                id,
+                Counts {
+                    generation: 1,
+                    sent_symbols: 0,
+                    expected: 0,
+                    lost: 0,
+                    received_bytes: 0,
+                    report_time_us: Some(0),
+                },
+            )
+        });
+        let mut sample = |now, sent, bytes, queues, replacement| {
+            for (_, counts) in &mut paths {
+                counts.report_time_us = Some(now);
+                counts.received_bytes += bytes;
+            }
+            if replacement {
+                paths[1].1.generation += 1;
+            }
+            pacing.observe(now, &paths, sent, 125_000, (6_000_000, None), queues);
+            pacing.cap_bps()
+        };
+        assert_eq!(sample(0, 0, 0, 0, false), Some(4_000_000));
+        assert_eq!(sample(250_000, 125_000, 25_000, 2, false), Some(2_000_000));
+        assert_eq!(sample(500_000, 187_500, 28_000, 0, false), Some(2_400_000));
+        assert_eq!(sample(750_000, 262_500, 33_000, 0, true), Some(2_400_000));
+        assert_eq!(sample(1_000_000, 270_000, 3_000, 0, false), Some(2_400_000));
+        assert_eq!(
+            sample(1_250_000, 345_000, 33_000, 0, false),
+            Some(2_880_000)
+        );
+    }
+
+    #[test]
+    fn a_shallow_bottleneck_needs_two_deficits_at_the_effective_cap() {
+        let mut pacing = DeliveryPacer::default();
+        let mut paths = [0, 1].map(|id| {
+            (
+                id,
+                Counts {
+                    generation: 1,
+                    sent_symbols: 0,
+                    expected: 0,
+                    lost: 0,
+                    received_bytes: 0,
+                    report_time_us: Some(0),
+                },
+            )
+        });
+        let mut sample = |now, sent, delivered| {
+            for (_, counts) in &mut paths {
+                counts.report_time_us = Some(now);
+                counts.received_bytes += delivered;
+            }
+            pacing.observe(now, &paths, sent, 250_000, (8_000_000, Some(4_000_000)), 0);
+            pacing.cap_bps()
+        };
+        assert_eq!(sample(0, 0, 0), Some(8_000_000));
+        assert_eq!(sample(250_000, 125_000, 15_000), Some(8_000_000));
+        assert_eq!(sample(500_000, 250_000, 15_000), Some(2_000_000));
+    }
+
+    #[test]
+    fn clean_recent_service_speeds_recovery_without_skipping_current_loss_feedback() {
+        let mut guard = Guard {
+            state: State::Limited {
+                cap: 10_000_000.0,
+                floor: 0.0,
+                slack_windows: 0,
+                peak: Some(10_000_000.0),
+                excess: false,
+                decreased_from: None,
+            },
+            recovery_ceiling: Some(13_000_000.0),
+            ..Guard::default()
+        };
+        let report = Window {
+            sent: 10_000_000.0,
+            delivered: 10_000_000.0,
+        };
+        guard.decide(0, Some((0.0, report)), report.sent);
+        assert!(matches!(guard.state, State::Limited { cap, .. } if cap == 12_000_000.0));
+        guard.decide(1, Some((0.10, report)), report.sent);
+        assert!(matches!(guard.state, State::Limited { cap, .. } if cap < 12_000_000.0));
+    }
 
     /// Drive one window per call: each of four paths finalizes 1000 symbols
     /// with its loss while the aggregate sends `sent_bps`.

@@ -435,6 +435,7 @@ pub(super) fn pacing_burst_bytes(rate_bps: u64, minimum_bytes: usize) -> f64 {
 
 pub struct Pacer {
     tokens: f64,
+    spent_bytes: u64,
     last_us: u64,
     rate: u64,
     burst: f64,
@@ -445,6 +446,7 @@ impl Pacer {
     pub fn new(rate: u64, burst: usize) -> Self {
         Self {
             tokens: 0.0,
+            spent_bytes: 0,
             last_us: 0,
             rate,
             burst: burst as f64,
@@ -480,6 +482,10 @@ impl Pacer {
     pub fn spend(&mut self, bytes: usize) {
         assert!(self.available(bytes));
         self.tokens -= bytes as f64;
+        self.spent_bytes += bytes as u64;
+    }
+    pub fn spent_bytes(&self) -> u64 {
+        self.spent_bytes
     }
 }
 

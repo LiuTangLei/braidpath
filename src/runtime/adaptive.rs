@@ -1267,6 +1267,10 @@ impl PathController {
         }
     }
 
+    pub(super) fn native_initial_window(&self) -> u64 {
+        self.native_initial_window_bytes.unwrap_or(0)
+    }
+
     /// Renew native service only with a NEW positive receiver report and a
     /// clear local delay guard. Unlike disabling adaptive control, this cannot
     /// undo a brake, bypass health/deadlines, or manufacture burst tokens.
