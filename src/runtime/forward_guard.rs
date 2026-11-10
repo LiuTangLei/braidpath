@@ -118,6 +118,14 @@ impl DeliveryPacer {
         self.cap
     }
 
+    pub(super) fn clear(&mut self) -> bool {
+        if self.cap.is_none() {
+            return false;
+        }
+        *self = Self::default();
+        true
+    }
+
     pub(super) fn recovery_ceiling(&self, now: u64) -> Option<f64> {
         self.clean_service
             .filter(|(at, _)| now.saturating_sub(*at) <= 30_000_000)
@@ -136,10 +144,7 @@ impl DeliveryPacer {
         queued_paths: usize,
     ) -> bool {
         if paths.len() < 2 || initial_window == 0 {
-            self.sample = None;
-            self.clean_service = None;
-            self.delivery_deficit = false;
-            return self.cap.take().is_some();
+            return self.clear();
         }
         let previous = self.cap;
         let start = (initial_window * 8_000_000 / Self::SAMPLE_US).min(limit);

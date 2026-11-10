@@ -1644,6 +1644,7 @@ async fn sender(
     let mut delivery_pacer =
         (policy.adaptive && reliable_native_service && metrics.direction == stats::RETURN)
             .then(forward_guard::DeliveryPacer::default);
+    let mut concurrent_demand_until_us = 0;
     let mut repair_turn = false;
     let mut tick = interval(Duration::from_millis(1));
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -1865,10 +1866,9 @@ async fn sender(
                 policy.rate
             });
         }
-        if observation_schedule
+        if let Some(observation_cause) = observation_schedule
             .as_mut()
             .and_then(|schedule| schedule.take_due(now_us))
-            .is_some()
         {
             let mut cap_changed = false;
             if let Some(guard) = forward_guard.as_mut() {
@@ -1914,24 +1914,34 @@ async fn sender(
                     })
                     .collect();
                 if let Some(delivery) = delivery_pacer.as_mut() {
-                    let mut initial_window = 0;
-                    let mut queued_paths = 0;
-                    for path in paths.iter() {
-                        let controller = &controllers[usize::from(path.id)];
-                        initial_window = initial_window.max(controller.native_initial_window());
-                        queued_paths += usize::from(
-                            controller.decision(now_us).queue_delay_ms
-                                >= policy.latency_target_ms as f64 * 0.5,
+                    if observation_cause.periodic && queue.has_concurrent_stream_data() {
+                        concurrent_demand_until_us = now_us.saturating_add(2_000_000);
+                    }
+                    if now_us >= concurrent_demand_until_us
+                        || silent != 0
+                        || paths.iter().any(|path| !path.open())
+                    {
+                        cap_changed |= delivery.clear();
+                    } else {
+                        let mut initial_window = 0;
+                        let mut queued_paths = 0;
+                        for path in paths.iter() {
+                            let controller = &controllers[usize::from(path.id)];
+                            initial_window = initial_window.max(controller.native_initial_window());
+                            queued_paths += usize::from(
+                                controller.decision(now_us).queue_delay_ms
+                                    >= policy.latency_target_ms as f64 * 0.5,
+                            );
+                        }
+                        cap_changed |= delivery.observe(
+                            now_us,
+                            &counts,
+                            pacer.spent_bytes(),
+                            initial_window,
+                            (policy.rate, guard.cap_bps()),
+                            queued_paths,
                         );
                     }
-                    cap_changed |= delivery.observe(
-                        now_us,
-                        &counts,
-                        pacer.spent_bytes(),
-                        initial_window,
-                        (policy.rate, guard.cap_bps()),
-                        queued_paths,
-                    );
                     guard.set_recovery_ceiling(delivery.recovery_ceiling(now_us));
                 }
                 cap_changed |= guard.observe(now_us, &counts, sent_bytes);

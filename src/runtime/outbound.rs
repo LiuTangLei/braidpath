@@ -179,6 +179,17 @@ impl Queue {
                 .any(|pending| pending.hold.as_ref().is_some_and(|hold| hold.bytes > 320))
         })
     }
+    pub(super) fn has_concurrent_stream_data(&self) -> bool {
+        let mut streams = self.flows.values().flat_map(|queue| {
+            queue.iter().filter_map(|pending| {
+                let hold = pending.hold.as_ref()?;
+                (hold.bytes > 320).then_some(hold.identity.0)
+            })
+        });
+        streams
+            .next()
+            .is_some_and(|first| streams.any(|stream| stream != first))
+    }
     pub fn original_flows(&self) -> usize {
         self.turns.len()
     }
@@ -987,6 +998,22 @@ mod tests {
         assert_eq!(q.pop(false).unwrap().flow, Some(1));
         assert_eq!(q.pop(false).unwrap().flow, Some(2));
         assert_eq!(q.len(), PER_FLOW_LIMIT - 1);
+    }
+    #[test]
+    fn concurrent_stream_demand_ignores_small_status_and_duplicates() {
+        let now = Instant::now();
+        let gauge = Arc::new(Gauge::default());
+        let mut queue = Queue::default();
+        for (flow, stream, size) in [(1, 1, 1000), (2, 1, 1000), (3, 2, 100)] {
+            let mut record = item(flow, u64::from(flow), now);
+            record.hold = Some(gauge.hold(stream, 0, 1, size, true, false));
+            assert!(queue.push(record).is_ok());
+        }
+        assert!(!queue.has_concurrent_stream_data());
+        let mut record = item(3, 4, now);
+        record.hold = Some(gauge.hold(2, 0, 1, 1000, true, false));
+        assert!(queue.push(record).is_ok());
+        assert!(queue.has_concurrent_stream_data());
     }
     #[test]
     fn ack_and_status_backlog_do_not_hide_a_bulk_reactivation() {
