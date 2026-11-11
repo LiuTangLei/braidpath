@@ -1407,14 +1407,16 @@ impl PathController {
         // fraction of its allowance. Renewing toward a retained native window
         // on every such report compounds unused budgets across parallel paths.
         // Use the integrated admission interval captured before observe_native
-        // settles it. Idle first-flight renewal has its separate guard above.
+        // settles it. A measured congestion bound already caps restoration to
+        // served rates; requiring full use there delays post-queue recovery.
+        // Idle first-flight renewal has its separate guard above.
         let allowance_exercised = self.last_control.integrated_allowance_bytes > 0.0
             && self.last_control.admitted_bytes as f64
                 >= self.last_control.integrated_allowance_bytes * 0.9;
         let eligible = self.decision(now).eligible
             && (!self.shared_loss || !self.shared_uplink_service)
             && observation.offered_backlog
-            && allowance_exercised
+            && (allowance_exercised || measured_bps.is_some())
             && fresh_positive
             && new_positive
             && !observation.transport_blocked
@@ -4748,6 +4750,28 @@ mod tests {
         assert!(delivered as f64 >= START_BPS as f64 * 0.1 / 8.0 * 0.9);
         assert_eq!(controller.rate_bps, START_BPS);
         assert_eq!(controller.native_service_recoveries, 0);
+    }
+
+    #[test]
+    fn native_service_can_restore_measured_service_before_the_lower_budget_is_exercised() {
+        let mut controller = PathController::new(100_000_000, 100);
+        let mut sample = observation(0, 50.0);
+        sample.delivered_bytes = 0;
+        sample.delivered_bps = None;
+        controller.observe_native_service(&sample, 200_000, 50_000);
+        controller.congestion_seen = true;
+        controller.congestion_delivery_bps = Some(48_000_000.0);
+        assert!(controller.allow(99_999, 1000, 0.0));
+        controller.admitted(99_999, 1000);
+        sample.now_us = 100_000;
+        sample.report_number += 1;
+        sample.delivered_bytes = 1000;
+        sample.delivered_bps = Some(80_000.0);
+        sample.delivery_report_time_us = Some(100_000);
+        sample.delivery_sample_span_us = 100_000;
+        controller.observe_native_service(&sample, 2_000_000, 50_000);
+        assert_eq!(controller.rate_bps, 48_000_000);
+        assert_eq!(controller.native_service_recoveries, 1);
     }
 
     #[test]

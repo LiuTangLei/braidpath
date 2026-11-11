@@ -18,10 +18,12 @@ admission allowance toward the connection's current native congestion window
 divided by its RTT. This is a sending allowance, **not measured path capacity**.
 Each renewal is bounded by the configured maximum and one doubling per native
 RTT (with a 10ms minimum interval). It creates no burst tokens.
+When no measured congestion-delivery bound is available, renewal also requires
+at least 90% use of the integrated admission allowance. Successful admission
+costs and allowance use the same interval, including any pace changes.
 
-Recovery requires active demand, at least 90% use of the integrated admission
-allowance, fresh positive delivery and finalized feedback, low queue delay,
-no current transport blockage, no ordinary or fast-loss pressure,
+Recovery requires active demand, fresh positive delivery and finalized feedback,
+low queue delay, no current transport blockage, no ordinary or fast-loss pressure,
 and no active reprobe. A new reduction takes precedence. Existing post-brake
 holds and at least two native RTTs after the last brake cannot be bypassed.
 Repeated reports, idle traffic and first reports from a new generation cannot
