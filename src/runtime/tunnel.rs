@@ -4314,6 +4314,15 @@ impl std::fmt::Display for SessionExpired {
 }
 impl std::error::Error for SessionExpired {}
 
+#[derive(Debug)]
+struct ExitStopped;
+impl std::fmt::Display for ExitStopped {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("selected stream exit shut down")
+    }
+}
+impl std::error::Error for ExitStopped {}
+
 #[derive(Clone)]
 struct PathConfig {
     remote: SocketAddr,
@@ -4471,6 +4480,7 @@ pub(crate) async fn client_with_health(
         entrances.map(|rx| EntranceUpdates::Addresses(rx, mesh::Uplink::default())),
         health,
         None,
+        None,
     )
     .await
 }
@@ -4497,6 +4507,7 @@ pub(crate) async fn client_with_mesh_exit(
         entrances.map(|rx| EntranceUpdates::Addresses(rx, uplink)),
         health,
         Some(exit),
+        None,
     )
     .await
 }
@@ -4512,6 +4523,32 @@ pub(crate) async fn client_with_routes(
         Some(EntranceUpdates::Routes(routes)),
         Some(health),
         Some(exit),
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn client_with_fixed_listener(
+    mut options: ClientOptions,
+    entrances: watch::Receiver<Vec<SocketAddr>>,
+    health: watch::Sender<mesh::PathHealth>,
+    exit: String,
+    listener: TcpListener,
+) -> Result<()> {
+    ensure!(
+        options.interfaces.len() <= 1,
+        "fixed forwarding accepts one uplink interface"
+    );
+    let uplink = mesh::Uplink {
+        interface: options.interfaces.pop(),
+        ..Default::default()
+    };
+    client_inner(
+        options,
+        Some(EntranceUpdates::Addresses(entrances, uplink)),
+        Some(health),
+        Some(exit),
+        Some(listener),
     )
     .await
 }
@@ -4521,7 +4558,12 @@ async fn client_inner(
     mut entrances: Option<EntranceUpdates>,
     health: Option<watch::Sender<mesh::PathHealth>>,
     exit: Option<String>,
+    fixed_listener: Option<TcpListener>,
 ) -> Result<()> {
+    ensure!(
+        options.tcp_listen.is_none() || fixed_listener.is_none(),
+        "duplicate fixed TCP listener"
+    );
     if entrances.is_some() {
         // Path replacement needs authenticated monotonic generations, carried
         // by feedback v2 even when adaptive pacing is disabled.
@@ -4561,7 +4603,7 @@ async fn client_inner(
         "invalid bottleneck group"
     );
     ensure!(
-        options.policy.streams == options.tcp_listen.is_some(),
+        options.policy.streams == (options.tcp_listen.is_some() || fixed_listener.is_some()),
         "TCP streams require a TCP listener"
     );
     ensure!(
@@ -4570,7 +4612,11 @@ async fn client_inner(
         "proxy streams require a proxy listener"
     );
     let socket = Arc::new(UdpSocket::bind(options.listen).await?);
-    let mut listeners = tcp::Listeners::default();
+    let persistent_fixed = fixed_listener.is_some();
+    let mut listeners = tcp::Listeners {
+        fixed: fixed_listener.map(Arc::new),
+        ..Default::default()
+    };
     // Neither listener authenticates its callers: every caller spends the
     // tunnel credential, and a proxy caller also gets a UDP relay.
     let exposed = |address: SocketAddr, kind: &str| {
@@ -4607,13 +4653,12 @@ async fn client_inner(
                 .stream_connector
                 .as_ref()
                 .is_none_or(|connector| !connector.is_closed())
-            && result
-                .as_ref()
-                .err()
-                .is_some_and(|error| error.is::<SessionExpired>())
+            && result.as_ref().err().is_some_and(|error| {
+                error.is::<SessionExpired>() || (persistent_fixed && error.is::<ExitStopped>())
+            })
         {
             info!(
-                "server session expired; creating a fresh authenticated epoch on the existing local listener"
+                "server session ended; creating a fresh authenticated epoch on the existing local listener"
             );
             tokio::select! {
                 _=shutdown.wait()=>return Ok(()),
@@ -4766,8 +4811,9 @@ async fn client_session(
             completed=delivery.ready()=>drops+=completed,
             _=tick.tick()=>{
                 let now_us=epoch.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
-                if options.policy.streams || options.policy.proxy {
-                    ensure!(!exit_terminated(paths.lock().expect("paths lock").iter().map(|path|path.conn.close_reason())), "selected stream exit shut down");
+                if (options.policy.streams || options.policy.proxy)
+                    && exit_terminated(paths.lock().expect("paths lock").iter().map(|path|path.conn.close_reason())) {
+                    return Err(ExitStopped.into());
                 }
                 if let Some(desired)=&desired {
                     reconcile_routes(desired,&mut configs,&inflight,&mut endpoints,&paths,&mut rotations);

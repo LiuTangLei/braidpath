@@ -41,6 +41,7 @@ pub struct ClientOptions {
     pub exits: Vec<String>,
     pub listen: SocketAddr,
     pub socks5: Vec<Listener>,
+    pub tcp_forward: Vec<Listener>,
     pub paths: usize,
     pub interface: Option<String>,
     pub socks5_early_reply: bool,
@@ -397,26 +398,7 @@ impl Pool {
             name: self.identity.name(),
             ca: self.identity.dir.join("cert.pem"),
             token: self.identity.dir.join("token"),
-            policy: tunnel::Policy {
-                max_message_bytes: crate::runtime::MAX_PAYLOAD,
-                streams: false,
-                proxy: true,
-                adaptive: true,
-                capacity_probe_bps: 0,
-                probe_guided_recovery: false,
-                latency_target_ms: 20,
-                group_rates: [crate::runtime::MAX_RATE_BPS; crate::runtime::MAX_PATHS],
-                receiver_feedback: true,
-                quality_schedule: true,
-                fec: crate::runtime::automatic_fec::AUTO,
-                fec_repairs: 1,
-                small_fec_bytes: 0,
-                mixed_fec: false,
-                redundancy: 30,
-                rate: crate::runtime::MAX_RATE_BPS,
-                block_ms: 3,
-                queue_ms: 100,
-            },
+            policy: reliable_policy(),
             congestion: transport::Congestion::Bbr,
             stats: slot.stream_metrics.clone(),
         };
@@ -760,11 +742,121 @@ impl Drop for Pool {
     }
 }
 
+fn reliable_policy() -> tunnel::Policy {
+    tunnel::Policy {
+        max_message_bytes: crate::runtime::MAX_PAYLOAD,
+        streams: false,
+        proxy: true,
+        adaptive: true,
+        capacity_probe_bps: 0,
+        probe_guided_recovery: false,
+        latency_target_ms: 20,
+        group_rates: [crate::runtime::MAX_RATE_BPS; crate::runtime::MAX_PATHS],
+        receiver_feedback: true,
+        quality_schedule: true,
+        fec: crate::runtime::automatic_fec::AUTO,
+        fec_repairs: 1,
+        small_fec_bytes: 0,
+        mixed_fec: false,
+        redundancy: 30,
+        rate: crate::runtime::MAX_RATE_BPS,
+        block_ms: 3,
+        queue_ms: 100,
+    }
+}
+
+pub(super) fn validate_tcp_forwards(forwards: &[Listener], socks: &[Listener]) -> Result<()> {
+    ensure!(
+        forwards.len() <= crate::runtime::MAX_PATHS,
+        "at most eight fixed TCP forwards"
+    );
+    let mut addresses: BTreeSet<_> = socks.iter().map(|listener| listener.address).collect();
+    let mut exits = BTreeSet::new();
+    for listener in forwards {
+        ensure!(!listener.exit.is_empty(), "missing fixed TCP exit");
+        ensure!(
+            listener.address.ip().is_loopback(),
+            "fixed TCP listeners must use loopback addresses"
+        );
+        ensure!(
+            exits.insert(&listener.exit),
+            "duplicate fixed TCP exit: {}",
+            listener.exit
+        );
+        ensure!(
+            listener.address.port() == 0 || addresses.insert(listener.address),
+            "duplicate local listener address: {}",
+            listener.address
+        );
+    }
+    Ok(())
+}
+
+async fn fixed_forward(
+    identity: mesh::ClientIdentity,
+    nodes: Vec<mesh::Node>,
+    mapping: Listener,
+    listener: TcpListener,
+    paths: usize,
+    interface: Option<String>,
+) -> Result<()> {
+    let uplink = mesh::Uplink {
+        interface: interface.clone(),
+        ..Default::default()
+    };
+    let (entrances, leases) = identity
+        .entrances_on(nodes, &mapping.exit, paths, &uplink)
+        .await?;
+    let mut policy = reliable_policy();
+    policy.proxy = false;
+    policy.streams = true;
+    let options = tunnel::ClientOptions {
+        adaptive_fec_retention: false,
+        rotate_source_port: false,
+        listen: "127.0.0.1:0".parse().expect("loopback address"),
+        tcp_listen: None,
+        proxy_listen: None,
+        stream_connector: None,
+        entrances,
+        interfaces: interface.into_iter().collect(),
+        path_binds: vec![],
+        path_groups: vec![],
+        name: identity.name(),
+        ca: identity.dir.join("cert.pem"),
+        token: identity.dir.join("token"),
+        datagram_send_buffer_bytes: transport::MAX_DATAGRAM_SEND_BUFFER_BYTES,
+        congestion: transport::Congestion::Bbr,
+        policy,
+        stats: stats::Metrics::new("fixed-forward"),
+    };
+    let result = tunnel::client_with_fixed_listener(
+        options,
+        leases.updates(),
+        leases.health(),
+        mapping.exit,
+        listener,
+    )
+    .await;
+    leases.shutdown().await;
+    result
+}
+
 pub async fn client(options: ClientOptions) -> Result<()> {
     let planned = listener_plan(&options.exits, options.listen, &options.socks5)?;
+    validate_tcp_forwards(&options.tcp_forward, &planned)?;
+    let wanted: BTreeSet<_> = options
+        .exits
+        .iter()
+        .chain(options.tcp_forward.iter().map(|listener| &listener.exit))
+        .cloned()
+        .collect();
+    ensure!(
+        wanted.len() <= crate::runtime::MAX_PATHS,
+        "select at most eight mesh exits"
+    );
     let mut nodes = options.identity.discover_any(&options.connect).await?;
     let mut missing = JoinSet::new();
-    for exit in &options.exits {
+    for exit in &wanted {
         if !nodes.iter().any(|node| node.id == *exit) {
             let identity = options.identity.clone();
             let entries = options.connect.clone();
@@ -784,6 +876,9 @@ pub async fn client(options: ClientOptions) -> Result<()> {
         nodes.push(result??);
     }
     let selected_exits = options.exits.clone();
+    let fixed_identity = options.identity.clone();
+    let fixed_nodes = nodes.clone();
+    let fixed_interface = options.interface.clone();
     let pool = Pool::new(options.identity, nodes, options.exits, options.interface)?;
     ensure!(
         (1..=crate::runtime::MAX_PATHS).contains(&options.paths),
@@ -801,8 +896,26 @@ pub async fn client(options: ClientOptions) -> Result<()> {
             listener.exit,
         ));
     }
+    let mut forwards = Vec::with_capacity(options.tcp_forward.len());
+    for mapping in options.tcp_forward {
+        let listener = TcpListener::bind(mapping.address).await.with_context(|| {
+            format!("bind fixed TCP for {} at {}", mapping.exit, mapping.address)
+        })?;
+        forwards.push((mapping, listener));
+    }
     let permits = Arc::new(Semaphore::new(crate::runtime::tunnel::tcp::MAX_TCP_FLOWS));
     let mut tasks = JoinSet::new();
+    for (mapping, listener) in forwards {
+        tracing::info!(address=%listener.local_addr()?, exit=%mapping.exit, "fixed TCP forward bound");
+        tasks.spawn(fixed_forward(
+            fixed_identity.clone(),
+            fixed_nodes.clone(),
+            mapping,
+            listener,
+            options.paths,
+            fixed_interface.clone(),
+        ));
+    }
     for (listener, exit) in listeners {
         tracing::info!(address=%listener.local_addr()?, %exit, "SOCKS5 proxy ready");
         tasks.spawn(listen(
@@ -834,6 +947,7 @@ pub async fn client(options: ClientOptions) -> Result<()> {
     let mut shutdown = Shutdown::new();
     loop {
         tokio::select! {
+            biased;
             _ = shutdown.wait() => break,
             _ = maintenance.tick() => {
                 pool.retire_stale_udp_paths();

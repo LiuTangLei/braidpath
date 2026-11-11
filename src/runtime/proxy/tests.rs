@@ -27,6 +27,15 @@ async fn start_metered(
     join: Option<SocketAddr>,
     allow_private: bool,
 ) -> (SocketAddr, Task<Result<()>>, stats::Metrics) {
+    start_metered_target(root, id, join, allow_private, None).await
+}
+async fn start_metered_target(
+    root: &Path,
+    id: &str,
+    join: Option<SocketAddr>,
+    allow_private: bool,
+    tcp_target: Option<SocketAddr>,
+) -> (SocketAddr, Task<Result<()>>, stats::Metrics) {
     let at = address();
     let metrics = stats::Metrics::new("test-proxy");
     let task = Task(tokio::spawn(mesh::serve(mesh::ServerOptions {
@@ -37,7 +46,7 @@ async fn start_metered(
         advertise_alternate: None,
         relay_ports: None,
         target: None,
-        tcp_target: None,
+        tcp_target,
         proxy: Some(ServerConfig { allow_private }),
         join,
         join_key: join.map(|_| root.join("a/server-key.json")),
@@ -105,6 +114,9 @@ async fn socks(at: SocketAddr, command: u8, target: Address) -> (TcpStream, u8, 
     (tcp, response[1], bound)
 }
 async fn echo() -> (SocketAddr, Task<()>) {
+    echo_with_finish(b"FIN").await
+}
+async fn echo_with_finish(marker: &'static [u8]) -> (SocketAddr, Task<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let at = listener.local_addr().unwrap();
     let task = Task(tokio::spawn(async move {
@@ -117,7 +129,7 @@ async fn echo() -> (SocketAddr, Task<()>) {
                         let mut buffer = [0;8192];
                         loop {
                             match tcp.read(&mut buffer).await {
-                                Ok(0) => { let _ = tcp.write_all(b"FIN").await; break; }
+                                Ok(0) => { let _ = tcp.write_all(marker).await; break; }
                                 Ok(n) => { if tcp.write_all(&buffer[..n]).await.is_err() { break; } }
                                 Err(_) => break,
                             }
@@ -1771,4 +1783,169 @@ async fn idle_streaming_flows_do_not_starve_an_active_flow_and_all_release() {
     drop(listener);
     pool.shutdown().await;
     drop(peer);
+}
+
+#[tokio::test]
+async fn one_client_serves_fixed_exits_and_socks_tcp_udp_with_exit_failure_isolation() {
+    let root = tempfile::tempdir().unwrap();
+    let root = root.path();
+    let (target_a, _echo_a) = echo_with_finish(b"A-END").await;
+    let (target_b, _echo_b) = echo_with_finish(b"B-END").await;
+    let (a, _server_a, _) = start_metered_target(root, "a", None, true, Some(target_a)).await;
+    let (b, server_b, _) = start_metered_target(root, "b", Some(a), true, Some(target_b)).await;
+    let socks_at = address();
+    let fixed_a = address();
+    let fixed_b = address();
+    let mut process = Task(tokio::spawn(client(ClientOptions {
+        identity: identity(root, "unified"),
+        connect: vec![a, b],
+        exits: vec!["a".into()],
+        listen: socks_at,
+        socks5: vec![],
+        tcp_forward: vec![
+            Listener {
+                exit: "a".into(),
+                address: fixed_a,
+            },
+            Listener {
+                exit: "b".into(),
+                address: fixed_b,
+            },
+        ],
+        paths: 2,
+        interface: None,
+        socks5_early_reply: false,
+    })));
+    timeout(Duration::from_secs(5), async {
+        loop {
+            if process.0.is_finished() {
+                panic!("unified startup: {:?}", (&mut process.0).await);
+            }
+            if TcpStream::connect(socks_at).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    async fn transfer(mut tcp: TcpStream, marker: &[u8]) {
+        let payload: Vec<_> = (0..65_536).map(|index| (index % 251) as u8).collect();
+        let (mut r, mut w) = tcp.split();
+        let send = async {
+            w.write_all(&payload).await.unwrap();
+            w.shutdown().await.unwrap();
+        };
+        let read = async {
+            let mut out = Vec::new();
+            r.read_to_end(&mut out).await.unwrap();
+            out
+        };
+        let (_, out) = timeout(Duration::from_secs(8), async { tokio::join!(send, read) })
+            .await
+            .unwrap();
+        assert_eq!(&out[..payload.len()], payload.as_slice());
+        assert_eq!(&out[payload.len()..], marker);
+    }
+    let (socks_tcp, status, _) = socks(socks_at, TCP, Address::Ip(target_a)).await;
+    assert_eq!(status, 0);
+    let first = TcpStream::connect(fixed_a).await.unwrap();
+    let second = TcpStream::connect(fixed_b).await.unwrap();
+    let target = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let target_at = target.local_addr().unwrap();
+    let _echo_udp = Task(tokio::spawn(async move {
+        let mut buffer = [0; 4096];
+        loop {
+            let (n, peer) = target.recv_from(&mut buffer).await.unwrap();
+            target.send_to(&buffer[..n], peer).await.unwrap();
+        }
+    }));
+    let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let (_association, status, bound) =
+        socks(socks_at, UDP, Address::Ip(udp.local_addr().unwrap())).await;
+    assert_eq!(status, 0);
+    let Address::Ip(bound) = bound else {
+        panic!("UDP relay address")
+    };
+    let datagram = async {
+        let mut packet = vec![0, 0, 0];
+        Address::Ip(target_at).encode(&mut packet);
+        packet.extend_from_slice(b"independent UDP");
+        udp.send_to(&packet, bound).await.unwrap();
+        let mut reply = [0; 4096];
+        let (n, _) = timeout(Duration::from_secs(5), udp.recv_from(&mut reply))
+            .await
+            .unwrap()
+            .unwrap();
+        let (address, body) = protocol::packet(&reply[3..n]).await.unwrap();
+        assert_eq!(address, Address::Ip(target_at));
+        assert_eq!(body, b"independent UDP");
+    };
+    tokio::join!(
+        transfer(first, b"A-END"),
+        transfer(second, b"B-END"),
+        transfer(socks_tcp, b"A-END"),
+        datagram
+    );
+    server_b.0.abort();
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    if process.0.is_finished() {
+        panic!(
+            "exit outage stopped unified client: {:?}",
+            (&mut process.0).await
+        );
+    }
+    let first = TcpStream::connect(fixed_a).await.unwrap();
+    transfer(first, b"A-END").await;
+    let (tcp, status, _) = socks(socks_at, TCP, Address::Ip(target_a)).await;
+    assert_eq!(status, 0);
+    transfer(tcp, b"A-END").await;
+    let _restarted_b = Task(tokio::spawn(mesh::serve(mesh::ServerOptions {
+        dir: root.join("b"),
+        id: "b".into(),
+        listen: b,
+        advertise: b,
+        advertise_alternate: None,
+        relay_ports: None,
+        target: None,
+        tcp_target: Some(target_b),
+        proxy: Some(ServerConfig {
+            allow_private: true,
+        }),
+        join: Some(a),
+        join_key: Some(root.join("a/server-key.json")),
+        rate: crate::runtime::MAX_RATE_BPS,
+        stats: stats::Metrics::new("restarted-b"),
+    })));
+    transfer(TcpStream::connect(fixed_b).await.unwrap(), b"B-END").await;
+}
+
+#[test]
+fn fixed_forward_plans_reject_exposure_and_conflicting_listeners() {
+    let socks = vec![Listener {
+        exit: "a".into(),
+        address: "127.0.0.1:1080".parse().unwrap(),
+    }];
+    for forwards in [
+        vec![Listener {
+            exit: "a".into(),
+            address: "0.0.0.0:2080".parse().unwrap(),
+        }],
+        vec![Listener {
+            exit: "a".into(),
+            address: socks[0].address,
+        }],
+        vec![
+            Listener {
+                exit: "a".into(),
+                address: "127.0.0.1:2080".parse().unwrap(),
+            },
+            Listener {
+                exit: "a".into(),
+                address: "127.0.0.1:2081".parse().unwrap(),
+            },
+        ],
+    ] {
+        assert!(client::validate_tcp_forwards(&forwards, &socks).is_err());
+    }
 }

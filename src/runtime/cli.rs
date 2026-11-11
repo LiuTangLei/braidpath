@@ -96,6 +96,25 @@ mod proxy_cli_tests {
         assert!(
             Cli::try_parse_from(client.into_iter().chain(["--socks5", "b=0.0.0.0:1082"])).is_err()
         );
+        let parsed = Cli::try_parse_from(client.into_iter().chain([
+            "--tcp-forward",
+            "a=127.0.0.1:9443",
+            "--tcp-forward",
+            "c=127.0.0.1:9444",
+        ]))
+        .unwrap();
+        assert!(
+            matches!(parsed.command, Command::ProxyClient { tcp_forward, .. }
+            if tcp_forward.len() == 2 && tcp_forward[1].exit == "c")
+        );
+        assert!(
+            Cli::try_parse_from(
+                client
+                    .into_iter()
+                    .chain(["--tcp-forward", "a=0.0.0.0:9443",])
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -241,7 +260,7 @@ enum Command {
         #[command(flatten)]
         stats: stats::Options,
     },
-    /// Offer a separate local SOCKS5 TCP/UDP endpoint for each selected mesh exit.
+    /// Offer per-exit SOCKS5 TCP/UDP and fixed-target TCP listeners in one process.
     ProxyClient {
         #[arg(long, required = true)]
         connect: Vec<SocketAddr>,
@@ -258,6 +277,9 @@ enum Command {
         /// Override one exit's SOCKS5 address, EXIT=127.0.0.1:PORT; one listener per exit.
         #[arg(long)]
         socks5: Vec<proxy::Listener>,
+        /// Forward loopback TCP to an exit's fixed --tcp-target, EXIT=127.0.0.1:PORT.
+        #[arg(long)]
+        tcp_forward: Vec<proxy::Listener>,
         /// Maximum server paths cooperating on each TCP connection (1..8).
         #[arg(long, default_value_t = 4, value_parser = clap::value_parser!(u8).range(1..=8))]
         paths: u8,
@@ -597,6 +619,7 @@ pub async fn run() -> Result<()> {
             exit,
             listen,
             socks5,
+            tcp_forward,
             paths,
             interface,
             socks5_wait_for_connect,
@@ -609,6 +632,7 @@ pub async fn run() -> Result<()> {
                 exits: exit,
                 listen,
                 socks5,
+                tcp_forward,
                 paths: usize::from(paths),
                 interface,
                 socks5_early_reply: !socks5_wait_for_connect,

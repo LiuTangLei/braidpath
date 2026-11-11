@@ -56,6 +56,16 @@ destination; the client cannot name another. `--proxy` and
 access to other private addresses or ports. Existing client-key holders can
 use the configured target; this does not add per-user target authorization.
 
+One `proxy-client` can also serve fixed TCP listeners alongside its SOCKS5
+listeners. Repeat `--tcp-forward node-a=127.0.0.1:9443` for each fixed exit;
+that exit need not appear in `--exit`, which selects SOCKS5 listeners. The
+combined selection supports up to eight exits. Fixed listeners are loopback
+only, and each uses the selected server's `--tcp-target`. They retain the same
+adaptive transport and automatic FEC policy as the SOCKS5 aggregate engine.
+An exit restart closes its existing flows and renews that exit's authenticated
+session while the other exits and local listeners continue running. Applications
+must establish new connections after losing their target socket.
+
 `--target`, `--tcp-target` and `--proxy` may coexist; at least one service is
 required. Adding a fixed target does not enable addressed proxy streams. Only
 exits using the new fixed-target mesh option and clients using the new listener
