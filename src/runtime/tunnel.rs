@@ -4657,9 +4657,19 @@ async fn client_inner(
                 error.is::<SessionExpired>() || (persistent_fixed && error.is::<ExitStopped>())
             })
         {
-            info!(
-                "server session ended; creating a fresh authenticated epoch on the existing local listener"
-            );
+            if result
+                .as_ref()
+                .err()
+                .is_some_and(|error| error.is::<SessionExpired>())
+            {
+                info!(
+                    "server session expired; creating a fresh authenticated epoch on the existing local listener"
+                );
+            } else {
+                info!(
+                    "selected exit stopped; creating a fresh authenticated epoch on the existing local listener"
+                );
+            }
             tokio::select! {
                 _=shutdown.wait()=>return Ok(()),
                 _=tokio::time::sleep(Duration::from_secs(1))=>{}
