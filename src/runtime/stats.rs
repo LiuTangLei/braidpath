@@ -831,6 +831,7 @@ pub struct Scope {
     pub metrics: Metrics,
     pub session: String,
     pub direction: &'static str,
+    path_keys: Arc<[String; 256]>,
     trace_context: Option<trace::Context>,
 }
 impl Metrics {
@@ -985,6 +986,7 @@ impl Metrics {
             metrics: self.clone(),
             session: session.to_owned(),
             direction,
+            path_keys: Arc::new(std::array::from_fn(|pid| format!("{session}/{pid}"))),
             trace_context,
         }
     }
@@ -1244,7 +1246,7 @@ impl Scope {
     }
     pub fn path(&self, pid: u8, f: impl FnOnce(&mut Path)) {
         self.metrics.state(|s| {
-            if let Some(p) = s.paths.get_mut(&format!("{}/{pid}", self.session)) {
+            if let Some(p) = s.paths.get_mut(&self.path_keys[usize::from(pid)]) {
                 f(p);
             }
         });
@@ -1527,6 +1529,64 @@ mod tests {
     use crate::runtime::transport::{self, Congestion};
     use bytes::Bytes;
     use tokio::time::timeout;
+
+    #[test]
+    fn cached_path_keys_preserve_all_path_ids_and_share_across_scope_clones() {
+        let metrics = Metrics::new("client");
+        let scope = metrics.scope("test/session", FORWARD);
+        let cloned = scope.clone();
+        assert!(Arc::ptr_eq(&scope.path_keys, &cloned.path_keys));
+        for pid in 0..=u8::MAX {
+            let key = format!("test/session/{pid}");
+            assert_eq!(scope.path_keys[usize::from(pid)], key);
+            metrics.state(|state| {
+                state.paths.insert(key.clone(), Path::default());
+            });
+            cloned.path(pid, |path| path.quinn_admitted_originals += 1);
+            metrics.state(|state| assert_eq!(state.paths[&key].quinn_admitted_originals, 1));
+        }
+        let missing = metrics.scope("missing", FORWARD);
+        missing.path(0, |_| panic!("missing paths do not invoke the callback"));
+    }
+
+    #[test]
+    #[ignore = "bounded local comparison of the old and cached statistics lookup"]
+    fn cached_path_key_cost_comparison() {
+        const CALLS: u64 = 1_000_000;
+        let metrics = Metrics::new("client");
+        let scope = metrics.scope("00112233445566778899aabbccddeeff", FORWARD);
+        metrics.state(|state| {
+            state
+                .paths
+                .insert(format!("{}/0", scope.session), Path::default());
+        });
+        let before = Instant::now();
+        for _ in 0..CALLS {
+            scope.metrics.state(|state| {
+                if let Some(path) = state.paths.get_mut(&format!("{}/0", scope.session)) {
+                    path.quinn_admitted_originals += 1;
+                }
+            });
+        }
+        let window_a = before.elapsed();
+        let before = Instant::now();
+        for _ in 0..CALLS {
+            scope.path(0, |path| path.quinn_admitted_originals += 1);
+        }
+        let window_b = before.elapsed();
+        metrics.state(|state| {
+            assert_eq!(
+                state.paths[&format!("{}/0", scope.session)].quinn_admitted_originals,
+                CALLS * 2
+            );
+        });
+        eprintln!(
+            "stats_key_cost {}",
+            serde_json::json!({"calls":CALLS,
+            "window_a_ns":window_a.as_nanos(),"window_b_ns":window_b.as_nanos(),
+            "scope":"single-threaded statistics lookup only"})
+        );
+    }
 
     fn diagnostic_options(dir: &std::path::Path) -> Options {
         Options {
