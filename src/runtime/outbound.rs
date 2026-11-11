@@ -179,6 +179,17 @@ impl Queue {
                 .any(|pending| pending.hold.as_ref().is_some_and(|hold| hold.bytes > 320))
         })
     }
+    pub(super) fn has_concurrent_stream_data(&self) -> bool {
+        let mut streams = self.flows.values().flat_map(|queue| {
+            queue.iter().filter_map(|pending| {
+                let hold = pending.hold.as_ref()?;
+                (hold.bytes > 320).then_some(hold.identity.0)
+            })
+        });
+        streams
+            .next()
+            .is_some_and(|first| streams.any(|stream| stream != first))
+    }
     pub fn original_flows(&self) -> usize {
         self.turns.len()
     }
