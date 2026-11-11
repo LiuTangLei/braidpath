@@ -1641,6 +1641,7 @@ async fn sender(
         (policy.adaptive && !metrics.metrics.legacy_recovery()).then(reverse_guard::Guard::default);
     let mut forward_guard =
         (policy.adaptive && !metrics.metrics.legacy_recovery()).then(forward_guard::Guard::default);
+    let mut concurrent_demand_until_us = 0;
     let mut repair_turn = false;
     let mut tick = interval(Duration::from_millis(1));
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -1862,13 +1863,24 @@ async fn sender(
                 policy.rate
             });
         }
-        if observation_schedule
+        if let Some(observation_cause) = observation_schedule
             .as_mut()
             .and_then(|schedule| schedule.take_due(now_us))
-            .is_some()
         {
             let mut cap_changed = false;
             if let Some(guard) = forward_guard.as_mut() {
+                if reliable_native_service && metrics.direction == stats::RETURN {
+                    if observation_cause.periodic && queue.has_concurrent_stream_data() {
+                        concurrent_demand_until_us = now_us.saturating_add(2_000_000);
+                    }
+                    guard.set_concurrent_return(
+                        now_us < concurrent_demand_until_us
+                            && paths.len() >= 2
+                            && paths.iter().all(|path| {
+                                path.open() && !liveness[usize::from(path.id)].silent()
+                            }),
+                    );
+                }
                 if metrics.direction == stats::FORWARD {
                     let native: Vec<_> = paths
                         .iter()

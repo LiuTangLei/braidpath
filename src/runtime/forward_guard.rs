@@ -86,6 +86,9 @@ const RETEST_US: u64 = 3_000_000;
 const RETEST_LOSS: f64 = 1.5;
 const INCONCLUSIVE_RETEST_US: u64 = 5_000_000;
 const RELEASE_WINDOWS: u32 = 20;
+const CONCURRENT_LOSS_EXCESS: f64 = 0.20;
+const SERVICE_LIFETIME_US: u64 = 30_000_000;
+const PACER_OVERHEAD: f64 = 1.12;
 
 /// Cumulative finalized counts of one path generation from the peer's reports.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -297,6 +300,8 @@ pub struct Guard {
     native_window_us: Option<u64>,
     state: State,
     snapshot: Snapshot,
+    concurrent_return: bool,
+    recent_service: Option<(u64, f64)>,
 }
 
 impl Default for Guard {
@@ -324,6 +329,8 @@ impl Default for Guard {
             native_window_us: None,
             state: State::Open,
             snapshot: Snapshot::default(),
+            concurrent_return: false,
+            recent_service: None,
         }
     }
 }
@@ -433,6 +440,13 @@ impl Guard {
         self.snapshot.cap_bps
     }
 
+    pub(super) fn set_concurrent_return(&mut self, active: bool) {
+        self.concurrent_return = active;
+        if !active {
+            self.recent_service = None;
+        }
+    }
+
     /// Whether loss that most paths share is being tested or limited here;
     /// per-path loss tests cannot attribute it meanwhile.
     pub fn shared_loss(&self) -> bool {
@@ -452,7 +466,11 @@ impl Guard {
     /// Returns whether the cap changed.
     pub fn observe(&mut self, now_us: u64, paths: &[(usize, Counts)], sent_bytes: u64) -> bool {
         self.learned_losses = [None; MAX_PATHS];
-        self.connected = paths.iter().filter(|(id, _)| *id < MAX_PATHS).count();
+        let connected = paths.iter().filter(|(id, _)| *id < MAX_PATHS).count();
+        if connected != self.connected {
+            self.recent_service = None;
+        }
+        self.connected = connected;
         let mut present = [false; MAX_PATHS];
         for &(id, counts) in paths {
             if id >= MAX_PATHS {
@@ -460,6 +478,7 @@ impl Guard {
             }
             present[id] = true;
             if self.last[id].is_some_and(|old| old.generation != counts.generation) {
+                self.recent_service = None;
                 self.expected[id] = 0;
                 self.lost[id] = 0;
                 self.cohorts[id] = Cohort::default();
@@ -476,6 +495,9 @@ impl Guard {
         }
         for (id, present) in present.iter().enumerate() {
             if !present {
+                if self.last[id].is_some() {
+                    self.recent_service = None;
+                }
                 self.last[id] = None;
                 self.delivery_start[id] = None;
                 self.expected[id] = 0;
@@ -547,21 +569,21 @@ impl Guard {
         self.recent_common_loss = self.common_loss();
         self.snapshot.recent_common_loss = self.recent_common_loss;
         self.snapshot.shared_loss = self.shared_loss();
-        let complete_trial_cohort = ready
-            && matches!(self.state, State::Trial { .. })
+        let complete_short_cohort = ready
             && elapsed >= TRIAL_WINDOW_US
             && self.expected.iter().sum::<u64>() >= MIN_TRIAL_SYMBOLS
-            && self.common_loss().is_some();
-        if elapsed < WINDOW_US && !complete_trial_cohort {
+            && (matches!(self.state, State::Trial { .. }) && self.recent_common_loss.is_some()
+                || self.concurrent_return
+                    && self
+                        .recent_common_loss
+                        .is_some_and(|loss| loss >= self.snapshot.floor + CONCURRENT_LOSS_EXCESS)
+                    && self.receiver_delivery(paths).is_some());
+        if elapsed < WINDOW_US && !complete_short_cohort {
             return false;
         }
         let sent = sent_bytes.saturating_sub(self.sent_at_start) as f64 * 8e6 / elapsed as f64;
         let common = self.common_loss();
         let delivered = self.receiver_delivery(paths);
-        self.snapshot.receiver_delivery_bps = delivered.map(|rate| rate as u64);
-        if delivered.is_none() {
-            self.snapshot.delivery_unavailable_windows += 1;
-        }
         // Finalized loss can arrive while the application is idle. Match its
         // sequence prefix to the state and rate at admission, not today's send
         // window. Peer byte delivery remains independently clocked; it is never
@@ -584,6 +606,13 @@ impl Guard {
             cohort_rate += c.bytes * 8e6 / c.span_us.max(1.0);
         }
         qualified &= symbols > 0;
+        if elapsed < WINDOW_US && !matches!(self.state, State::Trial { .. }) && !qualified {
+            return false;
+        }
+        self.snapshot.receiver_delivery_bps = delivered.map(|rate| rate as u64);
+        if delivered.is_none() {
+            self.snapshot.delivery_unavailable_windows += 1;
+        }
         self.snapshot.backlogged_fraction =
             (symbols > 0).then(|| backlogged as f64 / symbols as f64);
         self.snapshot.cohort_sent_bps = qualified.then_some(cohort_rate as u64);
@@ -618,6 +647,20 @@ impl Guard {
         self.snapshot.sent_bps = sent as u64;
         if let Some(window) = window {
             self.snapshot.delivered_bps = window.delivered() as u64;
+        }
+        if self.concurrent_return
+            && let Some((loss, window)) = common.zip(window)
+            && loss <= self.snapshot.floor.max(0.15) + EXCESS
+            && sent >= MIN_TRIGGER_BPS
+            && (sent * 0.78..=sent * (1.0 + UNBOUND)).contains(&window.delivered)
+            && self.recent_service.is_none_or(|(at, rate)| {
+                now_us.saturating_sub(at) > SERVICE_LIFETIME_US
+                    || sent * PACER_OVERHEAD >= rate * 0.98
+            })
+        {
+            // The aggregate pacer counts packet overhead. Only remember an
+            // offered rate that the receiver recently sustained.
+            self.recent_service = Some((now_us, sent * PACER_OVERHEAD));
         }
         self.decide(now_us, common.zip(window), sent);
         if let Some(window) = window {
@@ -707,6 +750,13 @@ impl Guard {
             self.snapshot.floor = self.snapshot.floor.max(loss);
         }
         let floor = self.snapshot.floor;
+        let concurrent_return = self.concurrent_return;
+        let severe_deficit = |loss: f64, floor: f64, window: Window| {
+            concurrent_return
+                && loss >= floor + CONCURRENT_LOSS_EXCESS
+                && (sent * 0.10..=sent * 0.75).contains(&window.delivered)
+                && sent >= MIN_TRIGGER_BPS
+        };
         self.state = match self.state {
             State::Open => {
                 // Loss well above a rejected one is no longer that loss.
@@ -725,7 +775,8 @@ impl Guard {
                         self.onset_windows = 0;
                         self.inconclusive_cooldown = false;
                         self.snapshot.trials += 1;
-                        let before = match self.previous {
+                        let severe = severe_deficit(loss, floor, window);
+                        let before = match self.previous.filter(|_| !severe) {
                             Some(previous) => {
                                 let sent = window.sent + previous.sent;
                                 Window {
@@ -737,8 +788,14 @@ impl Guard {
                         };
                         let fraction =
                             (1.0 - TRIAL_GAIN * (loss - floor)).clamp(TRIAL_MIN, TRIAL_MAX);
+                        let mut cap = before.sent * fraction;
+                        if severe {
+                            // The first binding trial can use the measured service
+                            // when common loss and a large delivery deficit agree.
+                            cap = cap.min((window.delivered * PACER_OVERHEAD).max(sent * 0.25));
+                        }
                         State::Trial {
-                            cap: (before.sent * fraction).max(MIN_CAP_BPS),
+                            cap: cap.max(MIN_CAP_BPS),
                             before,
                             loss_before: loss,
                             paths_before: self.window_losses,
@@ -915,6 +972,7 @@ impl Guard {
             } => {
                 if let Some((loss, window)) = report
                     && window.sent >= cap * BINDING
+                    && (!concurrent_return || sent >= cap * 0.70)
                 {
                     if let Some((from, previous_sent)) = decreased_from.take()
                         && window.sent <= previous_sent * MIN_CUT
@@ -934,26 +992,44 @@ impl Guard {
                     let beyond = loss > floor + EXCESS;
                     // Reports lag the pace: this loss may describe the
                     // previous window's rate.
-                    let sent = self
+                    let offered = self
                         .previous
                         .map_or(window.sent, |previous| previous.sent.max(window.sent));
-                    let base = cap.min(sent);
+                    let base = cap.min(offered);
                     if beyond && (excess || loss > floor + 2.0 * EXCESS) {
                         self.snapshot.decreases += 1;
-                        decreased_from = Some((loss, sent));
+                        decreased_from = Some((loss, offered));
                         peak = Some(base);
-                        cap = (sent * (1.0 - loss) / (1.0 - floor).max(0.05))
+                        let ordinary = (offered * (1.0 - loss) / (1.0 - floor).max(0.05))
                             .clamp(base * MAX_CUT, base * MIN_CUT)
                             .max(MIN_CAP_BPS);
+                        cap = if severe_deficit(loss, floor, window) {
+                            ordinary
+                                .min((window.delivered * PACER_OVERHEAD).max(sent * 0.25))
+                                .max(MIN_CAP_BPS)
+                        } else {
+                            ordinary
+                        };
                     } else if loss <= floor + EXCESS / 2.0 && window.sent >= cap * BINDING {
                         // Grow only a cap that binds; one far above the rate
                         // the sender reaches would no longer describe the link.
                         // Near the rate that overran last, grow slowly.
-                        cap *= if peak.is_some_and(|rate| cap >= rate * (1.0 - PLATEAU)) {
-                            PLATEAU_INCREASE
-                        } else {
-                            INCREASE
-                        };
+                        let ordinary = cap
+                            * if peak.is_some_and(|rate| cap >= rate * (1.0 - PLATEAU)) {
+                                PLATEAU_INCREASE
+                            } else {
+                                INCREASE
+                            };
+                        cap = self
+                            .recent_service
+                            .filter(|(at, _)| {
+                                now_us.saturating_sub(*at) <= SERVICE_LIFETIME_US
+                                    && (sent * (1.0 - floor - EXCESS)..=sent * (1.0 + UNBOUND))
+                                        .contains(&window.delivered)
+                            })
+                            .map_or(ordinary, |(_, service)| {
+                                ordinary.max((cap * 1.20).min(service))
+                            });
                     }
                     excess = beyond;
                 }
@@ -983,6 +1059,73 @@ impl Guard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn concurrent_return_uses_delivery_for_a_severe_shared_loss_trial() {
+        let window = Window {
+            sent: 80_000_000.0,
+            delivered: 28_000_000.0,
+        };
+        let mut guard = Guard::default();
+        guard.set_concurrent_return(true);
+        guard.decide(WINDOW_US, Some((0.65, window)), window.sent);
+        assert_eq!(guard.state, State::Open);
+        guard.decide(2 * WINDOW_US, Some((0.65, window)), window.sent);
+        assert!(matches!(guard.state, State::Trial { cap, .. } if cap as u64 == 31_360_000));
+    }
+
+    #[test]
+    fn concurrent_return_recovers_toward_recent_service_only_with_fresh_evidence() {
+        let mut guard = Guard {
+            recent_service: Some((0, 20_000_000.0)),
+            state: State::Limited {
+                cap: 10_000_000.0,
+                floor: 0.12,
+                slack_windows: 0,
+                peak: Some(10_000_000.0),
+                excess: false,
+                decreased_from: None,
+            },
+            ..Guard::default()
+        };
+        guard.set_concurrent_return(true);
+        let window = Window {
+            sent: 10_000_000.0,
+            delivered: 8_800_000.0,
+        };
+        guard.decide(WINDOW_US, Some((0.12, window)), window.sent);
+        assert!(matches!(guard.state, State::Limited { cap, .. } if cap == 12_000_000.0));
+        guard.set_concurrent_return(false);
+        assert!(guard.recent_service.is_none());
+    }
+
+    #[test]
+    fn concurrent_return_ignores_a_delayed_loss_cohort_when_the_cap_is_idle() {
+        let mut guard = Guard {
+            state: State::Limited {
+                cap: 20_000_000.0,
+                floor: 0.12,
+                slack_windows: 0,
+                peak: None,
+                excess: false,
+                decreased_from: None,
+            },
+            ..Guard::default()
+        };
+        guard.set_concurrent_return(true);
+        let report = Some((
+            0.55,
+            Window {
+                sent: 25_000_000.0,
+                delivered: 5_000_000.0,
+            },
+        ));
+        guard.decide(WINDOW_US, report, 1_800_000.0);
+        assert_eq!(guard.snapshot.decreases, 0);
+        guard.decide(2 * WINDOW_US, report, 18_000_000.0);
+        assert_eq!(guard.snapshot.decreases, 1);
+        assert!(matches!(guard.state, State::Limited { cap, .. } if cap as u64 == 5_600_000));
+    }
 
     /// Drive one window per call: each of four paths finalizes 1000 symbols
     /// with its loss while the aggregate sends `sent_bps`.
