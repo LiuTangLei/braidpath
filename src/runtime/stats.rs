@@ -1,6 +1,7 @@
 //! Bounded, cumulative counters. Record, aggregate-symbol, QUIC-packet and relay
 //! UDP-datagram units are deliberately separate; transport loss is not record loss.
 use super::{trace, wire};
+pub mod summary;
 use anyhow::{Context, Result, ensure};
 use clap::Args;
 use serde::Serialize;
@@ -10,7 +11,7 @@ use std::{
     io::Write,
     path::{Path as FsPath, PathBuf},
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicBool, Ordering},
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -260,6 +261,10 @@ impl Ids {
 }
 #[derive(Clone, Default, Serialize)]
 pub struct Direction {
+    #[serde(skip)]
+    pub(crate) summary_sender_queue: Option<usize>,
+    #[serde(skip)]
+    pub(crate) summary_sender_sampled_at: Option<Instant>,
     pub records: Records,
     pub symbols: Symbols,
     pub udp_delivery: UdpDelivery,
@@ -380,6 +385,8 @@ pub struct Generation {
 }
 #[derive(Clone, Default, Serialize)]
 pub struct Path {
+    /// UDP transmit bytes from all superseded connection generations.
+    pub retired_udp_bytes_tx: u64,
     pub connection_id: usize,
     /// Includes the current generation. Re-registering the same connection is idempotent.
     pub total_generations: u64,
@@ -451,6 +458,8 @@ pub struct RelayDirection {
 }
 #[derive(Clone, Default, Serialize)]
 pub struct State {
+    /// Wire bytes retained when finished session scopes are evicted.
+    pub evicted_udp_bytes_tx: u64,
     pub mesh_uplinks: Vec<MeshUplink>,
     pub ready: bool,
     pub configured_paths: usize,
@@ -507,7 +516,16 @@ impl State {
             self.evicted_session_scopes += 1;
         }
         let before = self.paths.len();
-        self.paths.retain(|_, path| path.session_id != session);
+        self.paths.retain(|_, path| {
+            if path.session_id != session {
+                return true;
+            }
+            self.evicted_udp_bytes_tx = self
+                .evicted_udp_bytes_tx
+                .saturating_add(path.retired_udp_bytes_tx)
+                .saturating_add(path.quinn.udp_bytes_tx);
+            false
+        });
         self.evicted_path_scopes += (before - self.paths.len()) as u64;
         true
     }
@@ -807,6 +825,8 @@ impl ConnectionTrace {
     }
 }
 struct Inner {
+    summary_registered: AtomicBool,
+    summary_label: OnceLock<String>,
     legacy_recovery: bool,
     repair_usefulness_guard: bool,
     rtt_source_baselines: bool,
@@ -882,6 +902,8 @@ impl Metrics {
         queue_gated_loss: bool,
     ) -> Self {
         Self(Arc::new(Inner {
+            summary_registered: AtomicBool::new(false),
+            summary_label: OnceLock::new(),
             legacy_recovery: false,
             repair_usefulness_guard,
             rtt_source_baselines,
@@ -961,7 +983,12 @@ impl Metrics {
         });
         self.0.changed.notify_one();
     }
+    pub(crate) fn with_summary_label(self, label: String) -> Self {
+        let _ = self.0.summary_label.set(label);
+        self
+    }
     pub fn scope(&self, session: &str, direction: &'static str) -> Scope {
+        summary::register(self);
         self.state(|s| {
             s.retired_sessions.retain(|id| id != session);
             if !s.sessions.contains_key(session) {
@@ -1049,6 +1076,9 @@ impl Metrics {
                     path.quinn = Quinn::sample(previous);
                     path.peer_socket = previous.remote_address().to_string();
                 }
+                path.retired_udp_bytes_tx = path
+                    .retired_udp_bytes_tx
+                    .saturating_add(path.quinn.udp_bytes_tx);
                 if path.previous_generations.len() == MAX_PREVIOUS_GENERATIONS {
                     path.previous_generations.remove(0);
                 }

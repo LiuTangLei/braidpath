@@ -38,6 +38,7 @@ quinn-proto = { path = "vendor/quinn-proto" }
 quinn = { path = "vendor/quinn" }
 
 [target.'cfg(unix)'.dependencies]
+nix = { version = "0.31", default-features = false, features = ["resource"] }
 rustix = { version = "1", features = ["fs"] }
 
 [dev-dependencies]

@@ -1615,6 +1615,7 @@ async fn sender(
     let mut logged_rate_changes = [0u64; MAX_PATHS];
     let mut transfer_telemetry = telemetry::Schedule::default();
     let mut next_sender_log_us = 0u64;
+    let mut next_summary_gauge_us = 0u64;
     let mut logged_guard = forward_guard::Snapshot::default();
     let reliable_native_service =
         (policy.streams || policy.proxy) && !metrics.metrics.legacy_recovery();
@@ -3012,6 +3013,19 @@ async fn sender(
             }) {
                 next_wait = Some(attempt);
             }
+        }
+        if publish_feedback_stats && stats::summary::enabled() && now_us >= next_summary_gauge_us {
+            next_summary_gauge_us = now_us.saturating_add(10_000_000);
+            metrics.metrics.state(|s| {
+                if let Some(d) = s
+                    .sessions
+                    .get_mut(&metrics.session)
+                    .and_then(|s| s.get_mut(metrics.direction))
+                {
+                    d.summary_sender_queue = Some(queue.len());
+                    d.summary_sender_sampled_at = Some(Instant::now());
+                }
+            });
         }
         if publish_feedback_stats {
             publish_receiver_feedback(&paths, &metrics);

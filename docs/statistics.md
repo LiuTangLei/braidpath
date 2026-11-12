@@ -464,3 +464,60 @@ Stream gauges distinguish `send_retained_bytes` (including ACK-waiting bytes),
 `receive_out_of_order_bytes`. Empty writer/kernel queues therefore cannot hide a
 full reliable-stream window. These are gauges, never subtracted as cumulative
 counters; publication reads them without changing stream recovery or flow control.
+
+
+## Compact operational summaries
+
+`RUST_LOG=warn,braidpath::summary=info` enables a dedicated INFO target without
+turning on packet diagnostics or full snapshots. The executable samples every
+10 seconds on a blocking worker. All reliable session metric owners register
+when their first scope is created, including fixed TCP forwards and each SOCKS
+exit. No packet identifiers, peer addresses, credentials or payloads enter the
+summary. `label` identifies `socks:EXIT` or `fixed:EXIT` on a combined client.
+
+A session emits on its first observation, activity changes, retirement, or an
+idle heartbeat every five minutes. Retirement emits once; it does not keep an
+endpoint alive. A process summary emits every 10 seconds. Counters are cumulative,
+not per-period rates. The tracing `sample_unix_ms` supplies the UTC instant.
+Use metric/session/connection identifiers to separate epochs and reconnects.
+
+Session JSON has `schema: 1`, `kind: session`, `metric`, `role`, `label`, `session`,
+`retired`, and compact `directions` / `paths` arrays (normally around 1 KiB for
+four paths). Tuple columns are:
+
+- `directions`: direction name; sender queue record gauge or null; gauge age in
+  milliseconds or null; expired sender symbols (original, ingress-original and
+  repair); ingress queue full/closed drops; optional mux tuple; forward cap bps;
+  reverse cap bps; optional FEC `[data_shards, repair_shards]`.
+- Mux tuple: active flows, opened flows, stream ACKs generated, bytes read from
+  local applications, bytes successfully written to local applications, stream
+  retransmitted bytes, duplicate received bytes. The mux owns both byte directions
+  but publishes under its sending direction; do not count it twice.
+- `paths`: path ID; current connection identifier; closed; Quinn packets sent;
+  Quinn packets declared lost; UDP bytes transmitted; UDP bytes received;
+  smoothed RTT in microseconds; current adaptive pacing bps (native fallback);
+  native QUIC ACK frames sent; native QUIC ACK frames received; locally finalized
+  reverse-symbol expected count; locally finalized reverse-symbol received count.
+
+Queue gauges are sampled on existing sender timer/evidence turns, at most once
+per 10 seconds. Other scalar views retain their existing publication timing.
+Null means unavailable, not zero. Reverse-symbol counts describe traffic arriving
+at this endpoint before FEC, whereas Quinn loss describes this endpoint's outgoing
+packets; they are different units and directions. Path counters restart with a
+new connection identifier. Receive byte counters cannot identify an application
+or prove a peer consumed its body.
+
+Process JSON has `schema: 1`, `kind: process`, PID, active session/path counts,
+`observed_udp_tx`, and `usage`. `observed_udp_tx` accumulates observed reliable
+session owners' UDP transmissions, retaining superseded connection generations
+and evicted finished session scopes. It excludes discovery sockets, native UDP
+proxy associations, relay-only UDP and other processes. An owner that is created
+and destroyed between samples may be missed; it is not a physical interface
+counter. Correlate it with per-interface or capture evidence when measuring a
+shared public uplink, particularly when private and public traffic share an NIC.
+
+On Unix, `usage.user_us` and `system_us` come from process `getrusage` counters;
+`peak_rss_bytes` normalizes the OS's maximum-RSS unit. Linux additionally reports
+current `rss_bytes` from `/proc/self/status`. Unsupported fields are null,
+including these resource fields on Windows. Queue/packet handling, controller
+rules, pacing and stream ACK behavior are unchanged by this reporter.

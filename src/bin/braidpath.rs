@@ -10,5 +10,10 @@ async fn main() -> anyhow::Result<()> {
                 .unwrap_or_else(|_| "braidpath=info,quinn_udp=warn".into()),
         )
         .init();
-    braidpath::runtime::cli::run().await
+    let summary = braidpath::runtime::stats::summary::start();
+    let result = braidpath::runtime::cli::run().await;
+    if let Some(summary) = summary {
+        summary.abort();
+    }
+    result
 }

@@ -286,7 +286,8 @@ impl Pool {
                     paths: Mutex::new(BTreeMap::new()),
                     routes: AsyncMutex::new(None),
                     aggregate: AsyncMutex::new(None),
-                    stream_metrics: stats::Metrics::new("client"),
+                    stream_metrics: stats::Metrics::new("client")
+                        .with_summary_label(format!("socks:{exit}")),
                     #[cfg(test)]
                     stream_health: Mutex::new(None),
                     #[cfg(test)]
@@ -827,7 +828,8 @@ async fn fixed_forward(
         datagram_send_buffer_bytes: transport::MAX_DATAGRAM_SEND_BUFFER_BYTES,
         congestion: transport::Congestion::Bbr,
         policy,
-        stats: stats::Metrics::new("fixed-forward"),
+        stats: stats::Metrics::new("fixed-forward")
+            .with_summary_label(format!("fixed:{}", mapping.exit)),
     };
     let result = tunnel::client_with_fixed_listener(
         options,
