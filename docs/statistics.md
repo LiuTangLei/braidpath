@@ -521,3 +521,18 @@ On Unix, `usage.user_us` and `system_us` come from process `getrusage` counters;
 current `rss_bytes` from `/proc/self/status`. Unsupported fields are null,
 including these resource fields on Windows. Queue/packet handling, controller
 rules, pacing and stream ACK behavior are unchanged by this reporter.
+
+## Path lifecycle events
+
+The opt-in `braidpath::path_lifecycle=info` logging target records changes rather
+than periodic full snapshots: selected-address changes, retired entrances,
+qualified delivery stalls, and path establishment/closure. Address selection
+includes the current control connections' smoothed RTT samples; these are not
+application delivery latency. Path events carry generation identifiers and
+endpoint addresses so a replacement can be distinguished from a session restart.
+
+Closure events use bounded reason labels and an optional application error code.
+They never include arbitrary peer-provided close text, payloads, or credentials.
+Endpoint addresses and session identifiers are private operational data: retain
+them in access-controlled local logs. This target adds observations without new
+probes, retry policies, timers, or routing decisions.

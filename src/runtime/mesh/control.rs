@@ -274,7 +274,14 @@ impl Control {
             return self.supports(node.address).then_some(node.address);
         };
         let (primary, secondary) = tokio::join!(probe(node.address), probe(alternate));
-        select_address([primary, secondary], current)
+        let selected = select_address([primary, secondary], current);
+        if selected.is_some() && selected != current {
+            tracing::info!(target: "braidpath::path_lifecycle", event="address_selected", node=%node.id,
+                old=?current, new=?selected,
+                primary_control_rtt_ms=?primary.map(|(_, rtt)| rtt.as_secs_f64()*1000.0),
+                alternate_control_rtt_ms=?secondary.map(|(_, rtt)| rtt.as_secs_f64()*1000.0));
+        }
+        selected
     }
 
     async fn request_with_rtt<T: DeserializeOwned>(

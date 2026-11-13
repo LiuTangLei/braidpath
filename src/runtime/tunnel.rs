@@ -4425,6 +4425,8 @@ fn reconcile_routes(
             && !desired.iter().any(|route| matches_route(config, route))
         {
             config.enabled = false;
+            info!(target: "braidpath::path_lifecycle", event="route_retired", path=id,
+                generation=config.generation, remote=%config.remote, cause="entrance_removed");
             let mut paths = paths.lock().expect("paths lock");
             for path in paths.iter().filter(|p| usize::from(p.id) == id) {
                 path.conn.close(0u32.into(), b"entrance retired");
@@ -4862,6 +4864,8 @@ async fn client_session(
                             reachability[id].observe(&path.conn, Instant::now());
                             let silent = reachability[id].silent();
                             if stalled && path.conn.close_reason().is_none() {
+                                info!(target: "braidpath::path_lifecycle", event="path_stalled", session=%sid,
+                                    path=id, generation=q.generation, remote=%path.conn.remote_address());
                                 tracing::debug!(path=id, group=path.group, "mesh data delivery stalled; reconnecting");
                                 path.conn.close(0u32.into(), b"mesh delivery stalled");
                             }
@@ -4975,6 +4979,8 @@ async fn client_session(
                         if elective_inflight[id] {rotations[id].rotation_succeeded(now_us);}
                         else {rotations[id].connection_succeeded(now_us);}
                         let replacing=endpoints[id].is_some();
+                        info!(target: "braidpath::path_lifecycle", event="path_ready", session=%sid, path=pid,
+                            generation, replacing, remote=%value.conn.remote_address(), local=?value.endpoint.local_addr().ok());
                         options.stats.register(&sid,pid,value.stream,stats::FORWARD,&value.conn);
                         forward.path(pid,|p|{
                             p.local_socket=value.endpoint.local_addr().ok().map(|a|a.to_string());
@@ -5140,6 +5146,11 @@ async fn drive_client_path(
                         }
                     }}}.await;
     let normal = diagnostic.finish(result.as_ref().err());
+    let close = conn.close_reason();
+    let (cause, application_code) = path_close_label(close.as_ref());
+    info!(target: "braidpath::path_lifecycle", event="path_closed", session=%measurement_scope.session,
+        path=pid, generation, remote=%conn.remote_address(), cause, ?application_code,
+        normal, request_ok=result.is_ok());
     trace_path(&returning, trace::Stage::PathClosed, trace_key);
     trace_path(&measurement_scope, trace::Stage::PathClosed, trace_key);
     if normal {
@@ -5149,6 +5160,24 @@ async fn drive_client_path(
     }
     if conn.close_reason().is_none() {
         conn.close(0u32.into(), b"path ended");
+    }
+}
+
+// Keep lifecycle logs bounded: never emit peer-provided close reason bytes.
+fn path_close_label(reason: Option<&quinn::ConnectionError>) -> (&'static str, Option<u64>) {
+    use quinn::ConnectionError;
+    match reason {
+        None => ("http3_request_end", None),
+        Some(ConnectionError::ApplicationClosed(close)) => {
+            ("peer_application", Some(close.error_code.into_inner()))
+        }
+        Some(ConnectionError::LocallyClosed) => ("local_close", None),
+        Some(ConnectionError::TimedOut) => ("idle_timeout", None),
+        Some(ConnectionError::Reset) => ("stateless_reset", None),
+        Some(ConnectionError::ConnectionClosed(_)) => ("peer_transport", None),
+        Some(ConnectionError::TransportError(_)) => ("transport_error", None),
+        Some(ConnectionError::VersionMismatch) => ("version_mismatch", None),
+        Some(ConnectionError::CidsExhausted) => ("cids_exhausted", None),
     }
 }
 
@@ -5642,6 +5671,24 @@ mod stream_profile_tests {
             error_code: code.into(),
             reason: Bytes::from_static(reason),
         })
+    }
+
+    #[test]
+    fn lifecycle_close_labels_keep_codes_but_omit_peer_text() {
+        let close = peer_close(7, b"private peer text must never be logged");
+        assert_eq!(
+            path_close_label(Some(&close)),
+            ("peer_application", Some(7))
+        );
+        assert_eq!(
+            path_close_label(Some(&quinn::ConnectionError::TimedOut)),
+            ("idle_timeout", None)
+        );
+        assert_eq!(
+            path_close_label(Some(&quinn::ConnectionError::LocallyClosed)),
+            ("local_close", None)
+        );
+        assert_eq!(path_close_label(None), ("http3_request_end", None));
     }
 
     #[test]
