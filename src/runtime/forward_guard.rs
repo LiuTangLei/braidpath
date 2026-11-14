@@ -705,7 +705,13 @@ impl Guard {
     }
 
     /// `report` is the common loss and the window, when reports measured it.
-    fn decide(&mut self, now_us: u64, report: Option<(f64, Window)>, sent: f64, demand: bool) {
+    fn decide(
+        &mut self,
+        now_us: u64,
+        report: Option<(f64, Window)>,
+        current_sent: f64,
+        demand: bool,
+    ) {
         self.snapshot.floor *= FLOOR_DECAY;
         // A late loss prefix can qualify old busy admissions after their byte
         // progress has already finished. During idle it is not a new service
@@ -794,11 +800,17 @@ impl Guard {
                 mut loss_under,
             } => {
                 // observe() admits only post-cut finalized intervals after settlement.
-                let nonbinding = report.is_none_or(|(_, window)| window.sent < cap * BINDING);
+                // Cohort loss needs substantial per-path samples; sparse
+                // paths may not enter that rate. The cap covers ALL paths.
+                // Actual aggregate admission can prove it was exercised. Use
+                // the larger rate so a partial cohort cannot exaggerate the
+                // cut or make independent receiver delivery look leading.
+                let nonbinding =
+                    report.is_none_or(|(_, window)| window.sent.max(current_sent) < cap * BINDING);
                 if let Some((loss, window)) = report
-                    && window.sent >= cap * BINDING
+                    && window.sent.max(current_sent) >= cap * BINDING
                 {
-                    sent += window.sent;
+                    sent += window.sent.max(current_sent);
                     delivered += window.delivered();
                     loss_under = loss_under.max(loss);
                     measured += 1;
@@ -944,10 +956,10 @@ impl Guard {
                 mut decreased_from,
             } => {
                 if let Some((loss, window)) = report
-                    && window.sent >= cap * BINDING
+                    && window.sent.max(current_sent) >= cap * BINDING
                 {
                     if let Some((from, previous_sent)) = decreased_from.take()
-                        && window.sent <= previous_sent * MIN_CUT
+                        && window.sent.max(current_sent) <= previous_sent * MIN_CUT
                         && loss >= from - EXCESS / 2.0
                     {
                         // A lower rate lost as much: this loss is the path's.
@@ -964,9 +976,10 @@ impl Guard {
                     let beyond = loss > floor + EXCESS;
                     // Reports lag the pace: this loss may describe the
                     // previous window's rate.
-                    let sent = self
-                        .previous
-                        .map_or(window.sent, |previous| previous.sent.max(window.sent));
+                    let sent = current_sent.max(
+                        self.previous
+                            .map_or(window.sent, |previous| previous.sent.max(window.sent)),
+                    );
                     let base = cap.min(sent);
                     if beyond && (excess || loss > floor + 2.0 * EXCESS) {
                         self.snapshot.decreases += 1;
@@ -987,7 +1000,7 @@ impl Guard {
                     }
                     excess = beyond;
                 }
-                let slack_windows = if sent * 2.0 < cap {
+                let slack_windows = if current_sent * 2.0 < cap {
                     slack_windows + 1
                 } else {
                     0
@@ -1221,6 +1234,34 @@ mod tests {
         assert_eq!(d.guard.cap_bps(), None);
         assert_eq!(d.guard.snapshot().rejected, 1);
         assert!(d.guard.snapshot().floor >= 0.59);
+    }
+
+    #[test]
+    fn aggregate_admission_can_exercise_a_cap_with_sparse_cohort_paths() {
+        let mut d = Drive::new();
+        d.policed(47.9e6, 6e6, 0.0);
+        let cap = d.policed(47.9e6, 6e6, 0.0).unwrap();
+        // Two routes qualify loss, while other routes carry enough symbols
+        // to exercise the aggregate cap without each finalizing 100 symbols
+        // in this window. Delivery and actual admissions cover all routes.
+        let report = Some((
+            0.2,
+            Window {
+                sent: 4.7e6,
+                delivered: 5.4e6,
+            },
+        ));
+        for i in 0..2 {
+            d.guard
+                .decide(d.now_us + (i + 1) * WINDOW_US, report, 6.6e6, true);
+        }
+        assert_eq!(d.guard.snapshot().confirmed, 1);
+        assert_eq!(d.guard.snapshot().inconclusive, 0);
+        assert!(matches!(d.guard.state, State::Limited { cap: c, .. } if c == cap as f64));
+        d.guard
+            .decide(d.now_us + 3 * WINDOW_US, report, 6.6e6, true);
+        assert_eq!(d.guard.snapshot().decreases, 1);
+        assert!(matches!(d.guard.state, State::Limited { cap, .. } if cap < 6e6));
     }
 
     #[test]
