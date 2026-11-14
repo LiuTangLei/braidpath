@@ -15,7 +15,8 @@
 //! them can falsely confirm a low cap after startup or a pace change.
 //! A trial caps the aggregate pacer below the
 //! measured rate by three quarters of the loss above the learned floor, within
-//! 10% to 40%, and compares delivery before and under the cap. Rate-independent
+//! 10% to 40%, with a ceiling of 1.25 times qualified receiver delivery, and
+//! compares delivery before and under the cap. Rate-independent
 //! loss loses the same fraction of a lower rate, so delivery falls with the
 //! cap; an overrun bottleneck delivers about the same at the lower rate, as
 //! long as the cut does not go far below it, which is why the cut follows the
@@ -35,6 +36,9 @@
 //! report intervals enter decisions. An unchanged
 //! loss raises the floor only if the actual sending rate also fell by 5%.
 //! A cut that leaves the loss unchanged clears its old overrun threshold.
+//! Idle windows retain a trial or kept cap for the next burst. Only demand
+//! that does not exercise the cap can time it out; binding demand still grows
+//! through the existing measured-service checks.
 //! This bounds the aggregate pacer, not individual path clocks or native
 //! congestion control, and remains a heuristic rather than a capacity proof.
 use super::MAX_PATHS;
@@ -449,8 +453,15 @@ impl Guard {
 
     /// `paths` are cumulative forward counts by path id; `sent_bytes` is this
     /// direction's cumulative transmitted symbol bytes over all paths.
+    /// `offered_backlog` reports queued demand even when admission is blocked.
     /// Returns whether the cap changed.
-    pub fn observe(&mut self, now_us: u64, paths: &[(usize, Counts)], sent_bytes: u64) -> bool {
+    pub fn observe(
+        &mut self,
+        now_us: u64,
+        paths: &[(usize, Counts)],
+        sent_bytes: u64,
+        offered_backlog: bool,
+    ) -> bool {
         self.learned_losses = [None; MAX_PATHS];
         self.connected = paths.iter().filter(|(id, _)| *id < MAX_PATHS).count();
         let mut present = [false; MAX_PATHS];
@@ -619,7 +630,12 @@ impl Guard {
         if let Some(window) = window {
             self.snapshot.delivered_bps = window.delivered() as u64;
         }
-        self.decide(now_us, common.zip(window), sent);
+        self.decide(
+            now_us,
+            common.zip(window),
+            sent,
+            offered_backlog || sent > 0.0,
+        );
         if let Some(window) = window {
             self.previous = Some(window);
         }
@@ -693,8 +709,16 @@ impl Guard {
     }
 
     /// `report` is the common loss and the window, when reports measured it.
-    fn decide(&mut self, now_us: u64, report: Option<(f64, Window)>, sent: f64) {
+    fn decide(&mut self, now_us: u64, report: Option<(f64, Window)>, sent: f64, demand: bool) {
         let loss = report.map(|(loss, _)| loss);
+        // `previous` can predate an idle gap. Use the larger qualified delivery
+        // window for the ceiling, without changing the trial's before/after
+        // reference or letting an old small sample reduce today's service.
+        let delivery = report.map_or(0.0, |(_, window)| {
+            self.previous.map_or(window.delivered(), |previous| {
+                previous.delivered().max(window.delivered())
+            })
+        });
         self.snapshot.floor *= FLOOR_DECAY;
         if loss.is_some() {
             self.snapshot.forward_loss = loss;
@@ -738,7 +762,9 @@ impl Guard {
                         let fraction =
                             (1.0 - TRIAL_GAIN * (loss - floor)).clamp(TRIAL_MIN, TRIAL_MAX);
                         State::Trial {
-                            cap: (before.sent * fraction).max(MIN_CAP_BPS),
+                            cap: (before.sent * fraction)
+                                .min(delivery * 1.25)
+                                .max(MIN_CAP_BPS),
                             before,
                             loss_before: loss,
                             paths_before: self.window_losses,
@@ -766,6 +792,8 @@ impl Guard {
                 mut loss_under,
             } => {
                 // observe() admits only post-cut finalized intervals after settlement.
+                let nonbinding =
+                    demand && report.is_none_or(|(_, window)| window.sent < cap * BINDING);
                 if let Some((loss, window)) = report
                     && window.sent >= cap * BINDING
                 {
@@ -837,6 +865,7 @@ impl Guard {
                             State::Trial {
                                 cap: (before.sent * fraction)
                                     .min(cap * TRIAL_MAX)
+                                    .min(delivery * 1.25)
                                     .max(MIN_CAP_BPS),
                                 before,
                                 loss_before: loss_under,
@@ -880,7 +909,7 @@ impl Guard {
                         self.retest_after_us = now_us.saturating_add(RETEST_US);
                         State::Open
                     }
-                } else if windows >= TRIAL_WINDOWS {
+                } else if nonbinding && windows >= TRIAL_WINDOWS {
                     // Unexercised/missing cohorts cannot establish random loss.
                     // Retry on fresh qualified demand without a five-second blackout.
                     self.snapshot.inconclusive += 1;
@@ -888,7 +917,7 @@ impl Guard {
                     self.retest_after_us = now_us;
                     State::Open
                 } else {
-                    if report.is_none_or(|(_, window)| window.sent < cap * BINDING) {
+                    if nonbinding {
                         self.snapshot.nonbinding_windows += 1;
                     }
                     State::Trial {
@@ -897,7 +926,7 @@ impl Guard {
                         loss_before,
                         paths_before,
                         refined,
-                        windows: windows + 1,
+                        windows: windows + u8::from(nonbinding),
                         sent,
                         delivered,
                         measured,
@@ -957,8 +986,10 @@ impl Guard {
                     }
                     excess = beyond;
                 }
-                let slack_windows = if sent * 2.0 < cap {
+                let slack_windows = if demand && sent * 2.0 < cap {
                     slack_windows + 1
+                } else if !demand {
+                    slack_windows
                 } else {
                     0
                 };
@@ -993,6 +1024,7 @@ mod tests {
         counts: [Counts; 4],
         admitted_at_us: u64,
         admitted_bytes: u64,
+        backlogged: bool,
     }
 
     impl Drive {
@@ -1003,6 +1035,7 @@ mod tests {
                 sent: 0,
                 admitted_at_us: 1_000_000,
                 admitted_bytes: 0,
+                backlogged: true,
                 counts: [Counts {
                     generation: 7,
                     sent_symbols: 0,
@@ -1035,7 +1068,7 @@ mod tests {
                             from_us: last_us,
                             to_us: self.now_us,
                             bytes,
-                            backlogged: true,
+                            backlogged: self.backlogged,
                         },
                     );
                 }
@@ -1043,7 +1076,7 @@ mod tests {
             self.admitted_at_us = self.now_us;
             self.admitted_bytes = self.sent;
             let paths: Vec<_> = self.counts.iter().copied().enumerate().collect();
-            self.guard.observe(self.now_us, &paths, self.sent)
+            self.guard.observe(self.now_us, &paths, self.sent, false)
         }
 
         fn window(&mut self, losses: [f64; 4], sent_bps: f64) -> Option<u64> {
@@ -1125,6 +1158,124 @@ mod tests {
     }
 
     #[test]
+    fn application_limited_admissions_cannot_start_a_delivery_trial() {
+        let mut d = Drive::new();
+        d.backlogged = false;
+        for _ in 0..8 {
+            assert_eq!(d.policed(47.9e6, 6e6, 0.0), None);
+        }
+        assert_eq!(d.guard.snapshot().trials, 0);
+        assert!(d.guard.snapshot().cohort_unavailable_windows > 0);
+    }
+
+    #[test]
+    fn severe_overrun_trial_uses_qualified_delivery_and_confirms() {
+        let mut d = Drive::new();
+        d.policed(47.9e6, 6e6, 0.0);
+        let trial = d.policed(47.9e6, 6e6, 0.0).expect("qualified onset") as f64;
+        assert!(trial <= 6e6 * 1.25, "{trial}");
+        for _ in 0..4 {
+            d.policed(trial, 6e6, 0.0);
+            if d.guard.snapshot().confirmed > 0 {
+                break;
+            }
+        }
+        assert_eq!(d.guard.snapshot().confirmed, 1);
+        assert_eq!(d.guard.snapshot().rejected, 0);
+    }
+
+    #[test]
+    fn a_small_old_delivery_window_cannot_lower_the_trial_ceiling() {
+        let mut d = Drive::new();
+        d.window_rates([0.87; 4], 47.9e6, [2e6 / 4.0; 4]);
+        let trial = d.window_rates([0.87; 4], 47.9e6, [6e6 / 4.0; 4]).unwrap();
+        assert_eq!(trial, 7_500_000);
+    }
+
+    #[test]
+    fn ordinary_random_loss_keeps_the_existing_cap_sequences() {
+        // Exact 32-window traces from the pre-change guard; the sender follows
+        // any cap and resumes 80 Mbps when a trial is rejected.
+        for (loss, first_cap) in [(0.05, 72_000_000), (0.20, 68_000_000), (0.40, 56_000_000)] {
+            let mut d = Drive::new();
+            for step in 0..32 {
+                let rate = d.guard.cap_bps().map_or(80e6, |cap| cap as f64);
+                let expected = matches!(step, 1 | 2).then_some(first_cap);
+                assert_eq!(d.window([loss; 4], rate), expected, "{loss} / {step}");
+            }
+            assert_eq!(d.guard.snapshot().rejected, 1);
+        }
+    }
+
+    #[test]
+    fn severe_random_loss_is_still_rejected_and_learned() {
+        let mut d = Drive::new();
+        d.window([0.6; 4], 47.9e6);
+        let trial = d.window([0.6; 4], 47.9e6).unwrap() as f64;
+        assert!(trial <= 47.9e6 * 0.4 * 1.25);
+        for _ in 0..4 {
+            d.window([0.6; 4], trial);
+            if d.guard.cap_bps().is_none() {
+                break;
+            }
+        }
+        assert_eq!(d.guard.cap_bps(), None);
+        assert_eq!(d.guard.snapshot().rejected, 1);
+        assert!(d.guard.snapshot().floor >= 0.59);
+    }
+
+    #[test]
+    fn idle_caps_survive_path_replacement_and_grow_on_new_binding_demand() {
+        for confirm_before_idle in [false, true] {
+            let mut d = Drive::new();
+            d.policed(47.9e6, 6e6, 0.0);
+            let trial = d.policed(47.9e6, 6e6, 0.0).unwrap();
+            if confirm_before_idle {
+                for _ in 0..4 {
+                    d.policed(trial as f64, 6e6, 0.0);
+                    if d.guard.snapshot().confirmed > 0 {
+                        break;
+                    }
+                }
+                assert_eq!(d.guard.snapshot().confirmed, 1);
+            }
+            let cap = d.guard.cap_bps().unwrap();
+            let nonbinding = d.guard.snapshot().nonbinding_windows;
+            // No admitted traffic and no queued demand, longer than both old
+            // ten-second release timers. Feedback clocks still advance.
+            for _ in 0..60 {
+                d.now_us += WINDOW_US;
+                for c in &mut d.counts {
+                    c.report_time_us = Some(d.now_us);
+                }
+                d.call();
+                assert_eq!(d.guard.cap_bps(), Some(cap));
+            }
+            assert_eq!(d.guard.snapshot().nonbinding_windows, nonbinding);
+            assert_eq!(d.guard.snapshot().releases, 0);
+            for c in &mut d.counts {
+                *c = Counts {
+                    generation: c.generation + 1,
+                    report_time_us: Some(d.now_us),
+                    sent_symbols: 0,
+                    expected: 0,
+                    lost: 0,
+                    received_bytes: 0,
+                };
+            }
+            d.call();
+            assert_eq!(d.guard.cap_bps(), Some(cap));
+            // Capacity has increased: the retained cap must follow measured
+            // binding service instead of staying at its previous ceiling.
+            for _ in 0..30 {
+                let cap = d.guard.cap_bps().expect("keep a useful cap");
+                d.policed(cap as f64, 12e6, 0.0);
+            }
+            assert!(d.guard.cap_bps().unwrap() > 10_000_000);
+        }
+    }
+
+    #[test]
     fn an_overrun_shared_bottleneck_is_capped_near_its_rate() {
         let mut d = Drive::new();
         // Random loss alone: one trial learns it.
@@ -1143,7 +1294,8 @@ mod tests {
         // Overrunning a 90 Mbit/s policer more than twice over.
         assert_eq!(d.policed(200e6, 90e6, 0.11), None);
         let trial = d.policed(200e6, 90e6, 0.11).expect("trial") as f64;
-        assert!((110e6..=130e6).contains(&trial), "{trial}");
+        let delivered = 90e6 * 0.89;
+        assert!((delivered..=delivered * 1.25).contains(&trial), "{trial}");
         for _ in 0..TRIAL_WINDOWS {
             if !matches!(d.guard.state, State::Trial { .. }) {
                 break;
@@ -1329,6 +1481,7 @@ mod tests {
                 },
             )),
             10.5e6,
+            true,
         );
         let State::Limited {
             cap, peak, floor, ..
@@ -1507,7 +1660,7 @@ mod tests {
         // Disconnection removes that generation's evidence and wait mark.
         let paths: Vec<_> = d.counts.iter().copied().enumerate().skip(1).collect();
         d.now_us += WINDOW_US;
-        d.guard.observe(d.now_us, &paths, d.sent);
+        d.guard.observe(d.now_us, &paths, d.sent, false);
         assert!(!d.guard.snapshot().settling);
     }
 
@@ -1756,6 +1909,7 @@ mod tests {
                         now,
                         &counts.into_iter().enumerate().collect::<Vec<_>>(),
                         sent,
+                        false,
                     );
                     let mut pending = VecDeque::new();
                     let mut late_sent = 0.0;
@@ -1807,6 +1961,7 @@ mod tests {
                             now,
                             &counts.into_iter().enumerate().collect::<Vec<_>>(),
                             sent,
+                            backlogged,
                         );
                         let snapshot = guard.snapshot();
                         let case = (burst, busy, gap, delay, phase, step);
