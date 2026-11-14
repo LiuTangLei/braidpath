@@ -630,13 +630,9 @@ impl Guard {
         if let Some(window) = window {
             self.snapshot.delivered_bps = window.delivered() as u64;
         }
-        self.decide(
-            now_us,
-            common.zip(window),
-            sent,
-            offered_backlog || sent > 0.0,
-        );
-        if let Some(window) = window {
+        let demand = offered_backlog || sent > 0.0;
+        self.decide(now_us, common.zip(window), sent, demand);
+        if let Some(window) = window.filter(|_| demand) {
             self.previous = Some(window);
         }
         (self.snapshot.cap_bps, self.snapshot.cap_floor) = match self.state {
@@ -710,6 +706,13 @@ impl Guard {
 
     /// `report` is the common loss and the window, when reports measured it.
     fn decide(&mut self, now_us: u64, report: Option<(f64, Window)>, sent: f64, demand: bool) {
+        self.snapshot.floor *= FLOOR_DECAY;
+        // A late loss prefix can qualify old busy admissions after their byte
+        // progress has already finished. During idle it is not a new service
+        // sample: neither rebase a trial on its zero tail nor forget the cap.
+        if !demand {
+            return;
+        }
         let loss = report.map(|(loss, _)| loss);
         // `previous` can predate an idle gap. Use the larger qualified delivery
         // window for the ceiling, without changing the trial's before/after
@@ -719,7 +722,6 @@ impl Guard {
                 previous.delivered().max(window.delivered())
             })
         });
-        self.snapshot.floor *= FLOOR_DECAY;
         if loss.is_some() {
             self.snapshot.forward_loss = loss;
         }
@@ -792,8 +794,7 @@ impl Guard {
                 mut loss_under,
             } => {
                 // observe() admits only post-cut finalized intervals after settlement.
-                let nonbinding =
-                    demand && report.is_none_or(|(_, window)| window.sent < cap * BINDING);
+                let nonbinding = report.is_none_or(|(_, window)| window.sent < cap * BINDING);
                 if let Some((loss, window)) = report
                     && window.sent >= cap * BINDING
                 {
@@ -986,10 +987,8 @@ impl Guard {
                     }
                     excess = beyond;
                 }
-                let slack_windows = if demand && sent * 2.0 < cap {
+                let slack_windows = if sent * 2.0 < cap {
                     slack_windows + 1
-                } else if !demand {
-                    slack_windows
                 } else {
                     0
                 };
@@ -1222,6 +1221,48 @@ mod tests {
         assert_eq!(d.guard.cap_bps(), None);
         assert_eq!(d.guard.snapshot().rejected, 1);
         assert!(d.guard.snapshot().floor >= 0.59);
+    }
+
+    #[test]
+    fn late_loss_after_delivery_finishes_cannot_rebase_an_idle_trial() {
+        let mut d = Drive::new();
+        d.policed(47.9e6, 6e6, 0.0);
+        let cap = d.policed(47.9e6, 6e6, 0.0).unwrap();
+        // Positive byte reports arrive while data is busy, before the same
+        // symbols' loss prefix has finalized. They are separate peer clocks.
+        for _ in 0..2 {
+            d.now_us += WINDOW_US;
+            d.sent += (cap as f64 * WINDOW_US as f64 / 8e6) as u64;
+            for c in &mut d.counts {
+                c.sent_symbols += 1000;
+                c.received_bytes += (6e6 * WINDOW_US as f64 / 8e6 / 4.0) as u64;
+                c.report_time_us = Some(d.now_us);
+            }
+            d.call();
+        }
+        // Finalized loss now describes those busy admissions, but receiver
+        // byte progress is zero because the transfer has already completed.
+        for _ in 0..2 {
+            d.now_us += WINDOW_US;
+            for c in &mut d.counts {
+                c.expected += 1000;
+                c.lost += 120;
+                c.report_time_us = Some(d.now_us);
+            }
+            d.call();
+        }
+        assert_eq!(d.guard.cap_bps(), Some(cap));
+        assert_eq!(d.guard.snapshot().trials, 1);
+        assert_eq!(d.guard.snapshot().inconclusive, 0);
+        assert_eq!(d.guard.snapshot().floor, 0.0);
+        // The next upload can still settle and confirm the retained trial.
+        for _ in 0..4 {
+            d.policed(cap as f64, 6e6, 0.0);
+            if d.guard.snapshot().confirmed > 0 {
+                break;
+            }
+        }
+        assert_eq!(d.guard.snapshot().confirmed, 1);
     }
 
     #[test]
