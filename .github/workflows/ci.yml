@@ -23,6 +23,7 @@ jobs:
       - name: Install Rust
         run: rustup toolchain install stable --profile minimal --component rustfmt --component clippy
       - run: cargo +stable fmt --all -- --check
+      - run: cargo +stable check --all-targets --locked --features quinn/log
       - run: cargo +stable clippy --all-targets --locked -- -D warnings
       - run: cargo +stable test --all-targets --locked
       - run: cargo +stable run --locked --example loss_recovery

@@ -40,7 +40,7 @@ runtime-async-std = ["async-io", "async-std"]
 runtime-smol = ["async-io", "smol"]
 
 # Configure `tracing` to log events via `log` if no `tracing` subscriber exists.
-log = ["tracing/log", "proto/log", "udp/log"]
+log = ["tracing/log", "proto/log", "udp/tracing-log"]
 # Enable rustls logging
 rustls-log = ["rustls?/logging"]
 # Enable qlog support
@@ -65,7 +65,7 @@ smol = { workspace = true, optional = true }
 thiserror = { workspace = true }
 tracing =  { workspace = true }
 tokio = { workspace = true }
-udp = { package = "quinn-udp", path = "../quinn-udp", version = "0.5", default-features = false, features = ["tracing"] }
+udp = { package = "quinn-udp", path = "../quinn-udp", version = "0.6.3", default-features = false, features = ["tracing-log"] }
 
 [target.'cfg(not(all(target_family = "wasm", target_os = "unknown")))'.dependencies]
 socket2 = { workspace = true }

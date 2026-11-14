@@ -62,7 +62,7 @@ lock_tracking = []
 log = [
     "tracing/log",
     "proto/log",
-    "udp/log",
+    "udp/tracing-log",
 ]
 platform-verifier = ["proto/platform-verifier"]
 qlog = ["proto/qlog"]
@@ -194,8 +194,8 @@ features = ["std"]
 default-features = false
 
 [dependencies.udp]
-version = "0.5"
-features = ["tracing"]
+version = "0.6.3"
+features = ["tracing-log"]
 default-features = false
 package = "quinn-udp"
 

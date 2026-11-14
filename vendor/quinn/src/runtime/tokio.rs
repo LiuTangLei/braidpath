@@ -62,6 +62,10 @@ impl AsyncUdpSocket for UdpSocket {
         }))
     }
 
+    #[expect(
+        deprecated,
+        reason = "Quinn 0.11 treats non-WouldBlock send errors as fatal; retain its UDP probe/error policy"
+    )]
     fn try_send(&self, transmit: &udp::Transmit) -> io::Result<()> {
         self.io.try_io(Interest::WRITABLE, || {
             self.inner.send((&self.io).into(), transmit)
