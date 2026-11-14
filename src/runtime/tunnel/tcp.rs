@@ -561,7 +561,15 @@ impl Drain {
     }
     fn limit(&self, lifetime: Duration) -> usize {
         let rate = self.rates[0].max(self.rates[1]);
-        ((rate * lifetime.as_secs_f64() * 0.5) as usize).clamp(MIN_QUEUED, MAX_QUEUED)
+        // The startup allowance is not a measured minimum. At low service it
+        // can exceed the record lifetime and defeat dropped()'s backoff. Once
+        // service is known, keep only a full segment as the lower bound.
+        let minimum = if rate > 0.0 {
+            super::super::MAX_STREAM_PAYLOAD
+        } else {
+            MIN_QUEUED
+        };
+        ((rate * lifetime.as_secs_f64() * 0.5) as usize).clamp(minimum, MAX_QUEUED)
     }
 }
 
@@ -2981,6 +2989,21 @@ mod tests {
         assert_eq!(budget.snapshot(), (1, 0));
         drop(lease);
         assert_eq!(budget.snapshot(), (0, 0));
+    }
+
+    #[test]
+    fn measured_admission_and_drop_backoff_can_lower_the_bootstrap_queue() {
+        let now = Instant::now();
+        let lifetime = Duration::from_millis(20);
+        let mut drain = Drain::new(now);
+        assert_eq!(drain.limit(lifetime), MIN_QUEUED);
+        // Five KB per 10 ms leaves ten KB within the lifetime. Use half of
+        // that service budget, then respect the existing local-drop backoff.
+        drain.sample(5000, now + Duration::from_millis(10));
+        let measured = drain.limit(lifetime);
+        assert_eq!(measured, 5000);
+        drain.dropped();
+        assert_eq!(drain.limit(lifetime), measured / 2);
     }
 
     #[tokio::test(flavor = "current_thread")]
