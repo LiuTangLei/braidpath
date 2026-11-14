@@ -2176,11 +2176,12 @@ async fn sender(
                         rate_reason = ?snapshot.rate_changes.back().map(|change| change.reason),
                         "sender path statistics");
                 }
-                if tracing::enabled!(tracing::Level::DEBUG)
+                if tracing::enabled!(target: "braidpath::rate_lifecycle", tracing::Level::INFO)
                     && logged_rate_changes[usize::from(path.id)] != snapshot.rate_changes_total
                 {
                     logged_rate_changes[usize::from(path.id)] = snapshot.rate_changes_total;
-                    tracing::debug!(
+                    info!(target: "braidpath::rate_lifecycle",
+                        event = "path_rate_changed",
                         session = %metrics.session,
                         direction = metrics.direction,
                         path = path.id,
@@ -4864,8 +4865,15 @@ async fn client_session(
                             reachability[id].observe(&path.conn, Instant::now());
                             let silent = reachability[id].silent();
                             if stalled && path.conn.close_reason().is_none() {
+                                let (pending_symbols, pending_us) = delivery_health[id].pending(elapsed);
+                                let native = path.conn.stats();
                                 info!(target: "braidpath::path_lifecycle", event="path_stalled", session=%sid,
-                                    path=id, generation=q.generation, remote=%path.conn.remote_address());
+                                    path=id, generation=q.generation, remote=%path.conn.remote_address(),
+                                    pending_symbols, pending_us,
+                                    feedback_age_us=?q.sender_estimate.updated_us.map(|at|elapsed.saturating_sub(at)),
+                                    probe_reply_age_us=?q.probe_updated_us.map(|at|elapsed.saturating_sub(at)),
+                                    native_sent_packets=native.path.sent_packets,
+                                    native_lost_packets=native.path.lost_packets, silent);
                                 tracing::debug!(path=id, group=path.group, "mesh data delivery stalled; reconnecting");
                                 path.conn.close(0u32.into(), b"mesh delivery stalled");
                             }

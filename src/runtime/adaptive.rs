@@ -768,6 +768,8 @@ pub struct RateChange {
     pub previous_bps: u64,
     pub pacing_bps: u64,
     pub reason: RateReason,
+    pub congestion_delivery_bps: Option<f64>,
+    pub shared_loss: bool,
     pub control: ControlSample,
 }
 
@@ -4403,6 +4405,8 @@ impl PathController {
             previous_bps,
             pacing_bps: self.rate_bps,
             reason,
+            congestion_delivery_bps: self.congestion_delivery_bps,
+            shared_loss: self.shared_loss,
             control: self.last_control.clone(),
         });
     }
