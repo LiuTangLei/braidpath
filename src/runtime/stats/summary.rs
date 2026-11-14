@@ -67,7 +67,8 @@ type PathRow = (
 );
 // direction, sender queue, queue sample age ms, expired, ingress drops,
 // mux [active, opened, ACK sent, app read, app written, retransmit, duplicate],
-// forward cap, reverse cap, FEC [data, repair].
+// forward cap, reverse cap, FEC [data, repair],
+// expired [original, repair, ingress], forward guard cumulative counters.
 type DirectionRow = (
     String,
     Option<usize>,
@@ -78,6 +79,8 @@ type DirectionRow = (
     Option<u64>,
     Option<u64>,
     Option<[u8; 2]>,
+    [u64; 3],
+    Option<[u64; 9]>,
 );
 
 #[derive(Serialize)]
@@ -116,7 +119,7 @@ fn sample(metrics: &Metrics) -> Sample {
     };
     for (session, directions) in &state.sessions {
         let mut row = Session {
-            schema: 1,
+            schema: 2,
             kind: "session",
             metric: metrics.0.instance_id.clone(),
             role: metrics.0.role,
@@ -166,6 +169,24 @@ fn sample(metrics: &Metrics) -> Sample {
                 d.automatic_fec
                     .as_ref()
                     .map(|f| [f.data_shards, f.repair_shards]),
+                [
+                    d.symbols.originals_expired_dropped,
+                    d.symbols.repairs_expired_dropped,
+                    d.symbols.originals_ingress_expired_dropped,
+                ],
+                d.forward_guard.as_ref().map(|g| {
+                    [
+                        g.trials,
+                        g.confirmed,
+                        g.rejected,
+                        g.inconclusive,
+                        g.decreases,
+                        g.releases,
+                        g.delivery_unavailable_windows,
+                        g.cohort_unavailable_windows,
+                        g.nonbinding_windows,
+                    ]
+                }),
             ));
         }
         for (key, path) in state.paths.iter().filter(|(_, p)| p.session_id == *session) {
@@ -404,6 +425,21 @@ mod tests {
             .scope("epoch", RETURN)
             .update(|d| d.records.original_records_delivered = 19);
         forward.update(|d| {
+            d.symbols.originals_expired_dropped = 3;
+            d.symbols.repairs_expired_dropped = 5;
+            d.symbols.originals_ingress_expired_dropped = 7;
+            d.forward_guard = Some(crate::runtime::forward_guard::Snapshot {
+                trials: 11,
+                confirmed: 2,
+                rejected: 3,
+                inconclusive: 4,
+                decreases: 13,
+                releases: 17,
+                delivery_unavailable_windows: 19,
+                cohort_unavailable_windows: 23,
+                nonbinding_windows: 29,
+                ..Default::default()
+            });
             d.tcp_streams = Some(super::super::super::stream::Snapshot {
                 active: 2,
                 acks_sent: 31,
@@ -438,6 +474,11 @@ mod tests {
         assert_eq!((s.tx, s.open_paths), (8000, 4));
         assert_eq!(s.sessions[0].directions.len(), 2);
         assert_eq!(s.sessions[0].directions[0].5.unwrap()[2], 31);
+        let row = &s.sessions[0].directions[0];
+        assert_eq!(row.3, 15);
+        assert_eq!(row.9, [3, 5, 7]);
+        assert_eq!(row.10.unwrap(), [11, 2, 3, 4, 13, 17, 19, 23, 29]);
+        assert_eq!(s.sessions[0].schema, 2);
         let json = serde_json::to_string(&s.sessions[0]).unwrap();
         assert!(!json.contains("PRIVATE") && !json.contains("recent"));
         assert!(json.len() < 1400, "{}", json.len());

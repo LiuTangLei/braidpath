@@ -12,6 +12,10 @@ pub(super) struct DeliveryHealth {
     since: Option<u64>,
 }
 impl DeliveryHealth {
+    pub(super) fn pending(&self, now_us: u64) -> (u64, Option<u64>) {
+        (self.pending, self.since.map(|at| now_us.saturating_sub(at)))
+    }
+
     pub(super) fn stalled(&mut self, now_us: u64, quality: &Snapshot) -> bool {
         if self.generation != Some(quality.generation) {
             *self = Self {
@@ -53,8 +57,10 @@ mod tests {
         q.probe_updated_us = Some(23_000_000);
         assert!(!health.stalled(23_999_999, &q));
         assert!(health.stalled(24_000_000, &q));
+        assert_eq!(health.pending(24_000_000), (8, Some(3_000_000)));
         q.sender_estimate.received = 1;
         assert!(!health.stalled(24_100_000, &q));
+        assert_eq!(health.pending(24_100_000), (0, None));
         assert!(!health.stalled(100_000_000, &q));
         q.sent_symbols += 8;
         assert!(!health.stalled(101_000_000, &q));

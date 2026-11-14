@@ -481,14 +481,20 @@ endpoint alive. A process summary emits every 10 seconds. Counters are cumulativ
 not per-period rates. The tracing `sample_unix_ms` supplies the UTC instant.
 Use metric/session/connection identifiers to separate epochs and reconnects.
 
-Session JSON has `schema: 1`, `kind: session`, `metric`, `role`, `label`, `session`,
+Session JSON has `schema: 2`, `kind: session`, `metric`, `role`, `label`, `session`,
 `retired`, and compact `directions` / `paths` arrays (normally around 1 KiB for
 four paths). Tuple columns are:
 
 - `directions`: direction name; sender queue record gauge or null; gauge age in
   milliseconds or null; expired sender symbols (original, ingress-original and
   repair); ingress queue full/closed drops; optional mux tuple; forward cap bps;
-  reverse cap bps; optional FEC `[data_shards, repair_shards]`.
+  reverse cap bps; optional FEC `[data_shards, repair_shards]`; expired counts
+  `[originals, repair_copies, ingress_originals]`; optional forward guard counters
+  `[trials, confirmed, rejected, inconclusive, decreases, releases,
+  delivery_unavailable_windows, cohort_unavailable_windows, nonbinding_windows]`.
+  Schema 2 appends the last two columns; all schema-1 column positions remain
+  unchanged. The original expired total remains the saturating sum of the three
+  separate counters. Counters describe one sending direction and session epoch.
 - Mux tuple: active flows, opened flows, stream ACKs generated, bytes read from
   local applications, bytes successfully written to local applications, stream
   retransmitted bytes, duplicate received bytes. The mux owns both byte directions
@@ -521,6 +527,14 @@ On Unix, `usage.user_us` and `system_us` come from process `getrusage` counters;
 current `rss_bytes` from `/proc/self/status`. Unsupported fields are null,
 including these resource fields on Windows. Queue/packet handling, controller
 rules, pacing and stream ACK behavior are unchanged by this reporter.
+
+`RUST_LOG=warn,braidpath::rate_lifecycle=info` independently enables existing
+per-path rate transitions with `event=path_rate_changed`, including the bounded
+control sample, congestion delivery reference and shared-loss flag at the rate
+change. This does not enable packet-level or general tunnel DEBUG logging.
+`braidpath::path_lifecycle=info` adds pending symbol count/duration, local feedback
+and probe-reply ages, native sent/lost packet counters and the silent flag to
+`path_stalled` events. Missing evidence ages are null; they are not peer clocks.
 
 ## Path lifecycle events
 

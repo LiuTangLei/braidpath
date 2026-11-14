@@ -1358,11 +1358,13 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path();
         let exit_address = address();
-        let relay_address = address();
         let _exit = server(root, "exit", exit_address, address(), None).await;
         let identity =
             ClientIdentity::open(root.join("client"), &root.join("exit/client-key.json")).unwrap();
         wait_nodes(&identity, exit_address, &["exit"]).await;
+        // Allocate after the exit binds: released ephemeral addresses can be
+        // reused immediately, producing two fixture nodes at the same port.
+        let relay_address = address();
         let _relay = server(
             root,
             "relay",
