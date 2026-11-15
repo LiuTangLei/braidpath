@@ -13,6 +13,10 @@ jobs:
       - uses: actions/checkout@v4
       - run: python3 -m unittest discover -s bench -p 'test_*.py'
   rust:
+    # Real socket/disk fixtures retain their own concurrency. Run unrelated
+    # cases serially so they do not compete for each other's timing budgets.
+    env:
+      RUST_TEST_THREADS: 1
     strategy:
       fail-fast: false
       matrix:
@@ -28,6 +32,8 @@ jobs:
       - run: cargo +stable test --all-targets --locked
       - run: cargo +stable run --locked --example loss_recovery
   msrv:
+    env:
+      RUST_TEST_THREADS: 1
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
