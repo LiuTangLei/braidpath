@@ -54,6 +54,10 @@ record and consumes no pacing or repair credit. Each peer's current membership,
 frame size and path-specific allowance are checked before using the wakeup.
 Forward-side senders retain their selected-path wait.
 
+Reliable return actors coalesce at most 16 input records already available in
+the bounded channel. They stop at the first full flow without prefetching the
+next record; no timer waits for a batch. Forward-side input turns remain single.
+
 Each path records the current `peer_socket`. Clients additionally record
 `local_socket`, including the actual bound UDP port. A wildcard bind does not
 identify the egress IP; confirm that independently when needed. On the server,

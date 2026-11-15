@@ -566,6 +566,18 @@ struct QueuedRecord {
     hold: Option<Arc<outbound::Hold>>,
 }
 
+/// Take only input already available at this actor turn. Dropping this iterator
+/// on backpressure leaves the next records in the bounded input channel.
+fn ready_input_batch(
+    first: QueuedRecord,
+    input: &mut mpsc::Receiver<QueuedRecord>,
+    maximum: usize,
+) -> impl Iterator<Item = QueuedRecord> + '_ {
+    std::iter::once(first)
+        .chain(std::iter::from_fn(|| input.try_recv().ok()))
+        .take(maximum)
+}
+
 #[derive(Clone)]
 struct BlockSend {
     created: Instant,
@@ -1727,6 +1739,14 @@ async fn sender(
     let mut tick = interval(Duration::from_millis(1));
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let lifetime = policy.admission_lifetime();
+    // Only already-ready return records are coalesced; forward upload keeps
+    // its single-input turn and all per-record admission checks remain below.
+    let input_batch_limit =
+        if metrics.direction == stats::RETURN && (policy.proxy || policy.streams) {
+            16
+        } else {
+            1
+        };
     let mut profile = profile::Sender::new(metrics.direction);
     let mut waiting: Option<WaitingSend> = None;
     let mut liveness: [liveness::Liveness; MAX_PATHS] = Default::default();
@@ -1888,29 +1908,23 @@ async fn sender(
                     &mut pacer,
                     &mut groups,
                 );
-                let Some(QueuedRecord {
-                    record,
-                    created,
-                    hold,
-                }) = item
-                else {
+                let Some(first) = item else {
                     break;
                 };
-                metrics.update(|d| d.records.sender_input_consumed += 1);
-                metrics.trace_record(trace::Stage::SenderInput, &record, None, None);
-                if created.elapsed() < lifetime && queue.would_be_full(policy.flow(record.flow)) {
-                    deferred_input = Some(QueuedRecord {
-                        record,
-                        created,
-                        hold,
-                    });
-                } else {
+                // A bounded ready batch amortizes path/control scans without
+                // waiting for more input. Stop immediately at backpressure;
+                // only that already-owned record may defer until the drain.
+                for item in ready_input_batch(first, &mut input, input_batch_limit) {
+                    metrics.update(|d| d.records.sender_input_consumed += 1);
+                    metrics.trace_record(trace::Stage::SenderInput, &item.record, None, None);
+                    if item.created.elapsed() < lifetime
+                        && queue.would_be_full(policy.flow(item.record.flow))
+                    {
+                        deferred_input = Some(item);
+                        break;
+                    }
                     encode_input(
-                        QueuedRecord {
-                            record,
-                            created,
-                            hold,
-                        },
+                        item,
                         &mut encoder,
                         &policy,
                         &mut queue,

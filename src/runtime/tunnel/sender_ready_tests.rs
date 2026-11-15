@@ -2864,3 +2864,42 @@ async fn native_liveness_hints_track_real_data_and_ack_progress() {
     assert!(acks <= actual.frame_rx.acks);
     assert!(eliciting <= actual.frame_tx.datagram + actual.frame_tx.stream + actual.frame_tx.ping);
 }
+
+#[test]
+fn ready_input_turn_preserves_backpressured_channel_heads_and_bounds_work() {
+    let queued = |id| QueuedRecord {
+        record: record(id),
+        created: Instant::now(),
+        hold: None,
+    };
+    let (tx, mut input) = mpsc::channel(32);
+    for id in 1..=20 {
+        tx.try_send(queued(id))
+            .unwrap_or_else(|_| panic!("bounded fixture"));
+    }
+    let mut batch = ready_input_batch(queued(0), &mut input, 16);
+    assert_eq!(batch.next().unwrap().record.id, 0);
+    // The first full-flow input is deferred by the caller. Dropping its batch
+    // must not prefetch or lose the following (possibly interactive) input.
+    drop(batch);
+    assert_eq!(input.try_recv().unwrap().record.id, 1);
+    let ids: Vec<_> = ready_input_batch(queued(1), &mut input, 16)
+        .map(|item| item.record.id)
+        .collect();
+    assert_eq!(ids, (1..=16).collect::<Vec<_>>());
+    assert_eq!(input.try_recv().unwrap().record.id, 17);
+    let ids: Vec<_> = ready_input_batch(queued(17), &mut input, 1)
+        .map(|item| item.record.id)
+        .collect();
+    assert_eq!(
+        ids,
+        vec![17],
+        "ordinary/upload actor consumes only its selected input"
+    );
+    assert_eq!(input.try_recv().unwrap().record.id, 18);
+    drop(tx);
+    let ids: Vec<_> = ready_input_batch(queued(18), &mut input, 16)
+        .map(|item| item.record.id)
+        .collect();
+    assert_eq!(ids, vec![18, 19, 20]);
+}
