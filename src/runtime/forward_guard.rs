@@ -716,9 +716,11 @@ impl Guard {
                             || (!self.inconclusive_cooldown
                                 && loss >= floor * RETEST_LOSS + FLOOR_MARGIN))
                 }) && report.is_some_and(|(_, window)| window.sent >= MIN_TRIGGER_BPS);
-                if report.is_some() {
-                    self.onset_windows = (self.onset_windows << 1 | u8::from(onset)) & 0b111;
-                }
+                // An unconfirmed onset is a recent-window hint, not a cap.
+                // Missing evidence cannot confirm loss, but must age the hint:
+                // otherwise sparse/idle traffic holds native recovery forever.
+                // Active trials and confirmed limits retain their own state.
+                self.onset_windows = (self.onset_windows << 1 | u8::from(onset)) & 0b111;
                 match report {
                     // Two of three windows: one noisy report cannot hide it.
                     Some((loss, window)) if onset && self.onset_windows.count_ones() >= 2 => {
@@ -1105,6 +1107,43 @@ mod tests {
         active_window(&mut d, [Some(0.3), Some(0.3), None, None]);
         assert_eq!(d.guard.snapshot().trials, 1);
         assert!(d.guard.cap_bps().is_some());
+        assert!(d.guard.shared_loss());
+    }
+
+    #[test]
+    fn unconfirmed_shared_loss_ages_out_without_new_qualified_reports() {
+        let mut d = Drive::new();
+        active_window(&mut d, [Some(0.09); 4]);
+        assert!(d.guard.shared_loss());
+        assert_eq!(d.guard.cap_bps(), None);
+        let recorded_loss = d.guard.snapshot().forward_loss;
+        for _ in 0..3 {
+            d.now_us += WINDOW_US;
+            d.call();
+        }
+        assert!(
+            !d.guard.shared_loss(),
+            "an unconfirmed onset cannot hold idle recovery forever"
+        );
+        assert_eq!(d.guard.snapshot().forward_loss, recorded_loss);
+        assert_eq!(d.guard.snapshot().floor, 0.0);
+        assert_eq!(d.guard.snapshot().trials, 0);
+        // The old onset must not pair with one much later window.
+        active_window(&mut d, [Some(0.09); 4]);
+        assert_eq!(d.guard.snapshot().trials, 0);
+        active_window(&mut d, [Some(0.09); 4]);
+        assert_eq!(d.guard.snapshot().trials, 1);
+    }
+
+    #[test]
+    fn an_unmeasured_window_keeps_an_active_shared_loss_trial() {
+        let mut d = Drive::new();
+        active_window(&mut d, [Some(0.3); 4]);
+        active_window(&mut d, [Some(0.3); 4]);
+        let cap = d.guard.cap_bps().expect("qualified trial");
+        d.now_us += WINDOW_US;
+        d.call();
+        assert_eq!(d.guard.cap_bps(), Some(cap));
         assert!(d.guard.shared_loss());
     }
 
