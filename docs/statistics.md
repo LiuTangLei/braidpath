@@ -48,6 +48,12 @@ counts alongside these totals before attributing a throughput bottleneck.
 
 ## Connection and admission diagnostics
 
+Reliable return-side senders also observe writable peers in the selected
+uplink group. Such a notification restarts normal path selection; it sends no
+record and consumes no pacing or repair credit. Each peer's current membership,
+frame size and path-specific allowance are checked before using the wakeup.
+Forward-side senders retain their selected-path wait.
+
 Each path records the current `peer_socket`. Clients additionally record
 `local_socket`, including the actual bound UDP port. A wildcard bind does not
 identify the egress IP; confirm that independently when needed. On the server,

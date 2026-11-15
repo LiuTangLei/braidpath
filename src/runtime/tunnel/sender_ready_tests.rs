@@ -162,6 +162,90 @@ impl Wake for Wakes {
 
 const FILLER: &[u8; 1100] = &[0xa5; 1100];
 
+#[tokio::test(flavor = "current_thread")]
+async fn another_ready_return_path_restarts_selection_without_waiting_for_the_primary() {
+    let primary = Pair::connect().await;
+    let other = Pair::connect().await;
+    let path0 = primary.path();
+    let mut path1 = other.path();
+    path1.id = 1;
+    let paths = Arc::new(Mutex::new(vec![path0.clone(), path1.clone()]));
+    let mut accounting = Accounting::new();
+    accounting.enqueue(wire::plain(&record(1)).unwrap(), Instant::now());
+    let mut prepared = accounting.prepare(&path0, false);
+    prepared.candidates = vec![(0, 1), (1, 1)];
+    assert!(path0.writer.send(Bytes::from_static(FILLER)));
+    assert!(!path0.writer.admits(prepared.data.len()));
+    assert!(path1.writer.admits(prepared.data.len()));
+    let mut wait = WaitingSend::new(prepared);
+    wait.watch_alternatives(&paths.lock().unwrap());
+    let waker = Waker::from(Arc::new(Wakes::default()));
+    // No await or timer advance after filling the selected writer. The other
+    // path becoming writable just before this poll is a valid race.
+    let not_credited = wait.poll(
+        &mut TaskContext::from_waker(&waker),
+        &paths,
+        Duration::from_secs(1),
+        |_, path, _, _, _| path.id == 0,
+    );
+    assert!(
+        not_credited.is_pending(),
+        "an uncredited peer must not create a wake loop"
+    );
+    let ready = wait.poll(
+        &mut TaskContext::from_waker(&waker),
+        &paths,
+        Duration::from_secs(1),
+        |_, _, _, _, _| true,
+    );
+    assert!(
+        matches!(ready, Poll::Ready(SendReadiness::GateChanged)),
+        "{ready:?}"
+    );
+    accounting.assert_no_admission(&path0, 1);
+    accounting.assert_no_admission(&path1, 1);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn alternate_readiness_uses_its_own_http_mapping_size() {
+    let primary = Pair::connect_with_send_buffer(16 * 1200).await;
+    let other = Pair::connect_with_send_buffer(16 * 1200).await;
+    let path0 = primary.path();
+    let mut path1 = other.path();
+    path1.id = 1;
+    path1.stream = 256;
+    let paths = Arc::new(Mutex::new(vec![path0.clone(), path1.clone()]));
+    let mut accounting = Accounting::new();
+    accounting.enqueue(wire::plain(&record(1)).unwrap(), Instant::now());
+    let mut prepared = accounting.prepare(&path0, false);
+    prepared.candidates = vec![(0, 1), (1, 1)];
+    let bytes = prepared.data.len();
+    let other_bytes = bytes - wire::http_datagram_overhead(path0.stream).unwrap()
+        + wire::http_datagram_overhead(path1.stream).unwrap();
+    assert!(other_bytes > bytes);
+    path1
+        .writer
+        .set_pace(((FILLER.len() + bytes) * 8000) as u64);
+    assert!(path0.writer.send(Bytes::from_static(FILLER)));
+    assert!(path1.writer.send(Bytes::from_static(FILLER)));
+    assert!(path1.writer.admits(bytes));
+    assert!(!path1.writer.admits(other_bytes));
+    let mut wait = WaitingSend::new(prepared);
+    wait.watch_alternatives(&paths.lock().unwrap());
+    let waker = Waker::from(Arc::new(Wakes::default()));
+    assert!(
+        wait.poll(
+            &mut TaskContext::from_waker(&waker),
+            &paths,
+            Duration::from_secs(1),
+            |_, _, _, _, _| true
+        )
+        .is_pending()
+    );
+    accounting.assert_no_admission(&path0, 1);
+    accounting.assert_no_admission(&path1, 1);
+}
+
 fn block_and_poll(wait: &mut WaitingSend, paths: &Paths, lifetime: Duration) -> Arc<Wakes> {
     // This current-thread runtime cannot run the writer or drive QUIC between
     // the fill and poll.
@@ -174,7 +258,7 @@ fn block_and_poll(wait: &mut WaitingSend, paths: &Paths, lifetime: Duration) -> 
             &mut TaskContext::from_waker(&waker),
             paths,
             lifetime,
-            |_, _, _| true,
+            |_, _, _, _, _| true,
         )
         .is_pending()
     );
@@ -1120,15 +1204,17 @@ async fn adaptive_small_readiness_ignores_fast_peer_without_current_packet_credi
     let mut wait = WaitingSend::new(prepared);
     let wakes = block_and_poll(&mut wait, &paths, lifetime);
     let waker = Waker::from(wakes.clone());
-    let mut allowed = |attempt: &PreparedSend, now: Instant, paths: &[OutPath]| {
-        attempt.small_delivery_allowed(
-            &accounting.policy,
-            paths,
-            &mut accounting.controllers,
-            0,
-            now.saturating_duration_since(attempt.front.created),
-        )
-    };
+    let mut allowed =
+        |attempt: &PreparedSend, path: &OutPath, _bytes: usize, now: Instant, paths: &[OutPath]| {
+            attempt.small_delivery_allowed(
+                path,
+                &accounting.policy,
+                paths,
+                &mut accounting.controllers,
+                0,
+                now.saturating_duration_since(attempt.front.created),
+            )
+        };
     let blocked = wait.poll(
         &mut TaskContext::from_waker(&waker),
         &paths,
@@ -1714,15 +1800,20 @@ async fn mixed_small_copy_uses_its_own_bounded_admission_credit_on_wider_http_st
     let ready = timeout(
         Duration::from_secs(1),
         poll_fn(|cx| {
-            wait.poll(cx, &shared, Duration::from_secs(1), |attempt, _, _| {
-                repair_allowed(
-                    &accounting.policy,
-                    &accounting.budget,
-                    &accounting.blocks,
-                    &attempt.front,
-                    attempt.data.len(),
-                )
-            })
+            wait.poll(
+                cx,
+                &shared,
+                Duration::from_secs(1),
+                |attempt, _, _, _, _| {
+                    repair_allowed(
+                        &accounting.policy,
+                        &accounting.budget,
+                        &accounting.blocks,
+                        &attempt.front,
+                        attempt.data.len(),
+                    )
+                },
+            )
         }),
     )
     .await
@@ -1813,16 +1904,21 @@ async fn cold_small_copy_is_authorized_only_by_its_actual_original_admission() {
     let ready = timeout(
         Duration::from_secs(1),
         poll_fn(|cx| {
-            wait.poll(cx, &shared, Duration::from_secs(1), |attempt, _, _| {
-                repair_allowed(
-                    &accounting.policy,
-                    &accounting.budget,
-                    &accounting.blocks,
-                    &attempt.front,
-                    attempt.data.len(),
-                ) && accounting.pacer.available(attempt.data.len() + 80)
-                    && accounting.groups[2].available(attempt.data.len() + 80)
-            })
+            wait.poll(
+                cx,
+                &shared,
+                Duration::from_secs(1),
+                |attempt, _, _, _, _| {
+                    repair_allowed(
+                        &accounting.policy,
+                        &accounting.budget,
+                        &accounting.blocks,
+                        &attempt.front,
+                        attempt.data.len(),
+                    ) && accounting.pacer.available(attempt.data.len() + 80)
+                        && accounting.groups[2].available(attempt.data.len() + 80)
+                },
+            )
         }),
     )
     .await
@@ -1920,7 +2016,7 @@ async fn ready_admission_rechecks_deadline_after_control_gate() {
     let mut wait = WaitingSend::new(prepared);
     let mut gate_checked = false;
     let readiness = poll_fn(|cx| {
-        wait.poll(cx, &paths, lifetime, |_, _, _| {
+        wait.poll(cx, &paths, lifetime, |_, _, _, _, _| {
             gate_checked = true;
             ADMISSION_CLOCK_OVERRIDE.with(|clock| clock.set(Some(expired_at)));
             true
@@ -1967,7 +2063,7 @@ async fn quinn_readiness_wakes_without_input_or_timer_and_commits_each_symbol_on
         let ready = timeout(
             Duration::from_secs(1),
             poll_fn(|cx| {
-                wait.poll(cx, &paths, Duration::from_secs(1), |attempt, _, _| {
+                wait.poll(cx, &paths, Duration::from_secs(1), |attempt, _, _, _, _| {
                     let cost = attempt.data.len() + 80;
                     accounting.pacer.available(cost)
                         && accounting.groups[usize::from(path.group)].available(cost)
@@ -2043,7 +2139,8 @@ async fn cancelling_a_pending_wait_does_not_send_or_mint_credit_and_can_be_resel
     accounting.assert_no_admission(&path, 1);
     // A later actor turn can reselect the same still-queued original exactly once.
     let mut wait = WaitingSend::new(prepared);
-    let ready = poll_fn(|cx| wait.poll(cx, &paths, Duration::from_secs(1), |_, _, _| true)).await;
+    let ready =
+        poll_fn(|cx| wait.poll(cx, &paths, Duration::from_secs(1), |_, _, _, _, _| true)).await;
     let SendReadiness::Admitted { at, next_cursor } = ready else {
         panic!("{ready:?}")
     };
@@ -2072,7 +2169,7 @@ async fn a_ready_buffer_cannot_send_past_the_adaptive_20ms_limit_with_a_100ms_qu
     assert_eq!(pair.receive().await.as_ref(), FILLER);
     tokio::time::sleep_until((created + Duration::from_millis(25)).into()).await;
     assert!(wait.prepared.path.writer.admits(wait.prepared.data.len()));
-    let ready = poll_fn(|cx| wait.poll(cx, &paths, lifetime, |_, _, _| true)).await;
+    let ready = poll_fn(|cx| wait.poll(cx, &paths, lifetime, |_, _, _, _, _| true)).await;
     assert!(matches!(ready, SendReadiness::Expired));
     wait.cancel();
     accounting.assert_no_admission(&path, 1);
@@ -2106,7 +2203,7 @@ async fn removal_or_generation_change_invalidates_a_pending_wait_before_ready_se
         assert_eq!(pair.receive().await.as_ref(), FILLER);
         assert!(wait.prepared.path.writer.admits(wait.prepared.data.len()));
         let ready =
-            poll_fn(|cx| wait.poll(cx, &paths, Duration::from_secs(1), |_, _, _| true)).await;
+            poll_fn(|cx| wait.poll(cx, &paths, Duration::from_secs(1), |_, _, _, _, _| true)).await;
         assert!(matches!(ready, SendReadiness::PathChanged));
         wait.cancel();
         accounting.assert_no_admission(&path, 1);
@@ -2126,7 +2223,7 @@ async fn ready_poll_rechecks_current_group_budget_before_entering_quinn() {
     assert_eq!(pair.receive().await.as_ref(), FILLER);
     let exhausted_group = outbound::Pacer::new(64_000, 2400);
     let ready = poll_fn(|cx| {
-        wait.poll(cx, &paths, Duration::from_secs(1), |attempt, _, _| {
+        wait.poll(cx, &paths, Duration::from_secs(1), |attempt, _, _, _, _| {
             exhausted_group.available(attempt.data.len() + 80)
         })
     })

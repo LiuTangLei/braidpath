@@ -1046,6 +1046,7 @@ struct PreparedSend {
 impl PreparedSend {
     fn small_delivery_allowed(
         &self,
+        selected: &OutPath,
         policy: &Policy,
         paths: &[OutPath],
         controllers: &mut [adaptive::PathController; MAX_PATHS],
@@ -1095,13 +1096,20 @@ impl PreparedSend {
                 0
             },
         );
-        timely & (1 << self.path.id) != 0
-            && (!self.repair || small_delivery::copy_ready(&self.path, self.used))
+        timely & (1 << selected.id) != 0
+            && (!self.repair || small_delivery::copy_ready(selected, self.used))
     }
 }
 
 struct WaitingSend {
     prepared: PreparedSend,
+    admitted: Pin<Box<dyn Future<Output = ()> + Send>>,
+    alternatives: Vec<AlternativeWait>,
+}
+
+struct AlternativeWait {
+    path: OutPath,
+    bytes: usize,
     admitted: Pin<Box<dyn Future<Output = ()> + Send>>,
 }
 
@@ -1122,7 +1130,34 @@ impl WaitingSend {
             prepared,
             // Waiting queues nothing: dropping it cancels without any debit.
             admitted: Box::pin(async move { writer.admitted(bytes).await }),
+            alternatives: Vec::new(),
         }
+    }
+
+    /// Wake-only peers share the selected path's uplink/feedback reservation.
+    /// Their normal path-specific policy and exact frame size are still checked.
+    fn watch_alternatives(&mut self, paths: &[OutPath]) {
+        let mapping = wire::http_datagram_overhead(self.prepared.path.stream)
+            .expect("prepared datagram mapping");
+        let payload = self.prepared.data.len() - mapping;
+        self.alternatives = paths
+            .iter()
+            .filter(|p| {
+                p.id != self.prepared.path.id
+                    && p.group == self.prepared.path.group
+                    && self.prepared.candidates.iter().any(|(id, _)| *id == p.id)
+                    && p.open()
+            })
+            .filter_map(|path| {
+                let bytes = payload + wire::http_datagram_overhead(path.stream).ok()?;
+                let writer = path.writer.clone();
+                Some(AlternativeWait {
+                    path: path.clone(),
+                    bytes,
+                    admitted: Box::pin(async move { writer.admitted(bytes).await }),
+                })
+            })
+            .collect();
     }
 
     fn poll(
@@ -1130,7 +1165,7 @@ impl WaitingSend {
         cx: &mut TaskContext<'_>,
         shared_paths: &Paths,
         lifetime: Duration,
-        mut allowed: impl FnMut(&PreparedSend, Instant, &[OutPath]) -> bool,
+        mut allowed: impl FnMut(&PreparedSend, &OutPath, usize, Instant, &[OutPath]) -> bool,
     ) -> Poll<SendReadiness> {
         let paths = shared_paths.lock().expect("paths lock");
         let Some(index) = paths.iter().position(|path| {
@@ -1157,7 +1192,13 @@ impl WaitingSend {
         if now.saturating_duration_since(self.prepared.front.created) >= lifetime {
             return Poll::Ready(SendReadiness::Expired);
         }
-        if !allowed(&self.prepared, now, &paths) {
+        if !allowed(
+            &self.prepared,
+            &paths[index],
+            self.prepared.data.len(),
+            now,
+            &paths,
+        ) {
             return Poll::Ready(SendReadiness::GateChanged);
         }
         // Control checks can take time. Refresh after them, immediately
@@ -1166,6 +1207,31 @@ impl WaitingSend {
             return Poll::Ready(SendReadiness::Expired);
         }
         if self.admitted.as_mut().poll(cx).is_pending() {
+            for alternative in &mut self.alternatives {
+                let Some(path) = paths.iter().find(|p| {
+                    p.id == alternative.path.id
+                        && p.group == alternative.path.group
+                        && p.stream == alternative.path.stream
+                        && p.conn.stable_id() == alternative.path.conn.stable_id()
+                        && Arc::ptr_eq(&p.writer, &alternative.path.writer)
+                }) else {
+                    continue;
+                };
+                if !path.open()
+                    || path
+                        .conn
+                        .max_datagram_size_hint()
+                        .is_none_or(|m| alternative.bytes > m)
+                    || !allowed(&self.prepared, path, alternative.bytes, now, &paths)
+                {
+                    continue;
+                }
+                if alternative.admitted.as_mut().poll(cx).is_ready() {
+                    // Readiness only restarts normal selection: no alternate
+                    // owns the record and no pacing/FEC credit is consumed.
+                    return Poll::Ready(SendReadiness::GateChanged);
+                }
+            }
             return Poll::Pending;
         }
         if self.prepared.path.writer.send(self.prepared.data.clone()) {
@@ -1181,7 +1247,9 @@ impl WaitingSend {
     }
 
     fn cancel(self) -> PreparedSend {
-        let Self { prepared, admitted } = self;
+        let Self {
+            prepared, admitted, ..
+        } = self;
         drop(admitted);
         prepared
     }
@@ -1686,29 +1754,29 @@ async fn sender(
                 let Some(wait) = waiting.as_mut() else {
                     return Poll::Pending;
                 };
-                wait.poll(cx, &shared_paths, lifetime, |attempt, now, paths| {
-                    let cost = attempt.data.len() + 80;
+                wait.poll(cx, &shared_paths, lifetime, |attempt, path, frame_bytes, now, paths| {
+                    let cost = frame_bytes + 80;
                     let now_us = now.saturating_duration_since(epoch).as_micros()
                         .min(u128::from(u64::MAX)) as u64;
                     let age = now.saturating_duration_since(attempt.front.created);
                     if !pacer.available(cost + attempt.feedback_reserve)
-                        || !groups[usize::from(attempt.path.group)]
+                        || !groups[usize::from(path.group)]
                             .available(cost + attempt.group_reserve)
-                        || (attempt.repair && !repair_allowed(&policy, &budget, &blocks, &attempt.front, attempt.data.len()))
+                        || (attempt.repair && !repair_allowed(&policy, &budget, &blocks, &attempt.front, frame_bytes))
                     {
                         return false;
                     }
-                    if !attempt.small_delivery_allowed(&policy, paths, &mut controllers, now_us, age) {
+                    if !attempt.small_delivery_allowed(path, &policy, paths, &mut controllers, now_us, age) {
                         return false;
                     }
                     if !policy.adaptive {
                         return true;
                     }
-                    let allowed = controllers[usize::from(attempt.path.id)]
+                    let allowed = controllers[usize::from(path.id)]
                         .allow(now_us, cost, age.as_secs_f64() * 1000.0);
                     update_business_pacer(&mut business, paths, &controllers, now_us);
                     allowed && business.as_ref().expect("adaptive business pacer")
-                        .available(attempt.path.group, cost)
+                        .available(path.group, cost)
                 })
             }), if waiting.is_some()=>SenderEvent::Ready(ready),
             item=input.recv()=>SenderEvent::Input(item),
@@ -3065,8 +3133,14 @@ async fn sender(
             publish_receiver_feedback(&paths, &metrics);
             metrics.publish_sender_frontier(frontier.clone());
         }
+        waiting = next_wait.map(|prepared| {
+            let mut wait = WaitingSend::new(prepared);
+            if metrics.direction == stats::RETURN && (policy.proxy || policy.streams) {
+                wait.watch_alternatives(&paths);
+            }
+            wait
+        });
         drop(paths);
-        waiting = next_wait.map(WaitingSend::new);
         if let Some(profile) = &mut profile {
             profile.finish_turn();
         }
