@@ -29,6 +29,23 @@ Schema version 1 contains `role`, `process_id`, a random process-stable `instanc
 
 `stats.shutdown_complete` and `drain_incomplete` describe application task/queue cleanup, not delivery of all packets already submitted to Quinn. Remaining owned input/event/symbol queues are counted as shutdown drops. If cleanup times out, `drain_incomplete` is true and complete conservation assertions must be refused. Even an orderly stop can discard Quinn/kernel/network in-flight packets; these cannot be classified as application queue drops.
 
+## Opt-in pipeline timing
+
+Set `BRAIDPATH_PIPELINE_PROFILE=1` and enable
+`RUST_LOG=warn,braidpath::pipeline_profile=info` for a finite diagnostic run.
+Each sender and path writer emits one `pipeline timing profile` on teardown.
+The default is off; it changes no admission, pacing, queue, or protocol policy.
+No packet contents, target names, credentials, or keys are recorded.
+
+Sender counters separate time inside event selection, queued and pending-native
+wait subsets, processing turns, and acquisition of the shared paths lock.
+Writer counters record native API call time, local-budget blocks, and waits
+with local or native bytes pending. Wait subsets overlap and must not be added
+together. Event-selection wall time includes polling work as well as suspension;
+none of these counters measure process CPU. Lock/API fields use nanoseconds;
+other durations use microseconds. Use process CPU and matching transfer byte
+counts alongside these totals before attributing a throughput bottleneck.
+
 ## Connection and admission diagnostics
 
 Each path records the current `peer_socket`. Clients additionally record

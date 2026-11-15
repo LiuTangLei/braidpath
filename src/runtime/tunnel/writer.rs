@@ -141,6 +141,7 @@ impl Drop for Writer {
 }
 
 async fn run(conn: quinn::Connection, shared: Arc<Shared>, capacity: usize) {
+    let mut profile = super::profile::Writer::new(conn.stable_id());
     loop {
         let drained = conn.datagrams_drained();
         tokio::pin!(drained);
@@ -149,6 +150,7 @@ async fn run(conn: quinn::Connection, shared: Arc<Shared>, capacity: usize) {
             break;
         }
         let budget = shared.budget.load(Ordering::Relaxed);
+        let mut turn_datagrams = 0;
         loop {
             #[cfg(test)]
             TEST_BEFORE_POP.with(|hook| {
@@ -164,13 +166,21 @@ async fn run(conn: quinn::Connection, shared: Arc<Shared>, capacity: usize) {
                 };
                 let in_quinn = capacity.saturating_sub(conn.datagram_send_buffer_space_hint());
                 if in_quinn > 0 && in_quinn + len > budget {
+                    if let Some(profile) = &mut profile {
+                        profile.counters.budget_blocks += 1;
+                    }
                     break;
                 }
                 (queue.pop_front().expect("front datagram"), len)
             };
             // Quinn's space shrinks before the queue does, so `held` never
             // understates. A refused datagram is a closed or resized path.
+            let called = profile.as_ref().map(|_| std::time::Instant::now());
             let _ = conn.send_datagram(data);
+            if let (Some(profile), Some(at)) = (&mut profile, called) {
+                profile.called(at.elapsed());
+            }
+            turn_datagrams += 1;
             #[cfg(test)]
             {
                 let pause = TEST_AFTER_SEND.with(|hook| hook.borrow_mut().take());
@@ -182,10 +192,25 @@ async fn run(conn: quinn::Connection, shared: Arc<Shared>, capacity: usize) {
             shared.queued.fetch_sub(len, Ordering::AcqRel);
             shared.admission.notify_waiters();
         }
+        if let Some(profile) = &mut profile {
+            profile.counters.turns += 1;
+            profile.counters.max_turn_datagrams =
+                profile.counters.max_turn_datagrams.max(turn_datagrams);
+        }
+        let waiting = profile.as_ref().map(|_| {
+            (
+                std::time::Instant::now(),
+                shared.queued.load(Ordering::Acquire) > 0,
+                conn.datagram_send_buffer_space_hint() < capacity,
+            )
+        });
         // Space and closure both arrive as drain notifications.
         tokio::select! {
             () = &mut drained => {}
             () = shared.wake.notified() => {}
+        }
+        if let (Some(profile), Some((at, queued, buffered))) = (&mut profile, waiting) {
+            profile.waited(at.elapsed(), queued, buffered);
         }
     }
     let mut queue = shared.queue.lock().expect("writer queue");

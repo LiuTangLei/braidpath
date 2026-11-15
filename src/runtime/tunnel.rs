@@ -60,6 +60,7 @@ mod mixed_fec_tests;
 mod native_probe;
 mod path_health;
 mod payload;
+mod profile;
 mod proxy;
 #[cfg(test)]
 mod repair_usefulness_tests;
@@ -1577,6 +1578,18 @@ fn publish_receiver_feedback(paths: &[OutPath], metrics: &Scope) {
     }
 }
 
+fn lock_sender_paths<'a>(
+    paths: &'a Paths,
+    profile: &mut Option<profile::Sender>,
+) -> std::sync::MutexGuard<'a, Vec<OutPath>> {
+    let at = profile.as_ref().map(|_| Instant::now());
+    let locked = paths.lock().expect("paths lock");
+    if let (Some(profile), Some(at)) = (profile, at) {
+        profile.locked(at.elapsed());
+    }
+    locked
+}
+
 /// A single owner admits every business, repair, feedback and probe datagram.
 /// Each local flow gets a turn; all classes obey the aggregate and group caps.
 async fn sender(
@@ -1646,6 +1659,7 @@ async fn sender(
     let mut tick = interval(Duration::from_millis(1));
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let lifetime = policy.admission_lifetime();
+    let mut profile = profile::Sender::new(metrics.direction);
     let mut waiting: Option<WaitingSend> = None;
     let mut liveness: [liveness::Liveness; MAX_PATHS] = Default::default();
     loop {
@@ -1659,6 +1673,9 @@ async fn sender(
         if *stop.borrow() {
             break;
         }
+        let wait_started = profile.as_ref().map(|_| Instant::now());
+        let queued_before_wait = queue.len();
+        let native_pending_before_wait = waiting.is_some();
         let event = tokio::select! {
             biased;
             _=stop.changed()=>SenderEvent::Stop,
@@ -1696,6 +1713,16 @@ async fn sender(
             }), if waiting.is_some()=>SenderEvent::Ready(ready),
             item=input.recv()=>SenderEvent::Input(item),
         };
+        if let (Some(profile), Some(at)) = (&mut profile, wait_started) {
+            profile.waited(at.elapsed(), queued_before_wait, native_pending_before_wait);
+            match &event {
+                SenderEvent::Input(_) => profile.counters.input_turns += 1,
+                SenderEvent::Tick => profile.counters.tick_turns += 1,
+                SenderEvent::Evidence => profile.counters.evidence_turns += 1,
+                SenderEvent::Ready(_) => profile.counters.ready_turns += 1,
+                SenderEvent::Stop => {}
+            }
+        }
         // A different actor event invalidates this prepared queue head and its
         // budget checks. Cancel the future before touching any actor state.
         let prepared = waiting.take().map(WaitingSend::cancel);
@@ -1736,7 +1763,10 @@ async fn sender(
             SenderEvent::Ready(SendReadiness::Admitted { at, next_cursor }) => {
                 frontier.readiness_admitted += 1;
                 let attempt = prepared.expect("selected readiness attempt");
-                let paths = shared_paths.lock().expect("paths lock");
+                let paths = lock_sender_paths(&shared_paths, &mut profile);
+                if let Some(profile) = &mut profile {
+                    profile.counters.admissions += 1;
+                }
                 SendAccounting {
                     policy: &policy,
                     metrics: &metrics,
@@ -1832,7 +1862,7 @@ async fn sender(
         for expired in queue.expire(now, lifetime) {
             account_expired(&expired, now, &metrics);
         }
-        let paths = shared_paths.lock().expect("paths lock");
+        let paths = lock_sender_paths(&shared_paths, &mut profile);
         if policy.streams || policy.proxy {
             transfer_telemetry.observe(
                 now_us,
@@ -2957,6 +2987,9 @@ async fn sender(
                 next_wait = wait_candidate;
                 break;
             };
+            if let Some(profile) = &mut profile {
+                profile.counters.admissions += 1;
+            }
             SendAccounting {
                 policy: &policy,
                 metrics: &metrics,
@@ -3034,6 +3067,12 @@ async fn sender(
         }
         drop(paths);
         waiting = next_wait.map(WaitingSend::new);
+        if let Some(profile) = &mut profile {
+            profile.finish_turn();
+        }
+    }
+    if let Some(profile) = &mut profile {
+        profile.finish_turn();
     }
     drop(waiting);
     if policy.streams || policy.proxy {
