@@ -50,3 +50,7 @@ tokio = { version = "1", features = ["test-util"] }
 # codec/packet-trace overhead on small CI runners as network packet loss.
 [profile.test]
 opt-level = 1
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
