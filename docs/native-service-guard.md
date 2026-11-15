@@ -17,7 +17,10 @@ The experiment lets a new, positive receiver report renew a cautious application
 admission allowance toward the connection's current native congestion window
 divided by its RTT. This is a sending allowance, **not measured path capacity**.
 Each renewal is bounded by the configured maximum and one doubling per native
-RTT (with a 10ms minimum interval). It creates no burst tokens.
+RTT (with a 10ms minimum interval). An uplink that has not yet measured
+congestion explores the native window with at most a 25% increase per renewal;
+restoration after congestion and the download direction keep the previous step.
+This changes the growth step, not the link's rate limit. It creates no burst tokens.
 
 Recovery requires active demand, fresh positive delivery and finalized feedback,
 low queue delay, no current transport blockage, no ordinary or fast-loss pressure,

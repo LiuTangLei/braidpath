@@ -1438,11 +1438,22 @@ impl PathController {
             measured_bps.map_or(rate, |measured| rate.min(measured))
         });
         if eligible && let Some(native_bps) = recovery_bps.filter(|rate| *rate > self.rate_bps) {
-            // At most one doubling per native RTT. Existing admission tokens
-            // were integrated at the old rate by observe_native; changing the
-            // allowance below grants no instantaneous sending credit.
+            // Before an uplink has measured congestion, a retained native
+            // window can be far above its shared access link. Explore it in
+            // quarter steps instead of doubling every fresh RTT. Recovery of
+            // measured service and the download direction keep their old step.
+            // Existing tokens were integrated at the old rate by observe_native;
+            // changing the allowance grants no instantaneous sending credit.
             let previous = self.rate_bps;
-            self.rate_bps = native_bps.min(previous.saturating_mul(2));
+            let next = if self.fast_recovery_enabled
+                && self.shared_uplink_service
+                && !self.congestion_seen
+            {
+                previous.saturating_add(previous / 4)
+            } else {
+                previous.saturating_mul(2)
+            };
+            self.rate_bps = native_bps.min(next);
             self.last_growth_us = now;
             self.native_service_recoveries = self.native_service_recoveries.saturating_add(1);
             self.record_rate_change(now, previous, RateReason::NativeServiceRecovery);
@@ -4695,6 +4706,43 @@ mod tests {
             controller.rate_changes.back().unwrap().reason,
             RateReason::NativeIdleRestart
         ));
+    }
+
+    #[test]
+    fn native_uplink_recovery_does_not_double_an_unmeasured_restart() {
+        let (mut ordinary, sample) = native_service_fixture();
+        ordinary.maximum_bps = 1_000_000_000;
+        ordinary.rate_bps = 64_000_000;
+        ordinary.congestion_seen = false;
+        ordinary.observe_native(&sample, None, 4_200_000, 100_000);
+        let before = ordinary.rate_bps;
+        let (mut controller, _) = native_service_fixture();
+        controller.maximum_bps = 1_000_000_000;
+        controller.rate_bps = 64_000_000;
+        controller.congestion_seen = false;
+        controller.observe_native_service(&sample, 4_200_000, 100_000);
+        assert!(controller.rate_bps > before);
+        assert!(
+            controller.rate_bps <= before + before / 4,
+            "unmeasured native window raised {before} to {}",
+            controller.rate_bps
+        );
+        assert_eq!(controller.tokens, ordinary.tokens);
+        assert_eq!(controller.remembered_bps, ordinary.remembered_bps);
+    }
+
+    #[test]
+    fn native_recovery_keeps_verified_service_and_download_restore() {
+        for measured in [false, true] {
+            let (mut controller, sample) = native_service_fixture();
+            controller.maximum_bps = 1_000_000_000;
+            controller.rate_bps = 64_000_000;
+            controller.congestion_seen = measured;
+            controller.congestion_delivery_bps = measured.then_some(128_000_000.0);
+            controller.shared_uplink_service = measured;
+            controller.observe_native_service(&sample, 4_200_000, 100_000);
+            assert_eq!(controller.rate_bps, 128_000_000, "measured {measured}");
+        }
     }
 
     #[test]
