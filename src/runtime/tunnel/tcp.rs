@@ -1573,10 +1573,18 @@ impl Mux {
                 continue;
             }
             let before_splits = s.send.pmtu_splits;
-            let transmit = if self.native_return {
+            let interactive = s.send.written() - s.send.retained_from() <= INTERACTIVE_BYTES;
+            let transmit = if self.native_return && !interactive {
                 s.send.poll_transmit_reliable(now, self.payload_limit)
             } else {
-                s.send.poll_transmit_sized(now, self.payload_limit)
+                // Short responses must fit the DATAGRAM lane: otherwise they
+                // wait behind an already queued native bulk response body.
+                let payload = if self.native_return {
+                    self.payload_limit.min(super::MAX_PAYLOAD)
+                } else {
+                    self.payload_limit
+                };
+                s.send.poll_transmit_sized(now, payload)
             };
             let Some(t) = transmit else {
                 idle += 1;
@@ -1591,7 +1599,6 @@ impl Mux {
             let payload = t.frame.encode();
             self.stats.local_small_retry_frames +=
                 u64::from(t.local_retry && payload.len() <= super::LATENCY_RECORD_BYTES);
-            let interactive = s.send.written() - s.send.retained_from() <= INTERACTIVE_BYTES;
             let hold = (t.transmission > 0).then(|| {
                 self.gauge.hold(
                     id,
@@ -3011,6 +3018,48 @@ mod tests {
         assert_eq!(budget.snapshot(), (1, 0));
         drop(lease);
         assert_eq!(budget.snapshot(), (0, 0));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn native_bulk_keeps_large_frames_while_short_responses_fit_the_bypass_lane() {
+        let mut policy = proxy_policy();
+        policy.native_return = true;
+        let scope = stats::Metrics::new("server").scope("native-mixed", stats::RETURN);
+        let mut mux = Mux::new(
+            Listeners::default(),
+            Targets::default(),
+            &policy,
+            scope.clone(),
+        );
+        mux.set_payload_limit(stream::RELIABLE_PAYLOAD);
+        for (id, size) in [(1, 8192), (2, 128 * 1024)] {
+            assert!(mux.open(id, false));
+            mux.streams.get_mut(&id).unwrap().send.push(&vec![7; size]);
+        }
+        let (tx, mut rx) = mpsc::channel(32);
+        mux.pump(
+            &mut Out {
+                tx: &tx,
+                next_id: &mut 0,
+                scope: &scope,
+                small_threshold: 0,
+            },
+            Instant::now(),
+        );
+        let mut small = false;
+        let mut bulk = false;
+        while let Ok(item) = rx.try_recv() {
+            if item.record.flow == stream::data_flow(1) {
+                assert!(item.record.payload.len() <= crate::runtime::MAX_PAYLOAD);
+                assert!(item.hold.as_ref().unwrap().interactive());
+                small = true;
+            } else {
+                assert_eq!(item.record.payload.len(), stream::RELIABLE_PAYLOAD);
+                assert!(!item.hold.as_ref().unwrap().interactive());
+                bulk = true;
+            }
+        }
+        assert!(small && bulk, "both carriers must retain producer progress");
     }
 
     #[tokio::test(flavor = "current_thread")]

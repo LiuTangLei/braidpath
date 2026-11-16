@@ -10,7 +10,7 @@ fn policy() -> Policy {
         adaptive: true,
         capacity_probe_bps: 0,
         probe_guided_recovery: false,
-        latency_target_ms: 8,
+        latency_target_ms: 20,
         group_rates: [100_000_000; MAX_PATHS],
         receiver_feedback: true,
         quality_schedule: true,
@@ -21,7 +21,7 @@ fn policy() -> Policy {
         redundancy: 30,
         rate: 100_000_000,
         block_ms: 1,
-        queue_ms: 8,
+        queue_ms: 20,
     }
 }
 
@@ -54,7 +54,7 @@ fn game_udp_and_fragments_have_immediate_protection_without_waiting_for_a_block(
             payload: vec![id as u8; size],
         };
         let symbols = encoder.encode(&record, now).unwrap();
-        assert_eq!(symbols.len(), 2, "one original and one immediate repair");
+        assert_eq!(symbols.len(), 4, "one original and three immediate repairs");
         assert!(symbols.iter().all(|s| s.small));
         let recovered = receiver.receive(&symbols[1].data, now).unwrap();
         assert_eq!(
@@ -68,6 +68,9 @@ fn game_udp_and_fragments_have_immediate_protection_without_waiting_for_a_block(
             receiver.receive(&symbols[0].data, now).unwrap().is_empty(),
             "late original must not reach the destination twice"
         );
+        for symbol in &symbols[2..] {
+            assert!(receiver.receive(&symbol.data, now).unwrap().is_empty());
+        }
     }
     assert!(
         encoder

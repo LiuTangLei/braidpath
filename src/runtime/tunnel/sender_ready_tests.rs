@@ -162,6 +162,62 @@ impl Wake for Wakes {
 }
 
 #[tokio::test]
+async fn interactive_data_bypasses_a_full_native_response_body_queue() {
+    let pair = Pair::connect().await;
+    let mut path = pair.path();
+    let (native_tx, _native_rx) = native_return::channel();
+    // Keep all permits: the bulk body cannot accept any additional frame.
+    let mut permits = Vec::new();
+    while let Ok(permit) = native_tx.clone().try_reserve_owned() {
+        permits.push(permit);
+    }
+    path.native_return = Some(native_tx);
+    let paths = Arc::new(Mutex::new(vec![path]));
+    let mut p = policy();
+    p.native_return = true;
+    p.proxy = true;
+    p.fec = 0;
+    p.receiver_feedback = false;
+    p.quality_schedule = false;
+    let scope = stats::Metrics::new("server").scope("native-bypass", stats::RETURN);
+    let gauge = Arc::new(outbound::Gauge::default());
+    let record = Record {
+        flow: stream::data_flow(9),
+        id: 1,
+        payload: stream::Frame::Data {
+            offset: 0,
+            fin: true,
+            data: vec![7; 64],
+        }
+        .encode(),
+    };
+    let hold = gauge.hold(9, 0, 1, record.payload.len(), true, false);
+    let (tx, rx) = mpsc::channel(QUEUE);
+    tx.try_send(QueuedRecord {
+        record: record.clone(),
+        created: Instant::now(),
+        hold: Some(hold),
+    })
+    .unwrap();
+    let (stop, stopped) = watch::channel(false);
+    let task = tokio::spawn(sender(rx, paths, p, stopped, scope, None));
+    let frame = pair.receive().await;
+    let payload = wire::http_payload(&frame, 0).unwrap();
+    assert_eq!(
+        Receiver::default()
+            .receive(payload, Instant::now())
+            .unwrap(),
+        vec![record]
+    );
+    stop.send(true).unwrap();
+    timeout(Duration::from_secs(1), task)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!permits.is_empty());
+}
+
+#[tokio::test]
 async fn native_return_avoids_an_open_but_unresponsive_path_and_reuses_it_after_ack() {
     let pair = Pair::connect().await;
     let mut first = pair.path();

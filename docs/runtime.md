@@ -403,8 +403,9 @@ All fragments of one message inherit its original local ingress time. Receiver
 reassembly has at most 64 messages / 256 KiB of payload allocation per session
 direction, plus a bounded 8,192-ID completion window. Its deadline starts with
 the first fragment and is never refreshed by duplicates. It uses the negotiated
-sender queue lifetime (the smaller latency/queue limit in adaptive mode).
-Reassembly time also counts toward local delivery's existing deadline. Missing,
+sender queue lifetime (the smaller latency/queue limit in adaptive mode), with
+a 250 ms minimum for cross-path arrival skew. Complete messages are delivered
+immediately; reassembly does not create a sender admission extension. Missing,
 conflicting, expired or capacity-rejected fragments never produce a partial UDP
 message; late fragments cannot revive an expired message within the deduplication
 window. A process/session close releases all assemblies. These local bounds do
@@ -420,8 +421,8 @@ bidirectional echo after all configured paths are ready.
 
 ## Traffic modes
 
-The `client` and `mesh-client` commands offer opt-in policies. Existing defaults remain the normal policy. `--native-return-stream` negotiates a reliable HTTP/3 response body for TCP download DATA/FIN with a bounded 4 MiB per-path window. The carrier respects the same QUIC ACK-silence exclusion as DATAGRAM scheduling, so new data and repairs avoid an unresponsive route while another route is available. Uploads, stream acknowledgments, resets and UDP use the DATAGRAM carrier. Both endpoints must support and acknowledge the requested capability.
+The `client` and `mesh-client` commands offer opt-in policies. Existing defaults remain the normal policy. `--native-return-stream` negotiates a reliable HTTP/3 response body for bulk TCP download DATA/FIN with a bounded 2 MiB per-path window. Interactive stream data uses bounded DATAGRAM records so it can bypass an already queued bulk response body. The carrier respects the same QUIC ACK-silence exclusion as DATAGRAM scheduling, so new data and repairs avoid an unresponsive route while another route is available. Uploads, stream acknowledgments, resets and UDP use the DATAGRAM carrier. Both endpoints must support and acknowledge the requested capability.
 
-`--game-mode` selects adaptive scheduling, automatic FEC and an 8 ms local sender admission deadline. UDP originals prefer the earliest available route; one immediate protection copy prefers another eligible route. Protection shares the operator limits and is bounded to the smaller of one quarter of the aggregate limit and 4 Mbps. It does not retransmit application UDP packets. Complete packets are delivered immediately; partial segmented messages retain bounded state for up to 250 ms so different network paths can recover a missing fragment. SOCKS UDP accepts whole packets within the negotiated message limit, with tunnel segmentation when needed; SOCKS FRAG requests remain unsupported.
+`--game-mode` selects adaptive scheduling, automatic FEC and a 20 ms local sender admission deadline, preserving TCP's normal admission budget. UDP originals prefer the earliest available route; three immediate protection copies prefer unused eligible routes. Protection shares the operator limits and is bounded to the smaller of one quarter of the aggregate limit and 4 Mbps. It does not retransmit application UDP packets. Complete packets are delivered immediately; partial segmented messages retain bounded state for at least 250 ms so different network paths can recover a missing fragment. SOCKS UDP accepts whole packets within the negotiated message limit, with tunnel segmentation when needed; SOCKS FRAG requests remain unsupported.
 
 Game mode trades bandwidth and bulk shares for timely UDP. It conflicts with explicit codec/deadline overrides. Aggregate and group caps remain active. Use separate sessions/listeners when comparing it with the normal policy. The flag does not apply to the separate `proxy-client` native UDP backend. These mechanisms do not establish a latency or throughput result for a particular network; use same-target, bounded paired measurements of delivery, loss, jitter and competing TCP traffic.

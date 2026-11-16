@@ -232,8 +232,8 @@ impl RecordEncoder {
                                     | super::super::stream::ACK_FLAG)));
                 if control {
                     // A sparse interactive stream cannot amortize a lost tail
-                    // over the next packet. Keep one immediate copy even when
-                    // clean bulk and superseding ACKs need no proactive FEC.
+                    // over the next packet. Immediate copies protect its tail
+                    // even when clean bulk and superseding ACKs need no FEC.
                     let interactive = gaming
                         || (super::super::stream::stream_id(record.flow).is_some()
                             && !super::super::stream::is_ack_flow(record.flow)
@@ -253,7 +253,7 @@ impl RecordEncoder {
                         *small_repairs
                     };
                     let copies = if gaming {
-                        1
+                        3
                     } else {
                         protection.max(recovery).max(u8::from(interactive))
                     };

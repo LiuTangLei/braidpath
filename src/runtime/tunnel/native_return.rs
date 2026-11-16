@@ -23,7 +23,7 @@ pub(super) const BURST: usize = wire_cost(PAYLOAD + HEADER_BYTES);
 const fn wire_cost(bytes: usize) -> usize {
     bytes + bytes.div_ceil(PACKET_PAYLOAD) * PACKET_ALLOWANCE
 }
-pub(super) const WINDOW: u32 = 4 * 1024 * 1024;
+pub(super) const WINDOW: u32 = 2 * 1024 * 1024;
 const PATH_QUEUE: usize = 4;
 
 pub(super) type Writer = mpsc::Sender<Flight>;
