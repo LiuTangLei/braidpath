@@ -1846,7 +1846,7 @@ async fn sender(
                 };
                 metrics.update(|d| d.records.sender_input_consumed += 1);
                 metrics.trace_record(trace::Stage::SenderInput, &record, None, None);
-                if native_returning && native_return::data(record.flow, &record.payload) {
+                if native_returning && native_return::bulk_data(record.flow, &record.payload) {
                     native_return::enqueue(
                         QueuedRecord {
                             record,
@@ -3585,11 +3585,10 @@ async fn session_loop(
         }
         if let Some(mux) = streams.as_mut() {
             mux.service_io();
-            mux.set_payload_limit(if session.policy.native_return {
-                native_return::PAYLOAD
-            } else {
-                stream_payload_limit(&session.paths, session.policy.receiver_feedback)
-            });
+            mux.set_payload_limit(stream_payload_limit(
+                &session.paths,
+                session.policy.receiver_feedback,
+            ));
             mux.flush(&mut tcp::Out {
                 tx: &tx,
                 next_id: &mut next_id,

@@ -36,6 +36,12 @@ pub(super) fn requested(headers: &http::HeaderMap) -> Result<bool> {
 pub(super) fn data(flow: u32, payload: &[u8]) -> bool {
     stream::stream_id(flow).is_some() && !stream::is_ack_flow(flow) && payload.first() == Some(&0)
 }
+pub(super) fn bulk_data(flow: u32, payload: &[u8]) -> bool {
+    data(flow, payload)
+        && payload.get(2..10).is_some_and(|bytes| {
+            u64::from_be_bytes(bytes.try_into().expect("offset")) >= stream::RELIABLE_FRONTIER
+        })
+}
 pub(super) fn enqueue(item: QueuedRecord, queue: &mut outbound::Queue) {
     let QueuedRecord {
         record,

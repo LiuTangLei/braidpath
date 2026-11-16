@@ -1543,7 +1543,15 @@ impl Mux {
         // before it reaches the sender's existing per-flow fair queue. The
         // reserve is at most two maximum segments plus one tiny frame;
         // bulk keeps the original limit and all wire budgets remain shared.
-        while self.gauge.queued() < limit + 2 * self.payload_limit && idle < self.turns.len() {
+        while self.gauge.queued()
+            < limit
+                + 2 * if self.native_return {
+                    super::native_return::PAYLOAD
+                } else {
+                    self.payload_limit
+                }
+            && idle < self.turns.len()
+        {
             let id = self.turns.pop_front().expect("turn");
             self.turns.push_back(id);
             let s = self.streams.get_mut(&id).expect("stream turn");
@@ -1553,7 +1561,7 @@ impl Mux {
             }
             let before_splits = s.send.pmtu_splits;
             let transmit = if self.native_return {
-                s.send.poll_transmit_reliable(now, self.payload_limit)
+                s.send.poll_transmit_return(now, self.payload_limit)
             } else {
                 s.send.poll_transmit_sized(now, self.payload_limit)
             };
