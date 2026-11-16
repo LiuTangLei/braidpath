@@ -7,7 +7,10 @@ use super::{OutPath, QueuedRecord, outbound, stream, wire::Record};
 use anyhow::{Result, ensure};
 use bytes::{Buf, Bytes, BytesMut};
 use std::{
-    sync::{Arc, OnceLock},
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Instant,
 };
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
@@ -26,8 +29,27 @@ const fn wire_cost(bytes: usize) -> usize {
 pub(super) const WINDOW: u32 = 2 * 1024 * 1024;
 const PATH_QUEUE: usize = 4;
 
-pub(super) type Writer = mpsc::Sender<Flight>;
-pub(super) type Reader = mpsc::Receiver<Flight>;
+#[derive(Clone)]
+pub(super) struct Writer {
+    pub(super) tx: mpsc::Sender<Flight>,
+    reachable: Arc<AtomicBool>,
+}
+impl Writer {
+    pub(super) fn set_reachable(&self, reachable: bool) {
+        self.reachable
+            .store(reachable && !self.tx.is_closed(), Ordering::Release);
+    }
+}
+pub(super) struct Reader {
+    pub(super) rx: mpsc::Receiver<Flight>,
+    reachable: Arc<AtomicBool>,
+}
+impl Drop for Reader {
+    fn drop(&mut self) {
+        self.rx.close();
+        self.reachable.store(false, Ordering::Release);
+    }
+}
 
 /// Retains the stream's failure callback while the bounded native writer owns
 /// the payload, without retaining its producer-queue reservation.
@@ -36,9 +58,14 @@ pub(super) struct Flight {
     written: bool,
 }
 impl Flight {
-    fn new(pending: outbound::Pending, path: u8, rtt: std::time::Duration) -> Self {
+    fn new(
+        pending: outbound::Pending,
+        path: u8,
+        rtt: std::time::Duration,
+        reachable: Arc<AtomicBool>,
+    ) -> Self {
         if let Some(hold) = &pending.hold {
-            hold.reliable_handoff(path, rtt, Instant::now());
+            hold.reliable_handoff(path, rtt, Instant::now(), reachable);
         }
         Self {
             pending,
@@ -56,7 +83,15 @@ impl Drop for Flight {
     }
 }
 pub(super) fn channel() -> (Writer, Reader) {
-    mpsc::channel(PATH_QUEUE)
+    let (tx, rx) = mpsc::channel(PATH_QUEUE);
+    let reachable = Arc::new(AtomicBool::new(true));
+    (
+        Writer {
+            tx,
+            reachable: reachable.clone(),
+        },
+        Reader { rx, reachable },
+    )
 }
 
 pub(super) fn requested(headers: &http::HeaderMap) -> Result<bool> {
@@ -127,13 +162,23 @@ pub(super) fn drain(
                 return None;
             }
             let writer = path.native_return.as_ref()?;
-            Some((i, writer.try_reserve().ok()?))
+            if !writer.reachable.load(Ordering::Acquire) {
+                return None;
+            }
+            Some((i, writer.tx.try_reserve().ok()?, writer.reachable.clone()))
         });
-        let Some((i, permit)) = ready else { break };
+        let Some((i, permit, reachable)) = ready else {
+            break;
+        };
         let pending = queue.pop(false).expect("native queue front");
         pacer.spend(cost);
         groups[usize::from(paths[i].group)].spend(cost);
-        permit.send(Flight::new(pending, paths[i].id, paths[i].conn.rtt_hint()));
+        permit.send(Flight::new(
+            pending,
+            paths[i].id,
+            paths[i].conn.rtt_hint(),
+            reachable,
+        ));
         *cursor = (i + 1) % paths.len();
     }
 }
@@ -143,7 +188,13 @@ pub(super) async fn write(
     mut stream: h3::server::RequestStream<h3_quinn::SendStream<Bytes>, Bytes>,
     mut input: Reader,
 ) {
-    while let Some(mut flight) = input.recv().await {
+    loop {
+        let Some(mut flight) = (tokio::select! {
+            value = input.rx.recv() => value,
+            _ = conn.closed() => break,
+        }) else {
+            break;
+        };
         let result = tokio::select! {
             result = stream.send_data(flight.pending.data.clone()) => result,
             _ = conn.closed() => break,
@@ -277,7 +328,12 @@ mod tests {
                 small: false,
                 hold: Some(hold),
             };
-            let mut flight = Flight::new(pending, 2, std::time::Duration::from_millis(100));
+            let mut flight = Flight::new(
+                pending,
+                2,
+                std::time::Duration::from_millis(100),
+                Arc::new(AtomicBool::new(true)),
+            );
             assert_eq!(
                 gauge.queued(),
                 0,
@@ -286,6 +342,7 @@ mod tests {
             let sent = gauge.take_sent();
             assert_eq!(sent.len(), 1);
             assert_eq!(sent[0].path, 2);
+            assert!(sent[0].reliable.as_ref().unwrap().load(Ordering::Acquire));
             flight.written = written;
             drop(flight);
             if written {
@@ -301,6 +358,16 @@ mod tests {
                 "release exactly once on success or cancellation"
             );
         }
+    }
+
+    #[test]
+    fn a_closed_native_writer_cannot_be_made_reachable_by_an_old_probe() {
+        let (writer, reader) = channel();
+        assert!(writer.reachable.load(Ordering::Acquire));
+        drop(reader);
+        assert!(!writer.reachable.load(Ordering::Acquire));
+        writer.set_reachable(true);
+        assert!(!writer.reachable.load(Ordering::Acquire));
     }
 
     #[test]

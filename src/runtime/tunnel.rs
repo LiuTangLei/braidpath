@@ -1956,6 +1956,9 @@ async fn sender(
             if silent == open { 0 } else { silent }
         };
         for path in paths.iter() {
+            if let Some(writer) = &path.native_return {
+                writer.set_reachable(path.open() && !liveness[usize::from(path.id)].silent());
+            }
             path.writer.set_pace(if policy.adaptive {
                 controllers[usize::from(path.id)].pacing_bps()
             } else {

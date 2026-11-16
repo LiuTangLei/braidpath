@@ -1334,8 +1334,19 @@ impl Mux {
         for sent in self.gauge.take_sent() {
             let (id, start, transmission) = sent.identity;
             if let Some(s) = self.streams.get_mut(&id) {
-                s.send
-                    .admitted(start, transmission, sent.path, sent.rtt, sent.at);
+                if let Some(reliable) = sent.reliable {
+                    s.send.admitted_reliable(
+                        start,
+                        transmission,
+                        sent.path,
+                        sent.rtt,
+                        sent.at,
+                        reliable,
+                    );
+                } else {
+                    s.send
+                        .admitted(start, transmission, sent.path, sent.rtt, sent.at);
+                }
                 // A published session can still have no usable path. Reply only
                 // after the first destination record was admitted by Quinn.
                 if start == 0
