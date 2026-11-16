@@ -180,11 +180,11 @@ impl Pacer {
         if !due {
             return self.capacity;
         }
-        // Retain at most one extra interval of earned service after a late
+        // Retain at most one extra millisecond of earned service after a late
         // backlogged wake. Idle credit, normal wake deadlines and rate remain
         // unchanged; the native congestion window still bounds in-flight data.
-        let extra = (u128::from(rate) * BURST_INTERVAL_NANOS / 1_000_000_000)
-            .min(u128::from(self.capacity)) as u64;
+        let extra =
+            (u128::from(rate) * 1_000_000 / 1_000_000_000).min(u128::from(self.capacity)) as u64;
         self.capacity
             .saturating_add(extra)
             .min(MAX_BURST_SIZE * u64::from(mtu))
@@ -343,7 +343,7 @@ mod tests {
         assert_eq!(send(&mut p, at, rtt, window), 20);
         assert_eq!(
             send(&mut p, at + Duration::from_millis(10), rtt, window),
-            40,
+            30,
             "large scheduling stalls cannot create an unbounded burst"
         );
         let mut idle = Pacer::new(rtt, window, 1000, at);
