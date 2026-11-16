@@ -15,7 +15,14 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 pub(super) const HEADER: &str = "braidpath-return-stream";
 pub(super) const PAYLOAD: usize = stream::RELIABLE_PAYLOAD;
 const HEADER_BYTES: usize = 16;
-pub(super) const BURST: usize = PAYLOAD + HEADER_BYTES + 128;
+// A native record spans multiple QUIC packets. Pay the same conservative
+// per-packet allowance as datagrams, including when operator caps are low.
+const PACKET_ALLOWANCE: usize = 80;
+const PACKET_PAYLOAD: usize = super::MAX_PAYLOAD;
+pub(super) const BURST: usize = wire_cost(PAYLOAD + HEADER_BYTES);
+const fn wire_cost(bytes: usize) -> usize {
+    bytes + bytes.div_ceil(PACKET_PAYLOAD) * PACKET_ALLOWANCE
+}
 pub(super) const WINDOW: u32 = 2 * 1024 * 1024;
 const PATH_QUEUE: usize = 4;
 
@@ -100,7 +107,7 @@ pub(super) fn drain(
         let Some(front) = queue.front(false) else {
             break;
         };
-        let cost = front.data.len() + 80;
+        let cost = wire_cost(front.data.len());
         if !pacer.available(cost) {
             break;
         }
@@ -243,6 +250,15 @@ mod tests {
         );
         queue.pop(false).unwrap().data
     }
+    #[test]
+    fn one_native_frame_fits_even_the_minimum_operator_rate() {
+        let mut cap = outbound::Pacer::for_sender(64_000, BURST);
+        cap.refill(5_000_000);
+        assert!(cap.available(wire_cost(PAYLOAD + HEADER_BYTES)));
+        cap.spend(wire_cost(PAYLOAD + HEADER_BYTES));
+        assert!(!cap.available(wire_cost(PAYLOAD + HEADER_BYTES)));
+    }
+
     #[test]
     fn blocked_native_writer_cannot_pin_the_shared_producer() {
         for written in [false, true] {
