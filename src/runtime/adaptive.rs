@@ -1435,7 +1435,24 @@ impl PathController {
             let rate = self
                 .loss_ceiling
                 .map_or(rate, |(ceiling, _)| rate.min(ceiling.max(MIN_BPS)));
-            measured_bps.map_or(rate, |measured| rate.min(measured))
+            let rate = measured_bps.map_or(rate, |measured| rate.min(measured));
+            if self.shared_uplink_service && self.fast_recovery_enabled && measured_bps.is_none() {
+                // Several native windows share one access uplink. An ACK-only
+                // or compressed short report cannot qualify their next doubling.
+                // Restore against one RTT of delivered service, with a bounded
+                // upward trial; ordinary measured growth and brakes still run.
+                let supported = observation.delivered_bps.filter(|bps| {
+                    bps.is_finite()
+                        && *bps > 0.0
+                        && observation.delivery_sample_span_us >= rtt_us.max(100_000)
+                });
+                let ceiling = supported.map_or(self.rate_bps, |bps| {
+                    ((bps * self.wire_per_symbol * 1.25) as u64).max(self.rate_bps)
+                });
+                rate.min(ceiling)
+            } else {
+                rate
+            }
         });
         if eligible && let Some(native_bps) = recovery_bps.filter(|rate| *rate > self.rate_bps) {
             // At most one doubling per native RTT. Existing admission tokens
@@ -4481,6 +4498,43 @@ mod tests {
     }
 
     #[test]
+    fn upload_native_recovery_needs_delivered_service_before_a_large_retained_window() {
+        let run = |uplink, span| {
+            let (mut controller, mut sample) = native_service_fixture();
+            controller.shared_uplink_service = uplink;
+            controller.rate_bps = 10_000_000;
+            sample.delivered_bytes = 125_000;
+            sample.delivered_bps = Some(10_000_000.0 / controller.wire_per_symbol);
+            sample.delivery_sample_span_us = span;
+            controller.observe_native_service(&sample, 2_000_000, 50_000);
+            controller
+        };
+        let upload = run(true, 100_000);
+        let download = run(false, 100_000);
+        assert!(
+            upload.rate_bps > 10_000_000,
+            "new service should permit a bounded upward trial"
+        );
+        assert!(
+            upload.rate_bps <= 12_500_000,
+            "a retained cwnd cannot double a shared upload before delivery supports it"
+        );
+        assert_eq!(
+            download.rate_bps, 20_000_000,
+            "the download policy remains independent"
+        );
+        assert_eq!(
+            upload.tokens, download.tokens,
+            "raising the allowance creates no burst credit"
+        );
+        assert_eq!(
+            run(true, 1_000).rate_bps,
+            10_000_000,
+            "a short ACK burst does not establish upload service"
+        );
+    }
+
+    #[test]
     fn idle_restart_is_not_consumed_by_ack_or_status_backlog() {
         let (mut controller, mut sample) = idle_native_fixture();
         sample.bulk_backlog = false;
@@ -4867,31 +4921,40 @@ mod tests {
 
     #[test]
     fn native_service_recovers_up_to_a_loss_ceiling_and_releases_an_expired_one() {
-        for expired in [false, true] {
-            let (mut controller, sample) = native_service_fixture();
-            controller.queue_gated_loss_enabled = true;
-            let previous = controller.rate_bps;
-            let ceiling = previous + previous / 2;
-            controller.loss_ceiling = Some((
-                ceiling,
+        for uplink in [false, true] {
+            for expired in [false, true] {
+                let (mut controller, sample) = native_service_fixture();
+                controller.shared_uplink_service = uplink;
+                controller.queue_gated_loss_enabled = true;
+                let previous = controller.rate_bps;
+                let ceiling = previous + previous / 2;
+                controller.loss_ceiling = Some((
+                    ceiling,
+                    if expired {
+                        sample.now_us - 1
+                    } else {
+                        sample.now_us + 1_000_000
+                    },
+                ));
+                controller.observe_native_service(&sample, 200_000, 50_000);
+                assert!(
+                    controller.rate_bps > previous,
+                    "recovery below the ceiling remains possible"
+                );
                 if expired {
-                    sample.now_us - 1
+                    assert!(controller.loss_ceiling.is_none());
+                    if !uplink {
+                        assert!(controller.rate_bps > ceiling);
+                    }
+                } else if uplink {
+                    let support =
+                        (sample.delivered_bps.unwrap() * controller.wire_per_symbol * 1.25) as u64;
+                    assert_eq!(controller.rate_bps, ceiling.min(support));
                 } else {
-                    sample.now_us + 1_000_000
-                },
-            ));
-            controller.observe_native_service(&sample, 200_000, 50_000);
-            assert!(
-                controller.rate_bps > previous,
-                "recovery below the ceiling remains possible"
-            );
-            if expired {
-                assert!(controller.loss_ceiling.is_none());
-                assert!(controller.rate_bps > ceiling);
-            } else {
-                assert_eq!(controller.rate_bps, ceiling);
+                    assert_eq!(controller.rate_bps, ceiling);
+                }
+                assert_eq!(controller.native_service_recoveries, 1);
             }
-            assert_eq!(controller.native_service_recoveries, 1);
         }
     }
 
