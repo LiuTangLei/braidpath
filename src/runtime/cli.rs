@@ -511,7 +511,7 @@ mod dual_cli_tests {
 #[derive(Args)]
 struct PolicyArgs {
     /// Prefer low UDP delay: earliest-ready paths, immediate bounded protection,
-    /// adaptive pacing and a 3 ms local admission deadline.
+    /// adaptive pacing and an 8 ms local admission deadline.
     #[arg(long, conflicts_with_all = ["fec", "fec_repairs", "small_fec_bytes", "mixed_fec", "latency_target_ms", "queue_ms", "block_ms", "capacity_probe_bps", "probe_guided_recovery"])]
     game_mode: bool,
     /// Use a negotiated reliable QUIC stream for TCP downloads; uploads and UDP stay unchanged.
@@ -1353,8 +1353,8 @@ impl PolicyArgs {
             policy.receiver_feedback = true;
             policy.quality_schedule = true;
             policy.fec = super::automatic_fec::AUTO;
-            policy.latency_target_ms = 3;
-            policy.queue_ms = 3;
+            policy.latency_target_ms = 8;
+            policy.queue_ms = 8;
             policy.block_ms = 1;
         }
         policy
@@ -1390,7 +1390,7 @@ mod aggregate_cli_tests {
         assert!(p.game_mode && p.adaptive && p.receiver_feedback && p.quality_schedule);
         assert!(!p.native_return);
         assert_eq!(p.fec, super::super::automatic_fec::AUTO);
-        assert_eq!((p.queue_ms, p.latency_target_ms, p.block_ms), (3, 3, 1));
+        assert_eq!((p.queue_ms, p.latency_target_ms, p.block_ms), (8, 8, 1));
         assert_eq!(p.rate, 8_000_000);
         assert!(p.validate().is_ok());
         assert!(Cli::try_parse_from(args.into_iter().chain(["--queue-ms", "20"])).is_err());

@@ -10,7 +10,7 @@ fn policy() -> Policy {
         adaptive: true,
         capacity_probe_bps: 0,
         probe_guided_recovery: false,
-        latency_target_ms: 3,
+        latency_target_ms: 8,
         group_rates: [100_000_000; MAX_PATHS],
         receiver_feedback: true,
         quality_schedule: true,
@@ -21,7 +21,7 @@ fn policy() -> Policy {
         redundancy: 30,
         rate: 100_000_000,
         block_ms: 1,
-        queue_ms: 3,
+        queue_ms: 8,
     }
 }
 
@@ -100,4 +100,23 @@ fn game_udp_classification_preserves_tcp_and_normal_mode() {
         "normal clean UDP does not gain a forced copy"
     );
     assert!(!symbols[0].small);
+}
+
+#[test]
+fn normal_udp_reassembly_keeps_arrival_skew_separate_from_send_deadline() {
+    let mut p = policy();
+    p.game_mode = false;
+    p.queue_ms = 20;
+    p.latency_target_ms = 20;
+    let now = Instant::now();
+    let mut next = 0;
+    let payload = vec![13; 1200];
+    let mut parts = messages::split(associate::FLAG | 1, &mut next, payload.clone(), 4096).unwrap();
+    let mut receiver = messages::Reassembly::new(4096, p.reassembly_lifetime());
+    assert!(receiver.receive(parts.next().unwrap(), now).is_none());
+    let (packet, _) = receiver
+        .receive(parts.next().unwrap(), now + Duration::from_millis(80))
+        .expect("a slower path must still complete the UDP packet");
+    assert_eq!(packet.flow, associate::FLAG | 1);
+    assert_eq!(packet.payload, payload);
 }

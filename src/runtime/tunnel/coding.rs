@@ -252,7 +252,11 @@ impl RecordEncoder {
                     } else {
                         *small_repairs
                     };
-                    let copies = protection.max(recovery).max(u8::from(interactive));
+                    let copies = if gaming {
+                        1
+                    } else {
+                        protection.max(recovery).max(u8::from(interactive))
+                    };
                     if copies == 0 {
                         return Ok(vec![EncodedSymbol {
                             data: wire::plain(record)?,

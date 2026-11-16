@@ -133,11 +133,7 @@ impl Policy {
         // This retains partial messages; complete datagrams are delivered
         // immediately. A prompt-send deadline cannot be an arrival-skew limit
         // for a fragment protected over a second network path.
-        if self.game_mode {
-            Duration::from_millis(250)
-        } else {
-            self.admission_lifetime()
-        }
+        self.admission_lifetime().max(Duration::from_millis(250))
     }
 
     pub fn validate(&self) -> Result<()> {
