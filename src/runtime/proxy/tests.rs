@@ -1383,7 +1383,7 @@ async fn prepared_paths_do_not_open_targets_and_cold_relays_do_not_hold_download
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn udp_prefers_complete_datagram_delivery_over_a_faster_lossy_handshake() {
     async fn entrance(target: SocketAddr, loss: bool) -> (SocketAddr, Task<()>) {
-        let front = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let front = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         let address = front.local_addr().unwrap();
         let back = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         back.connect(target).await.unwrap();
@@ -1391,6 +1391,7 @@ async fn udp_prefers_complete_datagram_delivery_over_a_faster_lossy_handshake() 
             let (mut up, mut down) = (vec![0; 65536], vec![0; 65536]);
             let mut peer = None;
             let mut small = 0;
+            let mut delayed = tokio::task::JoinSet::new();
             loop {
                 tokio::select! {
                     r = front.recv_from(&mut up) => {
@@ -1404,9 +1405,23 @@ async fn udp_prefers_complete_datagram_delivery_over_a_faster_lossy_handshake() 
                             small += 1;
                             if small % 3 == 0 { continue; }
                         }
-                        if !loss && n > 100 { tokio::time::sleep(Duration::from_millis(15)).await; }
-                        if let Some(peer) = peer { front.send_to(&down[..n], peer).await.unwrap(); }
+                        if let Some(peer) = peer {
+                            if !loss && n > 100 {
+                                // Propagation delay applies independently to
+                                // packets; serial sleeps create an unintended
+                                // one-packet-per-timer-tick bandwidth cap.
+                                let front = front.clone();
+                                let data = down[..n].to_vec();
+                                delayed.spawn(async move {
+                                    tokio::time::sleep(Duration::from_millis(15)).await;
+                                    front.send_to(&data, peer).await.unwrap();
+                                });
+                            } else {
+                                front.send_to(&down[..n], peer).await.unwrap();
+                            }
+                        }
                     }
+                    result = delayed.join_next(), if !delayed.is_empty() => { result.unwrap().unwrap(); }
                 }
             }
         }));
