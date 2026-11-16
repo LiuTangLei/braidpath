@@ -14,6 +14,7 @@ use tracing::warn;
 /// <https://tools.ietf.org/html/draft-ietf-quic-recovery-34#section-7.7>
 pub(super) struct Pacer {
     capacity: u64,
+    wake_capacity: u64,
     last_window: u64,
     last_mtu: u16,
     tokens: u64,
@@ -27,6 +28,7 @@ impl Pacer {
         let capacity = optimal_capacity(smoothed_rtt, window, mtu);
         Self {
             capacity,
+            wake_capacity: capacity,
             last_window: window,
             last_mtu: mtu,
             tokens: capacity,
@@ -72,10 +74,22 @@ impl Pacer {
 
         if window != self.last_window || mtu != self.last_mtu {
             self.capacity = match self.rate {
-                Some(rate) => ((rate as u128 * BURST_INTERVAL_NANOS / 1_000_000_000)
-                    .min(u64::MAX as u128) as u64)
-                    .clamp(MIN_BURST_SIZE * mtu as u64, MAX_BURST_SIZE * mtu as u64),
-                None => optimal_capacity(smoothed_rtt, window, mtu),
+                Some(rate) => {
+                    let quantum = (rate as u128 * BURST_INTERVAL_NANOS / 1_000_000_000)
+                        .min(u64::MAX as u128) as u64;
+                    let minimum = MIN_BURST_SIZE * mtu as u64;
+                    let maximum = MAX_BURST_SIZE * mtu as u64;
+                    // Preserve the wake quantum and one more earned quantum
+                    // when runtime scheduling is late. This creates neither
+                    // rate credit nor congestion-window allowance.
+                    self.wake_capacity = quantum.clamp(minimum, maximum);
+                    quantum.saturating_mul(2).clamp(minimum, maximum)
+                }
+                None => {
+                    let capacity = optimal_capacity(smoothed_rtt, window, mtu);
+                    self.wake_capacity = capacity;
+                    capacity
+                }
             };
 
             // Clamp the tokens
@@ -98,7 +112,7 @@ impl Pacer {
             if self.tokens >= bytes_to_send {
                 return None;
             }
-            let missing = bytes_to_send.max(self.capacity) - self.tokens;
+            let missing = bytes_to_send.max(self.wake_capacity) - self.tokens;
             let nanos = (missing as u128 * 1_000_000_000).div_ceil(rate as u128);
             return Some(now + Duration::from_nanos(nanos.min(u64::MAX as u128) as u64));
         }
@@ -192,11 +206,12 @@ mod tests {
         let window = 20 * 1024 * 1024;
         let mut pacer = Pacer::new(rtt, window, 1000, now);
         pacer.set_rate(Some(10_000_000));
-        for _ in 0..20 {
+        for _ in 0..40 {
             assert_eq!(pacer.delay(rtt, 1000, 1000, window, now), None);
             pacer.on_transmit(1000);
         }
-        assert_eq!(pacer.capacity, 20_000);
+        assert_eq!(pacer.capacity, 40_000);
+        assert_eq!(pacer.wake_capacity, 20_000);
         assert_eq!(
             pacer.delay(rtt, 1000, 1000, window, now),
             Some(now + Duration::from_millis(2))
@@ -212,6 +227,40 @@ mod tests {
         pacer.set_rate(None);
         pacer.delay(rtt, 1000, 1000, window, next);
         assert_eq!(pacer.capacity, optimal_capacity(rtt, window, 1000));
+    }
+
+    #[test]
+    fn late_model_wake_keeps_rate_and_existing_wake_without_unbounded_bursts() {
+        let start = Instant::now();
+        let rtt = Duration::from_millis(100);
+        let window = 16 * 1024 * 1024;
+        let rate = 32_000_000u64;
+        let mtu = 1000;
+        let mut pacer = Pacer::new(rtt, window, mtu, start);
+        pacer.set_rate(Some(rate));
+        let mut now = start;
+        let mut bytes = 0;
+        let mut burst = 0;
+        let mut maximum_burst = 0;
+        while now.duration_since(start) < Duration::from_secs(1) {
+            if let Some(deadline) = pacer.delay(rtt, mtu as u64, mtu, window, now) {
+                maximum_burst = maximum_burst.max(burst);
+                burst = 0;
+                now = deadline + Duration::from_millis(1);
+            } else {
+                pacer.on_transmit(mtu);
+                bytes += mtu as u64;
+                burst += mtu as u64;
+            }
+        }
+        assert!(
+            bytes >= rate * 95 / 100,
+            "late timers lost earned service: {bytes}/{rate}"
+        );
+        assert!(bytes <= rate + pacer.capacity, "no future rate credit");
+        assert_eq!(pacer.wake_capacity, 64_000);
+        assert_eq!(pacer.capacity, 128_000);
+        assert!(maximum_burst <= 128_000);
     }
 
     #[test]
