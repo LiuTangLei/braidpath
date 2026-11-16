@@ -1793,11 +1793,15 @@ async fn one_client_serves_fixed_exits_and_socks_tcp_udp_with_exit_failure_isola
     let (target_b, _echo_b) = echo_with_finish(b"B-END").await;
     let (a, _server_a, _) = start_metered_target(root, "a", None, true, Some(target_a)).await;
     let (b, server_b, _) = start_metered_target(root, "b", Some(a), true, Some(target_b)).await;
-    let socks_at = address();
-    let fixed_a = address();
-    let fixed_b = address();
+    // UDP and TCP have separate port namespaces. Keep distinct TCP
+    // reservations while preparing identity, then hand them to the client.
+    let reserved =
+        std::array::from_fn::<_, 3, _>(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap());
+    let [socks_at, fixed_a, fixed_b] = reserved.each_ref().map(|s| s.local_addr().unwrap());
+    let unified_identity = identity(root, "unified");
+    drop(reserved);
     let mut process = Task(tokio::spawn(client(ClientOptions {
-        identity: identity(root, "unified"),
+        identity: unified_identity,
         connect: vec![a, b],
         exits: vec!["a".into()],
         listen: socks_at,
