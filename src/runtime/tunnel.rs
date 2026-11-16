@@ -2953,9 +2953,9 @@ async fn sender(
                 }
                 if policy.adaptive {
                     let allowed = controllers[id].allow(now_us, cost, age.as_secs_f64() * 1000.0);
-                    // The loop has already settled business credit at now_us.
-                    // allow only refills this path's tokens; it cannot change
-                    // path membership or the aggregate/group rate budgets.
+                    // allow can roll an expired finite reprobe back while
+                    // refilling path tokens. Settle that changed budget here.
+                    update_business_pacer(&mut business, &paths, &controllers, now_us);
                     if !allowed {
                         frontier.add(path.id, is_small, Gate::PathAllowance);
                         continue;
