@@ -57,6 +57,7 @@ impl Pair {
 
     fn path(&self) -> OutPath {
         OutPath {
+            native_return: None,
             id: 0,
             group: 2,
             conn: self.outgoing.clone(),
@@ -188,6 +189,7 @@ fn block_and_poll(wait: &mut WaitingSend, paths: &Paths, lifetime: Duration) -> 
 
 fn policy() -> Policy {
     Policy {
+        native_return: false,
         max_message_bytes: 1000,
         streams: false,
         proxy: false,

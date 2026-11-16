@@ -58,6 +58,7 @@ pub(crate) mod messages;
 #[cfg(test)]
 mod mixed_fec_tests;
 mod native_probe;
+mod native_return;
 mod path_health;
 mod payload;
 mod profile;
@@ -80,6 +81,7 @@ const WEBSITE: &str = "<!doctype html><html lang=\"en\"><meta charset=\"utf-8\">
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Policy {
+    pub native_return: bool,
     pub max_message_bytes: usize,
     /// Reliable TCP streams to the server's fixed TCP target.
     pub streams: bool,
@@ -121,6 +123,10 @@ impl Policy {
     }
 
     pub fn validate(&self) -> Result<()> {
+        ensure!(
+            !self.native_return || self.streams || self.proxy,
+            "return stream requires a TCP listener"
+        );
         ensure!(
             (MAX_PAYLOAD..=super::MAX_MESSAGE).contains(&self.max_message_bytes),
             "max-message-bytes must be 1000..4096"
@@ -265,6 +271,7 @@ struct OutPath {
     writer: Arc<writer::Writer>,
     stream: u64,
     stream_payload: usize,
+    native_return: Option<native_return::Writer>,
     quality: Arc<Mutex<quality::State>>,
     capacity_probe: Arc<Mutex<capacity_probe::State>>,
     capacity_probe_enabled: bool,
@@ -1610,6 +1617,9 @@ async fn sender(
         ..Default::default()
     };
     let mut queue = outbound::Queue::default();
+    let mut native_queue = outbound::Queue::default();
+    let native_returning = policy.native_return && metrics.direction == stats::RETURN;
+    let mut native_cursor = 0;
     let mut blocks = BTreeMap::<u64, BlockSend>::new();
     let mut budget = outbound::RepairBudget::new(policy.redundancy);
     if policy.fec == automatic_fec::AUTO {
@@ -1632,7 +1642,13 @@ async fn sender(
     let mut logged_guard = forward_guard::Snapshot::default();
     let reliable_native_service =
         (policy.streams || policy.proxy) && !metrics.metrics.legacy_recovery();
-    let burst = if policy.adaptive { 2400 } else { 9600 };
+    let burst = if native_returning {
+        native_return::BURST
+    } else if policy.adaptive {
+        2400
+    } else {
+        9600
+    };
     let mut pacer = outbound::Pacer::for_sender(policy.rate, burst);
     let mut groups: [outbound::Pacer; MAX_PATHS] =
         std::array::from_fn(|i| outbound::Pacer::for_sender(policy.group_rates[i], burst));
@@ -1830,7 +1846,18 @@ async fn sender(
                 };
                 metrics.update(|d| d.records.sender_input_consumed += 1);
                 metrics.trace_record(trace::Stage::SenderInput, &record, None, None);
-                if created.elapsed() < lifetime && queue.would_be_full(policy.flow(record.flow)) {
+                if native_returning && native_return::data(record.flow, &record.payload) {
+                    native_return::enqueue(
+                        QueuedRecord {
+                            record,
+                            created,
+                            hold,
+                        },
+                        &mut native_queue,
+                    );
+                } else if created.elapsed() < lifetime
+                    && queue.would_be_full(policy.flow(record.flow))
+                {
                     deferred_input = Some(QueuedRecord {
                         record,
                         created,
@@ -2397,6 +2424,13 @@ async fn sender(
                 metrics.update(|d| d.symbols.feedback_deferred += 1);
             }
         }
+        native_return::drain(
+            &mut native_queue,
+            &paths,
+            &mut native_cursor,
+            &mut pacer,
+            &mut groups,
+        );
         // Preserve one feedback route's group allowance as well as global credit.
         // Small business/probe datagrams otherwise can starve a larger report forever.
         let feedback_reserve = pending_feedback
@@ -3551,10 +3585,11 @@ async fn session_loop(
         }
         if let Some(mux) = streams.as_mut() {
             mux.service_io();
-            mux.set_payload_limit(stream_payload_limit(
-                &session.paths,
-                session.policy.receiver_feedback,
-            ));
+            mux.set_payload_limit(if session.policy.native_return {
+                native_return::PAYLOAD
+            } else {
+                stream_payload_limit(&session.paths, session.policy.receiver_feedback)
+            });
             mux.flush(&mut tcp::Out {
                 tx: &tx,
                 next_id: &mut next_id,
@@ -4028,7 +4063,9 @@ async fn server_connection(
     };
     diagnostic.succeeded();
     let mut joined: Option<(String, Arc<Session>, u8, u64, u64, usize)> = None;
-    let mut request: Option<h3::server::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>> = None;
+    let mut request: Option<h3::server::RequestStream<h3_quinn::RecvStream, Bytes>> = None;
+    let mut response_send = None;
+    let mut return_tasks = JoinSet::new();
     // Our clients send their first request within their 8-second (data) or
     // 4-second (control) attempt deadline. Unclassified connections hold the
     // small pending budget, so release it soon after that.
@@ -4175,7 +4212,10 @@ async fn server_connection(
                                 ensure!(!streams || tcp.fixed.is_some(),"TCP streams are not enabled on this server");
                                 ensure!(!proxy || tcp.proxy.is_some(),"proxy streams are not enabled on this server");
                                 let stream_payload=payload::negotiate(req.headers(),streams || proxy)?;
-                                let policy=Policy{max_message_bytes,streams,proxy,
+                                let native_return=native_return::requested(req.headers())?;
+                                ensure!(!native_return || streams || proxy,"return stream requires TCP profile");
+                                let (return_writer,return_reader)=if native_return { let (tx,rx)=native_return::channel(); (Some(tx),Some(rx)) } else { (None,None) };
+                                let policy=Policy{native_return,max_message_bytes,streams,proxy,
             fec_repairs,small_fec_bytes,mixed_fec,probe_guided_recovery,capacity_probe_bps,adaptive:quality_schedule==Some("adaptive"),latency_target_ms,group_rates,quality_schedule:quality_schedule.is_some(),receiver_feedback:feedback.is_some(),fec:parse_fec(header("braidpath-fec")?).map_err(anyhow::Error::msg)?,redundancy:header("braidpath-redundancy")?.parse()?,rate,block_ms:header("braidpath-block-ms")?.parse()?,queue_ms:header("braidpath-queue-ms")?.parse()?};policy.validate()?;
                                 if policy.fec==automatic_fec::AUTO {ensure!(req.headers().get_all("braidpath-auto-small").iter().count()==1 && req.headers().get("braidpath-auto-small").is_some_and(|v|v=="1"),"automatic small protection not negotiated");}
                                 let rejoin=req.headers().get("braidpath-rejoin").is_some_and(|v|v=="1");
@@ -4207,7 +4247,7 @@ async fn server_connection(
                                             let mut generations=session.generations.lock().expect("generation lock");
                                             scheduler::admit_generation(&mut generations[usize::from(pid)],generation)?;
                                             if let Some(i)=existing {paths.remove(i).conn.close(0u32.into(),b"path rejoined");}
-                                            paths.push(OutPath{id:pid,group,conn:conn.clone(),writer:writer::Writer::spawn(&conn),stream:stream_id,stream_payload,quality:Arc::new(Mutex::new(quality::State::new(generation))),capacity_probe:Arc::new(Mutex::new(capacity_probe::State::new(generation))),capacity_probe_enabled:capacity_probe_bps>0,epoch:Instant::now(),probe_reply:Arc::new(Mutex::new(None))});
+                                            paths.push(OutPath{id:pid,group,conn:conn.clone(),writer:writer::Writer::spawn(&conn),stream:stream_id,stream_payload,native_return:return_writer,quality:Arc::new(Mutex::new(quality::State::new(generation))),capacity_probe:Arc::new(Mutex::new(capacity_probe::State::new(generation))),capacity_probe_enabled:capacity_probe_bps>0,epoch:Instant::now(),probe_reply:Arc::new(Mutex::new(None))});
                                             *session.empty_since.lock().expect("empty time lock")=None;
                                         }
                                         Some(session)
@@ -4238,11 +4278,17 @@ async fn server_connection(
                                 if header("braidpath-fec")?=="auto" {response=response.header("braidpath-auto-small","1");}
                                 if streams {response=response.header("braidpath-streams","2");}
                                 if proxy {response=response.header("braidpath-proxy","2");}
+                                if native_return {response=response.header(native_return::HEADER,"1");}
                                 if fec_repairs==2 {response=response.header("braidpath-fec-repairs","2");}
                                 if capacity_probe_bps>0 {response=response.header("braidpath-capacity-probe-bps",capacity_probe_bps).header("braidpath-capacity-probe-format",capacity_probe::FORMAT);}
                                 if probe_guided_recovery {response=response.header("braidpath-probe-guided-recovery","1");}
                                 if let Some(scheduler)=quality_schedule {response=response.header("braidpath-scheduler",scheduler);}stream.send_response(response.body(())?).await?;
-                                request=Some(stream);
+                                let (send,recv)=stream.split();
+                                if let Some(reader)=return_reader {
+                                    conn.set_send_window(u64::from(native_return::WINDOW));
+                                    return_tasks.spawn(native_return::write(conn.clone(),send,reader,pid));
+                                } else { response_send=Some(send); }
+                                request=Some(recv);
                                 if let Some(authenticated)=authenticated.take() {let _=authenticated.send(());}
                                 diagnostic.admitted();
                                 info!(path=pid,remote=%conn.remote_address(),"authenticated path joined");
@@ -4751,6 +4797,7 @@ async fn client_session(
     let forward = options.stats.scope(&sid, stats::FORWARD);
     let returning = options.stats.scope(&sid, stats::RETURN);
     let (wire_tx, mut wire_rx) = mpsc::channel::<(u8, Bytes)>(WIRE_QUEUE);
+    let (native_tx, mut native_rx) = mpsc::channel::<native_return::Incoming>(64);
     let mut tasks = JoinSet::new();
     let mut endpoints: [Option<quinn::Endpoint>; MAX_PATHS] = std::array::from_fn(|_| None);
     let mut configs = Vec::<PathConfig>::new();
@@ -4978,7 +5025,7 @@ async fn client_session(
                     tasks.spawn(async move {
                         let mut diagnostic=stats::ConnectionTrace::new(metrics,config.remote,Some(id as u8),"quic_connect");
                         let attempt:Result<Option<Rejoined>>=async {
-                            let endpoint=transport::client_bound_with_session_alpn(config.remote,&ca,config.interface.as_deref(),congestion,bind,datagram_send_buffer_bytes,ack_request,policy.streams || policy.proxy)?;
+                            let endpoint=transport::client_bound_with_session_alpn(config.remote,&ca,config.interface.as_deref(),congestion,bind,datagram_send_buffer_bytes,ack_request,policy.streams || policy.proxy,policy.native_return)?;
                             info!(path=id,generation,local=%endpoint.local_addr()?,remote=%config.remote,"path attempt source socket");
                             let connected=tokio::select! {
                                 biased;
@@ -5039,13 +5086,13 @@ async fn client_session(
                             for old in active.iter().filter(|p|p.id==pid) {old.conn.close(0u32.into(),b"path replaced");}
                             active.retain(|p|p.id!=pid);
                             active.push(OutPath{id:pid,group:configs[id].group,conn:value.conn.clone(),stream:value.stream,stream_payload:value.stream_payload,
-                                writer:writer::Writer::spawn(&value.conn),
+                                native_return:None,writer:writer::Writer::spawn(&value.conn),
                                 quality:Arc::new(Mutex::new(quality::State::new(generation))),capacity_probe:Arc::new(Mutex::new(capacity_probe::State::new(generation))),capacity_probe_enabled:options.policy.capacity_probe_bps>0,epoch:Instant::now(),
                                 probe_reply:Arc::new(Mutex::new(None))});
                         }
                         if let Some(old)=endpoints[id].replace(value.endpoint) {old.close(0u32.into(),b"path replaced");}
                         tasks.spawn(drive_client_path(value.conn,value.stream,value.driver,value.request,value.send,diagnostic,pid,generation,
-                            wire_tx.clone(),ingress_drops.clone(),returning.clone(),forward.clone(),paths.clone(),options.policy.receiver_feedback,value.stream_payload,observation_notify.clone()));
+                            wire_tx.clone(),native_tx.clone(),options.policy.native_return,ingress_drops.clone(),returning.clone(),forward.clone(),paths.clone(),options.policy.receiver_feedback,value.stream_payload,observation_notify.clone()));
                         has_session=true;
                         if recover_paths && !announced {
                             options.stats.readiness(true,configs.iter().filter(|c|c.enabled).count());
@@ -5077,6 +5124,9 @@ async fn client_session(
                 if !enqueue_message(&tx,parts,created,&forward,ingress::small_threshold(&options.policy)) {
                     drops+=1;
                 } else {forward.update(|d|{d.records.ingress_queue_enqueued+=1;});}
+            },
+            incoming=native_rx.recv(),if options.policy.native_return=>{
+                if let Some(incoming)=incoming && let Some(mux)=streams.as_mut() { mux.receive(incoming.record); }
             },
             data=wire_rx.recv()=>{
                 let Some((pid,data))=data else {bail!("all receivers ended")};
@@ -5161,6 +5211,8 @@ async fn drive_client_path(
     pid: u8,
     generation: u64,
     tx: mpsc::Sender<(u8, Bytes)>,
+    native_tx: mpsc::Sender<native_return::Incoming>,
+    native_return: bool,
     ingress_drops: Arc<AtomicU64>,
     returning: Scope,
     measurement_scope: Scope,
@@ -5178,9 +5230,17 @@ async fn drive_client_path(
     };
     trace_path(&returning, trace::Stage::PathOpened, trace_key);
     trace_path(&measurement_scope, trace::Stage::PathOpened, trace_key);
+    let mut native_decoder = native_return::Decoder::default();
     let result:Result<()>=async {loop {tokio::select! {
                         e=driver.wait_idle()=>return Err(e.into()),
-                        body=request.recv_data()=>{let _=body?;return Ok(())},
+                        body=request.recv_data()=>{
+                            let Some(mut body)=body? else {native_decoder.finish()?;return Ok(())};
+                            ensure!(native_return,"unexpected reliable response data");
+                            while let Some(record)=native_decoder.next(&mut body)? {
+                                let incoming=native_return::Incoming::new(record).await?;
+                                tokio::select! { sent=native_tx.send(incoming)=>sent.context("native stream receiver closed")?, _=conn.closed()=>return Ok(()) }
+                            }
+                        },
                         d=conn.read_datagram()=>match d {
                             Ok(d)=>{
                                 trace_http(&returning,trace::Stage::PeerHttpReceived,&d,stream,feedback,trace_key,None);
@@ -5420,6 +5480,9 @@ async fn admit_path(
     if policy.streams || policy.proxy {
         req = req.header(payload::HEADER, super::MAX_STREAM_PAYLOAD);
     }
+    if policy.native_return {
+        req = req.header(native_return::HEADER, "1");
+    }
     let req = req.body(())?;
     // Sent without waiting for peer SETTINGS, so that 0-RTT saves its round trip.
     let mut stream = send.send_request(req).await?;
@@ -5441,6 +5504,10 @@ async fn admit_path(
         conn.close(0u32.into(), b"session epoch expired");
         return Err(SessionExpired.into());
     }
+    ensure!(
+        native_return::requested(response.headers())? == policy.native_return,
+        "return-stream capability not negotiated"
+    );
     diagnostic.enter("http3", "peer_settings");
     // Poll the driver so peer SETTINGS are processed before datagrams are used.
     tokio::select! {

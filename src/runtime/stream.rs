@@ -23,6 +23,8 @@ pub const ACK_FLAG: u32 = 1 << 29;
 pub const MAX_STREAM_ID: u32 = ((1 << 27) - 1) | (1 << 28);
 const DATA_HEADER: usize = 10;
 pub const MAX_SEGMENT: usize = MAX_PAYLOAD - DATA_HEADER;
+/// Negotiated reliable carriers may amortize framing over larger chunks.
+pub(crate) const RELIABLE_PAYLOAD: usize = 32 * 1024 + DATA_HEADER;
 /// Both peers assume this window before the first acknowledgment.
 pub const INITIAL_WINDOW: u64 = 256 * 1024;
 /// A stream's flight plus the data held behind one hole while it is repaired,
@@ -652,10 +654,25 @@ impl Sender {
     }
 
     pub(crate) fn poll_transmit_sized(&mut self, now: Instant, payload: usize) -> Option<Transmit> {
-        let maximum = payload.clamp(DATA_HEADER + 1, super::MAX_STREAM_PAYLOAD) - DATA_HEADER;
+        self.poll_transmit_limited(now, payload, super::MAX_STREAM_PAYLOAD)
+    }
+    pub(crate) fn poll_transmit_reliable(
+        &mut self,
+        now: Instant,
+        payload: usize,
+    ) -> Option<Transmit> {
+        self.poll_transmit_limited(now, payload, RELIABLE_PAYLOAD)
+    }
+    fn poll_transmit_limited(
+        &mut self,
+        now: Instant,
+        payload: usize,
+        bound: usize,
+    ) -> Option<Transmit> {
+        let maximum = payload.clamp(DATA_HEADER + 1, bound) - DATA_HEADER;
         if let Some(start) = self.lost.pop_first() {
             if self.split_for_payload(start, maximum) {
-                return self.poll_transmit_sized(now, payload);
+                return self.poll_transmit_limited(now, payload, bound);
             }
             let end = self.segments[&start].end;
             let t = self.send_segment(start, end, now, false);
@@ -666,7 +683,7 @@ impl Sender {
         }
         if let Some((start, end)) = self.head_copy_ready() {
             if self.split_for_payload(start, maximum) {
-                return self.poll_transmit_sized(now, payload);
+                return self.poll_transmit_limited(now, payload, bound);
             }
             self.head_copy = None;
             let mut t = self.send_segment(start, end, now, true);
@@ -679,7 +696,7 @@ impl Sender {
                 && now >= at
             {
                 if self.split_for_payload(start, maximum) {
-                    return self.poll_transmit_sized(now, payload);
+                    return self.poll_transmit_limited(now, payload, bound);
                 }
                 let end = self.segments[&start].end;
                 self.head_probe = None;
@@ -695,7 +712,7 @@ impl Sender {
                 && now >= at
             {
                 if self.split_for_payload(start, maximum) {
-                    return self.poll_transmit_sized(now, payload);
+                    return self.poll_transmit_limited(now, payload, bound);
                 }
                 let end = self.segments[&start].end;
                 return Some(self.send_segment(start, end, now, true));
@@ -1383,6 +1400,30 @@ impl Receiver {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reliable_chunks_do_not_raise_the_datagram_segment_bound() {
+        let now = Instant::now();
+        let mut reliable = Sender::new(false);
+        let mut datagram = Sender::new(false);
+        let bytes = vec![7; 64 * 1024];
+        reliable.push(&bytes);
+        datagram.push(&bytes);
+        let Frame::Data { data: large, .. } = reliable
+            .poll_transmit_reliable(now, usize::MAX)
+            .unwrap()
+            .frame
+        else {
+            panic!("expected data")
+        };
+        let Frame::Data { data: small, .. } =
+            datagram.poll_transmit_sized(now, usize::MAX).unwrap().frame
+        else {
+            panic!("expected data")
+        };
+        assert_eq!(large.len(), RELIABLE_PAYLOAD - DATA_HEADER);
+        assert_eq!(small.len(), super::super::MAX_STREAM_PAYLOAD - DATA_HEADER);
+    }
 
     #[test]
     fn transfer_gauges_distinguish_ack_retention_from_peer_window_blockage() {

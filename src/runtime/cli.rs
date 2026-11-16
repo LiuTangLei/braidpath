@@ -510,6 +510,9 @@ mod dual_cli_tests {
 }
 #[derive(Args)]
 struct PolicyArgs {
+    /// Use a negotiated reliable QUIC stream for TCP downloads; uploads and UDP stay unchanged.
+    #[arg(long)]
+    native_return_stream: bool,
     /// Maximum UDP application message; larger messages use bounded fragmentation.
     #[arg(long, default_value_t = 4096, value_parser = clap::value_parser!(u16).range(1000..=4096))]
     max_message_bytes: u16,
@@ -1315,6 +1318,7 @@ mod tests {
 impl PolicyArgs {
     fn build(&self, rate: u64, group_rates: [u64; super::MAX_PATHS]) -> tunnel::Policy {
         tunnel::Policy {
+            native_return: self.native_return_stream,
             streams: false,
             proxy: false,
             max_message_bytes: usize::from(self.max_message_bytes),

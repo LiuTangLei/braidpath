@@ -745,6 +745,7 @@ impl Drop for Pool {
 
 fn reliable_policy() -> tunnel::Policy {
     tunnel::Policy {
+        native_return: false,
         max_message_bytes: crate::runtime::MAX_PAYLOAD,
         streams: false,
         proxy: true,

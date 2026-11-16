@@ -458,6 +458,7 @@ pub fn client_bound_with_ack_request(
         datagram_send_buffer_bytes,
         ack_request,
         false,
+        false,
     )
 }
 
@@ -471,6 +472,7 @@ pub(crate) fn client_bound_with_session_alpn(
     datagram_send_buffer_bytes: usize,
     ack_request: AckRequest,
     stream_transport: bool,
+    native_return: bool,
 ) -> Result<Endpoint> {
     client_with_alpn_and_ack(
         remote,
@@ -485,6 +487,7 @@ pub(crate) fn client_bound_with_session_alpn(
             b"h3"
         },
         ack_request,
+        native_return,
     )
 }
 
@@ -522,6 +525,7 @@ fn client_with_alpn(
         datagram_send_buffer_bytes,
         alpn,
         AckRequest::Unchanged,
+        false,
     )
 }
 
@@ -535,6 +539,7 @@ fn client_with_alpn_and_ack(
     datagram_send_buffer_bytes: usize,
     alpn: &[u8],
     ack_request: AckRequest,
+    native_return: bool,
 ) -> Result<Endpoint> {
     ensure!(
         (MIN_DATAGRAM_SEND_BUFFER_BYTES..=MAX_DATAGRAM_SEND_BUFFER_BYTES)
@@ -559,6 +564,10 @@ fn client_with_alpn_and_ack(
     let mut transport = config(congestion);
     transport.datagram_send_buffer_size(datagram_send_buffer_bytes);
     ack_request.apply(&mut transport);
+    if native_return {
+        transport.receive_window((4u32 * 1024 * 1024).into());
+        transport.stream_receive_window((4u32 * 1024 * 1024).into());
+    }
     conf.transport_config(Arc::new(transport));
     let s = Socket::new(
         if remote.is_ipv4() {
@@ -692,6 +701,7 @@ mod tests {
                 DEFAULT_DATAGRAM_SEND_BUFFER_BYTES,
                 AckRequest::Unchanged,
                 stream_transport,
+                false,
             )
             .unwrap();
             let (outgoing, incoming) = tokio::time::timeout(Duration::from_secs(3), async {

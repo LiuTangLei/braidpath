@@ -147,6 +147,9 @@ impl Topology {
 /// `server` selects the stream kind on the server; `local` is the client flag
 /// for the matching local listener.
 fn topology(server: &[&str], relays: &[&str], local: &str) -> Topology {
+    topology_options(server, relays, local, &[])
+}
+fn topology_options(server: &[&str], relays: &[&str], local: &str, extra: &[&str]) -> Topology {
     let fixture = socket_fixture();
     // Keep the live fixture and retained evidence on the same volume on Windows.
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("local/test-fixtures");
@@ -245,6 +248,7 @@ fn topology(server: &[&str], relays: &[&str], local: &str) -> Topology {
     for entrance in &entrances {
         args.extend(["--entrance", entrance]);
     }
+    args.extend_from_slice(extra);
     let mut client = launch(&args, dir.path(), "client");
     ready(&mut client, "UDP client ready");
     processes.push(client);
@@ -721,4 +725,65 @@ fn proxy_server_denies_private_destinations_by_default() {
         udp_exchange(&socket, relay, &udp_request(echo, b"private"), &[]),
         None
     );
+}
+
+#[test]
+fn native_return_keeps_upload_half_close_udp_and_survives_one_path_closing() {
+    let target = echo_target();
+    let mut topology = topology_options(
+        &["--proxy", "--proxy-allow-private"],
+        &["13"],
+        "--proxy-listen",
+        &["--native-return-stream"],
+    );
+    let proxy = topology.tcp_listen.clone();
+    let (status, mut conn) = socks(&proxy, &socks_ipv4(&target));
+    assert_eq!(status, 0);
+    assert_eq!(read_exact_or_eof(&mut conn, 7), b"banner\n");
+    let expected: Vec<u8> = (0..4u32 << 20)
+        .map(|i| (i.wrapping_mul(2654435761) >> 24) as u8)
+        .collect();
+    let send = expected.clone();
+    let mut writer = conn.try_clone().unwrap();
+    let upload = thread::spawn(move || {
+        writer.write_all(&send).unwrap();
+        writer.shutdown(Shutdown::Write).unwrap();
+    });
+    let mut got = read_exact_or_eof(&mut conn, 32768);
+    // Retire the relay during this same transfer; the direct path remains.
+    topology._processes[1].child.kill().unwrap();
+    topology._processes[1].child.wait().unwrap();
+    let (status, mut small) = socks(&proxy, &socks_ipv4(&target));
+    assert_eq!(status, 0);
+    assert_eq!(read_exact_or_eof(&mut small, 7), b"banner\n");
+    small.write_all(b"ping").unwrap();
+    assert_eq!(read_exact_or_eof(&mut small, 4), b"ping");
+    conn.read_to_end(&mut got).unwrap();
+    upload.join().unwrap();
+    assert_eq!(got, expected);
+    let echo = udp_echo();
+    let (_control, relay) = associate(&proxy);
+    let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+    socket
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let request = udp_request(echo, b"native-mode-udp");
+    assert_eq!(
+        udp_exchange(&socket, relay, &request, &[]),
+        Some(udp_request(echo, b"echo:native-mode-udp"))
+    );
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        if topology
+            .streams("server")
+            .is_some_and(|s| s["max_data_segment_bytes"].as_u64().unwrap_or(0) > 1400)
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "native download never emitted a large stream segment"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
 }

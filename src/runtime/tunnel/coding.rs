@@ -472,6 +472,7 @@ mod tests {
 
     fn policy(fec: u8, cutoff: u16, mixed: bool) -> Policy {
         Policy {
+            native_return: false,
             max_message_bytes: 1000,
             streams: false,
             proxy: false,

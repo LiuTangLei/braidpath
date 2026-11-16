@@ -1,0 +1,255 @@
+//! Opt-in download carrier on the authenticated HTTP/3 response body.
+//!
+//! Only stream DATA (including FIN) uses this lane. Uploads, acknowledgments,
+//! resets and UDP retain the datagram carrier. Offsets and the existing stream
+//! credit remain authoritative, including recovery after a path disappears.
+use super::{OutPath, QueuedRecord, outbound, stream, wire::Record};
+use anyhow::{Result, ensure};
+use bytes::{Buf, Bytes, BytesMut};
+use std::{
+    sync::{Arc, OnceLock},
+    time::Instant,
+};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
+
+pub(super) const HEADER: &str = "braidpath-return-stream";
+pub(super) const PAYLOAD: usize = stream::RELIABLE_PAYLOAD;
+const HEADER_BYTES: usize = 16;
+pub(super) const BURST: usize = PAYLOAD + HEADER_BYTES + 128;
+pub(super) const WINDOW: u32 = 4 * 1024 * 1024;
+const PATH_QUEUE: usize = 4;
+
+pub(super) type Writer = mpsc::Sender<outbound::Pending>;
+pub(super) type Reader = mpsc::Receiver<outbound::Pending>;
+pub(super) fn channel() -> (Writer, Reader) {
+    mpsc::channel(PATH_QUEUE)
+}
+
+pub(super) fn requested(headers: &http::HeaderMap) -> Result<bool> {
+    let value = headers.get(HEADER).map(|v| v.to_str()).transpose()?;
+    ensure!(
+        matches!(value, None | Some("1")),
+        "unsupported return-stream format"
+    );
+    Ok(value.is_some())
+}
+pub(super) fn data(flow: u32, payload: &[u8]) -> bool {
+    stream::stream_id(flow).is_some() && !stream::is_ack_flow(flow) && payload.first() == Some(&0)
+}
+pub(super) fn enqueue(item: QueuedRecord, queue: &mut outbound::Queue) {
+    let QueuedRecord {
+        record,
+        created,
+        hold,
+    } = item;
+    let mut encoded = Vec::with_capacity(HEADER_BYTES + record.payload.len());
+    encoded.extend((record.payload.len() as u32).to_be_bytes());
+    encoded.extend(record.flow.to_be_bytes());
+    encoded.extend(record.id.to_be_bytes());
+    encoded.extend(record.payload);
+    // Queue rejection drops the unadmitted hold; the stream retains its bytes
+    // and retries through the normal bounded producer backpressure.
+    let _ = queue.push(outbound::Pending {
+        data: encoded.into(),
+        created,
+        flow: Some(record.flow),
+        record_id: Some(record.id),
+        block: None,
+        small: false,
+        hold,
+    });
+}
+
+/// Uses the same aggregate/group credit as datagrams. Each successful pop
+/// rotates logical flows, and a full path never blocks an available sibling.
+pub(super) fn drain(
+    queue: &mut outbound::Queue,
+    paths: &[OutPath],
+    cursor: &mut usize,
+    pacer: &mut outbound::Pacer,
+    groups: &mut [outbound::Pacer; super::MAX_PATHS],
+) {
+    for _ in 0..16 {
+        let Some(front) = queue.front(false) else {
+            break;
+        };
+        let cost = front.data.len() + 80;
+        if !pacer.available(cost) {
+            break;
+        }
+        let mut order: Vec<_> = (0..paths.len())
+            .map(|n| (*cursor + n) % paths.len())
+            .collect();
+        if front.hold.as_ref().is_some_and(|hold| hold.interactive()) {
+            order.sort_by_key(|&i| paths[i].conn.rtt_hint());
+        }
+        let ready = order.into_iter().find_map(|i| {
+            let path = &paths[i];
+            if !path.open() || !groups[usize::from(path.group)].available(cost) {
+                return None;
+            }
+            let writer = path.native_return.as_ref()?;
+            Some((i, writer.try_reserve().ok()?))
+        });
+        let Some((i, permit)) = ready else { break };
+        let pending = queue.pop(false).expect("native queue front");
+        pacer.spend(cost);
+        groups[usize::from(paths[i].group)].spend(cost);
+        permit.send(pending);
+        *cursor = (i + 1) % paths.len();
+    }
+}
+
+pub(super) async fn write(
+    conn: quinn::Connection,
+    mut stream: h3::server::RequestStream<h3_quinn::SendStream<Bytes>, Bytes>,
+    mut input: Reader,
+    path: u8,
+) {
+    while let Some(pending) = input.recv().await {
+        let result = tokio::select! {
+            result = stream.send_data(pending.data.clone()) => result,
+            _ = conn.closed() => break,
+        };
+        if result.is_err() {
+            conn.close(0u32.into(), b"return stream failed");
+            break;
+        }
+        if let Some(hold) = &pending.hold {
+            hold.admitted(path, conn.rtt_hint(), Instant::now());
+        }
+    }
+}
+
+/// Native ingress gets its own process-wide byte budget before entering a
+/// session queue; TCP receive credit then owns the retained/reordered bytes.
+pub(super) struct Incoming {
+    pub record: Record,
+    _credit: OwnedSemaphorePermit,
+}
+impl Incoming {
+    pub async fn new(record: Record) -> Result<Self> {
+        static BUDGET: OnceLock<Arc<Semaphore>> = OnceLock::new();
+        let budget = BUDGET.get_or_init(|| Arc::new(Semaphore::new(32 * 1024 * 1024)));
+        let credit = budget
+            .clone()
+            .acquire_many_owned(record.payload.len() as u32)
+            .await?;
+        Ok(Self {
+            record,
+            _credit: credit,
+        })
+    }
+}
+
+#[derive(Default)]
+pub(super) struct Decoder {
+    partial: BytesMut,
+}
+impl Decoder {
+    /// Reads at most one bounded frame; DATA boundaries are not record boundaries.
+    pub fn next(&mut self, input: &mut impl Buf) -> Result<Option<Record>> {
+        loop {
+            let need = if self.partial.len() < HEADER_BYTES {
+                HEADER_BYTES
+            } else {
+                let len =
+                    u32::from_be_bytes(self.partial[..4].try_into().expect("header")) as usize;
+                ensure!(
+                    (10..=PAYLOAD).contains(&len),
+                    "invalid return-stream frame length"
+                );
+                HEADER_BYTES + len
+            };
+            let count = (need - self.partial.len()).min(input.remaining());
+            if count > 0 {
+                self.partial.extend_from_slice(&input.copy_to_bytes(count));
+            }
+            if self.partial.len() < need {
+                return Ok(None);
+            }
+            if need == HEADER_BYTES {
+                continue;
+            }
+            let mut frame = self.partial.split().freeze();
+            let len = frame.get_u32() as usize;
+            let flow = frame.get_u32();
+            let id = frame.get_u64();
+            ensure!(data(flow, &frame), "return-stream frame is not TCP data");
+            ensure!(
+                stream::Frame::decode(&frame).is_some(),
+                "invalid return-stream TCP frame"
+            );
+            debug_assert_eq!(len, frame.len());
+            return Ok(Some(Record {
+                flow,
+                id,
+                payload: frame.to_vec(),
+            }));
+        }
+    }
+    pub fn finish(&self) -> Result<()> {
+        ensure!(self.partial.is_empty(), "truncated return-stream frame");
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn encoded() -> Bytes {
+        let payload = stream::Frame::Data {
+            offset: 345,
+            fin: true,
+            data: vec![7; 32 * 1024],
+        }
+        .encode();
+        let mut queue = outbound::Queue::default();
+        enqueue(
+            QueuedRecord {
+                record: Record {
+                    flow: stream::data_flow(17),
+                    id: 42,
+                    payload,
+                },
+                created: Instant::now(),
+                hold: None,
+            },
+            &mut queue,
+        );
+        queue.pop(false).unwrap().data
+    }
+    #[test]
+    fn arbitrary_body_splits_and_coalescing() {
+        let encoded = encoded();
+        for size in [1, 7, 16, 997, 65536] {
+            let all = [encoded.as_ref(), encoded.as_ref()].concat();
+            let mut decoder = Decoder::default();
+            let mut records = Vec::new();
+            for chunk in all.chunks(size) {
+                let mut input = Bytes::copy_from_slice(chunk);
+                while let Some(record) = decoder.next(&mut input).unwrap() {
+                    records.push(record);
+                }
+                assert!(!input.has_remaining());
+            }
+            decoder.finish().unwrap();
+            assert_eq!(records.len(), 2);
+            assert_eq!(records[0].id, 42);
+            assert_eq!(records[0].flow, stream::data_flow(17));
+            assert_eq!(records[0].payload.len(), PAYLOAD);
+        }
+    }
+    #[test]
+    fn rejects_unbounded_non_data_and_truncation() {
+        let mut invalid = Bytes::from_static(&[255; 16]);
+        assert!(Decoder::default().next(&mut invalid).is_err());
+        let mut truncated = encoded().slice(..20);
+        let mut decoder = Decoder::default();
+        assert!(decoder.next(&mut truncated).unwrap().is_none());
+        assert!(decoder.finish().is_err());
+        let mut bad = encoded().to_vec();
+        bad[16] = 2;
+        assert!(Decoder::default().next(&mut Bytes::from(bad)).is_err());
+    }
+}

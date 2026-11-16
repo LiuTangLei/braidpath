@@ -584,6 +584,7 @@ pub(super) struct Mux {
     lifetime: Duration,
     drain: Drain,
     payload_limit: usize,
+    native_return: bool,
     blocked_until: Option<Instant>,
     accept_paused_until: Option<Instant>,
     stats: stream::Snapshot,
@@ -621,6 +622,7 @@ impl Mux {
             lifetime: policy.admission_lifetime(),
             drain: Drain::new(now),
             payload_limit: crate::runtime::MAX_PAYLOAD,
+            native_return: policy.native_return && scope.direction == crate::runtime::stats::RETURN,
             blocked_until: None,
             accept_paused_until: None,
             stats: stream::Snapshot::default(),
@@ -1550,7 +1552,12 @@ impl Mux {
                 continue;
             }
             let before_splits = s.send.pmtu_splits;
-            let Some(t) = s.send.poll_transmit_sized(now, self.payload_limit) else {
+            let transmit = if self.native_return {
+                s.send.poll_transmit_reliable(now, self.payload_limit)
+            } else {
+                s.send.poll_transmit_sized(now, self.payload_limit)
+            };
+            let Some(t) = transmit else {
                 idle += 1;
                 continue;
             };
@@ -1941,6 +1948,7 @@ mod tests {
 
     fn proxy_policy() -> Policy {
         Policy {
+            native_return: false,
             max_message_bytes: 1000,
             streams: false,
             proxy: true,
@@ -2986,6 +2994,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn bulk_local_backpressure_cannot_hide_a_tiny_interactive_record() {
         let policy = Policy {
+            native_return: false,
             max_message_bytes: 1000,
             streams: true,
             proxy: false,
@@ -3064,6 +3073,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn socket_reads_and_eof_progress_while_wire_input_stays_ready() {
         let policy = Policy {
+            native_return: false,
             max_message_bytes: 1000,
             streams: true,
             proxy: false,
