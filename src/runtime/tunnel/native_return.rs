@@ -24,6 +24,9 @@ const fn wire_cost(bytes: usize) -> usize {
     bytes + bytes.div_ceil(PACKET_PAYLOAD) * PACKET_ALLOWANCE
 }
 pub(super) const WINDOW: u32 = 4 * 1024 * 1024;
+// Receive credit amortizes WINDOW_UPDATE across an RTT. Keeping the outgoing
+// unacknowledged buffer smaller bounds how much one failed path can retain.
+pub(super) const SEND_WINDOW: u32 = 2 * 1024 * 1024;
 const PATH_QUEUE: usize = 4;
 
 pub(super) type Writer = mpsc::Sender<Flight>;

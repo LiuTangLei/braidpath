@@ -30,6 +30,18 @@ jobs:
       - run: cargo +stable check --all-targets --locked --features quinn/log
       - run: cargo +stable clippy --all-targets --locked -- -D warnings
       - run: cargo +stable test --all-targets --locked
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: socket-failure-${{ matrix.os }}
+          retention-days: 5
+          path: |
+            local/test-failures/**/fixture.log
+            local/test-failures/**/client.log
+            local/test-failures/**/server.log
+            local/test-failures/**/relay*.log
+            local/test-failures/**/client.jsonl
+            local/test-failures/**/server.jsonl
       - run: cargo +stable run --locked --example loss_recovery
   msrv:
     env:
