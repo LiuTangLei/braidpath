@@ -420,7 +420,7 @@ bidirectional echo after all configured paths are ready.
 
 ## Traffic modes
 
-The `client` and `mesh-client` commands offer opt-in policies. Existing defaults remain the normal policy. `--native-return-stream` negotiates a reliable HTTP/3 response body for TCP download DATA/FIN with 4 MiB receive credit and a 2 MiB outgoing unacknowledged-data limit per path. Uploads, stream acknowledgments, resets and UDP use the DATAGRAM carrier. Both endpoints must support and acknowledge the requested capability.
+The `client` and `mesh-client` commands offer opt-in policies. Existing defaults remain the normal policy. `--native-return-stream` negotiates a reliable HTTP/3 response body for TCP download DATA/FIN with a bounded 4 MiB per-path window. The carrier respects the same QUIC ACK-silence exclusion as DATAGRAM scheduling, so new data and repairs avoid an unresponsive route while another route is available. Uploads, stream acknowledgments, resets and UDP use the DATAGRAM carrier. Both endpoints must support and acknowledge the requested capability.
 
 `--game-mode` selects adaptive scheduling, automatic FEC and an 8 ms local sender admission deadline. UDP originals prefer the earliest available route; one immediate protection copy prefers another eligible route. Protection shares the operator limits and is bounded to the smaller of one quarter of the aggregate limit and 4 Mbps. It does not retransmit application UDP packets. Complete packets are delivered immediately; partial segmented messages retain bounded state for up to 250 ms so different network paths can recover a missing fragment. SOCKS UDP accepts whole packets within the negotiated message limit, with tunnel segmentation when needed; SOCKS FRAG requests remain unsupported.
 

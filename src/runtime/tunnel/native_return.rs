@@ -24,9 +24,6 @@ const fn wire_cost(bytes: usize) -> usize {
     bytes + bytes.div_ceil(PACKET_PAYLOAD) * PACKET_ALLOWANCE
 }
 pub(super) const WINDOW: u32 = 4 * 1024 * 1024;
-// Receive credit amortizes WINDOW_UPDATE across an RTT. Keeping the outgoing
-// unacknowledged buffer smaller bounds how much one failed path can retain.
-pub(super) const SEND_WINDOW: u32 = 2 * 1024 * 1024;
 const PATH_QUEUE: usize = 4;
 
 pub(super) type Writer = mpsc::Sender<Flight>;
@@ -102,6 +99,7 @@ pub(super) fn enqueue(item: QueuedRecord, queue: &mut outbound::Queue) {
 pub(super) fn drain(
     queue: &mut outbound::Queue,
     paths: &[OutPath],
+    silent: u8,
     cursor: &mut usize,
     pacer: &mut outbound::Pacer,
     groups: &mut [outbound::Pacer; super::MAX_PATHS],
@@ -122,7 +120,10 @@ pub(super) fn drain(
         }
         let ready = order.into_iter().find_map(|i| {
             let path = &paths[i];
-            if !path.open() || !groups[usize::from(path.group)].available(cost) {
+            if !path.open()
+                || silent & (1 << path.id) != 0
+                || !groups[usize::from(path.group)].available(cost)
+            {
                 return None;
             }
             let writer = path.native_return.as_ref()?;

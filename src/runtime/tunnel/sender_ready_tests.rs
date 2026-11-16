@@ -161,6 +161,66 @@ impl Wake for Wakes {
     }
 }
 
+#[tokio::test]
+async fn native_return_avoids_an_open_but_unresponsive_path_and_reuses_it_after_ack() {
+    let pair = Pair::connect().await;
+    let mut first = pair.path();
+    let mut second = pair.path();
+    second.id = 1;
+    let (tx0, rx0) = native_return::channel();
+    let (tx1, rx1) = native_return::channel();
+    first.native_return = Some(tx0);
+    second.native_return = Some(tx1);
+    let paths = [first, second];
+    let mut queue = outbound::Queue::default();
+    let mut cursor = 0;
+    let mut pacer = outbound::Pacer::for_sender(10_000_000, native_return::BURST);
+    let mut groups =
+        std::array::from_fn(|_| outbound::Pacer::for_sender(10_000_000, native_return::BURST));
+    pacer.refill(1_000_000);
+    for group in &mut groups {
+        group.refill(1_000_000);
+    }
+    for (id, silent) in [(1, 1), (2, 0)] {
+        native_return::enqueue(
+            QueuedRecord {
+                record: Record {
+                    flow: stream::data_flow(1),
+                    id,
+                    payload: stream::Frame::Data {
+                        offset: id * 64,
+                        fin: false,
+                        data: vec![7; 64],
+                    }
+                    .encode(),
+                },
+                created: Instant::now(),
+                hold: None,
+            },
+            &mut queue,
+        );
+        native_return::drain(
+            &mut queue,
+            &paths,
+            silent,
+            &mut cursor,
+            &mut pacer,
+            &mut groups,
+        );
+        assert!(queue.front(false).is_none());
+        assert_eq!(
+            rx1.len(),
+            1,
+            "the first frame must use the responsive fallback"
+        );
+        assert_eq!(
+            rx0.len(),
+            if silent == 0 { 1 } else { 0 },
+            "clearing ACK-silence must make the original route usable again"
+        );
+    }
+}
+
 const FILLER: &[u8; 1100] = &[0xa5; 1100];
 
 fn block_and_poll(wait: &mut WaitingSend, paths: &Paths, lifetime: Duration) -> Arc<Wakes> {

@@ -2466,6 +2466,7 @@ async fn sender(
         native_return::drain(
             &mut native_queue,
             &paths,
+            silent,
             &mut native_cursor,
             &mut pacer,
             &mut groups,
@@ -4341,7 +4342,7 @@ async fn server_connection(
                                 if let Some(scheduler)=quality_schedule {response=response.header("braidpath-scheduler",scheduler);}stream.send_response(response.body(())?).await?;
                                 let (send,recv)=stream.split();
                                 if let Some(reader)=return_reader {
-                                    conn.set_send_window(u64::from(native_return::SEND_WINDOW));
+                                    conn.set_send_window(u64::from(native_return::WINDOW));
                                     return_tasks.spawn(native_return::write(conn.clone(),send,reader));
                                 } else { response_send=Some(send); }
                                 request=Some(recv);
