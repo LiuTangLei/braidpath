@@ -2684,7 +2684,11 @@ impl PathController {
                 self.congestion_seen |= service_deficit
                     || backlogged_queue
                     || (self.pressure_episode_exercised == Some(true) && capacity_evidence);
-                if self.congestion_seen {
+                // ACK/status traffic may still trigger a queue brake, but its
+                // application-limited service cannot size a later bulk flight.
+                // Keep any ceiling already measured under real data demand.
+                if self.congestion_seen && (observation.bulk_backlog || observation.startup_backlog)
+                {
                     let delivered = self
                         .latest_delivery_bps
                         .map_or(0.0, |rate| rate * self.wire_per_symbol)
@@ -4452,6 +4456,7 @@ mod tests {
         sample.report_number = 1;
         sample.delivered_bytes = 0;
         sample.delivered_bps = None;
+        sample.bulk_backlog = true;
         controller.observe_native(&sample, None, 12_000, 50_000);
         // A previously cautious path can have ample native service even when
         // its application allowance remains small. No brake is pending here.
@@ -4940,6 +4945,34 @@ mod tests {
         controller.congestion_delivery_bps = Some(controller.rate_bps as f64);
         controller.observe_native_service(&sample, 2_000_000, 50_000);
         assert_eq!(controller.native_service_recoveries, 0);
+    }
+
+    #[test]
+    fn ack_only_queue_brake_does_not_measure_bulk_capacity() {
+        for measured in [None, Some(8_000_000.0)] {
+            let (mut controller, mut sample) = native_service_fixture();
+            controller.congestion_delivery_bps = measured;
+            sample.bulk_backlog = false;
+            sample.startup_backlog = false;
+            controller.observe_native_service(&sample, 200_000, 50_000);
+            let before = controller.rate_bps;
+            for now in [200_000, 300_000, 400_000] {
+                let admitted = exercise_budget(&mut controller, sample.now_us, now - sample.now_us);
+                sample.now_us = now;
+                sample.report_number += 1;
+                sample.delivered_bytes += admitted;
+                sample.delivered_bps = Some(admitted as f64 * 80.0);
+                sample.delivery_report_time_us = Some(now);
+                sample.rtt_ms = 150.0;
+                sample.probe_rtt_ms = Some(150.0);
+                sample.probe_latest_rtt_ms = Some(150.0);
+                sample.probe_sample_id += 1;
+                controller.observe_native_service(&sample, 2_000_000, 150_000);
+            }
+            assert!(controller.rate_bps < before);
+            assert!(controller.last_brake_us.is_some());
+            assert_eq!(controller.congestion_delivery_bps, measured);
+        }
     }
 
     #[test]
@@ -12202,6 +12235,7 @@ mod tests {
     #[test]
     fn a_congested_brake_records_the_delivery_it_could_not_exceed() {
         let (mut controller, mut sample) = paired_loss_service_fixture();
+        sample.bulk_backlog = true;
         sample.delivered_bytes = 3_500_000;
         sample.delivered_bps = Some(7_800_000.0);
         controller.observe(&sample);
