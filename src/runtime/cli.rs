@@ -1354,7 +1354,9 @@ impl PolicyArgs {
             policy.quality_schedule = true;
             policy.fec = super::automatic_fec::AUTO;
             policy.latency_target_ms = 20;
-            policy.queue_ms = 20;
+            // Sending still expires at min(queue, latency_target) = 20 ms.
+            // Keep cross-path FEC state as long as the regular proxy profile.
+            policy.queue_ms = 100;
             policy.block_ms = 1;
         }
         policy
@@ -1390,10 +1392,41 @@ mod aggregate_cli_tests {
         assert!(p.game_mode && p.adaptive && p.receiver_feedback && p.quality_schedule);
         assert!(!p.native_return);
         assert_eq!(p.fec, super::super::automatic_fec::AUTO);
-        assert_eq!((p.queue_ms, p.latency_target_ms, p.block_ms), (20, 20, 1));
+        assert_eq!((p.queue_ms, p.latency_target_ms, p.block_ms), (100, 20, 1));
         assert_eq!(p.rate, 8_000_000);
         assert!(p.validate().is_ok());
         assert!(Cli::try_parse_from(args.into_iter().chain(["--queue-ms", "20"])).is_err());
+
+        // Retaining repair state is independent of delivering an original:
+        // the first packet must be immediate, while a different path's repair
+        // can still recover a missing packet 60 ms later.
+        use super::super::wire::{Receiver, Record, shard};
+        use std::time::{Duration, Instant};
+        let now = Instant::now();
+        let records: Vec<_> = (0..2)
+            .map(|id| Record {
+                flow: 7,
+                id,
+                payload: vec![id as u8; 17],
+            })
+            .collect();
+        let mut encoder = crate::fec::Encoder::new(2, Duration::from_millis(1)).unwrap();
+        let symbols: Vec<_> = records
+            .iter()
+            .flat_map(|record| encoder.push(&record.encode().unwrap(), now).unwrap())
+            .map(shard)
+            .collect();
+        let mut receiver = Receiver::configured(Duration::from_millis(p.queue_ms), false);
+        assert_eq!(
+            receiver.receive(&symbols[0], now).unwrap(),
+            vec![records[0].clone()]
+        );
+        assert_eq!(
+            receiver
+                .receive(&symbols[2], now + Duration::from_millis(60))
+                .unwrap(),
+            vec![records[1].clone()]
+        );
     }
 
     #[test]
