@@ -20,6 +20,7 @@ pub(super) struct Pacer {
     prev: Instant,
     rate: Option<u64>,
     waiting_until: Option<Instant>,
+    stream_backlogged: bool,
     observation: Observation,
 }
 
@@ -44,6 +45,7 @@ impl Pacer {
             prev: now,
             rate: None,
             waiting_until: None,
+            stream_backlogged: false,
             observation: Observation::default(),
         }
     }
@@ -56,6 +58,14 @@ impl Pacer {
             self.rate = rate;
             self.last_window = 0; // Recompute and clamp the burst before sending.
             self.waiting_until = None;
+        }
+    }
+
+    pub(super) fn set_stream_backlogged(&mut self, active: bool) {
+        if self.stream_backlogged != active {
+            self.waiting_until = None;
+            self.tokens = self.tokens.min(self.capacity);
+            self.stream_backlogged = active;
         }
     }
 
@@ -107,8 +117,9 @@ impl Pacer {
             let elapsed = now.checked_duration_since(self.prev).unwrap_or_default();
             let refill =
                 (elapsed.as_nanos() * rate as u128 / 1_000_000_000).min(u64::MAX as u128) as u64;
-            self.observe_refill(now, refill, self.capacity);
-            self.tokens = self.tokens.saturating_add(refill).min(self.capacity);
+            let limit = self.refill_limit(now, rate, mtu);
+            self.observe_refill(now, refill, limit);
+            self.tokens = self.tokens.saturating_add(refill).min(limit);
             self.prev = now;
             if self.tokens >= bytes_to_send {
                 return None;
@@ -158,6 +169,25 @@ impl Pacer {
         // divisions come before multiplications to prevent overflow
         // this is the time at which the pacing window becomes empty
         Some(self.prev + (unscaled_delay / 5) * 4)
+    }
+
+    fn refill_limit(&self, now: Instant, rate: u64, mtu: u16) -> u64 {
+        let due = self.stream_backlogged
+            && self
+                .waiting_until
+                .and_then(|at| now.checked_duration_since(at))
+                .is_some_and(|late| late <= Duration::from_millis(20));
+        if !due {
+            return self.capacity;
+        }
+        // Retain at most one extra interval of earned service after a late
+        // backlogged wake. Idle credit, normal wake deadlines and rate remain
+        // unchanged; the native congestion window still bounds in-flight data.
+        let extra = (u128::from(rate) * BURST_INTERVAL_NANOS / 1_000_000_000)
+            .min(u128::from(self.capacity)) as u64;
+        self.capacity
+            .saturating_add(extra)
+            .min(MAX_BURST_SIZE * u64::from(mtu))
     }
 
     fn observe_refill(&mut self, now: Instant, refill: u64, limit: u64) {
@@ -237,6 +267,133 @@ const MAX_BURST_SIZE: u64 = 256;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn datagrams_keep_the_original_bucket_after_late_wakes_and_streams() {
+        let at = Instant::now();
+        let rtt = Duration::from_millis(100);
+        let window = 20 * 1024 * 1024;
+        let mut p = Pacer::new(rtt, window, 1000, at);
+        p.set_rate(Some(10_000_000));
+        for _ in 0..20 {
+            assert_eq!(p.delay(rtt, 1000, 1000, window, at), None);
+            p.on_transmit(1000);
+        }
+        assert!(p.delay(rtt, 1000, 1000, window, at).is_some());
+        let late = at + Duration::from_millis(3);
+        assert_eq!(p.delay(rtt, 1000, 1000, window, late), None);
+        assert_eq!(
+            p.tokens, 20_000,
+            "DATAGRAM does not gain stream catch-up credit"
+        );
+        p.set_stream_backlogged(true);
+        p.tokens = 30_000;
+        p.set_stream_backlogged(false);
+        assert_eq!(
+            p.tokens, 20_000,
+            "stream credit cannot leak into DATAGRAM traffic"
+        );
+    }
+    #[test]
+    fn a_three_ms_wake_delivers_three_ms_of_modeled_credit() {
+        let start = Instant::now();
+        let rtt = Duration::from_millis(100);
+        let window = 20 * 1024 * 1024;
+        let mut p = Pacer::new(rtt, window, 1000, start);
+        p.set_rate(Some(10_000_000));
+        p.set_stream_backlogged(true);
+        for _ in 0..20 {
+            assert_eq!(p.delay(rtt, 1000, 1000, window, start), None);
+            p.on_transmit(1000);
+        }
+        assert_eq!(
+            p.delay(rtt, 1000, 1000, window, start),
+            Some(start + Duration::from_millis(2))
+        );
+        let late = start + Duration::from_millis(3);
+        let mut count = 0;
+        while p.delay(rtt, 1000, 1000, window, late).is_none() {
+            p.on_transmit(1000);
+            count += 1;
+            assert!(count < 100);
+        }
+        assert_eq!(
+            count, 30,
+            "timer lateness must not throw away earned pacing service"
+        );
+    }
+
+    #[test]
+    fn late_credit_is_bounded_and_idle_or_rate_changes_do_not_bank_it() {
+        let at = Instant::now();
+        let rtt = Duration::from_millis(100);
+        let window = 20 * 1024 * 1024;
+        fn send(p: &mut Pacer, now: Instant, rtt: Duration, window: u64) -> u64 {
+            let mut n = 0;
+            while p.delay(rtt, 1000, 1000, window, now).is_none() {
+                p.on_transmit(1000);
+                n += 1;
+                assert!(n < 1000);
+            }
+            n
+        }
+        let mut p = Pacer::new(rtt, window, 1000, at);
+        p.set_rate(Some(10_000_000));
+        p.set_stream_backlogged(true);
+        assert_eq!(send(&mut p, at, rtt, window), 20);
+        assert_eq!(
+            send(&mut p, at + Duration::from_millis(10), rtt, window),
+            40,
+            "large scheduling stalls cannot create an unbounded burst"
+        );
+        let mut idle = Pacer::new(rtt, window, 1000, at);
+        idle.set_rate(Some(10_000_000));
+        idle.set_stream_backlogged(true);
+        for _ in 0..20 {
+            assert_eq!(idle.delay(rtt, 1000, 1000, window, at), None);
+            idle.on_transmit(1000);
+        }
+        assert_eq!(
+            send(&mut idle, at + Duration::from_secs(1), rtt, window),
+            20,
+            "idle is the original bucket"
+        );
+        let mut changed = Pacer::new(rtt, window, 1000, at);
+        changed.set_rate(Some(10_000_000));
+        changed.set_stream_backlogged(true);
+        send(&mut changed, at, rtt, window);
+        let later = at + Duration::from_millis(3);
+        assert_eq!(changed.delay(rtt, 1000, 1000, window, later), None);
+        changed.set_rate(Some(1_000_000));
+        assert_eq!(
+            send(&mut changed, later, rtt, window),
+            10,
+            "a lower rate clamps late credit immediately"
+        );
+    }
+    #[test]
+    fn repeated_late_wakes_retain_service_without_exceeding_the_rate() {
+        let at = Instant::now();
+        let rtt = Duration::from_millis(100);
+        let window = 20 * 1024 * 1024;
+        let mut now = at;
+        let mut p = Pacer::new(rtt, window, 1000, at);
+        p.set_rate(Some(10_000_000));
+        p.set_stream_backlogged(true);
+        let mut sent = 0u64;
+        for gap in [0, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3] {
+            now += Duration::from_millis(gap);
+            let mut n = 0;
+            while p.delay(rtt, 1000, 1000, window, now).is_none() {
+                p.on_transmit(1000);
+                sent += 1000;
+                n += 1;
+                assert!(n <= 40);
+            }
+            let earned = 20_000 + (now - at).as_micros() as u64 * 10;
+            assert_eq!(sent, earned);
+        }
+    }
 
     #[test]
     fn modeled_rate_does_not_send_an_inflated_window_per_rtt() {
