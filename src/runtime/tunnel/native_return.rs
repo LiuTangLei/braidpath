@@ -26,7 +26,7 @@ pub(super) const BURST: usize = wire_cost(PAYLOAD + HEADER_BYTES);
 const fn wire_cost(bytes: usize) -> usize {
     bytes + bytes.div_ceil(PACKET_PAYLOAD) * PACKET_ALLOWANCE
 }
-pub(super) const WINDOW: u32 = 2 * 1024 * 1024;
+pub(super) const WINDOW: u32 = 4 * 1024 * 1024;
 const PATH_QUEUE: usize = 4;
 
 #[derive(Clone)]
@@ -104,6 +104,11 @@ pub(super) fn requested(headers: &http::HeaderMap) -> Result<bool> {
 }
 pub(super) fn data(flow: u32, payload: &[u8]) -> bool {
     stream::stream_id(flow).is_some() && !stream::is_ack_flow(flow) && payload.first() == Some(&0)
+}
+pub(super) fn bulk_data(flow: u32, payload: &[u8]) -> bool {
+    // An ACK request must bypass a full native response body. It retains no
+    // payload and uses the same short DATAGRAM lane as other stream control.
+    data(flow, payload) && !stream::is_ack_request(payload)
 }
 pub(super) fn enqueue(item: QueuedRecord, queue: &mut outbound::Queue) {
     let QueuedRecord {
@@ -312,6 +317,20 @@ mod tests {
         assert!(cap.available(wire_cost(PAYLOAD + HEADER_BYTES)));
         cap.spend(wire_cost(PAYLOAD + HEADER_BYTES));
         assert!(!cap.available(wire_cost(PAYLOAD + HEADER_BYTES)));
+    }
+
+    #[test]
+    fn an_empty_ack_request_bypasses_native_data_but_a_fin_keeps_its_carrier() {
+        for fin in [false, true] {
+            let payload = stream::Frame::Data {
+                offset: 32768,
+                fin,
+                data: vec![],
+            }
+            .encode();
+            assert!(data(stream::data_flow(1), &payload));
+            assert_eq!(bulk_data(stream::data_flow(1), &payload), fin);
+        }
     }
 
     #[test]

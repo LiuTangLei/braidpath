@@ -77,6 +77,9 @@ pub fn ack_flow(id: u32) -> u32 {
 pub fn is_ack_flow(flow: u32) -> bool {
     stream_id(flow).is_some() && flow & ACK_FLAG != 0
 }
+pub(crate) fn is_ack_request(payload: &[u8]) -> bool {
+    payload.len() == DATA_HEADER && payload[..2] == [DATA, 0]
+}
 /// The stream identifier of a stream-lane record, if it is one.
 pub fn stream_id(flow: u32) -> Option<u32> {
     (flow & STREAM_FLAG != 0 && flow & !(STREAM_FLAG | ACK_FLAG | MAX_STREAM_ID) == 0)
@@ -528,11 +531,12 @@ impl Sender {
     fn awaiting_peer(&self) -> bool {
         !self.segments.is_empty() || self.needs_probe()
     }
-    /// Nothing retained is in flight, yet the peer must still respond.
+    /// Ask for lost stream ACKs even when native QUIC owns payload recovery.
     fn needs_probe(&self) -> bool {
-        self.segments.is_empty()
-            && ((self.open_pending && self.open_sent)
-                || (self.next < self.written && self.next >= self.limit))
+        !self.reliable_flight.is_empty()
+            || (self.segments.is_empty()
+                && ((self.open_pending && self.open_sent)
+                    || (self.next < self.written && self.next >= self.limit)))
     }
     fn threshold(&self, now: Instant) -> Duration {
         self.rtt.high(now).mul_f64(self.reorder) + Duration::from_millis(2)
@@ -837,6 +841,7 @@ impl Sender {
         if segment.reliable.is_some() {
             segment.deadline = None;
             self.reliable_flight.insert(start);
+            self.probe_at.get_or_insert(at);
         } else if segment.stalls == 0 {
             segment.deadline = None;
             self.fresh[path].insert((at, start));
@@ -1553,11 +1558,12 @@ mod tests {
             replacement.clone(),
         );
         sender.on_timeout(later + Duration::from_millis(300));
-        assert!(
-            sender
-                .poll_transmit_reliable(later + Duration::from_millis(300), RELIABLE_PAYLOAD)
-                .is_none()
-        );
+        if let Some(probe) =
+            sender.poll_transmit_reliable(later + Duration::from_millis(300), RELIABLE_PAYLOAD)
+        {
+            assert!(is_ack_request(&probe.frame.encode()));
+            assert!(!probe.retransmission);
+        }
         assert!(
             !sender.locally_dropped(0, 1),
             "stale cancellation cannot replace the new owner"
@@ -1608,6 +1614,32 @@ mod tests {
         let later = at + Duration::from_millis(230);
         datagram.on_timeout(later);
         assert!(datagram.poll_transmit(later).unwrap().retransmission);
+    }
+
+    #[test]
+    fn native_delivery_still_requests_an_ack_when_the_stream_ack_was_lost() {
+        let at = Instant::now();
+        let mut sender = Sender::new(false);
+        sender.push(&vec![7; 32 * 1024]);
+        let sent = sender.poll_transmit_reliable(at, RELIABLE_PAYLOAD).unwrap();
+        sender.admitted_reliable(
+            sent.start,
+            sent.transmission,
+            0,
+            Duration::from_millis(100),
+            at,
+            Arc::new(AtomicBool::new(true)),
+        );
+        // QUIC delivery can succeed while the separate DATAGRAM stream ACK
+        // disappears. Request another ACK without sending the payload again.
+        let later = at + Duration::from_millis(600);
+        sender.on_timeout(later);
+        let probe = sender
+            .poll_transmit_reliable(later, RELIABLE_PAYLOAD)
+            .expect("a native flight still needs end-to-end ACK recovery");
+        assert!(matches!(probe.frame, Frame::Data { fin: false, ref data, .. } if data.is_empty()));
+        assert!(!probe.retransmission);
+        assert_eq!(probe.transmission, 0);
     }
 
     #[test]

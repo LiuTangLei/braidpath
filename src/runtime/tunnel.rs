@@ -1886,7 +1886,7 @@ async fn sender(
                 metrics.update(|d| d.records.sender_input_consumed += 1);
                 metrics.trace_record(trace::Stage::SenderInput, &record, None, None);
                 if native_returning
-                    && native_return::data(record.flow, &record.payload)
+                    && native_return::bulk_data(record.flow, &record.payload)
                     && !hold.as_ref().is_some_and(|hold| hold.interactive())
                 {
                     native_return::enqueue(
