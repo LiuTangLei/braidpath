@@ -565,8 +565,8 @@ fn client_with_alpn_and_ack(
     transport.datagram_send_buffer_size(datagram_send_buffer_bytes);
     ack_request.apply(&mut transport);
     if native_return {
-        transport.receive_window((4u32 * 1024 * 1024).into());
-        transport.stream_receive_window((4u32 * 1024 * 1024).into());
+        transport.receive_window(super::tunnel::NATIVE_RETURN_WINDOW.into());
+        transport.stream_receive_window(super::tunnel::NATIVE_RETURN_WINDOW.into());
     }
     conf.transport_config(Arc::new(transport));
     let s = Socket::new(

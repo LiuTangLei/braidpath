@@ -25,7 +25,6 @@ const DATA_HEADER: usize = 10;
 pub const MAX_SEGMENT: usize = MAX_PAYLOAD - DATA_HEADER;
 /// Negotiated reliable carriers may amortize framing over larger chunks.
 pub(crate) const RELIABLE_PAYLOAD: usize = 32 * 1024 + DATA_HEADER;
-pub(crate) const RELIABLE_FRONTIER: u64 = 64 * 1024;
 /// Both peers assume this window before the first acknowledgment.
 pub const INITIAL_WINDOW: u64 = 256 * 1024;
 /// A stream's flight plus the data held behind one hole while it is repaired,
@@ -657,26 +656,11 @@ impl Sender {
     pub(crate) fn poll_transmit_sized(&mut self, now: Instant, payload: usize) -> Option<Transmit> {
         self.poll_transmit_limited(now, payload, super::MAX_STREAM_PAYLOAD)
     }
-    #[cfg(test)]
     pub(crate) fn poll_transmit_reliable(
         &mut self,
         now: Instant,
         payload: usize,
     ) -> Option<Transmit> {
-        self.poll_transmit_limited(now, payload, RELIABLE_PAYLOAD)
-    }
-    /// Keep connection setup and short responses on the datagram lane. Only
-    /// offsets at or above this frontier may use large reliable chunks.
-    pub(crate) fn poll_transmit_return(
-        &mut self,
-        now: Instant,
-        datagram_payload: usize,
-    ) -> Option<Transmit> {
-        let payload = if self.next < RELIABLE_FRONTIER {
-            datagram_payload.min((RELIABLE_FRONTIER - self.next) as usize + DATA_HEADER)
-        } else {
-            RELIABLE_PAYLOAD
-        };
         self.poll_transmit_limited(now, payload, RELIABLE_PAYLOAD)
     }
     fn poll_transmit_limited(
@@ -1416,35 +1400,6 @@ impl Receiver {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn return_frontier_keeps_short_data_and_repairs_datagram_sized() {
-        let now = Instant::now();
-        let mut sender = Sender::new(false);
-        sender.push(&vec![5; 128 * 1024]);
-        let mut large = false;
-        while let Some(t) = sender.poll_transmit_return(now, 1347) {
-            let Frame::Data { offset, data, .. } = t.frame else {
-                panic!("data")
-            };
-            if offset < RELIABLE_FRONTIER {
-                assert!(data.len() <= 1337);
-                assert!(offset + data.len() as u64 <= RELIABLE_FRONTIER);
-            } else {
-                large |= data.len() == RELIABLE_PAYLOAD - DATA_HEADER;
-            }
-        }
-        assert!(large);
-        // A repair from the initial flight keeps its original small extent,
-        // even after the new-data frontier moved into the reliable lane.
-        sender.mark_lost(0);
-        let t = sender.poll_transmit_return(now, 1347).unwrap();
-        let Frame::Data { offset, data, .. } = t.frame else {
-            panic!("data")
-        };
-        assert_eq!(offset, 0);
-        assert!(data.len() <= 1337);
-    }
 
     #[test]
     fn reliable_chunks_do_not_raise_the_datagram_segment_bound() {

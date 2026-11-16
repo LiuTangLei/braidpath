@@ -43,6 +43,7 @@ const WIRE_QUEUE: usize = 4096;
 const SESSION_IDLE_GRACE: Duration = Duration::from_secs(120);
 const SESSION_PATH: &str = "/session";
 pub(crate) const STREAM_ALPN: &[u8] = b"braidpath-stream/2";
+pub(crate) const NATIVE_RETURN_WINDOW: u32 = native_return::WINDOW;
 // An authenticated stream/2 owner is discarding this epoch, rather than
 // temporarily replacing a transport path. Its remote stream budget can end now.
 const STREAM_SESSION_STOP: u32 = 0x4250;
@@ -1846,7 +1847,7 @@ async fn sender(
                 };
                 metrics.update(|d| d.records.sender_input_consumed += 1);
                 metrics.trace_record(trace::Stage::SenderInput, &record, None, None);
-                if native_returning && native_return::bulk_data(record.flow, &record.payload) {
+                if native_returning && native_return::data(record.flow, &record.payload) {
                     native_return::enqueue(
                         QueuedRecord {
                             record,
@@ -3585,10 +3586,11 @@ async fn session_loop(
         }
         if let Some(mux) = streams.as_mut() {
             mux.service_io();
-            mux.set_payload_limit(stream_payload_limit(
-                &session.paths,
-                session.policy.receiver_feedback,
-            ));
+            mux.set_payload_limit(if session.policy.native_return {
+                native_return::PAYLOAD
+            } else {
+                stream_payload_limit(&session.paths, session.policy.receiver_feedback)
+            });
             mux.flush(&mut tcp::Out {
                 tx: &tx,
                 next_id: &mut next_id,
@@ -4285,7 +4287,7 @@ async fn server_connection(
                                 let (send,recv)=stream.split();
                                 if let Some(reader)=return_reader {
                                     conn.set_send_window(u64::from(native_return::WINDOW));
-                                    return_tasks.spawn(native_return::write(conn.clone(),send,reader,pid));
+                                    return_tasks.spawn(native_return::write(conn.clone(),send,reader));
                                 } else { response_send=Some(send); }
                                 request=Some(recv);
                                 if let Some(authenticated)=authenticated.take() {let _=authenticated.send(());}

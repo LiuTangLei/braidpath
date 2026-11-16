@@ -16,11 +16,38 @@ pub(super) const HEADER: &str = "braidpath-return-stream";
 pub(super) const PAYLOAD: usize = stream::RELIABLE_PAYLOAD;
 const HEADER_BYTES: usize = 16;
 pub(super) const BURST: usize = PAYLOAD + HEADER_BYTES + 128;
-pub(super) const WINDOW: u32 = 4 * 1024 * 1024;
+pub(super) const WINDOW: u32 = 2 * 1024 * 1024;
 const PATH_QUEUE: usize = 4;
 
-pub(super) type Writer = mpsc::Sender<outbound::Pending>;
-pub(super) type Reader = mpsc::Receiver<outbound::Pending>;
+pub(super) type Writer = mpsc::Sender<Flight>;
+pub(super) type Reader = mpsc::Receiver<Flight>;
+
+/// Retains the stream's failure callback while the bounded native writer owns
+/// the payload, without retaining its producer-queue reservation.
+pub(super) struct Flight {
+    pending: outbound::Pending,
+    written: bool,
+}
+impl Flight {
+    fn new(pending: outbound::Pending, path: u8, rtt: std::time::Duration) -> Self {
+        if let Some(hold) = &pending.hold {
+            hold.reliable_handoff(path, rtt, Instant::now());
+        }
+        Self {
+            pending,
+            written: false,
+        }
+    }
+}
+impl Drop for Flight {
+    fn drop(&mut self) {
+        if !self.written
+            && let Some(hold) = &self.pending.hold
+        {
+            hold.reliable_cancel();
+        }
+    }
+}
 pub(super) fn channel() -> (Writer, Reader) {
     mpsc::channel(PATH_QUEUE)
 }
@@ -35,12 +62,6 @@ pub(super) fn requested(headers: &http::HeaderMap) -> Result<bool> {
 }
 pub(super) fn data(flow: u32, payload: &[u8]) -> bool {
     stream::stream_id(flow).is_some() && !stream::is_ack_flow(flow) && payload.first() == Some(&0)
-}
-pub(super) fn bulk_data(flow: u32, payload: &[u8]) -> bool {
-    data(flow, payload)
-        && payload.get(2..10).is_some_and(|bytes| {
-            u64::from_be_bytes(bytes.try_into().expect("offset")) >= stream::RELIABLE_FRONTIER
-        })
 }
 pub(super) fn enqueue(item: QueuedRecord, queue: &mut outbound::Queue) {
     let QueuedRecord {
@@ -101,7 +122,7 @@ pub(super) fn drain(
         let pending = queue.pop(false).expect("native queue front");
         pacer.spend(cost);
         groups[usize::from(paths[i].group)].spend(cost);
-        permit.send(pending);
+        permit.send(Flight::new(pending, paths[i].id, paths[i].conn.rtt_hint()));
         *cursor = (i + 1) % paths.len();
     }
 }
@@ -110,20 +131,17 @@ pub(super) async fn write(
     conn: quinn::Connection,
     mut stream: h3::server::RequestStream<h3_quinn::SendStream<Bytes>, Bytes>,
     mut input: Reader,
-    path: u8,
 ) {
-    while let Some(pending) = input.recv().await {
+    while let Some(mut flight) = input.recv().await {
         let result = tokio::select! {
-            result = stream.send_data(pending.data.clone()) => result,
+            result = stream.send_data(flight.pending.data.clone()) => result,
             _ = conn.closed() => break,
         };
         if result.is_err() {
             conn.close(0u32.into(), b"return stream failed");
             break;
         }
-        if let Some(hold) = &pending.hold {
-            hold.admitted(path, conn.rtt_hint(), Instant::now());
-        }
+        flight.written = true;
     }
 }
 
@@ -225,6 +243,46 @@ mod tests {
         );
         queue.pop(false).unwrap().data
     }
+    #[test]
+    fn blocked_native_writer_cannot_pin_the_shared_producer() {
+        for written in [false, true] {
+            let gauge = Arc::new(outbound::Gauge::default());
+            let hold = gauge.hold(9, 123, 1, PAYLOAD, false, false);
+            let pending = outbound::Pending {
+                data: Bytes::from_static(b"payload"),
+                created: Instant::now(),
+                record_id: Some(1),
+                flow: Some(stream::data_flow(9)),
+                block: None,
+                small: false,
+                hold: Some(hold),
+            };
+            let mut flight = Flight::new(pending, 2, std::time::Duration::from_millis(100));
+            assert_eq!(
+                gauge.queued(),
+                0,
+                "a blocked writer cannot block other paths' production"
+            );
+            let sent = gauge.take_sent();
+            assert_eq!(sent.len(), 1);
+            assert_eq!(sent[0].path, 2);
+            flight.written = written;
+            drop(flight);
+            if written {
+                assert_eq!(gauge.admitted(), PAYLOAD as u64);
+                assert!(gauge.take_dropped().is_empty());
+            } else {
+                assert_eq!(gauge.admitted(), 0);
+                assert_eq!(gauge.take_dropped(), vec![(9, 123, 1)]);
+            }
+            assert_eq!(
+                gauge.queued(),
+                0,
+                "release exactly once on success or cancellation"
+            );
+        }
+    }
+
     #[test]
     fn arbitrary_body_splits_and_coalescing() {
         let encoded = encoded();

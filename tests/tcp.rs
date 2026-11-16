@@ -750,6 +750,7 @@ fn native_return_keeps_upload_half_close_udp_and_survives_one_path_closing() {
         writer.shutdown(Shutdown::Write).unwrap();
     });
     let mut got = read_exact_or_eof(&mut conn, 32768);
+    let interrupted_at = Instant::now();
     // Retire the relay during this same transfer; the direct path remains.
     topology._processes[1].child.kill().unwrap();
     topology._processes[1].child.wait().unwrap();
@@ -761,6 +762,10 @@ fn native_return_keeps_upload_half_close_udp_and_survives_one_path_closing() {
     conn.read_to_end(&mut got).unwrap();
     upload.join().unwrap();
     assert_eq!(got, expected);
+    assert!(
+        interrupted_at.elapsed() < Duration::from_secs(8),
+        "surviving path waited for native idle expiry"
+    );
     let echo = udp_echo();
     let (_control, relay) = associate(&proxy);
     let socket = UdpSocket::bind("127.0.0.1:0").unwrap();

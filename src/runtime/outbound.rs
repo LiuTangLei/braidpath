@@ -83,6 +83,7 @@ impl Gauge {
             interactive,
             local_retry,
             admitted: AtomicBool::new(false),
+            queue_reserved: AtomicBool::new(true),
         })
     }
 }
@@ -95,6 +96,7 @@ pub struct Hold {
     interactive: bool,
     local_retry: bool,
     admitted: AtomicBool,
+    queue_reserved: AtomicBool,
 }
 impl Hold {
     pub fn transmission(&self) -> u32 {
@@ -105,6 +107,25 @@ impl Hold {
     }
     pub fn local_retry(&self) -> bool {
         self.local_retry
+    }
+    /// A bounded reliable writer now owns this frame. Give end-to-end repair
+    /// its chosen path immediately; native flow-control waits must not pin the
+    /// shared producer watermark or leave the segment on an unknown path.
+    pub(crate) fn reliable_handoff(&self, path: u8, rtt: Duration, at: Instant) {
+        self.admitted(path, rtt, at);
+        self.release_queue();
+    }
+    /// The reliable writer dropped the frame before completing its write.
+    pub(crate) fn reliable_cancel(&self) {
+        self.admitted.store(false, Ordering::Release);
+    }
+    fn release_queue(&self) {
+        if self.queue_reserved.swap(false, Ordering::AcqRel) {
+            let before = self.gauge.queued.fetch_sub(self.bytes, Ordering::AcqRel);
+            if before - self.bytes <= self.gauge.low_water.load(Ordering::Acquire) {
+                self.gauge.notify.notify_one();
+            }
+        }
     }
     pub fn admitted(&self, path: u8, rtt: Duration, at: Instant) {
         if !self.admitted.swap(true, Ordering::AcqRel) {
@@ -136,8 +157,8 @@ impl Drop for Hold {
                 .expect("gauge lock")
                 .push(self.identity);
         }
-        let before = gauge.queued.fetch_sub(self.bytes, Ordering::AcqRel);
-        if !admitted || before - self.bytes <= gauge.low_water.load(Ordering::Acquire) {
+        self.release_queue();
+        if !admitted {
             gauge.notify.notify_one();
         }
     }
