@@ -43,7 +43,7 @@ const WIRE_QUEUE: usize = 4096;
 const SESSION_IDLE_GRACE: Duration = Duration::from_secs(120);
 const SESSION_PATH: &str = "/session";
 pub(crate) const STREAM_ALPN: &[u8] = b"braidpath-stream/2";
-pub(crate) const NATIVE_RETURN_WINDOW: u32 = native_return::WINDOW;
+pub(crate) const NATIVE_RETURN_WINDOW: u32 = native_return::RECEIVE_WINDOW;
 // An authenticated stream/2 owner is discarding this epoch, rather than
 // temporarily replacing a transport path. Its remote stream budget can end now.
 const STREAM_SESSION_STOP: u32 = 0x4250;
@@ -1717,6 +1717,7 @@ async fn sender(
     let mut profile = profile::Sender::new(metrics.direction);
     let mut waiting: Option<WaitingSend> = None;
     let mut liveness: [liveness::Liveness; MAX_PATHS] = Default::default();
+    let mut native_credit: [native_return::Credit; MAX_PATHS] = Default::default();
     loop {
         #[cfg(test)]
         sender_ready_tests::hold_deferred_expiry(
@@ -1958,6 +1959,15 @@ async fn sender(
         for path in paths.iter() {
             if let Some(writer) = &path.native_return {
                 writer.set_reachable(path.open() && !liveness[usize::from(path.id)].silent());
+                if let Some(window) = native_credit[usize::from(path.id)].observe(
+                    &path.conn,
+                    now_us,
+                    policy.latency_target_ms,
+                ) {
+                    path.conn.set_send_window(window);
+                    info!(target: "braidpath::native_credit", path=path.id, window_bytes=window,
+                        "native return storage credit changed");
+                }
             }
             path.writer.set_pace(if policy.adaptive {
                 controllers[usize::from(path.id)].pacing_bps()

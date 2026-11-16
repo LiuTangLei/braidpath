@@ -26,8 +26,89 @@ pub(super) const BURST: usize = wire_cost(PAYLOAD + HEADER_BYTES);
 const fn wire_cost(bytes: usize) -> usize {
     bytes + bytes.div_ceil(PACKET_PAYLOAD) * PACKET_ALLOWANCE
 }
-pub(super) const WINDOW: u32 = 4 * 1024 * 1024;
+pub(super) const WINDOW: u32 = 2 * 1024 * 1024;
+pub(super) const RECEIVE_WINDOW: u32 = 4 * 1024 * 1024;
+const MAX_SEND_WINDOW: u64 = 3 * 1024 * 1024;
 const PATH_QUEUE: usize = 4;
+
+/// Keep startup/backpressure at the established budget. Expand only against
+/// exercised native service, without exceeding the current native cwnd.
+#[derive(Default)]
+pub(super) struct Credit {
+    connection: Option<usize>,
+    sampled_us: u64,
+    sent: u64,
+    lost: u64,
+    current: u64,
+}
+impl Credit {
+    pub(super) fn observe(
+        &mut self,
+        conn: &quinn::Connection,
+        now_us: u64,
+        target_ms: u64,
+    ) -> Option<u64> {
+        let identity = conn.stable_id();
+        if self.connection != Some(identity) {
+            let stats = conn.stats();
+            *self = Self {
+                connection: Some(identity),
+                sampled_us: now_us,
+                sent: stats.path.sent_packets,
+                lost: stats.path.lost_packets,
+                current: u64::from(WINDOW),
+            };
+            return None;
+        }
+        if now_us.saturating_sub(self.sampled_us) < 100_000 {
+            return None;
+        }
+        let stats = conn.stats();
+        let queued_ms = conn
+            .rtt_hint()
+            .saturating_sub(conn.min_rtt_hint())
+            .as_secs_f64()
+            * 1000.0;
+        self.update(
+            now_us,
+            stats.path.cwnd,
+            queued_ms > target_ms as f64 * 0.25,
+            conn.probing_rtt_hint(),
+            stats.path.sent_packets,
+            stats.path.lost_packets,
+        )
+    }
+
+    fn update(
+        &mut self,
+        now_us: u64,
+        cwnd: u64,
+        queued: bool,
+        probing: bool,
+        sent: u64,
+        lost: u64,
+    ) -> Option<u64> {
+        let packets = sent.saturating_sub(self.sent);
+        let losses = lost.saturating_sub(self.lost);
+        self.sampled_us = now_us;
+        self.sent = sent;
+        self.lost = lost;
+        if probing || (packets < 64 && !queued && losses == 0) {
+            return None;
+        }
+        let ceiling = (cwnd.saturating_mul(3) / 4).clamp(u64::from(WINDOW), MAX_SEND_WINDOW);
+        let next = if !queued && losses.saturating_mul(100) <= packets {
+            ceiling.min(self.current.saturating_add(32 * 1024))
+        } else {
+            u64::from(WINDOW)
+        };
+        if next == self.current {
+            return None;
+        }
+        self.current = next;
+        Some(next)
+    }
+}
 
 #[derive(Clone)]
 pub(super) struct Writer {
@@ -288,6 +369,41 @@ impl Decoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn native_credit_grows_in_one_frame_steps_and_keeps_backpressure_on_loss_or_queue() {
+        let mut credit = Credit {
+            current: u64::from(WINDOW),
+            ..Default::default()
+        };
+        assert_eq!(
+            credit.update(100_000, 4 * 1024 * 1024, false, false, 0, 0),
+            None
+        );
+        for n in 1..=32 {
+            assert_eq!(
+                credit.update(n * 100_000, 4 * 1024 * 1024, false, false, n * 500, 0),
+                Some(u64::from(WINDOW) + n * 32768)
+            );
+        }
+        assert_eq!(credit.current, MAX_SEND_WINDOW);
+        assert_eq!(
+            credit.update(3_300_000, 4096, true, true, 16_100, 0),
+            None,
+            "a deliberate native RTT probe does not resize retained storage"
+        );
+        assert_eq!(
+            credit.update(3_400_000, 4 * 1024 * 1024, true, false, 16_600, 0),
+            Some(u64::from(WINDOW))
+        );
+        assert_eq!(
+            credit.update(3_500_000, 4 * 1024 * 1024, false, false, 17_100, 0),
+            Some(u64::from(WINDOW) + 32768)
+        );
+        assert_eq!(
+            credit.update(3_600_000, 4 * 1024 * 1024, false, false, 17_600, 20),
+            Some(u64::from(WINDOW))
+        );
+    }
     fn encoded() -> Bytes {
         let payload = stream::Frame::Data {
             offset: 345,
