@@ -354,3 +354,19 @@ counts successful local queue entries, also included in retransmission totals.
 The duplicate allowance is credited only when Quinn admits the copy, once per
 transmission. A copy discarded locally grants no allowance. Admission or discard
 can follow the original's acknowledgment without changing the repair's timer.
+
+### Opt-in reliable return buffering
+
+With `--native-return-stream`, bulk DATA and FIN use the authenticated HTTP/3
+response body on each path. Short responses retain the datagram bypass;
+uploads, acknowledgments, resets and UDP retain their existing carrier.
+End-to-end offsets, receive credit and recovery after path loss still apply.
+
+Each native receiver grants 4 MiB of connection and stream credit. The server
+starts with the existing 2 MiB send-retention limit. Adaptive return sessions
+update that limit on the existing 100 ms observation tick to the path's actual
+native congestion window, bounded to 256 KiB–4 MiB. ProbeRTT preserves the
+previous retention limit while native congestion control drains its flight.
+Fixed-pace sessions retain the 2 MiB limit. This bounds local buffering rather
+than setting a bandwidth target; native congestion control and operator rate
+caps continue to apply. Upload send windows are unchanged.

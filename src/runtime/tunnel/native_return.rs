@@ -24,7 +24,17 @@ const fn wire_cost(bytes: usize) -> usize {
     bytes + bytes.div_ceil(PACKET_PAYLOAD) * PACKET_ALLOWANCE
 }
 pub(super) const WINDOW: u32 = 2 * 1024 * 1024;
+pub(super) const RECEIVE_WINDOW: u32 = 4 * 1024 * 1024;
+const MIN_SEND_WINDOW: u64 = 256 * 1024;
 const PATH_QUEUE: usize = 4;
+
+// Follow actual native flight allowance: fast paths can fill their window,
+// while a slow sibling cannot queue the same bytes several RTTs ahead.
+pub(super) fn send_window(cwnd: u64, probing_rtt: bool) -> Option<u64> {
+    // ProbeRTT deliberately reduces native flight. Keep the previous buffering
+    // allowance so its completion does not wait for another observation tick.
+    (!probing_rtt).then(|| cwnd.clamp(MIN_SEND_WINDOW, u64::from(RECEIVE_WINDOW)))
+}
 
 pub(super) type Writer = mpsc::Sender<Flight>;
 pub(super) type Reader = mpsc::Receiver<Flight>;
@@ -232,6 +242,19 @@ impl Decoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn adaptive_window_fits_receive_credit_and_keeps_startup_bounded() {
+        assert_eq!(WINDOW, 2 * 1024 * 1024);
+        assert!(MIN_SEND_WINDOW >= 4 * PAYLOAD as u64);
+        assert_eq!(send_window(0, false), Some(MIN_SEND_WINDOW));
+        assert_eq!(send_window(1024 * 1024, false), Some(1024 * 1024));
+        assert_eq!(
+            send_window(u64::MAX, false),
+            Some(u64::from(RECEIVE_WINDOW))
+        );
+        assert_eq!(send_window(0, true), None);
+        assert_eq!(send_window(u64::MAX, true), None);
+    }
     fn encoded() -> Bytes {
         let payload = stream::Frame::Data {
             offset: 345,

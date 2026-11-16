@@ -43,7 +43,7 @@ const WIRE_QUEUE: usize = 4096;
 const SESSION_IDLE_GRACE: Duration = Duration::from_secs(120);
 const SESSION_PATH: &str = "/session";
 pub(crate) const STREAM_ALPN: &[u8] = b"braidpath-stream/2";
-pub(crate) const NATIVE_RETURN_WINDOW: u32 = native_return::WINDOW;
+pub(crate) const NATIVE_RETURN_WINDOW: u32 = native_return::RECEIVE_WINDOW;
 // An authenticated stream/2 owner is discarding this epoch, rather than
 // temporarily replacing a transport path. Its remote stream budget can end now.
 const STREAM_SESSION_STOP: u32 = 0x4250;
@@ -1962,11 +1962,23 @@ async fn sender(
                 policy.rate
             });
         }
-        if observation_schedule
+        if let Some(cause) = observation_schedule
             .as_mut()
             .and_then(|schedule| schedule.take_due(now_us))
-            .is_some()
         {
+            // Native stream buffering follows its own congestion window only
+            // on periodic observations. Upload/DATAGRAM and fixed-pace
+            // sessions retain their existing send windows.
+            if native_returning && cause.periodic {
+                for path in paths.iter().filter(|path| path.open()) {
+                    if let Some(window) = native_return::send_window(
+                        path.conn.cwnd_hint(),
+                        path.conn.probing_rtt_hint(),
+                    ) {
+                        path.conn.set_send_window(window);
+                    }
+                }
+            }
             let mut cap_changed = false;
             if let Some(guard) = forward_guard.as_mut() {
                 if metrics.direction == stats::FORWARD {
