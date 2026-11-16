@@ -2701,7 +2701,7 @@ async fn sender(
                     })
                     .map(|path| {
                         let weight = if policy.adaptive {
-                            controllers[usize::from(path.id)].decision(now_us).weight
+                            controllers[usize::from(path.id)].scheduling_weight(now_us)
                         } else {
                             scheduler::weight(
                                 &path
@@ -2953,7 +2953,9 @@ async fn sender(
                 }
                 if policy.adaptive {
                     let allowed = controllers[id].allow(now_us, cost, age.as_secs_f64() * 1000.0);
-                    update_business_pacer(&mut business, &paths, &controllers, now_us);
+                    // The loop has already settled business credit at now_us.
+                    // allow only refills this path's tokens; it cannot change
+                    // path membership or the aggregate/group rate budgets.
                     if !allowed {
                         frontier.add(path.id, is_small, Gate::PathAllowance);
                         continue;

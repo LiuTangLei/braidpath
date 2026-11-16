@@ -274,6 +274,13 @@ struct WeightLoss {
     age_us: u64,
 }
 
+struct Weighting {
+    weight: i32,
+    loss: Option<(WeightLoss, u64)>,
+    effective_loss: Option<f64>,
+    erasure_corroborated: bool,
+}
+
 #[derive(Clone, Copy)]
 struct WeightBatch {
     expected: u64,
@@ -3764,8 +3771,7 @@ impl PathController {
         self.rate_bps
     }
 
-    pub fn decision(&self, now_us: u64) -> Decision {
-        let stale = self.stale(now_us);
+    fn weighting(&self, now_us: u64) -> Weighting {
         let weight_loss = self.weight_loss.and_then(|sample| {
             let age = sample
                 .age_us
@@ -3811,12 +3817,33 @@ impl PathController {
                 + self.queue_delay_ms / self.target_ms))
             .round()
             .clamp(1.0, 128.0);
-        Decision {
-            pacing_bps: self.rate_bps,
-            eligible: self.eligible && !stale,
+        Weighting {
             weight: (base_weight * 16.0 * reliability)
                 .round()
                 .clamp(4.0, 2048.0) as i32,
+            loss: weight_loss,
+            effective_loss,
+            erasure_corroborated: weight_erasure_corroborated,
+        }
+    }
+
+    /// Packet scheduling does not need the full diagnostic decision snapshot.
+    pub(crate) fn scheduling_weight(&self, now_us: u64) -> i32 {
+        self.weighting(now_us).weight
+    }
+
+    pub fn decision(&self, now_us: u64) -> Decision {
+        let stale = self.stale(now_us);
+        let Weighting {
+            weight,
+            loss: weight_loss,
+            effective_loss,
+            erasure_corroborated: weight_erasure_corroborated,
+        } = self.weighting(now_us);
+        Decision {
+            pacing_bps: self.rate_bps,
+            eligible: self.eligible && !stale,
+            weight,
             weight_erasure_corroborated,
             weight_loss_rate: weight_loss.map(|(sample, _)| sample.rate),
             weight_loss_age_us: weight_loss.map(|(_, age)| age),

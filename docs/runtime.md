@@ -423,6 +423,12 @@ bidirectional echo after all configured paths are ready.
 
 The `client` and `mesh-client` commands offer opt-in policies. Existing defaults remain the normal policy. `--native-return-stream` negotiates a reliable HTTP/3 response body for bulk TCP download DATA/FIN with a bounded 2 MiB per-path window. Interactive stream data uses bounded DATAGRAM records so it can bypass an already queued bulk response body. The carrier respects the same QUIC ACK-silence exclusion as DATAGRAM scheduling, so new data and repairs avoid an unresponsive route while another route is available. Uploads, stream acknowledgments, resets and UDP use the DATAGRAM carrier. Both endpoints must support and acknowledge the requested capability.
 
+Packet scheduling reads the existing path weight without assembling its full
+diagnostic snapshot. Business pacing settles elapsed time once per rate update;
+an unchanged rate retains its burst bound, and a disabled group earns no idle
+credit. These computation shortcuts retain the same configured caps, admission
+checks, loss response and UDP protection policy.
+
 `--game-mode` selects adaptive scheduling, automatic FEC and a 20 ms local sender admission deadline, preserving TCP's normal admission budget. UDP originals prefer the earliest available route; three immediate protection copies prefer unused eligible routes. Protection shares the operator limits and is bounded to the smaller of one quarter of the aggregate limit and 4 Mbps. It does not retransmit application UDP packets. Complete packets are delivered immediately; partial segmented messages retain bounded state for at least 250 ms so different network paths can recover a missing fragment. SOCKS UDP accepts whole packets within the negotiated message limit, with tunnel segmentation when needed; SOCKS FRAG requests remain unsupported.
 
 Game mode trades bandwidth and bulk shares for timely UDP. It conflicts with explicit codec/deadline overrides. Aggregate and group caps remain active. Use separate sessions/listeners when comparing it with the normal policy. The flag does not apply to the separate `proxy-client` native UDP backend. These mechanisms do not establish a latency or throughput result for a particular network; use same-target, bounded paired measurements of delivery, loss, jitter and competing TCP traffic.

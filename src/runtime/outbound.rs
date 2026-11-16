@@ -489,6 +489,9 @@ impl Pacer {
     /// Integrate the old rate before replacing it; a change creates no credit.
     pub fn set_rate(&mut self, now_us: u64, rate: u64) {
         self.refill(now_us.max(self.last_us));
+        if self.rate == rate {
+            return;
+        }
         self.rate = rate;
         if self.rate_aware {
             self.burst = pacing_burst_bytes(rate, self.minimum_burst);
@@ -543,10 +546,8 @@ impl BusinessPacer {
         if now_us < self.last_us {
             return;
         }
-        self.aggregate.refill(now_us);
-        for group in &mut self.groups {
-            group.refill(now_us);
-        }
+        // set_rate settles the old rate before changing it. Refilling every
+        // bucket here as well repeated the same timestamp on every packet.
         self.last_us = now_us;
         let mut rates = [0u64; MAX_PATHS];
         for (group, rate) in budgets {
@@ -556,7 +557,11 @@ impl BusinessPacer {
         let mut total = 0u64;
         for (id, rate) in rates.into_iter().enumerate() {
             let rate = rate.min(self.group_maximum_bps[id]);
-            self.groups[id].set_rate(now_us, rate);
+            // An already disabled bucket earns nothing. Settle it when it
+            // changes state, retaining its original bounded credit meanwhile.
+            if rate != 0 || self.groups[id].rate != 0 {
+                self.groups[id].set_rate(now_us, rate);
+            }
             total = total.saturating_add(rate);
         }
         self.aggregate.set_rate(now_us, total.min(self.maximum_bps));
@@ -593,6 +598,20 @@ impl BusinessPacer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inactive_group_reactivation_does_not_mint_idle_credit() {
+        let mut business = BusinessPacer::new(8_000_000, [8_000_000; MAX_PATHS], 2400);
+        business.update(0, [(0, 8_000_000)]);
+        business.spend(0, 2400);
+        business.update(0, []);
+        business.update(1_000_000, []);
+        business.update(1_000_000, [(1, 8_000_000)]);
+        assert!(!business.available(1, 1), "idle membership earns no credit");
+        business.update(1_001_000, [(1, 8_000_000)]);
+        assert!(business.available(1, 1000));
+        assert!(!business.available(1, 1001));
+    }
 
     #[test]
     fn high_rate_pacers_service_the_budget_at_a_millisecond_wakeup_cadence() {
