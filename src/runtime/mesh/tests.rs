@@ -208,6 +208,7 @@ pub(super) async fn server_with_metrics(
 }
 pub(crate) fn policy() -> Policy {
     Policy {
+        game_mode: false,
         native_return: false,
         streams: false,
         proxy: false,

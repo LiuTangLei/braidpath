@@ -52,6 +52,8 @@ mod associate;
 mod coding;
 #[cfg(test)]
 mod dual_tests;
+#[cfg(test)]
+mod game_tests;
 mod ingress;
 mod liveness;
 mod local_delivery;
@@ -82,6 +84,8 @@ const WEBSITE: &str = "<!doctype html><html lang=\"en\"><meta charset=\"utf-8\">
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Policy {
+    /// Prefer prompt UDP delivery over weighted bulk shares.
+    pub game_mode: bool,
     pub native_return: bool,
     pub max_message_bytes: usize,
     /// Reliable TCP streams to the server's fixed TCP target.
@@ -105,6 +109,9 @@ pub struct Policy {
     pub queue_ms: u64,
 }
 impl Policy {
+    fn gaming_datagram(&self, flow: Option<u32>) -> bool {
+        self.game_mode && flow.is_some_and(|flow| stream::stream_id(flow).is_none())
+    }
     fn flow(&self, flow: u32) -> u32 {
         if self.max_message_bytes > MAX_PAYLOAD {
             flow & !messages::FLAG
@@ -122,8 +129,22 @@ impl Policy {
             self.queue_ms
         })
     }
+    fn reassembly_lifetime(&self) -> Duration {
+        // This retains partial messages; complete datagrams are delivered
+        // immediately. A prompt-send deadline cannot be an arrival-skew limit
+        // for a fragment protected over a second network path.
+        if self.game_mode {
+            Duration::from_millis(250)
+        } else {
+            self.admission_lifetime()
+        }
+    }
 
     pub fn validate(&self) -> Result<()> {
+        ensure!(
+            !self.game_mode || (self.adaptive && self.fec == automatic_fec::AUTO),
+            "game mode requires adaptive scheduling and automatic FEC"
+        );
         ensure!(
             !self.native_return || self.streams || self.proxy,
             "return stream requires a TCP listener"
@@ -224,6 +245,22 @@ pub(super) fn parse_fec(value: &str) -> std::result::Result<u8, String> {
         .ok()
         .filter(|n| *n <= 32)
         .ok_or_else(|| "FEC must be auto or 0..32".to_owned())
+}
+
+fn game_mode_header(headers: &http::HeaderMap) -> Result<bool> {
+    ensure!(
+        headers.get_all("braidpath-game-mode").iter().count() <= 1,
+        "duplicate game mode header"
+    );
+    match headers
+        .get("braidpath-game-mode")
+        .map(|v| v.to_str())
+        .transpose()?
+    {
+        None => Ok(false),
+        Some("1") => Ok(true),
+        _ => bail!("unsupported game mode"),
+    }
 }
 
 fn mixed_fec_header(headers: &http::HeaderMap) -> Result<bool> {
@@ -1060,7 +1097,8 @@ impl PreparedSend {
         now_us: u64,
         age: Duration,
     ) -> bool {
-        if !small_delivery::applies(policy, &self.front) {
+        if policy.gaming_datagram(self.front.flow) || !small_delivery::applies(policy, &self.front)
+        {
             return true;
         }
         let candidates: Vec<_> = paths
@@ -1624,7 +1662,11 @@ async fn sender(
     let mut blocks = BTreeMap::<u64, BlockSend>::new();
     let mut budget = outbound::RepairBudget::new(policy.redundancy);
     if policy.fec == automatic_fec::AUTO {
-        budget.enable_small_rate((policy.rate / 4).min(1_000_000));
+        budget.enable_small_rate((policy.rate / 4).min(if policy.game_mode {
+            4_000_000
+        } else {
+            1_000_000
+        }));
     }
     let mut scheduler = scheduler::Scheduler::default();
     let mut controllers: [adaptive::PathController; MAX_PATHS] = std::array::from_fn(|_| {
@@ -2643,6 +2685,7 @@ async fn sender(
             }
             frontier.head_previews += 1;
             let is_small = small_delivery::applies(&policy, &front);
+            let gaming_datagram = policy.gaming_datagram(front.flow);
             let candidates: Vec<_> = if policy.quality_schedule || policy.adaptive {
                 paths
                     .iter()
@@ -2728,7 +2771,7 @@ async fn sender(
                 .block
                 .and_then(|b| blocks.get(&b))
                 .map_or(0, |b| b.paths);
-            let small_mask = if is_small {
+            let small_mask = if is_small && !gaming_datagram {
                 let eligible = if policy.quality_schedule {
                     candidates.iter().fold(0, |mask, (id, _)| mask | (1 << id))
                 } else {
@@ -2795,10 +2838,23 @@ async fn sender(
                 ranked.sort_by(|a, b| a.0.total_cmp(&b.0));
                 order = ranked.into_iter().map(|(_, i)| i).collect();
             }
+            if gaming_datagram {
+                // Prefer the earliest ready route; a blocked best route keeps
+                // every eligible fallback. Put a repair on an unused route
+                // first, without waiting for the original's acknowledgement.
+                order.sort_by(|&a, &b| {
+                    let used_a = repair && used & (1 << paths[a].id) != 0;
+                    let used_b = repair && used & (1 << paths[b].id) != 0;
+                    used_a.cmp(&used_b).then_with(|| {
+                        small_delivery::delay_ms(&paths[a])
+                            .total_cmp(&small_delivery::delay_ms(&paths[b]))
+                    })
+                });
+            }
             // AUTO originals prefer a ready faster route in the same protection
             // tier. Repairs/fixed policies retain the opt-in frontier treatment.
             // Reordering never removes a fallback or bypasses any gate below.
-            if is_small && policy.adaptive && order.len() > 1 {
+            if is_small && policy.adaptive && !gaming_datagram && order.len() > 1 {
                 frontier.small_rank_evaluations += 1;
                 let ids: Vec<_> = order.iter().map(|i| paths[*i].id).collect();
                 let samples: Vec<_> = order
@@ -3559,7 +3615,7 @@ async fn session_loop(
     });
     let mut messages = messages::Reassembly::new(
         session.policy.max_message_bytes,
-        session.policy.admission_lifetime(),
+        session.policy.reassembly_lifetime(),
     )
     .with_scope(session.forward.clone());
     publish_retention(&decoder, &session.forward);
@@ -3623,6 +3679,7 @@ async fn session_loop(
                         if stream::stream_id(r.flow).is_some() || associate::is_flow(r.flow) {dropped+=1;continue}
                         let Some((r, decoded)) = messages.receive(r, decoded) else { publish_messages(&mut messages, &session.forward); continue; };
                         publish_messages(&mut messages, &session.forward);
+                        if let Some(mux)=streams.as_mut() && associate::is_flow(r.flow) {mux.receive(r);continue}
                         if !flows.contains_key(&r.flow) {
                             let Some(target)=target else{dropped+=delivery.socket_error(pid,&r);continue};
                             if flows.len()>=MAX_FLOWS{dropped+=1;session.forward.trace_record(trace::Stage::RecordDropped,&r,None,Some(trace::Reason::FlowLimit));session.forward.update(|d|d.records.udp_target_flow_dropped+=1);session.forward.path(pid,|p|p.udp_target_flow_dropped+=1);continue}
@@ -4214,9 +4271,10 @@ async fn server_connection(
                                 ensure!(!proxy || tcp.proxy.is_some(),"proxy streams are not enabled on this server");
                                 let stream_payload=payload::negotiate(req.headers(),streams || proxy)?;
                                 let native_return=native_return::requested(req.headers())?;
+                                let game_mode=game_mode_header(req.headers())?;
                                 ensure!(!native_return || streams || proxy,"return stream requires TCP profile");
                                 let (return_writer,return_reader)=if native_return { let (tx,rx)=native_return::channel(); (Some(tx),Some(rx)) } else { (None,None) };
-                                let policy=Policy{native_return,max_message_bytes,streams,proxy,
+                                let policy=Policy{game_mode,native_return,max_message_bytes,streams,proxy,
             fec_repairs,small_fec_bytes,mixed_fec,probe_guided_recovery,capacity_probe_bps,adaptive:quality_schedule==Some("adaptive"),latency_target_ms,group_rates,quality_schedule:quality_schedule.is_some(),receiver_feedback:feedback.is_some(),fec:parse_fec(header("braidpath-fec")?).map_err(anyhow::Error::msg)?,redundancy:header("braidpath-redundancy")?.parse()?,rate,block_ms:header("braidpath-block-ms")?.parse()?,queue_ms:header("braidpath-queue-ms")?.parse()?};policy.validate()?;
                                 if policy.fec==automatic_fec::AUTO {ensure!(req.headers().get_all("braidpath-auto-small").iter().count()==1 && req.headers().get("braidpath-auto-small").is_some_and(|v|v=="1"),"automatic small protection not negotiated");}
                                 let rejoin=req.headers().get("braidpath-rejoin").is_some_and(|v|v=="1");
@@ -4280,6 +4338,7 @@ async fn server_connection(
                                 if streams {response=response.header("braidpath-streams","2");}
                                 if proxy {response=response.header("braidpath-proxy","2");}
                                 if native_return {response=response.header(native_return::HEADER,"1");}
+                                if game_mode {response=response.header("braidpath-game-mode","1");}
                                 if fec_repairs==2 {response=response.header("braidpath-fec-repairs","2");}
                                 if capacity_probe_bps>0 {response=response.header("braidpath-capacity-probe-bps",capacity_probe_bps).header("braidpath-capacity-probe-format",capacity_probe::FORMAT);}
                                 if probe_guided_recovery {response=response.header("braidpath-probe-guided-recovery","1");}
@@ -4889,7 +4948,7 @@ async fn client_session(
     publish_retention(&decoder, &returning);
     let mut messages = messages::Reassembly::new(
         options.policy.max_message_bytes,
-        options.policy.admission_lifetime(),
+        options.policy.reassembly_lifetime(),
     )
     .with_scope(returning.clone());
     let mut delivery = local_delivery::Queue::new(
@@ -5137,6 +5196,7 @@ async fn client_session(
                     if let Some(mux)=streams.as_mut() && (stream::stream_id(record.flow).is_some() || associate::is_flow(record.flow)) {mux.receive(record);continue}
                     let Some((record, decoded)) = messages.receive(record, decoded) else {publish_messages(&mut messages, &returning);continue;};
                     publish_messages(&mut messages, &returning);
+                    if let Some(mux)=streams.as_mut() && associate::is_flow(record.flow) {mux.receive(record);continue}
                     if let Some(peer)=reverse.get(&record.flow) {
                         if let Some((_,last))=peers.get_mut(peer) {*last=Instant::now();}
                         drops+=delivery.send(&socket,Some(*peer),record,pid,decoded);
@@ -5484,6 +5544,9 @@ async fn admit_path(
     if policy.native_return {
         req = req.header(native_return::HEADER, "1");
     }
+    if policy.game_mode {
+        req = req.header("braidpath-game-mode", "1");
+    }
     let req = req.body(())?;
     // Sent without waiting for peer SETTINGS, so that 0-RTT saves its round trip.
     let mut stream = send.send_request(req).await?;
@@ -5508,6 +5571,10 @@ async fn admit_path(
     ensure!(
         native_return::requested(response.headers())? == policy.native_return,
         "return-stream capability not negotiated"
+    );
+    ensure!(
+        game_mode_header(response.headers())? == policy.game_mode,
+        "game mode capability not negotiated"
     );
     diagnostic.enter("http3", "peer_settings");
     // Poll the driver so peer SETTINGS are processed before datagrams are used.

@@ -510,6 +510,10 @@ mod dual_cli_tests {
 }
 #[derive(Args)]
 struct PolicyArgs {
+    /// Prefer low UDP delay: earliest-ready paths, immediate bounded protection,
+    /// adaptive pacing and a 3 ms local admission deadline.
+    #[arg(long, conflicts_with_all = ["fec", "fec_repairs", "small_fec_bytes", "mixed_fec", "latency_target_ms", "queue_ms", "block_ms", "capacity_probe_bps", "probe_guided_recovery"])]
+    game_mode: bool,
     /// Use a negotiated reliable QUIC stream for TCP downloads; uploads and UDP stay unchanged.
     #[arg(long)]
     native_return_stream: bool,
@@ -879,14 +883,16 @@ impl RateCap {
 const FIXED_RATE_BPS: u64 = 10_000_000;
 
 fn client_rate(policy: &PolicyArgs) -> Result<u64> {
-    let rate = policy.rate_bps.unwrap_or(if policy.adaptive {
-        RateCap::Auto
-    } else {
-        RateCap::Bps(FIXED_RATE_BPS)
-    });
+    let rate = policy
+        .rate_bps
+        .unwrap_or(if policy.adaptive || policy.game_mode {
+            RateCap::Auto
+        } else {
+            RateCap::Bps(FIXED_RATE_BPS)
+        });
     ensure!(
-        policy.adaptive || rate != RateCap::Auto,
-        "--rate-bps auto requires --adaptive; otherwise the cap is the sending pace"
+        policy.adaptive || policy.game_mode || rate != RateCap::Auto,
+        "--rate-bps auto requires --adaptive or --game-mode; otherwise the cap is the sending pace"
     );
     Ok(rate.bps())
 }
@@ -1317,7 +1323,8 @@ mod tests {
 
 impl PolicyArgs {
     fn build(&self, rate: u64, group_rates: [u64; super::MAX_PATHS]) -> tunnel::Policy {
-        tunnel::Policy {
+        let mut policy = tunnel::Policy {
+            game_mode: self.game_mode,
             native_return: self.native_return_stream,
             streams: false,
             proxy: false,
@@ -1340,13 +1347,54 @@ impl PolicyArgs {
             rate,
             block_ms: self.block_ms,
             queue_ms: self.queue_ms,
+        };
+        if self.game_mode {
+            policy.adaptive = true;
+            policy.receiver_feedback = true;
+            policy.quality_schedule = true;
+            policy.fec = super::automatic_fec::AUTO;
+            policy.latency_target_ms = 3;
+            policy.queue_ms = 3;
+            policy.block_ms = 1;
         }
+        policy
     }
 }
 
 #[cfg(test)]
 mod aggregate_cli_tests {
     use super::*;
+
+    #[test]
+    fn game_preset_enables_low_delay_udp_and_preserves_explicit_rate_caps() {
+        let args = [
+            "braidpath",
+            "client",
+            "--entrance",
+            "127.0.0.1:7001",
+            "--server-name",
+            "localhost",
+            "--ca",
+            "cert.pem",
+            "--token-file",
+            "token",
+            "--game-mode",
+            "--rate-bps",
+            "8000000",
+        ];
+        let Command::Client { policy, .. } = Cli::try_parse_from(args).unwrap().command else {
+            panic!("client")
+        };
+        let rate = client_rate(&policy).unwrap();
+        let p = policy.build(rate, [rate; super::super::MAX_PATHS]);
+        assert!(p.game_mode && p.adaptive && p.receiver_feedback && p.quality_schedule);
+        assert!(!p.native_return);
+        assert_eq!(p.fec, super::super::automatic_fec::AUTO);
+        assert_eq!((p.queue_ms, p.latency_target_ms, p.block_ms), (3, 3, 1));
+        assert_eq!(p.rate, 8_000_000);
+        assert!(p.validate().is_ok());
+        assert!(Cli::try_parse_from(args.into_iter().chain(["--queue-ms", "20"])).is_err());
+    }
 
     #[test]
     fn addressed_stream_entry_preserves_defaults_and_accepts_the_historical_profile() {

@@ -581,7 +581,7 @@ fn udp_echo() -> SocketAddr {
     let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
     let address = socket.local_addr().unwrap();
     thread::spawn(move || {
-        let mut buffer = [0; 2048];
+        let mut buffer = [0; 8192];
         while let Ok((n, from)) = socket.recv_from(&mut buffer) {
             let _ = socket.send_to(&[b"echo:", &buffer[..n]].concat(), from);
         }
@@ -621,7 +621,7 @@ fn udp_exchange(
     request: &[u8],
     previous_replies: &[Vec<u8>],
 ) -> Option<Vec<u8>> {
-    let mut buffer = [0; 2048];
+    let mut buffer = [0; 8192];
     for _ in 0..12 {
         socket.send_to(request, relay).unwrap();
         let deadline = Instant::now() + Duration::from_millis(250);
@@ -791,4 +791,33 @@ fn native_return_keeps_upload_half_close_udp_and_survives_one_path_closing() {
         );
         thread::sleep(Duration::from_millis(50));
     }
+}
+
+#[test]
+fn game_mode_preserves_socks_udp_boundaries_fragmentation_and_tcp() {
+    let echo = udp_echo();
+    let topology = topology_options(
+        &["--proxy", "--proxy-allow-private"],
+        &["13"],
+        "--proxy-listen",
+        &["--game-mode"],
+    );
+    let (_control, relay) = associate(&topology.tcp_listen);
+    let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let mut previous = Vec::new();
+    for size in [128, 800, 1200, 4080] {
+        let bytes = vec![(size % 251) as u8; size];
+        let expected = udp_request(echo, &[b"echo:", bytes.as_slice()].concat());
+        let got = udp_exchange(&socket, relay, &udp_request(echo, &bytes), &previous)
+            .expect("game UDP echo");
+        assert_eq!(got.len(), expected.len(), "UDP payload size {size}");
+        assert_eq!(got, expected);
+        previous.push(expected);
+    }
+    let target = echo_target();
+    let (status, mut tcp) = socks(&topology.tcp_listen, &socks_ipv4(&target));
+    assert_eq!(status, 0);
+    assert_eq!(read_exact_or_eof(&mut tcp, 7), b"banner\n");
+    tcp.write_all(b"game-mode-tcp").unwrap();
+    assert_eq!(read_exact_or_eof(&mut tcp, 13), b"game-mode-tcp");
 }

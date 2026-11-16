@@ -11,12 +11,12 @@
 //! The server resolves names itself (IPv4 first: a datagram has no failed
 //! connection to fall back from), applies the same destination rule as
 //! CONNECT, and accepts replies only from addresses this association sent to.
-//! Fragmented and oversized datagrams are dropped, not reassembled.
+//! SOCKS FRAG requests remain unsupported. Larger whole datagrams use the
+//! session's negotiated bounded message segmentation above FEC.
 use super::{
     proxy::{self, Destination},
     tcp::Io,
 };
-use crate::runtime::MAX_PAYLOAD;
 use std::{
     collections::{HashMap, HashSet},
     net::{IpAddr, Ipv4Addr, SocketAddr},
@@ -57,10 +57,10 @@ fn canonical(address: SocketAddr) -> SocketAddr {
 
 /// A client datagram's tunnel payload: no fragments, a valid address, and
 /// within the record limit.
-pub(super) fn client_payload(datagram: &[u8]) -> Option<&[u8]> {
+pub(super) fn client_payload(datagram: &[u8], limit: usize) -> Option<&[u8]> {
     let payload = datagram.strip_prefix(&[0, 0, 0])?;
     let (_, used) = Destination::decode(payload).ok()??;
-    (used < payload.len() && payload.len() <= MAX_PAYLOAD).then_some(payload)
+    (used < payload.len() && payload.len() <= limit).then_some(payload)
 }
 
 /// The datagram for the SOCKS client: reserved and fragment fields, then the
@@ -74,7 +74,12 @@ pub(super) fn to_client(payload: &[u8]) -> Vec<u8> {
 
 /// Client: bind the relay beside the address the SOCKS client reached, answer
 /// the request with it, then relay until the control connection closes.
-pub(super) async fn client(flow: u32, mut tcp: TcpStream, events: mpsc::UnboundedSender<Io>) {
+pub(super) async fn client(
+    flow: u32,
+    mut tcp: TcpStream,
+    events: mpsc::UnboundedSender<Io>,
+    limit: usize,
+) {
     let (Ok(local), Ok(owner)) = (tcp.local_addr(), tcp.peer_addr()) else {
         return;
     };
@@ -114,7 +119,7 @@ pub(super) async fn client(flow: u32, mut tcp: TcpStream, events: mpsc::Unbounde
                     continue;
                 }
                 *peer.lock().expect("association peer") = Some(from);
-                let datagram = match client_payload(&buffer[..n]) {
+                let datagram = match client_payload(&buffer[..n], limit) {
                     Some(payload) => Io::Datagram(flow, payload.to_vec()),
                     None => Io::DatagramDropped,
                 };
@@ -195,6 +200,7 @@ pub(super) async fn server(
     allow_private: bool,
     mut datagrams: mpsc::Receiver<Vec<u8>>,
     events: mpsc::UnboundedSender<Io>,
+    limit: usize,
 ) {
     let Ok(socket) = bind_any() else {
         let _ = events.send(Io::Unassociated(flow));
@@ -239,7 +245,7 @@ pub(super) async fn server(
                 }
                 let mut payload = Destination::Ip(from).encode();
                 payload.extend(&buffer[..n]);
-                let reply = if payload.len() <= MAX_PAYLOAD {
+                let reply = if payload.len() <= limit {
                     Io::Datagram(flow, payload)
                 } else {
                     Io::DatagramDropped
@@ -258,18 +264,28 @@ mod tests {
 
     #[test]
     fn client_datagrams_need_whole_unfragmented_addressed_payloads() {
+        const MAX_PAYLOAD: usize = crate::runtime::MAX_PAYLOAD;
         let mut datagram = vec![0, 0, 0];
         datagram.extend(Destination::Ip("1.2.3.4:53".parse().unwrap()).encode());
         datagram.extend(b"query");
-        assert_eq!(client_payload(&datagram), Some(&datagram[3..]));
+        assert_eq!(client_payload(&datagram, MAX_PAYLOAD), Some(&datagram[3..]));
         let mut fragment = datagram.clone();
         fragment[2] = 1;
-        assert_eq!(client_payload(&fragment), None);
-        assert_eq!(client_payload(&datagram[..10]), None, "no data");
-        assert_eq!(client_payload(&[0, 0, 0, 9, 1, 2]), None, "address type");
+        assert_eq!(client_payload(&fragment, MAX_PAYLOAD), None);
+        assert_eq!(
+            client_payload(&datagram[..10], MAX_PAYLOAD),
+            None,
+            "no data"
+        );
+        assert_eq!(
+            client_payload(&[0, 0, 0, 9, 1, 2], MAX_PAYLOAD),
+            None,
+            "address type"
+        );
         let mut large = datagram.clone();
         large.resize(3 + MAX_PAYLOAD + 1, 0);
-        assert_eq!(client_payload(&large), None);
+        assert_eq!(client_payload(&large, MAX_PAYLOAD), None);
+        assert!(client_payload(&large, 4096).is_some());
         assert_eq!(to_client(&datagram[3..]), datagram);
         assert!(is_flow(FLAG | 7) && !is_flow(7));
     }

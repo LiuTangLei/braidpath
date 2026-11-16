@@ -3,6 +3,7 @@ use std::collections::BTreeSet;
 
 fn policy() -> Policy {
     Policy {
+        game_mode: false,
         native_return: false,
         max_message_bytes: 1000,
         streams: false,

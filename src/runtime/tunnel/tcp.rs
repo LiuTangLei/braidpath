@@ -391,6 +391,21 @@ pub(super) struct Out<'a> {
     pub small_threshold: usize,
 }
 impl Out<'_> {
+    fn datagram(&mut self, flow: u32, payload: Vec<u8>, limit: usize) -> bool {
+        if payload.len() <= crate::runtime::MAX_PAYLOAD {
+            return self.enqueue(flow, payload, None);
+        }
+        let Ok(parts) = super::messages::split(flow, self.next_id, payload, limit) else {
+            return false;
+        };
+        super::enqueue_message(
+            self.tx,
+            parts,
+            Instant::now(),
+            self.scope,
+            self.small_threshold,
+        )
+    }
     fn enqueue(
         &mut self,
         flow: u32,
@@ -595,6 +610,7 @@ pub(super) struct Mux {
     associations: HashMap<u32, Association>,
     next_association: u32,
     datagrams: VecDeque<(u32, Vec<u8>)>,
+    max_message_bytes: usize,
 }
 
 impl Mux {
@@ -633,6 +649,7 @@ impl Mux {
             associations: HashMap::new(),
             next_association: 0,
             datagrams: VecDeque::new(),
+            max_message_bytes: policy.max_message_bytes,
         }
     }
     /// Accepts local connections; the peer connects each stream onward.
@@ -1088,15 +1105,18 @@ impl Mux {
         }
         self.next_association += 1;
         let flow = associate::FLAG | self.next_association;
-        let task = self
-            .tasks
-            .spawn(associate::client(flow, tcp, self.events_tx.clone()));
+        let task = self.tasks.spawn(associate::client(
+            flow,
+            tcp,
+            self.events_tx.clone(),
+            self.max_message_bytes,
+        ));
         self.associations.insert(flow, Association::Starting(task));
         self.stats.udp_associations += 1;
     }
 
     fn queue_datagram(&mut self, flow: u32, payload: Vec<u8>) {
-        if self.datagrams.len() >= DATAGRAM_QUEUE {
+        if payload.len() > self.max_message_bytes || self.datagrams.len() >= DATAGRAM_QUEUE {
             self.stats.udp_datagrams_dropped += 1;
             return;
         }
@@ -1146,6 +1166,7 @@ impl Mux {
                 access.allow_private,
                 receiver,
                 self.events_tx.clone(),
+                self.max_message_bytes,
             ));
             self.associations.insert(
                 flow,
@@ -1497,7 +1518,7 @@ impl Mux {
             }
         }
         while let Some((flow, payload)) = self.datagrams.pop_front() {
-            if !out.enqueue(flow, payload.clone(), None) {
+            if !out.datagram(flow, payload.clone(), self.max_message_bytes) {
                 self.datagrams.push_front((flow, payload));
                 break;
             }
@@ -1948,6 +1969,7 @@ mod tests {
 
     fn proxy_policy() -> Policy {
         Policy {
+            game_mode: false,
             native_return: false,
             max_message_bytes: 1000,
             streams: false,
@@ -2994,6 +3016,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn bulk_local_backpressure_cannot_hide_a_tiny_interactive_record() {
         let policy = Policy {
+            game_mode: false,
             native_return: false,
             max_message_bytes: 1000,
             streams: true,
@@ -3073,6 +3096,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn socket_reads_and_eof_progress_while_wire_input_stays_ready() {
         let policy = Policy {
+            game_mode: false,
             native_return: false,
             max_message_bytes: 1000,
             streams: true,

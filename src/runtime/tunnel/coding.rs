@@ -135,6 +135,7 @@ enum Mode {
 
 pub(super) struct RecordEncoder {
     mode: Mode,
+    game_mode: bool,
     fragments: bool,
     // Only one block per coding lane can be open. Keep its ingress clock even
     // if many immediate small blocks evict its sender scheduling metadata.
@@ -169,6 +170,7 @@ impl RecordEncoder {
         };
         Ok(Self {
             mode,
+            game_mode: policy.game_mode,
             fragments: policy.max_message_bytes > crate::runtime::MAX_PAYLOAD,
             clocks: [None; 2],
         })
@@ -218,19 +220,24 @@ impl RecordEncoder {
             } => {
                 // Stream ACKs are control even when selective ranges exceed a
                 // size cutoff. Short records get independent immediate blocks.
-                let control = !fragmented
-                    && (record.payload.len() <= 128
-                        || record.flow
-                            & (super::super::stream::STREAM_FLAG | super::super::stream::ACK_FLAG)
-                            == (super::super::stream::STREAM_FLAG
-                                | super::super::stream::ACK_FLAG));
+                let gaming =
+                    self.game_mode && super::super::stream::stream_id(record.flow).is_none();
+                let control = gaming
+                    || (!fragmented
+                        && (record.payload.len() <= 128
+                            || record.flow
+                                & (super::super::stream::STREAM_FLAG
+                                    | super::super::stream::ACK_FLAG)
+                                == (super::super::stream::STREAM_FLAG
+                                    | super::super::stream::ACK_FLAG)));
                 if control {
                     // A sparse interactive stream cannot amortize a lost tail
                     // over the next packet. Keep one immediate copy even when
                     // clean bulk and superseding ACKs need no proactive FEC.
-                    let interactive = super::super::stream::stream_id(record.flow).is_some()
-                        && !super::super::stream::is_ack_flow(record.flow)
-                        && record.payload.len() <= 128;
+                    let interactive = gaming
+                        || (super::super::stream::stream_id(record.flow).is_some()
+                            && !super::super::stream::is_ack_flow(record.flow)
+                            && record.payload.len() <= 128);
                     let recovery = match attempt {
                         0 | 1 => 0,
                         2 => 1,
@@ -472,6 +479,7 @@ mod tests {
 
     fn policy(fec: u8, cutoff: u16, mixed: bool) -> Policy {
         Policy {
+            game_mode: false,
             native_return: false,
             max_message_bytes: 1000,
             streams: false,

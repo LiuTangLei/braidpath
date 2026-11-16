@@ -10,6 +10,7 @@ fn replay_implementation_identity() -> &'static str {
 }
 fn replay_policy(_mode: &str, block_ms: u64, queue_ms: u64) -> Policy {
     Policy {
+        game_mode: false,
         native_return: false,
         max_message_bytes: 1000,
         streams: false,
