@@ -24,6 +24,9 @@ const fn wire_cost(bytes: usize) -> usize {
     bytes + bytes.div_ceil(PACKET_PAYLOAD) * PACKET_ALLOWANCE
 }
 pub(super) const WINDOW: u32 = 2 * 1024 * 1024;
+// Receive credit must cover the retained sender window plus credit updates in
+// flight. Enlarging it does not increase the sender's bounded storage/burst.
+pub(super) const RECEIVE_WINDOW: u32 = 2 * WINDOW;
 const PATH_QUEUE: usize = 4;
 
 pub(super) type Writer = mpsc::Sender<Flight>;

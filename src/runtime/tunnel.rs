@@ -43,7 +43,7 @@ const WIRE_QUEUE: usize = 4096;
 const SESSION_IDLE_GRACE: Duration = Duration::from_secs(120);
 const SESSION_PATH: &str = "/session";
 pub(crate) const STREAM_ALPN: &[u8] = b"braidpath-stream/2";
-pub(crate) const NATIVE_RETURN_WINDOW: u32 = native_return::WINDOW;
+pub(crate) const NATIVE_RETURN_RECEIVE_WINDOW: u32 = native_return::RECEIVE_WINDOW;
 // An authenticated stream/2 owner is discarding this epoch, rather than
 // temporarily replacing a transport path. Its remote stream budget can end now.
 const STREAM_SESSION_STOP: u32 = 0x4250;
