@@ -192,12 +192,12 @@ async fn existing_client_recovers_moved_server_and_never_delivers_to_address_suc
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();
     // Reserve all endpoints together so the allocator cannot reuse one.
-    let reservations: Vec<_> = (0..5)
-        .map(|_| std::net::UdpSocket::bind("127.0.0.1:0").unwrap())
+    let mut reservations: Vec<_> = (0..5)
+        .map(|_| Some(std::net::UdpSocket::bind("127.0.0.1:0").unwrap()))
         .collect();
     let addresses: Vec<_> = reservations
         .iter()
-        .map(|s| s.local_addr().unwrap())
+        .map(|s| s.as_ref().unwrap().local_addr().unwrap())
         .collect();
     let (old_a, moved_a, b, c, client_at) = (
         addresses[0],
@@ -206,11 +206,15 @@ async fn existing_client_recovers_moved_server_and_never_delivers_to_address_suc
         addresses[3],
         addresses[4],
     );
-    drop(reservations);
+    // Other fixture sockets and mesh-control clients also allocate ephemeral
+    // endpoints. Keep every unused address bound until its owner starts.
     let target_a = Echo::start(b'A').await;
     let other_target = Echo::start(b'X').await;
+    drop(reservations[0].take());
     let initial = server(root, "node_a", old_a, target_a.address, None).await;
+    drop(reservations[2].take());
     let _b = server(root, "node_b", b, other_target.address, Some(old_a)).await;
+    drop(reservations[3].take());
     let _c = server(root, "node_c", c, other_target.address, Some(b)).await;
     let key_path = root.join("node_a/client-key.json");
     let identity = ClientIdentity::open(root.join("observer"), &key_path).unwrap();
@@ -221,6 +225,7 @@ async fn existing_client_recovers_moved_server_and_never_delivers_to_address_suc
     )
     .await;
     let key_before = fs::read(root.join("node_a/server-key.json")).unwrap();
+    drop(reservations[4].take());
     let _client = Process::start(
         root,
         "client",
@@ -252,9 +257,12 @@ async fn existing_client_recovers_moved_server_and_never_delivers_to_address_suc
         .as_secs();
     let started = Instant::now();
     drop(initial);
+    let old_address = std::net::UdpSocket::bind(old_a).unwrap();
+    drop(reservations[1].take());
     // Same ID, keys and state directory; no enrollment arguments are required.
     let _moved = server(root, "node_a", moved_a, target_a.address, None).await;
     wait_members(&identity, b, &[("node_a", moved_a, 1)]).await;
+    drop(old_address);
     let _successor = server(root, "successor", old_a, other_target.address, Some(b)).await;
     wait_members(
         &identity,
