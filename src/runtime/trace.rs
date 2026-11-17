@@ -213,6 +213,8 @@ pub enum Stage {
     SenderInput,
     SymbolGenerated,
     SymbolQueued,
+    WriterQueued,
+    WriterRejected,
     QuinnApiAdmitted,
     QuinnApiRejected,
     PeerHttpReceived,

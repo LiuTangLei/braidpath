@@ -416,6 +416,7 @@ pub struct Path {
     /// Attempt count, retried frames can increment this multiple times. Not a drop count.
     pub send_buffer_full_attempts: u64,
     pub quinn_send_error_attempts: u64,
+    pub writer_expired_game_datagrams: u64,
     pub http_datagrams_received: u64,
     pub receiver_queue_full_dropped: u64,
     pub receiver_queue_closed_dropped: u64,

@@ -447,7 +447,28 @@ impl Connection {
     /// Previously queued datagrams which are still unsent may be discarded to make space for this
     /// datagram, in order of oldest to newest.
     pub fn send_datagram(&self, data: Bytes) -> Result<(), SendDatagramError> {
+        self.send_datagram_inner(data, None).map(|_| ())
+    }
+
+    /// Queue a datagram only if its local deadline has not passed after the
+    /// connection lock is acquired. Returns false when the deadline expired.
+    pub fn send_datagram_before(
+        &self,
+        data: Bytes,
+        deadline: Instant,
+    ) -> Result<bool, SendDatagramError> {
+        self.send_datagram_inner(data, Some(deadline))
+    }
+
+    fn send_datagram_inner(
+        &self,
+        data: Bytes,
+        deadline: Option<Instant>,
+    ) -> Result<bool, SendDatagramError> {
         let conn = &mut *self.0.state.lock("send_datagram");
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return Ok(false);
+        }
         if let Some(ref x) = conn.error {
             return Err(SendDatagramError::ConnectionLost(x.clone()));
         }
@@ -456,7 +477,7 @@ impl Connection {
             Ok(()) => {
                 conn.publish(&self.0.shared);
                 conn.wake();
-                Ok(())
+                Ok(true)
             }
             Err(e) => Err(match e {
                 Blocked(..) => unreachable!(),

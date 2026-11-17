@@ -61,7 +61,7 @@ impl Pair {
             id: 0,
             group: 2,
             conn: self.outgoing.clone(),
-            writer: writer::Writer::spawn(&self.outgoing),
+            writer: writer::Writer::spawn(&self.outgoing, None),
             stream: 0,
             stream_payload: MAX_PAYLOAD,
             quality: Arc::new(Mutex::new(quality::State::new(7))),
@@ -805,6 +805,7 @@ impl Accounting {
             candidates: vec![(path.id, 1)],
             feedback_reserve: 0,
             group_reserve: 0,
+            game: None,
         }
     }
 
@@ -1698,6 +1699,7 @@ async fn bulk_unready_path_cannot_steal_later_small_requests(adaptive: bool) {
         prepared.data.clone(),
         created,
         Duration::from_secs(1),
+        None,
     )
     .unwrap()
     .unwrap();
@@ -1882,6 +1884,7 @@ async fn mixed_small_copy_uses_its_own_bounded_admission_credit_on_wider_http_st
         original.data.clone(),
         created,
         Duration::from_secs(1),
+        None,
     )
     .unwrap()
     .unwrap();
@@ -1992,6 +1995,7 @@ async fn cold_small_copy_is_authorized_only_by_its_actual_original_admission() {
         original.data.clone(),
         created,
         Duration::from_secs(1),
+        None,
     )
     .unwrap()
     .unwrap();
@@ -2083,8 +2087,14 @@ async fn direct_admission_rechecks_ingress_deadline_after_preparation() {
         // or waiting for locks after the cached preflight, without wall-clock sleep.
         ADMISSION_CLOCK_OVERRIDE.with(|clock| clock.set(Some(created + lifetime)));
         assert!(
-            send_datagram_before_deadline(&path, attempt.data, attempt.front.created, lifetime,)
-                .is_none(),
+            send_datagram_before_deadline(
+                &path,
+                attempt.data,
+                attempt.front.created,
+                lifetime,
+                None
+            )
+            .is_none(),
             "an expired prepared frame must never enter a ready Quinn buffer"
         );
         let expired = accounting.queue.pop(attempt.repair).unwrap();
@@ -2102,6 +2112,7 @@ async fn direct_admission_rechecks_ingress_deadline_after_preparation() {
             fresh.clone(),
             Instant::now(),
             Duration::from_secs(1),
+            None,
         )
         .unwrap()
         .is_ok()
@@ -2912,6 +2923,69 @@ async fn writer_control_prepend_preserves_byte_accounting() {
         0,
         "drained writer byte count must not wrap"
     );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn game_writer_orders_originals_before_copies_and_drops_expired_frames() {
+    let pair = Pair::connect().await;
+    let path = pair.path();
+    path.writer.set_pace(80_000_000);
+
+    // Leave the writer unscheduled across the first packet's deadline.
+    let deadline = Instant::now() + Duration::from_millis(10);
+    assert!(path.writer.send_data(
+        Bytes::from_static(b"expired"),
+        Some(writer::GamePacket {
+            deadline,
+            repair: false
+        }),
+    ));
+    std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
+    assert!(Instant::now() >= deadline);
+
+    let deadline = Instant::now() + Duration::from_secs(1);
+    assert!(path.writer.send(Bytes::from_static(b"bulk")));
+    assert!(path.writer.send_data(
+        Bytes::from_static(b"copy"),
+        Some(writer::GamePacket {
+            deadline,
+            repair: true
+        }),
+    ));
+    assert!(path.writer.send_data(
+        Bytes::from_static(b"original"),
+        Some(writer::GamePacket {
+            deadline,
+            repair: false
+        }),
+    ));
+    assert!(path.writer.send_first(Bytes::from_static(b"control")));
+    for expected in [b"control".as_slice(), b"original", b"copy", b"bulk"] {
+        assert_eq!(pair.receive().await.as_ref(), expected);
+    }
+    pair.assert_quiet().await;
+    assert_eq!(path.writer.held(), 0);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn quinn_does_not_enqueue_an_expired_datagram() {
+    let pair = Pair::connect().await;
+    assert!(
+        !pair
+            .outgoing
+            .send_datagram_before(Bytes::from_static(b"expired"), Instant::now(),)
+            .unwrap()
+    );
+    assert!(
+        pair.outgoing
+            .send_datagram_before(
+                Bytes::from_static(b"live"),
+                Instant::now() + Duration::from_secs(1),
+            )
+            .unwrap()
+    );
+    assert_eq!(pair.receive().await.as_ref(), b"live");
+    pair.assert_quiet().await;
 }
 
 #[tokio::test(flavor = "current_thread")]

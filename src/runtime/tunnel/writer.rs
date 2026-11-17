@@ -12,6 +12,7 @@
 //! with segmentation offload); a slow path keeps one datagram in flight
 //! locally, as before.
 
+use super::{Scope, trace, trace_http};
 use bytes::Bytes;
 use std::{
     collections::VecDeque,
@@ -19,6 +20,7 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
+    time::Instant,
 };
 use tokio::sync::Notify;
 
@@ -32,9 +34,50 @@ pub(super) struct Writer {
     capacity: usize,
 }
 
+#[derive(Clone, Copy)]
+pub(super) struct GamePacket {
+    pub deadline: Instant,
+    pub repair: bool,
+}
+
+pub(super) struct Observations {
+    pub scope: Scope,
+    pub path: trace::PathKey,
+    pub stream: u64,
+    pub feedback: bool,
+}
+
+struct Frame {
+    data: Bytes,
+    priority: Priority,
+}
+
+enum Priority {
+    Control,
+    Game(GamePacket),
+    Ordinary,
+}
+
+impl Priority {
+    fn rank(&self) -> u8 {
+        match self {
+            Self::Control => 0,
+            Self::Game(packet) => 1 + u8::from(packet.repair),
+            Self::Ordinary => 3,
+        }
+    }
+
+    fn deadline(&self) -> Option<Instant> {
+        match self {
+            Self::Game(packet) => Some(packet.deadline),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Default)]
 struct Shared {
-    queue: Mutex<VecDeque<Bytes>>,
+    queue: Mutex<VecDeque<Frame>>,
     /// Bytes in `queue`; never below its contents while a datagram moves.
     queued: AtomicUsize,
     budget: AtomicUsize,
@@ -44,10 +87,10 @@ struct Shared {
 }
 
 impl Writer {
-    pub(super) fn spawn(conn: &quinn::Connection) -> Arc<Self> {
+    pub(super) fn spawn(conn: &quinn::Connection, observations: Option<Observations>) -> Arc<Self> {
         let capacity = conn.datagram_send_buffer_space();
         let shared = Arc::new(Shared::default());
-        tokio::spawn(run(conn.clone(), shared.clone(), capacity));
+        tokio::spawn(run(conn.clone(), shared.clone(), capacity, observations));
         Arc::new(Self {
             conn: conn.clone(),
             shared,
@@ -85,17 +128,21 @@ impl Writer {
         );
     }
 
-    /// Queue a datagram after this path's queued data. False once closed.
+    /// Queue an ordinary datagram behind existing data. False once closed.
     pub(super) fn send(&self, data: Bytes) -> bool {
-        self.enqueue(data, false)
+        self.send_data(data, None)
+    }
+
+    pub(super) fn send_data(&self, data: Bytes, game: Option<GamePacket>) -> bool {
+        self.enqueue(data, game.map_or(Priority::Ordinary, Priority::Game))
     }
 
     /// Queue a control datagram ahead of this path's queued data.
     pub(super) fn send_first(&self, data: Bytes) -> bool {
-        self.enqueue(data, true)
+        self.enqueue(data, Priority::Control)
     }
 
-    fn enqueue(&self, data: Bytes, first: bool) -> bool {
+    fn enqueue(&self, data: Bytes, priority: Priority) -> bool {
         if self.conn.is_closed() || self.shared.stopped.load(Ordering::Relaxed) {
             return false;
         }
@@ -103,11 +150,15 @@ impl Writer {
         {
             let mut queue = self.shared.queue.lock().expect("writer queue");
             self.shared.queued.fetch_add(len, Ordering::AcqRel);
-            if first {
-                queue.push_front(data);
-            } else {
-                queue.push_back(data);
-            }
+            let index = match &priority {
+                Priority::Control => 0,
+                Priority::Game(_) => queue
+                    .iter()
+                    .position(|other| other.priority.rank() > priority.rank())
+                    .unwrap_or(queue.len()),
+                Priority::Ordinary => queue.len(),
+            };
+            queue.insert(index, Frame { data, priority });
         }
         self.shared.wake.notify_one();
         true
@@ -140,7 +191,12 @@ impl Drop for Writer {
     }
 }
 
-async fn run(conn: quinn::Connection, shared: Arc<Shared>, capacity: usize) {
+async fn run(
+    conn: quinn::Connection,
+    shared: Arc<Shared>,
+    capacity: usize,
+    observations: Option<Observations>,
+) {
     let mut profile = super::profile::Writer::new(conn.stable_id());
     loop {
         let drained = conn.datagrams_drained();
@@ -151,6 +207,7 @@ async fn run(conn: quinn::Connection, shared: Arc<Shared>, capacity: usize) {
         }
         let budget = shared.budget.load(Ordering::Relaxed);
         let mut turn_datagrams = 0;
+        let mut blocked_deadline = None;
         loop {
             #[cfg(test)]
             TEST_BEFORE_POP.with(|hook| {
@@ -159,28 +216,75 @@ async fn run(conn: quinn::Connection, shared: Arc<Shared>, capacity: usize) {
                     f();
                 }
             });
-            let (data, len) = {
+            let frame = {
                 let mut queue = shared.queue.lock().expect("writer queue");
-                let Some(len) = queue.front().map(Bytes::len) else {
+                let Some(front) = queue.front() else {
                     break;
                 };
+                let deadline = front.priority.deadline();
                 let in_quinn = capacity.saturating_sub(conn.datagram_send_buffer_space_hint());
-                if in_quinn > 0 && in_quinn + len > budget {
+                if in_quinn > 0
+                    && in_quinn + front.data.len() > budget
+                    && deadline.is_none_or(|at| Instant::now() < at)
+                {
+                    blocked_deadline = deadline;
                     if let Some(profile) = &mut profile {
                         profile.counters.budget_blocks += 1;
                     }
                     break;
                 }
-                (queue.pop_front().expect("front datagram"), len)
+                queue.pop_front().expect("front datagram")
             };
-            // Quinn's space shrinks before the queue does, so `held` never
-            // understates. A refused datagram is a closed or resized path.
-            let called = profile.as_ref().map(|_| std::time::Instant::now());
-            let _ = conn.send_datagram(data);
-            if let (Some(profile), Some(at)) = (&mut profile, called) {
-                profile.called(at.elapsed());
+            // Quinn updates its buffer before releasing the writer's byte
+            // charge. Its locked deadline check also covers lock contention.
+            let Frame { data, priority } = frame;
+            let len = data.len();
+            let tracing = observations
+                .as_ref()
+                .filter(|watch| watch.scope.metrics.trace().enabled())
+                .filter(|_| !matches!(priority, Priority::Control))
+                .map(|_| data.clone());
+            let deadline = priority.deadline();
+            let result = if deadline.is_some_and(|at| Instant::now() >= at) {
+                Ok(false)
+            } else {
+                let called = profile.as_ref().map(|_| Instant::now());
+                let result = match deadline {
+                    Some(at) => conn.send_datagram_before(data, at),
+                    None => conn.send_datagram(data).map(|()| true),
+                };
+                if let (Some(profile), Some(at)) = (&mut profile, called) {
+                    profile.called(at.elapsed());
+                }
+                result
+            };
+            if matches!(result, Ok(false))
+                && let Some(watch) = &observations
+            {
+                watch.scope.path(watch.path.path_id, |p| {
+                    p.writer_expired_game_datagrams += 1;
+                });
             }
-            turn_datagrams += 1;
+            if let (Some(watch), Some(data)) = (&observations, tracing) {
+                let (stage, reason) = match result {
+                    Ok(true) => (trace::Stage::QuinnApiAdmitted, None),
+                    Ok(false) => (trace::Stage::SymbolDropped, Some(trace::Reason::Expired)),
+                    Err(_) => (
+                        trace::Stage::QuinnApiRejected,
+                        Some(trace::Reason::QuinnError),
+                    ),
+                };
+                trace_http(
+                    &watch.scope,
+                    stage,
+                    &data,
+                    watch.stream,
+                    watch.feedback,
+                    watch.path,
+                    reason,
+                );
+            }
+            turn_datagrams += u64::from(matches!(result, Ok(true)));
             #[cfg(test)]
             {
                 let pause = TEST_AFTER_SEND.with(|hook| hook.borrow_mut().take());
@@ -208,6 +312,9 @@ async fn run(conn: quinn::Connection, shared: Arc<Shared>, capacity: usize) {
         tokio::select! {
             () = &mut drained => {}
             () = shared.wake.notified() => {}
+            () = async {
+                tokio::time::sleep_until(blocked_deadline.expect("blocked deadline").into()).await;
+            }, if blocked_deadline.is_some() => {}
         }
         if let (Some(profile), Some((at, queued, buffered))) = (&mut profile, waiting) {
             profile.waited(at.elapsed(), queued, buffered);
@@ -215,7 +322,7 @@ async fn run(conn: quinn::Connection, shared: Arc<Shared>, capacity: usize) {
     }
     let mut queue = shared.queue.lock().expect("writer queue");
     shared.queued.fetch_sub(
-        queue.drain(..).map(|data| data.len()).sum(),
+        queue.drain(..).map(|frame| frame.data.len()).sum(),
         Ordering::AcqRel,
     );
 }

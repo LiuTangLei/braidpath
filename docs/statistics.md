@@ -212,11 +212,16 @@ record ID. `record_assigned` establishes the actual flow/record ID, retaining th
 optional probe identity; the server's target-reply event queue sits between
 those two stages. `ingress_queued` identifies successful queue admissions; server
 replies can have one before record assignment and one at the sender input queue.
-`sender_input`, `symbol_generated`, `symbol_queued`, `quinn_api_admitted`,
+`sender_input`, `symbol_generated`, `symbol_queued`, `writer_queued`, `quinn_api_admitted`,
 `peer_http_received`, `peer_symbol_received`, `record_decoded` and
 `local_udp_delivered` expose subsequent boundaries. Terminal record/symbol
 events identify their local reason. Queueing/WouldBlock and duplicate events are
 separate; a duplicate discard is not another lost business record.
+
+`writer_queued` is the scheduler's handoff. `quinn_api_admitted` is emitted by
+the writer after Quinn accepts the datagram. The `quinn_admitted_*` admission
+counters track the scheduler handoff, and `writer_expired_game_datagrams`
+counts Game UDP frames discarded after that handoff due to their local deadline.
 
 The key is authenticated session and direction, actual wire kind/block/index
 (repair uses source count), and flow/record ID when observed. Plain frames have

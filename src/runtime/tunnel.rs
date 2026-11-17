@@ -1195,6 +1195,7 @@ struct PreparedSend {
     repair: bool,
     used: u8,
     data: Bytes,
+    game: Option<writer::GamePacket>,
     feedback_reserve: usize,
     group_reserve: usize,
 }
@@ -1324,7 +1325,12 @@ impl WaitingSend {
         if self.admitted.as_mut().poll(cx).is_pending() {
             return Poll::Pending;
         }
-        if self.prepared.path.writer.send(self.prepared.data.clone()) {
+        if self
+            .prepared
+            .path
+            .writer
+            .send_data(self.prepared.data.clone(), self.prepared.game)
+        {
             Poll::Ready(SendReadiness::Admitted {
                 at: Instant::now(),
                 next_cursor: (index + 1) % paths.len(),
@@ -1357,12 +1363,18 @@ fn send_datagram_before_deadline(
     data: Bytes,
     created: Instant,
     lifetime: Duration,
+    game: Option<writer::GamePacket>,
 ) -> Option<std::result::Result<Instant, ()>> {
     // Preparation can outlive the queue-head preflight.
     if admission_now().saturating_duration_since(created) >= lifetime {
         return None;
     }
-    Some(path.writer.send(data).then(Instant::now).ok_or(()))
+    Some(
+        path.writer
+            .send_data(data, game)
+            .then(Instant::now)
+            .ok_or(()),
+    )
 }
 
 fn admission_now() -> Instant {
@@ -1578,7 +1590,7 @@ impl SendAccounting<'_> {
         debug_assert_eq!(sent.small, front.small);
         trace_outgoing(
             self.metrics,
-            trace::Stage::QuinnApiAdmitted,
+            trace::Stage::WriterQueued,
             &sent,
             path,
             frame_bytes,
@@ -2079,7 +2091,7 @@ async fn sender_with_game_input(
                 let attempt = prepared.expect("selected readiness attempt");
                 trace_outgoing(
                     &metrics,
-                    trace::Stage::QuinnApiRejected,
+                    trace::Stage::WriterRejected,
                     &attempt.front,
                     &attempt.path,
                     attempt.data.len(),
@@ -3292,6 +3304,11 @@ async fn sender_with_game_input(
                     continue;
                 };
                 debug_assert_eq!(data.len(), frame_bytes);
+                let lifetime = policy.symbol_lifetime(&front);
+                let game = gaming_datagram.then(|| writer::GamePacket {
+                    deadline: front.created + lifetime,
+                    repair,
+                });
                 if blocked {
                     wait_candidate = Some(PreparedSend {
                         path: path.clone(),
@@ -3306,17 +3323,13 @@ async fn sender_with_game_input(
                         repair,
                         used,
                         data,
+                        game,
                         feedback_reserve,
                         group_reserve,
                     });
                     continue;
                 }
-                match send_datagram_before_deadline(
-                    path,
-                    data,
-                    front.created,
-                    policy.symbol_lifetime(&front),
-                ) {
+                match send_datagram_before_deadline(path, data, front.created, lifetime, game) {
                     None => {
                         frontier.add(path.id, is_small, Gate::ExpiredBeforeApi);
                         let expired = queue.pop(repair).expect("expired front");
@@ -3333,7 +3346,7 @@ async fn sender_with_game_input(
                         frontier.add(path.id, is_small, Gate::ApiError);
                         trace_outgoing(
                             &metrics,
-                            trace::Stage::QuinnApiRejected,
+                            trace::Stage::WriterRejected,
                             &front,
                             path,
                             frame_bytes,
@@ -4612,7 +4625,12 @@ async fn server_connection(
                                             let mut generations=session.generations.lock().expect("generation lock");
                                             scheduler::admit_generation(&mut generations[usize::from(pid)],generation)?;
                                             if let Some(i)=existing {paths.remove(i).conn.close(0u32.into(),b"path rejoined");}
-                                            paths.push(OutPath{id:pid,group,conn:conn.clone(),writer:writer::Writer::spawn(&conn),stream:stream_id,stream_payload,native_return:return_writer,quality:Arc::new(Mutex::new(quality::State::new(generation))),capacity_probe:Arc::new(Mutex::new(capacity_probe::State::new(generation))),capacity_probe_enabled:capacity_probe_bps>0,epoch:Instant::now(),probe_reply:Arc::new(Mutex::new(None))});
+                                            paths.push(OutPath{id:pid,group,conn:conn.clone(),writer:writer::Writer::spawn(&conn, Some(writer::Observations {
+                                                scope: session.returning.clone(),
+                                                path: trace::PathKey { path_id: pid, generation, connection_id: conn.stable_id() as u64 },
+                                                stream: stream_id,
+                                                feedback: session.policy.receiver_feedback,
+                                            })),stream:stream_id,stream_payload,native_return:return_writer,quality:Arc::new(Mutex::new(quality::State::new(generation))),capacity_probe:Arc::new(Mutex::new(capacity_probe::State::new(generation))),capacity_probe_enabled:capacity_probe_bps>0,epoch:Instant::now(),probe_reply:Arc::new(Mutex::new(None))});
                                             *session.empty_since.lock().expect("empty time lock")=None;
                                         }
                                         Some(session)
@@ -5458,7 +5476,12 @@ async fn client_session(
                             for old in active.iter().filter(|p|p.id==pid) {old.conn.close(0u32.into(),b"path replaced");}
                             active.retain(|p|p.id!=pid);
                             active.push(OutPath{id:pid,group:configs[id].group,conn:value.conn.clone(),stream:value.stream,stream_payload:value.stream_payload,
-                                native_return:None,writer:writer::Writer::spawn(&value.conn),
+                                native_return:None,writer:writer::Writer::spawn(&value.conn, Some(writer::Observations {
+                                    scope: forward.clone(),
+                                    path: trace::PathKey { path_id: pid, generation, connection_id: value.conn.stable_id() as u64 },
+                                    stream: value.stream,
+                                    feedback: options.policy.receiver_feedback,
+                                })),
                                 quality:Arc::new(Mutex::new(quality::State::new(generation))),capacity_probe:Arc::new(Mutex::new(capacity_probe::State::new(generation))),capacity_probe_enabled:options.policy.capacity_probe_bps>0,epoch:Instant::now(),
                                 probe_reply:Arc::new(Mutex::new(None))});
                         }
