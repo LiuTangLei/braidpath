@@ -1,5 +1,11 @@
 # Runtime statistics
 
+CLI diagnostics use a dedicated writer thread and a queue of at most 256
+formatted records. A blocked stderr cannot backpressure network tasks. When
+the queue fills, diagnostics are dropped and counted in the snapshot's
+`logging.dropped_records`; `logging.queued_record_limit` reports the bound.
+The writer guard stays alive through normal CLI shutdown to flush final logs.
+
 With `--adaptive-fec-retention`, receiving session/direction snapshots include
 `stats.sessions[session][direction].fec_retention`. Its current/minimum/maximum
 and peak values are milliseconds. It also records samples, distinct late samples,

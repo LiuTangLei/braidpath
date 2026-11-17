@@ -1136,6 +1136,10 @@ impl Metrics {
         };
         let mut value = serde_json::json!({"schema_version":1,"process_id":std::process::id(),"instance_id":self.0.instance_id,"bounds":{"session_scopes":MAX_SCOPES,"path_scopes":MAX_SCOPES,"connection_events":MAX_CONNECTION_EVENTS,"record_id_window":ID_WINDOW,"previous_generations_per_path":MAX_PREVIOUS_GENERATIONS,"current_connection_references":MAX_SCOPES,"retired_session_snapshots":MAX_RETIRED_SESSIONS},"role":self.0.role,"final":final_snapshot,"outcome":outcome,"error":error,"elapsed_ms":elapsed_ms,"sample_unix_ms":sample_unix_ms,"counters":"cumulative; units separated by records/symbols/quinn/relay; pre-path queues have aggregate scope","stats":state});
         value["repair_usefulness_guard"] = serde_json::json!(self.0.repair_usefulness_guard);
+        value["logging"] = serde_json::json!({
+            "queued_record_limit": super::logging::BUFFERED_RECORDS,
+            "dropped_records": super::logging::dropped_records(),
+        });
         if self.trace().enabled() {
             value["packet_trace"] = serde_json::to_value(self.trace().snapshot())?;
         }

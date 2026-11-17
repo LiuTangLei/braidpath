@@ -5,6 +5,7 @@ pub mod capacity_probe;
 pub mod cli;
 pub mod fec_retention;
 pub mod forward_guard;
+pub mod logging;
 pub mod mesh;
 pub mod outbound;
 pub mod probe;

@@ -1,7 +1,8 @@
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let (log_writer, _log_guard) = braidpath::runtime::logging::stderr();
     tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
+        .with_writer(log_writer)
         .with_ansi(false)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
