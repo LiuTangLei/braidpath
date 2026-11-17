@@ -2929,6 +2929,11 @@ async fn sender(
                 }
             }
             let mut accepted = None;
+            if !repair
+                && native_return::latency_datagram(native_returning, policy.game_mode, front.flow)
+            {
+                order = native_return::udp_order(order, &paths, policy.latency_target_ms);
+            }
             let mut wait_candidate = None;
             for i in order {
                 let path = &paths[i];

@@ -24,6 +24,60 @@ pub(super) fn latency_datagram(native_returning: bool, game_mode: bool, flow: Op
         && flow.is_some_and(|flow| super::associate::is_flow(flow & !super::messages::FLAG))
 }
 
+#[derive(Clone, Copy)]
+struct UdpRoute {
+    index: usize,
+    delay_ms: f64,
+    loss: Option<f64>,
+}
+fn rank_udp(routes: &mut [UdpRoute], slack_ms: f64) {
+    let fastest = routes
+        .iter()
+        .map(|p| p.delay_ms)
+        .fold(f64::INFINITY, f64::min);
+    let timely = fastest + slack_ms;
+    let best_loss = routes
+        .iter()
+        .filter(|p| p.delay_ms <= timely)
+        .filter_map(|p| p.loss)
+        .fold(1.0f64, f64::min);
+    let tier = |p: &UdpRoute| {
+        if p.delay_ms > timely {
+            2
+        } else if p.loss.is_some_and(|loss| loss > best_loss + 0.001) {
+            1
+        } else {
+            0
+        }
+    };
+    routes.sort_by(|a, b| {
+        tier(a)
+            .cmp(&tier(b))
+            .then_with(|| a.delay_ms.total_cmp(&b.delay_ms))
+    });
+}
+/// A near-equal, demonstrably healthier route is worth a few milliseconds for
+/// an unreliable fragment. QUIC loss is transport evidence, not UDP delivery
+/// proof; this is only ordering and never removes a fallback.
+pub(super) fn udp_order(order: Vec<usize>, paths: &[OutPath], target_ms: u64) -> Vec<usize> {
+    let mut routes: Vec<_> = order
+        .into_iter()
+        .map(|index| {
+            let path = &paths[index];
+            let stats = path.conn.stats();
+            UdpRoute {
+                index,
+                delay_ms: super::small_delivery::delay_ms(path),
+                loss: (stats.path.sent_packets >= 64).then(|| {
+                    (stats.path.lost_packets as f64 / stats.path.sent_packets as f64).min(1.0)
+                }),
+            }
+        })
+        .collect();
+    rank_udp(&mut routes, target_ms.min(20) as f64);
+    routes.into_iter().map(|p| p.index).collect()
+}
+
 pub(super) const HEADER: &str = "braidpath-return-stream";
 pub(super) const PAYLOAD: usize = stream::RELIABLE_PAYLOAD;
 const HEADER_BYTES: usize = 16;
@@ -378,6 +432,51 @@ impl Decoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn native_udp_prefers_a_nearby_healthy_route_without_hiding_fallbacks() {
+        let mut routes = [
+            UdpRoute {
+                index: 0,
+                delay_ms: 50.0,
+                loss: Some(0.006),
+            },
+            UdpRoute {
+                index: 1,
+                delay_ms: 55.0,
+                loss: Some(0.0),
+            },
+            UdpRoute {
+                index: 2,
+                delay_ms: 80.0,
+                loss: Some(0.0),
+            },
+        ];
+        rank_udp(&mut routes, 20.0);
+        assert_eq!(routes.map(|p| p.index), [1, 0, 2]);
+        assert_eq!(
+            routes.len(),
+            3,
+            "a busy healthy path retains both fallbacks"
+        );
+        for route in &mut routes {
+            route.loss = None;
+        }
+        rank_udp(&mut routes, 20.0);
+        assert_eq!(
+            routes.map(|p| p.index),
+            [0, 1, 2],
+            "unknown loss preserves latency order"
+        );
+        routes[1].loss = Some(0.0);
+        routes[0].loss = Some(0.006);
+        rank_udp(&mut routes, 2.0);
+        assert_eq!(
+            routes.map(|p| p.index),
+            [0, 1, 2],
+            "health preference stays in the delay budget"
+        );
+    }
+
     #[test]
     fn native_udp_latency_scope_includes_fragments_and_preserves_other_carriers() {
         let flow = super::super::associate::FLAG | 1;
