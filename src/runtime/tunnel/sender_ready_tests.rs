@@ -5,6 +5,78 @@ use std::{
     task::{Wake, Waker},
 };
 
+thread_local! {
+    static GAME_EVIDENCE_PRESSURE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static GAME_INPUT_PRESSURE: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+pub(super) fn observe_game_input() {
+    GAME_EVIDENCE_PRESSURE.with(|remaining| {
+        GAME_INPUT_PRESSURE.with(|first| {
+            if remaining.get() > 0 && first.get().is_none() {
+                first.set(Some(remaining.get()));
+            }
+        });
+    });
+}
+
+pub(super) fn renew_game_evidence(notify: Option<&Notify>) {
+    GAME_EVIDENCE_PRESSURE.with(|remaining| {
+        if remaining.get() > 0 {
+            remaining.set(remaining.get() - 1);
+            notify.expect("test observation source").notify_one();
+        }
+    });
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn game_input_gets_a_turn_while_observation_remains_ready() {
+    let pair = Pair::connect().await;
+    let paths = Arc::new(Mutex::new(vec![pair.path()]));
+    let mut p = policy();
+    p.game_mode = true;
+    p.adaptive = true;
+    p.fec = automatic_fec::AUTO;
+    p.queue_ms = 20;
+    p.latency_target_ms = 20;
+    let metrics = stats::Metrics::new("client");
+    let scope = metrics.scope("game-input-fairness", stats::FORWARD);
+    metrics.register("game-input-fairness", 0, 2, stats::FORWARD, &pair.outgoing);
+    let (tx, rx) = mpsc::channel(QUEUE);
+    tx.try_send(QueuedRecord {
+        record: record(1),
+        created: Instant::now(),
+        hold: None,
+    })
+    .unwrap();
+    let (stop, stopped) = watch::channel(false);
+    let observation = Arc::new(Notify::new());
+    GAME_EVIDENCE_PRESSURE.with(|remaining| remaining.set(4096));
+    GAME_INPUT_PRESSURE.with(|first| first.set(None));
+    let task = tokio::spawn(sender(rx, paths, p, stopped, scope, Some(observation)));
+    let mut consumed = 0;
+    for _ in 0..256 {
+        tokio::task::yield_now().await;
+        metrics.state(|s| {
+            consumed = s.sessions["game-input-fairness"][stats::FORWARD]
+                .records
+                .sender_input_consumed
+        });
+        if consumed > 0 {
+            break;
+        }
+    }
+    GAME_EVIDENCE_PRESSURE.with(|remaining| remaining.set(0));
+    let pressure_at_input = GAME_INPUT_PRESSURE.with(|first| first.replace(None));
+    stop.send(true).unwrap();
+    task.await.unwrap();
+    assert_eq!(consumed, 1, "queued game input must make progress");
+    assert!(
+        pressure_at_input.is_some_and(|remaining| remaining > 4090),
+        "input must get a bounded turn before ongoing evidence drains"
+    );
+}
+
 struct Pair {
     _identity: tempfile::TempDir,
     _server: quinn::Endpoint,

@@ -1717,6 +1717,7 @@ async fn sender(
     let mut profile = profile::Sender::new(metrics.direction);
     let mut waiting: Option<WaitingSend> = None;
     let mut liveness: [liveness::Liveness; MAX_PATHS] = Default::default();
+    let mut prefer_game_input = true;
     loop {
         #[cfg(test)]
         sender_ready_tests::hold_deferred_expiry(
@@ -1728,46 +1729,61 @@ async fn sender(
         if *stop.borrow() {
             break;
         }
+        #[cfg(test)]
+        sender_ready_tests::renew_game_evidence(observation_notify.as_deref());
         let wait_started = profile.as_ref().map(|_| Instant::now());
         let queued_before_wait = queue.len();
         let native_pending_before_wait = waiting.is_some();
-        let event = tokio::select! {
-            biased;
-            _=stop.changed()=>SenderEvent::Stop,
-            _=async { observation_notify.as_ref().expect("adaptive observation notify").notified().await },
-                if policy.adaptive && observation_notify.is_some()=>SenderEvent::Evidence,
-            _=tick.tick()=>SenderEvent::Tick,
-            ready=poll_fn(|cx| {
-                let Some(wait) = waiting.as_mut() else {
-                    return Poll::Pending;
-                };
-                wait.poll(cx, &shared_paths, lifetime, |attempt, now, paths| {
-                    let cost = attempt.data.len() + 80;
-                    let now_us = now.saturating_duration_since(epoch).as_micros()
-                        .min(u128::from(u64::MAX)) as u64;
-                    let age = now.saturating_duration_since(attempt.front.created);
-                    if !pacer.available(cost + attempt.feedback_reserve)
-                        || !groups[usize::from(attempt.path.group)]
-                            .available(cost + attempt.group_reserve)
-                        || (attempt.repair && !repair_allowed(&policy, &budget, &blocks, &attempt.front, attempt.data.len()))
-                    {
-                        return false;
-                    }
-                    if !attempt.small_delivery_allowed(&policy, paths, &mut controllers, now_us, age) {
-                        return false;
-                    }
-                    if !policy.adaptive {
-                        return true;
-                    }
-                    let allowed = controllers[usize::from(attempt.path.id)]
-                        .allow(now_us, cost, age.as_secs_f64() * 1000.0);
-                    update_business_pacer(&mut business, paths, &controllers, now_us);
-                    allowed && business.as_ref().expect("adaptive business pacer")
-                        .available(attempt.path.group, cost)
-                })
-            }), if waiting.is_some()=>SenderEvent::Ready(ready),
-            item=input.recv()=>SenderEvent::Input(item),
+        // One queued game input may precede continuously ready observations or
+        // ticks. The next turn retains control/readiness priority, so this does
+        // not starve maintenance or bypass any send/deadline/budget checks.
+        let game_input = if policy.game_mode && prefer_game_input {
+            input.try_recv().ok()
+        } else {
+            None
         };
+        let event = if let Some(input) = game_input {
+            SenderEvent::Input(Some(input))
+        } else {
+            tokio::select! {
+                biased;
+                _=stop.changed()=>SenderEvent::Stop,
+                _=async { observation_notify.as_ref().expect("adaptive observation notify").notified().await },
+                    if policy.adaptive && observation_notify.is_some()=>SenderEvent::Evidence,
+                _=tick.tick()=>SenderEvent::Tick,
+                ready=poll_fn(|cx| {
+                    let Some(wait) = waiting.as_mut() else {
+                        return Poll::Pending;
+                    };
+                    wait.poll(cx, &shared_paths, lifetime, |attempt, now, paths| {
+                        let cost = attempt.data.len() + 80;
+                        let now_us = now.saturating_duration_since(epoch).as_micros()
+                            .min(u128::from(u64::MAX)) as u64;
+                        let age = now.saturating_duration_since(attempt.front.created);
+                        if !pacer.available(cost + attempt.feedback_reserve)
+                            || !groups[usize::from(attempt.path.group)]
+                                .available(cost + attempt.group_reserve)
+                            || (attempt.repair && !repair_allowed(&policy, &budget, &blocks, &attempt.front, attempt.data.len()))
+                        {
+                            return false;
+                        }
+                        if !attempt.small_delivery_allowed(&policy, paths, &mut controllers, now_us, age) {
+                            return false;
+                        }
+                        if !policy.adaptive {
+                            return true;
+                        }
+                        let allowed = controllers[usize::from(attempt.path.id)]
+                            .allow(now_us, cost, age.as_secs_f64() * 1000.0);
+                        update_business_pacer(&mut business, paths, &controllers, now_us);
+                        allowed && business.as_ref().expect("adaptive business pacer")
+                            .available(attempt.path.group, cost)
+                    })
+                }), if waiting.is_some()=>SenderEvent::Ready(ready),
+                item=input.recv()=>SenderEvent::Input(item),
+            }
+        };
+        prefer_game_input = !matches!(&event, SenderEvent::Input(_));
         if let (Some(profile), Some(at)) = (&mut profile, wait_started) {
             profile.waited(at.elapsed(), queued_before_wait, native_pending_before_wait);
             match &event {
@@ -1867,6 +1883,8 @@ async fn sender(
                 frontier.readiness_gate_changed += 1;
             }
             SenderEvent::Input(item) => {
+                #[cfg(test)]
+                sender_ready_tests::observe_game_input();
                 #[cfg(test)]
                 sender_ready_tests::prime_full_input_turn(
                     &mut queue,
