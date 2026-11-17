@@ -117,7 +117,7 @@ impl Policy {
     }
     fn control_latency_target_ms(&self, direction: &str) -> u64 {
         if self.game_mode && direction == stats::RETURN {
-            self.latency_target_ms.min(5)
+            self.latency_target_ms.min(10)
         } else {
             self.latency_target_ms
         }
