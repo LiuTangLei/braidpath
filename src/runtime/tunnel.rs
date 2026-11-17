@@ -2212,7 +2212,9 @@ async fn sender_with_game_input(
                             path: path.id,
                             generation: q.snapshot.generation,
                             bytes: q.snapshot.sender_estimate.received_bytes,
-                            symbols: q.snapshot.sender_estimate.received,
+                            report_time_us: q.snapshot.sender_estimate.report_time_us,
+                            admitted_bytes: q.snapshot.sent_bytes,
+                            admitted_symbols: q.snapshot.sent_symbols,
                         }
                     })
                     .collect();
