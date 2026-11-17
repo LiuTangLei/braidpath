@@ -809,7 +809,7 @@ fn game_mode_preserves_socks_udp_boundaries_fragmentation_and_tcp() {
         let bytes = vec![(size % 251) as u8; size];
         let expected = udp_request(echo, &[b"echo:", bytes.as_slice()].concat());
         let got = udp_exchange(&socket, relay, &udp_request(echo, &bytes), &previous)
-            .expect("game UDP echo");
+            .unwrap_or_else(|| panic!("game UDP echo, payload size {size}"));
         assert_eq!(got.len(), expected.len(), "UDP payload size {size}");
         assert_eq!(got, expected);
         previous.push(expected);
