@@ -663,6 +663,8 @@ struct BlockSend {
     acknowledgment: bool,
     /// Game UDP copies may wait for existing rate credit until their deadline.
     game_datagram: bool,
+    /// Accepted original plus accepted copies; fits the existing metadata padding.
+    game_admissions: u8,
 }
 
 fn repair_locally_unrecoverable(
@@ -832,6 +834,7 @@ fn enqueue_coded_symbol(
                 small_repair_reserved: 0,
                 acknowledgment: false,
                 game_datagram: false,
+                game_admissions: 0,
             })
             .created
             .min(oldest)
@@ -1061,13 +1064,36 @@ fn prioritize_game_repair(
     policy: &Policy,
     blocks: &BTreeMap<u64, BlockSend>,
 ) -> bool {
+    let now = Instant::now();
     policy.game_mode
         && queue.promote_ready_repair(|pending| {
             pending
                 .block
                 .and_then(|block| blocks.get(&block))
                 .is_some_and(|meta| meta.game_datagram && meta.paths != 0)
+                && game_copy_due(policy, pending, blocks, now)
         })
+}
+
+fn game_copy_due(
+    policy: &Policy,
+    pending: &outbound::Pending,
+    blocks: &BTreeMap<u64, BlockSend>,
+    now: Instant,
+) -> bool {
+    if !policy.game_mode || !policy.gaming_symbol(pending) {
+        return true;
+    }
+    let Some(meta) = pending.block.and_then(|id| blocks.get(&id)) else {
+        return false;
+    };
+    let delay_ms = match meta.game_admissions {
+        1 => 1,
+        2 => 3,
+        3 => 6,
+        _ => return false,
+    };
+    now.saturating_duration_since(meta.created) >= Duration::from_millis(delay_ms)
 }
 
 fn game_pacing_reserve(
@@ -1638,6 +1664,11 @@ impl SendAccounting<'_> {
             frame_bytes,
             self.metrics,
         );
+        if let Some(meta) = sent.block.and_then(|id| self.blocks.get_mut(&id))
+            && meta.game_datagram
+        {
+            meta.game_admissions = meta.game_admissions.saturating_add(1);
+        }
         if repair {
             self.metrics.path(path.id, |p| {
                 p.quinn_admitted_repairs += 1;
@@ -3170,6 +3201,10 @@ async fn sender_with_game_input(
                     continue;
                 }
                 if is_small && repair && !small_delivery::copy_ready(path, used) {
+                    frontier.add(path.id, is_small, Gate::CopySpacing);
+                    continue;
+                }
+                if repair && !game_copy_due(&policy, &front, &blocks, Instant::now()) {
                     frontier.add(path.id, is_small, Gate::CopySpacing);
                     continue;
                 }

@@ -241,7 +241,7 @@ fn game_udp_classification_preserves_tcp_and_normal_mode() {
 
 #[test]
 fn game_copy_waits_for_rate_credit_ahead_of_superseding_ack_copies() {
-    let now = Instant::now();
+    let now = Instant::now() - Duration::from_millis(7);
     let p = policy();
     let mut encoder = coding::RecordEncoder::new(&p).unwrap();
     encoder.set_fec(4).unwrap();
@@ -282,6 +282,7 @@ fn game_copy_waits_for_rate_credit_ahead_of_superseding_ack_copies() {
     while let Some(original) = queue.pop(false) {
         let meta = blocks.get_mut(&original.block.unwrap()).unwrap();
         meta.paths = 1;
+        meta.game_admissions = 1;
         meta.small_repair_reserved = meta.small_repair_limit;
     }
     let ack_block = queue.front(true).unwrap().block;
@@ -324,6 +325,65 @@ fn game_copy_waits_for_rate_credit_ahead_of_superseding_ack_copies() {
         queue.is_empty(),
         "the existing deadline still expires every copy"
     );
+}
+
+#[test]
+fn game_copies_spread_inside_the_original_ten_ms_deadline() {
+    let p = policy();
+    let now = Instant::now();
+    let metrics = stats::Metrics::new("test");
+    let scope = metrics.scope("game-copy-clock", stats::FORWARD);
+    let mut encoder = coding::RecordEncoder::new(&p).unwrap();
+    let mut queue = outbound::Queue::default();
+    let mut blocks = BTreeMap::new();
+    let r = Record {
+        flow: associate::FLAG | 1,
+        id: 1,
+        payload: vec![7; 128],
+    };
+    for symbol in encoder.encode(&r, now).unwrap() {
+        enqueue_coded_symbol(
+            symbol,
+            now,
+            &mut queue,
+            &mut blocks,
+            Some(&p),
+            &scope,
+            &mut None,
+        );
+    }
+    let original = queue.pop(false).unwrap();
+    let block = original.block.unwrap();
+    let copy = queue.front(true).unwrap().clone();
+    assert!(!game_copy_due(
+        &p,
+        &copy,
+        &blocks,
+        now + Duration::from_millis(6)
+    ));
+    for (count, delay) in [(1, 1), (2, 3), (3, 6)] {
+        blocks.get_mut(&block).unwrap().game_admissions = count;
+        assert!(!game_copy_due(
+            &p,
+            &copy,
+            &blocks,
+            now + Duration::from_micros(delay * 1000 - 1)
+        ));
+        assert!(game_copy_due(
+            &p,
+            &copy,
+            &blocks,
+            now + Duration::from_millis(delay)
+        ));
+        assert_eq!(
+            copy.created, now,
+            "spacing never refreshes the ingress deadline"
+        );
+    }
+    assert_eq!(p.symbol_lifetime(&copy), Duration::from_millis(10));
+    let mut normal = p;
+    normal.game_mode = false;
+    assert!(game_copy_due(&normal, &copy, &blocks, now));
 }
 
 #[test]

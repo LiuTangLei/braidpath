@@ -167,6 +167,7 @@ fn missing_metadata_short_blocks_invalid_headers_and_small_lane_keep_repairs() {
         small_repair_reserved: 0,
         acknowledgment: false,
         game_datagram: false,
+        game_admissions: 0,
     };
     let mut data = vec![0u8; wire::HEADER];
     data[3] = 1;
