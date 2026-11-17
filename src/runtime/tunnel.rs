@@ -82,7 +82,7 @@ pub use tcp::Connector as StreamConnector;
 /// acknowledgments, keystrokes, DNS and similar small datagrams.
 const LATENCY_RECORD_BYTES: usize = 320;
 // Five original fragments for the Game preset's 4KiB packet plus one frame.
-const GAME_BURST_BYTES: usize = 7200;
+const GAME_PACKET_RESERVE: usize = 6000;
 const WEBSITE: &str = "<!doctype html><html lang=\"en\"><meta charset=\"utf-8\"><title>Welcome</title><h1>Welcome</h1><p>This service is online.</p></html>\n";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1081,7 +1081,7 @@ fn game_pacing_reserve(
     if policy.game_mode
         && (!policy.gaming_symbol(pending) || (repair && wire_bytes > LATENCY_RECORD_BYTES))
     {
-        6000.min(GAME_BURST_BYTES.saturating_sub(wire_bytes))
+        GAME_PACKET_RESERVE.min((2400 + GAME_PACKET_RESERVE).saturating_sub(wire_bytes))
     } else {
         0
     }
@@ -1786,10 +1786,10 @@ async fn sender_with_game_input(
         .with_queue_gated_loss(metrics.metrics.queue_gated_loss())
         .with_legacy_recovery(metrics.metrics.legacy_recovery())
         .with_shared_uplink_service(policy.game_mode || metrics.direction == stats::FORWARD)
-        .with_minimum_burst(if policy.game_mode {
-            GAME_BURST_BYTES
+        .with_packet_reserve(if policy.game_mode {
+            GAME_PACKET_RESERVE
         } else {
-            2400
+            0
         })
         .with_admission_deadline(policy.stream_lifetime().as_millis() as u64)
     });
@@ -1803,21 +1803,25 @@ async fn sender_with_game_input(
         (policy.streams || policy.proxy) && !metrics.metrics.legacy_recovery();
     let burst = if native_returning {
         native_return::BURST
-    } else if policy.game_mode {
-        GAME_BURST_BYTES
     } else if policy.adaptive {
         2400
     } else {
         9600
     };
-    let mut pacer = outbound::Pacer::for_sender(policy.rate, burst);
-    let mut groups: [outbound::Pacer; MAX_PATHS] =
-        std::array::from_fn(|i| outbound::Pacer::for_sender(policy.group_rates[i], burst));
+    let reserve = if policy.game_mode {
+        GAME_PACKET_RESERVE
+    } else {
+        0
+    };
+    let mut pacer = outbound::Pacer::for_sender(policy.rate, burst).with_packet_reserve(reserve);
+    let mut groups: [outbound::Pacer; MAX_PATHS] = std::array::from_fn(|i| {
+        outbound::Pacer::for_sender(policy.group_rates[i], burst).with_packet_reserve(reserve)
+    });
     let mut business = policy
         .adaptive
         .then(|| outbound::BusinessPacer::new(policy.rate, policy.group_rates, burst));
     if policy.game_mode {
-        business = business.map(|pacer| pacer.with_minimum_burst(GAME_BURST_BYTES));
+        business = business.map(|pacer| pacer.with_packet_reserve(GAME_PACKET_RESERVE));
     }
     let mut game_startup = policy.game_mode.then(game_startup::Budget::default);
     let mut game_data_demand = false;

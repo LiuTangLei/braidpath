@@ -79,11 +79,12 @@ fn game_originals_and_copies_use_reserved_credit_without_increasing_operator_lim
     assert_eq!(game_pacing_reserve(&p, &game, true, 1180), 6000);
     for cost in [100, 1180, 1400, 2400] {
         assert!(
-            cost + game_pacing_reserve(&p, &tcp, false, cost) <= GAME_BURST_BYTES,
+            cost + game_pacing_reserve(&p, &tcp, false, cost) <= 2400 + GAME_PACKET_RESERVE,
             "a minimum-size sender bucket must retain TCP progress"
         );
     }
-    let mut pacer = outbound::Pacer::for_sender(7_000_000, GAME_BURST_BYTES);
+    let mut pacer =
+        outbound::Pacer::for_sender(7_000_000, 2400).with_packet_reserve(GAME_PACKET_RESERVE);
     pacer.refill(1_000_000);
     assert!(pacer.available(1180 + reserve));
     pacer.spend(1180);
@@ -93,7 +94,7 @@ fn game_originals_and_copies_use_reserved_credit_without_increasing_operator_lim
     );
     pacer.spend(6000);
     assert!(
-        !pacer.available(1180),
+        !pacer.available(6000),
         "priority never creates new operator credit"
     );
     p.game_mode = false;

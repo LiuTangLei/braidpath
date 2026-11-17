@@ -904,7 +904,7 @@ pub struct PathController {
     maximum_bps: u64,
     target_ms: f64,
     admission_ms: f64,
-    minimum_burst_bytes: usize,
+    packet_reserve_bytes: usize,
     generation: Option<u64>,
     born_us: u64,
     rate_bps: u64,
@@ -1031,7 +1031,7 @@ impl PathController {
             rtt_source_baseline_corrections: 0,
             target_ms: latency_target_ms.max(1) as f64,
             admission_ms: latency_target_ms.max(1) as f64,
-            minimum_burst_bytes: 2400,
+            packet_reserve_bytes: 0,
             generation: None,
             born_us: 0,
             rate_bps: maximum_bps.min(START_BPS),
@@ -1152,8 +1152,8 @@ impl PathController {
     }
 
     /// Retain elapsed-time credit for a complete fragmented application packet.
-    pub(crate) fn with_minimum_burst(mut self, bytes: usize) -> Self {
-        self.minimum_burst_bytes = bytes;
+    pub(crate) fn with_packet_reserve(mut self, bytes: usize) -> Self {
+        self.packet_reserve_bytes = bytes;
         self
     }
 
@@ -1496,7 +1496,7 @@ impl PathController {
                 .with_queue_gated_loss(self.queue_gated_loss_enabled)
                 .with_legacy_recovery(!self.fast_recovery_enabled)
                 .with_shared_uplink_service(self.shared_uplink_service)
-                .with_minimum_burst(self.minimum_burst_bytes)
+                .with_packet_reserve(self.packet_reserve_bytes)
                 .with_admission_deadline(self.admission_ms as u64);
             self.shared_loss = shared_loss;
             self.generation = Some(observation.generation);
@@ -3525,10 +3525,7 @@ impl PathController {
         self.last_rtt_ms = rtt;
         self.last_local_rtt_ms = local_rtt;
         self.last_transport_wait_ms = transport_wait;
-        self.tokens = self.tokens.min(super::outbound::pacing_burst_bytes(
-            self.rate_bps,
-            self.minimum_burst_bytes,
-        ));
+        self.tokens = self.tokens.min(self.packet_burst_bytes(self.rate_bps));
     }
 
     /// Held clear-queue loss beyond the path's random loss starts one test.
@@ -4009,10 +4006,7 @@ impl PathController {
     /// credit exactly like `allow`; it neither reserves nor grants any tokens.
     pub(crate) fn admission_wait_ms(&mut self, now_us: u64, bytes: usize) -> f64 {
         self.refill(now_us);
-        if !self.eligible(now_us)
-            || bytes as f64
-                > super::outbound::pacing_burst_bytes(self.rate_bps, self.minimum_burst_bytes)
-        {
+        if !self.eligible(now_us) || bytes as f64 > self.packet_burst_bytes(self.rate_bps) {
             return f64::INFINITY;
         }
         (bytes as f64 - self.tokens).max(0.0) * 8000.0 / self.rate_bps.max(1) as f64
@@ -4413,10 +4407,7 @@ impl PathController {
         if previous_bps == self.rate_bps {
             return;
         }
-        self.tokens = self.tokens.min(super::outbound::pacing_burst_bytes(
-            self.rate_bps,
-            self.minimum_burst_bytes,
-        ));
+        self.tokens = self.tokens.min(self.packet_burst_bytes(self.rate_bps));
         self.initial_delivery_credit = None;
         self.growth_monitor = None;
         let owned_retry = self.last_control.growth_retry_ceiling_bps.is_some()
@@ -4449,6 +4440,10 @@ impl PathController {
         });
     }
 
+    fn packet_burst_bytes(&self, rate_bps: u64) -> f64 {
+        super::outbound::pacing_burst_bytes(rate_bps, 2400) + self.packet_reserve_bytes as f64
+    }
+
     fn refill(&mut self, now_us: u64) {
         if let Some(deadline) = self
             .reprobe
@@ -4461,10 +4456,7 @@ impl PathController {
             let before =
                 deadline.saturating_sub(self.token_us) as f64 * old_rate as f64 / 8_000_000.0;
             self.allowance_bytes += before;
-            self.tokens = (self.tokens + before).min(super::outbound::pacing_burst_bytes(
-                old_rate,
-                self.minimum_burst_bytes,
-            ));
+            self.tokens = (self.tokens + before).min(self.packet_burst_bytes(old_rate));
             self.token_us = self.token_us.max(deadline);
             if let Some(maximum) = self.reprobe.expire(now_us) {
                 self.rate_bps = self.rate_bps.min(maximum);
@@ -4475,10 +4467,7 @@ impl PathController {
         let allowance =
             now_us.saturating_sub(self.token_us) as f64 * self.rate_bps as f64 / 8_000_000.0;
         self.allowance_bytes += allowance;
-        self.tokens = (self.tokens + allowance).min(super::outbound::pacing_burst_bytes(
-            self.rate_bps,
-            self.minimum_burst_bytes,
-        ));
+        self.tokens = (self.tokens + allowance).min(self.packet_burst_bytes(self.rate_bps));
         self.token_us = self.token_us.max(now_us);
     }
 }
@@ -4510,13 +4499,13 @@ mod tests {
 
     #[test]
     fn packet_storage_supports_game_reserve_without_changing_normal_paths() {
-        let mut c = PathController::new(2_000_000, 20).with_minimum_burst(7200);
+        let mut c = PathController::new(2_000_000, 20).with_packet_reserve(6000);
         c.observe(&observation(0, 100.0));
         assert!(c.allow(1_000_000, 7135, 0.0));
         let mut next = observation(1_100_000, 100.0);
         next.generation += 1;
         c.observe(&next);
-        assert_eq!(c.minimum_burst_bytes, 7200);
+        assert_eq!(c.packet_reserve_bytes, 6000);
         let mut normal = PathController::new(2_000_000, 20);
         normal.observe(&observation(0, 100.0));
         assert!(!normal.allow(1_000_000, 7135, 0.0));

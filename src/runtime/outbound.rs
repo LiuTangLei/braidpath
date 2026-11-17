@@ -469,6 +469,7 @@ pub struct Pacer {
     rate: u64,
     burst: f64,
     minimum_burst: usize,
+    packet_reserve: usize,
     rate_aware: bool,
 }
 impl Pacer {
@@ -479,6 +480,7 @@ impl Pacer {
             rate,
             burst: burst as f64,
             minimum_burst: burst,
+            packet_reserve: 0,
             rate_aware: false,
         }
     }
@@ -488,6 +490,11 @@ impl Pacer {
             rate_aware: true,
             ..Self::new(rate, minimum_burst)
         }
+    }
+    pub(crate) fn with_packet_reserve(mut self, bytes: usize) -> Self {
+        self.packet_reserve = bytes;
+        self.burst = pacing_burst_bytes(self.rate, self.minimum_burst) + bytes as f64;
+        self
     }
     pub fn refill(&mut self, now_us: u64) {
         self.tokens = (self.tokens
@@ -500,7 +507,7 @@ impl Pacer {
         self.refill(now_us.max(self.last_us));
         self.rate = rate;
         if self.rate_aware {
-            self.burst = pacing_burst_bytes(rate, self.minimum_burst);
+            self.burst = pacing_burst_bytes(rate, self.minimum_burst) + self.packet_reserve as f64;
         }
         self.tokens = self.tokens.min(self.burst);
     }
@@ -549,10 +556,10 @@ impl BusinessPacer {
 
     /// Retain enough elapsed-time credit for one fragmented application packet.
     /// Raising the storage bound does not refill any bucket.
-    pub(crate) fn with_minimum_burst(mut self, bytes: usize) -> Self {
+    pub(crate) fn with_packet_reserve(mut self, bytes: usize) -> Self {
         for bucket in std::iter::once(&mut self.aggregate).chain(self.groups.iter_mut()) {
-            bucket.minimum_burst = bytes;
-            bucket.burst = pacing_burst_bytes(bucket.rate, bytes);
+            bucket.packet_reserve = bytes;
+            bucket.burst = pacing_burst_bytes(bucket.rate, bucket.minimum_burst) + bytes as f64;
         }
         self
     }
@@ -642,13 +649,36 @@ mod tests {
     #[test]
     fn packet_burst_storage_needs_elapsed_earned_credit() {
         let mut p =
-            BusinessPacer::new(4_000_000, [4_000_000; MAX_PATHS], 2400).with_minimum_burst(7200);
+            BusinessPacer::new(4_000_000, [4_000_000; MAX_PATHS], 2400).with_packet_reserve(6000);
         p.update(0, [(0, 4_000_000)]);
         assert!(!p.available(0, 6000));
         p.update(12_000, [(0, 4_000_000)]);
-        assert!(p.available(0, 7200));
-        p.spend(0, 7200);
+        assert!(p.available(0, 8400));
+        p.spend(0, 8400);
         assert!(!p.available(0, 1));
+    }
+
+    #[test]
+    fn game_reservation_preserves_rate_service_at_millisecond_cadence() {
+        const COST: usize = 1135;
+        const RESERVE: usize = 6000;
+        for rate in [2_000_000, 20_000_000, 100_000_000] {
+            let mut p =
+                BusinessPacer::new(rate, [rate; MAX_PATHS], 2400).with_packet_reserve(RESERVE);
+            p.update(0, [(0, rate)]);
+            p.update(1_000_000, [(0, rate)]);
+            let mut sent = 0u64;
+            for tick in 1..=1000 {
+                p.update(1_000_000 + tick * 1000, [(0, rate)]);
+                while p.available(0, COST + RESERVE) {
+                    p.spend(0, COST);
+                    sent += COST as u64;
+                }
+            }
+            let earned = rate / 8;
+            assert!(sent >= earned * 95 / 100, "rate={rate}: {sent}/{earned}");
+            assert!(sent <= earned + p.aggregate.burst as u64);
+        }
     }
 
     #[test]
