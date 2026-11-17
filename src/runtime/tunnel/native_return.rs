@@ -15,6 +15,15 @@ use std::{
 };
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 
+/// Addressed UDP is latency traffic even when its message needs fragments.
+/// This affects only the native download return session's path ordering.
+/// It does not enable game coding, copies, or bypass admission gates.
+pub(super) fn latency_datagram(native_returning: bool, game_mode: bool, flow: Option<u32>) -> bool {
+    native_returning
+        && !game_mode
+        && flow.is_some_and(|flow| super::associate::is_flow(flow & !super::messages::FLAG))
+}
+
 pub(super) const HEADER: &str = "braidpath-return-stream";
 pub(super) const PAYLOAD: usize = stream::RELIABLE_PAYLOAD;
 const HEADER_BYTES: usize = 16;
@@ -369,6 +378,25 @@ impl Decoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn native_udp_latency_scope_includes_fragments_and_preserves_other_carriers() {
+        let flow = super::super::associate::FLAG | 1;
+        for udp in [flow, flow | super::super::messages::FLAG] {
+            assert!(latency_datagram(true, false, Some(udp)));
+            assert!(!latency_datagram(false, false, Some(udp)));
+            assert!(!latency_datagram(true, true, Some(udp)));
+        }
+        for other in [
+            None,
+            Some(7),
+            Some(stream::data_flow(1)),
+            Some(stream::ack_flow(1)),
+            Some(super::super::messages::FLAG | 7),
+        ] {
+            assert!(!latency_datagram(true, false, other));
+        }
+    }
+
     #[test]
     fn native_credit_grows_in_one_frame_steps_and_keeps_backpressure_on_loss_or_queue() {
         let mut credit = Credit {

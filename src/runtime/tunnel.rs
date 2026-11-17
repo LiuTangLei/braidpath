@@ -2837,11 +2837,17 @@ async fn sender(
             } else if order.len() > 1
                 && !is_small
                 && (front.data.len() <= LATENCY_RECORD_BYTES
-                    || front.hold.as_ref().is_some_and(|hold| hold.interactive()))
+                    || front.hold.as_ref().is_some_and(|hold| hold.interactive())
+                    || native_return::latency_datagram(
+                        native_returning,
+                        policy.game_mode,
+                        front.flow,
+                    ))
             {
-                // Small records (acknowledgments, interactive and control
-                // traffic) and latency-bound streams take the earliest ready
-                // path; bulk keeps the weighted spread across paths. Where the
+                // Small records, latency-bound streams and native-return UDP
+                // fragments take the earliest ready path. Splitting one UDP
+                // message over disparate paths adds the slow fragment's tail.
+                // Bulk keeps the weighted spread across paths. Where the
                 // small-delivery policy applies, its delay and loss ranking
                 // decides instead.
                 let mut ranked: Vec<_> = order

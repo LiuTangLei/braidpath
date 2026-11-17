@@ -567,3 +567,9 @@ They never include arbitrary peer-provided close text, payloads, or credentials.
 Endpoint addresses and session identifiers are private operational data: retain
 them in access-controlled local logs. This target adds observations without new
 probes, retry policies, timers, or routing decisions.
+
+Native return sessions rank SOCKS UDP fragments as latency traffic when
+choosing an original's ready path, so message size alone does not force a
+packet to wait for a slower stripe. This preserves fallback paths, coding,
+admission, pacing, buffers and bulk stream scheduling. The game-mode policy
+is excluded from this condition.
