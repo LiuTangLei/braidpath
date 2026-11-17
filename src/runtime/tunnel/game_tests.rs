@@ -26,6 +26,80 @@ fn policy() -> Policy {
 }
 
 #[test]
+fn game_udp_deadline_and_queue_control_preserve_tcp_and_reassembly_budgets() {
+    let mut p = policy();
+    assert_eq!(p.control_latency_target_ms(), 5);
+    assert_eq!(p.admission_lifetime(), Duration::from_millis(20));
+    assert_eq!(p.datagram_lifetime(), Duration::from_millis(10));
+    assert_eq!(
+        p.record_lifetime(associate::FLAG | 1),
+        Duration::from_millis(10)
+    );
+    assert_eq!(
+        p.record_lifetime(stream::data_flow(1)),
+        Duration::from_millis(20)
+    );
+    assert_eq!(p.reassembly_lifetime(), Duration::from_millis(250));
+    p.latency_target_ms = 3;
+    assert_eq!(p.control_latency_target_ms(), 3);
+    p.game_mode = false;
+    p.latency_target_ms = 20;
+    assert_eq!(p.control_latency_target_ms(), 20);
+    assert_eq!(p.datagram_lifetime(), Duration::from_millis(20));
+}
+
+#[test]
+fn game_originals_and_copies_expire_at_ten_ms_while_tcp_keeps_twenty_ms() {
+    let p = policy();
+    let now = Instant::now();
+    let mut encoder = coding::RecordEncoder::new(&p).unwrap();
+    let metrics = stats::Metrics::new("client");
+    let scope = metrics.scope("game-deadlines", stats::FORWARD);
+    let mut queue = outbound::Queue::default();
+    let mut blocks = BTreeMap::new();
+    for (id, flow) in [(1, associate::FLAG | 1), (2, stream::data_flow(1))] {
+        let record = Record {
+            flow,
+            id,
+            payload: vec![7; 128],
+        };
+        for symbol in encoder.encode(&record, now).unwrap() {
+            enqueue_coded_symbol(
+                symbol,
+                now,
+                &mut queue,
+                &mut blocks,
+                Some(&p),
+                &scope,
+                &mut None,
+            );
+        }
+    }
+    let before = queue.len();
+    assert!(
+        queue
+            .expire_with(now + Duration::from_millis(9), |item| p
+                .symbol_lifetime(item))
+            .is_empty()
+    );
+    let expired = queue.expire_with(now + Duration::from_millis(10), |item| {
+        p.symbol_lifetime(item)
+    });
+    assert_eq!(
+        expired.len(),
+        4,
+        "original and all three copies share the UDP deadline"
+    );
+    assert!(expired.iter().all(|item| p.gaming_symbol(item)));
+    assert_eq!(queue.len(), before - 4);
+    assert!(!queue.is_empty(), "TCP retains its normal budget");
+    queue.expire_with(now + Duration::from_millis(20), |item| {
+        p.symbol_lifetime(item)
+    });
+    assert!(queue.is_empty());
+}
+
+#[test]
 fn game_mode_rejects_unknown_or_duplicate_negotiation() {
     let mut h = http::HeaderMap::new();
     assert!(!game_mode_header(&h).unwrap());

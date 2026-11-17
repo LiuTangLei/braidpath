@@ -394,8 +394,11 @@ pub(super) struct Out<'a> {
 }
 impl Out<'_> {
     fn datagram(&mut self, flow: u32, payload: Vec<u8>, limit: usize) -> bool {
+        self.datagram_at(flow, payload, limit, Instant::now())
+    }
+    fn datagram_at(&mut self, flow: u32, payload: Vec<u8>, limit: usize, created: Instant) -> bool {
         if payload.len() <= crate::runtime::MAX_PAYLOAD {
-            return self.enqueue(flow, payload, None);
+            return self.enqueue_at(flow, payload, None, created);
         }
         let Ok(parts) = super::messages::split(flow, self.next_id, payload, limit) else {
             return false;
@@ -403,7 +406,7 @@ impl Out<'_> {
         super::enqueue_message(
             self.game_tx.unwrap_or(self.tx),
             parts,
-            Instant::now(),
+            created,
             self.scope,
             self.small_threshold,
         )
@@ -413,6 +416,15 @@ impl Out<'_> {
         flow: u32,
         payload: Vec<u8>,
         hold: Option<Arc<super::outbound::Hold>>,
+    ) -> bool {
+        self.enqueue_at(flow, payload, hold, Instant::now())
+    }
+    fn enqueue_at(
+        &mut self,
+        flow: u32,
+        payload: Vec<u8>,
+        hold: Option<Arc<super::outbound::Hold>>,
+        created: Instant,
     ) -> bool {
         let Some(id) = self.next_id.checked_add(1) else {
             return false;
@@ -425,7 +437,7 @@ impl Out<'_> {
                 self.tx
             },
             Record { flow, id, payload },
-            Instant::now(),
+            created,
             self.scope,
             self.small_threshold,
             hold,
@@ -617,7 +629,8 @@ pub(super) struct Mux {
     reported: (u64, u64, u64, u64),
     associations: HashMap<u32, Association>,
     next_association: u32,
-    datagrams: VecDeque<(u32, Vec<u8>)>,
+    datagrams: VecDeque<(u32, Vec<u8>, Option<Instant>)>,
+    datagram_lifetime: Duration,
     max_message_bytes: usize,
 }
 
@@ -665,6 +678,7 @@ impl Mux {
             associations: HashMap::new(),
             next_association: 0,
             datagrams: VecDeque::new(),
+            datagram_lifetime: policy.datagram_lifetime(),
             max_message_bytes: policy.max_message_bytes,
         }
     }
@@ -749,7 +763,12 @@ impl Mux {
         self.stats.udp_io_events_prioritized += 1;
         self.stats.udp_io_wait_us_sum += wait;
         self.stats.udp_io_wait_us_max = self.stats.udp_io_wait_us_max.max(wait);
-        self.io(queued.event);
+        match queued.event {
+            Io::Datagram(flow, payload) => {
+                self.queue_datagram_at(flow, payload, Some(queued.created));
+            }
+            event => self.io(event),
+        }
     }
 
     fn association_events(&self) -> associate::Events {
@@ -1156,16 +1175,22 @@ impl Mux {
     }
 
     fn queue_datagram(&mut self, flow: u32, payload: Vec<u8>) {
+        self.queue_datagram_at(flow, payload, None);
+    }
+    fn queue_datagram_at(&mut self, flow: u32, payload: Vec<u8>, created: Option<Instant>) {
         let limit = if self.game_events.is_some() {
             DATAGRAM_QUEUE / 2
         } else {
             DATAGRAM_QUEUE
         };
-        if payload.len() > self.max_message_bytes || self.datagrams.len() >= limit {
+        if payload.len() > self.max_message_bytes
+            || self.datagrams.len() >= limit
+            || created.is_some_and(|at| at.elapsed() >= self.datagram_lifetime)
+        {
             self.stats.udp_datagrams_dropped += 1;
             return;
         }
-        self.datagrams.push_back((flow, payload));
+        self.datagrams.push_back((flow, payload, created));
     }
 
     /// An association record from the peer.
@@ -1563,9 +1588,17 @@ impl Mux {
                 break;
             }
         }
-        while let Some((flow, payload)) = self.datagrams.pop_front() {
-            if !out.datagram(flow, payload.clone(), self.max_message_bytes) {
-                self.datagrams.push_front((flow, payload));
+        while let Some((flow, payload, created)) = self.datagrams.pop_front() {
+            if created.is_some_and(|at| at.elapsed() >= self.datagram_lifetime) {
+                self.stats.udp_datagrams_dropped += 1;
+                continue;
+            }
+            let admitted = match created {
+                Some(at) => out.datagram_at(flow, payload.clone(), self.max_message_bytes, at),
+                None => out.datagram(flow, payload.clone(), self.max_message_bytes),
+            };
+            if !admitted {
+                self.datagrams.push_front((flow, payload, created));
                 break;
             }
             if !payload.is_empty() {
@@ -1984,18 +2017,20 @@ mod tests {
         for _ in 0..128 {
             game.events_tx.send(Io::Written(0, 0)).unwrap();
         }
+        // This is ordering coverage; the separate expiry case owns the clock boundary.
+        let created = Instant::now() + Duration::from_secs(30);
         game.game_events_tx
             .as_ref()
             .unwrap()
             .try_send(associate::QueuedIo {
                 event: Io::Datagram(associate::FLAG | 1, vec![7; 128]),
-                created: Instant::now(),
+                created,
             })
             .unwrap();
         game.service_io();
         assert_eq!(
             game.datagrams.front(),
-            Some(&(associate::FLAG | 1, vec![7; 128]))
+            Some(&(associate::FLAG | 1, vec![7; 128], Some(created)))
         );
         assert_eq!(
             game.events.len(),
@@ -2007,6 +2042,69 @@ mod tests {
             game.game_events_tx.as_ref().unwrap().max_capacity() + DATAGRAM_QUEUE / 2,
             DATAGRAM_QUEUE
         );
+    }
+
+    #[test]
+    fn game_udp_expires_in_socket_io_and_staging_without_refreshing_its_clock() {
+        let metrics = crate::runtime::stats::Metrics::new("client");
+        let mut p = proxy_policy();
+        p.game_mode = true;
+        let scope = metrics.scope("game-staging-deadline", crate::runtime::stats::FORWARD);
+        let mut game = Mux::new(Listeners::default(), Targets::default(), &p, scope.clone());
+        let old = Instant::now() - Duration::from_millis(10);
+        game.game_io(associate::QueuedIo {
+            event: Io::Datagram(associate::FLAG | 1, vec![7; 128]),
+            created: old,
+        });
+        assert!(game.datagrams.is_empty());
+        assert_eq!(game.stats.udp_datagrams_dropped, 1);
+        game.datagrams
+            .push_back((associate::FLAG | 1, vec![7; 128], Some(old)));
+        let super::super::ingress::Channels {
+            tx,
+            game_tx,
+            mut game_rx,
+            ..
+        } = super::super::ingress::channels(true);
+        let mut next_id = 0;
+        game.flush(&mut Out {
+            tx: &tx,
+            game_tx: game_tx.as_ref(),
+            next_id: &mut next_id,
+            scope: &scope,
+            small_threshold: 0,
+        });
+        assert!(game.datagrams.is_empty());
+        assert_eq!(game.stats.udp_datagrams_dropped, 2);
+        assert!(game_rx.as_mut().unwrap().try_recv().is_err());
+        assert_eq!(next_id, 0, "expired datagrams never obtain record IDs");
+    }
+
+    #[test]
+    fn game_udp_fragments_keep_the_socket_receive_timestamp() {
+        let super::super::ingress::Channels {
+            tx,
+            game_tx,
+            mut game_rx,
+            ..
+        } = super::super::ingress::channels(true);
+        let metrics = crate::runtime::stats::Metrics::new("client");
+        let scope = metrics.scope("game-fragment-clock", crate::runtime::stats::FORWARD);
+        let mut next_id = 0;
+        let created = Instant::now() - Duration::from_millis(2);
+        let mut out = Out {
+            tx: &tx,
+            game_tx: game_tx.as_ref(),
+            next_id: &mut next_id,
+            scope: &scope,
+            small_threshold: 0,
+        };
+        assert!(out.datagram_at(associate::FLAG | 1, vec![7; 1200], 4096, created));
+        let rx = game_rx.as_mut().unwrap();
+        assert_eq!(rx.len(), 2);
+        for _ in 0..2 {
+            assert_eq!(rx.try_recv().unwrap().created, created);
+        }
     }
 
     #[test]

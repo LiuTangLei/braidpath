@@ -379,7 +379,7 @@ async fn game_udp_reaches_quinn_before_a_full_tcp_input_fifo_and_both_lanes_clos
     game_tx
         .try_send(QueuedRecord {
             record: game,
-            created: Instant::now(),
+            created: Instant::now() + Duration::from_secs(30),
             hold: None,
         })
         .unwrap();

@@ -4483,6 +4483,40 @@ mod tests {
         (controller, sample)
     }
 
+    #[test]
+    fn tighter_delay_target_brakes_native_startup_before_normal_delay_pressure() {
+        let run = |target| {
+            let mut c = PathController::new(1_000_000_000, target);
+            let mut sample = observation(0, 100.0);
+            sample.delivered_bytes = 0;
+            sample.delivered_bps = None;
+            sample.delivery_sample_span_us = 100_000;
+            sample.delivery_report_time_us = Some(100_000_000);
+            c.observe_native(&sample, None, 240_000, 100_000);
+            c.admitted_symbol(100_000, 40_000, 40_000);
+            sample = observation(100_000, 106.0);
+            sample.probe_sample_id = 2;
+            sample.report_number = 2;
+            sample.delivered_bytes = 30_000;
+            sample.delivered_bps = Some(2_400_000.0);
+            sample.delivery_sample_span_us = 100_000;
+            sample.delivery_report_time_us = Some(100_100_000);
+            c.observe_native(&sample, None, 240_000, 106_000);
+            c
+        };
+        let game = run(5);
+        let normal = run(20);
+        assert_eq!(
+            game.last_brake_us,
+            Some(100_000),
+            "{:?}",
+            game.snapshot(100_000)
+        );
+        assert_eq!(normal.last_brake_us, None);
+        assert!(game.rate_bps < normal.rate_bps);
+        assert_eq!(game.maximum_bps, normal.maximum_bps);
+    }
+
     fn idle_native_fixture() -> (PathController, Observation) {
         let (mut controller, mut sample) = native_service_fixture();
         sample.offered_backlog = false;

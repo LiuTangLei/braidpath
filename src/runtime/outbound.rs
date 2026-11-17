@@ -297,11 +297,18 @@ impl Queue {
         self.repairs.iter().any(|p| p.block == Some(block))
     }
     pub fn expire(&mut self, now: Instant, age: Duration) -> Vec<Pending> {
+        self.expire_with(now, |_| age)
+    }
+    pub fn expire_with(
+        &mut self,
+        now: Instant,
+        age: impl Fn(&Pending) -> Duration,
+    ) -> Vec<Pending> {
         let mut expired = Vec::new();
         for q in self.flows.values_mut() {
             while q
                 .front()
-                .is_some_and(|p| now.saturating_duration_since(p.created) >= age)
+                .is_some_and(|p| now.saturating_duration_since(p.created) >= age(p))
             {
                 expired.push(q.pop_front().expect("front"));
             }
@@ -310,7 +317,7 @@ impl Queue {
         self.turns.retain(|f| self.flows.contains_key(f));
         // Repair blocks can span flows with different ingress ages.
         self.repairs.retain(|p| {
-            if now.saturating_duration_since(p.created) >= age {
+            if now.saturating_duration_since(p.created) >= age(p) {
                 expired.push(p.clone());
                 false
             } else {

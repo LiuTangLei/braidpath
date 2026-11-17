@@ -115,6 +115,13 @@ impl Policy {
     fn gaming_symbol(&self, symbol: &outbound::Pending) -> bool {
         self.game_mode && (symbol.game_datagram || self.gaming_datagram(symbol.flow))
     }
+    fn control_latency_target_ms(&self) -> u64 {
+        if self.game_mode {
+            self.latency_target_ms.min(5)
+        } else {
+            self.latency_target_ms
+        }
+    }
     fn flow(&self, flow: u32) -> u32 {
         if self.max_message_bytes > MAX_PAYLOAD {
             flow & !messages::FLAG
@@ -131,6 +138,27 @@ impl Policy {
         } else {
             self.queue_ms
         })
+    }
+    fn datagram_lifetime(&self) -> Duration {
+        if self.game_mode {
+            self.admission_lifetime().min(Duration::from_millis(10))
+        } else {
+            self.admission_lifetime()
+        }
+    }
+    fn record_lifetime(&self, flow: u32) -> Duration {
+        if self.gaming_datagram(Some(flow)) {
+            self.datagram_lifetime()
+        } else {
+            self.admission_lifetime()
+        }
+    }
+    fn symbol_lifetime(&self, symbol: &outbound::Pending) -> Duration {
+        if self.gaming_symbol(symbol) {
+            self.datagram_lifetime()
+        } else {
+            self.admission_lifetime()
+        }
     }
     fn reassembly_lifetime(&self) -> Duration {
         // This retains partial messages; complete datagrams are delivered
@@ -699,7 +727,7 @@ fn encode_input(
         created,
         mut hold,
     } = input;
-    if created.elapsed() >= policy.admission_lifetime() {
+    if created.elapsed() >= policy.record_lifetime(record.flow) {
         metrics.trace_record(
             trace::Stage::RecordDropped,
             &record,
@@ -1720,7 +1748,7 @@ async fn sender_with_game_input(
     }
     let mut scheduler = scheduler::Scheduler::default();
     let mut controllers: [adaptive::PathController; MAX_PATHS] = std::array::from_fn(|_| {
-        adaptive::PathController::new(policy.rate, policy.latency_target_ms)
+        adaptive::PathController::new(policy.rate, policy.control_latency_target_ms())
             .with_rtt_source_baselines(metrics.metrics.rtt_source_baselines())
             .with_random_loss_service(metrics.metrics.random_loss_service())
             .with_queue_gated_loss(metrics.metrics.queue_gated_loss())
@@ -1805,7 +1833,8 @@ async fn sender_with_game_input(
                     let Some(wait) = waiting.as_mut() else {
                         return Poll::Pending;
                     };
-                    wait.poll(cx, &shared_paths, lifetime, |attempt, now, paths| {
+                    let send_lifetime = policy.symbol_lifetime(&wait.prepared.front);
+                    wait.poll(cx, &shared_paths, send_lifetime, |attempt, now, paths| {
                         let cost = attempt.data.len() + 80;
                         let now_us = now.saturating_duration_since(epoch).as_micros()
                             .min(u128::from(u64::MAX)) as u64;
@@ -1980,7 +2009,7 @@ async fn sender_with_game_input(
                         },
                         &mut native_queue,
                     );
-                } else if created.elapsed() < lifetime
+                } else if created.elapsed() < policy.record_lifetime(record.flow)
                     && queue.would_be_full(policy.flow(record.flow))
                 {
                     deferred_input = Some(QueuedRecord {
@@ -2011,7 +2040,12 @@ async fn sender_with_game_input(
         for group in &mut groups {
             group.refill(now_us);
         }
-        for expired in queue.expire(now, lifetime) {
+        let expired = if policy.game_mode {
+            queue.expire_with(now, |pending| policy.symbol_lifetime(pending))
+        } else {
+            queue.expire(now, lifetime)
+        };
+        for expired in expired {
             account_expired(&expired, now, &metrics);
         }
         let paths = lock_sender_paths(&shared_paths, &mut profile);
@@ -2126,7 +2160,7 @@ async fn sender_with_game_input(
                 let native_rtt = path.conn.rtt_hint();
                 let native_probe = path.conn.probing_rtt_hint();
                 let network_queue = native_rtt.saturating_sub(path.conn.min_rtt_hint())
-                    >= Duration::from_micros(policy.latency_target_ms.max(2) * 500);
+                    >= Duration::from_micros(policy.control_latency_target_ms().max(2) * 500);
                 if reliable_native_service
                     && native_probes[usize::from(path.id)].holds(
                         now_us,
@@ -2758,7 +2792,9 @@ async fn sender_with_game_input(
                 }
                 // A repair with no admitted-original credit cannot hold the queue.
                 if let Some(skipped) = queue.pop(true) {
-                    if now.saturating_duration_since(skipped.created) >= lifetime {
+                    if now.saturating_duration_since(skipped.created)
+                        >= policy.symbol_lifetime(&skipped)
+                    {
                         account_expired(&skipped, now, &metrics);
                     } else {
                         account_budget_skipped(&policy, &skipped, &metrics);
@@ -2773,7 +2809,7 @@ async fn sender_with_game_input(
                 break;
             };
             let age = now.saturating_duration_since(front.created);
-            if age >= lifetime {
+            if age >= policy.symbol_lifetime(&front) {
                 account_expired(&queue.pop(repair).expect("front"), now, &metrics);
                 stalled_originals = 0;
                 continue;
@@ -3114,7 +3150,12 @@ async fn sender_with_game_input(
                     });
                     continue;
                 }
-                match send_datagram_before_deadline(path, data, front.created, lifetime) {
+                match send_datagram_before_deadline(
+                    path,
+                    data,
+                    front.created,
+                    policy.symbol_lifetime(&front),
+                ) {
                     None => {
                         frontier.add(path.id, is_small, Gate::ExpiredBeforeApi);
                         let expired = queue.pop(repair).expect("expired front");
