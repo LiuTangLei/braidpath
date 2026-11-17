@@ -1,7 +1,7 @@
 //! A shared first-flight allowance; ordinary path congestion brakes stay active.
 use super::{MAX_PATHS, quality};
 
-const INITIAL_BPS: u64 = 6_000_000;
+const INITIAL_BPS: u64 = 4_000_000;
 const SAMPLE_US: u64 = 200_000;
 const IDLE_US: u64 = 500_000;
 
@@ -94,7 +94,10 @@ impl Budget {
         // This only qualifies startup growth. Loss on one route is not
         // evidence that all routes share a bottleneck. Existing path and
         // qualified shared-loss controllers retain the congestion brakes.
-        let trial = (measured * 1.25).min(self.rate_bps as f64 * 1.25);
+        // Receiver service trails an increasing sender by a flight and a
+        // reporting interval. Keep bounded trial headroom for that lag; the
+        // step limit and existing congestion brakes still constrain sending.
+        let trial = (measured * 1.5).min(self.rate_bps as f64 * 1.25);
         self.rate_bps = self.rate_bps.max(trial as u64);
         self.baseline = current;
         self.sampled_us = now_us;
@@ -126,23 +129,23 @@ mod tests {
             INITIAL_BPS
         );
         assert_eq!(
-            b.observe(200_000, true, &reports(37_500, 200_000)),
-            7_500_000
+            b.observe(200_000, true, &reports(25_000, 200_000)),
+            5_000_000
         );
         assert_eq!(
-            b.observe(400_000, true, &reports(37_500, 400_000)),
-            7_500_000
+            b.observe(400_000, true, &reports(25_000, 400_000)),
+            5_000_000
         );
         assert_eq!(
             b.observe(600_000, true, &reports(1_000_000_000, 600_000)),
-            9_375_000
+            6_250_000
         );
     }
     #[test]
     fn idle_and_new_generations_relearn_without_spending_cached_delivery() {
         let mut b = Budget::default();
         b.observe(0, true, &reports(0, 0));
-        b.observe(200_000, true, &reports(37_500, 200_000));
+        b.observe(200_000, true, &reports(25_000, 200_000));
         assert_eq!(
             b.observe(1_000_000, false, &reports(1_000_000, 1_000_000)),
             INITIAL_BPS
@@ -160,8 +163,8 @@ mod tests {
         let mut b = Budget::default();
         b.observe(0, true, &reports(0, 0));
         assert_eq!(
-            b.observe(200_000, true, &reports(37_500, 200_000)),
-            7_500_000
+            b.observe(200_000, true, &reports(25_000, 200_000)),
+            5_000_000
         );
         for index in 2..=100 {
             // Control-only or asymmetric delivery must not cause an
@@ -170,9 +173,9 @@ mod tests {
                 b.observe(
                     index * SAMPLE_US,
                     true,
-                    &reports(37_500 + index, index * SAMPLE_US)
+                    &reports(25_000 + index, index * SAMPLE_US)
                 ),
-                7_500_000
+                5_000_000
             );
         }
     }
@@ -187,8 +190,27 @@ mod tests {
         }
         // 2.56 Mbps of symbol bytes represents 6.304 Mbps of admitted
         // wire cost. Finalized loss counts are intentionally not an input.
-        assert_eq!(b.observe(200_000, true, &sample), 7_500_000);
-        assert_eq!(b.observe(400_000, true, &sample), 7_500_000);
+        assert_eq!(b.observe(200_000, true, &sample), 5_000_000);
+        assert_eq!(b.observe(400_000, true, &sample), 5_000_000);
+    }
+
+    #[test]
+    fn lagging_delivery_can_advance_only_one_bounded_step() {
+        let mut b = Budget::default();
+        b.observe(0, true, &reports(0, 0));
+        assert_eq!(
+            b.observe(200_000, true, &reports(20_000, 200_000)),
+            4_800_000
+        );
+        // A compressed new update cannot spend the next step early.
+        assert_eq!(
+            b.observe(300_000, true, &reports(100_000, 300_000)),
+            4_800_000
+        );
+        assert_eq!(
+            b.observe(400_000, true, &reports(1_000_000, 400_000)),
+            6_000_000
+        );
     }
 
     #[test]
@@ -197,18 +219,18 @@ mod tests {
         b.observe(0, true, &reports(0, 10_000_000));
         // Feedback arrives after 200 ms but spans only 100 ms at the peer.
         assert_eq!(
-            b.observe(200_000, true, &reports(18_750, 10_100_000)),
-            7_500_000
+            b.observe(200_000, true, &reports(12_500, 10_100_000)),
+            5_000_000
         );
         // A delayed report spanning 1 s must not be priced as 200 ms.
         assert_eq!(
-            b.observe(400_000, true, &reports(75_000, 11_100_000)),
-            7_500_000
+            b.observe(400_000, true, &reports(50_000, 11_100_000)),
+            5_000_000
         );
         let mut missing_clock = reports(1_000_000_000, 11_300_000);
         for r in &mut missing_clock {
             r.report_time_us = None;
         }
-        assert_eq!(b.observe(600_000, true, &missing_clock), 7_500_000);
+        assert_eq!(b.observe(600_000, true, &missing_clock), 5_000_000);
     }
 }
