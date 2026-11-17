@@ -2208,14 +2208,11 @@ async fn sender_with_game_input(
                     .filter(|p| p.open())
                     .map(|path| {
                         let q = path.quality.lock().expect("quality lock");
-                        let native = path.conn.stats();
                         game_startup::Report {
                             path: path.id,
                             generation: q.snapshot.generation,
                             bytes: q.snapshot.sender_estimate.received_bytes,
                             symbols: q.snapshot.sender_estimate.received,
-                            sent: native.path.sent_packets,
-                            lost: native.path.lost_packets,
                         }
                     })
                     .collect();

@@ -11,8 +11,6 @@ pub(super) struct Report {
     pub generation: u64,
     pub bytes: u64,
     pub symbols: u64,
-    pub sent: u64,
-    pub lost: u64,
 }
 
 pub(super) struct Budget {
@@ -20,7 +18,6 @@ pub(super) struct Budget {
     baseline: [Option<Report>; MAX_PATHS],
     sampled_us: u64,
     last_demand_us: Option<u64>,
-    grow_after_us: u64,
 }
 
 impl Default for Budget {
@@ -30,7 +27,6 @@ impl Default for Budget {
             baseline: [None; MAX_PATHS],
             sampled_us: 0,
             last_demand_us: None,
-            grow_after_us: 0,
         }
     }
 }
@@ -57,7 +53,6 @@ impl Budget {
             self.baseline = current;
             self.sampled_us = now_us;
             self.last_demand_us = None;
-            self.grow_after_us = 0;
         }
         if !demand {
             return self.rate_bps;
@@ -68,37 +63,20 @@ impl Budget {
             return self.rate_bps;
         }
         let mut delivered = 0u128;
-        let mut sent = 0u128;
-        let mut lost = 0u128;
         for (a, b) in current.iter().zip(&self.baseline) {
             if let (Some(a), Some(b)) = (a, b) {
                 // Symbols exclude the feedback envelope and transport cost.
                 let overhead = (quality::HEADER + 9 + 80) as u128;
                 delivered += u128::from(a.bytes.saturating_sub(b.bytes))
                     + u128::from(a.symbols.saturating_sub(b.symbols)) * overhead;
-                sent += u128::from(a.sent.saturating_sub(b.sent));
-                lost += u128::from(a.lost.saturating_sub(b.lost));
             }
         }
         let measured = delivered * 8_000_000 / u128::from(span);
-        if sent >= 32 && lost * 50 > sent {
-            let drain = if measured > 0 {
-                measured * 9 / 10
-            } else {
-                u128::from(self.rate_bps) * 3 / 4
-            };
-            // A delayed/small feedback interval must not collapse a busy
-            // sender to an ACK-only rate. Successive loss intervals can drain
-            // further; native/path brakes independently remain authoritative.
-            let bounded = drain.max(u128::from(self.rate_bps) * 3 / 4);
-            self.rate_bps = self
-                .rate_bps
-                .min(bounded.clamp(1, u128::from(u64::MAX)) as u64);
-            self.grow_after_us = now_us.saturating_add(IDLE_US);
-        } else if now_us >= self.grow_after_us {
-            let trial = (measured * 5 / 4).min(u128::from(self.rate_bps) * 5 / 4);
-            self.rate_bps = self.rate_bps.max(trial.min(u128::from(u64::MAX)) as u64);
-        }
+        // This only qualifies startup growth. Loss on one route is not
+        // evidence that all routes share a bottleneck. Existing path and
+        // qualified shared-loss controllers retain the congestion brakes.
+        let trial = (measured * 5 / 4).min(u128::from(self.rate_bps) * 5 / 4);
+        self.rate_bps = self.rate_bps.max(trial.min(u128::from(u64::MAX)) as u64);
         self.baseline = current;
         self.sampled_us = now_us;
         self.rate_bps
@@ -115,8 +93,6 @@ mod tests {
                 generation: 1,
                 bytes,
                 symbols: 0,
-                sent: 0,
-                lost: 0,
             })
             .collect()
     }
@@ -144,29 +120,17 @@ mod tests {
         assert_eq!(b.observe(1_200_000, true, &changed), INITIAL_BPS);
     }
     #[test]
-    fn shared_native_loss_drains_and_requires_a_clear_hold_before_growth() {
+    fn sparse_delivery_cannot_collapse_the_startup_envelope() {
         let mut b = Budget::default();
         b.observe(0, true, &reports(0));
-        let mut sample = reports(25_000);
-        for r in &mut sample {
-            r.sent = 100;
-            r.lost = 10;
+        assert_eq!(b.observe(200_000, true, &reports(25_000)), 5_000_000);
+        for index in 2..=100 {
+            // Control-only or asymmetric delivery must not cause an
+            // additional process-wide congestion penalty.
+            assert_eq!(
+                b.observe(index * SAMPLE_US, true, &reports(25_000 + index)),
+                5_000_000
+            );
         }
-        assert_eq!(b.observe(200_000, true, &sample), 3_600_000);
-        for r in &mut sample {
-            r.bytes += 25_000;
-            r.sent += 100;
-        }
-        assert_eq!(b.observe(400_000, true, &sample), 3_600_000);
-        for r in &mut sample {
-            r.bytes += 25_000;
-            r.sent += 100;
-        }
-        assert_eq!(b.observe(600_000, true, &sample), 3_600_000);
-        for r in &mut sample {
-            r.bytes += 25_000;
-            r.sent += 100;
-        }
-        assert_eq!(b.observe(800_000, true, &sample), 4_500_000);
     }
 }
