@@ -269,7 +269,12 @@ impl RecordEncoder {
                         out.push(out.last().expect("k=1 repair").clone());
                     }
                     Ok(out)
-                } else if *k == 0 {
+                } else if *k == 0
+                    || (self.game_mode && super::super::stream::stream_id(record.flow).is_some())
+                {
+                    // Reliable Game TCP already retransmits missing ranges.
+                    // Proactive bulk parity under shared-uplink loss displaced
+                    // useful data; UDP's immediate protection uses the lane above.
                     Ok(vec![EncodedSymbol {
                         data: wire::plain(record)?,
                         small: false,
@@ -703,6 +708,50 @@ mod tests {
         let bulk = e.encode_attempt(&record(4, 1000), now, 3).unwrap();
         assert_eq!(bulk.len(), 1);
         assert!(!bulk[0].small);
+    }
+
+    #[test]
+    fn game_bulk_tcp_uses_reliable_recovery_and_udp_keeps_three_copies() {
+        let mut p = policy(super::super::super::automatic_fec::AUTO, 0, false);
+        p.game_mode = true;
+        p.adaptive = true;
+        p.quality_schedule = true;
+        p.receiver_feedback = true;
+        let now = Instant::now();
+        let mut e = RecordEncoder::new(&p).unwrap();
+        for k in [0, 32, 16, 8, 4] {
+            e.set_fec(k).unwrap();
+            let tcp = Record {
+                flow: crate::runtime::stream::data_flow(3),
+                id: u64::from(k) + 100,
+                payload: vec![7; 900],
+            };
+            let symbols = e.encode(&tcp, now).unwrap();
+            assert_eq!(symbols.len(), 1);
+            assert_eq!(
+                symbols[0].data[3], 2,
+                "bulk TCP never adds proactive parity"
+            );
+            let udp = Record {
+                flow: 1,
+                id: u64::from(k) + 200,
+                payload: vec![9; 900],
+            };
+            assert_eq!(
+                e.encode(&udp, now).unwrap().len(),
+                4,
+                "UDP original and three copies"
+            );
+        }
+        p.game_mode = false;
+        let mut ordinary = RecordEncoder::new(&p).unwrap();
+        ordinary.set_fec(4).unwrap();
+        let tcp = Record {
+            flow: crate::runtime::stream::data_flow(3),
+            id: 400,
+            payload: vec![7; 900],
+        };
+        assert_eq!(ordinary.encode(&tcp, now).unwrap()[0].data[3], 0);
     }
 
     #[test]
