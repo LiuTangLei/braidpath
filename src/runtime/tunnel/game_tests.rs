@@ -28,7 +28,8 @@ fn policy() -> Policy {
 #[test]
 fn game_udp_deadline_and_queue_control_preserve_tcp_and_reassembly_budgets() {
     let mut p = policy();
-    assert_eq!(p.control_latency_target_ms(), 5);
+    assert_eq!(p.control_latency_target_ms(stats::RETURN), 5);
+    assert_eq!(p.control_latency_target_ms(stats::FORWARD), 20);
     assert_eq!(p.admission_lifetime(), Duration::from_millis(20));
     assert_eq!(p.datagram_lifetime(), Duration::from_millis(10));
     assert_eq!(
@@ -41,10 +42,12 @@ fn game_udp_deadline_and_queue_control_preserve_tcp_and_reassembly_budgets() {
     );
     assert_eq!(p.reassembly_lifetime(), Duration::from_millis(250));
     p.latency_target_ms = 3;
-    assert_eq!(p.control_latency_target_ms(), 3);
+    assert_eq!(p.control_latency_target_ms(stats::RETURN), 3);
+    assert_eq!(p.control_latency_target_ms(stats::FORWARD), 3);
     p.game_mode = false;
     p.latency_target_ms = 20;
-    assert_eq!(p.control_latency_target_ms(), 20);
+    assert_eq!(p.control_latency_target_ms(stats::RETURN), 20);
+    assert_eq!(p.control_latency_target_ms(stats::FORWARD), 20);
     assert_eq!(p.datagram_lifetime(), Duration::from_millis(20));
 }
 

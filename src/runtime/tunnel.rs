@@ -115,8 +115,8 @@ impl Policy {
     fn gaming_symbol(&self, symbol: &outbound::Pending) -> bool {
         self.game_mode && (symbol.game_datagram || self.gaming_datagram(symbol.flow))
     }
-    fn control_latency_target_ms(&self) -> u64 {
-        if self.game_mode {
+    fn control_latency_target_ms(&self, direction: &str) -> u64 {
+        if self.game_mode && direction == stats::RETURN {
             self.latency_target_ms.min(5)
         } else {
             self.latency_target_ms
@@ -1748,12 +1748,15 @@ async fn sender_with_game_input(
     }
     let mut scheduler = scheduler::Scheduler::default();
     let mut controllers: [adaptive::PathController; MAX_PATHS] = std::array::from_fn(|_| {
-        adaptive::PathController::new(policy.rate, policy.control_latency_target_ms())
-            .with_rtt_source_baselines(metrics.metrics.rtt_source_baselines())
-            .with_random_loss_service(metrics.metrics.random_loss_service())
-            .with_queue_gated_loss(metrics.metrics.queue_gated_loss())
-            .with_legacy_recovery(metrics.metrics.legacy_recovery())
-            .with_shared_uplink_service(metrics.direction == stats::FORWARD)
+        adaptive::PathController::new(
+            policy.rate,
+            policy.control_latency_target_ms(metrics.direction),
+        )
+        .with_rtt_source_baselines(metrics.metrics.rtt_source_baselines())
+        .with_random_loss_service(metrics.metrics.random_loss_service())
+        .with_queue_gated_loss(metrics.metrics.queue_gated_loss())
+        .with_legacy_recovery(metrics.metrics.legacy_recovery())
+        .with_shared_uplink_service(metrics.direction == stats::FORWARD)
     });
     let mut native_probes: [native_probe::Pause; MAX_PATHS] = Default::default();
     let mut logged_rate_changes = [0u64; MAX_PATHS];
@@ -2160,7 +2163,9 @@ async fn sender_with_game_input(
                 let native_rtt = path.conn.rtt_hint();
                 let native_probe = path.conn.probing_rtt_hint();
                 let network_queue = native_rtt.saturating_sub(path.conn.min_rtt_hint())
-                    >= Duration::from_micros(policy.control_latency_target_ms().max(2) * 500);
+                    >= Duration::from_micros(
+                        policy.control_latency_target_ms(metrics.direction).max(2) * 500,
+                    );
                 if reliable_native_service
                     && native_probes[usize::from(path.id)].holds(
                         now_us,
