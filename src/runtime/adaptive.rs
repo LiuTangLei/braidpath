@@ -895,6 +895,7 @@ pub struct PathController {
     /// would also measure the paths that take up its share.
     shared_loss: bool,
     shared_uplink_service: bool,
+    measured_native_startup: bool,
     /// Raw and compensated cumulative delivered symbol bytes in this generation.
     compensated_delivery: Option<(u64, u64)>,
     source_local_min_rtt_ms: Option<f64>,
@@ -1022,6 +1023,7 @@ impl PathController {
             loss_ceiling: None,
             shared_loss: false,
             shared_uplink_service: true,
+            measured_native_startup: false,
             compensated_delivery: None,
             source_local_min_rtt_ms: None,
             source_probe_min_rtt_ms: None,
@@ -1147,6 +1149,12 @@ impl PathController {
         self
     }
 
+    /// A latency-first session learns service before reusing a native window.
+    pub(crate) fn with_measured_native_startup(mut self, enabled: bool) -> Self {
+        self.measured_native_startup = enabled;
+        self
+    }
+
     /// Whether the session is testing or limiting loss that most paths share.
     pub(crate) fn set_shared_loss(&mut self, shared: bool) {
         self.shared_loss = shared;
@@ -1245,6 +1253,7 @@ impl PathController {
             self.native_initial_window_bytes = (cwnd_bytes > 0).then_some(cwnd_bytes);
         }
         if new_generation
+            && !self.measured_native_startup
             && cwnd_bytes > 0
             && rtt_us > 0
             && self.eligible
@@ -1330,6 +1339,7 @@ impl PathController {
         // retained BBR startup peak. Native readiness, current delay/loss and
         // tested loss ceilings still gate the first flight; no tokens are added.
         if previous_generation == Some(observation.generation)
+            && (!self.measured_native_startup || measured_bps.is_some())
             && (!self.shared_loss || !self.shared_uplink_service)
             && startup_demand
             && self.native_restart_until_us.is_some()
@@ -1479,7 +1489,8 @@ impl PathController {
                 .with_random_loss_service(self.random_loss_service_enabled)
                 .with_queue_gated_loss(self.queue_gated_loss_enabled)
                 .with_legacy_recovery(!self.fast_recovery_enabled)
-                .with_shared_uplink_service(self.shared_uplink_service);
+                .with_shared_uplink_service(self.shared_uplink_service)
+                .with_measured_native_startup(self.measured_native_startup);
             self.shared_loss = shared_loss;
             self.generation = Some(observation.generation);
             self.born_us = now;
@@ -4481,6 +4492,54 @@ mod tests {
         sample.delivery_sample_span_us = 100_000;
         sample.delivery_report_time_us = Some(100_000);
         (controller, sample)
+    }
+
+    #[test]
+    fn measured_native_startup_never_seeds_an_unmeasured_or_retained_window() {
+        let mut c = PathController::new(1_000_000_000, 10).with_measured_native_startup(true);
+        let mut sample = observation(0, 100.0);
+        sample.delivered_bytes = 0;
+        c.observe_native_service(&sample, 2_000_000, 100_000);
+        assert_eq!(c.rate_bps, START_BPS);
+        assert!(c.native_startup_window_bytes.is_none());
+        sample.now_us = 100_000;
+        sample.offered_backlog = false;
+        c.observe_native_service(&sample, 2_000_000, 100_000);
+        sample.now_us += NATIVE_IDLE_RESTART_US + 1;
+        sample.offered_backlog = true;
+        sample.startup_backlog = true;
+        c.observe_native_service(&sample, 2_000_000, 100_000);
+        assert_eq!(
+            c.rate_bps, START_BPS,
+            "idle control traffic is not capacity"
+        );
+        sample.generation += 1;
+        sample.now_us += 100_000;
+        c.observe_native_service(&sample, 2_000_000, 100_000);
+        assert!(c.measured_native_startup);
+        assert_eq!(c.rate_bps, START_BPS);
+    }
+
+    #[test]
+    fn measured_native_recovery_keeps_the_existing_qualified_growth_and_brakes() {
+        let (mut c, mut sample) = native_service_fixture();
+        c = c
+            .with_measured_native_startup(true)
+            .with_shared_uplink_service(true);
+        c.rate_bps = 10_000_000;
+        sample.delivered_bytes = 125_000;
+        sample.delivered_bps = Some(10_000_000.0 / c.wire_per_symbol);
+        sample.delivery_sample_span_us = 100_000;
+        c.observe_native_service(&sample, 2_000_000, 50_000);
+        assert!(c.rate_bps > 10_000_000);
+        assert!(c.rate_bps <= 12_500_000);
+        let before = c.rate_bps;
+        sample.now_us += 100_000;
+        c.observe_native_service(&sample, 2_000_000, 50_000);
+        assert_eq!(
+            c.rate_bps, before,
+            "one receiver sample cannot qualify another native recovery"
+        );
     }
 
     #[test]

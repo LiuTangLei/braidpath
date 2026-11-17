@@ -1058,6 +1058,19 @@ fn prioritize_game_repair(
         })
 }
 
+fn game_pacing_reserve(
+    policy: &Policy,
+    pending: &outbound::Pending,
+    repair: bool,
+    wire_bytes: usize,
+) -> usize {
+    if policy.game_mode && (repair || !policy.gaming_symbol(pending)) {
+        1200.min(2400usize.saturating_sub(wire_bytes))
+    } else {
+        0
+    }
+}
+
 fn account_budget_skipped(policy: &Policy, pending: &outbound::Pending, metrics: &Scope) {
     metrics.trace_symbol(
         trace::Stage::SymbolDropped,
@@ -1756,7 +1769,8 @@ async fn sender_with_game_input(
         .with_random_loss_service(metrics.metrics.random_loss_service())
         .with_queue_gated_loss(metrics.metrics.queue_gated_loss())
         .with_legacy_recovery(metrics.metrics.legacy_recovery())
-        .with_shared_uplink_service(metrics.direction == stats::FORWARD)
+        .with_shared_uplink_service(policy.game_mode || metrics.direction == stats::FORWARD)
+        .with_measured_native_startup(policy.game_mode)
     });
     let mut native_probes: [native_probe::Pause; MAX_PATHS] = Default::default();
     let mut logged_rate_changes = [0u64; MAX_PATHS];
@@ -1804,7 +1818,13 @@ async fn sender_with_game_input(
     let mut liveness: [liveness::Liveness; MAX_PATHS] = Default::default();
     let mut input_open = true;
     let mut prefer_game_input = true;
+    let mut normal_input_due = false;
     loop {
+        #[cfg(test)]
+        if metrics.session == "game-priority-order" {
+            // Force the timer to remain ready; this is input fairness coverage.
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
         #[cfg(test)]
         sender_ready_tests::hold_deferred_expiry(
             waiting
@@ -1819,12 +1839,27 @@ async fn sender_with_game_input(
         let queued_before_wait = queue.len();
         let native_pending_before_wait = waiting.is_some();
         let priority = if prefer_game_input {
-            game_input.as_mut().and_then(|rx| rx.try_recv().ok())
+            game_input.as_mut().and_then(|rx| match rx.try_recv() {
+                Ok(record) => Some(SenderEvent::GameInput(Some(record))),
+                Err(mpsc::error::TryRecvError::Disconnected) => Some(SenderEvent::GameInput(None)),
+                Err(mpsc::error::TryRecvError::Empty) => None,
+            })
         } else {
             None
         };
-        let event = if let Some(record) = priority {
-            SenderEvent::GameInput(Some(record))
+        let priority = priority.or_else(|| {
+            if policy.game_mode && normal_input_due && input_open {
+                match input.try_recv() {
+                    Ok(record) => Some(SenderEvent::Input(Some(record))),
+                    Err(mpsc::error::TryRecvError::Disconnected) => Some(SenderEvent::Input(None)),
+                    Err(mpsc::error::TryRecvError::Empty) => None,
+                }
+            } else {
+                None
+            }
+        });
+        let event = if let Some(event) = priority {
+            event
         } else {
             tokio::select! {
                 biased;
@@ -1839,6 +1874,7 @@ async fn sender_with_game_input(
                     let send_lifetime = policy.symbol_lifetime(&wait.prepared.front);
                     wait.poll(cx, &shared_paths, send_lifetime, |attempt, now, paths| {
                         let cost = attempt.data.len() + 80;
+                        let game_reserve = game_pacing_reserve(&policy, &attempt.front, attempt.repair, cost);
                         let now_us = now.saturating_duration_since(epoch).as_micros()
                             .min(u128::from(u64::MAX)) as u64;
                         let age = now.saturating_duration_since(attempt.front.created);
@@ -1856,16 +1892,23 @@ async fn sender_with_game_input(
                             return true;
                         }
                         let allowed = controllers[usize::from(attempt.path.id)]
-                            .allow(now_us, cost, age.as_secs_f64() * 1000.0);
+                            .allow(now_us, cost + game_reserve, age.as_secs_f64() * 1000.0);
                         update_business_pacer(&mut business, paths, &controllers, now_us);
                         allowed && business.as_ref().expect("adaptive business pacer")
-                            .available(attempt.path.group, cost)
+                            .available(attempt.path.group, cost + game_reserve)
                     })
                 }), if waiting.is_some()=>SenderEvent::Ready(ready),
                 item=input.recv(),if input_open=>SenderEvent::Input(item),
                 item=ingress::game_recv(&mut game_input)=>SenderEvent::GameInput(item),
             }
         };
+        match &event {
+            SenderEvent::Input(_) => normal_input_due = false,
+            SenderEvent::Tick | SenderEvent::Evidence | SenderEvent::Ready(_) => {
+                normal_input_due = true;
+            }
+            _ => {}
+        }
         prefer_game_input = !matches!(&event, SenderEvent::GameInput(_));
         if matches!(&event, SenderEvent::GameInput(None)) {
             game_input = None;
@@ -3070,11 +3113,14 @@ async fn sender_with_game_input(
                         0
                     };
                 let cost = frame_bytes + 80;
+                let game_reserve = game_pacing_reserve(&policy, &front, repair, cost);
                 let group_reserve = if Some(path.group) == reserved_group {
                     feedback_reserve
                 } else {
                     0
-                };
+                }
+                .max(game_reserve);
+                let feedback_reserve = feedback_reserve.max(game_reserve);
                 if !pacer.available(cost + feedback_reserve) {
                     frontier.add(path.id, is_small, Gate::Aggregate);
                     continue;
@@ -3088,7 +3134,11 @@ async fn sender_with_game_input(
                     continue;
                 }
                 if policy.adaptive {
-                    let allowed = controllers[id].allow(now_us, cost, age.as_secs_f64() * 1000.0);
+                    let allowed = controllers[id].allow(
+                        now_us,
+                        cost + game_reserve,
+                        age.as_secs_f64() * 1000.0,
+                    );
                     update_business_pacer(&mut business, &paths, &controllers, now_us);
                     if !allowed {
                         frontier.add(path.id, is_small, Gate::PathAllowance);
@@ -3097,7 +3147,7 @@ async fn sender_with_game_input(
                     if let Some(gate) = business
                         .as_ref()
                         .expect("adaptive business pacer")
-                        .blocked_gate(path.group, cost)
+                        .blocked_gate(path.group, cost + game_reserve)
                     {
                         frontier.add(path.id, is_small, gate);
                         continue;

@@ -52,6 +52,50 @@ fn game_udp_deadline_and_queue_control_preserve_tcp_and_reassembly_budgets() {
 }
 
 #[test]
+fn game_originals_keep_pacing_credit_without_increasing_operator_limits() {
+    let mut p = policy();
+    let now = Instant::now();
+    let tcp = outbound::Pending {
+        data: Bytes::new(),
+        created: now,
+        record_id: Some(1),
+        flow: Some(stream::data_flow(1)),
+        block: None,
+        small: false,
+        game_datagram: false,
+        hold: None,
+    };
+    let mut game = tcp.clone();
+    game.flow = Some(associate::FLAG | 1);
+    game.game_datagram = true;
+    let reserve = game_pacing_reserve(&p, &tcp, false, 1180);
+    assert_eq!(reserve, 1200);
+    assert_eq!(game_pacing_reserve(&p, &game, false, 1180), 0);
+    assert_eq!(game_pacing_reserve(&p, &game, true, 1180), 1200);
+    for cost in [100, 1180, 1400, 2400] {
+        assert!(
+            cost + game_pacing_reserve(&p, &tcp, false, cost) <= 2400,
+            "a minimum-size sender bucket must retain TCP progress"
+        );
+    }
+    let mut pacer = outbound::Pacer::for_sender(7_000_000, 2400);
+    pacer.refill(1_000_000);
+    assert!(pacer.available(1180 + reserve));
+    pacer.spend(1180);
+    assert!(
+        pacer.available(1180),
+        "one game original can use the held credit"
+    );
+    pacer.spend(1180);
+    assert!(
+        !pacer.available(1180),
+        "priority never creates new operator credit"
+    );
+    p.game_mode = false;
+    assert_eq!(game_pacing_reserve(&p, &tcp, false, 1180), 0);
+}
+
+#[test]
 fn game_originals_and_copies_expire_at_ten_ms_while_tcp_keeps_twenty_ms() {
     let p = policy();
     let now = Instant::now();

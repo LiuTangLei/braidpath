@@ -172,6 +172,11 @@ fn port() -> String {
         .to_string()
 }
 
+fn reserved_port() -> (String, UdpSocket) {
+    let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+    (socket.local_addr().unwrap().to_string(), socket)
+}
+
 #[test]
 fn mesh_fixed_tcp_discovers_relays_preserves_one_target_and_releases_leases() {
     mesh_fixed_tcp_fixture(false);
@@ -1066,15 +1071,20 @@ fn three_paths(mode: u8) {
     let cert = identity.join("cert.pem");
     let key = identity.join("key.pem");
     let token = identity.join("token");
-    let echo_addr = port();
-    let main_addr = port();
-    let relay_addr = port();
-    let relay2_addr = port();
-    let client_addr = port();
+    // Keep future listeners bound while earlier subprocesses allocate their
+    // own ephemeral sockets. Release only the listener being handed off.
+    let (echo_addr, echo_port) = reserved_port();
+    let (main_addr, main_port) = reserved_port();
+    let (relay_addr, relay_port) = reserved_port();
+    let (relay2_addr, relay2_port) = reserved_port();
+    let (client_addr, client_port) = reserved_port();
+    let (bad_client_addr, bad_client_port) = reserved_port();
+    drop(echo_port);
     let mut echo = launch(&args(&["echo", "--listen", &echo_addr]), dir.path(), "echo");
     ready(&mut echo, "test echo ready");
     let server_stats = dir.path().join("server-stats.jsonl");
     let client_stats = dir.path().join("client-stats.jsonl");
+    drop(main_port);
     let mut server = launch(
         &args(&[
             "server",
@@ -1142,10 +1152,11 @@ fn three_paths(mode: u8) {
     );
     let wrong = dir.path().join("wrong-token");
     fs::write(&wrong, "0".repeat(64)).unwrap();
+    drop(bad_client_port);
     let bad = run(&args(&[
         "client",
         "--listen",
-        &client_addr,
+        &bad_client_addr,
         "--entrance",
         &main_addr,
         "--server-name",
@@ -1162,6 +1173,7 @@ fn three_paths(mode: u8) {
         String::from_utf8_lossy(&bad.stderr),
         fs::read_to_string(&server.log).unwrap()
     );
+    drop(relay_port);
     let mut relay = launch(
         &args(&[
             "relay",
@@ -1176,6 +1188,7 @@ fn three_paths(mode: u8) {
         "relay",
     );
     ready(&mut relay, "fixed-target relay ready");
+    drop(relay2_port);
     let mut relay2 = launch(
         &args(&[
             "relay",
@@ -1282,6 +1295,7 @@ fn three_paths(mode: u8) {
     if repair_guard {
         client_args.extend(args(&["--repair-usefulness-guard", "--adaptive"]));
     }
+    drop(client_port);
     let mut client = launch(&client_args, dir.path(), "client");
     ready(&mut client, "UDP client ready");
     if frontier_enabled || repair_guard {
