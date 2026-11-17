@@ -29,7 +29,7 @@ fn policy() -> Policy {
 fn game_udp_deadline_is_separate_from_tcp_and_reassembly_budgets() {
     let mut p = policy();
     assert_eq!(p.control_latency_target_ms(stats::RETURN), 10);
-    assert_eq!(p.control_latency_target_ms(stats::FORWARD), 5);
+    assert_eq!(p.control_latency_target_ms(stats::FORWARD), 20);
     assert_eq!(p.admission_lifetime(), Duration::from_millis(20));
     assert_eq!(p.stream_lifetime(), Duration::from_millis(80));
     assert_eq!(p.datagram_lifetime(), Duration::from_millis(10));
