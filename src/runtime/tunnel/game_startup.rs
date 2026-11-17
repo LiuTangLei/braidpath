@@ -94,7 +94,10 @@ impl Budget {
         // This only qualifies startup growth. Loss on one route is not
         // evidence that all routes share a bottleneck. Existing path and
         // qualified shared-loss controllers retain the congestion brakes.
-        let trial = (measured * 1.25).min(self.rate_bps as f64 * 1.25);
+        // Receiver service trails an increasing sender by a flight and a
+        // reporting interval. Keep bounded trial headroom for that lag; the
+        // step limit and existing congestion brakes still constrain sending.
+        let trial = (measured * 1.5).min(self.rate_bps as f64 * 1.25);
         self.rate_bps = self.rate_bps.max(trial as u64);
         self.baseline = current;
         self.sampled_us = now_us;
@@ -189,6 +192,25 @@ mod tests {
         // wire cost. Finalized loss counts are intentionally not an input.
         assert_eq!(b.observe(200_000, true, &sample), 5_000_000);
         assert_eq!(b.observe(400_000, true, &sample), 5_000_000);
+    }
+
+    #[test]
+    fn lagging_delivery_can_advance_only_one_bounded_step() {
+        let mut b = Budget::default();
+        b.observe(0, true, &reports(0, 0));
+        assert_eq!(
+            b.observe(200_000, true, &reports(20_000, 200_000)),
+            4_800_000
+        );
+        // A compressed new update cannot spend the next step early.
+        assert_eq!(
+            b.observe(300_000, true, &reports(100_000, 300_000)),
+            4_800_000
+        );
+        assert_eq!(
+            b.observe(400_000, true, &reports(1_000_000, 400_000)),
+            6_000_000
+        );
     }
 
     #[test]

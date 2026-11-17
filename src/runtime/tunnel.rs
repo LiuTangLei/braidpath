@@ -119,8 +119,9 @@ impl Policy {
         self.game_mode && (symbol.game_datagram || self.gaming_datagram(symbol.flow))
     }
     fn control_latency_target_ms(&self, direction: &str) -> u64 {
-        if self.game_mode && direction == stats::RETURN {
-            self.latency_target_ms.min(10)
+        if self.game_mode {
+            self.latency_target_ms
+                .min(if direction == stats::RETURN { 10 } else { 5 })
         } else {
             self.latency_target_ms
         }
