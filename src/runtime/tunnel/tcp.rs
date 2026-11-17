@@ -377,6 +377,7 @@ enum WriteOp {
 
 pub(super) enum Wake {
     Io(Io),
+    GameIo(associate::QueuedIo),
     Accept(io::Result<(TcpStream, SocketAddr)>),
     ProxyAccept(io::Result<(TcpStream, SocketAddr)>),
     Queue,
@@ -386,6 +387,7 @@ pub(super) enum Wake {
 /// The session state a mux needs to enqueue records.
 pub(super) struct Out<'a> {
     pub tx: &'a mpsc::Sender<QueuedRecord>,
+    pub game_tx: Option<&'a mpsc::Sender<QueuedRecord>>,
     pub next_id: &'a mut u64,
     pub scope: &'a Scope,
     pub small_threshold: usize,
@@ -399,7 +401,7 @@ impl Out<'_> {
             return false;
         };
         super::enqueue_message(
-            self.tx,
+            self.game_tx.unwrap_or(self.tx),
             parts,
             Instant::now(),
             self.scope,
@@ -417,7 +419,11 @@ impl Out<'_> {
         };
         *self.next_id = id;
         enqueue_record(
-            self.tx,
+            if associate::is_flow(flow) {
+                self.game_tx.unwrap_or(self.tx)
+            } else {
+                self.tx
+            },
             Record { flow, id, payload },
             Instant::now(),
             self.scope,
@@ -594,6 +600,8 @@ pub(super) struct Mux {
     next_stream: u32,
     events_tx: mpsc::UnboundedSender<Io>,
     events: mpsc::UnboundedReceiver<Io>,
+    game_events_tx: Option<mpsc::Sender<associate::QueuedIo>>,
+    game_events: Option<mpsc::Receiver<associate::QueuedIo>>,
     tasks: JoinSet<()>,
     gauge: Arc<Gauge>,
     lifetime: Duration,
@@ -619,6 +627,12 @@ impl Mux {
     }
     fn new(listeners: Listeners, targets: Targets, policy: &Policy, scope: Scope) -> Self {
         let (events_tx, events) = mpsc::unbounded_channel();
+        let (game_events_tx, game_events) = if policy.game_mode {
+            let (tx, rx) = mpsc::channel(DATAGRAM_QUEUE / 2);
+            (Some(tx), Some(rx))
+        } else {
+            (None, None)
+        };
         let now = Instant::now();
         Self {
             budget: Arc::new(Budget::default()),
@@ -633,6 +647,8 @@ impl Mux {
             next_stream: 0,
             events_tx,
             events,
+            game_events_tx,
+            game_events,
             tasks: JoinSet::new(),
             gauge: Arc::new(Gauge::default()),
             lifetime: policy.admission_lifetime(),
@@ -714,8 +730,32 @@ impl Mux {
     /// higher-priority network input is continuously ready.
     pub(super) fn service_io(&mut self) {
         self.service_commands();
+        if let Some(rx) = self.game_events.as_mut()
+            && let Ok(event) = rx.try_recv()
+        {
+            self.game_io(event);
+        }
         if let Ok(event) = self.events.try_recv() {
             self.io(event);
+        }
+    }
+
+    fn game_io(&mut self, queued: associate::QueuedIo) {
+        let wait = queued
+            .created
+            .elapsed()
+            .as_micros()
+            .min(u128::from(u64::MAX)) as u64;
+        self.stats.udp_io_events_prioritized += 1;
+        self.stats.udp_io_wait_us_sum += wait;
+        self.stats.udp_io_wait_us_max = self.stats.udp_io_wait_us_max.max(wait);
+        self.io(queued.event);
+    }
+
+    fn association_events(&self) -> associate::Events {
+        match &self.game_events_tx {
+            Some(tx) => associate::Events::Game(tx.clone()),
+            None => associate::Events::Normal(self.events_tx.clone()),
         }
     }
 
@@ -735,6 +775,7 @@ impl Mux {
                 .any(|s| s.send.has_transmit() || (s.early_reply && s.open_reply.is_some()));
         tokio::select! {
             biased;
+            Some(event) = super::ingress::game_recv(&mut self.game_events) => Wake::GameIo(event),
             Some(event) = self.events.recv() => Wake::Io(event),
             _ = async { registration.as_ref().expect("registration").wake.notified().await }, if registration.is_some() => Wake::Queue,
             Some(command) = async { self.registration.as_mut().expect("registration").commands.recv().await }, if registration.is_some() => { self.command(command); Wake::Queue },
@@ -939,6 +980,7 @@ impl Mux {
         self.service_commands();
         match wake {
             Wake::Io(event) => self.io(event),
+            Wake::GameIo(event) => self.game_io(event),
             Wake::Accept(Ok((tcp, _))) => {
                 if let Some(id) = self.next_id(false)
                     && self.open(id, true)
@@ -1105,18 +1147,21 @@ impl Mux {
         }
         self.next_association += 1;
         let flow = associate::FLAG | self.next_association;
-        let task = self.tasks.spawn(associate::client(
-            flow,
-            tcp,
-            self.events_tx.clone(),
-            self.max_message_bytes,
-        ));
+        let events = self.association_events();
+        let task = self
+            .tasks
+            .spawn(associate::client(flow, tcp, events, self.max_message_bytes));
         self.associations.insert(flow, Association::Starting(task));
         self.stats.udp_associations += 1;
     }
 
     fn queue_datagram(&mut self, flow: u32, payload: Vec<u8>) {
-        if payload.len() > self.max_message_bytes || self.datagrams.len() >= DATAGRAM_QUEUE {
+        let limit = if self.game_events.is_some() {
+            DATAGRAM_QUEUE / 2
+        } else {
+            DATAGRAM_QUEUE
+        };
+        if payload.len() > self.max_message_bytes || self.datagrams.len() >= limit {
             self.stats.udp_datagrams_dropped += 1;
             return;
         }
@@ -1161,11 +1206,12 @@ impl Mux {
                 return;
             }
             let (datagrams, receiver) = mpsc::channel(associate::CHANNEL);
+            let events = self.association_events();
             let task = self.tasks.spawn(associate::server(
                 flow,
                 access.allow_private,
                 receiver,
-                self.events_tx.clone(),
+                events,
                 self.max_message_bytes,
             ));
             self.associations.insert(
@@ -1658,7 +1704,8 @@ impl Mux {
     fn publish(&mut self, now: Instant) {
         self.published = now;
         self.stats.active = self.streams.len() as u64;
-        self.stats.pending_io_events = self.events.len() as u64;
+        self.stats.pending_io_events =
+            (self.events.len() + self.game_events.as_ref().map_or(0, |rx| rx.len())) as u64;
         self.stats.local_sender_queued_bytes = self.gauge.queued() as u64;
         let mut gauges = [0u64; 5];
         for stream in self.streams.values() {
@@ -1903,6 +1950,122 @@ async fn write_payload<W: tokio::io::AsyncWrite + Unpin>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn game_udp_io_bypasses_tcp_completions_and_keeps_tcp_progress() {
+        let metrics = crate::runtime::stats::Metrics::new("client");
+        let mut normal = Mux::new(
+            Listeners::default(),
+            Targets::default(),
+            &proxy_policy(),
+            metrics.scope("normal-io", crate::runtime::stats::FORWARD),
+        );
+        for _ in 0..128 {
+            normal.events_tx.send(Io::Written(0, 0)).unwrap();
+        }
+        normal
+            .events_tx
+            .send(Io::Datagram(associate::FLAG | 1, vec![7; 128]))
+            .unwrap();
+        normal.service_io();
+        assert!(
+            normal.datagrams.is_empty(),
+            "the ordinary FIFO retains its ordering"
+        );
+
+        let mut p = proxy_policy();
+        p.game_mode = true;
+        let mut game = Mux::new(
+            Listeners::default(),
+            Targets::default(),
+            &p,
+            metrics.scope("game-io", crate::runtime::stats::FORWARD),
+        );
+        for _ in 0..128 {
+            game.events_tx.send(Io::Written(0, 0)).unwrap();
+        }
+        game.game_events_tx
+            .as_ref()
+            .unwrap()
+            .try_send(associate::QueuedIo {
+                event: Io::Datagram(associate::FLAG | 1, vec![7; 128]),
+                created: Instant::now(),
+            })
+            .unwrap();
+        game.service_io();
+        assert_eq!(
+            game.datagrams.front(),
+            Some(&(associate::FLAG | 1, vec![7; 128]))
+        );
+        assert_eq!(
+            game.events.len(),
+            127,
+            "a TCP completion also makes progress"
+        );
+        assert_eq!(game.stats.udp_io_events_prioritized, 1);
+        assert_eq!(
+            game.game_events_tx.as_ref().unwrap().max_capacity() + DATAGRAM_QUEUE / 2,
+            DATAGRAM_QUEUE
+        );
+    }
+
+    #[test]
+    fn game_udp_fragments_reserve_their_lane_atomically_behind_full_tcp() {
+        let super::super::ingress::Channels {
+            tx,
+            mut rx,
+            game_tx,
+            mut game_rx,
+        } = super::super::ingress::channels(true);
+        let game = game_tx.as_ref().unwrap();
+        let metrics = crate::runtime::stats::Metrics::new("client");
+        let scope = metrics.scope("game-fragments", crate::runtime::stats::FORWARD);
+        let mut next_id = 0;
+        for _ in 0..tx.max_capacity() {
+            let mut out = Out {
+                tx: &tx,
+                game_tx: Some(game),
+                next_id: &mut next_id,
+                scope: &scope,
+                small_threshold: 0,
+            };
+            assert!(out.enqueue(stream::data_flow(1), vec![9; 1000], None));
+        }
+        let tcp_slots = rx.len();
+        let before = next_id;
+        let payload = vec![7; 1200];
+        let mut out = Out {
+            tx: &tx,
+            game_tx: Some(game),
+            next_id: &mut next_id,
+            scope: &scope,
+            small_threshold: 0,
+        };
+        assert!(out.datagram(associate::FLAG | 1, payload.clone(), 4096));
+        assert_eq!(rx.len(), tcp_slots);
+        let game_rx = game_rx.as_mut().unwrap();
+        assert_eq!(game_rx.len(), 2);
+        let mut assembly = super::super::messages::Reassembly::new(4096, Duration::from_secs(1));
+        let first = game_rx.try_recv().unwrap().record;
+        let second = game_rx.try_recv().unwrap().record;
+        assert_eq!(first.id, before + 1);
+        assert_eq!(second.id, before + 2);
+        assert!(assembly.receive(first, Instant::now()).is_none());
+        assert_eq!(
+            assembly.receive(second, Instant::now()).unwrap().0.payload,
+            payload
+        );
+        for _ in 0..game.max_capacity() - 1 {
+            assert!(out.datagram(associate::FLAG | 1, vec![3; 128], 4096));
+        }
+        assert!(!out.datagram(associate::FLAG | 1, vec![7; 1200], 4096));
+        assert_eq!(
+            game_rx.len(),
+            game.max_capacity() - 1,
+            "no partial fragmented message leaks into the lane"
+        );
+        assert!(rx.try_recv().is_ok());
+    }
     use crate::runtime::{MAX_PATHS, stats};
 
     #[tokio::test]
@@ -2222,6 +2385,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(8);
         let scope = mux.scope.clone();
         mux.flush(&mut Out {
+            game_tx: None,
             tx: &tx,
             next_id: &mut 0,
             scope: &scope,
@@ -2263,6 +2427,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(8);
         let scope = mux.scope.clone();
         mux.flush(&mut Out {
+            game_tx: None,
             tx: &tx,
             next_id: &mut 0,
             scope: &scope,
@@ -2529,6 +2694,7 @@ mod tests {
         assert_eq!(mux.closed_order.len(), MAX_TOMBSTONES);
         assert!(mux.control.len() <= MAX_CONTROL);
         mux.flush(&mut Out {
+            game_tx: None,
             tx: &tx,
             next_id: &mut next_id,
             scope: &scope,
@@ -2543,6 +2709,7 @@ mod tests {
         for turn in 0..=MAX_CONTROL {
             assert!(!mux.accept_stream(last + turn as u32 + 1, Instant::now()));
             mux.flush(&mut Out {
+                game_tx: None,
                 tx: &tx,
                 next_id: &mut next_id,
                 scope: &scope,
@@ -2591,6 +2758,7 @@ mod tests {
         let scope = mux.scope.clone();
         let mut next_id = 0;
         mux.flush(&mut Out {
+            game_tx: None,
             tx: &tx,
             next_id: &mut next_id,
             scope: &scope,
@@ -3039,6 +3207,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(32);
         mux.pump(
             &mut Out {
+                game_tx: None,
                 tx: &tx,
                 next_id: &mut 0,
                 scope: &scope,
@@ -3108,6 +3277,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(32);
         let mut next_id = 0;
         let mut out = Out {
+            game_tx: None,
             tx: &tx,
             next_id: &mut next_id,
             scope: &scope,
@@ -3182,6 +3352,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(4);
         let mut next_id = 0;
         let mut out = Out {
+            game_tx: None,
             tx: &tx,
             next_id: &mut next_id,
             scope: &scope,

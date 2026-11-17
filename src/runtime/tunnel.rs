@@ -112,6 +112,9 @@ impl Policy {
     fn gaming_datagram(&self, flow: Option<u32>) -> bool {
         self.game_mode && flow.is_some_and(|flow| stream::stream_id(flow).is_none())
     }
+    fn gaming_symbol(&self, symbol: &outbound::Pending) -> bool {
+        self.game_mode && (symbol.game_datagram || self.gaming_datagram(symbol.flow))
+    }
     fn flow(&self, flow: u32) -> u32 {
         if self.max_message_bytes > MAX_PAYLOAD {
             flow & !messages::FLAG
@@ -618,6 +621,8 @@ struct BlockSend {
     small_repair_reserved: usize,
     /// The block's original is a reliable-stream acknowledgment.
     acknowledgment: bool,
+    /// Game UDP copies may wait for existing rate credit until their deadline.
+    game_datagram: bool,
 }
 
 fn repair_locally_unrecoverable(
@@ -786,6 +791,7 @@ fn enqueue_coded_symbol(
                 small_repair_limit: 0,
                 small_repair_reserved: 0,
                 acknowledgment: false,
+                game_datagram: false,
             })
             .created
             .min(oldest)
@@ -804,6 +810,14 @@ fn enqueue_coded_symbol(
         block_created
     };
     let flow = record.map(|(flow, _)| policy.map_or(flow, |p| p.flow(flow)));
+    if let Some(block) = block
+        && policy.is_some_and(|p| p.gaming_datagram(flow))
+    {
+        blocks
+            .get_mut(&block)
+            .expect("block inserted")
+            .game_datagram = true;
+    }
     if let Some(block) = block
         && flow.is_some_and(stream::is_ack_flow)
     {
@@ -860,6 +874,10 @@ fn enqueue_coded_symbol(
         flow,
         block,
         small,
+        game_datagram: policy.is_some_and(|p| p.gaming_datagram(flow))
+            || block
+                .and_then(|id| blocks.get(&id))
+                .is_some_and(|meta| meta.game_datagram),
         hold: if record_id.is_some() {
             hold.take()
         } else {
@@ -998,6 +1016,20 @@ fn repair_frame_floor(policy: &Policy, pending: &outbound::Pending) -> usize {
         + 2
 }
 
+fn prioritize_game_repair(
+    queue: &mut outbound::Queue,
+    policy: &Policy,
+    blocks: &BTreeMap<u64, BlockSend>,
+) -> bool {
+    policy.game_mode
+        && queue.promote_ready_repair(|pending| {
+            pending
+                .block
+                .and_then(|block| blocks.get(&block))
+                .is_some_and(|meta| meta.game_datagram && meta.paths != 0)
+        })
+}
+
 fn account_budget_skipped(policy: &Policy, pending: &outbound::Pending, metrics: &Scope) {
     metrics.trace_symbol(
         trace::Stage::SymbolDropped,
@@ -1093,8 +1125,7 @@ impl PreparedSend {
         now_us: u64,
         age: Duration,
     ) -> bool {
-        if policy.gaming_datagram(self.front.flow) || !small_delivery::applies(policy, &self.front)
-        {
+        if policy.gaming_symbol(&self.front) || !small_delivery::applies(policy, &self.front) {
             return true;
         }
         let candidates: Vec<_> = paths
@@ -1234,6 +1265,7 @@ enum SenderEvent {
     Evidence,
     Tick,
     Input(Option<QueuedRecord>),
+    GameInput(Option<QueuedRecord>),
     Ready(SendReadiness),
 }
 
@@ -1634,8 +1666,30 @@ fn lock_sender_paths<'a>(
 
 /// A single owner admits every business, repair, feedback and probe datagram.
 /// Each local flow gets a turn; all classes obey the aggregate and group caps.
+#[cfg(test)]
 async fn sender(
+    input: mpsc::Receiver<QueuedRecord>,
+    shared_paths: Paths,
+    policy: Policy,
+    stop: watch::Receiver<bool>,
+    metrics: Scope,
+    observation_notify: Option<Arc<Notify>>,
+) {
+    sender_with_game_input(
+        input,
+        None,
+        shared_paths,
+        policy,
+        stop,
+        metrics,
+        observation_notify,
+    )
+    .await;
+}
+
+async fn sender_with_game_input(
     mut input: mpsc::Receiver<QueuedRecord>,
+    mut game_input: Option<mpsc::Receiver<QueuedRecord>>,
     shared_paths: Paths,
     policy: Policy,
     mut stop: watch::Receiver<bool>,
@@ -1717,6 +1771,8 @@ async fn sender(
     let mut profile = profile::Sender::new(metrics.direction);
     let mut waiting: Option<WaitingSend> = None;
     let mut liveness: [liveness::Liveness; MAX_PATHS] = Default::default();
+    let mut input_open = true;
+    let mut prefer_game_input = true;
     loop {
         #[cfg(test)]
         sender_ready_tests::hold_deferred_expiry(
@@ -1731,47 +1787,74 @@ async fn sender(
         let wait_started = profile.as_ref().map(|_| Instant::now());
         let queued_before_wait = queue.len();
         let native_pending_before_wait = waiting.is_some();
-        let event = tokio::select! {
-            biased;
-            _=stop.changed()=>SenderEvent::Stop,
-            _=async { observation_notify.as_ref().expect("adaptive observation notify").notified().await },
-                if policy.adaptive && observation_notify.is_some()=>SenderEvent::Evidence,
-            _=tick.tick()=>SenderEvent::Tick,
-            ready=poll_fn(|cx| {
-                let Some(wait) = waiting.as_mut() else {
-                    return Poll::Pending;
-                };
-                wait.poll(cx, &shared_paths, lifetime, |attempt, now, paths| {
-                    let cost = attempt.data.len() + 80;
-                    let now_us = now.saturating_duration_since(epoch).as_micros()
-                        .min(u128::from(u64::MAX)) as u64;
-                    let age = now.saturating_duration_since(attempt.front.created);
-                    if !pacer.available(cost + attempt.feedback_reserve)
-                        || !groups[usize::from(attempt.path.group)]
-                            .available(cost + attempt.group_reserve)
-                        || (attempt.repair && !repair_allowed(&policy, &budget, &blocks, &attempt.front, attempt.data.len()))
-                    {
-                        return false;
-                    }
-                    if !attempt.small_delivery_allowed(&policy, paths, &mut controllers, now_us, age) {
-                        return false;
-                    }
-                    if !policy.adaptive {
-                        return true;
-                    }
-                    let allowed = controllers[usize::from(attempt.path.id)]
-                        .allow(now_us, cost, age.as_secs_f64() * 1000.0);
-                    update_business_pacer(&mut business, paths, &controllers, now_us);
-                    allowed && business.as_ref().expect("adaptive business pacer")
-                        .available(attempt.path.group, cost)
-                })
-            }), if waiting.is_some()=>SenderEvent::Ready(ready),
-            item=input.recv()=>SenderEvent::Input(item),
+        let priority = if prefer_game_input {
+            game_input.as_mut().and_then(|rx| rx.try_recv().ok())
+        } else {
+            None
         };
+        let event = if let Some(record) = priority {
+            SenderEvent::GameInput(Some(record))
+        } else {
+            tokio::select! {
+                biased;
+                _=stop.changed()=>SenderEvent::Stop,
+                _=async { observation_notify.as_ref().expect("adaptive observation notify").notified().await },
+                    if policy.adaptive && observation_notify.is_some()=>SenderEvent::Evidence,
+                _=tick.tick()=>SenderEvent::Tick,
+                ready=poll_fn(|cx| {
+                    let Some(wait) = waiting.as_mut() else {
+                        return Poll::Pending;
+                    };
+                    wait.poll(cx, &shared_paths, lifetime, |attempt, now, paths| {
+                        let cost = attempt.data.len() + 80;
+                        let now_us = now.saturating_duration_since(epoch).as_micros()
+                            .min(u128::from(u64::MAX)) as u64;
+                        let age = now.saturating_duration_since(attempt.front.created);
+                        if !pacer.available(cost + attempt.feedback_reserve)
+                            || !groups[usize::from(attempt.path.group)]
+                                .available(cost + attempt.group_reserve)
+                            || (attempt.repair && !repair_allowed(&policy, &budget, &blocks, &attempt.front, attempt.data.len()))
+                        {
+                            return false;
+                        }
+                        if !attempt.small_delivery_allowed(&policy, paths, &mut controllers, now_us, age) {
+                            return false;
+                        }
+                        if !policy.adaptive {
+                            return true;
+                        }
+                        let allowed = controllers[usize::from(attempt.path.id)]
+                            .allow(now_us, cost, age.as_secs_f64() * 1000.0);
+                        update_business_pacer(&mut business, paths, &controllers, now_us);
+                        allowed && business.as_ref().expect("adaptive business pacer")
+                            .available(attempt.path.group, cost)
+                    })
+                }), if waiting.is_some()=>SenderEvent::Ready(ready),
+                item=input.recv(),if input_open=>SenderEvent::Input(item),
+                item=ingress::game_recv(&mut game_input)=>SenderEvent::GameInput(item),
+            }
+        };
+        prefer_game_input = !matches!(&event, SenderEvent::GameInput(_));
+        if matches!(&event, SenderEvent::GameInput(None)) {
+            game_input = None;
+            if !input_open {
+                break;
+            }
+            continue;
+        }
+        if matches!(&event, SenderEvent::Input(None)) {
+            input_open = false;
+            if game_input.is_none() {
+                break;
+            }
+            continue;
+        }
         if let (Some(profile), Some(at)) = (&mut profile, wait_started) {
             profile.waited(at.elapsed(), queued_before_wait, native_pending_before_wait);
             match &event {
-                SenderEvent::Input(_) => profile.counters.input_turns += 1,
+                SenderEvent::Input(_) | SenderEvent::GameInput(_) => {
+                    profile.counters.input_turns += 1
+                }
                 SenderEvent::Tick => profile.counters.tick_turns += 1,
                 SenderEvent::Evidence => profile.counters.evidence_turns += 1,
                 SenderEvent::Ready(_) => profile.counters.ready_turns += 1,
@@ -1866,7 +1949,7 @@ async fn sender(
             SenderEvent::Ready(_) => {
                 frontier.readiness_gate_changed += 1;
             }
-            SenderEvent::Input(item) => {
+            SenderEvent::Input(item) | SenderEvent::GameInput(item) => {
                 #[cfg(test)]
                 sender_ready_tests::prime_full_input_turn(
                     &mut queue,
@@ -2639,7 +2722,19 @@ async fn sender(
             let affordable_repair = |p: &outbound::Pending| {
                 repair_allowed(&policy, &budget, &blocks, p, repair_frame_floor(&policy, p))
             };
-            let repair_ready = if policy.split_fec() {
+            let game_repair = prioritize_game_repair(&mut queue, &policy, &blocks);
+            let repair_ready = if game_repair {
+                // Keep a Game copy until credit refills or its unchanged
+                // deadline expires. Superseding TCP ACK copies must not spend
+                // every refill first. Originals keep their normal turns.
+                let ready = queue.front(true).is_some_and(|p| {
+                    !p.block
+                        .is_some_and(|block| stalled_repairs.contains(&block))
+                        && affordable_repair(p)
+                });
+                blocked_repair = !ready;
+                ready
+            } else if policy.split_fec() {
                 // At most REPAIR_LIMIT distinct heads are tried without an
                 // admission. A budget- or path-blocked lane cannot hide a
                 // separately authorized repair from the other coding lane.
@@ -2685,7 +2780,7 @@ async fn sender(
             }
             frontier.head_previews += 1;
             let is_small = small_delivery::applies(&policy, &front);
-            let gaming_datagram = policy.gaming_datagram(front.flow);
+            let gaming_datagram = policy.gaming_symbol(&front);
             let candidates: Vec<_> = if policy.quality_schedule || policy.adaptive {
                 paths
                     .iter()
@@ -3197,15 +3292,17 @@ async fn sender(
             });
         }
     }
-    input.close();
-    while let Ok(pending) = input.try_recv() {
-        metrics.trace_record(
-            trace::Stage::RecordDropped,
-            &pending.record,
-            None,
-            Some(trace::Reason::Shutdown),
-        );
-        metrics.update(|d| d.records.input_shutdown_dropped += 1);
+    for mut input in [Some(input), game_input].into_iter().flatten() {
+        input.close();
+        while let Ok(pending) = input.try_recv() {
+            metrics.trace_record(
+                trace::Stage::RecordDropped,
+                &pending.record,
+                None,
+                Some(trace::Reason::Shutdown),
+            );
+            metrics.update(|d| d.records.input_shutdown_dropped += 1);
+        }
     }
     publish_receiver_feedback(&shared_paths.lock().expect("paths lock"), &metrics);
     metrics.publish_sender_frontier(frontier);
@@ -3592,10 +3689,16 @@ async fn session_loop(
         session.finished.notify_waiters();
         return;
     }
-    let (tx, rx) = mpsc::channel(QUEUE);
-    let mut tasks = JoinSet::new();
-    tasks.spawn(sender(
+    let ingress::Channels {
+        tx,
         rx,
+        game_tx,
+        game_rx,
+    } = ingress::channels(session.policy.game_mode);
+    let mut tasks = JoinSet::new();
+    tasks.spawn(sender_with_game_input(
+        rx,
+        game_rx,
         session.paths.clone(),
         session.policy.clone(),
         session.stop.subscribe(),
@@ -3649,6 +3752,7 @@ async fn session_loop(
             });
             mux.flush(&mut tcp::Out {
                 tx: &tx,
+                game_tx: game_tx.as_ref(),
                 next_id: &mut next_id,
                 scope: &session.returning,
                 small_threshold,
@@ -3718,7 +3822,7 @@ async fn session_loop(
                 Some(Event::Reply(flow,payload,created))=>{
                     let Some((_,last))=flows.get_mut(&flow) else{trace_payload(&session.returning,trace::Stage::RecordDropped,&payload,Some(trace::Reason::FlowUnavailable));session.returning.update(|d|d.records.application_unavailable_dropped+=1);continue}; *last=Instant::now();
                     let Ok(parts)=messages::split(flow,&mut next_id,payload,session.policy.max_message_bytes) else {break};
-                    if !enqueue_message(&tx,parts,created,&session.returning,ingress::small_threshold(&session.policy)){dropped+=1;}
+                    if !enqueue_message(game_tx.as_ref().unwrap_or(&tx),parts,created,&session.returning,ingress::small_threshold(&session.policy)){dropped+=1;}
                 },
                 None=>break,
             },
@@ -4911,11 +5015,17 @@ async fn client_session(
             }
         }
     }
-    let (tx, rx) = mpsc::channel(QUEUE);
+    let ingress::Channels {
+        tx,
+        rx,
+        game_tx,
+        game_rx,
+    } = ingress::channels(options.policy.game_mode);
     let (stop, stop_rx) = watch::channel(false);
     let observation_notify = options.policy.adaptive.then(|| Arc::new(Notify::new()));
-    tasks.spawn(sender(
+    tasks.spawn(sender_with_game_input(
         rx,
+        game_rx,
         paths.clone(),
         options.policy.clone(),
         stop_rx,
@@ -4970,7 +5080,7 @@ async fn client_session(
         if let Some(mux)=streams.as_mut() {
             mux.service_io();
             mux.set_payload_limit(stream_payload_limit(&paths, options.policy.receiver_feedback));
-            mux.flush(&mut tcp::Out{tx:&tx,next_id:&mut next_id,scope:&forward,small_threshold});
+            mux.flush(&mut tcp::Out{tx:&tx,game_tx:game_tx.as_ref(),next_id:&mut next_id,scope:&forward,small_threshold});
         }
         tokio::select! {
             _=shutdown.wait()=>break,
@@ -5181,7 +5291,7 @@ async fn client_session(
                 }
                 let (flow,last)=peers.get_mut(&peer).expect("inserted peer");*last=created;
                 let parts=messages::split(*flow,&mut next_id,input[..n].to_vec(),options.policy.max_message_bytes)?;
-                if !enqueue_message(&tx,parts,created,&forward,ingress::small_threshold(&options.policy)) {
+                if !enqueue_message(game_tx.as_ref().unwrap_or(&tx),parts,created,&forward,ingress::small_threshold(&options.policy)) {
                     drops+=1;
                 } else {forward.update(|d|{d.records.ingress_queue_enqueued+=1;});}
             },

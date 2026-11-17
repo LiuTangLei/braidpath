@@ -328,6 +328,88 @@ fn policy() -> Policy {
     }
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn game_udp_reaches_quinn_before_a_full_tcp_input_fifo_and_both_lanes_close() {
+    let pair = Pair::connect().await;
+    let paths = Arc::new(Mutex::new(vec![pair.path()]));
+    let mut p = policy();
+    p.game_mode = true;
+    p.adaptive = true;
+    p.fec = automatic_fec::AUTO;
+    // This checks ordering, not a wall-clock deadline under CI load.
+    p.queue_ms = 1000;
+    p.latency_target_ms = 1000;
+    let metrics = stats::Metrics::new("client");
+    metrics.register("game-priority-order", 0, 2, stats::FORWARD, &pair.outgoing);
+    let scope = metrics.scope("game-priority-order", stats::FORWARD);
+    let ingress::Channels {
+        tx,
+        rx,
+        game_tx,
+        game_rx,
+    } = ingress::channels(true);
+    let tcp = Record {
+        flow: stream::data_flow(1),
+        id: 1,
+        payload: stream::Frame::Data {
+            offset: 0,
+            fin: false,
+            data: vec![9; 990],
+        }
+        .encode(),
+    };
+    for id in 1..=tx.max_capacity() {
+        let mut record = tcp.clone();
+        record.id = id as u64;
+        tx.try_send(QueuedRecord {
+            record,
+            created: Instant::now(),
+            hold: None,
+        })
+        .unwrap();
+    }
+    let game = Record {
+        flow: associate::FLAG | 1,
+        id: 10_000,
+        payload: vec![7; 128],
+    };
+    let game_encoded = game.encode().unwrap();
+    let tcp_encoded = tcp.encode().unwrap();
+    let game_tx = game_tx.unwrap();
+    game_tx
+        .try_send(QueuedRecord {
+            record: game,
+            created: Instant::now(),
+            hold: None,
+        })
+        .unwrap();
+    let (stop, stopped) = watch::channel(false);
+    let task = tokio::spawn(sender_with_game_input(
+        rx, game_rx, paths, p, stopped, scope, None,
+    ));
+    let mut first = None;
+    let mut tcp_seen = false;
+    for _ in 0..64 {
+        let frame = pair.receive().await;
+        if frame.windows(game_encoded.len()).any(|v| v == game_encoded) {
+            first.get_or_insert("game");
+        }
+        if frame.windows(tcp_encoded.len()).any(|v| v == tcp_encoded) {
+            first.get_or_insert("tcp");
+            tcp_seen = true;
+            break;
+        }
+    }
+    stop.send(true).unwrap();
+    task.await.unwrap();
+    assert_eq!(first, Some("game"));
+    assert!(tcp_seen, "TCP still gets service");
+    assert!(
+        tx.is_closed() && game_tx.is_closed(),
+        "shutdown closes and reclaims both inputs"
+    );
+}
+
 #[tokio::test]
 async fn reliable_auto_fec_uses_native_service_without_a_udp_default_change() {
     for reliable in [true, false] {
@@ -814,6 +896,7 @@ async fn interactive_first_flight_accounts_for_credit_wait() {
     controllers[0].admitted(0, 2400);
     let gauge = Arc::new(outbound::Gauge::default());
     let front = outbound::Pending {
+        game_datagram: false,
         data: Bytes::from(vec![7; 1000]),
         created: Instant::now(),
         record_id: Some(1),
@@ -898,6 +981,7 @@ async fn plain_interactive_waits_for_fast_credit_instead_of_entering_a_slow_queu
     let mut controllers = std::array::from_fn(|_| adaptive::PathController::new(policy.rate, 20));
     controllers[0].admitted(0, 2400);
     let mut front = outbound::Pending {
+        game_datagram: false,
         data: Bytes::from(vec![7; 100]),
         created: Instant::now(),
         record_id: Some(1),
@@ -1064,6 +1148,7 @@ async fn small_network_probe_keeps_timely_path_preference() {
     assert!(probe.tail_probe && !probe.local_retry);
     let data = Bytes::from(probe.frame.encode());
     let pending = outbound::Pending {
+        game_datagram: false,
         hold: Some(gauge.hold(
             1,
             probe.start,
@@ -1132,6 +1217,7 @@ async fn reliable_small_retry_escapes_repeated_local_expiry() {
             let data = Bytes::from(tx.frame.encode());
             let size = data.len();
             let pending = outbound::Pending {
+                game_datagram: false,
                 data,
                 created: now,
                 record_id: Some(u64::from(attempt)),

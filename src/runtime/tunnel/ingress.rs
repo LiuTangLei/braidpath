@@ -2,9 +2,42 @@
 //! This is admission isolation, not a larger queue or a bandwidth reservation.
 use super::Policy;
 use crate::runtime::QUEUE;
-use tokio::sync::mpsc::{Sender, error::TrySendError};
+use tokio::sync::mpsc::{self, Receiver, Sender, error::TrySendError};
 
 const SMALL_SLOTS: usize = QUEUE / 16;
+
+pub(super) struct Channels<T> {
+    pub tx: Sender<T>,
+    pub rx: Receiver<T>,
+    pub game_tx: Option<Sender<T>>,
+    pub game_rx: Option<Receiver<T>>,
+}
+
+/// Game UDP gets a separate FIFO carved out of the existing record budget.
+/// TCP retains the remaining slots; normal sessions keep the original channel.
+pub(super) fn channels<T>(game: bool) -> Channels<T> {
+    let reserved = if game { SMALL_SLOTS } else { 0 };
+    let (tx, rx) = mpsc::channel(QUEUE - reserved);
+    let (game_tx, game_rx) = if game {
+        let (tx, rx) = mpsc::channel(reserved);
+        (Some(tx), Some(rx))
+    } else {
+        (None, None)
+    };
+    Channels {
+        tx,
+        rx,
+        game_tx,
+        game_rx,
+    }
+}
+
+pub(super) async fn game_recv<T>(rx: &mut Option<Receiver<T>>) -> Option<T> {
+    match rx {
+        Some(rx) => rx.recv().await,
+        None => std::future::pending().await,
+    }
+}
 
 /// Reserve the complete message before publishing any fragment. A rejected
 /// reservation returns every permit, including the small-message reserve.
@@ -54,6 +87,28 @@ pub(super) fn try_send<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn game_reserve_bypasses_full_tcp_without_increasing_total_slots() {
+        let Channels {
+            tx,
+            mut rx,
+            game_tx,
+            mut game_rx,
+        } = channels(true);
+        let game = game_tx.unwrap();
+        assert_eq!(tx.max_capacity() + game.max_capacity(), QUEUE);
+        for id in 0..tx.max_capacity() {
+            tx.try_send(id).unwrap();
+        }
+        assert!(matches!(tx.try_send(999), Err(TrySendError::Full(999))));
+        game.try_send(1000).unwrap();
+        assert_eq!(game_rx.as_mut().unwrap().try_recv().unwrap(), 1000);
+        assert_eq!(rx.try_recv().unwrap(), 0, "TCP FIFO remains intact");
+        let normal = channels::<usize>(false);
+        assert_eq!(normal.tx.max_capacity(), QUEUE);
+        assert!(normal.game_tx.is_none() && normal.game_rx.is_none());
+    }
 
     #[test]
     fn old_fifo_admission_loses_small_requests_while_reserved_admission_keeps_them() {

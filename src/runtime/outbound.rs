@@ -25,6 +25,8 @@ pub struct Pending {
     pub block: Option<u64>,
     /// Actual coding lane; only mixed sessions use this to classify symbols.
     pub small: bool,
+    /// Local Game UDP classification, including copies without a record flow.
+    pub game_datagram: bool,
     /// Reliable-stream originals only; released when this original leaves.
     pub hold: Option<Arc<Hold>>,
 }
@@ -982,6 +984,7 @@ mod tests {
 
     fn item(flow: u32, id: u64, at: Instant) -> Pending {
         Pending {
+            game_datagram: false,
             data: Bytes::from_static(b"payload"),
             created: at,
             record_id: Some(id),
@@ -1095,6 +1098,7 @@ mod tests {
                 rejected_originals += 1;
             }
             let repair = Pending {
+                game_datagram: false,
                 data: Bytes::from_static(b"repair"),
                 created: now,
                 record_id: None,

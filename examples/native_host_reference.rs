@@ -287,7 +287,7 @@ async fn sender(
             item=rx.recv()=>{
                 let Some(item)=item else {break};inc(&stats.encoded);
                 let data=encode(frame,item.flow,sequence,&item.payload)?;
-                let pending=outbound::Pending{data,created:item.created,record_id:Some(sequence),
+                let pending=outbound::Pending{game_datagram:false,data,created:item.created,record_id:Some(sequence),
                     flow:Some(item.flow),block:None,small:false,hold:None};sequence+=1;
                 if queue.push(pending).is_err(){inc(&stats.queue_full)}
             }

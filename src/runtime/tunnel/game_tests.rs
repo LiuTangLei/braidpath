@@ -106,6 +106,93 @@ fn game_udp_classification_preserves_tcp_and_normal_mode() {
 }
 
 #[test]
+fn game_copy_waits_for_rate_credit_ahead_of_superseding_ack_copies() {
+    let now = Instant::now();
+    let p = policy();
+    let mut encoder = coding::RecordEncoder::new(&p).unwrap();
+    encoder.set_fec(4).unwrap();
+    let metrics = stats::Metrics::new("server");
+    let scope = metrics.scope("game-copy-budget", stats::RETURN);
+    let mut queue = outbound::Queue::default();
+    let mut blocks = BTreeMap::new();
+    for record in [
+        Record {
+            flow: stream::ack_flow(1),
+            id: 1,
+            payload: stream::Frame::Ack(stream::Ack {
+                cumulative: 0,
+                limit: stream::INITIAL_WINDOW,
+                duplicate_bytes: 0,
+                ranges: vec![],
+            })
+            .encode(),
+        },
+        Record {
+            flow: 2,
+            id: 2,
+            payload: vec![7; 1000],
+        },
+    ] {
+        for symbol in encoder.encode(&record, now).unwrap() {
+            enqueue_coded_symbol(
+                symbol,
+                now,
+                &mut queue,
+                &mut blocks,
+                Some(&p),
+                &scope,
+                &mut None,
+            );
+        }
+    }
+    while let Some(original) = queue.pop(false) {
+        let meta = blocks.get_mut(&original.block.unwrap()).unwrap();
+        meta.paths = 1;
+        meta.small_repair_reserved = meta.small_repair_limit;
+    }
+    let ack_block = queue.front(true).unwrap().block;
+    let mut normal = p.clone();
+    normal.game_mode = false;
+    assert!(!prioritize_game_repair(&mut queue, &normal, &blocks));
+    assert_eq!(queue.front(true).unwrap().block, ack_block);
+    let count = queue.len();
+    assert!(prioritize_game_repair(&mut queue, &p, &blocks));
+    let game = queue.front(true).unwrap();
+    assert_ne!(game.block, ack_block);
+    assert!(
+        game.flow.is_none() && p.gaming_symbol(game),
+        "copies retain Game route selection without an original record flow"
+    );
+    let frame = repair_frame_floor(&p, game);
+    let mut budget = outbound::RepairBudget::new(p.redundancy);
+    budget.enable_small_rate(4_000_000);
+    budget.refill_small(1_000_000);
+    budget.small_repair_admitted(2100);
+    assert!(
+        !repair_allowed(&p, &budget, &blocks, game, frame),
+        "priority cannot bypass the copy-rate cap"
+    );
+    assert_eq!(
+        queue.len(),
+        count,
+        "waiting retains the existing bounded queue"
+    );
+    budget.refill_small(1_002_000);
+    assert!(repair_allowed(
+        &p,
+        &budget,
+        &blocks,
+        queue.front(true).unwrap(),
+        frame
+    ));
+    queue.expire(now + p.admission_lifetime(), p.admission_lifetime());
+    assert!(
+        queue.is_empty(),
+        "the existing deadline still expires every copy"
+    );
+}
+
+#[test]
 fn normal_udp_reassembly_keeps_arrival_skew_separate_from_send_deadline() {
     let mut p = policy();
     p.game_mode = false;

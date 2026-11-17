@@ -110,6 +110,7 @@ Session/direction `tcp_streams` snapshots include:
 | `tail_probes_queued`, `head_copies_queued`, `local_drop_retransmits` | Bounded extra copies and repairs following local admission failure |
 | `acks_sent`, `acks_received`, `probe_timeouts`, `spurious_retransmit_reports` | Stream acknowledgment/recovery events, distinct from QUIC ACKs and packet loss |
 | `duplicate_bytes_received`, `pending_io_events`, `local_sender_queued_bytes` | Duplicate stream bytes and currently owned mux/input backlog |
+| `udp_io_events_prioritized`, `udp_io_wait_us_sum`, `udp_io_wait_us_max` | Game association events handled through their bounded priority FIFO, with total/maximum time from event creation to mux handling; normal sessions keep these zero |
 
 Actor-stage counters do not establish wire admission. Use symbol Quinn-admission
 counters and outer transport counters for their respective stages. FEC recovery

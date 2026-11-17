@@ -220,6 +220,10 @@ pub struct Snapshot {
     pub udp_datagrams_to_tunnel: u64,
     pub udp_datagrams_from_tunnel: u64,
     pub udp_datagrams_dropped: u64,
+    /// Game-only association events handled outside the TCP completion FIFO.
+    pub udp_io_events_prioritized: u64,
+    pub udp_io_wait_us_sum: u64,
+    pub udp_io_wait_us_max: u64,
 }
 
 #[derive(Clone, Copy)]

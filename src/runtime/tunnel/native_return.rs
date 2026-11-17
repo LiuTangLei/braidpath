@@ -84,6 +84,7 @@ pub(super) fn enqueue(item: QueuedRecord, queue: &mut outbound::Queue) {
     // Queue rejection drops the unadmitted hold; the stream retains its bytes
     // and retries through the normal bounded producer backpressure.
     let _ = queue.push(outbound::Pending {
+        game_datagram: false,
         data: encoded.into(),
         created,
         flow: Some(record.flow),
@@ -269,6 +270,7 @@ mod tests {
             let gauge = Arc::new(outbound::Gauge::default());
             let hold = gauge.hold(9, 123, 1, PAYLOAD, false, false);
             let pending = outbound::Pending {
+                game_datagram: false,
                 data: Bytes::from_static(b"payload"),
                 created: Instant::now(),
                 record_id: Some(1),

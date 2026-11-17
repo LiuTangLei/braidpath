@@ -51,6 +51,31 @@ pub(super) fn is_flow(flow: u32) -> bool {
 /// The SOCKS client's latest UDP source, where replies go.
 pub(super) type Peer = Arc<Mutex<Option<SocketAddr>>>;
 
+pub(super) struct QueuedIo {
+    pub event: Io,
+    pub created: Instant,
+}
+
+#[derive(Clone)]
+pub(super) enum Events {
+    Normal(mpsc::UnboundedSender<Io>),
+    Game(mpsc::Sender<QueuedIo>),
+}
+impl Events {
+    async fn send(&self, event: Io) -> Result<(), ()> {
+        match self {
+            Self::Normal(tx) => tx.send(event).map_err(|_| ()),
+            Self::Game(tx) => tx
+                .send(QueuedIo {
+                    event,
+                    created: Instant::now(),
+                })
+                .await
+                .map_err(|_| ()),
+        }
+    }
+}
+
 fn canonical(address: SocketAddr) -> SocketAddr {
     SocketAddr::new(address.ip().to_canonical(), address.port())
 }
@@ -74,12 +99,7 @@ pub(super) fn to_client(payload: &[u8]) -> Vec<u8> {
 
 /// Client: bind the relay beside the address the SOCKS client reached, answer
 /// the request with it, then relay until the control connection closes.
-pub(super) async fn client(
-    flow: u32,
-    mut tcp: TcpStream,
-    events: mpsc::UnboundedSender<Io>,
-    limit: usize,
-) {
+pub(super) async fn client(flow: u32, mut tcp: TcpStream, events: Events, limit: usize) {
     let (Ok(local), Ok(owner)) = (tcp.local_addr(), tcp.peer_addr()) else {
         return;
     };
@@ -102,6 +122,7 @@ pub(super) async fn client(
     let peer = Peer::default();
     if events
         .send(Io::Associated(flow, socket.clone(), peer.clone()))
+        .await
         .is_err()
     {
         return;
@@ -123,7 +144,7 @@ pub(super) async fn client(
                     Some(payload) => Io::Datagram(flow, payload.to_vec()),
                     None => Io::DatagramDropped,
                 };
-                if events.send(datagram).is_err() {
+                if events.send(datagram).await.is_err() {
                     return;
                 }
             }
@@ -134,7 +155,7 @@ pub(super) async fn client(
             }
         }
     }
-    let _ = events.send(Io::Unassociated(flow));
+    let _ = events.send(Io::Unassociated(flow)).await;
 }
 
 /// Server: one socket per association, reached from both address families
@@ -199,11 +220,11 @@ pub(super) async fn server(
     flow: u32,
     allow_private: bool,
     mut datagrams: mpsc::Receiver<Vec<u8>>,
-    events: mpsc::UnboundedSender<Io>,
+    events: Events,
     limit: usize,
 ) {
     let Ok(socket) = bind_any() else {
-        let _ = events.send(Io::Unassociated(flow));
+        let _ = events.send(Io::Unassociated(flow)).await;
         return;
     };
     let mut names = Names(HashMap::new());
@@ -214,7 +235,7 @@ pub(super) async fn server(
             datagram = datagrams.recv() => {
                 let Some(datagram) = datagram else { return };
                 let Ok(Some((destination, used))) = Destination::decode(&datagram) else {
-                    let _ = events.send(Io::DatagramDropped);
+                    let _ = events.send(Io::DatagramDropped).await;
                     continue;
                 };
                 let target = match destination {
@@ -227,14 +248,14 @@ pub(super) async fn server(
                         .map(|ip| SocketAddr::new(ip, port)),
                 };
                 let Some(target) = target.filter(|t| proxy::permitted(t.ip(), allow_private)) else {
-                    let _ = events.send(Io::DatagramDropped);
+                    let _ = events.send(Io::DatagramDropped).await;
                     continue;
                 };
                 if sent_to.len() < MAX_PEERS {
                     sent_to.insert(target.ip());
                 }
                 if socket.send_to(&datagram[used..], outbound(&socket, target)).await.is_err() {
-                    let _ = events.send(Io::DatagramDropped);
+                    let _ = events.send(Io::DatagramDropped).await;
                 }
             }
             received = socket.recv_from(&mut buffer) => {
@@ -250,7 +271,7 @@ pub(super) async fn server(
                 } else {
                     Io::DatagramDropped
                 };
-                if events.send(reply).is_err() {
+                if events.send(reply).await.is_err() {
                     return;
                 }
             }

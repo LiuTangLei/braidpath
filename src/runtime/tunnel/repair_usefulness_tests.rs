@@ -35,6 +35,7 @@ fn fill_flow(queue: &mut outbound::Queue, now: Instant) {
         };
         queue
             .push(outbound::Pending {
+                game_datagram: false,
                 data: wire::plain(&r).unwrap(),
                 created: now,
                 record_id: Some(r.id),
@@ -165,6 +166,7 @@ fn missing_metadata_short_blocks_invalid_headers_and_small_lane_keep_repairs() {
         small_repair_limit: 0,
         small_repair_reserved: 0,
         acknowledgment: false,
+        game_datagram: false,
     };
     let mut data = vec![0u8; wire::HEADER];
     data[3] = 1;
