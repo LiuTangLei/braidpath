@@ -5291,24 +5291,43 @@ async fn drive_client_path(
     };
     trace_path(&returning, trace::Stage::PathOpened, trace_key);
     trace_path(&measurement_scope, trace::Stage::PathOpened, trace_key);
-    let mut native_decoder = native_return::Decoder::default();
-    let mut native_reader = native_return
+    let native_reader = native_return
         .then(|| profile::NativeReader::new(conn.stable_id()))
-        .flatten();
-    let result:Result<()>=async {loop {tokio::select! {
+        .flatten()
+        .map(Mutex::new);
+    let result:Result<()>=async {
+        // Keep the entire body reader pinned as its own branch. A native
+        // queue or byte-credit wait can then yield to application DATAGRAMs,
+        // without canceling a partially decoded frame on each read.
+        let body = async {
+            let mut decoder = native_return::Decoder::default();
+            while let Some(mut body) = request.recv_data().await? {
+                ensure!(native_return, "unexpected reliable response data");
+                while let Some(record) = decoder.next(&mut body)? {
+                    if let Some(reader) = &native_reader {
+                        reader.lock().expect("native profile lock").record();
+                    }
+                    let incoming = profile::native_admission(
+                        native_reader.as_ref(), profile::NativeAdmission::Budget,
+                        || conn.stats().frame_rx.datagram,
+                        native_return::Incoming::new(record),
+                    ).await?;
+                    profile::native_admission(
+                        native_reader.as_ref(), profile::NativeAdmission::Channel,
+                        || conn.stats().frame_rx.datagram,
+                        native_tx.send(incoming),
+                    ).await.context("native stream receiver closed")?;
+                }
+            }
+            decoder.finish()
+        };
+        tokio::pin!(body);
+        loop {tokio::select! {
                         e=driver.wait_idle()=>return Err(e.into()),
-                        body=request.recv_data()=>{
-                            let Some(mut body)=body? else {native_decoder.finish()?;return Ok(())};
-                            ensure!(native_return,"unexpected reliable response data");
-                            while let Some(record)=native_decoder.next(&mut body)? {
-                                if let Some(reader)=native_reader.as_mut(){reader.record();}
-                                let incoming=profile::native_admission(native_reader.as_mut(),profile::NativeAdmission::Budget,||conn.stats().frame_rx.datagram,native_return::Incoming::new(record)).await?;
-                                tokio::select! { sent=profile::native_admission(native_reader.as_mut(),profile::NativeAdmission::Channel,||conn.stats().frame_rx.datagram,native_tx.send(incoming))=>sent.context("native stream receiver closed")?, _=conn.closed()=>return Ok(()) }
-                            }
-                        },
+                        result=&mut body=>return result,
                         d=conn.read_datagram()=>match d {
                             Ok(d)=>{
-                                if let Some(reader)=native_reader.as_mut(){reader.datagram(Instant::now());}
+                                if let Some(reader)=&native_reader {reader.lock().expect("native profile lock").datagram(Instant::now());}
                                 trace_http(&returning,trace::Stage::PeerHttpReceived,&d,stream,feedback,trace_key,None);
                                 returning.path(pid,|p|p.http_datagrams_received+=1);
                                 if let Ok(p)=wire::http_payload(&d,stream) && p.len()<=payload::wire_limit(stream_payload,feedback) {

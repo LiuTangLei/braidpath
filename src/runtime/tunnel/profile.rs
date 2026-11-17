@@ -252,7 +252,7 @@ impl Drop for NativeReader {
 /// Record only futures that really yield Pending, including cancellation.
 /// The frame counter is sampled only at those waits, not for each native record.
 pub(super) async fn native_admission<F: Future, C: Fn() -> u64>(
-    reader: Option<&mut NativeReader>,
+    reader: Option<&std::sync::Mutex<NativeReader>>,
     kind: NativeAdmission,
     frames: C,
     future: F,
@@ -261,7 +261,7 @@ pub(super) async fn native_admission<F: Future, C: Fn() -> u64>(
         return future.await;
     };
     struct Wait<'a, C: Fn() -> u64> {
-        reader: &'a mut NativeReader,
+        reader: &'a std::sync::Mutex<NativeReader>,
         kind: NativeAdmission,
         frames: C,
         pending: Option<(Instant, u64)>,
@@ -270,10 +270,11 @@ pub(super) async fn native_admission<F: Future, C: Fn() -> u64>(
     impl<C: Fn() -> u64> Drop for Wait<'_, C> {
         fn drop(&mut self) {
             if let Some((at, before)) = self.pending {
-                self.reader.waited(
+                let frames = (self.frames)().saturating_sub(before);
+                self.reader.lock().expect("native profile lock").waited(
                     self.kind,
                     at.elapsed(),
-                    (self.frames)().saturating_sub(before),
+                    frames,
                     !self.completed,
                 );
             }
@@ -317,25 +318,25 @@ mod tests {
 
     #[tokio::test]
     async fn native_admission_ready_does_not_sample_native_counters() {
-        let mut reader = native_reader();
+        let reader = std::sync::Mutex::new(native_reader());
         let output = native_admission(
-            Some(&mut reader),
+            Some(&reader),
             NativeAdmission::Budget,
             || panic!("a ready admission must not query native counters"),
             std::future::ready(7),
         )
         .await;
         assert_eq!(output, 7);
-        assert_eq!(reader.counters.budget_waits, 0);
+        assert_eq!(reader.lock().unwrap().counters.budget_waits, 0);
     }
 
     #[tokio::test]
     async fn native_admission_pending_records_frames_once() {
-        let mut reader = native_reader();
+        let reader = std::sync::Mutex::new(native_reader());
         let frames = std::cell::Cell::new(0u64);
         let mut first = true;
         native_admission(
-            Some(&mut reader),
+            Some(&reader),
             NativeAdmission::Channel,
             || {
                 let value = frames.get();
@@ -352,18 +353,21 @@ mod tests {
             }),
         )
         .await;
-        assert_eq!(reader.counters.channel_waits, 1);
-        assert_eq!(reader.counters.budget_waits, 0);
-        assert_eq!(reader.counters.datagram_frames_during_wait, 2);
-        assert_eq!(reader.counters.cancelled_waits, 0);
+        assert_eq!(reader.lock().unwrap().counters.channel_waits, 1);
+        assert_eq!(reader.lock().unwrap().counters.budget_waits, 0);
+        assert_eq!(
+            reader.lock().unwrap().counters.datagram_frames_during_wait,
+            2
+        );
+        assert_eq!(reader.lock().unwrap().counters.cancelled_waits, 0);
     }
 
     #[tokio::test]
     async fn native_admission_cancellation_keeps_the_wait_observation() {
-        let mut reader = native_reader();
+        let reader = std::sync::Mutex::new(native_reader());
         let frames = std::cell::Cell::new(0u64);
         let mut wait = Box::pin(native_admission(
-            Some(&mut reader),
+            Some(&reader),
             NativeAdmission::Budget,
             || frames.get(),
             std::future::pending::<()>(),
@@ -375,9 +379,12 @@ mod tests {
         .await;
         frames.set(3);
         drop(wait);
-        assert_eq!(reader.counters.budget_waits, 1);
-        assert_eq!(reader.counters.cancelled_waits, 1);
-        assert_eq!(reader.counters.datagram_frames_during_wait, 3);
+        assert_eq!(reader.lock().unwrap().counters.budget_waits, 1);
+        assert_eq!(reader.lock().unwrap().counters.cancelled_waits, 1);
+        assert_eq!(
+            reader.lock().unwrap().counters.datagram_frames_during_wait,
+            3
+        );
     }
 
     #[test]

@@ -36,6 +36,9 @@ Set `BRAIDPATH_PIPELINE_PROFILE=1` and enable
 Each sender and path writer emits one `pipeline timing profile` on teardown.
 Native-return readers additionally emit `native receive admission profile`
 snapshots at most once per second during activity and once on teardown.
+Native body assembly and admission have their own receive future. While it
+waits for byte credit or a session slot, the path can still read application
+DATAGRAMs. Body records remain ordered and use the same byte and queue bounds.
 The default is off; it changes no admission, pacing, queue, or protocol policy.
 No packet contents, target names, credentials, or keys are recorded.
 

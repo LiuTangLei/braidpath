@@ -13,6 +13,131 @@ struct Pair {
     incoming: quinn::Connection,
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn native_body_backpressure_keeps_reading_datagrams() {
+    use bytes::BufMut;
+
+    let pair = Pair::connect().await;
+    let (body_tx, body_rx) = tokio::sync::oneshot::channel::<Bytes>();
+    let incoming = pair.incoming.clone();
+    let server = tokio::spawn(async move {
+        let mut h3 = h3::server::builder()
+            .enable_datagram(true)
+            .build::<_, Bytes>(h3_quinn::Connection::new(incoming.clone()))
+            .await
+            .unwrap();
+        let (_, mut response) = h3
+            .accept()
+            .await
+            .unwrap()
+            .unwrap()
+            .resolve_request()
+            .await
+            .unwrap();
+        response.send_response(Response::new(())).await.unwrap();
+        response.send_data(body_rx.await.unwrap()).await.unwrap();
+        incoming.closed().await;
+    });
+    let (mut driver, mut send) = h3::client::builder()
+        .enable_datagram(true)
+        .build::<_, _, Bytes>(h3_quinn::Connection::new(pair.outgoing.clone()))
+        .await
+        .unwrap();
+    let mut request = send
+        .send_request(Request::get("https://localhost/session").body(()).unwrap())
+        .await
+        .unwrap();
+    tokio::select! {
+        response = timeout(Duration::from_secs(3), request.recv_response()) => {
+            assert_eq!(response.unwrap().unwrap().status(), StatusCode::OK);
+        }
+        error = driver.wait_idle() => panic!("HTTP/3 ended during fixture setup: {error}"),
+    }
+    let stream = request.id().into_inner();
+    let (tx, mut rx) = mpsc::channel(4);
+    let (native_tx, mut native_rx) = mpsc::channel(64);
+    let credits = native_tx.clone();
+    let metrics = stats::Metrics::new("client");
+    let diagnostic = stats::ConnectionTrace::new(
+        metrics.clone(),
+        pair.outgoing.remote_address(),
+        Some(0),
+        "quic_connect",
+    );
+    let task = tokio::spawn(drive_client_path(
+        pair.outgoing.clone(),
+        stream,
+        driver,
+        request,
+        send,
+        diagnostic,
+        0,
+        1,
+        tx,
+        native_tx,
+        true,
+        Arc::new(AtomicU64::new(0)),
+        metrics.scope("backpressure", stats::RETURN),
+        metrics.scope("backpressure", stats::FORWARD),
+        Arc::new(Mutex::new(Vec::new())),
+        false,
+        MAX_PAYLOAD,
+        None,
+    ));
+    let mut body = bytes::BytesMut::new();
+    let payload = stream::Frame::Data {
+        offset: 0,
+        fin: false,
+        data: vec![7],
+    }
+    .encode();
+    for id in 0..65 {
+        body.put_u32(payload.len() as u32);
+        body.put_u32(stream::data_flow(1));
+        body.put_u64(id);
+        body.extend_from_slice(&payload);
+    }
+    // One H3 DATA chunk holds more native records than the application can
+    // keep. The consumer stays paused until all probes are read.
+    body_tx.send(body.freeze()).unwrap();
+    timeout(Duration::from_secs(3), async {
+        while credits.capacity() != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("native receiver queue did not fill");
+
+    for probe in 0..3 {
+        let payload = [probe];
+        pair.incoming
+            .send_datagram(wire::http_datagram(stream, &payload).unwrap())
+            .unwrap();
+        let (_, received) = timeout(Duration::from_millis(500), rx.recv())
+            .await
+            .expect("DATAGRAM reader stalled behind full native queue")
+            .unwrap();
+        assert_eq!(received.as_ref(), payload);
+        assert_eq!(credits.capacity(), 0);
+    }
+    for id in 0..65 {
+        let frame = timeout(Duration::from_secs(3), native_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(frame.record.id, id);
+    }
+    pair.outgoing.close(0u32.into(), b"test completed");
+    timeout(Duration::from_secs(3), task)
+        .await
+        .unwrap()
+        .unwrap();
+    timeout(Duration::from_secs(3), server)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
 impl Pair {
     async fn connect() -> Self {
         Self::connect_with_send_buffer(transport::DEFAULT_DATAGRAM_SEND_BUFFER_BYTES).await
