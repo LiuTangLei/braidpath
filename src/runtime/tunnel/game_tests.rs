@@ -26,11 +26,12 @@ fn policy() -> Policy {
 }
 
 #[test]
-fn game_udp_deadline_and_queue_control_preserve_tcp_and_reassembly_budgets() {
+fn game_udp_deadline_is_separate_from_tcp_and_reassembly_budgets() {
     let mut p = policy();
     assert_eq!(p.control_latency_target_ms(stats::RETURN), 10);
     assert_eq!(p.control_latency_target_ms(stats::FORWARD), 20);
     assert_eq!(p.admission_lifetime(), Duration::from_millis(20));
+    assert_eq!(p.stream_lifetime(), Duration::from_millis(80));
     assert_eq!(p.datagram_lifetime(), Duration::from_millis(10));
     assert_eq!(
         p.record_lifetime(associate::FLAG | 1),
@@ -38,7 +39,7 @@ fn game_udp_deadline_and_queue_control_preserve_tcp_and_reassembly_budgets() {
     );
     assert_eq!(
         p.record_lifetime(stream::data_flow(1)),
-        Duration::from_millis(20)
+        Duration::from_millis(80)
     );
     assert_eq!(p.reassembly_lifetime(), Duration::from_millis(250));
     p.latency_target_ms = 3;
@@ -49,10 +50,11 @@ fn game_udp_deadline_and_queue_control_preserve_tcp_and_reassembly_budgets() {
     assert_eq!(p.control_latency_target_ms(stats::RETURN), 20);
     assert_eq!(p.control_latency_target_ms(stats::FORWARD), 20);
     assert_eq!(p.datagram_lifetime(), Duration::from_millis(20));
+    assert_eq!(p.stream_lifetime(), Duration::from_millis(20));
 }
 
 #[test]
-fn game_originals_keep_pacing_credit_without_increasing_operator_limits() {
+fn game_originals_and_copies_use_reserved_credit_without_increasing_operator_limits() {
     let mut p = policy();
     let now = Instant::now();
     let tcp = outbound::Pending {
@@ -71,6 +73,9 @@ fn game_originals_keep_pacing_credit_without_increasing_operator_limits() {
     let reserve = game_pacing_reserve(&p, &tcp, false, 1180);
     assert_eq!(reserve, 1200);
     assert_eq!(game_pacing_reserve(&p, &game, false, 1180), 0);
+    game.record_id = None;
+    game.flow = None;
+    assert_eq!(game_pacing_reserve(&p, &game, true, 300), 0);
     assert_eq!(game_pacing_reserve(&p, &game, true, 1180), 1200);
     for cost in [100, 1180, 1400, 2400] {
         assert!(
@@ -96,7 +101,7 @@ fn game_originals_keep_pacing_credit_without_increasing_operator_limits() {
 }
 
 #[test]
-fn game_originals_and_copies_expire_at_ten_ms_while_tcp_keeps_twenty_ms() {
+fn game_originals_and_copies_expire_at_ten_ms_while_tcp_can_wait_for_measured_service() {
     let p = policy();
     let now = Instant::now();
     let mut encoder = coding::RecordEncoder::new(&p).unwrap();
@@ -139,8 +144,15 @@ fn game_originals_and_copies_expire_at_ten_ms_while_tcp_keeps_twenty_ms() {
     );
     assert!(expired.iter().all(|item| p.gaming_symbol(item)));
     assert_eq!(queue.len(), before - 4);
-    assert!(!queue.is_empty(), "TCP retains its normal budget");
+    assert!(!queue.is_empty(), "TCP has an independent local budget");
     queue.expire_with(now + Duration::from_millis(20), |item| {
+        p.symbol_lifetime(item)
+    });
+    assert!(
+        !queue.is_empty(),
+        "paced TCP is not needlessly retransmitted"
+    );
+    queue.expire_with(now + Duration::from_millis(80), |item| {
         p.symbol_lifetime(item)
     });
     assert!(queue.is_empty());

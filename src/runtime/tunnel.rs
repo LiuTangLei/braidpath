@@ -146,18 +146,27 @@ impl Policy {
             self.admission_lifetime()
         }
     }
+    fn stream_lifetime(&self) -> Duration {
+        if self.game_mode {
+            // TCP can wait locally while a conservative initial allowance is
+            // measured. Its queue is separate from the 10ms UDP priority lane.
+            self.admission_lifetime().max(Duration::from_millis(80))
+        } else {
+            self.admission_lifetime()
+        }
+    }
     fn record_lifetime(&self, flow: u32) -> Duration {
         if self.gaming_datagram(Some(flow)) {
             self.datagram_lifetime()
         } else {
-            self.admission_lifetime()
+            self.stream_lifetime()
         }
     }
     fn symbol_lifetime(&self, symbol: &outbound::Pending) -> Duration {
         if self.gaming_symbol(symbol) {
             self.datagram_lifetime()
         } else {
-            self.admission_lifetime()
+            self.stream_lifetime()
         }
     }
     fn reassembly_lifetime(&self) -> Duration {
@@ -1064,7 +1073,11 @@ fn game_pacing_reserve(
     repair: bool,
     wire_bytes: usize,
 ) -> usize {
-    if policy.game_mode && (repair || !policy.gaming_symbol(pending)) {
+    // Short Game copies can immediately protect a small datagram on a second
+    // fast path. Large copies retain credit for the other original fragments.
+    if policy.game_mode
+        && (!policy.gaming_symbol(pending) || (repair && wire_bytes > LATENCY_RECORD_BYTES))
+    {
         1200.min(2400usize.saturating_sub(wire_bytes))
     } else {
         0
@@ -1201,7 +1214,7 @@ impl PreparedSend {
         let timely = small_delivery::mask(
             paths,
             eligible,
-            policy.admission_lifetime().saturating_sub(age),
+            policy.symbol_lifetime(&self.front).saturating_sub(age),
             policy.latency_target_ms,
             if self.repair && policy.fec == automatic_fec::AUTO {
                 self.used
@@ -1400,7 +1413,7 @@ fn latency_candidates(
     // records retain their timely-path preference, while larger interactive
     // records keep the existing first-attempt-only preference.
     let eligible = candidates.iter().fold(0, |mask, (id, _)| mask | (1 << id));
-    let remaining = policy.admission_lifetime().saturating_sub(age);
+    let remaining = policy.symbol_lifetime(front).saturating_sub(age);
     let timely = if front.data.len() > LATENCY_RECORD_BYTES {
         let mut waits = [f64::INFINITY; MAX_PATHS];
         let payload = front.data.len()
@@ -1773,7 +1786,7 @@ async fn sender_with_game_input(
         // A small first-flight allowance avoids seeding four paths from large,
         // unexercised native windows. Receiver-qualified growth has no such cap.
         .with_native_startup_limit(policy.game_mode.then_some(2_000_000))
-        .with_admission_deadline(policy.latency_target_ms)
+        .with_admission_deadline(policy.stream_lifetime().as_millis() as u64)
     });
     let mut native_probes: [native_probe::Pause; MAX_PATHS] = Default::default();
     let mut logged_rate_changes = [0u64; MAX_PATHS];
@@ -1815,7 +1828,7 @@ async fn sender_with_game_input(
     let mut repair_turn = false;
     let mut tick = interval(Duration::from_millis(1));
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    let lifetime = policy.admission_lifetime();
+    let lifetime = policy.stream_lifetime();
     let mut profile = profile::Sender::new(metrics.direction);
     let mut waiting: Option<WaitingSend> = None;
     let mut liveness: [liveness::Liveness; MAX_PATHS] = Default::default();
