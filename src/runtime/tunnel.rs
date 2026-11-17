@@ -52,6 +52,7 @@ mod associate;
 mod coding;
 #[cfg(test)]
 mod dual_tests;
+mod game_startup;
 #[cfg(test)]
 mod game_tests;
 mod ingress;
@@ -1809,6 +1810,11 @@ async fn sender_with_game_input(
     let mut business = policy
         .adaptive
         .then(|| outbound::BusinessPacer::new(policy.rate, policy.group_rates, burst));
+    let mut game_startup = policy.game_mode.then(game_startup::Budget::default);
+    let mut game_data_demand = false;
+    if let (Some(budget), Some(pacer)) = (&game_startup, &mut business) {
+        pacer.set_aggregate_limit(budget.rate_bps());
+    }
     let epoch = Instant::now();
     let mut cursor = 0usize;
     let mut control_cursor = 0usize;
@@ -2058,6 +2064,11 @@ async fn sender_with_game_input(
                     break;
                 };
                 metrics.update(|d| d.records.sender_input_consumed += 1);
+                game_data_demand |= policy.game_mode
+                    && (policy.gaming_datagram(Some(record.flow))
+                        || (stream::stream_id(record.flow).is_some()
+                            && !stream::is_ack_flow(record.flow)
+                            && record.payload.len() > LATENCY_RECORD_BYTES));
                 metrics.trace_record(trace::Stage::SenderInput, &record, None, None);
                 if native_returning
                     && native_return::data(record.flow, &record.payload)
@@ -2147,6 +2158,38 @@ async fn sender_with_game_input(
             .is_some()
         {
             let mut cap_changed = false;
+            if let Some(budget) = &mut game_startup {
+                let reports: Vec<_> = paths
+                    .iter()
+                    .filter(|p| p.open())
+                    .map(|path| {
+                        let q = path.quality.lock().expect("quality lock");
+                        let native = path.conn.stats();
+                        game_startup::Report {
+                            path: path.id,
+                            generation: q.snapshot.generation,
+                            bytes: q.snapshot.sender_estimate.received_bytes,
+                            symbols: q.snapshot.sender_estimate.received,
+                            sent: native.path.sent_packets,
+                            lost: native.path.lost_packets,
+                        }
+                    })
+                    .collect();
+                let previous = budget.rate_bps();
+                let limit = budget.observe(
+                    now_us,
+                    queue.has_bulk_stream_data() || game_data_demand,
+                    &reports,
+                );
+                game_data_demand = false;
+                business
+                    .as_mut()
+                    .expect("adaptive Game pacer")
+                    .set_aggregate_limit(limit);
+                if limit != previous {
+                    tracing::info!(target: "braidpath::summary", event="game_aggregate_budget", direction=metrics.direction, limit_bps=limit, "Game aggregate allowance changed");
+                }
+            }
             if let Some(guard) = forward_guard.as_mut() {
                 if metrics.direction == stats::FORWARD {
                     let native: Vec<_> = paths

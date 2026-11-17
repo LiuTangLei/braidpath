@@ -519,6 +519,7 @@ pub struct BusinessPacer {
     aggregate: Pacer,
     groups: [Pacer; MAX_PATHS],
     maximum_bps: u64,
+    aggregate_limit_bps: u64,
     group_maximum_bps: [u64; MAX_PATHS],
     last_us: u64,
 }
@@ -540,9 +541,16 @@ impl BusinessPacer {
             aggregate: startup_bucket(),
             groups: std::array::from_fn(|_| startup_bucket()),
             maximum_bps,
+            aggregate_limit_bps: maximum_bps,
             group_maximum_bps,
             last_us: 0,
         }
+    }
+
+    /// Apply a shared allowance at the next update, within the operator ceiling.
+    /// Updating path budgets still settles elapsed old-rate credit first.
+    pub(crate) fn set_aggregate_limit(&mut self, rate_bps: u64) {
+        self.aggregate_limit_bps = rate_bps.min(self.maximum_bps);
     }
 
     /// Supply current live, eligible path allowances, including paths whose
@@ -568,7 +576,8 @@ impl BusinessPacer {
             self.groups[id].set_rate(now_us, rate);
             total = total.saturating_add(rate);
         }
-        self.aggregate.set_rate(now_us, total.min(self.maximum_bps));
+        self.aggregate
+            .set_rate(now_us, total.min(self.aggregate_limit_bps));
     }
 
     pub fn available(&self, group: u8, wire_bytes: usize) -> bool {
@@ -602,6 +611,23 @@ impl BusinessPacer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dynamic_shared_limits_preserve_operator_caps_and_earned_credit() {
+        let mut p = BusinessPacer::new(5_000_000, [5_000_000; MAX_PATHS], 2400);
+        p.set_aggregate_limit(4_000_000);
+        p.update(1_000_000, [(0, 100_000_000), (1, 100_000_000)]);
+        assert_eq!(p.aggregate.rate, 4_000_000);
+        p.spend(0, 2000);
+        let before = p.aggregate.tokens;
+        p.set_aggregate_limit(100_000_000);
+        p.update(1_000_000, [(0, 100_000_000), (1, 100_000_000)]);
+        assert_eq!(p.aggregate.rate, 5_000_000);
+        assert_eq!(
+            p.aggregate.tokens, before,
+            "a raised ceiling creates no credit"
+        );
+    }
 
     #[test]
     fn high_rate_pacers_service_the_budget_at_a_millisecond_wakeup_cadence() {
