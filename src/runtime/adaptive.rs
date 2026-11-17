@@ -895,6 +895,7 @@ pub struct PathController {
     /// would also measure the paths that take up its share.
     shared_loss: bool,
     shared_uplink_service: bool,
+    native_startup_limit_bps: Option<u64>,
     /// Raw and compensated cumulative delivered symbol bytes in this generation.
     compensated_delivery: Option<(u64, u64)>,
     source_local_min_rtt_ms: Option<f64>,
@@ -1023,6 +1024,7 @@ impl PathController {
             loss_ceiling: None,
             shared_loss: false,
             shared_uplink_service: true,
+            native_startup_limit_bps: None,
             compensated_delivery: None,
             source_local_min_rtt_ms: None,
             source_probe_min_rtt_ms: None,
@@ -1149,6 +1151,12 @@ impl PathController {
         self
     }
 
+    /// Bound an unmeasured first flight, without limiting measured growth.
+    pub(crate) fn with_native_startup_limit(mut self, limit_bps: Option<u64>) -> Self {
+        self.native_startup_limit_bps = limit_bps.map(|rate| rate.min(self.maximum_bps));
+        self
+    }
+
     /// Queue-delay control and local record admission are independent budgets.
     pub(crate) fn with_admission_deadline(mut self, milliseconds: u64) -> Self {
         self.admission_ms = milliseconds.max(1) as f64;
@@ -1265,6 +1273,9 @@ impl PathController {
             // still gate every packet. A later observation cannot reseed it.
             let native_bps = (u128::from(cwnd_bytes) * 8_000_000 / u128::from(rtt_us))
                 .min(u128::from(self.maximum_bps)) as u64;
+            let native_bps = self
+                .native_startup_limit_bps
+                .map_or(native_bps, |limit| native_bps.min(limit));
             if native_bps > self.rate_bps {
                 let previous = self.rate_bps;
                 self.native_startup_window_bytes = Some(cwnd_bytes);
@@ -1360,6 +1371,12 @@ impl PathController {
             self.native_restart_until_us = None;
             let restart = (u128::from(window.min(cwnd_bytes)) * 8_000_000 / u128::from(rtt_us))
                 .min(u128::from(native)) as u64;
+            let restart = if measured_bps.is_none() {
+                self.native_startup_limit_bps
+                    .map_or(restart, |limit| restart.min(limit))
+            } else {
+                restart
+            };
             let restart = self
                 .loss_ceiling
                 .map_or(restart, |(ceiling, _)| restart.min(ceiling.max(MIN_BPS)));
@@ -1488,6 +1505,7 @@ impl PathController {
                 .with_queue_gated_loss(self.queue_gated_loss_enabled)
                 .with_legacy_recovery(!self.fast_recovery_enabled)
                 .with_shared_uplink_service(self.shared_uplink_service)
+                .with_native_startup_limit(self.native_startup_limit_bps)
                 .with_admission_deadline(self.admission_ms as u64);
             self.shared_loss = shared_loss;
             self.generation = Some(observation.generation);
@@ -4493,6 +4511,30 @@ mod tests {
     }
 
     #[test]
+    fn native_startup_limit_bounds_unmeasured_flights_and_survives_a_generation() {
+        let mut c =
+            PathController::new(1_000_000_000, 10).with_native_startup_limit(Some(2_000_000));
+        let mut sample = observation(0, 100.0);
+        sample.delivered_bytes = 0;
+        c.observe_native_service(&sample, 2_000_000, 100_000);
+        assert_eq!(c.rate_bps, 2_000_000);
+        assert!(c.native_startup_window_bytes.is_some());
+        sample.now_us = 100_000;
+        sample.offered_backlog = false;
+        c.observe_native_service(&sample, 2_000_000, 100_000);
+        sample.now_us += NATIVE_IDLE_RESTART_US + 1;
+        sample.offered_backlog = true;
+        sample.startup_backlog = true;
+        c.observe_native_service(&sample, 2_000_000, 100_000);
+        assert!(c.rate_bps <= 2_000_000);
+        sample.generation += 1;
+        sample.now_us += 100_000;
+        c.observe_native_service(&sample, 2_000_000, 100_000);
+        assert_eq!(c.native_startup_limit_bps, Some(2_000_000));
+        assert_eq!(c.rate_bps, 2_000_000);
+    }
+
+    #[test]
     fn control_delay_target_does_not_shorten_explicit_record_admission() {
         let mut c = PathController::new(100_000_000, 10).with_admission_deadline(20);
         c.observe(&observation(0, 100.0));
@@ -4511,7 +4553,9 @@ mod tests {
     #[test]
     fn shared_native_recovery_keeps_the_existing_qualified_growth_and_brakes() {
         let (mut c, mut sample) = native_service_fixture();
-        c = c.with_shared_uplink_service(true);
+        c = c
+            .with_shared_uplink_service(true)
+            .with_native_startup_limit(Some(2_000_000));
         c.rate_bps = 10_000_000;
         sample.delivered_bytes = 125_000;
         sample.delivered_bps = Some(10_000_000.0 / c.wire_per_symbol);

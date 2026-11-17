@@ -1770,6 +1770,9 @@ async fn sender_with_game_input(
         .with_queue_gated_loss(metrics.metrics.queue_gated_loss())
         .with_legacy_recovery(metrics.metrics.legacy_recovery())
         .with_shared_uplink_service(policy.game_mode || metrics.direction == stats::FORWARD)
+        // A small first-flight allowance avoids seeding four paths from large,
+        // unexercised native windows. Receiver-qualified growth has no such cap.
+        .with_native_startup_limit(policy.game_mode.then_some(2_000_000))
         .with_admission_deadline(policy.latency_target_ms)
     });
     let mut native_probes: [native_probe::Pause; MAX_PATHS] = Default::default();
