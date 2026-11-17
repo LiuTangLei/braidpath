@@ -704,6 +704,8 @@ pub struct ControlSample {
     pub transport_blocked: bool,
     pub offered_backlog: bool,
     pub latest_symbol_delivery_bps: Option<f64>,
+    /// Demand covered the latest delivery sample, rather than starting later.
+    pub latest_delivery_business_demand: bool,
     /// A real short report retained until the next control tick. `used` marks
     /// the evidence actually consumed by an initial pacing increase.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -971,12 +973,14 @@ pub struct PathController {
     blocked_since_us: Option<u64>,
     backlog_since_us: Option<u64>,
     demand_activity: DemandActivity,
+    business_demand: DemandActivity,
     delay_since_us: Option<u64>,
     braked_queue_ms: Option<f64>,
     last_report: Option<(u64, u64, u64)>,
     last_positive_report_us: Option<u64>,
     delivery_bps: Option<f64>,
     latest_delivery_bps: Option<f64>,
+    latest_delivery_business_demand: bool,
     service_window: service::Window,
     /// Short-lived service measured while bytes left faster than we admitted.
     draining_bps: Option<(f64, u64)>,
@@ -1081,12 +1085,14 @@ impl PathController {
             blocked_since_us: None,
             backlog_since_us: None,
             demand_activity: DemandActivity::default(),
+            business_demand: DemandActivity::default(),
             delay_since_us: None,
             braked_queue_ms: None,
             last_report: None,
             last_positive_report_us: None,
             delivery_bps: None,
             latest_delivery_bps: None,
+            latest_delivery_business_demand: false,
             service_window: service::Window::default(),
             draining_bps: None,
             drain_restore_pending: false,
@@ -1486,9 +1492,16 @@ impl PathController {
             .is_some_and(|elapsed| elapsed <= FRESH_US);
         if !observation_contiguous {
             self.demand_activity = DemandActivity::default();
+            self.business_demand = DemandActivity::default();
         }
         self.demand_activity
             .update(now, observation.offered_backlog);
+        if observation.offered_backlog && (observation.bulk_backlog || observation.startup_backlog)
+        {
+            self.business_demand.update(now, true);
+        } else {
+            self.business_demand = DemandActivity::default();
+        }
         if observation.offered_backlog {
             if now
                 .checked_sub(self.last_control.at_us)
@@ -1621,6 +1634,21 @@ impl PathController {
                         _ => {}
                     }
                 }
+                // Bind demand to this report's interval when the report is
+                // consumed. A later TLS enqueue cannot qualify old ACK service.
+                // Local report arrivals can be compressed, so cover the longer
+                // of their spacing and the receiver's reported sample duration.
+                self.latest_delivery_business_demand = previous_report.is_some_and(|(_, _, at)| {
+                    now.checked_sub(observation.delivery_sample_span_us)
+                        .is_some_and(|started| {
+                            let started = started.min(at);
+                            started < now
+                                && self
+                                    .business_demand
+                                    .since_us
+                                    .is_some_and(|since| since <= started)
+                        })
+                });
                 self.latest_delivery_bps = Some(rate);
                 self.delivery_bps =
                     Some(self.delivery_bps.map_or(rate, |old| old * 0.5 + rate * 0.5));
@@ -2156,6 +2184,7 @@ impl PathController {
             transport_blocked: observation.transport_blocked,
             offered_backlog: observation.offered_backlog,
             latest_symbol_delivery_bps: self.latest_delivery_bps,
+            latest_delivery_business_demand: self.latest_delivery_business_demand,
             initial_delivery_credit: None,
             service_symbol_delivery_bps: service_sample.map(|sample| sample.bps),
             service_sample_span_us: service_sample.map(|sample| sample.span_us),
@@ -2687,7 +2716,12 @@ impl PathController {
                 // ACK/status traffic may still trigger a queue brake, but its
                 // application-limited service cannot size a later bulk flight.
                 // Keep any ceiling already measured under real data demand.
-                if self.congestion_seen && (observation.bulk_backlog || observation.startup_backlog)
+                if self.congestion_seen
+                    && (observation.bulk_backlog || observation.startup_backlog)
+                    && self.latest_delivery_business_demand
+                    && self.last_report.is_some_and(|(_, _, at)| {
+                        now.checked_sub(at).is_some_and(|age| age <= CONTROL_US)
+                    })
                 {
                     let delivered = self
                         .latest_delivery_bps
@@ -4972,6 +5006,70 @@ mod tests {
             assert!(controller.rate_bps < before);
             assert!(controller.last_brake_us.is_some());
             assert_eq!(controller.congestion_delivery_bps, measured);
+        }
+    }
+
+    #[test]
+    fn ack_status_delivery_cannot_measure_capacity_when_tls_first_queues() {
+        for measured in [None, Some(1_000_000.0), Some(8_000_000.0)] {
+            let (mut controller, mut sample) = native_service_fixture();
+            controller.congestion_delivery_bps = measured;
+            sample.bulk_backlog = false;
+            sample.startup_backlog = false;
+            controller.observe_native_service(&sample, 200_000, 50_000);
+            let before = controller.rate_bps;
+            for now in [200_000, 300_000, 400_000] {
+                let admitted = exercise_budget(&mut controller, sample.now_us, now - sample.now_us);
+                sample.now_us = now;
+                sample.report_number += 1;
+                sample.delivered_bytes += admitted;
+                sample.delivered_bps = Some(admitted as f64 * 80.0);
+                sample.delivery_report_time_us = Some(now);
+                sample.rtt_ms = 150.0;
+                sample.probe_rtt_ms = Some(150.0);
+                sample.probe_latest_rtt_ms = Some(150.0);
+                sample.probe_sample_id += 1;
+                // This report still describes ACK/status service. The first
+                // TLS record has only just entered the sender queue.
+                sample.startup_backlog = now == 300_000;
+                controller.observe_native_service(&sample, 2_000_000, 150_000);
+            }
+            assert!(controller.rate_bps < before);
+            assert!(controller.last_brake_us.is_some());
+            assert_eq!(controller.congestion_delivery_bps, measured);
+        }
+    }
+
+    #[test]
+    fn delivery_capacity_qualification_cannot_bridge_ack_only_or_missing_observations() {
+        for boundary in ["ack_only", "gap", "compressed", "regressed", "generation"] {
+            let (mut controller, mut sample) = native_service_fixture();
+            controller.observe_native_service(&sample, 200_000, 50_000);
+            assert!(controller.latest_delivery_business_demand);
+            // A new TLS record follows either an observed control-only period,
+            // an unknown gap, or a report whose interval predates its demand.
+            sample.now_us = 150_000;
+            sample.bulk_backlog = boundary == "compressed";
+            controller.observe_native_service(&sample, 200_000, 50_000);
+            assert_eq!(controller.last_report.unwrap().0, sample.report_number);
+            sample.now_us = match boundary {
+                "gap" => 150_000 + FRESH_US + 1,
+                "regressed" => 50_000,
+                _ => 175_000,
+            };
+            sample.startup_backlog = true;
+            sample.report_number += 1;
+            sample.delivery_report_time_us = Some(sample.now_us);
+            sample.delivery_sample_span_us = if boundary == "compressed" {
+                500_000
+            } else {
+                50_000
+            };
+            if boundary == "generation" {
+                sample.generation += 1;
+            }
+            controller.observe_native_service(&sample, 200_000, 50_000);
+            assert!(!controller.latest_delivery_business_demand, "{boundary}");
         }
     }
 
@@ -12235,6 +12333,7 @@ mod tests {
     #[test]
     fn a_congested_brake_records_the_delivery_it_could_not_exceed() {
         let (mut controller, mut sample) = paired_loss_service_fixture();
+        controller.business_demand = controller.demand_activity.clone();
         sample.bulk_backlog = true;
         sample.delivered_bytes = 3_500_000;
         sample.delivered_bps = Some(7_800_000.0);

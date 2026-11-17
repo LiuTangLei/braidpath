@@ -56,6 +56,11 @@ while the application reader was blocked. Application DATAGRAM read gaps include
 idle time; interpret them alongside admission waits and frame arrivals. These
 wall-time observations leave the receive budgets and record order unchanged.
 
+`last_control.latest_delivery_business_demand` records demand provenance when
+that delivery report is consumed. Newly queued data cannot qualify a preceding
+ACK/status-only interval as bulk capacity. Safety brakes still apply without
+this qualification, and previously measured capacity is retained.
+
 ## Connection and admission diagnostics
 
 Each path records the current `peer_socket`. Clients additionally record
