@@ -1771,6 +1771,7 @@ async fn sender_with_game_input(
         .with_legacy_recovery(metrics.metrics.legacy_recovery())
         .with_shared_uplink_service(policy.game_mode || metrics.direction == stats::FORWARD)
         .with_measured_native_startup(policy.game_mode)
+        .with_admission_deadline(policy.latency_target_ms)
     });
     let mut native_probes: [native_probe::Pause; MAX_PATHS] = Default::default();
     let mut logged_rate_changes = [0u64; MAX_PATHS];

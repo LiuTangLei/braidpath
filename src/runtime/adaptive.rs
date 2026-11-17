@@ -904,6 +904,7 @@ pub struct PathController {
     rtt_source_baseline_corrections: u64,
     maximum_bps: u64,
     target_ms: f64,
+    admission_ms: f64,
     generation: Option<u64>,
     born_us: u64,
     rate_bps: u64,
@@ -1030,6 +1031,7 @@ impl PathController {
             source_probe_sample_id: None,
             rtt_source_baseline_corrections: 0,
             target_ms: latency_target_ms.max(1) as f64,
+            admission_ms: latency_target_ms.max(1) as f64,
             generation: None,
             born_us: 0,
             rate_bps: maximum_bps.min(START_BPS),
@@ -1152,6 +1154,12 @@ impl PathController {
     /// A latency-first session learns service before reusing a native window.
     pub(crate) fn with_measured_native_startup(mut self, enabled: bool) -> Self {
         self.measured_native_startup = enabled;
+        self
+    }
+
+    /// Queue-delay control and local record admission are independent budgets.
+    pub(crate) fn with_admission_deadline(mut self, milliseconds: u64) -> Self {
+        self.admission_ms = milliseconds.max(1) as f64;
         self
     }
 
@@ -1490,7 +1498,8 @@ impl PathController {
                 .with_queue_gated_loss(self.queue_gated_loss_enabled)
                 .with_legacy_recovery(!self.fast_recovery_enabled)
                 .with_shared_uplink_service(self.shared_uplink_service)
-                .with_measured_native_startup(self.measured_native_startup);
+                .with_measured_native_startup(self.measured_native_startup)
+                .with_admission_deadline(self.admission_ms as u64);
             self.shared_loss = shared_loss;
             self.generation = Some(observation.generation);
             self.born_us = now;
@@ -3993,7 +4002,7 @@ impl PathController {
         self.eligible(now_us)
             && queue_age_ms.is_finite()
             && queue_age_ms >= 0.0
-            && queue_age_ms <= self.target_ms
+            && queue_age_ms <= self.admission_ms
             && self.tokens >= bytes as f64
     }
 
@@ -4518,6 +4527,22 @@ mod tests {
         c.observe_native_service(&sample, 2_000_000, 100_000);
         assert!(c.measured_native_startup);
         assert_eq!(c.rate_bps, START_BPS);
+    }
+
+    #[test]
+    fn control_delay_target_does_not_shorten_explicit_record_admission() {
+        let mut c = PathController::new(100_000_000, 10).with_admission_deadline(20);
+        c.observe(&observation(0, 100.0));
+        assert!(c.allow(100_000, 1000, 15.0));
+        assert!(!c.allow(100_000, 1000, 21.0));
+        assert_eq!(c.target_ms, 10.0);
+        let mut next = observation(200_000, 100.0);
+        next.generation += 1;
+        c.observe(&next);
+        assert_eq!(c.admission_ms, 20.0);
+        let mut ordinary = PathController::new(100_000_000, 10);
+        ordinary.observe(&observation(0, 100.0));
+        assert!(!ordinary.allow(100_000, 1000, 15.0));
     }
 
     #[test]
