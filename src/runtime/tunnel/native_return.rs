@@ -159,11 +159,12 @@ pub(super) async fn write(
 /// Native ingress gets its own process-wide byte budget before entering a
 /// session queue; TCP receive credit then owns the retained/reordered bytes.
 pub(super) struct Incoming {
+    pub path: u8,
     pub record: Record,
     _credit: OwnedSemaphorePermit,
 }
 impl Incoming {
-    pub async fn new(record: Record) -> Result<Self> {
+    pub async fn new(record: Record, path: u8) -> Result<Self> {
         static BUDGET: OnceLock<Arc<Semaphore>> = OnceLock::new();
         let budget = BUDGET.get_or_init(|| Arc::new(Semaphore::new(32 * 1024 * 1024)));
         let credit = budget
@@ -171,6 +172,7 @@ impl Incoming {
             .acquire_many_owned(record.payload.len() as u32)
             .await?;
         Ok(Self {
+            path,
             record,
             _credit: credit,
         })

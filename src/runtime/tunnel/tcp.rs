@@ -435,6 +435,7 @@ struct Stream {
     status_header: Vec<u8>,
     send: stream::Sender,
     recv: stream::Receiver,
+    receive_profile: Option<super::profile::Receive>,
     range_slots: Vec<OwnedSemaphorePermit>,
     delivery_blocked_since: Option<Instant>,
     reads: Option<Arc<Semaphore>>,
@@ -454,7 +455,7 @@ struct Stream {
     refused: bool,
 }
 impl Stream {
-    fn new(open: bool, lease: Arc<Lease>) -> Self {
+    fn new(open: bool, lease: Arc<Lease>, id: u32) -> Self {
         Self {
             lease,
             cancel: None,
@@ -463,6 +464,7 @@ impl Stream {
             status_header: Vec::new(),
             send: stream::Sender::new(open),
             recv: stream::Receiver::default(),
+            receive_profile: super::profile::Receive::new(id),
             range_slots: Vec::new(),
             delivery_blocked_since: None,
             reads: None,
@@ -795,7 +797,7 @@ impl Mux {
         true
     }
     fn open_lease(&mut self, id: u32, open: bool, lease: Arc<Lease>) {
-        self.streams.insert(id, Stream::new(open, lease));
+        self.streams.insert(id, Stream::new(open, lease, id));
         self.turns.push_back(id);
         self.stats.opened += 1;
     }
@@ -990,6 +992,14 @@ impl Mux {
                 if let Some(s) = self.streams.get_mut(&id) {
                     self.stats.bytes_to_application += n as u64;
                     s.recv.consumed(n as u64, window);
+                    if let Some(profile) = s.receive_profile.as_mut() {
+                        profile.observe(
+                            Instant::now(),
+                            s.recv.receive_diagnostics(),
+                            s.recv.finished(),
+                            None,
+                        );
+                    }
                     s.lease.release_rx(n);
                 }
             }
@@ -1353,6 +1363,10 @@ impl Mux {
 
     /// Apply one stream record. Call `flush` after a batch of records.
     pub(super) fn receive(&mut self, record: Record) {
+        self.receive_from(record, u8::MAX);
+    }
+
+    pub(super) fn receive_from(&mut self, record: Record, path: u8) {
         // Admission metadata must arrive before an ACK samples the segment.
         self.admissions();
         if associate::is_flow(record.flow) {
@@ -1410,8 +1424,17 @@ impl Mux {
                 let Some(credit) = s.lease.rx.try_take(additional, progress) else {
                     return;
                 };
+                let arrival_bytes = data.len();
                 match s.recv.on_data(offset, fin, data, now) {
                     Ok(ready) => {
+                        if let Some(profile) = s.receive_profile.as_mut() {
+                            profile.observe(
+                                now,
+                                s.recv.receive_diagnostics(),
+                                s.recv.finished(),
+                                Some((path, arrival_bytes)),
+                            );
+                        }
                         if let Some(slot) = range_slot {
                             s.range_slots.push(slot);
                         }
@@ -1661,7 +1684,15 @@ impl Mux {
         self.stats.pending_io_events = self.events.len() as u64;
         self.stats.local_sender_queued_bytes = self.gauge.queued() as u64;
         let mut gauges = [0u64; 5];
-        for stream in self.streams.values() {
+        for stream in self.streams.values_mut() {
+            if let Some(profile) = stream.receive_profile.as_mut() {
+                profile.observe(
+                    now,
+                    stream.recv.receive_diagnostics(),
+                    stream.recv.finished(),
+                    None,
+                );
+            }
             let (retained, unsent, blocked) = stream.send.pending_data();
             gauges[0] += retained;
             gauges[1] += unsent;

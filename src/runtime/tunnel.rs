@@ -5186,14 +5186,14 @@ async fn client_session(
                 } else {forward.update(|d|{d.records.ingress_queue_enqueued+=1;});}
             },
             incoming=native_rx.recv(),if options.policy.native_return=>{
-                if let Some(incoming)=incoming && let Some(mux)=streams.as_mut() { mux.receive(incoming.record); }
+                if let Some(incoming)=incoming && let Some(mux)=streams.as_mut() { mux.receive_from(incoming.record, incoming.path); }
             },
             data=wire_rx.recv()=>{
                 let Some((pid,data))=data else {bail!("all receivers ended")};
                 let records=receive_records(&mut decoder,&returning,pid,&data,streams.as_ref());
                 let decoded=Instant::now();
                 for record in records {
-                    if let Some(mux)=streams.as_mut() && (stream::stream_id(record.flow).is_some() || associate::is_flow(record.flow)) {mux.receive(record);continue}
+                    if let Some(mux)=streams.as_mut() && (stream::stream_id(record.flow).is_some() || associate::is_flow(record.flow)) {mux.receive_from(record,pid);continue}
                     let Some((record, decoded)) = messages.receive(record, decoded) else {publish_messages(&mut messages, &returning);continue;};
                     publish_messages(&mut messages, &returning);
                     if let Some(mux)=streams.as_mut() && associate::is_flow(record.flow) {mux.receive(record);continue}
@@ -5302,7 +5302,7 @@ async fn drive_client_path(
                             ensure!(native_return,"unexpected reliable response data");
                             while let Some(record)=native_decoder.next(&mut body)? {
                                 if let Some(reader)=native_reader.as_mut(){reader.record();}
-                                let incoming=profile::native_admission(native_reader.as_mut(),profile::NativeAdmission::Budget,||conn.stats().frame_rx.datagram,native_return::Incoming::new(record)).await?;
+                                let incoming=profile::native_admission(native_reader.as_mut(),profile::NativeAdmission::Budget,||conn.stats().frame_rx.datagram,native_return::Incoming::new(record,pid)).await?;
                                 tokio::select! { sent=profile::native_admission(native_reader.as_mut(),profile::NativeAdmission::Channel,||conn.stats().frame_rx.datagram,native_tx.send(incoming))=>sent.context("native stream receiver closed")?, _=conn.closed()=>return Ok(()) }
                             }
                         },

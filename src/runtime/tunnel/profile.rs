@@ -140,6 +140,132 @@ impl Drop for Writer {
     }
 }
 
+/// Exclusive receive states. Holes count only with no contiguous data
+/// awaiting the local writer. These timings do not identify source starvation.
+#[derive(Default, Serialize)]
+struct ReceiveCounters {
+    received_bytes: u64,
+    written_bytes: u64,
+    gap_wait_us: u64,
+    local_ready_us: u64,
+    awaiting_data_us: u64,
+    out_of_order_peak_bytes: u64,
+    gap_progress: u64,
+    gap_progress_wait_max_us: u64,
+    gap_progress_by_path: [u64; 8],
+    gap_wait_by_closing_path_us: [u64; 8],
+    received_by_path_bytes: [u64; 8],
+}
+
+pub(super) struct Receive {
+    counters: ReceiveCounters,
+    stream: u32,
+    last: Option<Instant>,
+    last_report: Instant,
+    state: (u64, u64, u64, bool),
+    gap_since: Option<Instant>,
+}
+impl Receive {
+    pub fn new(stream: u32) -> Option<Self> {
+        enabled().then(|| Self::at(stream, Instant::now()))
+    }
+    fn at(stream: u32, now: Instant) -> Self {
+        Self {
+            counters: ReceiveCounters::default(),
+            stream,
+            last: None,
+            last_report: now,
+            state: (0, 0, 0, false),
+            gap_since: None,
+        }
+    }
+    fn accrue(&mut self, now: Instant) {
+        if let Some(last) = self.last {
+            let elapsed = us(now.saturating_duration_since(last));
+            let (cumulative, consumed, ooo, finished) = self.state;
+            if !finished {
+                if cumulative > consumed {
+                    self.counters.local_ready_us += elapsed;
+                } else if ooo > 0 {
+                    self.counters.gap_wait_us += elapsed;
+                } else {
+                    self.counters.awaiting_data_us += elapsed;
+                }
+            }
+        }
+        self.last = Some(now);
+    }
+    pub fn observe(
+        &mut self,
+        now: Instant,
+        receive: (u64, u64, u64, usize),
+        finished: bool,
+        arrival: Option<(u8, usize)>,
+    ) {
+        self.accrue(now);
+        let (cumulative, consumed, ooo, _) = receive;
+        if let Some((path, bytes)) = arrival {
+            self.counters.received_bytes += bytes as u64;
+            if let Some(total) = self
+                .counters
+                .received_by_path_bytes
+                .get_mut(usize::from(path))
+            {
+                *total += bytes as u64;
+            }
+            if cumulative > self.state.0
+                && let Some(since) = self.gap_since.take()
+            {
+                let wait = us(now.saturating_duration_since(since));
+                self.counters.gap_progress += 1;
+                self.counters.gap_progress_wait_max_us =
+                    self.counters.gap_progress_wait_max_us.max(wait);
+                if let Some(total) = self
+                    .counters
+                    .gap_progress_by_path
+                    .get_mut(usize::from(path))
+                {
+                    *total += 1;
+                }
+                if let Some(total) = self
+                    .counters
+                    .gap_wait_by_closing_path_us
+                    .get_mut(usize::from(path))
+                {
+                    *total += wait;
+                }
+            }
+        }
+        self.counters.written_bytes = consumed;
+        self.counters.out_of_order_peak_bytes = self.counters.out_of_order_peak_bytes.max(ooo);
+        if cumulative == consumed && ooo > 0 {
+            self.gap_since.get_or_insert(now);
+        } else {
+            self.gap_since = None;
+        }
+        self.state = (cumulative, consumed, ooo, finished);
+        if now.saturating_duration_since(self.last_report) >= Duration::from_secs(1) {
+            self.report(false);
+            self.last_report = now;
+        }
+    }
+    fn report(&self, final_report: bool) {
+        if self.counters.received_bytes == 0 {
+            return;
+        }
+        if let Ok(json) = serde_json::to_string(&self.counters) {
+            tracing::info!(target: "braidpath::pipeline_profile", role="stream_receive", stream=self.stream,
+                cumulative=self.state.0, consumed=self.state.1, out_of_order=self.state.2,
+                finished=self.state.3, final_report, counters=%json, "stream receive timing profile");
+        }
+    }
+}
+impl Drop for Receive {
+    fn drop(&mut self) {
+        self.report(true);
+    }
+}
+
 #[derive(Clone, Copy)]
 pub(super) enum NativeAdmission {
     Budget,
@@ -391,6 +517,30 @@ mod tests {
         assert_eq!(reader.counters.budget_wait_us, 10_000);
         assert_eq!(reader.counters.datagram_read_gap_max_us, 200_000);
         assert_eq!(reader.counters.datagram_read_gap_after_wait_max_us, 100_000);
+    }
+
+    #[test]
+    fn receive_waits_separate_holes_local_delivery_and_no_data() {
+        let now = Instant::now();
+        let mut p = Receive::at(1, now);
+        let t = |ms| now + Duration::from_millis(ms);
+        p.observe(t(0), (0, 0, 100, 1), false, Some((2, 100)));
+        p.observe(t(10), (200, 0, 0, 0), false, Some((1, 100)));
+        p.observe(t(30), (200, 200, 0, 0), false, None);
+        p.observe(t(60), (200, 200, 100, 1), false, Some((3, 100)));
+        p.observe(t(80), (200, 200, 100, 1), false, None);
+        p.observe(t(90), (400, 200, 0, 0), false, Some((0, 100)));
+        p.observe(t(100), (400, 400, 0, 0), true, None);
+        p.observe(t(500), (400, 400, 0, 0), true, None);
+        assert_eq!(p.counters.gap_wait_us, 40_000);
+        assert_eq!(p.counters.local_ready_us, 30_000);
+        assert_eq!(p.counters.awaiting_data_us, 30_000);
+        assert_eq!(p.counters.gap_progress_by_path, [1, 1, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(p.counters.gap_wait_by_closing_path_us[0], 30_000);
+        assert_eq!(p.counters.gap_progress_wait_max_us, 30_000);
+        assert_eq!(p.counters.out_of_order_peak_bytes, 100);
+        assert_eq!(p.counters.received_bytes, 400);
+        assert_eq!(p.counters.written_bytes, 400);
     }
 
     #[test]

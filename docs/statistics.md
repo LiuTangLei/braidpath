@@ -577,3 +577,11 @@ They never include arbitrary peer-provided close text, payloads, or credentials.
 Endpoint addresses and session identifiers are private operational data: retain
 them in access-controlled local logs. This target adds observations without new
 probes, retry policies, timers, or routing decisions.
+
+With `BRAIDPATH_PIPELINE_PROFILE`, `role=stream_receive` records per-stream
+exclusive wall durations: contiguous data awaiting local consumption, an empty
+contiguous queue with retained out-of-order bytes, or neither. It also records
+which arrival path advanced a stalled cumulative offset. These are receive-side
+observations, not proof of sender starvation or of a throughput improvement.
+Snapshots share the existing status timer; completed receive halves stop
+accumulating time. No payloads or destinations are logged.
