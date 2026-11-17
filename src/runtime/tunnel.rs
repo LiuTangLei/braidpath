@@ -1897,7 +1897,11 @@ async fn sender_with_game_input(
     let mut input_open = true;
     let mut prefer_game_input = true;
     let mut normal_input_due = false;
+    let mut yield_after_drain = false;
     loop {
+        if std::mem::take(&mut yield_after_drain) {
+            tokio::task::yield_now().await;
+        }
         #[cfg(test)]
         if metrics.session == "game-priority-order" {
             // Force the timer to remain ready; this is input fairness coverage.
@@ -2896,7 +2900,22 @@ async fn sender_with_game_input(
         let mut stalled_repairs = Vec::new();
         let mut repair_wait: Option<PreparedSend> = None;
         let mut next_wait = None;
+        let game_slice_end = policy
+            .game_mode
+            .then(|| Instant::now() + Duration::from_millis(1));
+        let mut drain_attempted = false;
         'drain: loop {
+            if drain_attempted
+                && game_slice_end.is_some_and(|end| {
+                    Instant::now() >= end || game_input.as_ref().is_some_and(|rx| !rx.is_empty())
+                })
+            {
+                // A single drain can otherwise hold paths and run for longer
+                // than an entire Game deadline while bulk remains writable.
+                yield_after_drain = true;
+                break;
+            }
+            drain_attempted = true;
             if deferred_input
                 .as_ref()
                 .is_some_and(|input| !queue.would_be_full(policy.flow(input.record.flow)))
