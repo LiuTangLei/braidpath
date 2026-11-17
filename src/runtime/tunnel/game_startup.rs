@@ -87,9 +87,13 @@ impl Budget {
             } else {
                 u128::from(self.rate_bps) * 3 / 4
             };
+            // A delayed/small feedback interval must not collapse a busy
+            // sender to an ACK-only rate. Successive loss intervals can drain
+            // further; native/path brakes independently remain authoritative.
+            let bounded = drain.max(u128::from(self.rate_bps) * 3 / 4);
             self.rate_bps = self
                 .rate_bps
-                .min(drain.clamp(1, u128::from(u64::MAX)) as u64);
+                .min(bounded.clamp(1, u128::from(u64::MAX)) as u64);
             self.grow_after_us = now_us.saturating_add(IDLE_US);
         } else if now_us >= self.grow_after_us {
             let trial = (measured * 5 / 4).min(u128::from(self.rate_bps) * 5 / 4);

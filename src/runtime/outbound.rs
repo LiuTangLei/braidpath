@@ -547,6 +547,16 @@ impl BusinessPacer {
         }
     }
 
+    /// Retain enough elapsed-time credit for one fragmented application packet.
+    /// Raising the storage bound does not refill any bucket.
+    pub(crate) fn with_minimum_burst(mut self, bytes: usize) -> Self {
+        for bucket in std::iter::once(&mut self.aggregate).chain(self.groups.iter_mut()) {
+            bucket.minimum_burst = bytes;
+            bucket.burst = pacing_burst_bytes(bucket.rate, bytes);
+        }
+        self
+    }
+
     /// Apply a shared allowance at the next update, within the operator ceiling.
     /// Updating path budgets still settles elapsed old-rate credit first.
     pub(crate) fn set_aggregate_limit(&mut self, rate_bps: u64) {
@@ -627,6 +637,18 @@ mod tests {
             p.aggregate.tokens, before,
             "a raised ceiling creates no credit"
         );
+    }
+
+    #[test]
+    fn packet_burst_storage_needs_elapsed_earned_credit() {
+        let mut p =
+            BusinessPacer::new(4_000_000, [4_000_000; MAX_PATHS], 2400).with_minimum_burst(7200);
+        p.update(0, [(0, 4_000_000)]);
+        assert!(!p.available(0, 6000));
+        p.update(12_000, [(0, 4_000_000)]);
+        assert!(p.available(0, 7200));
+        p.spend(0, 7200);
+        assert!(!p.available(0, 1));
     }
 
     #[test]

@@ -9,10 +9,19 @@ impl<T> Drop for Task<T> {
     }
 }
 pub(crate) fn address() -> SocketAddr {
-    std::net::UdpSocket::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
+    // Keep future listeners outside the ephemeral range used by the same
+    // process's connecting clients. Dropping bind(:0) let a client claim a
+    // selected relay address before that relay had started.
+    static NEXT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(24000);
+    loop {
+        let port = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        assert!(port < 32000, "mesh fixture port range exhausted");
+        match std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, port)) {
+            Ok(socket) => return socket.local_addr().unwrap(),
+            Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => continue,
+            Err(error) => panic!("mesh fixture port: {error}"),
+        }
+    }
 }
 
 #[tokio::test]

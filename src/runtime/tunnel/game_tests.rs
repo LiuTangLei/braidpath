@@ -71,27 +71,27 @@ fn game_originals_and_copies_use_reserved_credit_without_increasing_operator_lim
     game.flow = Some(associate::FLAG | 1);
     game.game_datagram = true;
     let reserve = game_pacing_reserve(&p, &tcp, false, 1180);
-    assert_eq!(reserve, 1200);
+    assert_eq!(reserve, 6000);
     assert_eq!(game_pacing_reserve(&p, &game, false, 1180), 0);
     game.record_id = None;
     game.flow = None;
     assert_eq!(game_pacing_reserve(&p, &game, true, 300), 0);
-    assert_eq!(game_pacing_reserve(&p, &game, true, 1180), 1200);
+    assert_eq!(game_pacing_reserve(&p, &game, true, 1180), 6000);
     for cost in [100, 1180, 1400, 2400] {
         assert!(
-            cost + game_pacing_reserve(&p, &tcp, false, cost) <= 2400,
+            cost + game_pacing_reserve(&p, &tcp, false, cost) <= GAME_BURST_BYTES,
             "a minimum-size sender bucket must retain TCP progress"
         );
     }
-    let mut pacer = outbound::Pacer::for_sender(7_000_000, 2400);
+    let mut pacer = outbound::Pacer::for_sender(7_000_000, GAME_BURST_BYTES);
     pacer.refill(1_000_000);
     assert!(pacer.available(1180 + reserve));
     pacer.spend(1180);
     assert!(
-        pacer.available(1180),
-        "one game original can use the held credit"
+        pacer.available(6000),
+        "all original fragments can use the held credit"
     );
-    pacer.spend(1180);
+    pacer.spend(6000);
     assert!(
         !pacer.available(1180),
         "priority never creates new operator credit"
