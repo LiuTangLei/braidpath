@@ -1836,6 +1836,7 @@ async fn sender_with_game_input(
     let mut native_cursor = 0;
     let mut mixed_writes =
         (native_returning && policy.game_mode).then(native_return::MixedWrites::default);
+    let native_writable = mixed_writes.as_ref().map(|writes| writes.ready.clone());
     let mut blocks = BTreeMap::<u64, BlockSend>::new();
     let mut budget = outbound::RepairBudget::new(policy.redundancy);
     if policy.fec == automatic_fec::AUTO {
@@ -1969,6 +1970,8 @@ async fn sender_with_game_input(
                 _=stop.changed()=>SenderEvent::Stop,
                 _=async { observation_notify.as_ref().expect("adaptive observation notify").notified().await },
                     if policy.adaptive && observation_notify.is_some()=>SenderEvent::Evidence,
+                _=async { native_writable.as_ref().expect("native writer notification").notified().await },
+                    if native_writable.is_some()=>SenderEvent::Tick,
                 _=tick.tick()=>SenderEvent::Tick,
                 ready=poll_fn(|cx| {
                     let Some(wait) = waiting.as_mut() else {

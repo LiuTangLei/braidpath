@@ -13,7 +13,7 @@ use std::{
     },
     time::Instant,
 };
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc};
 
 /// Addressed UDP is latency traffic even when its message needs fragments.
 /// This affects only the native download return session's path ordering.
@@ -236,6 +236,7 @@ type Refunds = [AtomicUsize; super::MAX_PATHS];
 
 struct Reservation {
     refunds: Arc<Refunds>,
+    ready: Arc<Notify>,
     group: usize,
     cost: usize,
 }
@@ -244,6 +245,7 @@ impl Drop for Reservation {
         if self.cost != 0 {
             self.refunds[self.group].fetch_add(self.cost, Ordering::Relaxed);
         }
+        self.ready.notify_one();
     }
 }
 
@@ -370,6 +372,7 @@ pub(super) const MIXED_SEND_WINDOW: u64 = 1024 * 1024;
 pub(super) struct MixedWrites {
     partial: [Option<(usize, Bytes)>; super::MAX_PATHS],
     refunds: Arc<Refunds>,
+    pub ready: Arc<Notify>,
 }
 
 impl MixedWrites {
@@ -464,6 +467,7 @@ impl MixedWrites {
                 last,
                 reservation: Some(Reservation {
                     refunds: self.refunds.clone(),
+                    ready: self.ready.clone(),
                     group,
                     cost,
                 }),
@@ -494,7 +498,7 @@ pub(super) async fn write(
             biased;
             _ = conn.closed() => break,
             result = async {
-                if let Some(mut reservation) = part.reservation.take() {
+                if let Some(reservation) = part.reservation.as_mut() {
                     // Once write starts, a failing H3 operation may have
                     // submitted a prefix. Charge the grant conservatively.
                     reservation.cost = 0;
