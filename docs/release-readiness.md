@@ -1,29 +1,59 @@
 # Release readiness
 
-Correctness checks and field performance gates are separate. A release candidate
-must identify the exact tested source, complete the CI matrix, and retain failed
-or incomplete measurements. One successful paired measurement does not establish
-capacity, fairness or latency across networks.
+## Candidate status
 
-The forward shared-bottleneck guard waits for post-cut finalized sequence ranges,
-not just a timer. It probes slowly at and above its last overrun rate. Its
-send-rate/loss estimate is a heuristic; feedback gaps, rate changes and competition
-still require measured validation. `forward_guard.settling` exposes the wait.
+**0.7.0-rc.1 is an unpublished integration candidate.** Native download and Game
+precursor builds have their own validation records. Those records do not
+constitute acceptance of the combined, cleaned source or a general performance
+limit. Freeze the final source revision and configuration before release tests.
 
-Known limits to carry into prerelease notes until separately verified:
+## Required integration gates
 
-- Aggregate throughput depends on usable path capacity and endpoint processing.
-  More paths do not guarantee proportional gains. CPU profiling is required to
-  distinguish endpoint limits from path scheduling or pacing.
-- Unequal RTT and independent delay variation can leave relay paths underused.
-  The severe independent-jitter regression remains an acceptance gate until a
-  bounded comparison passes; ordinary low-loss results do not close that gate.
-- An endpoint or relay requests an 8 MiB UDP receive buffer. Linux can cap this
-  at `net.core.rmem_max`; the runtime warns on a reduced grant. Operators should
-  inspect the granted socket buffer and UDP `RcvbufErrors` before choosing an
-  approved host-level change. This software does not change system-wide limits.
-- Sparse samples and short downloads make tail quantiles unstable. Report sample
-  counts, unconditional failures, maximum latency and complete-file goodput.
+1. **Source and contract:** build both endpoint roles from the same candidate;
+   update version metadata, current CLI guidance and feedback-format contracts.
+   Removed recovery modes and compatibility aliases must have no runtime callers.
+2. **Correctness:** pass the existing CI jobs for Rust on Linux, macOS and
+   Windows, Rust 1.88 MSRV, benchmark helpers and platform installers. Preserve
+   byte integrity, bounded resource use, half-close, cancellation and path
+   generation isolation.
+3. **Selected operating policy:** perform one bounded fixed-endpoint acceptance
+   for the final configuration. Download requires complete-file goodput and
+   responsive DATAGRAM/control service during native receive pressure. Game
+   requires full-population delivery and tail latency with competing TCP,
+   short-upload completion and idle restart. Missing or incomplete transfers are
+   failures, not omitted samples. Compare explicit limits with automatic settings
+   separately from code changes.
+4. **Artifacts:** build and smoke-check all 11 release targets through the
+   existing release workflow. Validate binary identity and the complete
+   `SHA256SUMS` bundle; the tag must match the Cargo package version.
+5. **Promotion:** review the exact candidate results and remaining limitations.
+   The existing tag workflow creates a draft release. A draft or successful build
+   is not a published release or deployment receipt.
 
-Private host details, run records, measurements and analyses belong in ignored
-`local/`. Publishing a tag or merging a candidate is a separate release action.
+The scope is integration and release acceptance. Do not rerun completed precursor
+workloads to seek a better result or introduce unrelated optimization work.
+
+## Operating boundaries
+
+- Aggregate goodput depends on usable path capacity, shared bottlenecks and
+  endpoint processing. Entrance count does not demonstrate independent capacity.
+- Short transfers and sparse UDP samples cannot establish steady-state
+  throughput or rare-tail behavior. Report population size, unconditional
+  failures, completion time and complete-file goodput.
+- Game's local UDP deadline is checked through writer and Quinn admission.
+  It cannot recall data already accepted by Quinn or the kernel, and does not
+  bound propagation or application round-trip time.
+- Game automatic startup still needs short-upload acceptance. Idle UDP results
+  do not establish performance while upload and download compete.
+- Unequal RTT, independent jitter, partial path replacement and shared-bottleneck
+  competition remain material operating conditions. Retain unresolved
+  regressions and avoid claims beyond the exercised conditions.
+- Native return and DATAGRAM carry different byte populations. Distinguish
+  writer handoff, native transport acceptance, peer receipt and application
+  delivery when interpreting counters.
+- Socket buffer requests remain subject to operating-system limits. The runtime
+  reports reduced grants; it does not change host-wide network configuration.
+
+Private hosts, credentials, run records and result analyses belong in ignored
+`local/`. Keep timestamp instants and negative results intact. Public notes
+describe mechanisms, supported contracts and verified release status.

@@ -1,18 +1,18 @@
 # Server-only ACK-frequency requests
 
-The server exposes `--ack-request unchanged|every-two|every-eight`. The runtime
-default is `every-eight`, and the client makes the same request of the server
-unless `--legacy-recovery` is set (see "Reverse load on an asymmetric uplink" in
-[runtime](runtime.md)). The library entry points keep `unchanged`. No policy is
-activated by traffic, a remembered path score, or a benchmark result.
+The server exposes `--ack-request unchanged|every-two|every-eight`. A proxy or
+aggregate stream-proxy server promotes an unchanged request to `every-eight`;
+UDP-only servers retain the explicitly selected policy. Aggregate clients request
+`every-eight`. Direct transport constructors keep `unchanged`. These are explicit
+runtime choices, not activation by traffic, a remembered score or a benchmark.
 
 The two experimental modes ask a supporting peer to acknowledge by the second
 or eighth ack-eliciting packet. They use the same requested maximum delay of
 10 ms and the same reordering threshold of two. The only difference in their
 request tuple is the ack-eliciting threshold (one versus seven).
 
-The server flag configures the server transport; the client's request follows
-its own `--legacy-recovery` choice. Real authenticated HTTP/3 regressions check
+The server flag configures the server transport; the aggregate client's request
+is set by its current transport policy. Real authenticated HTTP/3 regressions check
 received payloads, extension negotiation, and the unchanged mode's absence of
 negotiation.
 

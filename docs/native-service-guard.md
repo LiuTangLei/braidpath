@@ -9,7 +9,7 @@ The peer cannot enable this local option through session negotiation.
 Reliable aggregate TCP sessions use the same bounded allowance renewal internally,
 including automatic FEC, without a new command-line option. The fresh-feedback,
 delay, loss, post-brake and native-window safeguards below still apply. Plain UDP
-defaults and `--legacy-recovery` retain their prior behavior. See
+uses this mechanism only when the local option is enabled. See
 [reliable streams](reliable-streams.md) for native RTT-probe handling and current
 experimental acceptance status.
 

@@ -215,8 +215,8 @@ application data before the exit confirms the connection.
 
 Set `--socks5-wait-for-connect` for clients that need the exit's bound address
 or a specific SOCKS5 failure code. It applies to CONNECT on all listeners in
-that client process and takes precedence over the legacy
-`--experimental-socks5-early-reply` flag.
+that client process. Default pipelining and this explicit wait policy are the
+two supported behaviors.
 
 For [Clash/Mihomo SOCKS5 nodes](https://wiki.metacubex.one/en/config/proxies/socks/),
 merge these entries into the application's existing configuration:

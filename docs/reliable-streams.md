@@ -198,7 +198,7 @@ while native BBR drains its flight for an RTT probe, then allow two RTTs
 episode can pause observations for at most 750 ms. A native RTT rise of at least
 half the configured queue-delay target overrides this pause. Native congestion
 control, liveness, packet deadlines, FEC and byte-stream recovery continue during
-the pause. UDP-only sessions and `--legacy-recovery` keep their existing behavior.
+the pause. This automatic observation pause is specific to reliable sessions.
 This avoids treating the native controller's deliberate service dip as a new
 application capacity ceiling; WAN performance acceptance remains pending.
 
@@ -235,7 +235,7 @@ Before such a busy interval exists, a rising native RTT reaching the queue targe
 can trigger the startup brake. Its fallback allowance uses the initial native
 window divided by the current RTT, so an expanded BBR startup window cannot keep
 all paths overfilled while receiver feedback catches up. This is a sending
-allowance, not a capacity estimate; legacy recovery retains its original behavior.
+allowance, not a capacity estimate.
 
 ## Controlled measurement
 
