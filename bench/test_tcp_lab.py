@@ -37,6 +37,9 @@ class Arguments(unittest.TestCase):
     def test_duplex_requires_addressed_streams_and_keeps_total_connections_bounded(self):
         both = args("--direction", "both", "--entrance", "socks5", "--connections", "16")
         self.assertEqual(both.direction, "both")
+        mixed = args("--direction", "both", "--entrance", "socks5", "--connections", "8",
+                     "--mixed-seconds", "15")
+        self.assertEqual((mixed.connections, mixed.mixed_seconds), (8, 15))
         for extra in [("--direction", "both"),
                       ("--direction", "both", "--entrance", "socks5", "--connections", "17"),
                       ("--timeout-seconds", "0"), ("--timeout-seconds", "nan"),

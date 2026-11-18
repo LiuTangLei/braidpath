@@ -96,9 +96,8 @@ def parse_args(argv=None):
     if not 65_536 <= args.bytes <= 512 * 1024 * 1024 or not 1 <= len(args.path) <= 4:
         parser.error("bounded bytes/path count exceeded")
     if args.mixed_seconds and (not 1 <= args.mixed_seconds <= 120 or args.entrance != "socks5"
-                               or args.direction != "both" or args.connections != 1
-                               or args.chunk_bytes or args.tail_seconds or args.event):
-        parser.error("mixed-seconds requires a single SOCKS5 connection per direction without chunks, tail or events")
+                               or args.direction != "both" or args.chunk_bytes or args.tail_seconds or args.event):
+        parser.error("mixed-seconds requires SOCKS5 in both directions without chunks, tail or events")
     if args.unified_game and (not args.mixed_seconds or len(args.path) != 1 or args.client_arg):
         parser.error("unified-game needs a single-path mixed window with default client options")
     if args.chunk_bytes and (not 1 <= args.chunk_bytes <= args.bytes or args.direction != "up"):
@@ -612,7 +611,8 @@ def run(args):
         stop = threading.Event()
         if args.mixed_seconds:
             probe = FreshProbe(tcp_listen, echo.address, 1.0, stop, payload_bytes=1024)
-            result = mixed_load.run(tcp_listen, socks_connect, args.mixed_seconds, data, probe)
+            result = mixed_load.run(tcp_listen, socks_connect, args.mixed_seconds,
+                                    data, probe, args.connections)
             result["short_request_target"] = echo.requests
             save(args.output / "summary.json", result)
             for process in (client, server):

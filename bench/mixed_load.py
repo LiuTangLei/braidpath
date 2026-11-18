@@ -219,11 +219,10 @@ def receive_until(sock, start, stop, deadline, cap, delivery):
     return received, digest.hexdigest(), exact, progress
 
 
-def run(proxy, connect, seconds, data, probe):
+def run(proxy, connect, seconds, data, probe, connections):
     """Run one fixed window against a ready SOCKS5 endpoint."""
     stop_echo = threading.Event()
     with ExitStack() as stack:
-        listeners = [stack.enter_context(socket.create_server(("127.0.0.1", 0))) for _ in range(2)]
         udp_target = stack.enter_context(socket.socket(socket.AF_INET, socket.SOCK_DGRAM))
         udp_target.bind(("127.0.0.1", 0))
         control = stack.enter_context(socket.create_connection(split(proxy), timeout=10))
@@ -232,10 +231,12 @@ def run(proxy, connect, seconds, data, probe):
         target_host, target_port = udp_target.getsockname()
         header = b"\x00\x00\x00\x01" + socket.inet_aton(target_host) + struct.pack("!H", target_port)
         pairs = []
-        for listener in listeners:
+        for _ in range(2 * connections):
+            listener = stack.enter_context(socket.create_server(("127.0.0.1", 0)))
             listener.settimeout(10)
+            target = "127.0.0.1:%d" % listener.getsockname()[1]
             local = stack.enter_context(socket.create_connection(split(proxy), timeout=10))
-            connect(local, "127.0.0.1:%d" % listener.getsockname()[1], time.monotonic() + 10)
+            connect(local, target, time.monotonic() + 10)
             peer = stack.enter_context(listener.accept()[0])
             pairs.append((local, peer))
         start = time.monotonic() + .75
@@ -251,23 +252,39 @@ def run(proxy, connect, seconds, data, probe):
         echo.start()
         probe.start()
         try:
-            with ThreadPoolExecutor(max_workers=4) as workers:
-                traffic = []
-                for give, take in [pairs[0], pairs[1][::-1]]:
+            with ThreadPoolExecutor(max_workers=4 * connections) as workers:
+                traffic = {"up": [], "down": []}
+                for index, (local, peer) in enumerate(pairs):
+                    direction = "up" if index < connections else "down"
+                    give, take = (local, peer) if direction == "up" else (peer, local)
                     delivery = Delivery()
-                    sender = workers.submit(send_until, give, data, start, stop, delivery)
-                    receiver = workers.submit(receive_until, take, start, stop, stop + 10, len(data), delivery)
-                    traffic.append((sender, receiver))
+                    sending = workers.submit(send_until, give, data, start, stop, delivery)
+                    receiving = workers.submit(receive_until, take, start, stop, stop + 10,
+                                                len(data), delivery)
+                    traffic[direction].append((sending, receiving))
                 directions = {}
                 complete, generators = True, True
-                for direction, (sender, receiver) in zip(("up", "down"), traffic):
-                    count, checksum, active = sender.result()
-                    received, digest, drained, progress = receiver.result()
-                    complete &= drained and count > 0 and (count, checksum) == (received, digest)
-                    generators &= active
-                    directions[direction] = {"sent": count, "received": received, "sha256": digest,
-                                             "bytes_per_second": progress,
-                                             "goodput_mbps": sum(progress) * 8 / seconds / 1e6}
+                for direction, flows in traffic.items():
+                    sent_total, received_total = 0, 0
+                    progress_total = [0] * seconds
+                    transfers = []
+                    for sending, receiving in flows:
+                        count, checksum, active = sending.result()
+                        received, digest, drained, progress = receiving.result()
+                        exact = drained and count > 0 and (count, checksum) == (received, digest)
+                        complete &= exact
+                        generators &= active
+                        sent_total += count
+                        received_total += received
+                        progress_total = [a + b for a, b in zip(progress_total, progress)]
+                        transfers.append({"sent": count, "received": received,
+                                          "sha256": digest, "exact": exact})
+                    directions[direction] = {
+                        "sent": sent_total, "received": received_total,
+                        "flows": transfers,
+                        "bytes_per_second": progress_total,
+                        "goodput_mbps": sum(progress_total) * 8 / seconds / 1e6,
+                    }
                 if not report.poll(max(0, stop + 12 - time.monotonic())):
                     raise RuntimeError("UDP worker missed its report deadline")
                 udp_summary, on_schedule, sent, replies = report.recv()

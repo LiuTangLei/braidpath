@@ -2,8 +2,10 @@
 
 For a bounded mixed window, run `python3 -m bench.tcp_lab` with
 `--entrance socks5 --direction both --mixed-seconds 30`. The `--bytes` value
-limits each TCP sender. The fixture verifies both transfers and records
-whole UDP echo messages, their scheduling timestamps, and short requests.
+limits each TCP sender. Add `--connections N` to start N TCP transfers in
+each direction in the same window. The fixture verifies each transfer and
+records aggregate progress, whole UDP echoes, their scheduling timestamps,
+and short requests.
 Add `--unified-game on` or `--unified-game off` with one emulated path to run the
 actual unified proxy against an isolated mesh server. This mode uses distinct
 upstream sockets for concurrent QUIC connections on the same shaped path.
