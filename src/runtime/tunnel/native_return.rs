@@ -408,10 +408,9 @@ impl PathPace {
         {
             (rate * 9 / 10).max(4_000_000)
         } else if packets >= 64 && !conn.probing_rtt_hint() {
-            let trial = rate + rate / 20;
-            path.delivery_rate.map_or(trial, |delivery| {
-                trial.min(rate.max(delivery.saturating_mul(8) * 11 / 10))
-            })
+            // This writer limits its own delivery sample. A bounded trial
+            // must be able to grow when measured queue and loss stay low.
+            rate + rate / 20
         } else {
             rate
         };
