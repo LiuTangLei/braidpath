@@ -67,6 +67,8 @@ def parse_args(argv=None):
     parser.add_argument("--bytes", type=int, default=16 * 1024 * 1024)
     parser.add_argument("--chunk-bytes", type=int, default=0,
                         help="upload a block, wait for a one-byte target receipt, then send the next")
+    parser.add_argument("--unified-game", choices=("on", "off"),
+                        help="launch the unified proxy-client in a single-path mesh fixture")
     parser.add_argument("--mixed-seconds", type=int, default=0,
                         help="fixed SOCKS5 duplex + UDP window; --bytes is each sender cap")
     parser.add_argument("--direction", choices=("up", "down", "both"), default="up")
@@ -97,6 +99,8 @@ def parse_args(argv=None):
                                or args.direction != "both" or args.connections != 1
                                or args.chunk_bytes or args.tail_seconds or args.event):
         parser.error("mixed-seconds requires a single SOCKS5 connection per direction without chunks, tail or events")
+    if args.unified_game and (not args.mixed_seconds or len(args.path) != 1 or args.client_arg):
+        parser.error("unified-game needs a single-path mixed window with default client options")
     if args.chunk_bytes and (not 1 <= args.chunk_bytes <= args.bytes or args.direction != "up"):
         parser.error("chunk-bytes needs an upload and must be between 1 and bytes")
     if not 0 <= args.loss_percent <= 50:
@@ -484,6 +488,7 @@ def run(args):
         "direction": args.direction, "seed": args.seed, "events": args.event,
         "chunk_bytes": args.chunk_bytes,
         "mixed_seconds": args.mixed_seconds,
+        "unified_game": args.unified_game,
         "shared_forward_mbps": args.shared_forward_mbps,
         "shared_forward_burst_bytes": args.shared_forward_burst_bytes,
     })
@@ -500,8 +505,9 @@ def run(args):
 
     try:
         identity = args.output / "identity"
-        subprocess.run([str(args.binary), "init", "--dir", str(identity)], check=True,
-                       capture_output=True, timeout=10)
+        if not args.unified_game:
+            subprocess.run([str(args.binary), "init", "--dir", str(identity)], check=True,
+                           capture_output=True, timeout=10)
         cert, key, token = (identity / name for name in ("cert.pem", "key.pem", "token"))
         data = payload(args.bytes, args.seed)
         directions = ["up", "down"] if args.direction == "both" else [args.direction]
@@ -539,24 +545,42 @@ def run(args):
             for index in range(len(args.path)):
                 emulator.stdin.write(json.dumps({"path": index, "loss_percent": args.loss_percent}) + "\n")
             emulator.stdin.flush()
-        server = spawn("server", [args.binary, "server", "--listen", server_addr, "--cert", cert,
-                                  "--key", key, "--token-file", token,
-                                  *(["--tcp-target", target.address] if args.entrance == "fixed"
-                                    else ["--proxy", "--proxy-allow-private"]),
-                                  "--stats-file", args.output / "server.json",
-                                  "--stats-jsonl", args.output / "server.jsonl",
-                                  "--stats-interval-ms", "100", *args.server_arg])
-        wait_log(args.output / "server.log", "HTTP/3 server ready", server)
         entrances = [ready["paths"][i]["entrance"] for i in args.use_path]
-        client = spawn("client", [args.binary, "client", "--listen", udp_listen,
-                                  "--tcp-listen" if args.entrance == "fixed" else "--proxy-listen", tcp_listen,
-                                  *sum((["--entrance", e] for e in entrances), []),
-                                  "--server-name", "localhost", "--ca", cert, "--token-file", token,
-                                  "--stats-file", args.output / "client.json",
-                                  "--stats-jsonl", args.output / "client.jsonl",
-                                  "--stats-interval-ms", "100", *args.client_arg])
-        wait_log(args.output / "client.log", "UDP client ready", client)
-        wait_paths(args.output, len(entrances), client)
+        if args.unified_game:
+            server = spawn("server", [
+                args.binary, "mesh-server", "--dir", identity, "--id", "lab-exit",
+                "--listen", server_addr, "--advertise", entrances[0],
+                "--proxy", "--proxy-allow-private",
+                "--stats-file", args.output / "server.json",
+                "--stats-jsonl", args.output / "server.jsonl",
+                "--stats-interval-ms", "100", *args.server_arg,
+            ])
+            wait_log(args.output / "server.log", "HTTP/3 server ready", server)
+            client = spawn("client", [
+                args.binary, "proxy-client", "--dir", args.output / "client-identity",
+                "--connection-key", identity / "client-key.json", "--exit", "lab-exit",
+                "--connect", entrances[0], "--paths", "1", "--listen", tcp_listen,
+                "--game-mode", args.unified_game,
+            ])
+            wait_log(args.output / "client.log", "SOCKS5 proxy ready", client)
+        else:
+            server = spawn("server", [args.binary, "server", "--listen", server_addr, "--cert", cert,
+                                      "--key", key, "--token-file", token,
+                                      *(["--tcp-target", target.address] if args.entrance == "fixed"
+                                        else ["--proxy", "--proxy-allow-private"]),
+                                      "--stats-file", args.output / "server.json",
+                                      "--stats-jsonl", args.output / "server.jsonl",
+                                      "--stats-interval-ms", "100", *args.server_arg])
+            wait_log(args.output / "server.log", "HTTP/3 server ready", server)
+            client = spawn("client", [args.binary, "client", "--listen", udp_listen,
+                                      "--tcp-listen" if args.entrance == "fixed" else "--proxy-listen", tcp_listen,
+                                      *sum((["--entrance", e] for e in entrances), []),
+                                      "--server-name", "localhost", "--ca", cert, "--token-file", token,
+                                      "--stats-file", args.output / "client.json",
+                                      "--stats-jsonl", args.output / "client.jsonl",
+                                      "--stats-interval-ms", "100", *args.client_arg])
+            wait_log(args.output / "client.log", "UDP client ready", client)
+            wait_paths(args.output, len(entrances), client)
         time.sleep(0.5)
         stop = threading.Event()
         if args.mixed_seconds:

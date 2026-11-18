@@ -67,6 +67,39 @@ def compare(candidate, reference):
     return "pass"
 
 
+def evaluate(candidate, native, game, unified=False):
+    """Evaluate one comparable fixed-load block against predeclared gates."""
+    udp = compare(candidate, game)
+    if udp == "fail":
+        return {"status": "fail", "udp": udp}
+    if udp == "insufficient" or (not unified and
+                                 (not native["generator_valid"] or not native["reliable_exact"])):
+        return {"status": "insufficient", "udp": udp}
+    throughput_reference = game if unified else native
+
+    def short_tail(window):
+        sample = percentile([item["elapsed_seconds"] if item["outcome"] == "ok" else math.inf
+                             for item in window["short_requests"]], .95)
+        return sample if sample is not None and math.isfinite(sample) else None
+
+    reference_tail = short_tail(throughput_reference)
+    candidate_tail = short_tail(candidate)
+    ratios = {}
+    for direction, values in throughput_reference["directions"].items():
+        available = values["goodput_mbps"]
+        ratios[direction] = (candidate["directions"][direction]["goodput_mbps"] / available
+                             if available else None)
+    if reference_tail is None or any(ratio is None for ratio in ratios.values()):
+        return {"status": "insufficient", "udp": udp, "goodput_ratios": ratios}
+    short_ok = candidate_tail is not None and candidate_tail <= 1.15 * reference_tail
+    throughput_ok = all(ratio >= .90 for ratio in ratios.values())
+    return {"status": "pass" if short_ok and throughput_ok else "fail",
+            "udp": udp, "goodput_ratios": ratios, "short_requests_pass": short_ok,
+            "short_p95_ms": candidate_tail * 1000 if candidate_tail is not None else None,
+            "reference_short_p95_ms": reference_tail * 1000}
+
+
+
 def udp_echo(sock, stop):
     sock.settimeout(.1)
     while not stop.is_set():
