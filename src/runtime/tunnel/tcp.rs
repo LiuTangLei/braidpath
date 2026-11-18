@@ -321,6 +321,7 @@ const ADDRESSED: u32 = 1 << 28;
 /// bandwidth-bound: its segments take the earliest path rather than a share
 /// of every path.
 const INTERACTIVE_BYTES: u64 = 64 * 1024;
+const SHARED_NATIVE_ACK_FLOWS: usize = 16;
 /// Association datagrams waiting for the session queue; more are dropped.
 const DATAGRAM_QUEUE: usize = 256;
 
@@ -1511,7 +1512,7 @@ impl Mux {
             self.reset(id, "malformed frame");
             return;
         };
-        self.receive_frame(id, &mut frame);
+        self.receive_frame(id, &mut frame, false);
     }
 
     pub(super) fn receive_native(&mut self, mut incoming: native_return::Incoming) {
@@ -1520,7 +1521,11 @@ impl Mux {
             Frame::Data { data, .. } => data.len() as u64,
             _ => 0,
         };
-        match self.receive_frame(incoming.decoded.stream_id, &mut incoming.decoded.frame) {
+        match self.receive_frame(
+            incoming.decoded.stream_id,
+            &mut incoming.decoded.frame,
+            true,
+        ) {
             Receive::Deferred => self.native_pending.push_back(incoming),
             Receive::Accepted => self.stats.native_return_accepted_bytes += size,
             Receive::Duplicate | Receive::Closed => {}
@@ -1544,7 +1549,7 @@ impl Mux {
         !self.native_pending.is_empty()
     }
 
-    fn receive_frame(&mut self, id: u32, frame: &mut Frame) -> Receive {
+    fn receive_frame(&mut self, id: u32, frame: &mut Frame, native: bool) -> Receive {
         let now = Instant::now();
         match frame {
             Frame::Reset => {
@@ -1578,10 +1583,17 @@ impl Mux {
                     return Receive::Closed;
                 }
                 let (offset, fin) = (*offset, *fin);
-                let many_streams = self.streams.len() >= 32;
+                // QUIC acknowledges native downloads. Coalesce regular progress
+                // ACKs when their timers multiply across a busy download session.
+                // Game keeps its existing ACK timing. Window updates, ACK
+                // requests and FIN still bypass the delay.
+                let shared = self.streams.len() >= 32
+                    || (native
+                        && self.game_events.is_none()
+                        && self.streams.len() >= SHARED_NATIVE_ACK_FLOWS);
                 let s = self.streams.get_mut(&id).expect("stream");
                 s.recv
-                    .set_bulk_ack_spacing(many_streams && s.recv.cumulative() >= INTERACTIVE_BYTES);
+                    .set_bulk_ack_spacing(shared && s.recv.cumulative() >= INTERACTIVE_BYTES);
                 let additional = s.recv.additional_bytes(offset, data.len());
                 let range_slot = if s.recv.needs_range(offset, data.len()) {
                     match self.budget.range_slots.clone().try_acquire_owned() {
@@ -2835,6 +2847,70 @@ mod tests {
         )
         .await
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn parallel_native_download_coalesces_acks_and_preserves_requests_and_fin() {
+        for (count, game) in [
+            (1, false),
+            (SHARED_NATIVE_ACK_FLOWS - 1, false),
+            (SHARED_NATIVE_ACK_FLOWS, false),
+            (SHARED_NATIVE_ACK_FLOWS, true),
+        ] {
+            let mut policy = test_policy();
+            policy.game_mode = game;
+            let mut mux = Mux::new(
+                Listeners::default(),
+                Targets::default(),
+                &policy,
+                stats::Metrics::new("ack-spacing").scope("ack-spacing", stats::FORWARD),
+            );
+            for id in 1..=count {
+                assert!(mux.open(id as u32, false));
+            }
+            let chunk = vec![1; INTERACTIVE_BYTES as usize / 2];
+            mux.receive_native(native_test_frame(1, 0, false, &chunk).await);
+            mux.receive_native(native_test_frame(1, chunk.len() as u64, false, &chunk).await);
+
+            // Seed the previous ACK at a controlled instant so the check
+            // depends on spacing rather than on elapsed test execution time.
+            let last = Instant::now() + Duration::from_secs(1);
+            let recv = &mut mux.streams.get_mut(&1).unwrap().recv;
+            assert!(recv.take_ack(last, stream::INITIAL_WINDOW).is_some());
+            mux.receive_native(native_test_frame(1, INTERACTIVE_BYTES, false, &chunk).await);
+            assert_eq!(
+                mux.streams[&1]
+                    .recv
+                    .ack_pending(last + Duration::from_millis(8)),
+                game || count < SHARED_NATIVE_ACK_FLOWS
+            );
+
+            let end = INTERACTIVE_BYTES + chunk.len() as u64;
+            mux.receive(incoming(
+                1,
+                Frame::Data {
+                    offset: end,
+                    fin: false,
+                    data: Vec::new(),
+                },
+            ));
+            let recv = &mut mux.streams.get_mut(&1).unwrap().recv;
+            assert_eq!(
+                recv.take_ack(last, stream::INITIAL_WINDOW)
+                    .unwrap()
+                    .cumulative,
+                end
+            );
+
+            mux.receive_native(native_test_frame(1, end, true, b"").await);
+            let recv = &mut mux.streams.get_mut(&1).unwrap().recv;
+            assert_eq!(
+                recv.take_ack(last, stream::INITIAL_WINDOW)
+                    .unwrap()
+                    .cumulative,
+                end + 1
+            );
+        }
     }
 
     #[tokio::test]
