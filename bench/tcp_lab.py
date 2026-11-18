@@ -526,6 +526,8 @@ def run(args):
         lab = [args.lab_binary, "--server", server_addr, "--queue-packets", args.queue_packets,
                "--seed", args.seed, "--ready-file", args.output / "link-ready.json",
                "--stats-jsonl", args.output / "link.jsonl", "--final-file", args.output / "link-final.json"]
+        if args.unified_game:
+            lab += ["--multi-peer"]
         if args.loss_max_datagram_bytes:
             lab += ["--loss-max-datagram-bytes", args.loss_max_datagram_bytes]
         if args.shared_forward_mbps:

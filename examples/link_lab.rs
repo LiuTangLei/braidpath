@@ -15,7 +15,7 @@ use rand::{Rng, SeedableRng, rngs::StdRng};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     fs,
     io::{BufRead, Write},
     net::SocketAddr,
@@ -43,6 +43,9 @@ struct Args {
     /// Server address every upstream socket sends to (loopback only).
     #[arg(long)]
     server: SocketAddr,
+    /// Keep separate upstream sockets for concurrent clients of an entrance.
+    #[arg(long)]
+    multi_peer: bool,
     /// One path per occurrence: RTT_MS:RATE_MBPS (half the RTT each direction).
     #[arg(long = "path", required = true)]
     paths: Vec<String>,
@@ -211,31 +214,108 @@ fn tokio_socket(role: &str) -> Result<(Arc<UdpSocket>, lab_socket::SocketEvidenc
 }
 
 /// One shaped direction: receive on `input`, send from `output` to `peer`.
-async fn shape_direction(
-    input: Arc<UdpSocket>,
-    output: Arc<UdpSocket>,
-    state: Shared,
-    peer: Arc<Mutex<Option<SocketAddr>>>,
-    learn_peer: bool,
-    fixed_target: Option<SocketAddr>,
-    seed: u64,
-) -> Result<()> {
+type Reply = (SocketAddr, Vec<u8>);
+
+enum Wire {
+    Socket {
+        input: Arc<UdpSocket>,
+        output: Arc<UdpSocket>,
+        server: Option<SocketAddr>,
+        peer: Arc<Mutex<Option<SocketAddr>>>,
+    },
+    FanOut {
+        input: Arc<UdpSocket>,
+        server: SocketAddr,
+        sockets: HashMap<SocketAddr, Arc<UdpSocket>>,
+        replies: tokio::sync::mpsc::Sender<Reply>,
+        readers: JoinSet<()>,
+    },
+    FanIn {
+        input: tokio::sync::mpsc::Receiver<Reply>,
+        output: Arc<UdpSocket>,
+    },
+}
+
+impl Wire {
+    async fn receive(&mut self, buffer: &mut [u8]) -> Option<(usize, SocketAddr)> {
+        match self {
+            Self::Socket {
+                input,
+                peer,
+                server,
+                ..
+            } => {
+                let received = input.recv_from(buffer).await.ok()?;
+                if server.is_some() {
+                    *peer.lock().unwrap() = Some(received.1);
+                }
+                Some(received)
+            }
+            Self::FanOut { input, .. } => input.recv_from(buffer).await.ok(),
+            Self::FanIn { input, .. } => {
+                let (peer, reply) = input.recv().await?;
+                buffer[..reply.len()].copy_from_slice(&reply);
+                Some((reply.len(), peer))
+            }
+        }
+    }
+
+    fn send(&mut self, data: &[u8], from: SocketAddr) -> Result<Option<bool>> {
+        let sent = match self {
+            Self::Socket {
+                output,
+                server,
+                peer,
+                ..
+            } => {
+                let Some(target) = server.or(*peer.lock().unwrap()) else {
+                    return Ok(None);
+                };
+                output.try_send_to(data, target).is_ok()
+            }
+            Self::FanIn { output, .. } => output.try_send_to(data, from).is_ok(),
+            Self::FanOut {
+                server,
+                sockets,
+                replies,
+                readers,
+                ..
+            } => {
+                if !sockets.contains_key(&from) {
+                    if sockets.len() == 32 {
+                        return Ok(None);
+                    }
+                    let (socket, _) = tokio_socket("multi_peer_upstream")?;
+                    let receive = socket.clone();
+                    let replies = replies.clone();
+                    readers.spawn(async move {
+                        let mut buf = vec![0; MAX_DATAGRAM];
+                        while let Ok((n, _)) = receive.recv_from(&mut buf).await {
+                            if replies.send((from, buf[..n].to_vec())).await.is_err() {
+                                break;
+                            }
+                        }
+                    });
+                    sockets.insert(from, socket);
+                }
+                sockets[&from].try_send_to(data, *server).is_ok()
+            }
+        };
+        Ok(Some(sent))
+    }
+}
+
+async fn shape_direction(mut wire: Wire, state: Shared, seed: u64) -> Result<()> {
     let mut random = StdRng::seed_from_u64(seed);
-    let mut queue: VecDeque<(Instant, Instant, Vec<u8>)> = VecDeque::new();
+    let mut queue: VecDeque<(Instant, Instant, SocketAddr, Vec<u8>)> = VecDeque::new();
     let mut busy_until = Instant::now();
     let mut last_delivery = Instant::now();
     let mut buffer = vec![0; MAX_DATAGRAM];
     loop {
         let next = queue.front().map(|entry| entry.1);
         tokio::select! {
-            received = input.recv_from(&mut buffer) => {
-                let (length, from) = match received {
-                    Ok(value) => value,
-                    Err(_) => continue,
-                };
-                if learn_peer {
-                    *peer.lock().unwrap() = Some(from);
-                }
+            received = wire.receive(&mut buffer) => {
+                let Some((length, from)) = received else { continue };
                 let size = length + IP_UDP_BYTES;
                 let mut direction = state.lock().unwrap();
                 // Use one post-lock timestamp for admission and delivery, after
@@ -281,27 +361,23 @@ async fn shape_direction(
                 busy_until = start + serialization;
                 let delivery = (busy_until + Duration::from_micros(shape.delay_us)).max(last_delivery);
                 last_delivery = delivery;
-                queue.push_back((now, delivery, buffer[..length].to_vec()));
+                queue.push_back((now, delivery, from, buffer[..length].to_vec()));
                 direction.in_flight = queue.len();
                 direction.counters.peak_packets = direction.counters.peak_packets.max(queue.len());
             }
             _ = sleep_until(next.unwrap_or_else(Instant::now)), if next.is_some() => {
                 let now = Instant::now();
-                let target = fixed_target.or(*peer.lock().unwrap());
                 while queue.front().is_some_and(|entry| entry.1 <= now) {
-                    let (entered, _, data) = queue.pop_front().unwrap();
+                    let (entered, _, from, data) = queue.pop_front().unwrap();
                     if state.lock().unwrap().shape.down {
                         state.lock().unwrap().counters.outage_drops += 1;
                         continue;
                     }
-                    let sent = match target {
-                        Some(target) => output.try_send_to(&data, target).is_ok(),
-                        None => false,
-                    };
+                    let sent = wire.send(&data, from)?;
                     let mut direction = state.lock().unwrap();
-                    if target.is_none() {
+                    if sent.is_none() {
                         direction.counters.no_peer_drops += 1;
-                    } else if sent {
+                    } else if sent == Some(true) {
                         direction.counters.forwarded_packets += 1;
                         direction.counters.forwarded_ip_udp_bytes += (data.len() + IP_UDP_BYTES) as u64;
                         let sojourn = now.duration_since(entered).as_micros() as u64;
@@ -402,7 +478,6 @@ async fn main() -> Result<()> {
     for (index, text) in args.paths.iter().enumerate() {
         let shape = parse_path(text, args.queue_packets)?;
         let (entrance, entrance_evidence) = tokio_socket(&format!("path_{index}_entrance"))?;
-        let (upstream, upstream_evidence) = tokio_socket(&format!("path_{index}_upstream"))?;
         let make = |uplink: Option<Arc<Mutex<Uplink>>>| {
             Arc::new(Mutex::new(Direction {
                 shape,
@@ -416,29 +491,48 @@ async fn main() -> Result<()> {
             }))
         };
         let (forward, back) = (make(uplink.clone()), make(None));
-        let peer = Arc::new(Mutex::new(None));
         let seed = args.seed.wrapping_add(index as u64 * 2);
-        tasks.spawn(shape_direction(
-            entrance.clone(),
-            upstream.clone(),
-            forward.clone(),
-            peer.clone(),
-            true,
-            Some(args.server),
-            seed,
-        ));
-        tasks.spawn(shape_direction(
-            upstream.clone(),
-            entrance.clone(),
-            back.clone(),
-            peer,
-            false,
-            None,
-            seed + 1,
-        ));
+        let (up, down, upstream_address, evidence) = if args.multi_peer {
+            let (replies, input) = tokio::sync::mpsc::channel(args.queue_packets);
+            (
+                Wire::FanOut {
+                    input: entrance.clone(),
+                    server: args.server,
+                    sockets: HashMap::new(),
+                    replies,
+                    readers: JoinSet::new(),
+                },
+                Wire::FanIn {
+                    input,
+                    output: entrance.clone(),
+                },
+                None,
+                vec![entrance_evidence],
+            )
+        } else {
+            let (upstream, upstream_evidence) = tokio_socket(&format!("path_{index}_upstream"))?;
+            let peer = Arc::new(Mutex::new(None));
+            (
+                Wire::Socket {
+                    input: entrance.clone(),
+                    output: upstream.clone(),
+                    server: Some(args.server),
+                    peer: peer.clone(),
+                },
+                Wire::Socket {
+                    input: upstream.clone(),
+                    output: entrance.clone(),
+                    server: None,
+                    peer,
+                },
+                Some(upstream.local_addr()?),
+                vec![entrance_evidence, upstream_evidence],
+            )
+        };
+        tasks.spawn(shape_direction(up, forward.clone(), seed));
+        tasks.spawn(shape_direction(down, back.clone(), seed + 1));
         ready.push(json!({"index": index, "entrance": entrance.local_addr()?,
-                          "upstream": upstream.local_addr()?, "shape": shape,
-                          "sockets": [entrance_evidence, upstream_evidence]}));
+                          "upstream": upstream_address, "shape": shape, "sockets": evidence}));
         paths.push((forward, back));
     }
     let paths = Arc::new(paths);
@@ -509,6 +603,53 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn multi_peer_upstreams_keep_return_destinations_separate() {
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_a = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_b = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let entrance = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let (replies, input) = tokio::sync::mpsc::channel(8);
+        let mut up = Wire::FanOut {
+            input: entrance.clone(),
+            server: server.local_addr().unwrap(),
+            sockets: HashMap::new(),
+            replies,
+            readers: JoinSet::new(),
+        };
+        let mut down = Wire::FanIn {
+            input,
+            output: entrance,
+        };
+        let a = client_a.local_addr().unwrap();
+        let b = client_b.local_addr().unwrap();
+        let mut buf = [0; 16];
+        tokio::time::timeout(Duration::from_secs(1), async {
+            assert_eq!(up.send(b"a", a).unwrap(), Some(true));
+            assert_eq!(up.send(b"b", b).unwrap(), Some(true));
+            let sources: HashMap<_, _> = {
+                let mut sources = HashMap::new();
+                for _ in 0..2 {
+                    let (len, upstream) = server.recv_from(&mut buf).await.unwrap();
+                    sources.insert(buf[0], (len, upstream));
+                }
+                sources
+            };
+            assert_ne!(sources[&b'a'].1, sources[&b'b'].1);
+            for byte in [b'b', b'a'] {
+                server.send_to(&[byte], sources[&byte].1).await.unwrap();
+                let (len, client) = down.receive(&mut buf).await.unwrap();
+                assert_eq!(down.send(&buf[..len], client).unwrap(), Some(true));
+            }
+            assert_eq!(client_a.recv(&mut buf).await.unwrap(), 1);
+            assert_eq!(buf[0], b'a');
+            assert_eq!(client_b.recv(&mut buf).await.unwrap(), 1);
+            assert_eq!(buf[0], b'b');
+        })
+        .await
+        .unwrap();
+    }
 
     #[test]
     fn policer_drops_excess_without_spending_future_credit() {

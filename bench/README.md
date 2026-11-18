@@ -1,5 +1,14 @@
 # Finite benchmark runner
 
+For a bounded mixed window, run `python3 -m bench.tcp_lab` with
+`--entrance socks5 --direction both --mixed-seconds 30`. The `--bytes` value
+limits each TCP sender. The fixture verifies both transfers and records
+whole UDP echo messages, their scheduling timestamps, and short requests.
+Add `--unified-game on` or `--unified-game off` with one emulated path to run the
+actual unified proxy against an isolated mesh server. This mode uses distinct
+upstream sockets for concurrent QUIC connections on the same shaped path.
+
+
 `python3 -m bench.netem validate --output local/NEW_PREFLIGHT` checks an isolated
 Linux four-path testbed. `python3 -m bench.netem run --binary LINUX_BINARY
 --output local/NEW_RUN` validates it before one finite fixed-mode FEC0 diagnostic.

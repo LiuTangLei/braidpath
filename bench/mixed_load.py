@@ -2,6 +2,7 @@
 
 import hashlib
 import math
+import multiprocessing
 import select
 import socket
 import struct
@@ -149,6 +150,16 @@ def udp_window(sock, header, start, seconds):
     return datagram_metrics(sent, replies), valid, sent, replies
 
 
+def udp_worker(report, sock, header, start_wall, start_parent, seconds):
+    # Python 3.9 on macOS uses a process-local monotonic origin. Convert
+    # the common start instant once, then use only the worker's clock.
+    start = time.monotonic() + (start_wall - time.time())
+    with report, sock:
+        metrics, valid, sent, replies = udp_window(sock, header, start, seconds)
+        report.send((metrics, valid, {seq: start_parent + (at - start) for seq, at in sent.items()},
+                     replies))
+
+
 class Delivery:
     def __init__(self):
         self.condition = threading.Condition()
@@ -227,14 +238,20 @@ def run(proxy, connect, seconds, data, probe):
             connect(local, "127.0.0.1:%d" % listener.getsockname()[1], time.monotonic() + 10)
             peer = stack.enter_context(listener.accept()[0])
             pairs.append((local, peer))
-        start = time.monotonic() + .5
+        start = time.monotonic() + .75
+        start_wall = time.time() + (start - time.monotonic())
         stop = start + seconds
+        worker_context = multiprocessing.get_context("spawn")
+        report, sender = worker_context.Pipe(duplex=False)
+        datagrams = worker_context.Process(
+            target=udp_worker, args=(sender, udp, header, start_wall, start, seconds), daemon=True)
+        datagrams.start()
+        sender.close()
         echo = threading.Thread(target=udp_echo, args=(udp_target, stop_echo), daemon=True)
         echo.start()
         probe.start()
         try:
-            with ThreadPoolExecutor(max_workers=5) as workers:
-                udp_task = workers.submit(udp_window, udp, header, start, seconds)
+            with ThreadPoolExecutor(max_workers=4) as workers:
                 traffic = []
                 for give, take in [pairs[0], pairs[1][::-1]]:
                     delivery = Delivery()
@@ -251,8 +268,16 @@ def run(proxy, connect, seconds, data, probe):
                     directions[direction] = {"sent": count, "received": received, "sha256": digest,
                                              "bytes_per_second": progress,
                                              "goodput_mbps": sum(progress) * 8 / seconds / 1e6}
-                udp_summary, on_schedule, sent, replies = udp_task.result()
+                if not report.poll(max(0, stop + 12 - time.monotonic())):
+                    raise RuntimeError("UDP worker missed its report deadline")
+                udp_summary, on_schedule, sent, replies = report.recv()
         finally:
+            report.close()
+            if datagrams.is_alive():
+                datagrams.join(1)
+            if datagrams.is_alive():
+                datagrams.terminate()
+            datagrams.join()
             stop_echo.set()
             echo.join(1)
             probe.stop.set()
