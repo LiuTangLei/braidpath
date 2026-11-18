@@ -375,6 +375,7 @@ struct PathPace {
     sampled_us: u64,
     packets: u64,
     lost: u64,
+    queue_braked: bool,
 }
 impl PathPace {
     fn new(connection: usize, now_us: u64, ceiling: u64) -> Self {
@@ -386,6 +387,7 @@ impl PathPace {
             sampled_us: now_us,
             packets: 0,
             lost: 0,
+            queue_braked: false,
         }
     }
 
@@ -402,18 +404,18 @@ impl PathPace {
         self.sampled_us = now_us;
 
         let rate = self.credit.rate();
-        let queue = path.rtt.saturating_sub(path.min_rtt);
-        let next = if queue > std::time::Duration::from_millis(8)
-            || (packets >= 64 && lost.saturating_mul(200) > packets)
-        {
+        let queued = path.rtt.saturating_sub(path.min_rtt) > std::time::Duration::from_millis(8);
+        let lossy = packets >= 64 && lost.saturating_mul(200) > packets;
+        // RTT includes both directions. Apply one delay brake per episode;
+        // repeated local loss can still request another reduction.
+        let next = if lossy || (queued && !self.queue_braked && !conn.probing_rtt_hint()) {
             (rate * 9 / 10).max(4_000_000)
-        } else if packets >= 64 && !conn.probing_rtt_hint() {
-            // This writer limits its own delivery sample. A bounded trial
-            // must be able to grow when measured queue and loss stay low.
-            rate + rate / 20
+        } else if !queued && packets >= 64 && !conn.probing_rtt_hint() {
+            rate + rate / 10
         } else {
             rate
         };
+        self.queue_braked = queued;
         self.credit.set_rate(now_us, next.min(ceiling));
     }
 }
