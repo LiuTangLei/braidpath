@@ -1,8 +1,6 @@
 """Offline, common-window transfer accounting. Never launches traffic.
 
-New grouped sender frames share all path and application counter boundaries.
-Legacy per-connection logs must enclose the requested window on every path;
-missing startup/tail samples are reported explicitly, never hidden in a total.
+Grouped sender frames share all path and application counter boundaries.
 """
 from __future__ import annotations
 
@@ -15,7 +13,6 @@ from pathlib import Path
 import re
 
 COUNTERS = ('sent_packets', 'lost_packets', 'udp_tx_bytes', 'udp_rx_bytes')
-FIELD = re.compile(r'([a-z_]+)=("[^"]*"|\S+)')
 
 
 def timestamp(text):
@@ -46,58 +43,6 @@ def counter_delta(before, after):
     if any(after[k] < before[k] for k in before):
         return None
     return {k: after[k] - before[k] for k in before}
-
-
-def legacy_samples(lines, exit_name=None):
-    series = defaultdict(list)
-    for line in lines:
-        if 'proxy transport counters' not in line:
-            continue
-        fields = dict(FIELD.findall(line))
-        if exit_name is not None and fields.get('exit', '').strip('"') != exit_name:
-            continue
-        if 'connection' not in fields or not all(k in fields for k in COUNTERS):
-            continue
-        try:
-            sample = {k: int(fields[k]) for k in COUNTERS}
-            sample['unix'] = timestamp(line.split()[0])
-        except (ValueError, IndexError):
-            continue
-        series[fields['connection']].append(sample)
-    return dict(series)
-
-
-def enclose(series, start, end, expected_connections):
-    """No interpolation and no baselines taken after the transfer has started."""
-    rows, complete = [], bool(expected_connections)
-    for connection in expected_connections:
-        points = sorted(series.get(connection, []), key=lambda p: p['unix'])
-        before = next((p for p in reversed(points) if p['unix'] <= start), None)
-        after = next((p for p in points if p['unix'] >= end), None)
-        row = {'connection': connection, 'complete': False}
-        if before is None or after is None:
-            row['missing'] = 'startup' if before is None else 'tail'
-            complete = False
-        else:
-            delta = counter_delta({k: before[k] for k in COUNTERS},
-                                  {k: after[k] for k in COUNTERS})
-            if delta is None:
-                row['missing'] = 'counter_reset'
-                complete = False
-            else:
-                row.update(complete=True, start_unix=before['unix'], end_unix=after['unix'],
-                           padding_before_seconds=start - before['unix'],
-                           padding_after_seconds=after['unix'] - end, counters=delta)
-        rows.append(row)
-    totals = None
-    if complete:
-        totals = {k: sum(row['counters'][k] for row in rows) for k in COUNTERS}
-        totals['quinn_declared_loss_fraction'] = (totals['lost_packets'] / totals['sent_packets']
-                                                if totals['sent_packets'] else None)
-    return {'coverage_complete': complete, 'paths': rows, 'totals': totals,
-            'scope': 'enclosing per-connection intervals; includes boundary traffic',
-            'application_to_udp_ratio': None,
-            'ratio_note': 'Application counters do not share these exact legacy boundaries.'}
 
 
 def grouped_frames(lines):
@@ -263,10 +208,6 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--log', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
-    parser.add_argument('--legacy-start', help='UTC ISO timestamp; requires legacy-end/connections')
-    parser.add_argument('--legacy-end')
-    parser.add_argument('--connection', action='append', default=[])
-    parser.add_argument('--exit')
     parser.add_argument('--tcp-samples', type=Path)
     parser.add_argument('--clock-alignment', type=Path)
     parser.add_argument('--host')
@@ -280,24 +221,15 @@ def main(argv=None):
             parser.error('host and clock-alignment must be supplied together')
         alignment = json.loads(args.clock_alignment.read_text())[args.host]
         offset = alignment['remote_minus_mac_seconds']
-    if args.legacy_start:
-        if not args.legacy_end or not args.connection:
-            parser.error('legacy accounting requires end and every expected connection')
-        series = legacy_samples(read_lines(args.log), args.exit)
-        for points in series.values():
-            for point in points: point['unix'] -= offset
-        result = enclose(series, timestamp(args.legacy_start), timestamp(args.legacy_end), args.connection)
-        frames = []
-    else:
-        frames = list(grouped_frames(read_lines(args.log)))
-        sessions = defaultdict(list)
-        for frame in frames:
-            frame['unix'] -= offset
-            sessions[(frame['session'], frame['direction'])].append(frame)
-        result = {'sessions': [{'session': session, 'direction': direction,
-                   'intervals': [dict(end_utc=datetime.fromtimestamp(b['unix'], timezone.utc).isoformat(),
-                                      **frame_delta(a, b)) for a, b in zip(values, values[1:])]}
-                  for (session, direction), values in sessions.items()]}
+    frames = list(grouped_frames(read_lines(args.log)))
+    sessions = defaultdict(list)
+    for frame in frames:
+        frame['unix'] -= offset
+        sessions[(frame['session'], frame['direction'])].append(frame)
+    result = {'sessions': [{'session': session, 'direction': direction,
+               'intervals': [dict(end_utc=datetime.fromtimestamp(b['unix'], timezone.utc).isoformat(),
+                                  **frame_delta(a, b)) for a, b in zip(values, values[1:])]}
+              for (session, direction), values in sessions.items()]}
     if args.tcp_samples:
         if alignment is None:
             parser.error('TCP attribution needs its host clock alignment')

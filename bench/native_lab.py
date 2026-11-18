@@ -94,14 +94,7 @@ def client_arguments(args, cert, token, listen, entrances, stats):
     else:
         arguments += ["--adaptive", "--quality-schedule", "--small-fec-bytes", "0",
                       "--capacity-probe-bps", "0", "--datagram-send-buffer-bytes", "1200"]
-    return arguments + endpoint_options(args) + args.client_extra_arg
-
-
-def endpoint_options(args):
-    options = []
-    if args.legacy_recovery:
-        options.append("--legacy-recovery")
-    return options
+    return arguments + args.client_extra_arg
 
 
 class Lab:
@@ -186,7 +179,7 @@ class Lab:
         server_argv = [binary, "server", "--listen", server_addr, "--target", sink_addr, "--cert", cert,
                        "--key", key, "--token-file", token, "--max-rate-bps", args.rate_bps,
                        *(["--datagram-send-buffer-bytes", "1200"] if args.mode == "native-service" else []),
-                       *endpoint_options(args), *stats("server"), *args.server_extra_arg]
+                       *stats("server"), *args.server_extra_arg]
         server, server_started = self.spawn("server", server_argv)
         self.runtime_ready(server, server_started, "server")
         client, client_started = self.spawn("client", [binary, *client_arguments(
@@ -300,7 +293,6 @@ def parse_args(argv=None):
     parser.add_argument("--step", type=parse_step, action="append", default=[],
                         help="AT_SECONDS:PATH:RATE_MBPS forward and return rate change")
     parser.add_argument("--seed", type=int, default=20261016)
-    parser.add_argument("--legacy-recovery", action="store_true")
     parser.add_argument("--client-extra-arg", action="append", default=[])
     parser.add_argument("--server-extra-arg", action="append", default=[])
     args = parser.parse_args(argv)

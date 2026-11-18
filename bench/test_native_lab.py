@@ -67,17 +67,16 @@ class Arguments(unittest.TestCase):
         for burst in (-1, 2047, 1048577):
             self.rejected(["--policer-burst-bytes", str(burst)])
 
-    def test_modes_and_recovery_options_reach_the_client(self):
-        args = parse_args(self.common + ["--legacy-recovery", "--client-extra-arg=--x"])
+    def test_modes_and_extra_arguments_reach_the_client(self):
+        args = parse_args(self.common + ["--client-extra-arg=--x"])
         argv = client_arguments(args, "cert", "token", "127.0.0.1:1", ["127.0.0.1:2", "127.0.0.1:3"], [])
         self.assertEqual(argv.count("--entrance"), 2)
         self.assertEqual(argv[argv.index("--path-group", argv.index("127.0.0.1:3")) + 1], "1")
         self.assertIn("--quality-schedule", argv)
-        self.assertEqual(argv[-2:], ["--legacy-recovery", "--x"])
+        self.assertEqual(argv[-1], "--x")
         adaptive = parse_args(self.common + ["--mode", "adaptive"])
         argv = client_arguments(adaptive, "cert", "token", "127.0.0.1:1", ["127.0.0.1:2"], [])
         self.assertIn("--probe-guided-recovery", argv)
-        self.assertNotIn("--legacy-recovery", argv)
 
 
 if __name__ == "__main__":

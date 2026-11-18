@@ -1,31 +1,10 @@
 import copy
 import unittest
 
-from bench.transfer_evidence import COUNTERS, counter_delta, enclose, frame_delta, proc_counters, tcp_sockets, tcp_timeline
-
-
-def sample(at, sent, lost=0, tx=None):
-    return dict(unix=at, sent_packets=sent, lost_packets=lost,
-                udp_tx_bytes=sent * 1000 if tx is None else tx, udp_rx_bytes=sent)
+from bench.transfer_evidence import COUNTERS, counter_delta, frame_delta, proc_counters, tcp_sockets, tcp_timeline
 
 
 class CommonWindows(unittest.TestCase):
-    def test_startup_is_not_discarded_even_if_first_active_sample_is_late(self):
-        series = {'a': [sample(0, 0), sample(5, 100, 30), sample(10, 200, 31)],
-                  'b': [sample(0, 0), sample(10, 100, 2)]}
-        result = enclose(series, 2, 8, ['a', 'b'])
-        self.assertTrue(result['coverage_complete'])
-        self.assertEqual(result['totals']['lost_packets'], 33)
-        self.assertAlmostEqual(result['totals']['quinn_declared_loss_fraction'], 33 / 300)
-        self.assertIsNone(result['application_to_udp_ratio'])
-
-    def test_missing_path_start_or_tail_cannot_be_exported_as_a_complete_total(self):
-        for series in [{'a': [sample(3, 1), sample(10, 2)]},
-                       {'a': [sample(0, 1), sample(7, 2)]}, {}]:
-            result = enclose(series, 2, 8, ['a', 'b'])
-            self.assertFalse(result['coverage_complete'])
-            self.assertIsNone(result['totals'])
-
     def test_reset_counters_and_proc_header_mismatch_are_unknown_not_zero(self):
         self.assertIsNone(counter_delta({'x': 3}, {'x': 2}))
         self.assertIsNone(proc_counters('TcpExt: A B\nTcpExt: 1\n'))
