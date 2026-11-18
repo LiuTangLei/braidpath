@@ -260,7 +260,7 @@ impl Wire {
         }
     }
 
-    fn send(&mut self, data: &[u8], from: SocketAddr) -> Result<Option<bool>> {
+    async fn send(&mut self, data: &[u8], from: SocketAddr) -> Result<Option<bool>> {
         let sent = match self {
             Self::Socket {
                 output,
@@ -298,7 +298,7 @@ impl Wire {
                         }
                     }
                 });
-                let sent = socket.try_send_to(data, *server).is_ok();
+                let sent = socket.send_to(data, *server).await.is_ok();
                 sockets.insert(from, socket);
                 sent
             }
@@ -375,7 +375,7 @@ async fn shape_direction(mut wire: Wire, state: Shared, seed: u64) -> Result<()>
                         state.lock().unwrap().counters.outage_drops += 1;
                         continue;
                     }
-                    let sent = wire.send(&data, from)?;
+                    let sent = wire.send(&data, from).await?;
                     let mut direction = state.lock().unwrap();
                     if sent.is_none() {
                         direction.counters.no_peer_drops += 1;
@@ -612,6 +612,7 @@ mod tests {
         let client_a = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let client_b = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let entrance = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        entrance.writable().await.unwrap();
         let (replies, input) = tokio::sync::mpsc::channel(8);
         let mut up = Wire::FanOut {
             input: entrance.clone(),
@@ -628,8 +629,8 @@ mod tests {
         let b = client_b.local_addr().unwrap();
         let mut buf = [0; 16];
         tokio::time::timeout(Duration::from_secs(1), async {
-            assert_eq!(up.send(b"a", a).unwrap(), Some(true));
-            assert_eq!(up.send(b"b", b).unwrap(), Some(true));
+            assert_eq!(up.send(b"a", a).await.unwrap(), Some(true));
+            assert_eq!(up.send(b"b", b).await.unwrap(), Some(true));
             let sources: HashMap<_, _> = {
                 let mut sources = HashMap::new();
                 for _ in 0..2 {
@@ -642,7 +643,7 @@ mod tests {
             for byte in [b'b', b'a'] {
                 server.send_to(&[byte], sources[&byte].1).await.unwrap();
                 let (len, client) = down.receive(&mut buf).await.unwrap();
-                assert_eq!(down.send(&buf[..len], client).unwrap(), Some(true));
+                assert_eq!(down.send(&buf[..len], client).await.unwrap(), Some(true));
             }
             assert_eq!(client_a.recv(&mut buf).await.unwrap(), 1);
             assert_eq!(buf[0], b'a');
