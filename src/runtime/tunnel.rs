@@ -181,6 +181,10 @@ impl Policy {
 
     pub fn validate(&self) -> Result<()> {
         ensure!(
+            !(self.game_mode && self.native_return),
+            "game mode and native bulk return are mutually exclusive"
+        );
+        ensure!(
             !self.game_mode || (self.adaptive && self.fec == automatic_fec::AUTO),
             "game mode requires adaptive scheduling and automatic FEC"
         );

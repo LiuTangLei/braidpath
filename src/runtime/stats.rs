@@ -315,6 +315,8 @@ pub struct Quinn {
     /// it does not prove that the kernel performed GSO.
     pub udp_io_operations_tx: u64,
     pub udp_io_operations_rx: u64,
+    #[cfg(test)]
+    pub stream_frames_tx: u64,
     pub http_datagram_frames_tx: u64,
     pub http_datagram_frames_rx: u64,
     /// Frame counts, not ACK bytes or physical egress bandwidth.
@@ -345,6 +347,8 @@ impl Quinn {
             udp_bytes_rx: q.udp_rx.bytes,
             udp_io_operations_tx: q.udp_tx.ios,
             udp_io_operations_rx: q.udp_rx.ios,
+            #[cfg(test)]
+            stream_frames_tx: q.frame_tx.stream,
             http_datagram_frames_tx: q.frame_tx.datagram,
             http_datagram_frames_rx: q.frame_rx.datagram,
             ack_frames_tx: q.frame_tx.acks,

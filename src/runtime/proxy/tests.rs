@@ -1112,7 +1112,7 @@ async fn data_blackhole_is_quarantined_and_rejoins_the_same_tcp_flow_after_recov
     })
     .await
     .expect("recovered path did not pass its isolated liveness probe");
-    let payload_symbols = || {
+    let native_frames = || {
         let snapshot = server_metrics
             .snapshot(false, "recovery-diagnostic", None)
             .unwrap();
@@ -1121,11 +1121,11 @@ async fn data_blackhole_is_quarantined_and_rejoins_the_same_tcp_flow_after_recov
             .unwrap()
             .values()
             .find(|path| path["peer_socket"].as_str() == Some(relay_peer.as_str()))
-            .expect("authenticated relay path")["quinn_admitted_originals"]
+            .expect("authenticated relay path")["quinn"]["stream_frames_tx"]
             .as_u64()
             .unwrap()
     };
-    let before = payload_symbols();
+    let before = native_frames();
     go.send(()).unwrap();
     let received = timeout(Duration::from_secs(8), transfer)
         .await
@@ -1134,10 +1134,10 @@ async fn data_blackhole_is_quarantined_and_rejoins_the_same_tcp_flow_after_recov
     assert_eq!(received.len(), 64 * 1024 * 1024);
     assert!(received.iter().all(|b| *b == 71));
     assert!(
-        // Count payload symbols, excluding control/probe bytes. A restored
-        // path can still be rate-limited while the healthy path finishes.
-        payload_symbols() > before,
-        "restored path never resumed carrying payload; server paths={}",
+        // The default now sends bulk return data as STREAM frames. A burst of
+        // at least 32 frames excludes isolated HTTP/3 control and probe traffic.
+        native_frames() >= before + 32,
+        "restored path never resumed carrying native bulk payload; server paths={}",
         server_metrics
             .snapshot(false, "recovery-diagnostic", None)
             .unwrap()["stats"]["paths"]
