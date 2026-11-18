@@ -748,6 +748,11 @@ impl Drop for Pool {
 }
 
 fn reliable_policy(game_mode: bool) -> tunnel::Policy {
+    let rate = if game_mode {
+        tunnel::GAME_RATE_BPS
+    } else {
+        crate::runtime::MAX_RATE_BPS
+    };
     tunnel::Policy {
         game_mode,
         native_return: !game_mode,
@@ -762,7 +767,7 @@ fn reliable_policy(game_mode: bool) -> tunnel::Policy {
         capacity_probe_bps: 0,
         probe_guided_recovery: false,
         latency_target_ms: 20,
-        group_rates: [crate::runtime::MAX_RATE_BPS; crate::runtime::MAX_PATHS],
+        group_rates: [rate; crate::runtime::MAX_PATHS],
         receiver_feedback: true,
         quality_schedule: true,
         fec: crate::runtime::automatic_fec::AUTO,
@@ -770,7 +775,7 @@ fn reliable_policy(game_mode: bool) -> tunnel::Policy {
         small_fec_bytes: 0,
         mixed_fec: false,
         redundancy: 30,
-        rate: crate::runtime::MAX_RATE_BPS,
+        rate,
         block_ms: if game_mode { 1 } else { 3 },
         queue_ms: 100,
     }
@@ -1036,6 +1041,14 @@ pub(super) async fn listen(
 mod lifecycle_tests {
     use super::*;
     use std::path::Path as FsPath;
+
+    #[test]
+    fn game_proxy_uses_the_low_rate_cap() {
+        let policy = reliable_policy(true);
+        assert_eq!(policy.rate, tunnel::GAME_RATE_BPS);
+        assert!(policy.validate().is_ok());
+        assert_eq!(reliable_policy(false).rate, crate::runtime::MAX_RATE_BPS);
+    }
 
     fn pool(root: &FsPath) -> Arc<Pool> {
         let server = root.join("server");

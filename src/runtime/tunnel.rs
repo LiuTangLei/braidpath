@@ -81,6 +81,7 @@ pub use tcp::Connector as StreamConnector;
 /// Encoded symbols up to this size are latency traffic: stream
 /// acknowledgments, keystrokes, DNS and similar small datagrams.
 const LATENCY_RECORD_BYTES: usize = 320;
+pub(crate) const GAME_RATE_BPS: u64 = 10_000_000;
 // Five original fragments for the Game preset's 4KiB packet plus one frame.
 const GAME_PACKET_RESERVE: usize = 6000;
 const WEBSITE: &str = "<!doctype html><html lang=\"en\"><meta charset=\"utf-8\"><title>Welcome</title><h1>Welcome</h1><p>This service is online.</p></html>\n";
@@ -1891,7 +1892,8 @@ async fn sender_with_game_input(
     let mut waiting: Option<WaitingSend> = None;
     let mut liveness: [liveness::Liveness; MAX_PATHS] = Default::default();
     let mut input_open = true;
-    let mut prefer_game_input = true;
+    const GAME_INPUT_BURST: usize = 4;
+    let mut consecutive_game_inputs = 0usize;
     let mut normal_input_due = false;
     let mut yield_after_drain = false;
     let mut native_credit: [native_return::Credit; MAX_PATHS] = Default::default();
@@ -1917,7 +1919,10 @@ async fn sender_with_game_input(
         let wait_started = profile.as_ref().map(|_| Instant::now());
         let queued_before_wait = queue.len();
         let native_pending_before_wait = waiting.is_some();
-        let priority = if prefer_game_input {
+        // Feed a short burst of game input without alternating every packet
+        // against a continuously ready bulk producer. Once the burst is
+        // consumed, the main select gives control and bulk their turn.
+        let priority = if consecutive_game_inputs < GAME_INPUT_BURST {
             game_input.as_mut().and_then(|rx| match rx.try_recv() {
                 Ok(record) => Some(SenderEvent::GameInput(Some(record))),
                 Err(mpsc::error::TryRecvError::Disconnected) => Some(SenderEvent::GameInput(None)),
@@ -1988,7 +1993,11 @@ async fn sender_with_game_input(
             }
             _ => {}
         }
-        prefer_game_input = !matches!(&event, SenderEvent::GameInput(_));
+        if matches!(&event, SenderEvent::GameInput(Some(_))) {
+            consecutive_game_inputs = (consecutive_game_inputs + 1).min(GAME_INPUT_BURST);
+        } else {
+            consecutive_game_inputs = 0;
+        }
         if matches!(&event, SenderEvent::GameInput(None)) {
             game_input = None;
             if !input_open {
