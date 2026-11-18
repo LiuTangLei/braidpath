@@ -6104,15 +6104,6 @@ async fn admit_path(
         conn.close(0u32.into(), b"session epoch expired");
         return Err(SessionExpired.into());
     }
-    confirm_mode(response.headers(), policy)?;
-    diagnostic.enter("http3", "peer_settings");
-    // Poll the driver so peer SETTINGS are processed before datagrams are used.
-    tokio::select! {
-        e=driver.wait_idle()=>bail!("HTTP/3 closed before settings: {e}"),
-        _=async {while !send.settings().enable_datagram(){tokio::time::sleep(Duration::from_millis(1)).await;}}=>{}
-    }
-    diagnostic.succeeded();
-    diagnostic.enter("path_admission", "admission");
     ensure!(
         response.status() == StatusCode::OK
             && response
@@ -6122,6 +6113,15 @@ async fn admit_path(
         "session admission rejected: {}",
         response.status()
     );
+    confirm_mode(response.headers(), policy)?;
+    diagnostic.enter("http3", "peer_settings");
+    // Poll the driver so peer SETTINGS are processed before datagrams are used.
+    tokio::select! {
+        e=driver.wait_idle()=>bail!("HTTP/3 closed before settings: {e}"),
+        _=async {while !send.settings().enable_datagram(){tokio::time::sleep(Duration::from_millis(1)).await;}}=>{}
+    }
+    diagnostic.succeeded();
+    diagnostic.enter("path_admission", "admission");
     ensure!(
         response
             .headers()

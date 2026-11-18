@@ -281,24 +281,26 @@ impl Wire {
                 readers,
                 ..
             } => {
-                if !sockets.contains_key(&from) {
-                    if sockets.len() == 32 {
-                        return Ok(None);
-                    }
-                    let (socket, _) = tokio_socket("multi_peer_upstream")?;
-                    let receive = socket.clone();
-                    let replies = replies.clone();
-                    readers.spawn(async move {
-                        let mut buf = vec![0; MAX_DATAGRAM];
-                        while let Ok((n, _)) = receive.recv_from(&mut buf).await {
-                            if replies.send((from, buf[..n].to_vec())).await.is_err() {
-                                break;
-                            }
-                        }
-                    });
-                    sockets.insert(from, socket);
+                if let Some(socket) = sockets.get(&from) {
+                    return Ok(Some(socket.try_send_to(data, *server).is_ok()));
                 }
-                sockets[&from].try_send_to(data, *server).is_ok()
+                if sockets.len() == 32 {
+                    return Ok(None);
+                }
+                let (socket, _) = tokio_socket("multi_peer_upstream")?;
+                let receive = socket.clone();
+                let replies = replies.clone();
+                readers.spawn(async move {
+                    let mut buf = vec![0; MAX_DATAGRAM];
+                    while let Ok((n, _)) = receive.recv_from(&mut buf).await {
+                        if replies.send((from, buf[..n].to_vec())).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+                let sent = socket.try_send_to(data, *server).is_ok();
+                sockets.insert(from, socket);
+                sent
             }
         };
         Ok(Some(sent))
