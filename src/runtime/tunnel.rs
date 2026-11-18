@@ -5295,48 +5295,130 @@ async fn drive_client_path(
         .then(|| profile::NativeReader::new(conn.stable_id()))
         .flatten()
         .map(Mutex::new);
-    let result:Result<()>=async {
-        // Keep the entire body reader pinned as its own branch. A native
-        // queue or byte-credit wait can then yield to application DATAGRAMs,
-        // without canceling a partially decoded frame on each read.
-        let body = async {
-            let mut decoder = native_return::Decoder::default();
-            while let Some(mut body) = request.recv_data().await? {
-                ensure!(native_return, "unexpected reliable response data");
+    let handle_datagram = |d: Bytes| {
+        if let Some(reader) = &native_reader {
+            reader
+                .lock()
+                .expect("native profile lock")
+                .datagram(Instant::now());
+        }
+        trace_http(
+            &returning,
+            trace::Stage::PeerHttpReceived,
+            &d,
+            stream,
+            feedback,
+            trace_key,
+            None,
+        );
+        returning.path(pid, |p| p.http_datagrams_received += 1);
+        if let Ok(p) = wire::http_payload(&d, stream)
+            && p.len() <= payload::wire_limit(stream_payload, feedback)
+        {
+            match measured_payload(
+                &path_view,
+                pid,
+                p,
+                feedback,
+                &measurement_scope,
+                observation_notify.as_deref(),
+            ) {
+                Ok(Some(p)) => {
+                    if let Err(error) = tx.try_send((pid, p)) {
+                        returning.trace_symbol(
+                            trace::Stage::SymbolDropped,
+                            &rejected_item(&error).1,
+                            Some(trace_key),
+                            Some(d.len()),
+                            Some(queue_trace_reason(QueueLayer::Receiver, &error)),
+                        );
+                        ingress_drops.fetch_add(1, Ordering::Relaxed);
+                        queue_error(&returning, QueueLayer::Receiver, &error, Some(pid));
+                    }
+                }
+                Ok(None) => {}
+                Err(_) => {
+                    trace_http(
+                        &returning,
+                        trace::Stage::SymbolDropped,
+                        &d,
+                        stream,
+                        feedback,
+                        trace_key,
+                        Some(trace::Reason::InvalidHttp),
+                    );
+                    returning.path(pid, |p| p.invalid_http_datagrams_dropped += 1);
+                }
+            }
+        } else {
+            trace_http(
+                &returning,
+                trace::Stage::SymbolDropped,
+                &d,
+                stream,
+                feedback,
+                trace_key,
+                Some(trace::Reason::InvalidHttp),
+            );
+            returning.path(pid, |p| p.invalid_http_datagrams_dropped += 1);
+            returning.update(|d| d.records.invalid_symbols_dropped += 1);
+        }
+    };
+    let result: Result<()> = async {
+        let mut decoder = native_return::Decoder::default();
+        loop {
+            let mut body = tokio::select! {
+                e = driver.wait_idle() => return Err(e.into()),
+                body = request.recv_data() => {
+                    let Some(body) = body? else { return decoder.finish() };
+                    ensure!(native_return, "unexpected reliable response data");
+                    body
+                },
+                d = conn.read_datagram() => {
+                    handle_datagram(d?);
+                    continue;
+                },
+            };
+            // Finish this chunk before reading another. Keep decoding pinned
+            // across DATAGRAM reads when native admission has to wait.
+            let admission = async {
                 while let Some(record) = decoder.next(&mut body)? {
                     if let Some(reader) = &native_reader {
                         reader.lock().expect("native profile lock").record();
                     }
                     let incoming = profile::native_admission(
-                        native_reader.as_ref(), profile::NativeAdmission::Budget,
+                        native_reader.as_ref(),
+                        profile::NativeAdmission::Budget,
                         || conn.stats().frame_rx.datagram,
                         native_return::Incoming::new(record),
-                    ).await?;
+                    )
+                    .await?;
                     profile::native_admission(
-                        native_reader.as_ref(), profile::NativeAdmission::Channel,
+                        native_reader.as_ref(),
+                        profile::NativeAdmission::Channel,
                         || conn.stats().frame_rx.datagram,
                         native_tx.send(incoming),
-                    ).await.context("native stream receiver closed")?;
+                    )
+                    .await
+                    .context("native stream receiver closed")?;
+                }
+                Ok::<(), anyhow::Error>(())
+            };
+            tokio::pin!(admission);
+            loop {
+                tokio::select! {
+                    biased;
+                    result = &mut admission => {
+                        result?;
+                        break;
+                    },
+                    e = driver.wait_idle() => return Err(e.into()),
+                    d = conn.read_datagram() => handle_datagram(d?),
                 }
             }
-            decoder.finish()
-        };
-        tokio::pin!(body);
-        loop {tokio::select! {
-                        e=driver.wait_idle()=>return Err(e.into()),
-                        result=&mut body=>return result,
-                        d=conn.read_datagram()=>match d {
-                            Ok(d)=>{
-                                if let Some(reader)=&native_reader {reader.lock().expect("native profile lock").datagram(Instant::now());}
-                                trace_http(&returning,trace::Stage::PeerHttpReceived,&d,stream,feedback,trace_key,None);
-                                returning.path(pid,|p|p.http_datagrams_received+=1);
-                                if let Ok(p)=wire::http_payload(&d,stream) && p.len()<=payload::wire_limit(stream_payload,feedback) {
-                                    match measured_payload(&path_view,pid,p,feedback,&measurement_scope,observation_notify.as_deref()) {Ok(Some(p))=>{if let Err(error)=tx.try_send((pid,p)){returning.trace_symbol(trace::Stage::SymbolDropped,&rejected_item(&error).1,Some(trace_key),Some(d.len()),Some(queue_trace_reason(QueueLayer::Receiver,&error)));ingress_drops.fetch_add(1,Ordering::Relaxed);queue_error(&returning,QueueLayer::Receiver,&error,Some(pid));}},Ok(None)=>{},Err(_)=>{trace_http(&returning,trace::Stage::SymbolDropped,&d,stream,feedback,trace_key,Some(trace::Reason::InvalidHttp));returning.path(pid,|p|p.invalid_http_datagrams_dropped+=1);}}
-                                }else{trace_http(&returning,trace::Stage::SymbolDropped,&d,stream,feedback,trace_key,Some(trace::Reason::InvalidHttp));returning.path(pid,|p|p.invalid_http_datagrams_dropped+=1);returning.update(|d|d.records.invalid_symbols_dropped+=1);}
-                            },
-                            Err(e)=>return Err(e.into()),
-                        }
-                    }}}.await;
+        }
+    }
+    .await;
     let normal = diagnostic.finish(result.as_ref().err());
     let close = conn.close_reason();
     let (cause, application_code) = path_close_label(close.as_ref());
