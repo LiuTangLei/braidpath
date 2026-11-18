@@ -1516,10 +1516,14 @@ impl Mux {
 
     pub(super) fn receive_native(&mut self, mut incoming: native_return::Incoming) {
         self.admissions();
-        if self.receive_frame(incoming.decoded.stream_id, &mut incoming.decoded.frame)
-            == Receive::Deferred
-        {
-            self.native_pending.push_back(incoming);
+        let size = match &incoming.decoded.frame {
+            Frame::Data { data, .. } => data.len() as u64,
+            _ => 0,
+        };
+        match self.receive_frame(incoming.decoded.stream_id, &mut incoming.decoded.frame) {
+            Receive::Deferred => self.native_pending.push_back(incoming),
+            Receive::Accepted => self.stats.native_return_accepted_bytes += size,
+            Receive::Duplicate | Receive::Closed => {}
         }
     }
 
@@ -1532,8 +1536,8 @@ impl Mux {
         }
     }
 
-    pub(super) fn native_credit_watch(&self) -> Option<Arc<Notify>> {
-        self.native_return.then(|| self.budget.receive_credit())
+    pub(super) fn native_credit_watch(&self) -> Arc<Notify> {
+        self.budget.receive_credit()
     }
 
     pub(super) fn has_pending_native(&self) -> bool {

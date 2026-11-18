@@ -411,6 +411,8 @@ pub struct Path {
     pub send_buffer_full_attempts: u64,
     pub quinn_send_error_attempts: u64,
     pub writer_expired_game_datagrams: u64,
+    pub game_originals_admitted_by_quinn: u64,
+    pub game_copies_admitted_by_quinn: u64,
     pub http_datagrams_received: u64,
     pub receiver_queue_full_dropped: u64,
     pub receiver_queue_closed_dropped: u64,

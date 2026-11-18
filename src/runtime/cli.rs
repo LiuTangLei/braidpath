@@ -525,7 +525,7 @@ enum GameMode {
 struct PolicyArgs {
     /// Prefer low UDP delay: earliest-ready paths, immediate bounded protection,
     /// adaptive pacing, a 10 ms UDP target and a separate TCP admission budget of at least 80 ms.
-    #[arg(long, conflicts_with_all = ["fec", "fec_repairs", "small_fec_bytes", "mixed_fec", "latency_target_ms", "queue_ms", "block_ms", "capacity_probe_bps", "probe_guided_recovery", "native_return_stream"])]
+    #[arg(long, conflicts_with_all = ["fec", "fec_repairs", "small_fec_bytes", "mixed_fec", "latency_target_ms", "queue_ms", "block_ms", "capacity_probe_bps", "probe_guided_recovery"])]
     game_mode: bool,
     /// Use a negotiated reliable QUIC stream for TCP downloads; uploads and UDP stay unchanged.
     #[arg(long)]
@@ -1338,7 +1338,7 @@ mod tests {
 impl PolicyArgs {
     fn build(&self, rate: u64, group_rates: [u64; super::MAX_PATHS]) -> tunnel::Policy {
         let mut policy = tunnel::Policy {
-            game_mode: self.game_mode,
+            game_mode: false,
             native_return: self.native_return_stream,
             streams: false,
             proxy: false,
@@ -1363,13 +1363,7 @@ impl PolicyArgs {
             queue_ms: self.queue_ms,
         };
         if self.game_mode {
-            policy.adaptive = true;
-            policy.receiver_feedback = true;
-            policy.quality_schedule = true;
-            policy.fec = super::automatic_fec::AUTO;
-            policy.latency_target_ms = 20;
-            policy.queue_ms = 20;
-            policy.block_ms = 1;
+            policy.enable_game();
         }
         policy
     }
@@ -1411,7 +1405,7 @@ mod aggregate_cli_tests {
     }
 
     #[test]
-    fn download_and_game_presets_are_separate_for_both_client_entries() {
+    fn download_and_game_presets_can_combine_for_both_client_entries() {
         let entries = [
             vec![
                 "braidpath",
@@ -1444,15 +1438,15 @@ mod aggregate_cli_tests {
                 Cli::try_parse_from(entry.iter().copied().chain(["--native-return-stream"]))
                     .is_ok()
             );
-            let error = Cli::try_parse_from(
-                entry
-                    .iter()
-                    .copied()
-                    .chain(["--game-mode", "--native-return-stream"]),
-            )
-            .err()
-            .expect("combined presets must be rejected");
-            assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+            assert!(
+                Cli::try_parse_from(
+                    entry
+                        .iter()
+                        .copied()
+                        .chain(["--game-mode", "--native-return-stream"]),
+                )
+                .is_ok()
+            );
         }
     }
 

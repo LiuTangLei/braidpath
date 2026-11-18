@@ -206,6 +206,8 @@ pub struct Snapshot {
     pub receive_out_of_order_bytes: u64,
     pub bytes_from_application: u64,
     pub bytes_to_application: u64,
+    /// Payload bytes from accepted native records, including partial overlaps.
+    pub native_return_accepted_bytes: u64,
     pub segments_sent: u64,
     pub retransmitted_segments: u64,
     pub retransmitted_bytes: u64,

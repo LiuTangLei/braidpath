@@ -160,16 +160,26 @@ fn game_originals_and_copies_expire_at_ten_ms_while_tcp_can_wait_for_measured_se
 }
 
 #[test]
-fn game_mode_rejects_unknown_or_duplicate_negotiation() {
-    let mut h = http::HeaderMap::new();
-    assert!(!game_mode_header(&h).unwrap());
-    h.insert("braidpath-game-mode", "1".parse().unwrap());
-    assert!(game_mode_header(&h).unwrap());
-    h.append("braidpath-game-mode", "1".parse().unwrap());
-    assert!(game_mode_header(&h).is_err());
-    h.clear();
-    h.insert("braidpath-game-mode", "2".parse().unwrap());
-    assert!(game_mode_header(&h).is_err());
+fn versioned_session_policy_round_trips_and_rejects_malformed_or_wrong_echo() {
+    let mut headers = http::HeaderMap::new();
+    assert!(read_mode(&headers).is_err());
+    for (game, native) in [(false, false), (false, true), (true, false), (true, true)] {
+        let mut requested = policy();
+        requested.game_mode = game;
+        requested.native_return = native;
+        headers.insert(
+            MODE_HEADER,
+            http::HeaderValue::from_static(mode_value(game, native)),
+        );
+        assert_eq!(read_mode(&headers).unwrap(), (game, native));
+        assert!(confirm_mode(&headers, &requested).is_ok());
+        requested.native_return = !native;
+        assert!(confirm_mode(&headers, &requested).is_err());
+    }
+    headers.append(MODE_HEADER, http::HeaderValue::from_static("1/mixed"));
+    assert!(read_mode(&headers).is_err());
+    headers.insert(MODE_HEADER, http::HeaderValue::from_static("2/mixed"));
+    assert!(read_mode(&headers).is_err());
 }
 
 #[test]

@@ -78,7 +78,6 @@ pub(super) fn udp_order(order: Vec<usize>, paths: &[OutPath], target_ms: u64) ->
     routes.into_iter().map(|p| p.index).collect()
 }
 
-pub(super) const HEADER: &str = "braidpath-return-stream";
 pub(super) const PAYLOAD: usize = stream::RELIABLE_PAYLOAD;
 const HEADER_BYTES: usize = 16;
 // A native record spans multiple QUIC packets. Pay the same conservative
@@ -268,14 +267,6 @@ fn writer_channel(queue: usize) -> (Writer, Reader) {
     )
 }
 
-pub(super) fn requested(headers: &http::HeaderMap) -> Result<bool> {
-    let value = headers.get(HEADER).map(|v| v.to_str()).transpose()?;
-    ensure!(
-        matches!(value, None | Some("1")),
-        "unsupported return-stream format"
-    );
-    Ok(value.is_some())
-}
 pub(super) fn data(flow: u32, payload: &[u8]) -> bool {
     stream::stream_id(flow).is_some() && !stream::is_ack_flow(flow) && payload.first() == Some(&0)
 }

@@ -112,6 +112,16 @@ pub struct Policy {
     pub queue_ms: u64,
 }
 impl Policy {
+    pub(crate) fn enable_game(&mut self) {
+        self.game_mode = true;
+        self.adaptive = true;
+        self.receiver_feedback = true;
+        self.quality_schedule = true;
+        self.fec = automatic_fec::AUTO;
+        self.latency_target_ms = 20;
+        self.queue_ms = 20;
+        self.block_ms = 1;
+    }
     fn gaming_datagram(&self, flow: Option<u32>) -> bool {
         self.game_mode && flow.is_some_and(|flow| stream::stream_id(flow).is_none())
     }
@@ -286,20 +296,36 @@ pub(super) fn parse_fec(value: &str) -> std::result::Result<u8, String> {
         .ok_or_else(|| "FEC must be auto or 0..32".to_owned())
 }
 
-fn game_mode_header(headers: &http::HeaderMap) -> Result<bool> {
-    ensure!(
-        headers.get_all("braidpath-game-mode").iter().count() <= 1,
-        "duplicate game mode header"
-    );
-    match headers
-        .get("braidpath-game-mode")
-        .map(|v| v.to_str())
-        .transpose()?
-    {
-        None => Ok(false),
-        Some("1") => Ok(true),
-        _ => bail!("unsupported game mode"),
+const MODE_HEADER: &str = "braidpath-policy";
+
+fn mode_value(game: bool, native: bool) -> &'static str {
+    match (game, native) {
+        (false, false) => "1/datagram",
+        (false, true) => "1/native",
+        (true, false) => "1/game",
+        (true, true) => "1/mixed",
     }
+}
+
+fn read_mode(headers: &http::HeaderMap) -> Result<(bool, bool)> {
+    let mut values = headers.get_all(MODE_HEADER).into_iter();
+    let value = values.next().context("missing session policy")?.to_str()?;
+    ensure!(values.next().is_none(), "duplicate session policy");
+    match value {
+        "1/datagram" => Ok((false, false)),
+        "1/native" => Ok((false, true)),
+        "1/game" => Ok((true, false)),
+        "1/mixed" => Ok((true, true)),
+        _ => bail!("unsupported session policy"),
+    }
+}
+
+fn confirm_mode(headers: &http::HeaderMap, policy: &Policy) -> Result<()> {
+    ensure!(
+        read_mode(headers)? == (policy.game_mode, policy.native_return),
+        "session policy not negotiated"
+    );
+    Ok(())
 }
 
 fn mixed_fec_header(headers: &http::HeaderMap) -> Result<bool> {
@@ -4649,8 +4675,7 @@ async fn server_connection(
                                 ensure!(!streams || tcp.fixed.is_some(),"TCP streams are not enabled on this server");
                                 ensure!(!proxy || tcp.proxy.is_some(),"proxy streams are not enabled on this server");
                                 let stream_payload=payload::negotiate(req.headers(),streams || proxy)?;
-                                let native_return=native_return::requested(req.headers())?;
-                                let game_mode=game_mode_header(req.headers())?;
+                                let (game_mode,native_return)=read_mode(req.headers())?;
                                 ensure!(!native_return || streams || proxy,"return stream requires TCP profile");
                                 let (return_writer,return_reader)=if native_return { let (tx,rx)=if game_mode { native_return::mixed_channel() } else { native_return::channel() }; (Some(tx),Some(rx)) } else { (None,None) };
                                 let policy=Policy{game_mode,native_return,max_message_bytes,streams,proxy,
@@ -4723,8 +4748,7 @@ async fn server_connection(
                                 if header("braidpath-fec")?=="auto" {response=response.header("braidpath-auto-small","1");}
                                 if streams {response=response.header("braidpath-streams","2");}
                                 if proxy {response=response.header("braidpath-proxy","2");}
-                                if native_return {response=response.header(native_return::HEADER,"1");}
-                                if game_mode {response=response.header("braidpath-game-mode","1");}
+                                response=response.header(MODE_HEADER,mode_value(game_mode,native_return));
                                 if fec_repairs==2 {response=response.header("braidpath-fec-repairs","2");}
                                 if capacity_probe_bps>0 {response=response.header("braidpath-capacity-probe-bps",capacity_probe_bps).header("braidpath-capacity-probe-format",capacity_probe::FORMAT);}
                                 if probe_guided_recovery {response=response.header("braidpath-probe-guided-recovery","1");}
@@ -5360,7 +5384,10 @@ async fn client_session(
     let mut has_session = false;
     let mut announced = false;
     let mut last_stats = 0u64;
-    let native_credit = streams.as_ref().and_then(tcp::Mux::native_credit_watch);
+    let native_credit = streams
+        .as_ref()
+        .filter(|_| options.policy.native_return)
+        .map(tcp::Mux::native_credit_watch);
     let result:Result<()>=async {loop {
         let credit_changed = native_credit.as_ref().map(|credit| credit.notified());
         if let Some(mux)=streams.as_mut() {
@@ -6052,12 +6079,10 @@ async fn admit_path(
     if policy.streams || policy.proxy {
         req = req.header(payload::HEADER, super::MAX_STREAM_PAYLOAD);
     }
-    if policy.native_return {
-        req = req.header(native_return::HEADER, "1");
-    }
-    if policy.game_mode {
-        req = req.header("braidpath-game-mode", "1");
-    }
+    req = req.header(
+        MODE_HEADER,
+        mode_value(policy.game_mode, policy.native_return),
+    );
     let req = req.body(())?;
     // Sent without waiting for peer SETTINGS, so that 0-RTT saves its round trip.
     let mut stream = send.send_request(req).await?;
@@ -6079,14 +6104,7 @@ async fn admit_path(
         conn.close(0u32.into(), b"session epoch expired");
         return Err(SessionExpired.into());
     }
-    ensure!(
-        native_return::requested(response.headers())? == policy.native_return,
-        "return-stream capability not negotiated"
-    );
-    ensure!(
-        game_mode_header(response.headers())? == policy.game_mode,
-        "game mode capability not negotiated"
-    );
+    confirm_mode(response.headers(), policy)?;
     diagnostic.enter("http3", "peer_settings");
     // Poll the driver so peer SETTINGS are processed before datagrams are used.
     tokio::select! {

@@ -124,9 +124,9 @@ The default `--game-mode off` uses adaptive scheduling with native HTTP/3 return
 streams for bulk TCP responses on SOCKS5 and fixed TCP listeners. Small responses,
 stream control, and uploads retain their low-overhead DATAGRAM lanes. SOCKS5 UDP
 uses the dedicated per-exit association. Select `--game-mode on` for latency-sensitive
-UDP. It uses the aggregate Game scheduler for UDP associations and applies the
-existing server-wide proxy limits. Run separate instances for applications with
-different policies. Update all participating peers before enabling the new default.
+UDP. It uses the aggregate Game scheduler and native TCP return in the same
+per-exit session. Server-wide proxy limits apply in both modes. Upgrade participating
+clients and servers together to use the versioned session policy.
 
 Use `--socks5 node-a=127.0.0.1:2080` to override that exit's automatically
 assigned address. This replaces its listener rather than adding another one;

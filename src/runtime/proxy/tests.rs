@@ -1842,9 +1842,9 @@ async fn idle_streaming_flows_do_not_starve_an_active_flow_and_all_release() {
 }
 
 #[tokio::test]
-async fn game_socks_association_uses_aggregate_and_server_quota() {
+async fn game_socks_download_and_fragmented_udp_share_one_aggregate_session() {
     let root = tempfile::tempdir().unwrap();
-    let (at, _server) = start(root.path(), "a", None, true).await;
+    let (at, _server, server_metrics) = start_metered(root.path(), "a", None, true).await;
     let identity = identity(root.path(), "game-socks");
     let pool = client::Pool::new(
         identity.clone(),
@@ -1862,6 +1862,22 @@ async fn game_socks_association_uses_aggregate_and_server_quota() {
         let (n, peer) = destination.recv_from(&mut bytes).await.unwrap();
         destination.send_to(&bytes[..n], peer).await.unwrap();
     }));
+    let bulk = vec![67; 2 * 1024 * 1024];
+    let tcp_target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let target_at = tcp_target.local_addr().unwrap();
+    let expected = bulk.clone();
+    let (kick, start_download) = tokio::sync::oneshot::channel();
+    let bulk_source = Task(tokio::spawn(async move {
+        let (mut peer, _) = tcp_target.accept().await.unwrap();
+        start_download.await.unwrap();
+        peer.write_all(&bulk).await.unwrap();
+        peer.shutdown().await.unwrap();
+        let mut upstream = Vec::new();
+        peer.read_to_end(&mut upstream).await.unwrap();
+        assert_eq!(upstream, b"upload stays on DATAGRAM");
+    }));
+    let (mut download, status, _) = socks(listen, TCP, Address::Ip(target_at)).await;
+    assert_eq!(status, 0);
     let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let (control, status, bound) =
         socks(listen, UDP, Address::Ip(client.local_addr().unwrap())).await;
@@ -1873,14 +1889,94 @@ async fn game_socks_association_uses_aggregate_and_server_quota() {
     let mut packet = vec![0, 0, 0];
     Address::Ip(endpoint).encode(&mut packet);
     packet.extend_from_slice(&payload);
-    client.send_to(&packet, bound).await.unwrap();
-    let mut response = [0; 4096];
-    let (n, source) = timeout(Duration::from_secs(5), client.recv_from(&mut response))
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(source, bound);
-    assert_eq!(&response[..n], packet.as_slice());
+    kick.send(()).unwrap();
+    let mut delivered = Vec::new();
+    let tcp = async {
+        download
+            .write_all(b"upload stays on DATAGRAM")
+            .await
+            .unwrap();
+        download.shutdown().await.unwrap();
+        download.read_to_end(&mut delivered).await.unwrap();
+    };
+    let udp = async {
+        client.send_to(&packet, bound).await.unwrap();
+        let mut response = [0; 4096];
+        let (n, source) = client.recv_from(&mut response).await.unwrap();
+        assert_eq!(source, bound);
+        assert_eq!(&response[..n], packet.as_slice());
+    };
+    timeout(Duration::from_secs(10), async {
+        tokio::join!(tcp, udp);
+    })
+    .await
+    .unwrap();
+    assert_eq!(delivered, expected);
+    let stream_metrics = pool.test_stream_metrics("a");
+    let observed = timeout(Duration::from_secs(3), async {
+        loop {
+            let mut shared_session = None;
+            stream_metrics.state(|state| {
+                assert_eq!(state.sessions.len(), 1);
+                for (id, directions) in &state.sessions {
+                    if directions
+                        .get(stats::FORWARD)
+                        .and_then(|d| d.tcp_streams.as_ref())
+                        .is_some_and(|streams| {
+                            streams.native_return_accepted_bytes > 0
+                                && streams.udp_datagrams_from_tunnel == 1
+                        })
+                    {
+                        shared_session = Some(id.clone());
+                    }
+                }
+            });
+            if let Some(id) = shared_session {
+                let mut paths = 0;
+                server_metrics.state(|state| {
+                    paths = state
+                        .paths
+                        .values()
+                        .filter(|path| {
+                            path.session_id == id
+                                && path.authenticated
+                                && path.game_originals_admitted_by_quinn > 0
+                        })
+                        .count();
+                });
+                if paths == 1 {
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    if observed.is_err() {
+        stream_metrics.state(|state| {
+            for (session, dirs) in &state.sessions {
+                for (dir, stats) in dirs {
+                    eprintln!("{session} {dir} {:?}", stats.tcp_streams);
+                }
+            }
+        });
+        server_metrics.state(|state| {
+            for path in state.paths.values() {
+                eprintln!(
+                    "{}:{} {} auth={} game={} copies={}",
+                    path.session_id,
+                    path.path_id,
+                    path.sending_direction,
+                    path.authenticated,
+                    path.game_originals_admitted_by_quinn,
+                    path.game_copies_admitted_by_quinn
+                );
+            }
+        });
+        panic!("mixed session needs native data and the Game UDP original");
+    }
+
+    drop(bulk_source);
     let status = identity.status(at).await.unwrap().proxy.unwrap();
     assert_eq!(status.udp_associations, 1);
     assert_eq!(status.udp_destinations, 1);

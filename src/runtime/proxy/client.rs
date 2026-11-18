@@ -595,6 +595,11 @@ impl Pool {
         }
     }
     #[cfg(test)]
+    pub(super) fn test_stream_metrics(&self, id: &str) -> stats::Metrics {
+        self.slots[id].stream_metrics.clone()
+    }
+
+    #[cfg(test)]
     pub(super) fn transport_snapshot(
         &self,
         id: &str,
@@ -748,9 +753,9 @@ impl Drop for Pool {
 }
 
 fn reliable_policy(game_mode: bool) -> tunnel::Policy {
-    tunnel::Policy {
-        game_mode,
-        native_return: !game_mode,
+    let mut policy = tunnel::Policy {
+        game_mode: false,
+        native_return: true,
         max_message_bytes: if game_mode {
             crate::runtime::MAX_MESSAGE
         } else {
@@ -771,9 +776,13 @@ fn reliable_policy(game_mode: bool) -> tunnel::Policy {
         mixed_fec: false,
         redundancy: 30,
         rate: crate::runtime::MAX_RATE_BPS,
-        block_ms: if game_mode { 1 } else { 3 },
+        block_ms: 3,
         queue_ms: 100,
+    };
+    if game_mode {
+        policy.enable_game();
     }
+    policy
 }
 
 pub(super) fn validate_tcp_forwards(forwards: &[Listener], socks: &[Listener]) -> Result<()> {

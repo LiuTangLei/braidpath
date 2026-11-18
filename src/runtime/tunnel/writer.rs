@@ -262,11 +262,19 @@ async fn run(
                 }
                 result
             };
-            if matches!(result, Ok(false))
-                && let Some(watch) = &observations
-            {
+            if let (Priority::Game(packet), Some(watch)) = (&priority, &observations) {
                 watch.scope.path(watch.path.path_id, |p| {
-                    p.writer_expired_game_datagrams += 1;
+                    // An old writer can complete after the session replaces
+                    // its path. Keep new-generation stats independent.
+                    if p.connection_id != watch.path.connection_id as usize {
+                        return;
+                    }
+                    match result {
+                        Ok(false) => p.writer_expired_game_datagrams += 1,
+                        Ok(true) if packet.repair => p.game_copies_admitted_by_quinn += 1,
+                        Ok(true) => p.game_originals_admitted_by_quinn += 1,
+                        Err(_) => {}
+                    }
                 });
             }
             if !matches!(result, Ok(true))
