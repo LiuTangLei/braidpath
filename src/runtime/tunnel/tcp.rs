@@ -649,6 +649,7 @@ pub(super) struct Mux {
     datagrams: VecDeque<(u32, Vec<u8>, Option<Instant>)>,
     datagram_lifetime: Duration,
     max_message_bytes: usize,
+    next_game_delay_log: Instant,
 }
 
 impl Mux {
@@ -697,6 +698,7 @@ impl Mux {
             datagrams: VecDeque::new(),
             datagram_lifetime: policy.datagram_lifetime(),
             max_message_bytes: policy.max_message_bytes,
+            next_game_delay_log: now,
         }
     }
     /// Accepts local connections; the peer connects each stream onward.
@@ -776,9 +778,9 @@ impl Mux {
     }
 
     fn game_io(&mut self, queued: associate::QueuedIo) {
-        let wait = queued
-            .created
-            .elapsed()
+        let now = Instant::now();
+        let wait = now
+            .saturating_duration_since(queued.created)
             .as_micros()
             .min(u128::from(u64::MAX)) as u64;
         self.stats.udp_io_events_prioritized += 1;
@@ -786,6 +788,16 @@ impl Mux {
         self.stats.udp_io_wait_us_max = self.stats.udp_io_wait_us_max.max(wait);
         match queued.event {
             Io::Datagram(flow, payload) => {
+                if wait >= 30_000 && now >= self.next_game_delay_log {
+                    self.next_game_delay_log = now + Duration::from_millis(250);
+                    tracing::warn!(
+                        target: "braidpath::game_latency",
+                        reserve_us = queued.enqueued.saturating_duration_since(queued.created).as_micros() as u64,
+                        dispatch_us = now.saturating_duration_since(queued.enqueued).as_micros() as u64,
+                        pending = self.game_events.as_ref().map_or(0, |rx| rx.len()),
+                        "local Game datagram dispatch delayed"
+                    );
+                }
                 self.queue_datagram_at(flow, payload, Some(queued.created));
             }
             event => self.io(event),
@@ -2110,6 +2122,7 @@ mod tests {
                 .try_send(associate::QueuedIo {
                     event: Io::Datagram(associate::FLAG | 1, vec![7; 128]),
                     created,
+                    enqueued: created,
                 })
                 .unwrap();
         }
@@ -2146,6 +2159,7 @@ mod tests {
         game.game_io(associate::QueuedIo {
             event: Io::Datagram(associate::FLAG | 1, vec![7; 128]),
             created: old,
+            enqueued: old,
         });
         assert!(game.datagrams.is_empty());
         assert_eq!(game.stats.udp_datagrams_dropped, 1);
