@@ -2285,6 +2285,7 @@ async fn sender_with_game_input(
                                 sent_symbols: q.snapshot.sent_symbols,
                                 expected: estimate.expected,
                                 lost: estimate.lost,
+                                local_unsent: estimate.local_unsent,
                                 received_bytes: estimate.received_bytes,
                                 report_time_us: estimate.report_time_us,
                             },
@@ -2382,7 +2383,7 @@ async fn sender_with_game_input(
                         && policy.redundancy == 0
                         && path.open(),
                     feedback_sample_symbols: estimate.sample_symbols,
-                    finalized_expected: Some(estimate.expected),
+                    finalized_expected: Some(estimate.expected - estimate.local_unsent),
                     finalized_lost: Some(estimate.lost),
                     admitted_symbols: Some(snapshot.sent_symbols),
                     admitted_symbol_bytes: Some(snapshot.sent_bytes),
@@ -4644,12 +4645,14 @@ async fn server_connection(
                                             let mut generations=session.generations.lock().expect("generation lock");
                                             scheduler::admit_generation(&mut generations[usize::from(pid)],generation)?;
                                             if let Some(i)=existing {paths.remove(i).conn.close(0u32.into(),b"path rejoined");}
+                                            let quality = Arc::new(Mutex::new(quality::State::new(generation)));
                                             paths.push(OutPath{id:pid,group,conn:conn.clone(),writer:writer::Writer::spawn(&conn, Some(writer::Observations {
                                                 scope: session.returning.clone(),
                                                 path: trace::PathKey { path_id: pid, generation, connection_id: conn.stable_id() as u64 },
                                                 stream: stream_id,
                                                 feedback: session.policy.receiver_feedback,
-                                            })),stream:stream_id,stream_payload,native_return:return_writer,quality:Arc::new(Mutex::new(quality::State::new(generation))),capacity_probe:Arc::new(Mutex::new(capacity_probe::State::new(generation))),capacity_probe_enabled:capacity_probe_bps>0,epoch:Instant::now(),probe_reply:Arc::new(Mutex::new(None))});
+                                                game_quality: (session.policy.game_mode && session.policy.receiver_feedback).then(|| quality.clone()),
+                                            })),stream:stream_id,stream_payload,native_return:return_writer,quality,capacity_probe:Arc::new(Mutex::new(capacity_probe::State::new(generation))),capacity_probe_enabled:capacity_probe_bps>0,epoch:Instant::now(),probe_reply:Arc::new(Mutex::new(None))});
                                             *session.empty_since.lock().expect("empty time lock")=None;
                                         }
                                         Some(session)
@@ -5494,14 +5497,16 @@ async fn client_session(
                             let mut active=paths.lock().expect("paths lock");
                             for old in active.iter().filter(|p|p.id==pid) {old.conn.close(0u32.into(),b"path replaced");}
                             active.retain(|p|p.id!=pid);
+                            let quality = Arc::new(Mutex::new(quality::State::new(generation)));
                             active.push(OutPath{id:pid,group:configs[id].group,conn:value.conn.clone(),stream:value.stream,stream_payload:value.stream_payload,
                                 native_return:None,writer:writer::Writer::spawn(&value.conn, Some(writer::Observations {
                                     scope: forward.clone(),
                                     path: trace::PathKey { path_id: pid, generation, connection_id: value.conn.stable_id() as u64 },
                                     stream: value.stream,
                                     feedback: options.policy.receiver_feedback,
+                                    game_quality: (options.policy.game_mode && options.policy.receiver_feedback).then(|| quality.clone()),
                                 })),
-                                quality:Arc::new(Mutex::new(quality::State::new(generation))),capacity_probe:Arc::new(Mutex::new(capacity_probe::State::new(generation))),capacity_probe_enabled:options.policy.capacity_probe_bps>0,epoch:Instant::now(),
+                                quality,capacity_probe:Arc::new(Mutex::new(capacity_probe::State::new(generation))),capacity_probe_enabled:options.policy.capacity_probe_bps>0,epoch:Instant::now(),
                                 probe_reply:Arc::new(Mutex::new(None))});
                         }
                         if let Some(old)=endpoints[id].replace(value.endpoint) {old.close(0u32.into(),b"path replaced");}

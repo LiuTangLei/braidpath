@@ -15,6 +15,8 @@ const DELIVERY_MIN_BYTES: u64 = 4096;
 // 512-packet history lasts only about 4 ms at 1 Gbit/s, despite the 500 ms
 // loss-finalization grace below. Allocate the bounded bitmap only on receipt.
 const WINDOW: u64 = 1 << 20;
+// Only unresolved writer-local drops need exact sequence identities.
+const MAX_PENDING_UNSENT: usize = 8192;
 const ENTRY: usize = 49;
 const ENTRY_V2: usize = 65;
 
@@ -122,6 +124,8 @@ pub struct Estimate {
     pub expected: u64,
     pub received: u64,
     pub lost: u64,
+    /// Finalized sequence slots discarded before Quinn accepted the datagram.
+    pub local_unsent: u64,
     pub loss_rate: f64,
     /// Receiver transit delta above its running minimum; never absolute latency.
     pub delay_variation_ms: f64,
@@ -174,6 +178,7 @@ pub struct State {
     watermark: u64,
     transit_min: Option<i128>,
     peer_report: u64,
+    pending_unsent: BTreeSet<u64>,
     peer_report_time_us: Option<u64>,
     last_full_report: Option<Report>,
     last_reported_received_bytes: u64,
@@ -192,6 +197,7 @@ impl State {
             watermark: 0,
             transit_min: None,
             peer_report: 0,
+            pending_unsent: BTreeSet::new(),
             peer_report_time_us: None,
             last_full_report: None,
             last_reported_received_bytes: 0,
@@ -209,6 +215,21 @@ impl State {
         self.snapshot.sent_symbols = self.snapshot.sent_symbols.saturating_add(1);
         self.snapshot.sent_bytes = self.snapshot.sent_bytes.saturating_add(bytes as u64);
     }
+    pub fn writer_discarded(&mut self, payload: &[u8]) {
+        if payload.len() < HEADER
+            || !payload.starts_with(b"BQ1D")
+            || number(payload, 4) != self.snapshot.generation
+        {
+            return;
+        }
+        let seq = number(payload, 12);
+        if seq >= self.snapshot.sender_estimate.expected
+            && self.pending_unsent.len() < MAX_PENDING_UNSENT
+        {
+            self.pending_unsent.insert(seq);
+        }
+    }
+
     pub fn probe_admitted(&mut self, nonce: u64, now_us: u64) {
         if self.probes.len() == 4 {
             self.probes.pop_front();
@@ -417,10 +438,23 @@ impl State {
             delta_received <= delta_expected,
             "inconsistent cumulative feedback"
         );
-        let rate = if delta_expected == 0 {
+        let mut local_unsent = 0;
+        while self
+            .pending_unsent
+            .first()
+            .is_some_and(|seq| *seq < r.expected)
+        {
+            self.pending_unsent.pop_first();
+            local_unsent += 1;
+        }
+        // Preserve raw sequence watermarks for wire validation. Only the
+        // subset that entered Quinn can contribute a network loss sample.
+        let local_unsent = local_unsent.min(delta_expected - delta_received);
+        let network_expected = delta_expected - local_unsent;
+        let rate = if network_expected == 0 {
             old.loss_rate
         } else {
-            1.0 - delta_received as f64 / delta_expected as f64
+            1.0 - delta_received as f64 / network_expected as f64
         };
         let sample_span_us = if r.report_time_us != 0 {
             self.peer_report_time_us
@@ -442,8 +476,9 @@ impl State {
         self.snapshot.sender_estimate = Estimate {
             expected: r.expected,
             received: r.received,
-            lost: r.expected - r.received,
-            loss_rate: if delta_expected == 0 {
+            lost: old.lost + network_expected - delta_received,
+            local_unsent: old.local_unsent + local_unsent,
+            loss_rate: if network_expected == 0 {
                 old.loss_rate
             } else if old.updated_us.is_none() {
                 rate
@@ -452,7 +487,7 @@ impl State {
             },
             delay_variation_ms: r.delay_us as f64 / 1000.0,
             report_number: r.number,
-            updated_us: if delta_expected == 0 {
+            updated_us: if network_expected == 0 {
                 old.updated_us
             } else {
                 Some(now_us)
@@ -473,8 +508,8 @@ impl State {
             delivered_bps,
             report_time_us: (r.report_time_us != 0).then_some(r.report_time_us),
             sample_span_us,
-            sample_symbols: delta_expected,
-            sample_loss_rate: if delta_expected == 0 {
+            sample_symbols: network_expected,
+            sample_loss_rate: if network_expected == 0 {
                 old.sample_loss_rate
             } else {
                 rate
@@ -649,6 +684,47 @@ mod tests {
                 if missing == 0 { 0 } else { 32 }
             );
         }
+    }
+
+    #[test]
+    fn writer_local_drops_are_removed_from_the_matching_loss_interval() {
+        let mut sender = State::new(7);
+        let mut peer = State::new(7);
+        let mut frames = Vec::new();
+        for _ in 0..5 {
+            frames.push(sender.wrap(&payload(), 0));
+            sender.admitted(payload().len());
+        }
+        // Reordered writer failures, plus a duplicate notification.
+        for index in [4, 1, 1] {
+            sender.writer_discarded(&frames[index]);
+        }
+        peer.receive(&frames[0], 2).unwrap();
+        peer.receive(&frames[3], 2).unwrap();
+        let mut report = peer.report(0, INTERVAL_US + 3);
+        assert_eq!((report.expected, report.received), (4, 2));
+        sender.apply(&report, INTERVAL_US + 3).unwrap();
+        let first = &sender.snapshot.sender_estimate;
+        assert_eq!((first.expected, first.lost, first.local_unsent), (4, 1, 1));
+        assert_eq!(first.sample_symbols, 3);
+        assert!((first.sample_loss_rate - 1.0 / 3.0).abs() < 1e-10);
+
+        // A later watermark finalizes only another local drop.
+        report.number += 1;
+        report.expected = 5;
+        report.report_time_us += INTERVAL_US;
+        sender.apply(&report, 2 * INTERVAL_US + 3).unwrap();
+        let final_estimate = &sender.snapshot.sender_estimate;
+        assert_eq!(
+            (
+                final_estimate.expected,
+                final_estimate.lost,
+                final_estimate.local_unsent
+            ),
+            (5, 1, 2)
+        );
+        assert_eq!(final_estimate.sample_symbols, 0);
+        assert_eq!(final_estimate.updated_us, Some(INTERVAL_US + 3));
     }
 
     #[test]

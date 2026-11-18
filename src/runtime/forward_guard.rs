@@ -95,6 +95,7 @@ pub struct Counts {
     pub sent_symbols: u64,
     pub expected: u64,
     pub lost: u64,
+    pub local_unsent: u64,
     /// Unique received symbol bytes, independent of FEC recovery.
     pub received_bytes: u64,
     /// Receiver-local time of that byte report; never a sender timestamp.
@@ -515,11 +516,17 @@ impl Guard {
                 && counts.lost >= old.lost
             {
                 let expected = counts.expected - old.expected;
-                self.expected[id] += expected;
-                self.lost[id] += (counts.lost - old.lost).min(expected);
-                if expected > 0 {
-                    if let Some(cohort) =
-                        self.admissions[id].cohort(counts.generation, old.expected, counts.expected)
+                let network_expected =
+                    expected.saturating_sub(counts.local_unsent.saturating_sub(old.local_unsent));
+                self.expected[id] += network_expected;
+                self.lost[id] += (counts.lost - old.lost).min(network_expected);
+                if network_expected > 0 {
+                    if network_expected == expected
+                        && let Some(cohort) = self.admissions[id].cohort(
+                            counts.generation,
+                            old.expected,
+                            counts.expected,
+                        )
                     {
                         self.cohorts[id].bytes += cohort.bytes;
                         self.cohorts[id].span_us += cohort.span_us;
@@ -1010,6 +1017,7 @@ mod tests {
                     sent_symbols: 0,
                     expected: 0,
                     lost: 0,
+                    local_unsent: 0,
                     received_bytes: 0,
                     report_time_us: Some(1_000_000),
                 }; 4],
@@ -1534,6 +1542,7 @@ mod tests {
             sent_symbols: 10_000,
             expected: 0,
             lost: 0,
+            local_unsent: 0,
             received_bytes: 0,
             report_time_us: Some(1_000_000),
         };
@@ -1788,6 +1797,7 @@ mod tests {
                         sent_symbols: 0,
                         expected: 0,
                         lost: 0,
+                        local_unsent: 0,
                         received_bytes: 0,
                         report_time_us: Some(now),
                     }; 4];

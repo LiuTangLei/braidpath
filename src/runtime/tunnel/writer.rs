@@ -12,7 +12,7 @@
 //! with segmentation offload); a slow path keeps one datagram in flight
 //! locally, as before.
 
-use super::{Scope, trace, trace_http};
+use super::{Scope, quality, trace, trace_http, wire};
 use bytes::Bytes;
 use std::{
     collections::VecDeque,
@@ -45,6 +45,7 @@ pub(super) struct Observations {
     pub path: trace::PathKey,
     pub stream: u64,
     pub feedback: bool,
+    pub game_quality: Option<Arc<Mutex<quality::State>>>,
 }
 
 struct Frame {
@@ -239,11 +240,14 @@ async fn run(
             // charge. Its locked deadline check also covers lock contention.
             let Frame { data, priority } = frame;
             let len = data.len();
-            let tracing = observations
+            let watching = observations
                 .as_ref()
-                .filter(|watch| watch.scope.metrics.trace().enabled())
-                .filter(|_| !matches!(priority, Priority::Control))
-                .map(|_| data.clone());
+                .filter(|_| !matches!(priority, Priority::Control));
+            let tracing = watching.is_some_and(|watch| watch.scope.metrics.trace().enabled());
+            let game_quality = watching
+                .filter(|_| matches!(priority, Priority::Game(_)))
+                .and_then(|watch| watch.game_quality.as_ref());
+            let observed = (tracing || game_quality.is_some()).then(|| data.clone());
             let deadline = priority.deadline();
             let result = if deadline.is_some_and(|at| Instant::now() >= at) {
                 Ok(false)
@@ -265,7 +269,17 @@ async fn run(
                     p.writer_expired_game_datagrams += 1;
                 });
             }
-            if let (Some(watch), Some(data)) = (&observations, tracing) {
+            if !matches!(result, Ok(true))
+                && let (Some(quality), Some(watch), Some(data)) =
+                    (game_quality, watching, &observed)
+                && let Ok(payload) = wire::http_payload(data, watch.stream)
+            {
+                quality
+                    .lock()
+                    .expect("quality lock")
+                    .writer_discarded(payload);
+            }
+            if tracing && let (Some(watch), Some(data)) = (watching, observed) {
                 let (stage, reason) = match result {
                     Ok(true) => (trace::Stage::QuinnApiAdmitted, None),
                     Ok(false) => (trace::Stage::SymbolDropped, Some(trace::Reason::Expired)),
