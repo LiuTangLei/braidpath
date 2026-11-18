@@ -201,9 +201,11 @@ class Target(threading.Thread):
 class Echo(threading.Thread):
     """Echo every byte back, for the interactive probes; one thread per connection."""
 
-    def __init__(self):
+    def __init__(self, request_bytes=0):
         super().__init__(daemon=True)
         self.listener = socket.create_server(("127.0.0.1", 0), backlog=64)
+        self.request_bytes = request_bytes
+        self.requests = {}
         self.address = "127.0.0.1:%d" % self.listener.getsockname()[1]
 
     @staticmethod
@@ -212,11 +214,22 @@ class Echo(threading.Thread):
             while chunk := conn.recv(4096):
                 conn.sendall(chunk)
 
+    def serve_request(self, conn):
+        with contextlib.suppress(OSError, RuntimeError), conn:
+            conn.settimeout(10)
+            conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            request = mixed_load.read_exact(conn, self.request_bytes)
+            arrived = time.monotonic()
+            conn.sendall(request)
+            sequence = struct.unpack_from("!Q", request)[0]
+            self.requests[sequence] = {"arrived_monotonic": arrived,
+                                       "replied_monotonic": time.monotonic()}
+
     def run(self):
         with contextlib.suppress(OSError):
             while True:
                 conn, _ = self.listener.accept()
-                threading.Thread(target=self.serve, args=(conn,), daemon=True).start()
+                threading.Thread(target=self.serve_request if self.request_bytes else self.serve, args=(conn,), daemon=True).start()
 
 
 def rtt_summary(rtts, timeouts=0, error=None):
@@ -525,7 +538,11 @@ def run(args):
         for target in targets.values():
             target.start()
         target = targets.get(directions[0])
-        echo = Echo() if args.mixed_seconds or args.probe_interval_ms or args.fresh_probe_interval_ms else None
+        echo = None
+        if args.mixed_seconds:
+            echo = Echo(request_bytes=1024)
+        elif args.probe_interval_ms or args.fresh_probe_interval_ms:
+            echo = Echo()
         if echo:
             echo.start()
         server_addr, udp_listen = free_address(), free_address()
@@ -596,6 +613,7 @@ def run(args):
         if args.mixed_seconds:
             probe = FreshProbe(tcp_listen, echo.address, 1.0, stop, payload_bytes=1024)
             result = mixed_load.run(tcp_listen, socks_connect, args.mixed_seconds, data, probe)
+            result["short_request_target"] = echo.requests
             save(args.output / "summary.json", result)
             for process in (client, server):
                 process.send_signal(2)
