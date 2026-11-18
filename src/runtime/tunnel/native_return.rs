@@ -366,40 +366,56 @@ pub(super) fn drain(
 // are independent of the application record decoded from the response body.
 const PART_BYTES: usize = 2048;
 const H3_PART_ALLOWANCE: usize = 16;
-pub(super) const MIXED_INITIAL_WINDOW: u64 = 256 * 1024;
-const MIXED_MIN_WINDOW: u64 = 64 * 1024;
-const MIXED_MAX_WINDOW: u64 = 1024 * 1024;
+pub(super) const MIXED_SEND_WINDOW: u64 = 1024 * 1024;
+const PART_WIRE_BYTES: usize = wire_cost(PART_BYTES + H3_PART_ALLOWANCE);
 
-fn mixed_window(rate: Option<u64>, min_rtt: std::time::Duration, cwnd: u64) -> u64 {
-    let bdp = rate.map_or(cwnd / 2, |rate| {
-        (u128::from(rate) * min_rtt.as_micros() * 105 / 100_000_000) as u64
-    });
-    bdp.clamp(MIXED_MIN_WINDOW, MIXED_MAX_WINDOW)
+struct PathPace {
+    connection: usize,
+    credit: outbound::Pacer,
+    sampled_us: u64,
+    packets: u64,
+    lost: u64,
 }
+impl PathPace {
+    fn new(connection: usize, now_us: u64, ceiling: u64) -> Self {
+        let mut credit = outbound::Pacer::new(ceiling.min(20_000_000), 2 * PART_WIRE_BYTES);
+        credit.set_rate(now_us, credit.rate());
+        Self {
+            connection,
+            credit,
+            sampled_us: now_us,
+            packets: 0,
+            lost: 0,
+        }
+    }
 
-impl Credit {
-    pub(super) fn observe_mixed(&mut self, conn: &quinn::Connection, now_us: u64) -> Option<u64> {
-        let identity = conn.stable_id();
-        if self.connection != Some(identity) {
-            self.connection = Some(identity);
-            self.sampled_us = now_us;
-            self.current = MIXED_INITIAL_WINDOW;
-            return None;
+    fn observe(&mut self, conn: &quinn::Connection, now_us: u64, ceiling: u64) {
+        if now_us.saturating_sub(self.sampled_us) < 100_000 {
+            self.credit.refill(now_us);
+            return;
         }
-        if now_us.saturating_sub(self.sampled_us) < 100_000 || conn.probing_rtt_hint() {
-            return None;
-        }
-        self.sampled_us = now_us;
         let path = conn.stats().path;
-        // The bulk response body needs roughly one RTT of independently
-        // measured transport service. Large prewrites allow BBR startup and
-        // recovery to fill the shared queue ahead of feedback and Game UDP.
-        let target = mixed_window(path.delivery_rate, path.min_rtt, path.cwnd);
-        if target == self.current {
-            return None;
-        }
-        self.current = target;
-        Some(target)
+        let packets = path.sent_packets.saturating_sub(self.packets);
+        let lost = path.lost_packets.saturating_sub(self.lost);
+        self.packets = path.sent_packets;
+        self.lost = path.lost_packets;
+        self.sampled_us = now_us;
+
+        let rate = self.credit.rate();
+        let queue = path.rtt.saturating_sub(path.min_rtt);
+        let next = if queue > std::time::Duration::from_millis(8)
+            || (packets >= 64 && lost.saturating_mul(200) > packets)
+        {
+            (rate * 9 / 10).max(4_000_000)
+        } else if packets >= 64 && !conn.probing_rtt_hint() {
+            let trial = rate + rate / 20;
+            path.delivery_rate.map_or(trial, |delivery| {
+                trial.min(rate.max(delivery.saturating_mul(8) * 11 / 10))
+            })
+        } else {
+            rate
+        };
+        self.credit.set_rate(now_us, next.min(ceiling));
     }
 }
 
@@ -408,6 +424,7 @@ pub(super) struct MixedWrites {
     partial: [Option<(usize, Bytes)>; super::MAX_PATHS],
     refunds: Arc<Refunds>,
     pub ready: Arc<Notify>,
+    path_pace: [Option<PathPace>; super::MAX_PATHS],
 }
 
 impl MixedWrites {
@@ -434,6 +451,7 @@ impl MixedWrites {
         cursor: &mut usize,
         pacer: &mut outbound::Pacer,
         groups: &mut [outbound::Pacer; super::MAX_PATHS],
+        now_us: u64,
         feedback_reserve: usize,
         reserved_group: Option<u8>,
     ) {
@@ -482,6 +500,20 @@ impl MixedWrites {
             {
                 continue;
             }
+            let ceiling = pacer.rate().min(groups[group].rate());
+            let slot = &mut self.path_pace[id];
+            if slot
+                .as_ref()
+                .is_none_or(|pace| pace.connection != connection)
+            {
+                *slot = Some(PathPace::new(connection, now_us, ceiling));
+            }
+            let path_pace = slot.as_mut().expect("path pacer");
+            path_pace.observe(&path.conn, now_us, ceiling);
+            if !path_pace.credit.available(cost) {
+                continue;
+            }
+            path_pace.credit.spend(cost);
             let data = bytes.slice(..count);
             let last = count == bytes.len();
             let remaining = (!last).then(|| (connection, bytes.slice(count..)));
@@ -804,11 +836,13 @@ mod tests {
             &mut cursor,
             &mut pacer,
             &mut groups,
+            2_000_000,
             0,
             None,
         );
         assert!(reader.rx.is_empty(), "group must authorize every fragment");
         groups[group].refill(2_000_000);
+        writes.path_pace[0] = Some(PathPace::new(paths[0].conn.stable_id(), 0, 64_000));
         writes.drain(
             &mut queue,
             &paths,
@@ -816,6 +850,7 @@ mod tests {
             &mut cursor,
             &mut pacer,
             &mut groups,
+            2_000_000,
             0,
             None,
         );
@@ -841,6 +876,7 @@ mod tests {
                 &mut cursor,
                 &mut pacer,
                 &mut groups,
+                written_at,
                 0,
                 None,
             );

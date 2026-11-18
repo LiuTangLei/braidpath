@@ -529,6 +529,9 @@ impl Pacer {
         }
         self.tokens = self.tokens.min(self.burst);
     }
+    pub(super) fn rate(&self) -> u64 {
+        self.rate
+    }
     pub fn available(&self, bytes: usize) -> bool {
         self.tokens >= bytes as f64
     }

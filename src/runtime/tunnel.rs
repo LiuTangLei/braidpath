@@ -2236,13 +2236,13 @@ async fn sender_with_game_input(
         for path in paths.iter() {
             if let Some(writer) = &path.native_return {
                 writer.set_reachable(path.open() && !liveness[usize::from(path.id)].silent());
-                let credit = &mut native_credit[usize::from(path.id)];
-                let window = if mixed_writes.is_some() {
-                    credit.observe_mixed(&path.conn, now_us)
-                } else {
-                    credit.observe(&path.conn, now_us, policy.latency_target_ms)
-                };
-                if let Some(window) = window {
+                if mixed_writes.is_none()
+                    && let Some(window) = native_credit[usize::from(path.id)].observe(
+                        &path.conn,
+                        now_us,
+                        policy.latency_target_ms,
+                    )
+                {
                     path.conn.set_send_window(window);
                     info!(target: "braidpath::native_credit", path=path.id, window_bytes=window,
                         "native return storage credit changed");
@@ -3508,6 +3508,7 @@ async fn sender_with_game_input(
                 &mut native_cursor,
                 &mut pacer,
                 &mut groups,
+                now_us,
                 feedback_reserve,
                 reserved_group,
             );
@@ -4758,7 +4759,7 @@ async fn server_connection(
                                 if let Some(scheduler)=quality_schedule {response=response.header("braidpath-scheduler",scheduler);}stream.send_response(response.body(())?).await?;
                                 let (send,recv)=stream.split();
                                 if let Some(reader)=return_reader {
-                                    conn.set_send_window(if game_mode { native_return::MIXED_INITIAL_WINDOW } else { u64::from(native_return::WINDOW) });
+                                    conn.set_send_window(if game_mode { native_return::MIXED_SEND_WINDOW } else { u64::from(native_return::WINDOW) });
                                     return_tasks.spawn(native_return::write(conn.clone(),send,reader));
                                 } else { response_send=Some(send); }
                                 request=Some(recv);
