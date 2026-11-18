@@ -76,6 +76,24 @@ impl Server {
     pub(crate) fn stream_budget(&self) -> Arc<crate::runtime::tunnel::tcp::Budget> {
         self.stream_budget.clone()
     }
+    pub(crate) fn reserve_udp_association(&self) -> Result<OwnedSemaphorePermit> {
+        self.associations
+            .clone()
+            .try_acquire_owned()
+            .context("proxy UDP association limit")
+    }
+
+    pub(crate) fn reserve_udp_destination(&self) -> Result<OwnedSemaphorePermit> {
+        self.destinations
+            .clone()
+            .try_acquire_owned()
+            .context("proxy UDP destination limit")
+    }
+
+    pub(crate) fn admit_udp_bytes(&self, bytes: usize) -> bool {
+        self.rate.delay(bytes).is_none()
+    }
+
     pub fn snapshot(&self) -> Snapshot {
         let (tcp_flows, buffered_bytes) = self.stream_budget.snapshot();
         Snapshot {
@@ -184,11 +202,7 @@ impl Server {
         let command = timeout(CONNECT_TIMEOUT, recv.read_u8()).await??;
         match command {
             UDP => {
-                let _permit = self
-                    .associations
-                    .clone()
-                    .try_acquire_owned()
-                    .context("proxy UDP association limit")?;
+                let _permit = self.reserve_udp_association()?;
                 let id = send.id().index();
                 let registration = router.register(id)?;
                 timeout(CONNECT_TIMEOUT, send.write_all(&[0])).await??;
@@ -233,11 +247,11 @@ impl Server {
                     let Some(frame) = frame else { return Ok(()); };
                     let Some(packet) = reassembly.receive(frame, Instant::now()) else { continue; };
                     let Ok((address, data)) = packet_parts(&packet).await else { continue; };
-                    if self.rate.delay(packet.len()).is_some() { continue; }
+                    if !self.admit_udp_bytes(packet.len()) { continue; }
                     if flows.get(&address).is_some_and(|f| f._reader.0.is_finished()) { flows.remove(&address); }
                     if !flows.contains_key(&address) {
                         if flows.len() >= MAX_DESTINATIONS { continue; }
-                        let Ok(permit) = self.destinations.clone().try_acquire_owned() else { continue; };
+                        let Ok(permit) = self.reserve_udp_destination() else { continue; };
                         let opened = timeout(CONNECT_TIMEOUT, async {
                             let mut targets = address.resolve(self.config.allow_private).await?;
                             // UDP connect cannot detect an unreachable dual-stack peer.
@@ -259,7 +273,7 @@ impl Server {
                             let _permit = permit;
                             let mut data = vec![0; MAX_UDP + 1];
                             while let Ok(n) = read_socket.recv(&mut data).await {
-                                if n > MAX_UDP || state.rate.delay(n).is_some() { continue; }
+                                if n > MAX_UDP || !state.admit_udp_bytes(n) { continue; }
                                 let mut out = Vec::with_capacity(n + 19); Address::Ip(remote).encode(&mut out); out.extend(&data[..n]);
                                 if send_packet(&conn, id, counter.fetch_add(1, Ordering::Relaxed), &out).await.is_err() {
                                     if conn.close_reason().is_some() { break; }

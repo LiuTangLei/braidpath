@@ -424,6 +424,12 @@ bidirectional echo after all configured paths are ready.
 
 ## Traffic modes
 
+The unified `proxy-client` uses native HTTP/3 bulk return by default
+(`--game-mode off`). Use `--game-mode on` to choose Game for the instance;
+SOCKS5 UDP then shares the Game aggregate session with the exit's TCP flows.
+The server applies the same UDP association, destination and rate limits for
+either mode. Use the same current version on participating peers.
+
 The `client` and `mesh-client` commands offer two mutually exclusive opt-in policies: native return and Game. Use separate sessions or listeners for the two workloads; requesting both flags is rejected. Existing defaults remain the normal policy. `--native-return-stream` negotiates a reliable HTTP/3 response body for bulk TCP download DATA/FIN with a bounded 4 MiB per-path receive window. Sender storage starts at 2 MiB. Every 100 ms, a sample of at least 64 native packets with at most 1% native loss and queueing within one quarter of the local delay target permits one additional 32 KiB, bounded by three quarters of the current native cwnd and 3 MiB. Queue or loss pressure returns to 2 MiB; an idle interval creates no credit, and a native RTT probe holds the existing storage allowance. This changes buffering, not the native congestion window, packet pacing or operator limits. Interactive stream data uses bounded DATAGRAM records so it can bypass an already queued bulk response body. The carrier respects the same QUIC ACK-silence exclusion as DATAGRAM scheduling, so new data and repairs avoid an unresponsive route while another route is available. Uploads, stream acknowledgments, resets and UDP use the DATAGRAM carrier. Both endpoints must support and acknowledge the requested capability.
 
 Native receive admission preserves the process-wide byte budget and bounded channel. While a decoded record waits for byte credit or a channel slot, the client continues handling DATAGRAMs. Between response chunks it arbitrates another DATAGRAM read before resuming native decoding. This isolates application receive waiting without enlarging the budget or claiming independent transport capacity.
@@ -440,7 +446,7 @@ The Game sender returns to input selection between bulk drain steps when UDP
 input is ready. It also yields after a one-millisecond drain slice so the
 socket and path writers can run while bulk data stays writable.
 
-Game mode trades bandwidth and bulk shares for timely UDP. It conflicts with explicit codec/deadline overrides. Aggregate and group caps remain active. Use separate sessions/listeners for Game and native-return workloads. Automatic startup measures fresh delivery and can reduce short-upload performance. For latency-sensitive sessions that share the link with bulk transfers, start with explicit client and server ceilings sized to the link and check UDP delivery and tail latency under competing traffic. The flag does not apply to the separate `proxy-client` native UDP backend. These mechanisms do not establish a latency or throughput result for a particular network; use same-target, bounded paired measurements of delivery, loss, jitter and competing TCP traffic.
+Game mode trades bandwidth and bulk shares for timely UDP. It conflicts with explicit codec/deadline overrides. Aggregate and group caps remain active. Use separate sessions/listeners for Game and native-return workloads. Automatic startup measures fresh delivery and can reduce short-upload performance. For latency-sensitive sessions that share the link with bulk transfers, start with explicit client and server ceilings sized to the link and check UDP delivery and tail latency under competing traffic. The low-level client flag is separate from the unified client’s `--game-mode on|off` selector. These mechanisms do not establish a latency or throughput result for a particular network; use same-target, bounded paired measurements of delivery, loss, jitter and competing TCP traffic.
 
 Reliable Game TCP bulk uses its stream acknowledgments and retransmissions without proactive bulk parity. UDP retains its three protection copies, and short TCP/control records retain their separate protection policy.
 

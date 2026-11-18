@@ -77,6 +77,24 @@ mod proxy_cli_tests {
                 Command::ProxyClient { socks5_wait_for_connect, .. } if socks5_wait_for_connect == wait
             ));
         }
+        for (flag, expected) in [
+            (&[][..], GameMode::Off),
+            (&["--game-mode", "off"][..], GameMode::Off),
+            (&["--game-mode", "on"][..], GameMode::On),
+        ] {
+            let parsed =
+                Cli::try_parse_from(client.into_iter().chain(flag.iter().copied())).unwrap();
+            assert!(
+                matches!(parsed.command, Command::ProxyClient { game_mode, .. } if game_mode == expected)
+            );
+        }
+        for flag in [
+            &["--game-mode"][..],
+            &["--game-mode", "auto"][..],
+            &["--native-return-stream"][..],
+        ] {
+            assert!(Cli::try_parse_from(client.into_iter().chain(flag.iter().copied())).is_err());
+        }
         let parsed =
             Cli::try_parse_from(client.into_iter().chain(["--interface", "ifindex:6"])).unwrap();
         assert!(
@@ -278,6 +296,9 @@ enum Command {
         /// Wait for the exit's bound address or SOCKS5 failure before replying to CONNECT.
         #[arg(long)]
         socks5_wait_for_connect: bool,
+        /// Prefer timely UDP delivery over bulk throughput.
+        #[arg(long, value_enum, default_value = "off")]
+        game_mode: GameMode,
     },
     /// Discover live distributed servers through any member using a client key.
     Nodes {
@@ -494,6 +515,12 @@ mod dual_cli_tests {
         assert!(policy.mixed_fec);
     }
 }
+#[derive(Clone, Copy, Eq, PartialEq, clap::ValueEnum)]
+enum GameMode {
+    On,
+    Off,
+}
+
 #[derive(Args)]
 struct PolicyArgs {
     /// Prefer low UDP delay: earliest-ready paths, immediate bounded protection,
@@ -616,7 +643,7 @@ pub async fn run() -> Result<()> {
             paths,
             interface,
             socks5_wait_for_connect,
-            ..
+            game_mode,
         } => {
             let identity = mesh::ClientIdentity::open(dir, &connection_key)?;
             proxy::client(proxy::ClientOptions {
@@ -629,6 +656,7 @@ pub async fn run() -> Result<()> {
                 paths: usize::from(paths),
                 interface,
                 socks5_early_reply: !socks5_wait_for_connect,
+                game_mode: matches!(game_mode, GameMode::On),
             })
             .await
         }

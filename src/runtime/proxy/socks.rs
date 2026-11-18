@@ -80,6 +80,16 @@ pub(super) async fn serve(
         reply(&mut tcp, 0, flow.bound()).await?;
         return flow.run(tcp).await;
     }
+    if pool.game_mode {
+        let connector = match timeout(CONNECT_TIMEOUT, pool.prepare_stream(exit)).await {
+            Ok(Ok(connector)) => connector,
+            _ => {
+                reply(&mut tcp, 4, unspecified).await?;
+                return Ok(());
+            }
+        };
+        return timeout(CONNECT_TIMEOUT, connector.associate(tcp, target.port())).await?;
+    }
     let setup = timeout(CONNECT_TIMEOUT, async {
         let conn = pool.udp_connection(exit).await?;
         let (mut send, mut recv) = conn.raw.open_bi().await?;

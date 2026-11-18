@@ -90,6 +90,7 @@ enum Command {
         done: oneshot::Sender<Result<(), String>>,
     },
     Attach(u32, TcpStream),
+    Associate(TcpStream, u16),
 }
 struct ConnectorState {
     budget: Arc<Budget>,
@@ -166,24 +167,39 @@ impl Connector {
             });
         }
     }
+    async fn active_channel(
+        &self,
+        generation: &mut watch::Receiver<Option<Arc<Channel>>>,
+    ) -> anyhow::Result<Arc<Channel>> {
+        loop {
+            anyhow::ensure!(!self.is_closed(), "aggregate connector closed");
+            if let Some(channel) = generation.borrow_and_update().clone()
+                && !channel.closed.load(Ordering::Acquire)
+            {
+                return Ok(channel);
+            }
+            generation.changed().await?;
+        }
+    }
+
+    pub(crate) async fn associate(&self, tcp: TcpStream, port: u16) -> anyhow::Result<()> {
+        let channel = self.active_channel(&mut self.0.active.subscribe()).await?;
+        channel
+            .commands
+            .send(Command::Associate(tcp, port))
+            .await
+            .map_err(|_| anyhow::anyhow!("aggregate generation ended"))?;
+        channel.wake.notify_one();
+        Ok(())
+    }
+
     pub(crate) async fn open(
         &self,
         target: Destination,
         early_reply: bool,
     ) -> anyhow::Result<Flow> {
         let mut generation = self.0.active.subscribe();
-        let channel = loop {
-            anyhow::ensure!(!self.is_closed(), "aggregate connector closed");
-            if let Some(channel) = generation.borrow_and_update().clone()
-                && !channel.closed.load(Ordering::Acquire)
-            {
-                break channel;
-            }
-            generation
-                .changed()
-                .await
-                .map_err(|_| anyhow::anyhow!("aggregate session ended"))?;
-        };
+        let channel = self.active_channel(&mut generation).await?;
         let lease = tokio::select! {
             lease = self.0.budget.flow() => lease,
             _ = generation.changed() => anyhow::bail!("aggregate generation changed during admission"),
@@ -315,13 +331,13 @@ pub(super) struct Listeners {
 }
 
 /// Server destinations; the mux exists when either is configured and negotiated.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Default)]
 pub(super) struct Targets {
     pub fixed: Option<SocketAddr>,
     pub proxy: Option<proxy::Access>,
-    /// Only standalone legacy entrances use this UDP adapter. Mesh proxies
-    /// retain the native proxy association and host-wide DNS/socket budgets.
+    /// Standalone UDP associations and explicitly negotiated mesh Game sessions.
     pub allow_associations: bool,
+    pub proxy_gateway: Option<Arc<crate::runtime::proxy::Server>>,
 }
 
 pub(super) enum Io {
@@ -708,7 +724,10 @@ impl Mux {
         let targets = Targets {
             fixed: targets.fixed.filter(|_| policy.streams),
             proxy: targets.proxy.filter(|_| policy.proxy),
-            allow_associations: targets.allow_associations && policy.proxy,
+            allow_associations: policy.proxy
+                && (targets.allow_associations
+                    || (policy.game_mode && targets.proxy_gateway.is_some())),
+            proxy_gateway: targets.proxy_gateway.filter(|_| policy.game_mode),
         };
         (targets.fixed.is_some() || targets.proxy.is_some()).then(|| {
             let mut mux = Self::new(Listeners::default(), targets, policy, scope);
@@ -922,6 +941,19 @@ impl Mux {
                     self.reset(id, "destination header budget exhausted");
                 }
             }
+            Command::Associate(tcp, port) => {
+                if self.game_events.is_some()
+                    && self
+                        .registration
+                        .as_ref()
+                        .is_some_and(|r| !r.channel.closed.load(Ordering::Acquire))
+                {
+                    self.associate(tcp, port);
+                } else {
+                    self.tasks
+                        .spawn(refuse(tcp, proxy::Kind::Socks, proxy::GENERAL_FAILURE));
+                }
+            }
             Command::Attach(id, tcp) => {
                 let valid = self.streams.get(&id).is_some_and(|s| {
                     (!s.status_pending || s.early_status_deadline.is_some())
@@ -1083,7 +1115,13 @@ impl Mux {
                     self.stats.rejected += 1;
                 }
             }
-            Io::Proxied(tcp, request) if request.associate => self.associate(tcp),
+            Io::Proxied(tcp, request) if request.associate => {
+                let port = match request.destination {
+                    Destination::Ip(address) => address.port(),
+                    Destination::Domain(_, port) => port,
+                };
+                self.associate(tcp, port);
+            }
             Io::Associated(flow, socket, peer) => {
                 if let Some(Association::Starting(task)) = self.associations.remove(&flow) {
                     self.associations
@@ -1155,7 +1193,7 @@ impl Mux {
     }
 
     /// Client: start a UDP association for a SOCKS5 UDP ASSOCIATE request.
-    fn associate(&mut self, tcp: TcpStream) {
+    fn associate(&mut self, tcp: TcpStream, port: u16) {
         if self.associations.len() >= associate::MAX_ASSOCIATIONS
             || self.next_association + 1 >= associate::FLAG
         {
@@ -1167,9 +1205,13 @@ impl Mux {
         self.next_association += 1;
         let flow = associate::FLAG | self.next_association;
         let events = self.association_events();
-        let task = self
-            .tasks
-            .spawn(associate::client(flow, tcp, events, self.max_message_bytes));
+        let task = self.tasks.spawn(associate::client(
+            flow,
+            tcp,
+            port,
+            events,
+            self.max_message_bytes,
+        ));
         self.associations.insert(flow, Association::Starting(task));
         self.stats.udp_associations += 1;
     }
@@ -1196,7 +1238,7 @@ impl Mux {
     /// An association record from the peer.
     fn datagram(&mut self, record: Record) {
         let flow = record.flow;
-        if self.listeners.proxy.is_some() {
+        if self.listeners.proxy.is_some() || self.registration.is_some() {
             // Client: a reply for the SOCKS client.
             if let Some(Association::Client { socket, peer, .. }) = self.associations.get(&flow)
                 && !record.payload.is_empty()
@@ -1230,15 +1272,24 @@ impl Mux {
                 self.stats.udp_datagrams_dropped += 1;
                 return;
             }
+            let gateway = self.targets.proxy_gateway.clone();
+            let permit = if let Some(gateway) = &gateway {
+                let Ok(permit) = gateway.reserve_udp_association() else {
+                    self.stats.udp_datagrams_dropped += 1;
+                    return;
+                };
+                Some(permit)
+            } else {
+                None
+            };
             let (datagrams, receiver) = mpsc::channel(associate::CHANNEL);
             let events = self.association_events();
-            let task = self.tasks.spawn(associate::server(
-                flow,
-                access.allow_private,
-                receiver,
-                events,
-                self.max_message_bytes,
-            ));
+            let limit = self.max_message_bytes;
+            let task = self.tasks.spawn(async move {
+                let _permit = permit;
+                associate::server(flow, access.allow_private, receiver, events, limit, gateway)
+                    .await;
+            });
             self.associations.insert(
                 flow,
                 Association::Server {
@@ -2382,6 +2433,7 @@ mod tests {
                     allow_private: true,
                 }),
                 allow_associations: false,
+                proxy_gateway: None,
             },
             &policy,
             metrics.scope("no-legacy-udp", stats::RETURN),

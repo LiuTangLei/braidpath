@@ -18,7 +18,7 @@ use super::{
     tcp::Io,
 };
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::{Arc, Mutex},
     time::{Duration, Instant},
@@ -99,7 +99,7 @@ pub(super) fn to_client(payload: &[u8]) -> Vec<u8> {
 
 /// Client: bind the relay beside the address the SOCKS client reached, answer
 /// the request with it, then relay until the control connection closes.
-pub(super) async fn client(flow: u32, mut tcp: TcpStream, events: Events, limit: usize) {
+pub(super) async fn client(flow: u32, mut tcp: TcpStream, port: u16, events: Events, limit: usize) {
     let (Ok(local), Ok(owner)) = (tcp.local_addr(), tcp.peer_addr()) else {
         return;
     };
@@ -136,12 +136,18 @@ pub(super) async fn client(flow: u32, mut tcp: TcpStream, events: Events, limit:
                 let Ok((n, from)) = received else { break };
                 let from = canonical(from);
                 // Only the host that opened the association may use it.
-                if from.ip() != owner {
+                if from.ip() != owner || (port != 0 && from.port() != port) {
                     continue;
                 }
-                *peer.lock().expect("association peer") = Some(from);
                 let datagram = match client_payload(&buffer[..n], limit) {
-                    Some(payload) => Io::Datagram(flow, payload.to_vec()),
+                    Some(payload) => {
+                        let mut peer = peer.lock().expect("association peer");
+                        if peer.is_some_and(|source| source != from) {
+                            continue;
+                        }
+                        *peer = Some(from);
+                        Io::Datagram(flow, payload.to_vec())
+                    }
                     None => Io::DatagramDropped,
                 };
                 if events.send(datagram).await.is_err() {
@@ -222,18 +228,27 @@ pub(super) async fn server(
     mut datagrams: mpsc::Receiver<Vec<u8>>,
     events: Events,
     limit: usize,
+    gateway: Option<Arc<crate::runtime::proxy::Server>>,
 ) {
     let Ok(socket) = bind_any() else {
         let _ = events.send(Io::Unassociated(flow)).await;
         return;
     };
     let mut names = Names(HashMap::new());
-    let mut sent_to: HashSet<IpAddr> = HashSet::new();
+    let max_peers = if gateway.is_some() {
+        crate::runtime::proxy::MAX_DESTINATIONS
+    } else {
+        MAX_PEERS
+    };
+    let mut sent_to = HashMap::new();
     let mut buffer = vec![0; DATAGRAM];
     loop {
         tokio::select! {
             datagram = datagrams.recv() => {
                 let Some(datagram) = datagram else { return };
+                if gateway.as_ref().is_some_and(|server| !server.admit_udp_bytes(datagram.len())) {
+                    continue;
+                }
                 let Ok(Some((destination, used))) = Destination::decode(&datagram) else {
                     let _ = events.send(Io::DatagramDropped).await;
                     continue;
@@ -251,8 +266,19 @@ pub(super) async fn server(
                     let _ = events.send(Io::DatagramDropped).await;
                     continue;
                 };
-                if sent_to.len() < MAX_PEERS {
-                    sent_to.insert(target.ip());
+                if !sent_to.contains_key(&target) {
+                    if sent_to.len() >= max_peers {
+                        continue;
+                    }
+                    let permit = if let Some(server) = &gateway {
+                        let Ok(permit) = server.reserve_udp_destination() else {
+                            continue;
+                        };
+                        Some(permit)
+                    } else {
+                        None
+                    };
+                    sent_to.insert(target, permit);
                 }
                 if socket.send_to(&datagram[used..], outbound(&socket, target)).await.is_err() {
                     let _ = events.send(Io::DatagramDropped).await;
@@ -261,7 +287,9 @@ pub(super) async fn server(
             received = socket.recv_from(&mut buffer) => {
                 let Ok((n, from)) = received else { continue };
                 let from = canonical(from);
-                if !sent_to.contains(&from.ip()) {
+                if !sent_to.contains_key(&from)
+                    || gateway.as_ref().is_some_and(|server| !server.admit_udp_bytes(n))
+                {
                     continue;
                 }
                 let mut payload = Destination::Ip(from).encode();

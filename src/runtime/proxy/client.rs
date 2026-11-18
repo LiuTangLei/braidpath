@@ -45,6 +45,7 @@ pub struct ClientOptions {
     pub paths: usize,
     pub interface: Option<String>,
     pub socks5_early_reply: bool,
+    pub game_mode: bool,
 }
 
 pub(super) fn listener_plan(
@@ -245,6 +246,7 @@ struct Slot {
 pub(super) struct Pool {
     identity: mesh::ClientIdentity,
     interface: Option<String>,
+    pub(super) game_mode: bool,
     token: String,
     slots: BTreeMap<String, Slot>,
     nodes: RwLock<Vec<mesh::Node>>,
@@ -267,6 +269,7 @@ impl Pool {
         nodes: Vec<mesh::Node>,
         exits: Vec<String>,
         interface: Option<String>,
+        game_mode: bool,
     ) -> Result<Arc<Self>> {
         ensure!(
             !exits.is_empty() && exits.len() <= 8,
@@ -301,6 +304,7 @@ impl Pool {
         Ok(Arc::new(Self {
             identity,
             interface,
+            game_mode,
             token,
             slots,
             nodes: RwLock::new(nodes),
@@ -399,7 +403,7 @@ impl Pool {
             name: self.identity.name(),
             ca: self.identity.dir.join("cert.pem"),
             token: self.identity.dir.join("token"),
-            policy: reliable_policy(),
+            policy: reliable_policy(self.game_mode),
             congestion: transport::Congestion::Bbr,
             stats: slot.stream_metrics.clone(),
         };
@@ -743,11 +747,15 @@ impl Drop for Pool {
     }
 }
 
-fn reliable_policy() -> tunnel::Policy {
+fn reliable_policy(game_mode: bool) -> tunnel::Policy {
     tunnel::Policy {
-        game_mode: false,
-        native_return: false,
-        max_message_bytes: crate::runtime::MAX_PAYLOAD,
+        game_mode,
+        native_return: !game_mode,
+        max_message_bytes: if game_mode {
+            crate::runtime::MAX_MESSAGE
+        } else {
+            crate::runtime::MAX_PAYLOAD
+        },
         streams: false,
         proxy: true,
         adaptive: true,
@@ -763,7 +771,7 @@ fn reliable_policy() -> tunnel::Policy {
         mixed_fec: false,
         redundancy: 30,
         rate: crate::runtime::MAX_RATE_BPS,
-        block_ms: 3,
+        block_ms: if game_mode { 1 } else { 3 },
         queue_ms: 100,
     }
 }
@@ -802,6 +810,7 @@ async fn fixed_forward(
     listener: TcpListener,
     paths: usize,
     interface: Option<String>,
+    game_mode: bool,
 ) -> Result<()> {
     let uplink = mesh::Uplink {
         interface: interface.clone(),
@@ -810,7 +819,7 @@ async fn fixed_forward(
     let (entrances, leases) = identity
         .entrances_on(nodes, &mapping.exit, paths, &uplink)
         .await?;
-    let mut policy = reliable_policy();
+    let mut policy = reliable_policy(game_mode);
     policy.proxy = false;
     policy.streams = true;
     let options = tunnel::ClientOptions {
@@ -883,7 +892,13 @@ pub async fn client(options: ClientOptions) -> Result<()> {
     let fixed_identity = options.identity.clone();
     let fixed_nodes = nodes.clone();
     let fixed_interface = options.interface.clone();
-    let pool = Pool::new(options.identity, nodes, options.exits, options.interface)?;
+    let pool = Pool::new(
+        options.identity,
+        nodes,
+        options.exits,
+        options.interface,
+        options.game_mode,
+    )?;
     ensure!(
         (1..=crate::runtime::MAX_PATHS).contains(&options.paths),
         "invalid proxy path limit"
@@ -918,6 +933,7 @@ pub async fn client(options: ClientOptions) -> Result<()> {
             listener,
             options.paths,
             fixed_interface.clone(),
+            options.game_mode,
         ));
     }
     for (listener, exit) in listeners {
@@ -1046,6 +1062,7 @@ mod lifecycle_tests {
             }],
             vec!["exit".into()],
             None,
+            false,
         )
         .unwrap()
     }
@@ -1228,6 +1245,7 @@ mod lifecycle_tests {
             nodes.clone(),
             vec!["a".into(), "b".into()],
             None,
+            false,
         )
         .unwrap();
         let mut paths = Vec::new();

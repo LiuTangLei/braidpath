@@ -4255,7 +4255,7 @@ async fn serve_with_budgets(
             incoming=endpoint.accept()=>{
                 let Some(incoming)=incoming else{break};
                 let Ok(permit)=pending_connections.clone().try_acquire_owned() else{incoming.refuse();continue};
-                let sessions=sessions.clone(); let secret=secret.clone(); let target=options.target; let settings=ServerSessionSettings{max_rate:options.max_rate,adaptive_fec_retention:options.adaptive_fec_retention,mesh:mesh.clone(),data_connections:data_connections.clone(),proxy:options.proxy.clone(),tcp_budget:tcp_budget.clone(),tcp:tcp::Targets{fixed:options.tcp_target,proxy:options.stream_proxy,allow_associations:mesh.is_none() && options.proxy.is_none()}}; let metrics=options.stats.clone();
+                let sessions=sessions.clone(); let secret=secret.clone(); let target=options.target; let settings=ServerSessionSettings{max_rate:options.max_rate,adaptive_fec_retention:options.adaptive_fec_retention,mesh:mesh.clone(),data_connections:data_connections.clone(),proxy:options.proxy.clone(),tcp_budget:tcp_budget.clone(),tcp:tcp::Targets{fixed:options.tcp_target,proxy:options.stream_proxy,allow_associations:mesh.is_none() && options.proxy.is_none(),proxy_gateway:options.proxy.clone()}}; let metrics=options.stats.clone();
                 tasks.spawn(async move {
                     let mut diagnostic=stats::ConnectionTrace::new(metrics.clone(),incoming.remote_address(),None,"incoming");
                     let result=server_connection(incoming,permit,sessions,secret,target,settings,metrics,&mut diagnostic).await;
@@ -4650,7 +4650,7 @@ async fn server_connection(
                                             let observation_notify=policy.adaptive.then(||Arc::new(Notify::new()));
                                             let session=Arc::new(Session{adaptive_fec_retention,generations:Mutex::new([None;MAX_PATHS]),empty_since:Mutex::new(Some(Instant::now())),events:tx,paths:Arc::new(Mutex::new(Vec::new())),stop,policy,observation_notify,ingress_drops:Arc::new(AtomicU64::new(0)),forward:metrics.scope(&sid,stats::FORWARD),returning:metrics.scope(&sid,stats::RETURN),finished:tokio::sync::Notify::new(),done:std::sync::atomic::AtomicBool::new(false)});
                                             map.insert(sid.clone(),session.clone());
-                                            tokio::spawn(session_loop(session.clone(),rx,target,tcp,tcp_budget.clone()));
+                                            tokio::spawn(session_loop(session.clone(),rx,target,tcp.clone(),tcp_budget.clone()));
                                             session
                                         };
                                         {

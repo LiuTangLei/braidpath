@@ -27,7 +27,7 @@ const UDP_IDLE: Duration = Duration::from_secs(60);
 const MAX_CONNECTIONS: usize = 64;
 const MAX_STREAMS: usize = 256;
 const MAX_ASSOCIATIONS: usize = 64;
-const MAX_DESTINATIONS: usize = 32;
+pub(crate) const MAX_DESTINATIONS: usize = 32;
 
 async fn udp_socket(address: std::net::SocketAddr) -> Result<tokio::net::UdpSocket> {
     let socket = tokio::net::UdpSocket::bind(address).await?;
