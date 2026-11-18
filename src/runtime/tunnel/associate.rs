@@ -54,6 +54,7 @@ pub(super) type Peer = Arc<Mutex<Option<SocketAddr>>>;
 pub(super) struct QueuedIo {
     pub event: Io,
     pub created: Instant,
+    pub enqueued: Instant,
 }
 
 #[derive(Clone)]
@@ -65,13 +66,16 @@ impl Events {
     async fn send(&self, event: Io) -> Result<(), ()> {
         match self {
             Self::Normal(tx) => tx.send(event).map_err(|_| ()),
-            Self::Game(tx) => tx
-                .send(QueuedIo {
+            Self::Game(tx) => {
+                let created = Instant::now();
+                let slot = tx.reserve().await.map_err(|_| ())?;
+                slot.send(QueuedIo {
                     event,
-                    created: Instant::now(),
-                })
-                .await
-                .map_err(|_| ()),
+                    created,
+                    enqueued: Instant::now(),
+                });
+                Ok(())
+            }
         }
     }
 }

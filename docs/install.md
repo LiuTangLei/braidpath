@@ -147,6 +147,15 @@ For restarting a running installation use the manager's `restart` command, or
 `launchctl kickstart -k gui/$(id -u)/org.braidpath` on macOS. Unix binary replacement
 is atomic, but the upgrade is not a transaction across OS service configuration.
 
+### macOS Game LaunchAgent
+
+For a dedicated macOS client running Game mode, configure its LaunchAgent with
+`ProcessType` set to `Interactive` in the top-level property list dictionary.
+This applies interactive scheduling to that Game client. Use the usual
+`launchctl bootstrap` command to load the configured job. Generated service
+definitions are refreshed during upgrades, so reapply the setting to any
+dedicated Game job managed by the installer before loading it.
+
 ## Build and validation
 
 `scripts/release-targets.json` is the asset/matrix source. The release workflow

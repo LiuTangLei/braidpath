@@ -81,6 +81,7 @@ pub use tcp::Connector as StreamConnector;
 /// Encoded symbols up to this size are latency traffic: stream
 /// acknowledgments, keystrokes, DNS and similar small datagrams.
 const LATENCY_RECORD_BYTES: usize = 320;
+pub(crate) const GAME_RATE_BPS: u64 = 10_000_000;
 // Five original fragments for the Game preset's 4KiB packet plus one frame.
 const GAME_PACKET_RESERVE: usize = 6000;
 const WEBSITE: &str = "<!doctype html><html lang=\"en\"><meta charset=\"utf-8\"><title>Welcome</title><h1>Welcome</h1><p>This service is online.</p></html>\n";
@@ -390,9 +391,11 @@ impl OutPath {
 type Paths = Arc<Mutex<Vec<OutPath>>>;
 
 fn stream_payload_limit(paths: &Paths, feedback: bool) -> usize {
+    path_payload_limit(&paths.lock().expect("paths lock"), feedback)
+}
+
+fn path_payload_limit(paths: &[OutPath], feedback: bool) -> usize {
     paths
-        .lock()
-        .expect("paths lock")
         .iter()
         .filter(|path| path.open())
         .filter_map(|path| {
@@ -402,6 +405,17 @@ fn stream_payload_limit(paths: &Paths, feedback: bool) -> usize {
         })
         .min()
         .unwrap_or(MAX_PAYLOAD)
+}
+
+fn client_stream_payload_limit(paths: &Paths, policy: &Policy) -> Option<usize> {
+    if !policy.game_mode {
+        return Some(stream_payload_limit(paths, policy.receiver_feedback));
+    }
+    match paths.try_lock() {
+        Ok(paths) => Some(path_payload_limit(&paths, policy.receiver_feedback)),
+        Err(std::sync::TryLockError::WouldBlock) => None,
+        Err(std::sync::TryLockError::Poisoned(error)) => panic!("paths lock: {error}"),
+    }
 }
 
 fn trace_path(scope: &Scope, stage: trace::Stage, path: trace::PathKey) {
@@ -1779,16 +1793,46 @@ fn publish_receiver_feedback(paths: &[OutPath], metrics: &Scope) {
     }
 }
 
-fn lock_sender_paths<'a>(
+enum SenderPaths<'a> {
+    Locked(std::sync::MutexGuard<'a, Vec<OutPath>>),
+    Snapshot(&'a [OutPath]),
+}
+
+impl std::ops::Deref for SenderPaths<'_> {
+    type Target = [OutPath];
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Locked(paths) => paths,
+            Self::Snapshot(paths) => paths,
+        }
+    }
+}
+
+fn sender_paths<'a>(
     paths: &'a Paths,
+    snapshot: Option<&'a mut Vec<OutPath>>,
     profile: &mut Option<profile::Sender>,
-) -> std::sync::MutexGuard<'a, Vec<OutPath>> {
+) -> SenderPaths<'a> {
     let at = profile.as_ref().map(|_| Instant::now());
     let locked = paths.lock().expect("paths lock");
     if let (Some(profile), Some(at)) = (profile, at) {
         profile.locked(at.elapsed());
     }
-    locked
+    let Some(snapshot) = snapshot else {
+        return SenderPaths::Locked(locked);
+    };
+    // Membership changes only when a path joins or retires. Reuse the handles
+    // until then, releasing the shared lock before controller work and sends.
+    let connections = |path: &OutPath| path.conn.stable_id();
+    if !snapshot
+        .iter()
+        .map(connections)
+        .eq(locked.iter().map(connections))
+    {
+        snapshot.clone_from(&locked);
+    }
+    SenderPaths::Snapshot(snapshot)
 }
 
 /// A single owner admits every business, repair, feedback and probe datagram.
@@ -1916,9 +1960,14 @@ async fn sender_with_game_input(
     let lifetime = policy.stream_lifetime();
     let mut profile = profile::Sender::new(metrics.direction);
     let mut waiting: Option<WaitingSend> = None;
+    // The client closes a retired connection before removing it. Its writer
+    // rejects new datagrams once closed, including work from a prior snapshot.
+    let mut game_paths = (policy.game_mode && metrics.direction == stats::FORWARD)
+        .then(|| Vec::with_capacity(MAX_PATHS));
     let mut liveness: [liveness::Liveness; MAX_PATHS] = Default::default();
     let mut input_open = true;
-    let mut prefer_game_input = true;
+    const GAME_INPUT_BURST: usize = 4;
+    let mut consecutive_game_inputs = 0usize;
     let mut normal_input_due = false;
     let mut yield_after_drain = false;
     let mut native_credit: [native_return::Credit; MAX_PATHS] = Default::default();
@@ -1944,7 +1993,10 @@ async fn sender_with_game_input(
         let wait_started = profile.as_ref().map(|_| Instant::now());
         let queued_before_wait = queue.len();
         let native_pending_before_wait = waiting.is_some();
-        let priority = if prefer_game_input {
+        // Feed a short burst of game input without alternating every packet
+        // against a continuously ready bulk producer. Once the burst is
+        // consumed, the main select gives control and bulk their turn.
+        let priority = if consecutive_game_inputs < GAME_INPUT_BURST {
             game_input.as_mut().and_then(|rx| match rx.try_recv() {
                 Ok(record) => Some(SenderEvent::GameInput(Some(record))),
                 Err(mpsc::error::TryRecvError::Disconnected) => Some(SenderEvent::GameInput(None)),
@@ -2017,7 +2069,11 @@ async fn sender_with_game_input(
             }
             _ => {}
         }
-        prefer_game_input = !matches!(&event, SenderEvent::GameInput(_));
+        if matches!(&event, SenderEvent::GameInput(Some(_))) {
+            consecutive_game_inputs = (consecutive_game_inputs + 1).min(GAME_INPUT_BURST);
+        } else {
+            consecutive_game_inputs = 0;
+        }
         if matches!(&event, SenderEvent::GameInput(None)) {
             game_input = None;
             if !input_open {
@@ -2084,7 +2140,7 @@ async fn sender_with_game_input(
             SenderEvent::Ready(SendReadiness::Admitted { at, next_cursor }) => {
                 frontier.readiness_admitted += 1;
                 let attempt = prepared.expect("selected readiness attempt");
-                let paths = lock_sender_paths(&shared_paths, &mut profile);
+                let paths = sender_paths(&shared_paths, game_paths.as_mut(), &mut profile);
                 if let Some(profile) = &mut profile {
                     profile.counters.admissions += 1;
                 }
@@ -2211,7 +2267,7 @@ async fn sender_with_game_input(
         for expired in expired {
             account_expired(&expired, now, &metrics);
         }
-        let paths = lock_sender_paths(&shared_paths, &mut profile);
+        let paths = sender_paths(&shared_paths, game_paths.as_mut(), &mut profile);
         if policy.streams || policy.proxy {
             transfer_telemetry.observe(
                 now_us,
@@ -5398,8 +5454,11 @@ async fn client_session(
         let credit_changed = native_credit.as_ref().map(|credit| credit.notified());
         if let Some(mux)=streams.as_mut() {
             mux.service_io();
-            mux.retry_native();
-            mux.set_payload_limit(stream_payload_limit(&paths, options.policy.receiver_feedback));
+            // A busy path metadata refresh cannot delay Game UDP dispatch.
+            // The sender still checks the current path size before admission.
+            if let Some(limit) = client_stream_payload_limit(&paths, &options.policy) {
+                mux.set_payload_limit(limit);
+            }
             mux.flush(&mut tcp::Out{tx:&tx,game_tx:game_tx.as_ref(),next_id:&mut next_id,scope:&forward,small_threshold});
         }
         tokio::select! {

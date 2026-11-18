@@ -414,3 +414,19 @@ fn normal_udp_reassembly_keeps_arrival_skew_separate_from_send_deadline() {
     assert_eq!(packet.flow, associate::FLAG | 1);
     assert_eq!(packet.payload, payload);
 }
+
+#[test]
+fn game_payload_refresh_skips_a_busy_path_lock() {
+    let paths = Arc::new(Mutex::new(Vec::new()));
+    let policy = Policy {
+        game_mode: true,
+        ..policy()
+    };
+    let updating = paths.lock().unwrap();
+    assert_eq!(client_stream_payload_limit(&paths, &policy), None);
+    drop(updating);
+    assert_eq!(
+        client_stream_payload_limit(&paths, &policy),
+        Some(MAX_PAYLOAD)
+    );
+}

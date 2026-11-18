@@ -217,6 +217,30 @@ impl Pair {
 }
 
 #[tokio::test]
+async fn game_sender_snapshots_release_membership_and_follow_replacement() {
+    let first = Pair::connect().await;
+    let replacement = Pair::connect().await;
+    let old = first.path();
+    let new = replacement.path();
+    let paths = Arc::new(Mutex::new(vec![old.clone()]));
+    let mut snapshot = Vec::new();
+
+    {
+        let view = sender_paths(&paths, Some(&mut snapshot), &mut None);
+        let mut live = paths
+            .try_lock()
+            .expect("Game sender released the membership lock");
+        live[0].conn.close(0u32.into(), b"replaced");
+        live[0] = new.clone();
+        assert_eq!(view[0].conn.stable_id(), old.conn.stable_id());
+        assert!(!view[0].writer.send(Bytes::from_static(b"stale path")));
+    }
+    let view = sender_paths(&paths, Some(&mut snapshot), &mut None);
+    assert_eq!(view[0].conn.stable_id(), new.conn.stable_id());
+    assert!(view[0].open());
+}
+
+#[tokio::test]
 async fn negotiated_stream_fec_fits_real_quic_datagrams_and_legacy_paths() {
     let pair = Pair::connect().await;
     let mut path = pair.path();

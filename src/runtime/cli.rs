@@ -571,9 +571,9 @@ struct PolicyArgs {
     mixed_fec: bool,
     #[arg(long, default_value_t = 30)]
     redundancy_percent: u8,
-    /// Aggregate cap in bits/s. `auto` (requires --adaptive) sets no operator
-    /// cap below 10 Gbit/s; per-path control finds the pace.
-    /// Defaults to `auto` with --adaptive and 10000000 otherwise.
+    /// Aggregate cap in bits/s. `auto` requires --adaptive or --game-mode.
+    /// Standalone Game defaults to 10000000. Mixed Game and other adaptive
+    /// sessions default to `auto`.
     #[arg(long, value_parser = parse_rate_cap)]
     rate_bps: Option<RateCap>,
     #[arg(long, default_value_t = 3)]
@@ -899,7 +899,9 @@ const FIXED_RATE_BPS: u64 = 10_000_000;
 fn client_rate(policy: &PolicyArgs) -> Result<u64> {
     let rate = policy
         .rate_bps
-        .unwrap_or(if policy.adaptive || policy.game_mode {
+        .unwrap_or(if policy.game_mode && !policy.native_return_stream {
+            RateCap::Bps(tunnel::GAME_RATE_BPS)
+        } else if policy.adaptive || policy.game_mode {
             RateCap::Auto
         } else {
             RateCap::Bps(FIXED_RATE_BPS)
@@ -1210,7 +1212,7 @@ mod tests {
     }
 
     #[test]
-    fn rate_cap_defaults_to_auto_only_for_adaptive_sessions() {
+    fn game_and_adaptive_rate_cap_defaults() {
         let client = [
             "braidpath",
             "client",
@@ -1232,6 +1234,15 @@ mod tests {
         };
         assert_eq!(rate(&[]).unwrap(), FIXED_RATE_BPS);
         assert_eq!(rate(&["--adaptive"]).unwrap(), AUTO_RATE_BPS);
+        assert_eq!(rate(&["--game-mode"]).unwrap(), tunnel::GAME_RATE_BPS);
+        assert_eq!(
+            rate(&["--game-mode", "--native-return-stream"]).unwrap(),
+            AUTO_RATE_BPS
+        );
+        assert_eq!(
+            rate(&["--game-mode", "--rate-bps", "auto"]).unwrap(),
+            AUTO_RATE_BPS
+        );
         assert_eq!(
             rate(&["--adaptive", "--rate-bps", "400000000"]).unwrap(),
             400_000_000

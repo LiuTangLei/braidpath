@@ -324,6 +324,7 @@ const INTERACTIVE_BYTES: u64 = 64 * 1024;
 const SHARED_NATIVE_ACK_FLOWS: usize = 16;
 /// Association datagrams waiting for the session queue; more are dropped.
 const DATAGRAM_QUEUE: usize = 256;
+const GAME_DATAGRAMS_PER_TURN: usize = 8;
 
 /// Client listeners; the mux exists when either is configured and negotiated.
 #[derive(Clone, Default)]
@@ -659,6 +660,7 @@ pub(super) struct Mux {
     datagrams: VecDeque<(u32, Vec<u8>, Option<Instant>)>,
     datagram_lifetime: Duration,
     max_message_bytes: usize,
+    next_game_delay_log: Instant,
 }
 
 impl Mux {
@@ -708,6 +710,7 @@ impl Mux {
             datagrams: VecDeque::new(),
             datagram_lifetime: policy.datagram_lifetime(),
             max_message_bytes: policy.max_message_bytes,
+            next_game_delay_log: now,
         }
     }
     /// Accepts local connections; the peer connects each stream onward.
@@ -771,24 +774,25 @@ impl Mux {
         at
     }
 
-    /// Reserve one bounded local completion per actor turn, even when a
-    /// higher-priority network input is continuously ready.
+    /// Drain a bounded burst of realtime input first while guaranteeing a
+    /// normal completion on every actor turn.
     pub(super) fn service_io(&mut self) {
-        self.service_commands();
-        if let Some(rx) = self.game_events.as_mut()
-            && let Ok(event) = rx.try_recv()
-        {
+        for _ in 0..GAME_DATAGRAMS_PER_TURN {
+            let Some(event) = self.game_events.as_mut().and_then(|rx| rx.try_recv().ok()) else {
+                break;
+            };
             self.game_io(event);
         }
+        self.service_commands();
         if let Ok(event) = self.events.try_recv() {
             self.io(event);
         }
     }
 
     fn game_io(&mut self, queued: associate::QueuedIo) {
-        let wait = queued
-            .created
-            .elapsed()
+        let now = Instant::now();
+        let wait = now
+            .saturating_duration_since(queued.created)
             .as_micros()
             .min(u128::from(u64::MAX)) as u64;
         self.stats.udp_io_events_prioritized += 1;
@@ -796,6 +800,16 @@ impl Mux {
         self.stats.udp_io_wait_us_max = self.stats.udp_io_wait_us_max.max(wait);
         match queued.event {
             Io::Datagram(flow, payload) => {
+                if wait >= 30_000 && now >= self.next_game_delay_log {
+                    self.next_game_delay_log = now + Duration::from_millis(250);
+                    tracing::warn!(
+                        target: "braidpath::game_latency",
+                        reserve_us = queued.enqueued.saturating_duration_since(queued.created).as_micros() as u64,
+                        dispatch_us = now.saturating_duration_since(queued.enqueued).as_micros() as u64,
+                        pending = self.game_events.as_ref().map_or(0, |rx| rx.len()),
+                        "local Game datagram dispatch delayed"
+                    );
+                }
                 self.queue_datagram_at(flow, payload, Some(queued.created));
             }
             event => self.io(event),
@@ -1532,7 +1546,7 @@ impl Mux {
         }
     }
 
-    pub(super) fn retry_native(&mut self) {
+    fn retry_native(&mut self) {
         for _ in 0..self.native_pending.len() {
             let Some(incoming) = self.native_pending.pop_front() else {
                 break;
@@ -1659,6 +1673,12 @@ impl Mux {
 
     /// Run timers, retransmit, send acknowledgments and new data, retire streams.
     pub(super) fn flush(&mut self, out: &mut Out) {
+        if self.game_events.is_some() {
+            // Game datagrams have their own ingress queue. Submit them before
+            // scanning TCP streams and generating their acknowledgments.
+            self.flush_datagrams(out);
+        }
+        self.retry_native();
         self.service_commands();
         let now = Instant::now();
         self.admissions();
@@ -1724,22 +1744,8 @@ impl Mux {
                 break;
             }
         }
-        while let Some((flow, payload, created)) = self.datagrams.pop_front() {
-            if created.is_some_and(|at| at.elapsed() >= self.datagram_lifetime) {
-                self.stats.udp_datagrams_dropped += 1;
-                continue;
-            }
-            let admitted = match created {
-                Some(at) => out.datagram_at(flow, payload.clone(), self.max_message_bytes, at),
-                None => out.datagram(flow, payload.clone(), self.max_message_bytes),
-            };
-            if !admitted {
-                self.datagrams.push_front((flow, payload, created));
-                break;
-            }
-            if !payload.is_empty() {
-                self.stats.udp_datagrams_to_tunnel += 1;
-            }
+        if self.game_events.is_none() {
+            self.flush_datagrams(out);
         }
         self.associations
             .retain(|_, association| match association {
@@ -1759,6 +1765,26 @@ impl Mux {
         self.closed_order.retain(|id| self.closed.contains_key(id));
         if now.saturating_duration_since(self.published) >= PUBLISH_EVERY {
             self.publish(now);
+        }
+    }
+
+    fn flush_datagrams(&mut self, out: &mut Out) {
+        while let Some((flow, payload, created)) = self.datagrams.pop_front() {
+            if created.is_some_and(|at| at.elapsed() >= self.datagram_lifetime) {
+                self.stats.udp_datagrams_dropped += 1;
+                continue;
+            }
+            let admitted = match created {
+                Some(at) => out.datagram_at(flow, payload.clone(), self.max_message_bytes, at),
+                None => out.datagram(flow, payload.clone(), self.max_message_bytes),
+            };
+            if !admitted {
+                self.datagrams.push_front((flow, payload, created));
+                break;
+            }
+            if !payload.is_empty() {
+                self.stats.udp_datagrams_to_tunnel += 1;
+            }
         }
     }
 
@@ -2155,14 +2181,17 @@ mod tests {
         }
         // This is ordering coverage; the separate expiry case owns the clock boundary.
         let created = Instant::now() + Duration::from_secs(30);
-        game.game_events_tx
-            .as_ref()
-            .unwrap()
-            .try_send(associate::QueuedIo {
-                event: Io::Datagram(associate::FLAG | 1, vec![7; 128]),
-                created,
-            })
-            .unwrap();
+        for _ in 0..=GAME_DATAGRAMS_PER_TURN {
+            game.game_events_tx
+                .as_ref()
+                .unwrap()
+                .try_send(associate::QueuedIo {
+                    event: Io::Datagram(associate::FLAG | 1, vec![7; 128]),
+                    created,
+                    enqueued: created,
+                })
+                .unwrap();
+        }
         game.service_io();
         assert_eq!(
             game.datagrams.front(),
@@ -2173,7 +2202,12 @@ mod tests {
             127,
             "a TCP completion also makes progress"
         );
-        assert_eq!(game.stats.udp_io_events_prioritized, 1);
+        assert_eq!(game.datagrams.len(), GAME_DATAGRAMS_PER_TURN);
+        assert_eq!(game.game_events.as_ref().unwrap().len(), 1);
+        assert_eq!(
+            game.stats.udp_io_events_prioritized,
+            GAME_DATAGRAMS_PER_TURN as u64
+        );
         assert_eq!(
             game.game_events_tx.as_ref().unwrap().max_capacity() + DATAGRAM_QUEUE / 2,
             DATAGRAM_QUEUE
@@ -2191,6 +2225,7 @@ mod tests {
         game.game_io(associate::QueuedIo {
             event: Io::Datagram(associate::FLAG | 1, vec![7; 128]),
             created: old,
+            enqueued: old,
         });
         assert!(game.datagrams.is_empty());
         assert_eq!(game.stats.udp_datagrams_dropped, 1);
