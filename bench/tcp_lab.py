@@ -309,11 +309,12 @@ class Probe(threading.Thread):
 
 
 class FreshProbe(threading.Thread):
-    """Each attempt: new TCP connection, SOCKS5 CONNECT, one 64-byte echo, close."""
+    """Each attempt: new TCP connection, SOCKS5 CONNECT, one echo, close."""
 
-    def __init__(self, proxy, echo, interval, stop, limit=5.0):
+    def __init__(self, proxy, echo, interval, stop, limit=5.0, payload_bytes=64):
         super().__init__(daemon=True)
         self.proxy, self.echo, self.interval, self.stop, self.limit = proxy, echo, interval, stop, limit
+        self.payload_bytes = payload_bytes
         self.attempts = []
 
     def run(self):
@@ -323,11 +324,14 @@ class FreshProbe(threading.Thread):
             sent = time.monotonic()
             deadline = sent + self.limit
             outcome, error = "ok", None
+            connected = proxied = None
             try:
                 with socket.create_connection((host, int(port)), timeout=self.limit) as conn:
+                    connected = time.monotonic()
                     conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
                     socks_connect(conn, self.echo, deadline)
-                    message = struct.pack("!Q", sequence) + bytes(56)
+                    proxied = time.monotonic()
+                    message = struct.pack("!Q", sequence) + bytes(self.payload_bytes - 8)
                     conn.sendall(message)
                     reply = b""
                     while len(reply) < len(message):
@@ -348,6 +352,9 @@ class FreshProbe(threading.Thread):
             self.attempts.append({"sequence": sequence, "started_monotonic": sent,
                                   "finished_monotonic": finished,
                                   "elapsed_seconds": finished - sent,
+                                  "tcp_connect_seconds": connected - sent if connected is not None else None,
+                                  "socks_seconds": proxied - connected if proxied is not None else None,
+                                  "echo_seconds": finished - proxied if proxied is not None else None,
                                   "outcome": outcome, "error": error})
             sequence += 1
             self.stop.wait(max(0.0, self.interval - (time.monotonic() - sent)))
@@ -489,6 +496,7 @@ def run(args):
         "chunk_bytes": args.chunk_bytes,
         "mixed_seconds": args.mixed_seconds,
         "unified_game": args.unified_game,
+        "mixed_probe_bytes": 1024 if args.mixed_seconds else None,
         "shared_forward_mbps": args.shared_forward_mbps,
         "shared_forward_burst_bytes": args.shared_forward_burst_bytes,
     })
@@ -586,7 +594,7 @@ def run(args):
         time.sleep(0.5)
         stop = threading.Event()
         if args.mixed_seconds:
-            probe = FreshProbe(tcp_listen, echo.address, 1.0, stop)
+            probe = FreshProbe(tcp_listen, echo.address, 1.0, stop, payload_bytes=1024)
             result = mixed_load.run(tcp_listen, socks_connect, args.mixed_seconds, data, probe)
             save(args.output / "summary.json", result)
             for process in (client, server):
