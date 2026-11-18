@@ -3502,6 +3502,7 @@ async fn sender_with_game_input(
         }
         if let Some(writes) = &mut mixed_writes
             && game_input.as_ref().is_none_or(|input| input.is_empty())
+            && !queue.has_waiting_interactive_data()
         {
             writes.drain(
                 &mut native_queue,

@@ -220,6 +220,13 @@ impl Queue {
                 .any(|pending| pending.hold.as_ref().is_some_and(|hold| hold.bytes > 320))
         })
     }
+    pub(super) fn has_waiting_interactive_data(&self) -> bool {
+        self.flows.values().any(|queue| {
+            queue.front().is_some_and(|pending| {
+                pending.small && pending.hold.as_ref().is_some_and(|hold| hold.interactive())
+            })
+        })
+    }
     pub fn original_flows(&self) -> usize {
         self.turns.len()
     }
