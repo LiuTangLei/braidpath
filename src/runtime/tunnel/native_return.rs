@@ -3,7 +3,7 @@
 //! Only stream DATA (including FIN) uses this lane. Uploads, acknowledgments,
 //! resets and UDP retain the datagram carrier. Offsets and the existing stream
 //! credit remain authoritative, including recovery after a path disappears.
-use super::{OutPath, QueuedRecord, outbound, stream, wire::Record};
+use super::{OutPath, QueuedRecord, outbound, stream};
 use anyhow::{Result, ensure};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use std::{
@@ -419,10 +419,11 @@ impl Decoder {
             let header = &self.partial[..HEADER_BYTES];
             let payload = &self.partial[HEADER_BYTES..];
             let flow = u32::from_be_bytes(header[4..8].try_into()?);
-            let stream_id = stream::stream_id(flow).filter(|_| !stream::is_ack_flow(flow));
-            let (Some(stream_id), Some(frame @ stream::Frame::Data { .. })) =
-                (stream_id, stream::Frame::decode(payload))
+            let Some(stream_id) = stream::stream_id(flow).filter(|_| !stream::is_ack_flow(flow))
             else {
+                anyhow::bail!("invalid return-stream flow");
+            };
+            let Some(frame @ stream::Frame::Data { .. }) = stream::Frame::decode(payload) else {
                 anyhow::bail!("invalid return-stream TCP data frame");
             };
             let decoded = Decoded {
@@ -445,6 +446,7 @@ impl Decoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime::wire::Record;
     #[test]
     fn native_udp_prefers_a_nearby_healthy_route_without_hiding_fallbacks() {
         let mut routes = [
