@@ -98,6 +98,11 @@ pub trait Controller: Send + Sync {
         false
     }
 
+    /// Estimated transport delivery rate in bytes per second, when available.
+    fn delivery_rate(&self) -> Option<u64> {
+        None
+    }
+
     /// Retrieve implementation-specific metrics used to populate `qlog` traces when they are enabled
     fn metrics(&self) -> ControllerMetrics {
         ControllerMetrics {

@@ -1296,6 +1296,7 @@ impl Connection {
     /// Returns connection statistics
     pub fn stats(&self) -> ConnectionStats {
         let mut stats = self.stats;
+        stats.path.delivery_rate = self.path.congestion.delivery_rate();
         stats.datagrams_selection_delay = self.datagrams.selection_delay;
         stats.datagrams_pending = self.datagrams.pending_count();
         stats.datagrams_buffer_evicted = self.datagrams.buffer_evictions;

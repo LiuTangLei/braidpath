@@ -366,7 +366,42 @@ pub(super) fn drain(
 // are independent of the application record decoded from the response body.
 const PART_BYTES: usize = 2048;
 const H3_PART_ALLOWANCE: usize = 16;
-pub(super) const MIXED_SEND_WINDOW: u64 = 1024 * 1024;
+pub(super) const MIXED_INITIAL_WINDOW: u64 = 256 * 1024;
+const MIXED_MIN_WINDOW: u64 = 64 * 1024;
+const MIXED_MAX_WINDOW: u64 = 1024 * 1024;
+
+fn mixed_window(rate: Option<u64>, min_rtt: std::time::Duration, cwnd: u64) -> u64 {
+    let bdp = rate.map_or(cwnd / 2, |rate| {
+        (u128::from(rate) * min_rtt.as_micros() * 105 / 100_000_000) as u64
+    });
+    bdp.clamp(MIXED_MIN_WINDOW, MIXED_MAX_WINDOW)
+}
+
+impl Credit {
+    pub(super) fn observe_mixed(&mut self, conn: &quinn::Connection, now_us: u64) -> Option<u64> {
+        let identity = conn.stable_id();
+        if self.connection != Some(identity) {
+            self.connection = Some(identity);
+            self.sampled_us = now_us;
+            self.current = MIXED_INITIAL_WINDOW;
+            return None;
+        }
+        if now_us.saturating_sub(self.sampled_us) < 100_000 || conn.probing_rtt_hint() {
+            return None;
+        }
+        self.sampled_us = now_us;
+        let path = conn.stats().path;
+        // The bulk response body needs roughly one RTT of independently
+        // measured transport service. Large prewrites allow BBR startup and
+        // recovery to fill the shared queue ahead of feedback and Game UDP.
+        let target = mixed_window(path.delivery_rate, path.min_rtt, path.cwnd);
+        if target == self.current {
+            return None;
+        }
+        self.current = target;
+        Some(target)
+    }
+}
 
 #[derive(Default)]
 pub(super) struct MixedWrites {

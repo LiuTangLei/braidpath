@@ -522,6 +522,11 @@ impl Controller for Bbr {
         self.mode == Mode::ProbeRtt
     }
 
+    fn delivery_rate(&self) -> Option<u64> {
+        let rate = self.max_bandwidth.get_estimate();
+        (rate != 0).then_some(rate)
+    }
+
     fn metrics(&self) -> ControllerMetrics {
         ControllerMetrics {
             congestion_window: self.window(),
