@@ -408,6 +408,7 @@ def transfer(address, direction, data, limit, socks_target=None, chunk_bytes=0):
     conn = socket.create_connection((host, int(port)), timeout=limit)
     started = time.monotonic()
     setup, gap = None, None
+    gap_end_received = None
     chunk_seconds = []
     deadline = started + limit
 
@@ -453,8 +454,9 @@ def transfer(address, direction, data, limit, socks_target=None, chunk_bytes=0):
                 if not chunk:
                     break
                 now = time.monotonic()
-                if last is not None:
-                    gap = max(gap or 0.0, now - last)
+                if last is not None and (gap is None or now - last > gap):
+                    gap = now - last
+                    gap_end_received = count + len(chunk)
                 last = now
                 digest.update(chunk)
                 count += len(chunk)
@@ -462,6 +464,7 @@ def transfer(address, direction, data, limit, socks_target=None, chunk_bytes=0):
             exact = digest.digest() == hashlib.sha256(data).digest() and count == len(data)
     return {"elapsed_seconds": elapsed, "exact": exact, "received_bytes": count,
             "proxy_setup_seconds": setup, "max_gap_seconds": gap,
+            "max_gap_end_received_bytes": gap_end_received,
             "chunk_seconds": chunk_seconds,
             "goodput_mbps": len(data) * 8 / elapsed / 1e6 if exact else 0.0}
 
