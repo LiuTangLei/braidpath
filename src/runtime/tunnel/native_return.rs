@@ -90,7 +90,9 @@ const fn wire_cost(bytes: usize) -> usize {
 }
 pub(super) const WINDOW: u32 = 2 * 1024 * 1024;
 pub(super) const RECEIVE_WINDOW: u32 = 4 * 1024 * 1024;
-const MAX_SEND_WINDOW: u64 = 3 * 1024 * 1024;
+const MAX_SEND_WINDOW: u64 = RECEIVE_WINDOW as u64;
+const SEND_WINDOW_GROWTH: u64 = 64 * 1024;
+const SEND_WINDOW_BRAKE: u64 = 128 * 1024;
 const PATH_QUEUE: usize = 4;
 
 /// Keep startup/backpressure at the established budget. Expand only against
@@ -103,6 +105,17 @@ pub(super) struct Credit {
     lost: u64,
     current: u64,
 }
+#[derive(Clone, Copy)]
+struct CreditSample {
+    cwnd: u64,
+    sent: u64,
+    lost: u64,
+    queued: bool,
+    deeply_queued: bool,
+    probing: bool,
+    storage_limited: bool,
+}
+
 impl Credit {
     pub(super) fn observe(
         &mut self,
@@ -131,38 +144,45 @@ impl Credit {
             .saturating_sub(conn.min_rtt_hint())
             .as_secs_f64()
             * 1000.0;
+        let (retained, unsent) = conn.stream_send_buffer_bytes();
         self.update(
             now_us,
-            stats.path.cwnd,
-            queued_ms > target_ms as f64 * 0.25,
-            conn.probing_rtt_hint(),
-            stats.path.sent_packets,
-            stats.path.lost_packets,
+            CreditSample {
+                cwnd: stats.path.cwnd,
+                sent: stats.path.sent_packets,
+                lost: stats.path.lost_packets,
+                queued: queued_ms > target_ms as f64 * 0.25,
+                deeply_queued: queued_ms > target_ms as f64,
+                probing: conn.probing_rtt_hint(),
+                // Retained data can already be in the network. Expand only if
+                // storage is nearly full and QUIC has packetized most of it.
+                storage_limited: retained + PAYLOAD as u64 >= self.current
+                    && unsent <= 2 * PAYLOAD as u64,
+            },
         )
     }
 
-    fn update(
-        &mut self,
-        now_us: u64,
-        cwnd: u64,
-        queued: bool,
-        probing: bool,
-        sent: u64,
-        lost: u64,
-    ) -> Option<u64> {
-        let packets = sent.saturating_sub(self.sent);
-        let losses = lost.saturating_sub(self.lost);
+    fn update(&mut self, now_us: u64, sample: CreditSample) -> Option<u64> {
+        let packets = sample.sent.saturating_sub(self.sent);
+        let losses = sample.lost.saturating_sub(self.lost);
         self.sampled_us = now_us;
-        self.sent = sent;
-        self.lost = lost;
-        if probing || (packets < 64 && !queued && losses == 0) {
+        self.sent = sample.sent;
+        self.lost = sample.lost;
+        if sample.probing || (packets < 64 && !sample.queued && losses == 0) {
             return None;
         }
-        let ceiling = (cwnd.saturating_mul(3) / 4).clamp(u64::from(WINDOW), MAX_SEND_WINDOW);
-        let next = if !queued && losses.saturating_mul(100) <= packets {
-            ceiling.min(self.current.saturating_add(32 * 1024))
+        let floor = u64::from(WINDOW);
+        let ceiling = (sample.cwnd.saturating_mul(3) / 4).clamp(floor, MAX_SEND_WINDOW);
+        let next = if sample.deeply_queued || losses.saturating_mul(100) > packets {
+            floor
+        } else if sample.queued {
+            // A short RTT excursion need not discard an entire flight of
+            // earned storage. Severe congestion or loss still resets it.
+            ceiling.min(self.current.saturating_sub(SEND_WINDOW_BRAKE).max(floor))
+        } else if sample.storage_limited {
+            ceiling.min(self.current + SEND_WINDOW_GROWTH)
         } else {
-            u64::from(WINDOW)
+            ceiling.min(self.current)
         };
         if next == self.current {
             return None;
@@ -772,39 +792,57 @@ mod tests {
     }
 
     #[test]
-    fn native_credit_grows_in_one_frame_steps_and_keeps_backpressure_on_loss_or_queue() {
+    fn native_credit_grows_only_on_clean_storage_limited_service() {
+        let floor = u64::from(WINDOW);
         let mut credit = Credit {
-            current: u64::from(WINDOW),
+            current: floor,
             ..Default::default()
         };
-        assert_eq!(
-            credit.update(100_000, 4 * 1024 * 1024, false, false, 0, 0),
-            None
-        );
-        for n in 1..=32 {
+        let mut sample = CreditSample {
+            cwnd: 8 * 1024 * 1024,
+            sent: 500,
+            lost: 0,
+            queued: false,
+            deeply_queued: false,
+            probing: false,
+            storage_limited: false,
+        };
+        assert_eq!(credit.update(100_000, sample), None);
+        sample.storage_limited = true;
+        let growth_samples = (MAX_SEND_WINDOW - floor) / SEND_WINDOW_GROWTH;
+        for step in 1..=growth_samples {
+            sample.sent += 500;
             assert_eq!(
-                credit.update(n * 100_000, 4 * 1024 * 1024, false, false, n * 500, 0),
-                Some(u64::from(WINDOW) + n * 32768)
+                credit.update((step + 1) * 100_000, sample),
+                Some(floor + step * SEND_WINDOW_GROWTH)
             );
         }
+        let full_at = (growth_samples + 1) * 100_000;
+        sample.probing = true;
+        sample.queued = true;
+        sample.sent += 500;
+        assert_eq!(credit.update(full_at + 100_000, sample), None);
         assert_eq!(credit.current, MAX_SEND_WINDOW);
+
+        sample.probing = false;
+        sample.sent += 500;
         assert_eq!(
-            credit.update(3_300_000, 4096, true, true, 16_100, 0),
-            None,
-            "a deliberate native RTT probe does not resize retained storage"
+            credit.update(full_at + 200_000, sample),
+            Some(MAX_SEND_WINDOW - SEND_WINDOW_BRAKE)
         );
+        sample.deeply_queued = true;
+        sample.sent += 500;
+        assert_eq!(credit.update(full_at + 300_000, sample), Some(floor));
+        sample.deeply_queued = false;
+        sample.queued = false;
+        sample.sent += 500;
         assert_eq!(
-            credit.update(3_400_000, 4 * 1024 * 1024, true, false, 16_600, 0),
-            Some(u64::from(WINDOW))
+            credit.update(full_at + 400_000, sample),
+            Some(floor + SEND_WINDOW_GROWTH)
         );
-        assert_eq!(
-            credit.update(3_500_000, 4 * 1024 * 1024, false, false, 17_100, 0),
-            Some(u64::from(WINDOW) + 32768)
-        );
-        assert_eq!(
-            credit.update(3_600_000, 4 * 1024 * 1024, false, false, 17_600, 20),
-            Some(u64::from(WINDOW))
-        );
+        sample.sent += 500;
+        sample.lost += 20;
+        assert_eq!(credit.update(full_at + 500_000, sample), Some(floor));
     }
     #[tokio::test]
     async fn mixed_native_small_buckets_and_cancelled_parts_preserve_credit() {
