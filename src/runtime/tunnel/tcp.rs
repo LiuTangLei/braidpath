@@ -1903,13 +1903,20 @@ impl Mux {
             (self.events.len() + self.game_events.as_ref().map_or(0, |rx| rx.len())) as u64;
         self.stats.local_sender_queued_bytes = self.gauge.queued() as u64;
         let mut gauges = [0u64; 5];
+        let mut downloading = 0;
         for stream in self.streams.values() {
             let (retained, unsent, blocked) = stream.send.pending_data();
+            downloading += usize::from(retained >= native_return::PAYLOAD as u64);
             gauges[0] += retained;
             gauges[1] += unsent;
             gauges[2] += u64::from(blocked);
             gauges[3] += stream.recv.buffered();
             gauges[4] += stream.recv.receive_diagnostics().2;
+        }
+        if self.native_return {
+            self.scope
+                .parallel_downloads
+                .store(downloading > 1, Ordering::Relaxed);
         }
         self.stats.send_retained_bytes = gauges[0];
         self.stats.send_unsent_bytes = gauges[1];

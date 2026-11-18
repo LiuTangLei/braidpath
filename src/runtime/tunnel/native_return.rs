@@ -93,6 +93,8 @@ pub(super) const RECEIVE_WINDOW: u32 = 4 * 1024 * 1024;
 const MAX_SEND_WINDOW: u64 = RECEIVE_WINDOW as u64;
 const SEND_WINDOW_GROWTH: u64 = 64 * 1024;
 const SEND_WINDOW_BRAKE: u64 = 128 * 1024;
+const SLOW_PATH_BACKLOG_THRESHOLD: u64 = 256 * 1024;
+const SLOW_PATH_WRITER_MARGIN: u64 = 2 * PAYLOAD as u64;
 const PATH_QUEUE: usize = 4;
 
 /// Keep startup/backpressure at the established budget. Expand only against
@@ -114,6 +116,14 @@ struct CreditSample {
     deeply_queued: bool,
     probing: bool,
     storage_limited: bool,
+    unsent: u64,
+    faster_route: bool,
+}
+
+// A cwnd/RTT bound is sufficient to distinguish a much slower path. Actual
+// unsent bytes must also show that its current window is building a queue.
+pub(super) fn service_bound(conn: &quinn::Connection) -> u64 {
+    conn.cwnd_hint().saturating_mul(1_000) / conn.rtt_hint().as_micros().max(1) as u64
 }
 
 impl Credit {
@@ -122,6 +132,7 @@ impl Credit {
         conn: &quinn::Connection,
         now_us: u64,
         target_ms: u64,
+        best_service: u64,
     ) -> Option<u64> {
         let identity = conn.stable_id();
         if self.connection != Some(identity) {
@@ -158,6 +169,8 @@ impl Credit {
                 // storage is nearly full and QUIC has packetized most of it.
                 storage_limited: retained + PAYLOAD as u64 >= self.current
                     && unsent <= 2 * PAYLOAD as u64,
+                unsent,
+                faster_route: service_bound(conn).saturating_mul(2) < best_service,
             },
         )
     }
@@ -168,12 +181,26 @@ impl Credit {
         self.sampled_us = now_us;
         self.sent = sample.sent;
         self.lost = sample.lost;
-        if sample.probing || (packets < 64 && !sample.queued && losses == 0) {
+        let floor = u64::from(WINDOW);
+        let restore_default = self.current < floor && !sample.faster_route;
+        if sample.probing || (!restore_default && packets < 64 && !sample.queued && losses == 0) {
             return None;
         }
-        let floor = u64::from(WINDOW);
         let ceiling = (sample.cwnd.saturating_mul(3) / 4).clamp(floor, MAX_SEND_WINDOW);
-        let next = if sample.deeply_queued || losses.saturating_mul(100) > packets {
+        // BBR's cwnd already includes headroom beyond a typical flight.
+        // Keep the writer fed without giving the slow path another long queue.
+        let slow_window = (sample.cwnd.saturating_mul(3) / 4)
+            .saturating_add(SLOW_PATH_WRITER_MARGIN)
+            .min(floor);
+        let next = if sample.faster_route
+            && slow_window < floor
+            && (self.current < floor || sample.unsent > SLOW_PATH_BACKLOG_THRESHOLD)
+        {
+            slow_window
+        } else if self.current < floor
+            || sample.deeply_queued
+            || losses.saturating_mul(100) > packets
+        {
             floor
         } else if sample.queued {
             // A short RTT excursion need not discard an entire flight of
@@ -806,6 +833,8 @@ mod tests {
             deeply_queued: false,
             probing: false,
             storage_limited: false,
+            unsent: 0,
+            faster_route: false,
         };
         assert_eq!(credit.update(100_000, sample), None);
         sample.storage_limited = true;
@@ -844,6 +873,39 @@ mod tests {
         sample.lost += 20;
         assert_eq!(credit.update(full_at + 500_000, sample), Some(floor));
     }
+    #[test]
+    fn native_credit_limits_slow_path_write_ahead_while_a_faster_path_is_available() {
+        let floor = u64::from(WINDOW);
+        let mut credit = Credit {
+            current: floor,
+            ..Default::default()
+        };
+        let mut sample = CreditSample {
+            cwnd: 512 * 1024,
+            sent: 500,
+            lost: 0,
+            queued: false,
+            deeply_queued: false,
+            probing: false,
+            storage_limited: false,
+            unsent: 1024 * 1024,
+            faster_route: false,
+        };
+        assert_eq!(credit.update(100_000, sample), None);
+        sample.faster_route = true;
+        sample.sent += 500;
+        let limited = sample.cwnd * 3 / 4 + SLOW_PATH_WRITER_MARGIN;
+        assert_eq!(credit.update(200_000, sample), Some(limited));
+
+        sample.unsent = 0;
+        sample.sent += 500;
+        assert_eq!(credit.update(300_000, sample), None);
+        assert_eq!(credit.current, limited);
+
+        sample.faster_route = false;
+        assert_eq!(credit.update(400_000, sample), Some(floor));
+    }
+
     #[tokio::test]
     async fn mixed_native_small_buckets_and_cancelled_parts_preserve_credit() {
         let pair = super::super::sender_ready_tests::Pair::connect().await;

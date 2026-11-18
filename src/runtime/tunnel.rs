@@ -2291,6 +2291,25 @@ async fn sender_with_game_input(
             }
             if silent == open { 0 } else { silent }
         };
+        let best_native_service = if native_returning
+            && mixed_writes.is_none()
+            && paths.len() > 1
+            && metrics.parallel_downloads.load(Ordering::Relaxed)
+        {
+            paths
+                .iter()
+                .filter(|path| {
+                    path.native_return.is_some()
+                        && path.open()
+                        && !liveness[usize::from(path.id)].silent()
+                        && !path.conn.probing_rtt_hint()
+                })
+                .map(|path| native_return::service_bound(&path.conn))
+                .max()
+                .unwrap_or(0)
+        } else {
+            0
+        };
         for path in paths.iter() {
             if let Some(writer) = &path.native_return {
                 writer.set_reachable(path.open() && !liveness[usize::from(path.id)].silent());
@@ -2299,6 +2318,7 @@ async fn sender_with_game_input(
                         &path.conn,
                         now_us,
                         policy.latency_target_ms,
+                        best_native_service,
                     )
                 {
                     path.conn.set_send_window(window);

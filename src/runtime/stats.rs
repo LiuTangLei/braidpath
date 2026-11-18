@@ -856,6 +856,7 @@ pub struct Scope {
     pub metrics: Metrics,
     pub session: String,
     pub direction: &'static str,
+    pub(crate) parallel_downloads: Arc<AtomicBool>,
     path_keys: Arc<[String; 256]>,
     trace_context: Option<trace::Context>,
 }
@@ -960,6 +961,7 @@ impl Metrics {
             metrics: self.clone(),
             session: session.to_owned(),
             direction,
+            parallel_downloads: Arc::new(AtomicBool::new(false)),
             path_keys: Arc::new(std::array::from_fn(|pid| format!("{session}/{pid}"))),
             trace_context,
         }
