@@ -2383,7 +2383,7 @@ async fn sender_with_game_input(
                         && policy.redundancy == 0
                         && path.open(),
                     feedback_sample_symbols: estimate.sample_symbols,
-                    finalized_expected: Some(estimate.expected - estimate.local_unsent),
+                    finalized_expected: Some(estimate.network_expected()),
                     finalized_lost: Some(estimate.lost),
                     admitted_symbols: Some(snapshot.sent_symbols),
                     admitted_symbol_bytes: Some(snapshot.sent_bytes),

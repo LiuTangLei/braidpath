@@ -1,7 +1,7 @@
 //! Optional quality weights; every open path retains original-symbol probes.
 use super::{MAX_PATHS, quality::Estimate};
 pub fn weight(estimate: &Estimate, now_us: u64, rtt_ms: f64) -> i32 {
-    if estimate.expected < 16
+    if estimate.network_expected() < 16
         || estimate
             .updated_us
             .is_none_or(|t| now_us.saturating_sub(t) > 3_000_000)
@@ -65,7 +65,7 @@ pub struct Rotation {
 }
 impl Rotation {
     pub fn consider(&mut self, estimate: &Estimate, path_time_us: u64, now_us: u64) -> bool {
-        let bad = estimate.expected >= 32
+        let bad = estimate.network_expected() >= 32
             && estimate
                 .updated_us
                 .is_some_and(|t| path_time_us.saturating_sub(t) < 3_000_000)

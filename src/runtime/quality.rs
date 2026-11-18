@@ -147,6 +147,12 @@ pub struct Estimate {
     /// reports do not constitute a new loss sample.
     pub sample_loss_rate: f64,
 }
+impl Estimate {
+    pub fn network_expected(&self) -> u64 {
+        self.expected.saturating_sub(self.local_unsent)
+    }
+}
+
 #[derive(Clone, Default, Serialize)]
 pub struct Snapshot {
     pub generation: u64,

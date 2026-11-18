@@ -146,14 +146,15 @@ impl Controller {
                 };
             }
             let estimate = &path.sender_estimate;
-            let n = estimate.expected.saturating_sub(cursor.expected);
+            let network_expected = estimate.network_expected();
+            let n = network_expected.saturating_sub(cursor.expected);
             let missing = estimate.lost.saturating_sub(cursor.lost);
             if active {
                 sent = sent.saturating_add(path.sent_symbols.saturating_sub(cursor.sent));
             }
             *cursor = Cursor {
                 generation: path.generation,
-                expected: estimate.expected,
+                expected: network_expected,
                 lost: estimate.lost,
                 sent: path.sent_symbols,
             };
