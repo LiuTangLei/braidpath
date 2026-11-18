@@ -114,8 +114,8 @@ impl State {
 /// Multiplex into the existing pending control record and its reserved budget.
 /// Both lists have identical membership, so no business record loses feedback.
 pub fn control(business: &[quality::Report], probes: &[quality::Report]) -> Bytes {
-    let first = quality::control_v2(business);
-    let second = quality::control_v2(probes);
+    let first = quality::control(business);
+    let second = quality::control(probes);
     let mut frame = Vec::with_capacity(6 + first.len() + second.len());
     frame.extend(b"BQ3C");
     frame.extend((first.len() as u16).to_be_bytes());

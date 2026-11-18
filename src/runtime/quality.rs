@@ -17,8 +17,7 @@ const DELIVERY_MIN_BYTES: u64 = 4096;
 const WINDOW: u64 = 1 << 20;
 // Only unresolved writer-local drops need exact sequence identities.
 const MAX_PENDING_UNSENT: usize = 8192;
-const ENTRY: usize = 49;
-const ENTRY_V2: usize = 65;
+const ENTRY: usize = 65;
 
 #[derive(Clone, Copy, Default)]
 struct Word {
@@ -565,15 +564,9 @@ fn number(b: &[u8], offset: usize) -> u64 {
     u64::from_be_bytes(b[offset..offset + 8].try_into().expect("validated frame"))
 }
 pub fn control(reports: &[Report]) -> Bytes {
-    encode_control(reports, false)
-}
-pub fn control_v2(reports: &[Report]) -> Bytes {
-    encode_control(reports, true)
-}
-fn encode_control(reports: &[Report], v2: bool) -> Bytes {
     assert!(reports.len() <= MAX_PATHS);
-    let mut b = Vec::with_capacity(5 + if v2 { ENTRY_V2 } else { ENTRY } * reports.len());
-    b.extend(if v2 { *b"BQ2C" } else { *b"BQ1C" });
+    let mut b = Vec::with_capacity(5 + ENTRY * reports.len());
+    b.extend(*b"BQ2C");
     b.push(reports.len() as u8);
     for r in reports {
         b.push(r.id);
@@ -587,26 +580,22 @@ fn encode_control(reports: &[Report], v2: bool) -> Bytes {
         ] {
             b.extend(n.to_be_bytes());
         }
-        if v2 {
-            b.extend(r.received_bytes.to_be_bytes());
-            b.extend(r.report_time_us.to_be_bytes());
-        }
+        b.extend(r.received_bytes.to_be_bytes());
+        b.extend(r.report_time_us.to_be_bytes());
     }
     b.into()
 }
 pub fn parse_control(b: &[u8]) -> Result<Vec<Report>> {
-    let v2 = b.len() >= 4 && &b[..4] == b"BQ2C";
-    let entry = if v2 { ENTRY_V2 } else { ENTRY };
     ensure!(
         b.len() >= 5
-            && (&b[..4] == b"BQ1C" || v2)
+            && &b[..4] == b"BQ2C"
             && usize::from(b[4]) <= MAX_PATHS
-            && b.len() == 5 + entry * usize::from(b[4]),
+            && b.len() == 5 + ENTRY * usize::from(b[4]),
         "invalid control length"
     );
     let mut ids = BTreeSet::new();
     let mut out = Vec::new();
-    for e in b[5..].chunks_exact(entry) {
+    for e in b[5..].as_chunks::<ENTRY>().0 {
         ensure!(
             usize::from(e[0]) < MAX_PATHS && ids.insert(e[0]),
             "invalid control path"
@@ -619,8 +608,8 @@ pub fn parse_control(b: &[u8]) -> Result<Vec<Report>> {
             expected: number(e, 25),
             received: number(e, 33),
             delay_us: number(e, 41),
-            received_bytes: if v2 { number(e, 49) } else { 0 },
-            report_time_us: if v2 { number(e, 57) } else { 0 },
+            received_bytes: number(e, 49),
+            report_time_us: number(e, 57),
         });
     }
     Ok(out)
@@ -804,7 +793,7 @@ mod tests {
         .unwrap()
     }
     fn apply_wire_report(state: &mut State, report: Report, now_us: u64) {
-        let decoded = parse_control(&control_v2(&[report])).unwrap();
+        let decoded = parse_control(&control(&[report])).unwrap();
         state.apply(&decoded[0], now_us).unwrap();
     }
 
@@ -1259,7 +1248,7 @@ mod tests {
             received_bytes: 800,
             report_time_us: 100_000,
         };
-        let parsed = parse_control(&control_v2(&[report.clone()])).unwrap();
+        let parsed = parse_control(&control(&[report.clone()])).unwrap();
         tx.apply(&parsed[0], 9_000_000).unwrap();
         assert_eq!(tx.snapshot.sender_estimate.delivered_bps, None);
         report.number = 2;
@@ -1274,8 +1263,12 @@ mod tests {
         assert_eq!(tx.snapshot.sender_estimate.sample_symbols, 2);
         assert_eq!(tx.snapshot.sender_estimate.sample_loss_rate, 0.0);
         assert!(tx.snapshot.sender_estimate.loss_rate > 0.0);
-        let legacy = parse_control(&control(&[report.clone()])).unwrap();
-        assert_eq!(legacy[0].report_time_us, 0);
+        let mut obsolete = control(&[report.clone()]).to_vec();
+        obsolete[..4].copy_from_slice(b"BQ1C");
+        // A complete old-format entry had 49 bytes, without the two BQ2C
+        // cumulative delivery fields. Reject the retired format itself.
+        obsolete.truncate(5 + 49);
+        assert!(parse_control(&obsolete).is_err());
         report.number = 3;
         report.report_time_us += 500_000;
         report.received_bytes = 1201;

@@ -31,24 +31,6 @@ pub struct Options {
     /// were permanently rejected locally. Off by default; no added credit.
     #[arg(long)]
     pub repair_usefulness_guard: bool,
-    /// Per-source RTT baselines are the default. With --legacy-recovery,
-    /// re-enable this correction without changing the other legacy controls.
-    #[arg(long, hide = true)]
-    pub rtt_source_baselines: bool,
-    /// Random-loss service accounting with the minimum floor (at most 25%).
-    /// Only meaningful with --legacy-recovery; hidden, kept for old scripts.
-    #[arg(long, hide = true)]
-    pub random_loss_service: bool,
-    /// Queue-gated loss pacing, now the default; hidden, kept for old
-    /// scripts. Together with --legacy-recovery it re-enables only this part.
-    #[arg(long, hide = true)]
-    pub queue_gated_loss: bool,
-    /// Restore the earlier adaptive controller: 100 ms brake debounce,
-    /// post-brake restoration only from a qualified 500 ms service window, and
-    /// loss-only brakes at any queue delay (no queue-gated loss pacing), and
-    /// the old shared RTT baseline across estimators.
-    #[arg(long)]
-    pub legacy_recovery: bool,
     /// Experimental native-window service recovery; off by default. Adaptive
     /// health, delay/loss brakes, native BBR and all configured caps remain.
     #[arg(long)]
@@ -828,11 +810,7 @@ impl ConnectionTrace {
 struct Inner {
     summary_registered: AtomicBool,
     summary_label: OnceLock<String>,
-    legacy_recovery: bool,
     repair_usefulness_guard: bool,
-    rtt_source_baselines: bool,
-    random_loss_service: bool,
-    queue_gated_loss: bool,
     native_service_guard: bool,
     frontier_scheduler: bool,
     state: Mutex<State>,
@@ -871,45 +849,19 @@ impl Metrics {
         frontier_scheduler: bool,
         native_service_guard: bool,
     ) -> Self {
-        Self::configured_rtt(role, trace, frontier_scheduler, native_service_guard, false)
+        Self::configured_repair(role, trace, frontier_scheduler, native_service_guard, false)
     }
-    fn configured_rtt(
-        role: &'static str,
-        trace: trace::Trace,
-        frontier_scheduler: bool,
-        native_service_guard: bool,
-        rtt_source_baselines: bool,
-    ) -> Self {
-        Self::configured_repair(
-            role,
-            trace,
-            frontier_scheduler,
-            native_service_guard,
-            rtt_source_baselines,
-            false,
-            false,
-            false,
-        )
-    }
-    #[allow(clippy::too_many_arguments)]
     fn configured_repair(
         role: &'static str,
         trace: trace::Trace,
         frontier_scheduler: bool,
         native_service_guard: bool,
-        rtt_source_baselines: bool,
         repair_usefulness_guard: bool,
-        random_loss_service: bool,
-        queue_gated_loss: bool,
     ) -> Self {
         Self(Arc::new(Inner {
             summary_registered: AtomicBool::new(false),
             summary_label: OnceLock::new(),
-            legacy_recovery: false,
             repair_usefulness_guard,
-            rtt_source_baselines,
-            random_loss_service,
-            queue_gated_loss,
             native_service_guard,
             frontier_scheduler,
             state: Mutex::new(State::default()),
@@ -930,44 +882,12 @@ impl Metrics {
     pub fn native_service_guard(&self) -> bool {
         self.0.native_service_guard
     }
-    /// Default: a selected RTT is compared with the minimum of its own source,
-    /// so a stable Quinn/probe offset is not queue delay.
-    pub fn rtt_source_baselines(&self) -> bool {
-        self.0.rtt_source_baselines || !self.0.legacy_recovery
-    }
-    pub fn random_loss_service(&self) -> bool {
-        self.0.random_loss_service
-    }
-    /// Default throughput pacing: loss-only brakes need a queue or a sustained
-    /// transport block. --legacy-recovery restores loss brakes at any queue.
-    pub fn queue_gated_loss(&self) -> bool {
-        self.0.queue_gated_loss || !self.0.legacy_recovery
-    }
-    /// Configure before the metrics are shared with any sender.
-    fn with_legacy_recovery(mut self, legacy: bool) -> Self {
-        Arc::get_mut(&mut self.0)
-            .expect("metrics not yet shared")
-            .legacy_recovery = legacy;
-        self
-    }
-    pub fn legacy_recovery(&self) -> bool {
-        self.0.legacy_recovery
-    }
     pub fn repair_usefulness_guard(&self) -> bool {
         self.0.repair_usefulness_guard
     }
     #[cfg(test)]
     pub(crate) fn new_with_repair_guard(role: &'static str, enabled: bool) -> Self {
-        Self::configured_repair(
-            role,
-            trace::Trace::disabled(),
-            false,
-            false,
-            false,
-            enabled,
-            false,
-            false,
-        )
+        Self::configured_repair(role, trace::Trace::disabled(), false, false, enabled)
     }
     pub fn state(&self, f: impl FnOnce(&mut State)) {
         f(&mut self.0.state.lock().expect("stats lock"));
@@ -1413,22 +1333,6 @@ impl Reporter {
             "repair-usefulness-guard applies only to a client or server sender"
         );
         ensure!(
-            !options.rtt_source_baselines || matches!(role, "client" | "server"),
-            "rtt-source-baselines applies only to a client or server sender"
-        );
-        ensure!(
-            !options.random_loss_service || matches!(role, "client" | "server"),
-            "random-loss-service applies only to a client or server sender"
-        );
-        ensure!(
-            !options.queue_gated_loss || matches!(role, "client" | "server"),
-            "queue-gated-loss applies only to a client or server sender"
-        );
-        ensure!(
-            !options.legacy_recovery || matches!(role, "client" | "server"),
-            "legacy-recovery applies only to a client or server sender"
-        );
-        ensure!(
             !options.native_service_guard || matches!(role, "client" | "server"),
             "native-service-guard applies only to a client or server sender"
         );
@@ -1467,12 +1371,8 @@ impl Reporter {
             capture,
             options.frontier_scheduler,
             options.native_service_guard,
-            options.rtt_source_baselines,
             options.repair_usefulness_guard,
-            options.random_loss_service,
-            options.queue_gated_loss,
-        )
-        .with_legacy_recovery(options.legacy_recovery);
+        );
         let stopping = Arc::new(AtomicBool::new(false));
         let periodic = jsonl.clone().map(|file| {
             let metrics = metrics.clone();
@@ -1634,40 +1534,6 @@ mod tests {
             },
             ..Default::default()
         }
-    }
-
-    #[test]
-    fn queue_gated_loss_is_the_default_and_legacy_recovery_restores_loss_brakes() {
-        let metrics = |legacy: bool, gated: bool| {
-            Metrics::configured_repair(
-                "client",
-                trace::Trace::disabled(),
-                false,
-                false,
-                false,
-                false,
-                false,
-                gated,
-            )
-            .with_legacy_recovery(legacy)
-        };
-        assert!(metrics(false, false).queue_gated_loss());
-        assert!(!metrics(true, false).queue_gated_loss());
-        assert!(metrics(true, true).queue_gated_loss());
-    }
-
-    #[test]
-    fn source_specific_rtt_baselines_are_default_with_an_explicit_legacy_control() {
-        assert!(Metrics::new("client").rtt_source_baselines());
-        assert!(
-            !Metrics::new("client")
-                .with_legacy_recovery(true)
-                .rtt_source_baselines()
-        );
-        let explicit =
-            Metrics::configured_rtt("client", trace::Trace::disabled(), false, false, true)
-                .with_legacy_recovery(true);
-        assert!(explicit.rtt_source_baselines());
     }
 
     #[test]

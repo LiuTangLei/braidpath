@@ -22,6 +22,12 @@ fn two_ready() -> ([adaptive::PathController; MAX_PATHS], u64) {
         if now.is_multiple_of(100_000) {
             for id in 0..2 {
                 let report = now / 500_000;
+                // Establish both RTT-source baselines before exercising a
+                // shallow queue. Six milliseconds is above the current
+                // loss-only hold (25% of 20 ms) but below the reprobe gate
+                // (40%), so the measured loss can qualify a bounded trial.
+                // Flat RTT with random loss deliberately no longer does.
+                let rtt_ms = if now == 0 { 80.0 } else { 86.0 };
                 controllers[id].observe(&adaptive::Observation {
                     now_us: now,
                     generation: 7,
@@ -37,8 +43,8 @@ fn two_ready() -> ([adaptive::PathController; MAX_PATHS], u64) {
                     finalized_lost: Some(report_expected[id] / 5),
                     feedback_sample_symbols: report_symbols[id],
                     loss_sample_rate: Some(0.2),
-                    rtt_ms: 80.0,
-                    probe_latest_rtt_ms: Some(80.0),
+                    rtt_ms,
+                    probe_latest_rtt_ms: Some(rtt_ms),
                     probe_sample_id: report + 1,
                     probe_age_us: Some(now % 500_000),
                     offered_backlog: true,

@@ -2722,7 +2722,7 @@ async fn event_observation_036_notifies_only_the_owner_on_accepted_wire_evidence
     let other_sender = Notify::new();
     let mut peer0 = quality::State::new(7);
     let mut peer1 = quality::State::new(7);
-    let reports = quality::control_v2(&[peer0.report(0, 1000), peer1.report(1, 1000)]);
+    let reports = quality::control(&[peer0.report(0, 1000), peer1.report(1, 1000)]);
     assert!(
         measured_payload(&paths, 0, &reports, true, &scope, Some(&owner))
             .unwrap()
@@ -2753,7 +2753,7 @@ async fn event_observation_036_notifies_only_the_owner_on_accepted_wire_evidence
         sent
     };
     peer0.receive(&sent, 1500).unwrap();
-    let delivery = quality::control_v2(&[peer0.delivery_report(0, 2000)]);
+    let delivery = quality::control(&[peer0.delivery_report(0, 2000)]);
     measured_payload(&paths, 0, &delivery, true, &scope, Some(&owner)).unwrap();
     assert!(notified(&owner));
     assert!(!notified(&owner));
@@ -2762,7 +2762,7 @@ async fn event_observation_036_notifies_only_the_owner_on_accepted_wire_evidence
     measured_payload(
         &paths,
         0,
-        &quality::control_v2(&[stale]),
+        &quality::control(&[stale]),
         true,
         &scope,
         Some(&owner),
@@ -2849,7 +2849,7 @@ async fn event_observation_036_notifies_only_the_owner_on_accepted_wire_evidence
         !notified(&owner),
         "business reception does not notify this sender"
     );
-    let fixed = quality::control_v2(&[peer1.report(1, 4000)]);
+    let fixed = quality::control(&[peer1.report(1, 4000)]);
     measured_payload(&paths, 1, &fixed, true, &scope, None).unwrap();
     assert!(!notified(&owner));
     assert!(
@@ -2952,7 +2952,7 @@ async fn business_only_feedback_does_not_renew_independent_probe_evidence() {
         .snapshot(quality_time(&path));
     assert_eq!(before.sender_estimate.received_bytes, 972);
     assert!(before.sender_estimate.delivered_updated_us.is_some());
-    let business_only = quality::control_v2(&[business_peer.delivery_report(0, 2000)]);
+    let business_only = quality::control(&[business_peer.delivery_report(0, 2000)]);
     measured_payload(&paths, 0, &business_only, true, &scope, None).unwrap();
     let after = path
         .capacity_probe

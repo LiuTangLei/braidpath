@@ -69,18 +69,7 @@ mod proxy_cli_tests {
             "--socks5",
             "a=127.0.0.1:2080",
         ];
-        for (args, wait) in [
-            (&[][..], false),
-            (&["--experimental-socks5-early-reply"][..], false),
-            (&["--socks5-wait-for-connect"][..], true),
-            (
-                &[
-                    "--experimental-socks5-early-reply",
-                    "--socks5-wait-for-connect",
-                ][..],
-                true,
-            ),
-        ] {
+        for (args, wait) in [(&[][..], false), (&["--socks5-wait-for-connect"][..], true)] {
             let parsed =
                 Cli::try_parse_from(client.into_iter().chain(args.iter().copied())).unwrap();
             assert!(matches!(
@@ -289,9 +278,6 @@ enum Command {
         /// Wait for the exit's bound address or SOCKS5 failure before replying to CONNECT.
         #[arg(long)]
         socks5_wait_for_connect: bool,
-        /// Compatibility flag from the early-reply experiment.
-        #[arg(long, hide = true)]
-        experimental_socks5_early_reply: bool,
     },
     /// Discover live distributed servers through any member using a client key.
     Nodes {
@@ -511,8 +497,8 @@ mod dual_cli_tests {
 #[derive(Args)]
 struct PolicyArgs {
     /// Prefer low UDP delay: earliest-ready paths, immediate bounded protection,
-    /// adaptive pacing and the normal 20 ms TCP admission budget.
-    #[arg(long, conflicts_with_all = ["fec", "fec_repairs", "small_fec_bytes", "mixed_fec", "latency_target_ms", "queue_ms", "block_ms", "capacity_probe_bps", "probe_guided_recovery"])]
+    /// adaptive pacing, a 10 ms UDP target and a separate TCP admission budget of at least 80 ms.
+    #[arg(long, conflicts_with_all = ["fec", "fec_repairs", "small_fec_bytes", "mixed_fec", "latency_target_ms", "queue_ms", "block_ms", "capacity_probe_bps", "probe_guided_recovery", "native_return_stream"])]
     game_mode: bool,
     /// Use a negotiated reliable QUIC stream for TCP downloads; uploads and UDP stay unchanged.
     #[arg(long)]
@@ -1394,6 +1380,52 @@ mod aggregate_cli_tests {
         assert_eq!(p.rate, 8_000_000);
         assert!(p.validate().is_ok());
         assert!(Cli::try_parse_from(args.into_iter().chain(["--queue-ms", "20"])).is_err());
+    }
+
+    #[test]
+    fn download_and_game_presets_are_separate_for_both_client_entries() {
+        let entries = [
+            vec![
+                "braidpath",
+                "client",
+                "--entrance",
+                "127.0.0.1:7001",
+                "--server-name",
+                "localhost",
+                "--ca",
+                "cert.pem",
+                "--token-file",
+                "token",
+            ],
+            vec![
+                "braidpath",
+                "mesh-client",
+                "--connect",
+                "127.0.0.1:7001",
+                "--connection-key",
+                "key.json",
+                "--dir",
+                "state",
+                "--exit",
+                "exit-a",
+            ],
+        ];
+        for entry in entries {
+            assert!(Cli::try_parse_from(entry.iter().copied().chain(["--game-mode"])).is_ok());
+            assert!(
+                Cli::try_parse_from(entry.iter().copied().chain(["--native-return-stream"]))
+                    .is_ok()
+            );
+            let error = Cli::try_parse_from(
+                entry
+                    .iter()
+                    .copied()
+                    .chain(["--game-mode", "--native-return-stream"]),
+            )
+            .err()
+            .expect("combined presets must be rejected");
+            assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+        }
     }
 
     #[test]

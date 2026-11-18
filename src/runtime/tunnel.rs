@@ -554,8 +554,7 @@ fn measured_payload(
         return Ok(Some(Bytes::copy_from_slice(payload)));
     }
     let paths = paths.lock().expect("paths lock");
-    if payload.starts_with(b"BQ1C") || payload.starts_with(b"BQ2C") || payload.starts_with(b"BQ3C")
-    {
+    if payload.starts_with(b"BQ2C") || payload.starts_with(b"BQ3C") {
         let (reports, capacity_reports) = if payload.starts_with(b"BQ3C") {
             ensure!(
                 paths.iter().all(|p| p.capacity_probe_enabled),
@@ -1824,10 +1823,6 @@ async fn sender_with_game_input(
             policy.rate,
             policy.control_latency_target_ms(metrics.direction),
         )
-        .with_rtt_source_baselines(metrics.metrics.rtt_source_baselines())
-        .with_random_loss_service(metrics.metrics.random_loss_service())
-        .with_queue_gated_loss(metrics.metrics.queue_gated_loss())
-        .with_legacy_recovery(metrics.metrics.legacy_recovery())
         .with_shared_uplink_service(policy.game_mode || metrics.direction == stats::FORWARD)
         .with_packet_reserve(if policy.game_mode {
             GAME_PACKET_RESERVE
@@ -1842,8 +1837,7 @@ async fn sender_with_game_input(
     let mut next_sender_log_us = 0u64;
     let mut next_summary_gauge_us = 0u64;
     let mut logged_guard = forward_guard::Snapshot::default();
-    let reliable_native_service =
-        (policy.streams || policy.proxy) && !metrics.metrics.legacy_recovery();
+    let reliable_native_service = policy.streams || policy.proxy;
     let burst = if native_returning {
         native_return::BURST
     } else if policy.adaptive {
@@ -1883,10 +1877,8 @@ async fn sender_with_game_input(
     let mut feedback_schedule = quality::FeedbackSchedule::default();
     let mut pending_feedback: Option<(Bytes, quality::ReportKind)> = None;
     let mut observation_schedule = policy.adaptive.then(outbound::ObservationSchedule::default);
-    let mut reverse_guard =
-        (policy.adaptive && !metrics.metrics.legacy_recovery()).then(reverse_guard::Guard::default);
-    let mut forward_guard =
-        (policy.adaptive && !metrics.metrics.legacy_recovery()).then(forward_guard::Guard::default);
+    let mut reverse_guard = policy.adaptive.then(reverse_guard::Guard::default);
+    let mut forward_guard = policy.adaptive.then(forward_guard::Guard::default);
     let mut repair_turn = false;
     let mut tick = interval(Duration::from_millis(1));
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -2707,7 +2699,7 @@ async fn sender_with_game_input(
                             .collect();
                         capacity_probe::control(&reports, &probes)
                     } else {
-                        quality::control_v2(&reports)
+                        quality::control(&reports)
                     };
                     pending_feedback = Some((frame, kind));
                 }
@@ -5450,7 +5442,7 @@ async fn client_session(
                     let config=config.clone();
                     let ca=options.ca.clone();let name=options.name.clone();let token=token.clone();let sid=sid.clone();
                     let policy=options.policy.clone();let metrics=options.stats.clone();let tx=rejoin_tx.clone();
-                    let ack_request=if metrics.legacy_recovery(){transport::AckRequest::Unchanged}else{transport::AckRequest::EveryEight};
+                    let ack_request=transport::AckRequest::EveryEight;
                     let congestion=options.congestion;let rejoin=has_session;
                     let exit=exit.map(str::to_owned);
                     let datagram_send_buffer_bytes=options.datagram_send_buffer_bytes;
