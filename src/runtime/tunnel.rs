@@ -5223,7 +5223,9 @@ async fn client_session(
     let forward = options.stats.scope(&sid, stats::FORWARD);
     let returning = options.stats.scope(&sid, stats::RETURN);
     let (wire_tx, mut wire_rx) = mpsc::channel::<(u8, Bytes)>(WIRE_QUEUE);
-    let (native_tx, mut native_rx) = mpsc::channel::<native_return::Incoming>(64);
+    let (native_tx, mut native_rx) = mpsc::channel(MAX_PATHS * native_return::RX_PATH_RECORDS);
+    let native_ingress: [_; MAX_PATHS] =
+        std::array::from_fn(|_| native_return::Ingress::new(native_tx.clone()));
     let mut tasks = JoinSet::new();
     let mut endpoints: [Option<quinn::Endpoint>; MAX_PATHS] = std::array::from_fn(|_| None);
     let mut configs = Vec::<PathConfig>::new();
@@ -5338,9 +5340,12 @@ async fn client_session(
     let mut has_session = false;
     let mut announced = false;
     let mut last_stats = 0u64;
+    let native_credit = streams.as_ref().and_then(tcp::Mux::native_credit_watch);
     let result:Result<()>=async {loop {
+        let credit_changed = native_credit.as_ref().map(|credit| credit.notified());
         if let Some(mux)=streams.as_mut() {
             mux.service_io();
+            mux.retry_native();
             mux.set_payload_limit(stream_payload_limit(&paths, options.policy.receiver_feedback));
             mux.flush(&mut tcp::Out{tx:&tx,game_tx:game_tx.as_ref(),next_id:&mut next_id,scope:&forward,small_threshold});
         }
@@ -5531,7 +5536,7 @@ async fn client_session(
                         }
                         if let Some(old)=endpoints[id].replace(value.endpoint) {old.close(0u32.into(),b"path replaced");}
                         tasks.spawn(drive_client_path(value.conn,value.stream,value.driver,value.request,value.send,diagnostic,pid,generation,
-                            wire_tx.clone(),native_tx.clone(),options.policy.native_return,ingress_drops.clone(),returning.clone(),forward.clone(),paths.clone(),options.policy.receiver_feedback,value.stream_payload,observation_notify.clone()));
+                            wire_tx.clone(),native_ingress[id].clone(),options.policy.native_return,ingress_drops.clone(),returning.clone(),forward.clone(),paths.clone(),options.policy.receiver_feedback,value.stream_payload,observation_notify.clone()));
                         has_session=true;
                         if recover_paths && !announced {
                             options.stats.readiness(true,configs.iter().filter(|c|c.enabled).count());
@@ -5564,6 +5569,7 @@ async fn client_session(
                     drops+=1;
                 } else {forward.update(|d|{d.records.ingress_queue_enqueued+=1;});}
             },
+            _=async {credit_changed.expect("native receive credit").await},if native_credit.is_some() && streams.as_ref().is_some_and(tcp::Mux::has_pending_native)=>{},
             incoming=native_rx.recv(),if options.policy.native_return=>{
                 if let Some(incoming)=incoming && let Some(mux)=streams.as_mut() { mux.receive_native(incoming); }
             },
@@ -5651,7 +5657,7 @@ async fn drive_client_path(
     pid: u8,
     generation: u64,
     tx: mpsc::Sender<(u8, Bytes)>,
-    native_tx: mpsc::Sender<native_return::Incoming>,
+    native_ingress: native_return::Ingress,
     native_return: bool,
     ingress_drops: Arc<AtomicU64>,
     returning: Scope,
@@ -5769,14 +5775,14 @@ async fn drive_client_path(
                         native_reader.as_ref(),
                         profile::NativeAdmission::Budget,
                         || conn.stats().frame_rx.datagram,
-                        native_return::Incoming::new(record),
+                        native_return::Incoming::new(record, native_ingress.slots.clone()),
                     )
                     .await?;
                     profile::native_admission(
                         native_reader.as_ref(),
                         profile::NativeAdmission::Channel,
                         || conn.stats().frame_rx.datagram,
-                        native_tx.send(incoming),
+                        native_ingress.tx.send(incoming),
                     )
                     .await
                     .context("native stream receiver closed")?;

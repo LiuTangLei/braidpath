@@ -37,7 +37,7 @@ use tokio::{
         TcpListener, TcpStream, UdpSocket,
         tcp::{OwnedReadHalf, OwnedWriteHalf},
     },
-    sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch},
+    sync::{Notify, Semaphore, mpsc, oneshot, watch},
     task::{AbortHandle, JoinSet},
     time::{sleep_until, timeout},
 };
@@ -45,8 +45,9 @@ use tracing::{debug, info, warn};
 
 #[path = "stream_budget.rs"]
 mod stream_budget;
+use super::native_return;
 pub(crate) use stream_budget::Budget;
-use stream_budget::{Credit, Lease};
+use stream_budget::{Credit, Lease, RangeSlot};
 
 #[derive(Debug)]
 pub(crate) struct OpenError(pub u8);
@@ -469,7 +470,7 @@ struct Stream {
     status_header: Vec<u8>,
     send: stream::Sender,
     recv: stream::Receiver,
-    range_slots: Vec<OwnedSemaphorePermit>,
+    range_slots: Vec<RangeSlot>,
     delivery_blocked_since: Option<Instant>,
     reads: Option<Arc<Semaphore>>,
     granted: u64,
@@ -614,6 +615,14 @@ impl Drain {
     }
 }
 
+#[derive(PartialEq, Eq)]
+enum Receive {
+    Accepted,
+    Duplicate,
+    Deferred,
+    Closed,
+}
+
 pub(super) struct Mux {
     budget: Arc<Budget>,
     registration: Option<Registration>,
@@ -636,6 +645,7 @@ pub(super) struct Mux {
     drain: Drain,
     payload_limit: usize,
     native_return: bool,
+    native_pending: VecDeque<native_return::Incoming>,
     blocked_until: Option<Instant>,
     accept_paused_until: Option<Instant>,
     stats: stream::Snapshot,
@@ -684,6 +694,7 @@ impl Mux {
             drain: Drain::new(now),
             payload_limit: crate::runtime::MAX_PAYLOAD,
             native_return: policy.native_return && scope.direction == crate::runtime::stats::RETURN,
+            native_pending: VecDeque::new(),
             blocked_until: None,
             accept_paused_until: None,
             stats: stream::Snapshot::default(),
@@ -975,6 +986,8 @@ impl Mux {
 
     fn close(&mut self, id: u32) -> Option<Stream> {
         let s = self.streams.remove(&id)?;
+        self.native_pending
+            .retain(|entry| entry.decoded.stream_id != id);
         self.turns.retain(|t| *t != id);
         self.closed_duplicates += s.recv.duplicates();
         let final_ack = s.recv.final_ack().map(|ack| Frame::Ack(ack).encode());
@@ -1494,19 +1507,40 @@ impl Mux {
         let Some(id) = stream::stream_id(record.flow) else {
             return;
         };
-        let Some(frame) = Frame::decode(&record.payload) else {
+        let Some(mut frame) = Frame::decode(&record.payload) else {
             self.reset(id, "malformed frame");
             return;
         };
-        self.receive_frame(id, frame);
+        self.receive_frame(id, &mut frame);
     }
 
-    pub(super) fn receive_native(&mut self, incoming: super::native_return::Incoming) {
+    pub(super) fn receive_native(&mut self, mut incoming: native_return::Incoming) {
         self.admissions();
-        self.receive_frame(incoming.decoded.stream_id, incoming.decoded.frame);
+        if self.receive_frame(incoming.decoded.stream_id, &mut incoming.decoded.frame)
+            == Receive::Deferred
+        {
+            self.native_pending.push_back(incoming);
+        }
     }
 
-    fn receive_frame(&mut self, id: u32, frame: Frame) {
+    pub(super) fn retry_native(&mut self) {
+        for _ in 0..self.native_pending.len() {
+            let Some(incoming) = self.native_pending.pop_front() else {
+                break;
+            };
+            self.receive_native(incoming);
+        }
+    }
+
+    pub(super) fn native_credit_watch(&self) -> Option<Arc<Notify>> {
+        self.native_return.then(|| self.budget.receive_credit())
+    }
+
+    pub(super) fn has_pending_native(&self) -> bool {
+        !self.native_pending.is_empty()
+    }
+
+    fn receive_frame(&mut self, id: u32, frame: &mut Frame) -> Receive {
         let now = Instant::now();
         match frame {
             Frame::Reset => {
@@ -1515,25 +1549,31 @@ impl Mux {
                     s.abort();
                     self.stats.reset_peer += 1;
                 }
+                Receive::Closed
             }
             Frame::Ack(ack) => {
                 let Some(s) = self.streams.get_mut(&id) else {
-                    return;
+                    return Receive::Closed;
                 };
                 self.stats.acks_received += 1;
-                match s.send.on_ack(&ack, now) {
+                match s.send.on_ack(ack, now) {
                     Some((released, spurious)) => {
                         s.lease.release_tx(released as usize);
                         self.stats.spurious_retransmit_reports += u64::from(spurious);
                         s.grant_reads();
+                        Receive::Accepted
                     }
-                    None => self.reset(id, "invalid acknowledgment"),
+                    None => {
+                        self.reset(id, "invalid acknowledgment");
+                        Receive::Closed
+                    }
                 }
             }
             Frame::Data { offset, fin, data } => {
                 if !self.streams.contains_key(&id) && !self.accept_stream(id, now) {
-                    return;
+                    return Receive::Closed;
                 }
+                let (offset, fin) = (*offset, *fin);
                 let many_streams = self.streams.len() >= 32;
                 let s = self.streams.get_mut(&id).expect("stream");
                 s.recv
@@ -1542,7 +1582,7 @@ impl Mux {
                 let range_slot = if s.recv.needs_range(offset, data.len()) {
                     match self.budget.range_slots.clone().try_acquire_owned() {
                         Ok(slot) => Some(slot),
-                        Err(_) => return,
+                        Err(_) => return Receive::Deferred,
                     }
                 } else {
                     None
@@ -1550,12 +1590,13 @@ impl Mux {
                 let progress = offset <= s.recv.cumulative()
                     && offset + data.len() as u64 > s.recv.cumulative();
                 let Some(credit) = s.lease.rx.try_take(additional, progress) else {
-                    return;
+                    return Receive::Deferred;
                 };
-                match s.recv.on_data(offset, fin, data, now) {
+                let duplicate = additional == 0 && (!fin || s.recv.fin_received());
+                match s.recv.on_data(offset, fin, std::mem::take(data), now) {
                     Ok(ready) => {
                         if let Some(slot) = range_slot {
-                            s.range_slots.push(slot);
+                            s.range_slots.push(self.budget.retain_range(slot));
                         }
                         s.range_slots.truncate(s.recv.range_count());
                         if s.range_slots.capacity() > 256.max(s.range_slots.len().saturating_mul(4))
@@ -1578,15 +1619,23 @@ impl Mux {
                         }
                         s.lease.retain_rx(credit);
                         self.arrived(id, ready);
-                    }
-                    Err(violation) => self.reset(
-                        id,
-                        if violation == stream::Violation::FlowControl {
-                            "flow-control violation"
+                        if duplicate {
+                            Receive::Duplicate
                         } else {
-                            "final-size violation"
-                        },
-                    ),
+                            Receive::Accepted
+                        }
+                    }
+                    Err(violation) => {
+                        self.reset(
+                            id,
+                            if violation == stream::Violation::FlowControl {
+                                "flow-control violation"
+                            } else {
+                                "final-size violation"
+                            },
+                        );
+                        Receive::Closed
+                    }
                 }
             }
         }
@@ -2752,6 +2801,94 @@ mod tests {
         blocked.reset(1, "test cleanup");
         other.reset(2, "test cleanup");
         assert_eq!(budget.range_slots.available_permits(), 2);
+        assert_eq!(budget.snapshot(), (0, 0));
+    }
+
+    async fn native_test_frame(
+        id: u32,
+        offset: u64,
+        fin: bool,
+        data: &[u8],
+    ) -> super::super::native_return::Incoming {
+        use super::super::native_return::{Decoder, Incoming};
+        let payload = Frame::Data {
+            offset,
+            fin,
+            data: data.to_vec(),
+        }
+        .encode();
+        let mut wire = Vec::new();
+        wire.extend((payload.len() as u32).to_be_bytes());
+        wire.extend(stream::data_flow(id).to_be_bytes());
+        wire.extend(0u64.to_be_bytes());
+        wire.extend(payload);
+        Incoming::new(
+            Decoder::default()
+                .next(&mut wire.as_slice())
+                .unwrap()
+                .unwrap(),
+            Arc::new(Semaphore::new(1)),
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn native_receive_retries_after_other_flow_releases_credit() {
+        let budget = Arc::new(Budget::default());
+        let mut mux = budget_mux(budget.clone());
+        assert!(mux.open(1, false));
+        assert!(mux.open(2, false));
+        let lease = mux.streams[&1].lease.clone();
+        lease.retain_rx(lease.rx.try_take(32 * 1024 * 1024, false).unwrap());
+        mux.receive_native(native_test_frame(2, 3, false, b"def").await);
+        assert_eq!(mux.streams[&2].recv.additional_bytes(3, 3), 3);
+        lease.release_rx(32 * 1024 * 1024);
+        mux.retry_native();
+        mux.receive_native(native_test_frame(2, 0, false, b"abc").await);
+        mux.receive_native(native_test_frame(2, 6, true, b"").await);
+        assert_eq!(mux.streams[&2].undelivered.concat(), b"abcdef");
+        mux.io(Io::Written(2, 6));
+        assert!(mux.streams[&2].recv.finished());
+        drop(mux);
+        drop(lease);
+        assert_eq!(budget.snapshot(), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn native_receive_retries_after_filling_a_gap_releases_a_range_slot() {
+        let mut budget = Budget::default();
+        budget.range_slots = Arc::new(Semaphore::new(1));
+        let budget = Arc::new(budget);
+        let mut mux = budget_mux(budget.clone());
+        assert!(mux.open(1, false));
+        assert!(mux.open(2, false));
+        mux.receive_native(native_test_frame(2, 1, false, b"b").await);
+        mux.receive_native(native_test_frame(2, 3, true, b"d").await);
+        assert_eq!(budget.range_slots.available_permits(), 0);
+        mux.receive_native(native_test_frame(2, 0, false, b"a").await);
+        mux.retry_native();
+        mux.receive_native(native_test_frame(2, 2, false, b"c").await);
+        assert_eq!(mux.streams[&2].undelivered.concat(), b"abcd");
+        mux.io(Io::Written(2, 4));
+        assert!(mux.streams[&2].recv.finished());
+        drop(mux);
+        assert_eq!(budget.range_slots.available_permits(), 1);
+        assert_eq!(budget.snapshot(), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn native_receive_returns_staging_slots_on_reset() {
+        let mut budget = Budget::default();
+        budget.range_slots = Arc::new(Semaphore::new(0));
+        let budget = Arc::new(budget);
+        let mut mux = budget_mux(budget.clone());
+        assert!(mux.open(1, false));
+        let tail = native_test_frame(1, 3, true, b"def").await;
+        mux.receive_native(tail);
+        assert!(mux.has_pending_native());
+        mux.receive(incoming(1, Frame::Reset));
+        assert!(!mux.has_pending_native());
         assert_eq!(budget.snapshot(), (0, 0));
     }
 

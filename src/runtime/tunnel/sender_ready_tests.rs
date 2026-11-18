@@ -55,8 +55,10 @@ async fn native_body_backpressure_keeps_reading_datagrams() {
     }
     let stream = request.id().into_inner();
     let (tx, mut rx) = mpsc::channel(4);
-    let (native_tx, mut native_rx) = mpsc::channel(64);
-    let credits = native_tx.clone();
+    let records = native_return::RX_PATH_RECORDS as u64 + 1;
+    let (native_tx, mut native_rx) = mpsc::channel(native_return::RX_PATH_RECORDS);
+    let ingress = native_return::Ingress::new(native_tx);
+    let slots = ingress.slots.clone();
     let metrics = stats::Metrics::new("client");
     let diagnostic = stats::ConnectionTrace::new(
         metrics.clone(),
@@ -74,7 +76,7 @@ async fn native_body_backpressure_keeps_reading_datagrams() {
         0,
         1,
         tx,
-        native_tx,
+        ingress,
         true,
         Arc::new(AtomicU64::new(0)),
         metrics.scope("backpressure", stats::RETURN),
@@ -91,7 +93,7 @@ async fn native_body_backpressure_keeps_reading_datagrams() {
         data: vec![7],
     }
     .encode();
-    for id in 0..65 {
+    for id in 0..records {
         body.put_u32(payload.len() as u32);
         body.put_u32(stream::data_flow(1));
         body.put_u64(id);
@@ -101,7 +103,7 @@ async fn native_body_backpressure_keeps_reading_datagrams() {
     // keep. The consumer stays paused until all probes are read.
     body_tx.send(body.freeze()).unwrap();
     timeout(Duration::from_secs(3), async {
-        while credits.capacity() != 0 {
+        while slots.available_permits() != 0 {
             tokio::task::yield_now().await;
         }
     })
@@ -118,9 +120,9 @@ async fn native_body_backpressure_keeps_reading_datagrams() {
             .expect("DATAGRAM reader stalled behind full native queue")
             .unwrap();
         assert_eq!(received.as_ref(), payload);
-        assert_eq!(credits.capacity(), 0);
+        assert_eq!(slots.available_permits(), 0);
     }
-    for id in 0..65 {
+    for id in 0..records {
         let frame = timeout(Duration::from_secs(3), native_rx.recv())
             .await
             .unwrap()

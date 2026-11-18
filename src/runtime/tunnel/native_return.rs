@@ -357,15 +357,37 @@ pub(super) async fn write(
     }
 }
 
+// The channel and deferred queue hold the same permits. A slow path can
+// use at most eight staged records, across old and new generations. Each
+// driver can also be holding one decoded record while waiting for admission.
+pub(super) const RX_PATH_RECORDS: usize = 8;
+
+#[derive(Clone)]
+pub(super) struct Ingress {
+    pub tx: mpsc::Sender<Incoming>,
+    pub slots: Arc<Semaphore>,
+}
+
+impl Ingress {
+    pub fn new(tx: mpsc::Sender<Incoming>) -> Self {
+        Self {
+            tx,
+            slots: Arc::new(Semaphore::new(RX_PATH_RECORDS)),
+        }
+    }
+}
+
 /// Native ingress gets its own process-wide byte budget before entering a
 /// session queue; TCP receive credit then owns the retained/reordered bytes.
 pub(super) struct Incoming {
     pub decoded: Decoded,
     _credit: OwnedSemaphorePermit,
+    _slot: OwnedSemaphorePermit,
 }
 impl Incoming {
-    pub async fn new(decoded: Decoded) -> Result<Self> {
+    pub async fn new(decoded: Decoded, slots: Arc<Semaphore>) -> Result<Self> {
         static BUDGET: OnceLock<Arc<Semaphore>> = OnceLock::new();
+        let slot = slots.acquire_owned().await?;
         let budget = BUDGET.get_or_init(|| Arc::new(Semaphore::new(32 * 1024 * 1024)));
         let credit = budget
             .clone()
@@ -374,6 +396,7 @@ impl Incoming {
         Ok(Self {
             decoded,
             _credit: credit,
+            _slot: slot,
         })
     }
 }

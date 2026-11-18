@@ -18,7 +18,7 @@ use super::MAX_TCP_FLOWS;
 
 struct Pool {
     shared: Mutex<Pressure>,
-    notify: Notify,
+    notify: Arc<Notify>,
 }
 #[derive(Clone, Copy, Debug, Default)]
 pub(super) struct Pressure {
@@ -36,7 +36,7 @@ impl Default for Pool {
     fn default() -> Self {
         Self {
             shared: Mutex::default(),
-            notify: Notify::new(),
+            notify: Arc::default(),
         }
     }
 }
@@ -82,6 +82,15 @@ impl Budget {
             self.range_slots.available_permits(),
         )
     }
+    pub(super) fn receive_credit(&self) -> Arc<Notify> {
+        self.rx.notify.clone()
+    }
+    pub(super) fn retain_range(&self, permit: OwnedSemaphorePermit) -> RangeSlot {
+        RangeSlot {
+            permit: Some(permit),
+            notify: self.receive_credit(),
+        }
+    }
     pub(super) fn receive_window(&self) -> u64 {
         let active = self.rx.shared.lock().expect("stream budget").active.max(1);
         (SHARED as u64 / active as u64).clamp(
@@ -116,6 +125,18 @@ impl Budget {
         })
     }
 }
+pub(super) struct RangeSlot {
+    permit: Option<OwnedSemaphorePermit>,
+    notify: Arc<Notify>,
+}
+
+impl Drop for RangeSlot {
+    fn drop(&mut self) {
+        drop(self.permit.take());
+        self.notify.notify_waiters();
+    }
+}
+
 pub(super) struct Lease {
     pub tx: Arc<Allowance>,
     pub rx: Arc<Allowance>,
