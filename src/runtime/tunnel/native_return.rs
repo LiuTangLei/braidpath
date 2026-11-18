@@ -376,6 +376,7 @@ struct PathPace {
     packets: u64,
     lost: u64,
     queue_braked: bool,
+    last_pressure_us: Option<u64>,
 }
 impl PathPace {
     fn new(connection: usize, now_us: u64, ceiling: u64) -> Self {
@@ -388,6 +389,7 @@ impl PathPace {
             packets: 0,
             lost: 0,
             queue_braked: false,
+            last_pressure_us: None,
         }
     }
 
@@ -408,10 +410,18 @@ impl PathPace {
         let lossy = packets >= 64 && lost.saturating_mul(200) > packets;
         // RTT includes both directions. Apply one delay brake per episode;
         // repeated local loss can still request another reduction.
-        let next = if lossy || (queued && !self.queue_braked && !conn.probing_rtt_hint()) {
+        let next = if lossy {
+            self.last_pressure_us = Some(now_us);
             (rate * 9 / 10).max(4_000_000)
+        } else if queued && !self.queue_braked && !conn.probing_rtt_hint() {
+            self.last_pressure_us = Some(now_us);
+            (rate * 19 / 20).max(4_000_000)
         } else if !queued && packets >= 64 && !conn.probing_rtt_hint() {
-            rate + rate / 10
+            match self.last_pressure_us {
+                None => rate + rate / 10,
+                Some(at) if now_us.saturating_sub(at) >= 500_000 => rate + 500_000,
+                Some(_) => rate,
+            }
         } else {
             rate
         };
