@@ -197,6 +197,11 @@ impl SendBuffer {
         self.unsent != self.offset || !self.retransmits.is_empty()
     }
 
+    /// Newly written data not yet included in a STREAM frame.
+    pub(super) fn unsent_bytes(&self) -> u64 {
+        self.offset - self.unsent
+    }
+
     /// Bytes still retained from application writes, including acknowledged data
     pub(super) fn buffered(&self) -> u64 {
         (self.unacked_len + self.front_trimmed) as u64

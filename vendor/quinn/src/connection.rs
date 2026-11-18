@@ -641,6 +641,15 @@ impl Connection {
         self.0.state.lock("stats").inner.stats()
     }
 
+    /// Return retained stream send bytes and bytes awaiting first packetization.
+    pub fn stream_send_buffer_bytes(&self) -> (u64, u64) {
+        self.0
+            .state
+            .lock("stream_send_buffer_bytes")
+            .inner
+            .stream_send_buffer_bytes()
+    }
+
     /// Current state of the congestion control algorithm, for debugging purposes
     pub fn congestion_state(&self) -> Box<dyn Controller> {
         self.0

@@ -171,6 +171,13 @@ pub struct ConnectionStats {
     pub frame_tx: FrameStats,
     /// Statistics about frames received on a connection
     pub frame_rx: FrameStats,
+    /// Encoded STREAM frame bytes selected for transmission, including repairs.
+    /// Excludes packet headers, padding and UDP/IP overhead.
+    pub stream_frame_bytes_tx: u64,
+    /// Encoded DATAGRAM frame bytes selected for transmission.
+    pub datagram_frame_bytes_tx: u64,
+    /// Encoded ACK frame bytes selected for transmission.
+    pub ack_frame_bytes_tx: u64,
     /// Application DATAGRAM frames queued for packet assembly.
     pub datagrams_pending: u64,
     /// Tracked DATAGRAM queue delay at selection, binned by 1, 2, 5, 10 and 20 ms.

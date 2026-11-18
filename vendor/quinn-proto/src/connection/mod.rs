@@ -1308,6 +1308,12 @@ impl Connection {
         stats
     }
 
+    /// Return the bytes retained in stream send buffers and the subset waiting
+    /// for its first STREAM frame. Retransmissions are part of the retained total.
+    pub fn stream_send_buffer_bytes(&self) -> (u64, u64) {
+        self.streams.send_buffer_bytes()
+    }
+
     /// Ping the remote endpoint
     ///
     /// Causes an ACK-eliciting packet to be transmitted.
@@ -3369,6 +3375,7 @@ impl Connection {
 
         // DATAGRAM
         let mut sent_datagrams = false;
+        let before_datagrams = buf.len();
         while buf.len() + Datagram::SIZE_BOUND < max_size && space_id == SpaceId::Data {
             match self.datagrams.write(now, buf, max_size) {
                 true => {
@@ -3379,6 +3386,7 @@ impl Connection {
                 false => break,
             }
         }
+        self.stats.datagram_frame_bytes_tx += (buf.len() - before_datagrams) as u64;
         if self.datagrams.send_blocked && sent_datagrams {
             self.events.push_back(Event::DatagramsUnblocked);
             self.datagrams.send_blocked = false;
@@ -3425,10 +3433,12 @@ impl Connection {
 
         // STREAM
         if space_id == SpaceId::Data {
+            let before_streams = buf.len();
             sent.stream_frames =
                 self.streams
                     .write_stream_frames(buf, max_size, self.config.send_fairness);
             self.stats.frame_tx.stream += sent.stream_frames.len() as u64;
+            self.stats.stream_frame_bytes_tx += (buf.len() - before_streams) as u64;
         }
 
         // Bundle ACK with other frames when there is room for them.
@@ -3502,6 +3512,7 @@ impl Connection {
         }
         sent.largest_acked = space.pending_acks.ranges().max();
         stats.frame_tx.acks += 1;
+        stats.ack_frame_bytes_tx += (buf.len() - no_acks_len) as u64;
     }
 
     fn close_common(&mut self) {

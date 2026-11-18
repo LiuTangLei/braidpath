@@ -318,6 +318,12 @@ pub struct Quinn {
     #[cfg(test)]
     pub stream_frames_tx: u64,
     pub http_datagram_frames_tx: u64,
+    /// Encoded frame bytes selected by QUIC, before UDP/IP overhead.
+    pub stream_frame_bytes_tx: u64,
+    pub http_datagram_frame_bytes_tx: u64,
+    pub ack_frame_bytes_tx: u64,
+    pub stream_send_buffer_bytes: u64,
+    pub stream_unsent_bytes: u64,
     pub http_datagram_frames_pending: u64,
     pub game_datagrams_selection_delay: [u64; 6],
     pub http_datagram_frames_buffer_evicted: u64,
@@ -335,6 +341,7 @@ pub struct Quinn {
 impl Quinn {
     fn sample(conn: &quinn::Connection) -> Self {
         let q = conn.stats();
+        let (stream_send_buffer_bytes, stream_unsent_bytes) = conn.stream_send_buffer_bytes();
         Self {
             lost_packets: q.path.lost_packets,
             congestion_events: q.path.congestion_events,
@@ -354,6 +361,11 @@ impl Quinn {
             #[cfg(test)]
             stream_frames_tx: q.frame_tx.stream,
             http_datagram_frames_tx: q.frame_tx.datagram,
+            stream_frame_bytes_tx: q.stream_frame_bytes_tx,
+            http_datagram_frame_bytes_tx: q.datagram_frame_bytes_tx,
+            ack_frame_bytes_tx: q.ack_frame_bytes_tx,
+            stream_send_buffer_bytes,
+            stream_unsent_bytes,
             http_datagram_frames_pending: q.datagrams_pending,
             game_datagrams_selection_delay: q.datagrams_selection_delay,
             http_datagram_frames_buffer_evicted: q.datagrams_buffer_evicted,

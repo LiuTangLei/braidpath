@@ -838,6 +838,16 @@ impl StreamsState {
         Ok(())
     }
 
+    pub(crate) fn send_buffer_bytes(&self) -> (u64, u64) {
+        let unsent = self
+            .send
+            .values()
+            .flatten()
+            .map(|stream| stream.pending.unsent_bytes())
+            .sum();
+        (self.buffered_data, unsent)
+    }
+
     /// Returns the maximum amount of data this is allowed to be written on the connection
     pub(crate) fn write_limit(&self) -> u64 {
         (self.max_data - self.data_sent)
