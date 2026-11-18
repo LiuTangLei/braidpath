@@ -7,10 +7,76 @@ use super::{OutPath, QueuedRecord, outbound, stream, wire::Record};
 use anyhow::{Result, ensure};
 use bytes::{Buf, Bytes, BytesMut};
 use std::{
-    sync::{Arc, OnceLock},
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Instant,
 };
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
+
+/// Addressed UDP is latency traffic even when its message needs fragments.
+/// This affects only the native download return session's path ordering.
+/// It does not enable game coding, copies, or bypass admission gates.
+pub(super) fn latency_datagram(native_returning: bool, game_mode: bool, flow: Option<u32>) -> bool {
+    native_returning
+        && !game_mode
+        && flow.is_some_and(|flow| super::associate::is_flow(flow & !super::messages::FLAG))
+}
+
+#[derive(Clone, Copy)]
+struct UdpRoute {
+    index: usize,
+    delay_ms: f64,
+    loss: Option<f64>,
+}
+fn rank_udp(routes: &mut [UdpRoute], slack_ms: f64) {
+    let fastest = routes
+        .iter()
+        .map(|p| p.delay_ms)
+        .fold(f64::INFINITY, f64::min);
+    let timely = fastest + slack_ms;
+    let best_loss = routes
+        .iter()
+        .filter(|p| p.delay_ms <= timely)
+        .filter_map(|p| p.loss)
+        .fold(1.0f64, f64::min);
+    let tier = |p: &UdpRoute| {
+        if p.delay_ms > timely {
+            2
+        } else if p.loss.is_some_and(|loss| loss > best_loss + 0.001) {
+            1
+        } else {
+            0
+        }
+    };
+    routes.sort_by(|a, b| {
+        tier(a)
+            .cmp(&tier(b))
+            .then_with(|| a.delay_ms.total_cmp(&b.delay_ms))
+    });
+}
+/// A near-equal, demonstrably healthier route is worth a few milliseconds for
+/// an unreliable fragment. QUIC loss is transport evidence, not UDP delivery
+/// proof; this is only ordering and never removes a fallback.
+pub(super) fn udp_order(order: Vec<usize>, paths: &[OutPath], target_ms: u64) -> Vec<usize> {
+    let mut routes: Vec<_> = order
+        .into_iter()
+        .map(|index| {
+            let path = &paths[index];
+            let stats = path.conn.stats();
+            UdpRoute {
+                index,
+                delay_ms: super::small_delivery::delay_ms(path),
+                loss: (stats.path.sent_packets >= 64).then(|| {
+                    (stats.path.lost_packets as f64 / stats.path.sent_packets as f64).min(1.0)
+                }),
+            }
+        })
+        .collect();
+    rank_udp(&mut routes, target_ms.min(20) as f64);
+    routes.into_iter().map(|p| p.index).collect()
+}
 
 pub(super) const HEADER: &str = "braidpath-return-stream";
 pub(super) const PAYLOAD: usize = stream::RELIABLE_PAYLOAD;
@@ -23,11 +89,111 @@ pub(super) const BURST: usize = wire_cost(PAYLOAD + HEADER_BYTES);
 const fn wire_cost(bytes: usize) -> usize {
     bytes + bytes.div_ceil(PACKET_PAYLOAD) * PACKET_ALLOWANCE
 }
-pub(super) const WINDOW: u32 = 4 * 1024 * 1024;
+pub(super) const WINDOW: u32 = 2 * 1024 * 1024;
+pub(super) const RECEIVE_WINDOW: u32 = 4 * 1024 * 1024;
+const MAX_SEND_WINDOW: u64 = 3 * 1024 * 1024;
 const PATH_QUEUE: usize = 4;
 
-pub(super) type Writer = mpsc::Sender<Flight>;
-pub(super) type Reader = mpsc::Receiver<Flight>;
+/// Keep startup/backpressure at the established budget. Expand only against
+/// exercised native service, without exceeding the current native cwnd.
+#[derive(Default)]
+pub(super) struct Credit {
+    connection: Option<usize>,
+    sampled_us: u64,
+    sent: u64,
+    lost: u64,
+    current: u64,
+}
+impl Credit {
+    pub(super) fn observe(
+        &mut self,
+        conn: &quinn::Connection,
+        now_us: u64,
+        target_ms: u64,
+    ) -> Option<u64> {
+        let identity = conn.stable_id();
+        if self.connection != Some(identity) {
+            let stats = conn.stats();
+            *self = Self {
+                connection: Some(identity),
+                sampled_us: now_us,
+                sent: stats.path.sent_packets,
+                lost: stats.path.lost_packets,
+                current: u64::from(WINDOW),
+            };
+            return None;
+        }
+        if now_us.saturating_sub(self.sampled_us) < 100_000 {
+            return None;
+        }
+        let stats = conn.stats();
+        let queued_ms = conn
+            .rtt_hint()
+            .saturating_sub(conn.min_rtt_hint())
+            .as_secs_f64()
+            * 1000.0;
+        self.update(
+            now_us,
+            stats.path.cwnd,
+            queued_ms > target_ms as f64 * 0.25,
+            conn.probing_rtt_hint(),
+            stats.path.sent_packets,
+            stats.path.lost_packets,
+        )
+    }
+
+    fn update(
+        &mut self,
+        now_us: u64,
+        cwnd: u64,
+        queued: bool,
+        probing: bool,
+        sent: u64,
+        lost: u64,
+    ) -> Option<u64> {
+        let packets = sent.saturating_sub(self.sent);
+        let losses = lost.saturating_sub(self.lost);
+        self.sampled_us = now_us;
+        self.sent = sent;
+        self.lost = lost;
+        if probing || (packets < 64 && !queued && losses == 0) {
+            return None;
+        }
+        let ceiling = (cwnd.saturating_mul(3) / 4).clamp(u64::from(WINDOW), MAX_SEND_WINDOW);
+        let next = if !queued && losses.saturating_mul(100) <= packets {
+            ceiling.min(self.current.saturating_add(32 * 1024))
+        } else {
+            u64::from(WINDOW)
+        };
+        if next == self.current {
+            return None;
+        }
+        self.current = next;
+        Some(next)
+    }
+}
+
+#[derive(Clone)]
+pub(super) struct Writer {
+    pub(super) tx: mpsc::Sender<Flight>,
+    reachable: Arc<AtomicBool>,
+}
+impl Writer {
+    pub(super) fn set_reachable(&self, reachable: bool) {
+        self.reachable
+            .store(reachable && !self.tx.is_closed(), Ordering::Release);
+    }
+}
+pub(super) struct Reader {
+    pub(super) rx: mpsc::Receiver<Flight>,
+    reachable: Arc<AtomicBool>,
+}
+impl Drop for Reader {
+    fn drop(&mut self) {
+        self.rx.close();
+        self.reachable.store(false, Ordering::Release);
+    }
+}
 
 /// Retains the stream's failure callback while the bounded native writer owns
 /// the payload, without retaining its producer-queue reservation.
@@ -36,9 +202,14 @@ pub(super) struct Flight {
     written: bool,
 }
 impl Flight {
-    fn new(pending: outbound::Pending, path: u8, rtt: std::time::Duration) -> Self {
+    fn new(
+        pending: outbound::Pending,
+        path: u8,
+        rtt: std::time::Duration,
+        reachable: Arc<AtomicBool>,
+    ) -> Self {
         if let Some(hold) = &pending.hold {
-            hold.reliable_handoff(path, rtt, Instant::now());
+            hold.reliable_handoff(path, rtt, Instant::now(), reachable);
         }
         Self {
             pending,
@@ -56,7 +227,15 @@ impl Drop for Flight {
     }
 }
 pub(super) fn channel() -> (Writer, Reader) {
-    mpsc::channel(PATH_QUEUE)
+    let (tx, rx) = mpsc::channel(PATH_QUEUE);
+    let reachable = Arc::new(AtomicBool::new(true));
+    (
+        Writer {
+            tx,
+            reachable: reachable.clone(),
+        },
+        Reader { rx, reachable },
+    )
 }
 
 pub(super) fn requested(headers: &http::HeaderMap) -> Result<bool> {
@@ -69,6 +248,11 @@ pub(super) fn requested(headers: &http::HeaderMap) -> Result<bool> {
 }
 pub(super) fn data(flow: u32, payload: &[u8]) -> bool {
     stream::stream_id(flow).is_some() && !stream::is_ack_flow(flow) && payload.first() == Some(&0)
+}
+pub(super) fn bulk_data(flow: u32, payload: &[u8]) -> bool {
+    // An ACK request must bypass a full native response body. It retains no
+    // payload and uses the same short DATAGRAM lane as other stream control.
+    data(flow, payload) && !stream::is_ack_request(payload)
 }
 pub(super) fn enqueue(item: QueuedRecord, queue: &mut outbound::Queue) {
     let QueuedRecord {
@@ -128,13 +312,23 @@ pub(super) fn drain(
                 return None;
             }
             let writer = path.native_return.as_ref()?;
-            Some((i, writer.try_reserve().ok()?))
+            if !writer.reachable.load(Ordering::Acquire) {
+                return None;
+            }
+            Some((i, writer.tx.try_reserve().ok()?, writer.reachable.clone()))
         });
-        let Some((i, permit)) = ready else { break };
+        let Some((i, permit, reachable)) = ready else {
+            break;
+        };
         let pending = queue.pop(false).expect("native queue front");
         pacer.spend(cost);
         groups[usize::from(paths[i].group)].spend(cost);
-        permit.send(Flight::new(pending, paths[i].id, paths[i].conn.rtt_hint()));
+        permit.send(Flight::new(
+            pending,
+            paths[i].id,
+            paths[i].conn.rtt_hint(),
+            reachable,
+        ));
         *cursor = (i + 1) % paths.len();
     }
 }
@@ -144,7 +338,13 @@ pub(super) async fn write(
     mut stream: h3::server::RequestStream<h3_quinn::SendStream<Bytes>, Bytes>,
     mut input: Reader,
 ) {
-    while let Some(mut flight) = input.recv().await {
+    loop {
+        let Some(mut flight) = (tokio::select! {
+            value = input.rx.recv() => value,
+            _ = conn.closed() => break,
+        }) else {
+            break;
+        };
         let result = tokio::select! {
             result = stream.send_data(flight.pending.data.clone()) => result,
             _ = conn.closed() => break,
@@ -233,6 +433,105 @@ impl Decoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn native_udp_prefers_a_nearby_healthy_route_without_hiding_fallbacks() {
+        let mut routes = [
+            UdpRoute {
+                index: 0,
+                delay_ms: 50.0,
+                loss: Some(0.006),
+            },
+            UdpRoute {
+                index: 1,
+                delay_ms: 55.0,
+                loss: Some(0.0),
+            },
+            UdpRoute {
+                index: 2,
+                delay_ms: 80.0,
+                loss: Some(0.0),
+            },
+        ];
+        rank_udp(&mut routes, 20.0);
+        assert_eq!(routes.map(|p| p.index), [1, 0, 2]);
+        assert_eq!(
+            routes.len(),
+            3,
+            "a busy healthy path retains both fallbacks"
+        );
+        for route in &mut routes {
+            route.loss = None;
+        }
+        rank_udp(&mut routes, 20.0);
+        assert_eq!(
+            routes.map(|p| p.index),
+            [0, 1, 2],
+            "unknown loss preserves latency order"
+        );
+        routes[1].loss = Some(0.0);
+        routes[0].loss = Some(0.006);
+        rank_udp(&mut routes, 2.0);
+        assert_eq!(
+            routes.map(|p| p.index),
+            [0, 1, 2],
+            "health preference stays in the delay budget"
+        );
+    }
+
+    #[test]
+    fn native_udp_latency_scope_includes_fragments_and_preserves_other_carriers() {
+        let flow = super::super::associate::FLAG | 1;
+        for udp in [flow, flow | super::super::messages::FLAG] {
+            assert!(latency_datagram(true, false, Some(udp)));
+            assert!(!latency_datagram(false, false, Some(udp)));
+            assert!(!latency_datagram(true, true, Some(udp)));
+        }
+        for other in [
+            None,
+            Some(7),
+            Some(stream::data_flow(1)),
+            Some(stream::ack_flow(1)),
+            Some(super::super::messages::FLAG | 7),
+        ] {
+            assert!(!latency_datagram(true, false, other));
+        }
+    }
+
+    #[test]
+    fn native_credit_grows_in_one_frame_steps_and_keeps_backpressure_on_loss_or_queue() {
+        let mut credit = Credit {
+            current: u64::from(WINDOW),
+            ..Default::default()
+        };
+        assert_eq!(
+            credit.update(100_000, 4 * 1024 * 1024, false, false, 0, 0),
+            None
+        );
+        for n in 1..=32 {
+            assert_eq!(
+                credit.update(n * 100_000, 4 * 1024 * 1024, false, false, n * 500, 0),
+                Some(u64::from(WINDOW) + n * 32768)
+            );
+        }
+        assert_eq!(credit.current, MAX_SEND_WINDOW);
+        assert_eq!(
+            credit.update(3_300_000, 4096, true, true, 16_100, 0),
+            None,
+            "a deliberate native RTT probe does not resize retained storage"
+        );
+        assert_eq!(
+            credit.update(3_400_000, 4 * 1024 * 1024, true, false, 16_600, 0),
+            Some(u64::from(WINDOW))
+        );
+        assert_eq!(
+            credit.update(3_500_000, 4 * 1024 * 1024, false, false, 17_100, 0),
+            Some(u64::from(WINDOW) + 32768)
+        );
+        assert_eq!(
+            credit.update(3_600_000, 4 * 1024 * 1024, false, false, 17_600, 20),
+            Some(u64::from(WINDOW))
+        );
+    }
     fn encoded() -> Bytes {
         let payload = stream::Frame::Data {
             offset: 345,
@@ -265,6 +564,20 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_ack_request_bypasses_native_data_but_a_fin_keeps_its_carrier() {
+        for fin in [false, true] {
+            let payload = stream::Frame::Data {
+                offset: 32768,
+                fin,
+                data: vec![],
+            }
+            .encode();
+            assert!(data(stream::data_flow(1), &payload));
+            assert_eq!(bulk_data(stream::data_flow(1), &payload), fin);
+        }
+    }
+
+    #[test]
     fn blocked_native_writer_cannot_pin_the_shared_producer() {
         for written in [false, true] {
             let gauge = Arc::new(outbound::Gauge::default());
@@ -279,7 +592,12 @@ mod tests {
                 small: false,
                 hold: Some(hold),
             };
-            let mut flight = Flight::new(pending, 2, std::time::Duration::from_millis(100));
+            let mut flight = Flight::new(
+                pending,
+                2,
+                std::time::Duration::from_millis(100),
+                Arc::new(AtomicBool::new(true)),
+            );
             assert_eq!(
                 gauge.queued(),
                 0,
@@ -288,6 +606,7 @@ mod tests {
             let sent = gauge.take_sent();
             assert_eq!(sent.len(), 1);
             assert_eq!(sent[0].path, 2);
+            assert!(sent[0].reliable.as_ref().unwrap().load(Ordering::Acquire));
             flight.written = written;
             drop(flight);
             if written {
@@ -303,6 +622,16 @@ mod tests {
                 "release exactly once on success or cancellation"
             );
         }
+    }
+
+    #[test]
+    fn a_closed_native_writer_cannot_be_made_reachable_by_an_old_probe() {
+        let (writer, reader) = channel();
+        assert!(writer.reachable.load(Ordering::Acquire));
+        drop(reader);
+        assert!(!writer.reachable.load(Ordering::Acquire));
+        writer.set_reachable(true);
+        assert!(!writer.reachable.load(Ordering::Acquire));
     }
 
     #[test]

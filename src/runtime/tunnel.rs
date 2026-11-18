@@ -43,7 +43,7 @@ const WIRE_QUEUE: usize = 4096;
 const SESSION_IDLE_GRACE: Duration = Duration::from_secs(120);
 const SESSION_PATH: &str = "/session";
 pub(crate) const STREAM_ALPN: &[u8] = b"braidpath-stream/2";
-pub(crate) const NATIVE_RETURN_WINDOW: u32 = native_return::WINDOW;
+pub(crate) const NATIVE_RETURN_WINDOW: u32 = native_return::RECEIVE_WINDOW;
 // An authenticated stream/2 owner is discarding this epoch, rather than
 // temporarily replacing a transport path. Its remote stream budget can end now.
 const STREAM_SESSION_STOP: u32 = 0x4250;
@@ -1898,6 +1898,7 @@ async fn sender_with_game_input(
     let mut prefer_game_input = true;
     let mut normal_input_due = false;
     let mut yield_after_drain = false;
+    let mut native_credit: [native_return::Credit; MAX_PATHS] = Default::default();
     loop {
         if std::mem::take(&mut yield_after_drain) {
             tokio::task::yield_now().await;
@@ -2131,7 +2132,7 @@ async fn sender_with_game_input(
                             && record.payload.len() > LATENCY_RECORD_BYTES));
                 metrics.trace_record(trace::Stage::SenderInput, &record, None, None);
                 if native_returning
-                    && native_return::data(record.flow, &record.payload)
+                    && native_return::bulk_data(record.flow, &record.payload)
                     && !hold.as_ref().is_some_and(|hold| hold.interactive())
                 {
                     native_return::enqueue(
@@ -2206,6 +2207,18 @@ async fn sender_with_game_input(
             if silent == open { 0 } else { silent }
         };
         for path in paths.iter() {
+            if let Some(writer) = &path.native_return {
+                writer.set_reachable(path.open() && !liveness[usize::from(path.id)].silent());
+                if let Some(window) = native_credit[usize::from(path.id)].observe(
+                    &path.conn,
+                    now_us,
+                    policy.latency_target_ms,
+                ) {
+                    path.conn.set_send_window(window);
+                    info!(target: "braidpath::native_credit", path=path.id, window_bytes=window,
+                        "native return storage credit changed");
+                }
+            }
             path.writer.set_pace(if policy.adaptive {
                 controllers[usize::from(path.id)].pacing_bps()
             } else {
@@ -3137,11 +3150,17 @@ async fn sender_with_game_input(
             } else if order.len() > 1
                 && !is_small
                 && (front.data.len() <= LATENCY_RECORD_BYTES
-                    || front.hold.as_ref().is_some_and(|hold| hold.interactive()))
+                    || front.hold.as_ref().is_some_and(|hold| hold.interactive())
+                    || native_return::latency_datagram(
+                        native_returning,
+                        policy.game_mode,
+                        front.flow,
+                    ))
             {
-                // Small records (acknowledgments, interactive and control
-                // traffic) and latency-bound streams take the earliest ready
-                // path; bulk keeps the weighted spread across paths. Where the
+                // Small records, latency-bound streams and native-return UDP
+                // fragments take the earliest ready path. Splitting one UDP
+                // message over disparate paths adds the slow fragment's tail.
+                // Bulk keeps the weighted spread across paths. Where the
                 // small-delivery policy applies, its delay and loss ranking
                 // decides instead.
                 let mut ranked: Vec<_> = order
@@ -3223,6 +3242,11 @@ async fn sender_with_game_input(
                 }
             }
             let mut accepted = None;
+            if !repair
+                && native_return::latency_datagram(native_returning, policy.game_mode, front.flow)
+            {
+                order = native_return::udp_order(order, &paths, policy.latency_target_ms);
+            }
             let mut wait_candidate = None;
             for i in order {
                 let path = &paths[i];

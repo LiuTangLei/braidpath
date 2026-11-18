@@ -293,7 +293,7 @@ async fn interactive_data_bypasses_a_full_native_response_body_queue() {
     let (native_tx, _native_rx) = native_return::channel();
     // Keep all permits: the bulk body cannot accept any additional frame.
     let mut permits = Vec::new();
-    while let Ok(permit) = native_tx.clone().try_reserve_owned() {
+    while let Ok(permit) = native_tx.tx.clone().try_reserve_owned() {
         permits.push(permit);
     }
     path.native_return = Some(native_tx);
@@ -390,12 +390,12 @@ async fn native_return_avoids_an_open_but_unresponsive_path_and_reuses_it_after_
         );
         assert!(queue.front(false).is_none());
         assert_eq!(
-            rx1.len(),
+            rx1.rx.len(),
             1,
             "the first frame must use the responsive fallback"
         );
         assert_eq!(
-            rx0.len(),
+            rx0.rx.len(),
             if silent == 0 { 1 } else { 0 },
             "clearing ACK-silence must make the original route usable again"
         );

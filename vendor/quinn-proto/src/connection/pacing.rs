@@ -19,6 +19,17 @@ pub(super) struct Pacer {
     tokens: u64,
     prev: Instant,
     rate: Option<u64>,
+    waiting_until: Option<Instant>,
+    observation: Observation,
+}
+
+#[derive(Default)]
+struct Observation {
+    refills: u64,
+    refill_bytes: u64,
+    discarded_bytes: u64,
+    late_us: u64,
+    max_late_us: u64,
 }
 
 impl Pacer {
@@ -32,6 +43,8 @@ impl Pacer {
             tokens: capacity,
             prev: now,
             rate: None,
+            waiting_until: None,
+            observation: Observation::default(),
         }
     }
 
@@ -42,6 +55,7 @@ impl Pacer {
         if self.rate != rate {
             self.rate = rate;
             self.last_window = 0; // Recompute and clamp the burst before sending.
+            self.waiting_until = None;
         }
     }
 
@@ -93,6 +107,7 @@ impl Pacer {
             let elapsed = now.checked_duration_since(self.prev).unwrap_or_default();
             let refill =
                 (elapsed.as_nanos() * rate as u128 / 1_000_000_000).min(u64::MAX as u128) as u64;
+            self.observe_refill(now, refill, self.capacity);
             self.tokens = self.tokens.saturating_add(refill).min(self.capacity);
             self.prev = now;
             if self.tokens >= bytes_to_send {
@@ -100,7 +115,9 @@ impl Pacer {
             }
             let missing = bytes_to_send.max(self.capacity) - self.tokens;
             let nanos = (missing as u128 * 1_000_000_000).div_ceil(rate as u128);
-            return Some(now + Duration::from_nanos(nanos.min(u64::MAX as u128) as u64));
+            let until = now + Duration::from_nanos(nanos.min(u64::MAX as u128) as u64);
+            self.waiting_until = Some(until);
+            return Some(until);
         }
 
         // we disable pacing for extremely large windows
@@ -141,6 +158,42 @@ impl Pacer {
         // divisions come before multiplications to prevent overflow
         // this is the time at which the pacing window becomes empty
         Some(self.prev + (unscaled_delay / 5) * 4)
+    }
+
+    fn observe_refill(&mut self, now: Instant, refill: u64, limit: u64) {
+        let Some(until) = self.waiting_until.take() else {
+            return;
+        };
+        let Some(late) = now.checked_duration_since(until) else {
+            return;
+        };
+        // Long idle gaps do not establish loss of backlogged pacing service.
+        if late > Duration::from_millis(20) {
+            return;
+        }
+        self.observation.refills += 1;
+        self.observation.refill_bytes = self.observation.refill_bytes.saturating_add(refill);
+        self.observation.discarded_bytes = self
+            .observation
+            .discarded_bytes
+            .saturating_add(self.tokens.saturating_add(refill).saturating_sub(limit));
+        let micros = late.as_micros().min(u128::from(u64::MAX)) as u64;
+        self.observation.late_us = self.observation.late_us.saturating_add(micros);
+        self.observation.max_late_us = self.observation.max_late_us.max(micros);
+    }
+}
+
+impl Drop for Pacer {
+    fn drop(&mut self) {
+        if self.observation.refills > 0 {
+            tracing::info!(target: "quinn_proto::pacing_observation",
+                refills=self.observation.refills, refill_bytes=self.observation.refill_bytes,
+                discarded_bytes=self.observation.discarded_bytes,
+                timer_late_us=self.observation.late_us,
+                max_timer_late_us=self.observation.max_late_us,
+                rate_bytes_per_second=?self.rate, last_window=self.last_window,
+                "backlogged pacing observations");
+        }
     }
 }
 
@@ -220,21 +273,15 @@ mod tests {
         let new_instant = old_instant + Duration::from_micros(15);
         let rtt = Duration::from_micros(400);
 
-        assert!(
-            Pacer::new(rtt, 30000, 1500, new_instant)
-                .delay(Duration::from_micros(0), 0, 1500, 1, old_instant)
-                .is_none()
-        );
-        assert!(
-            Pacer::new(rtt, 30000, 1500, new_instant)
-                .delay(Duration::from_micros(0), 1600, 1500, 1, old_instant)
-                .is_none()
-        );
-        assert!(
-            Pacer::new(rtt, 30000, 1500, new_instant)
-                .delay(Duration::from_micros(0), 1500, 1500, 3000, old_instant)
-                .is_none()
-        );
+        assert!(Pacer::new(rtt, 30000, 1500, new_instant)
+            .delay(Duration::from_micros(0), 0, 1500, 1, old_instant)
+            .is_none());
+        assert!(Pacer::new(rtt, 30000, 1500, new_instant)
+            .delay(Duration::from_micros(0), 1600, 1500, 1, old_instant)
+            .is_none());
+        assert!(Pacer::new(rtt, 30000, 1500, new_instant)
+            .delay(Duration::from_micros(0), 1500, 1500, 3000, old_instant)
+            .is_none());
     }
 
     #[test]

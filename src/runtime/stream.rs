@@ -13,6 +13,10 @@ use super::{MAX_PATHS, MAX_PAYLOAD};
 use serde::Serialize;
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -72,6 +76,9 @@ pub fn ack_flow(id: u32) -> u32 {
 /// Whether a stream-lane record carries acknowledgments.
 pub fn is_ack_flow(flow: u32) -> bool {
     stream_id(flow).is_some() && flow & ACK_FLAG != 0
+}
+pub(crate) fn is_ack_request(payload: &[u8]) -> bool {
+    payload.len() == DATA_HEADER && payload[..2] == [DATA, 0]
 }
 /// The stream identifier of a stream-lane record, if it is one.
 pub fn stream_id(flow: u32) -> Option<u32> {
@@ -342,6 +349,8 @@ struct Segment {
     deadline: Option<Instant>,
     probe_transmission: Option<u32>,
     local_retry_pending: bool,
+    /// The native reliable writer owns recovery while its path is reachable.
+    reliable: Option<Arc<AtomicBool>>,
 }
 
 /// One reliable sending half. Data offsets start at zero.
@@ -364,6 +373,7 @@ pub struct Sender {
     acked: u64,
     segments: BTreeMap<u64, Segment>,
     fresh: [BTreeSet<(Instant, u64)>; MAX_PATHS + 1],
+    reliable_flight: BTreeSet<u64>,
     repeated: BTreeSet<(Instant, u64)>,
     lost: BTreeSet<u64>,
     rack: Option<Instant>,
@@ -418,6 +428,7 @@ impl Sender {
             acked: 0,
             segments: BTreeMap::new(),
             fresh: Default::default(),
+            reliable_flight: BTreeSet::new(),
             repeated: BTreeSet::new(),
             lost: BTreeSet::new(),
             rack: None,
@@ -524,11 +535,12 @@ impl Sender {
     fn awaiting_peer(&self) -> bool {
         !self.segments.is_empty() || self.needs_probe()
     }
-    /// Nothing retained is in flight, yet the peer must still respond.
+    /// Ask for lost stream ACKs even when native QUIC owns payload recovery.
     fn needs_probe(&self) -> bool {
-        self.segments.is_empty()
-            && ((self.open_pending && self.open_sent)
-                || (self.next < self.written && self.next >= self.limit))
+        !self.reliable_flight.is_empty()
+            || (self.segments.is_empty()
+                && ((self.open_pending && self.open_sent)
+                    || (self.next < self.written && self.next >= self.limit)))
     }
     fn threshold(&self, now: Instant) -> Duration {
         self.rtt.high(now).mul_f64(self.reorder) + Duration::from_millis(2)
@@ -551,6 +563,9 @@ impl Sender {
         (base * 2u32.pow(self.probe_count.min(6))).min(MAX_PTO)
     }
     fn unschedule(&mut self, start: u64) {
+        if self.reliable_flight.remove(&start) {
+            return;
+        }
         let segment = &self.segments[&start];
         match segment.deadline {
             Some(at) => self.repeated.remove(&(at, start)),
@@ -559,6 +574,10 @@ impl Sender {
     }
     fn mark_lost(&mut self, start: u64) {
         self.unschedule(start);
+        self.segments
+            .get_mut(&start)
+            .expect("lost segment")
+            .reliable = None;
         self.lost.insert(start);
     }
     fn send_segment(&mut self, start: u64, end: u64, now: Instant, probe: bool) -> Transmit {
@@ -589,6 +608,7 @@ impl Sender {
             deadline: None,
             probe_transmission: None,
             local_retry_pending: false,
+            reliable: None,
         });
         if !probe && segment.transmissions > 0 {
             let stalled = progress.is_none_or(|at| at <= segment.sent_at);
@@ -770,6 +790,32 @@ impl Sender {
         rtt: Duration,
         at: Instant,
     ) {
+        self.admitted_via(start, transmission, path, rtt, at, None);
+    }
+
+    /// Native stream admission delegates loss recovery to that carrier. A
+    /// cross-path SACK or its local write queue is not a native packet loss.
+    pub(crate) fn admitted_reliable(
+        &mut self,
+        start: u64,
+        transmission: u32,
+        path: u8,
+        rtt: Duration,
+        at: Instant,
+        reachable: Arc<AtomicBool>,
+    ) {
+        self.admitted_via(start, transmission, path, rtt, at, Some(reachable));
+    }
+
+    fn admitted_via(
+        &mut self,
+        start: u64,
+        transmission: u32,
+        path: u8,
+        rtt: Duration,
+        at: Instant,
+        reliable: Option<Arc<AtomicBool>>,
+    ) {
         let path = usize::from(path);
         if path >= MAX_PATHS {
             return;
@@ -795,7 +841,12 @@ impl Sender {
         segment.local_retry_pending = false;
         segment.path = path;
         segment.sent_at = at;
-        if segment.stalls == 0 {
+        segment.reliable = reliable;
+        if segment.reliable.is_some() {
+            segment.deadline = None;
+            self.reliable_flight.insert(start);
+            self.probe_at.get_or_insert(at);
+        } else if segment.stalls == 0 {
             segment.deadline = None;
             self.fresh[path].insert((at, start));
         } else {
@@ -956,6 +1007,7 @@ impl Sender {
         let (start, transmission) = self.head_copy?;
         let s = self.segments.get(&start)?;
         (start == self.acked
+            && s.reliable.is_none()
             && s.transmissions == transmission
             && s.path != UNKNOWN_PATH
             && s.probe_transmission.is_none()
@@ -967,6 +1019,7 @@ impl Sender {
         let (start, transmission, at) = self.head_probe?;
         let segment = self.segments.get(&start)?;
         (start == self.acked
+            && segment.reliable.is_none()
             && segment.transmissions == transmission
             && segment.path != UNKNOWN_PATH
             && segment.probe_transmission.is_none()
@@ -984,6 +1037,7 @@ impl Sender {
             return;
         };
         if start != self.acked
+            || segment.reliable.is_some()
             || self.written - self.base <= HEAD_PROBE_MIN_FLIGHT
             || segment.transmissions != 1
             || segment.path == UNKNOWN_PATH
@@ -1008,6 +1062,7 @@ impl Sender {
         }
         let (&start, s) = self.segments.first_key_value()?;
         if s.path == UNKNOWN_PATH
+            || s.reliable.is_some()
             || s.transmissions != 1
             || s.probe_transmission.is_some()
             // A sparse HTTPS response can occupy a full negotiated segment.
@@ -1029,6 +1084,21 @@ impl Sender {
         ))
     }
     fn detect_losses(&mut self, now: Instant) {
+        let failed: Vec<_> = self
+            .reliable_flight
+            .iter()
+            .copied()
+            .filter(|start| {
+                !self.segments[start]
+                    .reliable
+                    .as_ref()
+                    .expect("reliable flight")
+                    .load(Ordering::Acquire)
+            })
+            .collect();
+        for start in failed {
+            self.mark_lost(start);
+        }
         // The oldest transmission has the earliest deadline within its route.
         for path in 0..=MAX_PATHS {
             let threshold = self.path_threshold(path, now);
@@ -1048,6 +1118,10 @@ impl Sender {
     }
     pub fn next_deadline(&self, now: Instant) -> Option<Instant> {
         [
+            // The existing sender updates native reachability from QUIC ACK
+            // progress. Poll only while native bytes await their stream ACK;
+            // this also recovers if the whole original connection disappears.
+            (!self.reliable_flight.is_empty()).then_some(now + Duration::from_millis(50)),
             self.head_probe_deadline()
                 .filter(|_| !self.head_probe_due)
                 .map(|(_, at)| at),
@@ -1427,6 +1501,190 @@ mod tests {
         };
         assert_eq!(large.len(), RELIABLE_PAYLOAD - DATA_HEADER);
         assert_eq!(small.len(), super::super::MAX_STREAM_PAYLOAD - DATA_HEADER);
+    }
+
+    #[test]
+    fn native_carrier_wait_does_not_trigger_an_overlay_repair() {
+        let at = Instant::now();
+        let mut sender = Sender::new(false);
+        let reachable = Arc::new(AtomicBool::new(true));
+        sender.push(&vec![5; 3 * 32 * 1024]);
+        for path in [0, 1, 1] {
+            let sent = sender.poll_transmit_reliable(at, RELIABLE_PAYLOAD).unwrap();
+            sender.admitted_reliable(
+                sent.start,
+                sent.transmission,
+                path,
+                Duration::from_millis(100),
+                at,
+                reachable.clone(),
+            );
+        }
+        sender
+            .on_ack(
+                &Ack {
+                    cumulative: 0,
+                    limit: MAX_WINDOW,
+                    duplicate_bytes: 0,
+                    ranges: vec![(32 * 1024, 3 * 32 * 1024)],
+                },
+                at + Duration::from_millis(70),
+            )
+            .unwrap();
+        // The first native response stream is still delivering its queued
+        // bytes. A later path's SACK is not a loss of this reliable carrier.
+        let later = at + Duration::from_millis(230);
+        sender.on_timeout(later);
+        assert!(
+            sender
+                .poll_transmit_reliable(later, RELIABLE_PAYLOAD)
+                .is_none()
+        );
+        assert!(sender.next_deadline(later).unwrap() > later);
+        assert_eq!(sender.reliable_flight.len(), 1);
+
+        // A real outage releases the original carrier's ownership, without
+        // waiting for a long connection idle timeout or a stream failure.
+        reachable.store(false, Ordering::Release);
+        sender.on_timeout(later);
+        let repair = sender
+            .poll_transmit_reliable(later, RELIABLE_PAYLOAD)
+            .unwrap();
+        assert_eq!(repair.start, 0);
+        assert!(repair.retransmission);
+        let replacement = Arc::new(AtomicBool::new(true));
+        sender.admitted_reliable(
+            repair.start,
+            repair.transmission,
+            1,
+            Duration::from_millis(100),
+            later,
+            replacement.clone(),
+        );
+        sender.on_timeout(later + Duration::from_millis(300));
+        if let Some(probe) =
+            sender.poll_transmit_reliable(later + Duration::from_millis(300), RELIABLE_PAYLOAD)
+        {
+            assert!(is_ack_request(&probe.frame.encode()));
+            assert!(!probe.retransmission);
+        }
+        assert!(
+            !sender.locally_dropped(0, 1),
+            "stale cancellation cannot replace the new owner"
+        );
+        let (released, _) = sender
+            .on_ack(
+                &Ack {
+                    cumulative: 3 * 32 * 1024,
+                    limit: MAX_WINDOW,
+                    duplicate_bytes: 0,
+                    ranges: vec![],
+                },
+                later + Duration::from_millis(310),
+            )
+            .unwrap();
+        assert_eq!(released, 3 * 32 * 1024);
+        assert!(sender.reliable_flight.is_empty());
+    }
+
+    #[test]
+    fn cancelled_native_write_retries_and_datagram_loss_timers_remain_active() {
+        let at = Instant::now();
+        let mut native = Sender::new(false);
+        native.push(&[3; 4096]);
+        let sent = native.poll_transmit_reliable(at, RELIABLE_PAYLOAD).unwrap();
+        native.admitted_reliable(
+            sent.start,
+            sent.transmission,
+            0,
+            Duration::from_millis(20),
+            at,
+            Arc::new(AtomicBool::new(true)),
+        );
+        assert!(native.locally_dropped(sent.start, sent.transmission));
+        let retry = native.poll_transmit_reliable(at, RELIABLE_PAYLOAD).unwrap();
+        assert!(retry.retransmission && retry.local_retry);
+
+        let mut datagram = Sender::new(false);
+        datagram.push(&[3; MAX_SEGMENT]);
+        let sent = datagram.poll_transmit(at).unwrap();
+        datagram.admitted(
+            sent.start,
+            sent.transmission,
+            0,
+            Duration::from_millis(20),
+            at,
+        );
+        let later = at + Duration::from_millis(230);
+        datagram.on_timeout(later);
+        assert!(datagram.poll_transmit(later).unwrap().retransmission);
+    }
+
+    #[test]
+    fn native_delivery_still_requests_an_ack_when_the_stream_ack_was_lost() {
+        let at = Instant::now();
+        let mut sender = Sender::new(false);
+        sender.push(&vec![7; 32 * 1024]);
+        let sent = sender.poll_transmit_reliable(at, RELIABLE_PAYLOAD).unwrap();
+        sender.admitted_reliable(
+            sent.start,
+            sent.transmission,
+            0,
+            Duration::from_millis(100),
+            at,
+            Arc::new(AtomicBool::new(true)),
+        );
+        // QUIC delivery can succeed while the separate DATAGRAM stream ACK
+        // disappears. Request another ACK without sending the payload again.
+        let later = at + Duration::from_millis(600);
+        sender.on_timeout(later);
+        let probe = sender
+            .poll_transmit_reliable(later, RELIABLE_PAYLOAD)
+            .expect("a native flight still needs end-to-end ACK recovery");
+        assert!(matches!(probe.frame, Frame::Data { fin: false, ref data, .. } if data.is_empty()));
+        assert!(!probe.retransmission);
+        assert_eq!(probe.transmission, 0);
+    }
+
+    #[test]
+    fn a_healthy_native_flight_does_not_hide_later_datagram_loss_on_the_same_path() {
+        let at = Instant::now();
+        let mut sender = Sender::new(false);
+        sender.push(&vec![3; 64 * 1024]);
+        let native = sender.poll_transmit_reliable(at, RELIABLE_PAYLOAD).unwrap();
+        sender.admitted_reliable(
+            native.start,
+            native.transmission,
+            0,
+            Duration::from_millis(20),
+            at,
+            Arc::new(AtomicBool::new(true)),
+        );
+        let datagram = sender.poll_transmit(at).unwrap();
+        sender.admitted(
+            datagram.start,
+            datagram.transmission,
+            0,
+            Duration::from_millis(20),
+            at,
+        );
+        // Fill the rest of the flight on the reliable carrier.
+        while let Some(sent) = sender.poll_transmit_reliable(at, RELIABLE_PAYLOAD) {
+            sender.admitted_reliable(
+                sent.start,
+                sent.transmission,
+                0,
+                Duration::from_millis(20),
+                at,
+                Arc::new(AtomicBool::new(true)),
+            );
+        }
+        let later = at + Duration::from_millis(230);
+        sender.on_timeout(later);
+        let repair = sender.poll_transmit(later).unwrap();
+        assert_eq!(repair.start, datagram.start);
+        assert!(repair.retransmission);
+        assert!(!sender.lost.contains(&native.start));
     }
 
     #[test]
