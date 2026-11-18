@@ -369,9 +369,11 @@ impl OutPath {
 type Paths = Arc<Mutex<Vec<OutPath>>>;
 
 fn stream_payload_limit(paths: &Paths, feedback: bool) -> usize {
+    path_payload_limit(&paths.lock().expect("paths lock"), feedback)
+}
+
+fn path_payload_limit(paths: &[OutPath], feedback: bool) -> usize {
     paths
-        .lock()
-        .expect("paths lock")
         .iter()
         .filter(|path| path.open())
         .filter_map(|path| {
@@ -381,6 +383,17 @@ fn stream_payload_limit(paths: &Paths, feedback: bool) -> usize {
         })
         .min()
         .unwrap_or(MAX_PAYLOAD)
+}
+
+fn client_stream_payload_limit(paths: &Paths, policy: &Policy) -> Option<usize> {
+    if !policy.game_mode {
+        return Some(stream_payload_limit(paths, policy.receiver_feedback));
+    }
+    match paths.try_lock() {
+        Ok(paths) => Some(path_payload_limit(&paths, policy.receiver_feedback)),
+        Err(std::sync::TryLockError::WouldBlock) => None,
+        Err(std::sync::TryLockError::Poisoned(error)) => panic!("paths lock: {error}"),
+    }
 }
 
 fn trace_path(scope: &Scope, stage: trace::Stage, path: trace::PathKey) {
@@ -5350,7 +5363,11 @@ async fn client_session(
     let result:Result<()>=async {loop {
         if let Some(mux)=streams.as_mut() {
             mux.service_io();
-            mux.set_payload_limit(stream_payload_limit(&paths, options.policy.receiver_feedback));
+            // A busy path metadata refresh cannot delay Game UDP dispatch.
+            // The sender still checks the current path size before admission.
+            if let Some(limit) = client_stream_payload_limit(&paths, &options.policy) {
+                mux.set_payload_limit(limit);
+            }
             mux.flush(&mut tcp::Out{tx:&tx,game_tx:game_tx.as_ref(),next_id:&mut next_id,scope:&forward,small_threshold});
         }
         tokio::select! {
