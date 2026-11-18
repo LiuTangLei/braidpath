@@ -714,6 +714,7 @@ impl Iter {
                         } else {
                             self.take_remaining()
                         },
+                        queued_at: None,
                     })
                 } else {
                     return Err(IterErr::InvalidFrameId);
@@ -896,6 +897,7 @@ pub(crate) const RETIRE_CONNECTION_ID_SIZE_BOUND: usize = 9;
 pub struct Datagram {
     /// Payload
     pub data: Bytes,
+    pub(crate) queued_at: Option<crate::Instant>,
 }
 
 impl FrameStruct for Datagram {

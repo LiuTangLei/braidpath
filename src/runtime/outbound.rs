@@ -536,6 +536,9 @@ impl Pacer {
         assert!(self.available(bytes));
         self.tokens -= bytes as f64;
     }
+    pub(super) fn refund(&mut self, bytes: usize) {
+        self.tokens = (self.tokens + bytes as f64).min(self.burst);
+    }
 }
 
 /// Additional adaptive business credit, shared across paths and bottleneck groups.

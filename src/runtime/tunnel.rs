@@ -181,10 +181,6 @@ impl Policy {
 
     pub fn validate(&self) -> Result<()> {
         ensure!(
-            !(self.game_mode && self.native_return),
-            "game mode and native bulk return are mutually exclusive"
-        );
-        ensure!(
             !self.game_mode || (self.adaptive && self.fec == automatic_fec::AUTO),
             "game mode requires adaptive scheduling and automatic FEC"
         );
@@ -1812,6 +1808,8 @@ async fn sender_with_game_input(
     let mut native_queue = outbound::Queue::default();
     let native_returning = policy.native_return && metrics.direction == stats::RETURN;
     let mut native_cursor = 0;
+    let mut mixed_writes =
+        (native_returning && policy.game_mode).then(native_return::MixedWrites::default);
     let mut blocks = BTreeMap::<u64, BlockSend>::new();
     let mut budget = outbound::RepairBudget::new(policy.redundancy);
     if policy.fec == automatic_fec::AUTO {
@@ -1842,7 +1840,7 @@ async fn sender_with_game_input(
     let mut next_summary_gauge_us = 0u64;
     let mut logged_guard = forward_guard::Snapshot::default();
     let reliable_native_service = policy.streams || policy.proxy;
-    let burst = if native_returning {
+    let burst = if native_returning && mixed_writes.is_none() {
         native_return::BURST
     } else if policy.adaptive {
         2400
@@ -2121,16 +2119,17 @@ async fn sender_with_game_input(
                     break;
                 };
                 metrics.update(|d| d.records.sender_input_consumed += 1);
+                let native_record = native_returning
+                    && native_return::bulk_data(record.flow, &record.payload)
+                    && !hold.as_ref().is_some_and(|hold| hold.interactive());
                 game_data_demand |= policy.game_mode
+                    && !native_record
                     && (policy.gaming_datagram(Some(record.flow))
                         || (stream::stream_id(record.flow).is_some()
                             && !stream::is_ack_flow(record.flow)
                             && record.payload.len() > LATENCY_RECORD_BYTES));
                 metrics.trace_record(trace::Stage::SenderInput, &record, None, None);
-                if native_returning
-                    && native_return::bulk_data(record.flow, &record.payload)
-                    && !hold.as_ref().is_some_and(|hold| hold.interactive())
-                {
+                if native_record {
                     native_return::enqueue(
                         QueuedRecord {
                             record,
@@ -2170,6 +2169,9 @@ async fn sender_with_game_input(
         for group in &mut groups {
             group.refill(now_us);
         }
+        if let Some(writes) = &mixed_writes {
+            writes.refund(&mut pacer, &mut groups);
+        }
         let expired = if policy.game_mode {
             queue.expire_with(now, |pending| policy.symbol_lifetime(pending))
         } else {
@@ -2205,11 +2207,13 @@ async fn sender_with_game_input(
         for path in paths.iter() {
             if let Some(writer) = &path.native_return {
                 writer.set_reachable(path.open() && !liveness[usize::from(path.id)].silent());
-                if let Some(window) = native_credit[usize::from(path.id)].observe(
-                    &path.conn,
-                    now_us,
-                    policy.latency_target_ms,
-                ) {
+                if mixed_writes.is_none()
+                    && let Some(window) = native_credit[usize::from(path.id)].observe(
+                        &path.conn,
+                        now_us,
+                        policy.latency_target_ms,
+                    )
+                {
                     path.conn.set_send_window(window);
                     info!(target: "braidpath::native_credit", path=path.id, window_bytes=window,
                         "native return storage credit changed");
@@ -2759,14 +2763,16 @@ async fn sender_with_game_input(
                 metrics.update(|d| d.symbols.feedback_deferred += 1);
             }
         }
-        native_return::drain(
-            &mut native_queue,
-            &paths,
-            silent,
-            &mut native_cursor,
-            &mut pacer,
-            &mut groups,
-        );
+        if mixed_writes.is_none() {
+            native_return::drain(
+                &mut native_queue,
+                &paths,
+                silent,
+                &mut native_cursor,
+                &mut pacer,
+                &mut groups,
+            );
+        }
         // Preserve one feedback route's group allowance as well as global credit.
         // Small business/probe datagrams otherwise can starve a larger report forever.
         let feedback_reserve = pending_feedback
@@ -3462,6 +3468,20 @@ async fn sender_with_game_input(
             blocked_repair = false;
             stalled_repairs.clear();
             repair_wait = None;
+        }
+        if let Some(writes) = &mut mixed_writes
+            && game_input.as_ref().is_none_or(|input| input.is_empty())
+        {
+            writes.drain(
+                &mut native_queue,
+                &paths,
+                silent,
+                &mut native_cursor,
+                &mut pacer,
+                &mut groups,
+                feedback_reserve,
+                reserved_group,
+            );
         }
         if let Some(input) = deferred_input {
             // No immediate service freed the original slot. Keep the existing
@@ -4632,7 +4652,7 @@ async fn server_connection(
                                 let native_return=native_return::requested(req.headers())?;
                                 let game_mode=game_mode_header(req.headers())?;
                                 ensure!(!native_return || streams || proxy,"return stream requires TCP profile");
-                                let (return_writer,return_reader)=if native_return { let (tx,rx)=native_return::channel(); (Some(tx),Some(rx)) } else { (None,None) };
+                                let (return_writer,return_reader)=if native_return { let (tx,rx)=if game_mode { native_return::mixed_channel() } else { native_return::channel() }; (Some(tx),Some(rx)) } else { (None,None) };
                                 let policy=Policy{game_mode,native_return,max_message_bytes,streams,proxy,
             fec_repairs,small_fec_bytes,mixed_fec,probe_guided_recovery,capacity_probe_bps,adaptive:quality_schedule==Some("adaptive"),latency_target_ms,group_rates,quality_schedule:quality_schedule.is_some(),receiver_feedback:feedback.is_some(),fec:parse_fec(header("braidpath-fec")?).map_err(anyhow::Error::msg)?,redundancy:header("braidpath-redundancy")?.parse()?,rate,block_ms:header("braidpath-block-ms")?.parse()?,queue_ms:header("braidpath-queue-ms")?.parse()?};policy.validate()?;
                                 if policy.fec==automatic_fec::AUTO {ensure!(req.headers().get_all("braidpath-auto-small").iter().count()==1 && req.headers().get("braidpath-auto-small").is_some_and(|v|v=="1"),"automatic small protection not negotiated");}
@@ -4711,7 +4731,7 @@ async fn server_connection(
                                 if let Some(scheduler)=quality_schedule {response=response.header("braidpath-scheduler",scheduler);}stream.send_response(response.body(())?).await?;
                                 let (send,recv)=stream.split();
                                 if let Some(reader)=return_reader {
-                                    conn.set_send_window(u64::from(native_return::WINDOW));
+                                    conn.set_send_window(if game_mode { native_return::MIXED_SEND_WINDOW } else { u64::from(native_return::WINDOW) });
                                     return_tasks.spawn(native_return::write(conn.clone(),send,reader));
                                 } else { response_send=Some(send); }
                                 request=Some(recv);

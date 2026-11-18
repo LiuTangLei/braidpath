@@ -5,7 +5,7 @@ use std::{
     task::{Wake, Waker},
 };
 
-struct Pair {
+pub(super) struct Pair {
     _identity: tempfile::TempDir,
     _server: quinn::Endpoint,
     _client: quinn::Endpoint,
@@ -141,7 +141,7 @@ async fn native_body_backpressure_keeps_reading_datagrams() {
 }
 
 impl Pair {
-    async fn connect() -> Self {
+    pub(super) async fn connect() -> Self {
         Self::connect_with_send_buffer(transport::DEFAULT_DATAGRAM_SEND_BUFFER_BYTES).await
     }
 
@@ -182,7 +182,7 @@ impl Pair {
         }
     }
 
-    fn path(&self) -> OutPath {
+    pub(super) fn path(&self) -> OutPath {
         OutPath {
             native_return: None,
             id: 0,
@@ -535,6 +535,97 @@ async fn game_udp_reaches_quinn_before_a_full_tcp_input_fifo_and_both_lanes_clos
         tx.is_closed() && game_tx.is_closed(),
         "shutdown closes and reclaims both inputs"
     );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn mixed_game_and_control_pass_a_busy_native_writer_and_tcp_resumes() {
+    let pair = Pair::connect().await;
+    let mut path = pair.path();
+    let (writer, mut reader) = native_return::mixed_channel();
+    let block_native = writer.tx.clone().try_reserve_owned().unwrap();
+    path.native_return = Some(writer);
+    let paths = Arc::new(Mutex::new(vec![path]));
+    let mut policy = policy();
+    policy.game_mode = true;
+    policy.native_return = true;
+    policy.proxy = true;
+    policy.adaptive = true;
+    policy.fec = automatic_fec::AUTO;
+    policy.rate = 30_000_000;
+    policy.group_rates = [30_000_000; MAX_PATHS];
+    let ingress::Channels {
+        tx,
+        rx,
+        game_tx,
+        game_rx,
+    } = ingress::channels(true);
+    let bulk = Record {
+        flow: stream::data_flow(1),
+        id: 1,
+        payload: stream::Frame::Data {
+            offset: 0,
+            fin: false,
+            data: vec![1; 32 * 1024],
+        }
+        .encode(),
+    };
+    let game = Record {
+        flow: associate::FLAG | 1,
+        id: 100,
+        payload: vec![2; 128],
+    };
+    let control = Record {
+        flow: stream::data_flow(1),
+        id: 2,
+        payload: stream::Frame::Reset.encode(),
+    };
+    let game_encoded = game.encode().unwrap();
+    let control_encoded = control.encode().unwrap();
+    for record in [bulk, control] {
+        tx.try_send(QueuedRecord {
+            record,
+            created: Instant::now(),
+            hold: None,
+        })
+        .unwrap();
+    }
+    let game_tx = game_tx.unwrap();
+    game_tx
+        .try_send(QueuedRecord {
+            record: game,
+            created: Instant::now() + Duration::from_secs(5),
+            hold: None,
+        })
+        .unwrap();
+    let metrics = stats::Metrics::new("server");
+    let scope = metrics.scope("mixed-writer-pressure", stats::RETURN);
+    let (stop, stopped) = watch::channel(false);
+    let task = tokio::spawn(sender_with_game_input(
+        rx, game_rx, paths, policy, stopped, scope, None,
+    ));
+    let (mut saw_game, mut saw_control) = (false, false);
+    for _ in 0..32 {
+        let packet = pair.receive().await;
+        saw_game |= packet
+            .windows(game_encoded.len())
+            .any(|bytes| bytes == game_encoded);
+        saw_control |= packet
+            .windows(control_encoded.len())
+            .any(|bytes| bytes == control_encoded);
+        if saw_game && saw_control {
+            break;
+        }
+    }
+    assert!(saw_game && saw_control);
+    drop(block_native);
+    assert!(
+        timeout(Duration::from_secs(1), reader.rx.recv())
+            .await
+            .unwrap()
+            .is_some()
+    );
+    stop.send(true).unwrap();
+    task.await.unwrap();
 }
 
 #[tokio::test]

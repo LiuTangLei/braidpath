@@ -466,14 +466,15 @@ impl Connection {
         deadline: Option<Instant>,
     ) -> Result<bool, SendDatagramError> {
         let conn = &mut *self.0.state.lock("send_datagram");
-        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+        let queued_at = deadline.map(|_| Instant::now());
+        if queued_at.zip(deadline).is_some_and(|(now, limit)| now >= limit) {
             return Ok(false);
         }
         if let Some(ref x) = conn.error {
             return Err(SendDatagramError::ConnectionLost(x.clone()));
         }
         use proto::SendDatagramError::*;
-        match conn.inner.datagrams().send(data, true) {
+        match conn.inner.datagrams().send_observed(data, true, queued_at) {
             Ok(()) => {
                 conn.publish(&self.0.shared);
                 conn.wake();

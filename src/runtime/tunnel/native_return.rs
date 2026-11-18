@@ -9,7 +9,7 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
 use std::{
     sync::{
         Arc, OnceLock,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::Instant,
 };
@@ -175,7 +175,7 @@ impl Credit {
 
 #[derive(Clone)]
 pub(super) struct Writer {
-    pub(super) tx: mpsc::Sender<Flight>,
+    pub(super) tx: mpsc::Sender<WritePart>,
     reachable: Arc<AtomicBool>,
 }
 impl Writer {
@@ -185,7 +185,7 @@ impl Writer {
     }
 }
 pub(super) struct Reader {
-    pub(super) rx: mpsc::Receiver<Flight>,
+    pub(super) rx: mpsc::Receiver<WritePart>,
     reachable: Arc<AtomicBool>,
 }
 impl Drop for Reader {
@@ -198,7 +198,7 @@ impl Drop for Reader {
 /// Retains the stream's failure callback while the bounded native writer owns
 /// the payload, without retaining its producer-queue reservation.
 pub(super) struct Flight {
-    pending: outbound::Pending,
+    hold: Option<Arc<outbound::Hold>>,
     written: bool,
 }
 impl Flight {
@@ -212,7 +212,7 @@ impl Flight {
             hold.reliable_handoff(path, rtt, Instant::now(), reachable);
         }
         Self {
-            pending,
+            hold: pending.hold,
             written: false,
         }
     }
@@ -220,14 +220,44 @@ impl Flight {
 impl Drop for Flight {
     fn drop(&mut self) {
         if !self.written
-            && let Some(hold) = &self.pending.hold
+            && let Some(hold) = &self.hold
         {
             hold.reliable_cancel();
         }
     }
 }
+pub(super) struct WritePart {
+    data: Bytes,
+    start: Option<Flight>,
+    last: bool,
+    reservation: Option<Reservation>,
+}
+
+type Refunds = [AtomicUsize; super::MAX_PATHS];
+
+struct Reservation {
+    refunds: Arc<Refunds>,
+    group: usize,
+    cost: usize,
+}
+impl Drop for Reservation {
+    fn drop(&mut self) {
+        if self.cost != 0 {
+            self.refunds[self.group].fetch_add(self.cost, Ordering::Relaxed);
+        }
+    }
+}
+
 pub(super) fn channel() -> (Writer, Reader) {
-    let (tx, rx) = mpsc::channel(PATH_QUEUE);
+    writer_channel(PATH_QUEUE)
+}
+
+pub(super) fn mixed_channel() -> (Writer, Reader) {
+    writer_channel(1)
+}
+
+fn writer_channel(queue: usize) -> (Writer, Reader) {
+    let (tx, rx) = mpsc::channel(queue);
     let reachable = Arc::new(AtomicBool::new(true));
     (
         Writer {
@@ -323,13 +353,132 @@ pub(super) fn drain(
         let pending = queue.pop(false).expect("native queue front");
         pacer.spend(cost);
         groups[usize::from(paths[i].group)].spend(cost);
-        permit.send(Flight::new(
-            pending,
-            paths[i].id,
-            paths[i].conn.rtt_hint(),
-            reachable,
-        ));
+        let data = pending.data.clone();
+        permit.send(WritePart {
+            data,
+            start: Some(Flight::new(
+                pending,
+                paths[i].id,
+                paths[i].conn.rtt_hint(),
+                reachable,
+            )),
+            last: true,
+            reservation: None,
+        });
         *cursor = (i + 1) % paths.len();
+    }
+}
+
+// One H3 DATA fragment fits even the minimum sender bucket. H3 boundaries
+// are independent of the application record decoded from the response body.
+const PART_BYTES: usize = 2048;
+const H3_PART_ALLOWANCE: usize = 16;
+pub(super) const MIXED_SEND_WINDOW: u64 = 1024 * 1024;
+
+#[derive(Default)]
+pub(super) struct MixedWrites {
+    partial: [Option<(usize, Bytes)>; super::MAX_PATHS],
+    refunds: Arc<Refunds>,
+}
+
+impl MixedWrites {
+    pub fn refund(
+        &self,
+        pacer: &mut outbound::Pacer,
+        groups: &mut [outbound::Pacer; super::MAX_PATHS],
+    ) {
+        for (group, refund) in groups.iter_mut().zip(self.refunds.iter()) {
+            let returned = refund.swap(0, Ordering::Relaxed);
+            if returned != 0 {
+                group.refund(returned);
+                pacer.refund(returned);
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn drain(
+        &mut self,
+        queue: &mut outbound::Queue,
+        paths: &[OutPath],
+        silent: u8,
+        cursor: &mut usize,
+        pacer: &mut outbound::Pacer,
+        groups: &mut [outbound::Pacer; super::MAX_PATHS],
+        feedback_reserve: usize,
+        reserved_group: Option<u8>,
+    ) {
+        let start = *cursor;
+        for n in 0..paths.len() {
+            let i = (start + n) % paths.len();
+            let path = &paths[i];
+            let id = usize::from(path.id);
+            let connection = path.conn.stable_id();
+            if self.partial[id]
+                .as_ref()
+                .is_some_and(|(owner, _)| *owner != connection || !path.open())
+            {
+                self.partial[id] = None;
+            }
+            if !path.open() || silent & (1 << id) != 0 {
+                continue;
+            }
+            let Some(writer) = &path.native_return else {
+                continue;
+            };
+            if !writer.reachable.load(Ordering::Acquire) {
+                continue;
+            }
+            let Ok(permit) = writer.tx.try_reserve() else {
+                continue;
+            };
+            let Some(bytes) = self.partial[id]
+                .as_ref()
+                .map(|(_, b)| b)
+                .or_else(|| queue.front(false).map(|pending| &pending.data))
+            else {
+                continue;
+            };
+            let count = bytes.len().min(PART_BYTES);
+            let cost = wire_cost(count + H3_PART_ALLOWANCE);
+            let reserve = super::GAME_PACKET_RESERVE;
+            let group = usize::from(path.group);
+            let group_reserve = if Some(path.group) == reserved_group {
+                feedback_reserve.max(reserve)
+            } else {
+                reserve
+            };
+            if !pacer.available(cost + reserve.max(feedback_reserve))
+                || !groups[group].available(cost + group_reserve)
+            {
+                continue;
+            }
+            let data = bytes.slice(..count);
+            let last = count == bytes.len();
+            let remaining = (!last).then(|| (connection, bytes.slice(count..)));
+            let flight = self.partial[id].is_none().then(|| {
+                Flight::new(
+                    queue.pop(false).expect("native queue front"),
+                    path.id,
+                    path.conn.rtt_hint(),
+                    writer.reachable.clone(),
+                )
+            });
+            self.partial[id] = remaining;
+            pacer.spend(cost);
+            groups[group].spend(cost);
+            permit.send(WritePart {
+                data,
+                start: flight,
+                last,
+                reservation: Some(Reservation {
+                    refunds: self.refunds.clone(),
+                    group,
+                    cost,
+                }),
+            });
+            *cursor = (i + 1) % paths.len();
+        }
     }
 }
 
@@ -338,22 +487,37 @@ pub(super) async fn write(
     mut stream: h3::server::RequestStream<h3_quinn::SendStream<Bytes>, Bytes>,
     mut input: Reader,
 ) {
+    let mut flight = None;
     loop {
-        let Some(mut flight) = (tokio::select! {
+        let Some(mut part) = (tokio::select! {
             value = input.rx.recv() => value,
             _ = conn.closed() => break,
         }) else {
             break;
         };
+        if let Some(start) = part.start.take() {
+            debug_assert!(flight.is_none());
+            flight = Some(start);
+        }
         let result = tokio::select! {
-            result = stream.send_data(flight.pending.data.clone()) => result,
+            biased;
             _ = conn.closed() => break,
+            result = async {
+                if let Some(mut reservation) = part.reservation.take() {
+                    // Once write starts, a failing H3 operation may have
+                    // submitted a prefix. Charge the grant conservatively.
+                    reservation.cost = 0;
+                }
+                stream.send_data(part.data).await
+            } => result,
         };
         if result.is_err() {
             conn.close(0u32.into(), b"return stream failed");
             break;
         }
-        flight.written = true;
+        if part.last {
+            flight.take().expect("native record started").written = true;
+        }
     }
 }
 
@@ -569,6 +733,105 @@ mod tests {
             Some(u64::from(WINDOW))
         );
     }
+    #[tokio::test]
+    async fn mixed_native_small_buckets_and_cancelled_parts_preserve_credit() {
+        let pair = super::super::sender_ready_tests::Pair::connect().await;
+        let mut path = pair.path();
+        let (writer, mut reader) = mixed_channel();
+        path.native_return = Some(writer);
+        let group = usize::from(path.group);
+        let paths = [path];
+        let mut queue = outbound::Queue::default();
+        let mut writes = MixedWrites::default();
+        let mut cursor = 0;
+        let cost = wire_cost(PART_BYTES + H3_PART_ALLOWANCE);
+        let reserve = super::super::GAME_PACKET_RESERVE;
+        let mut pacer = outbound::Pacer::new(64_000, cost + reserve);
+        let mut groups = std::array::from_fn(|_| outbound::Pacer::new(64_000, cost + reserve));
+        let record = encoded();
+        for id in [42u64, 43] {
+            let mut frame = record.to_vec();
+            frame[8..16].copy_from_slice(&id.to_be_bytes());
+            queue
+                .push(outbound::Pending {
+                    game_datagram: false,
+                    data: frame.into(),
+                    created: Instant::now(),
+                    flow: Some(stream::data_flow(17)),
+                    record_id: Some(id),
+                    block: None,
+                    small: false,
+                    hold: None,
+                })
+                .ok()
+                .unwrap();
+        }
+        pacer.refill(2_000_000);
+        writes.drain(
+            &mut queue,
+            &paths,
+            0,
+            &mut cursor,
+            &mut pacer,
+            &mut groups,
+            0,
+            None,
+        );
+        assert!(reader.rx.is_empty(), "group must authorize every fragment");
+        groups[group].refill(2_000_000);
+        writes.drain(
+            &mut queue,
+            &paths,
+            0,
+            &mut cursor,
+            &mut pacer,
+            &mut groups,
+            0,
+            None,
+        );
+        assert_eq!(queue.len(), 1);
+        assert!(pacer.available(reserve) && groups[group].available(reserve));
+        assert!(!pacer.available(reserve + 1) && !groups[group].available(reserve + 1));
+        drop(reader.rx.try_recv().unwrap());
+        writes.refund(&mut pacer, &mut groups);
+        writes.refund(&mut pacer, &mut groups);
+        assert!(pacer.available(cost + reserve) && groups[group].available(cost + reserve));
+        // Simulate a new path generation, which owns no partially assigned record.
+        writes.partial[0] = None;
+        let mut received = Vec::new();
+        let mut written_at = 2_000_000;
+        loop {
+            written_at += 1_000_000;
+            pacer.refill(written_at);
+            groups[group].refill(written_at);
+            writes.drain(
+                &mut queue,
+                &paths,
+                0,
+                &mut cursor,
+                &mut pacer,
+                &mut groups,
+                0,
+                None,
+            );
+            let mut part = reader.rx.try_recv().unwrap();
+            assert_eq!(part.start.is_some(), received.is_empty());
+            part.reservation.as_mut().unwrap().cost = 0;
+            received.extend_from_slice(&part.data);
+            if part.last {
+                break;
+            }
+        }
+        let decoded = Decoder::default()
+            .next(&mut received.as_slice())
+            .unwrap()
+            .unwrap();
+        assert_eq!(decoded.record_id, 43);
+        assert_eq!(received.len(), record.len());
+        writes.refund(&mut pacer, &mut groups);
+        assert!(!pacer.available(cost + reserve));
+    }
+
     fn encoded() -> Bytes {
         let payload = stream::Frame::Data {
             offset: 345,

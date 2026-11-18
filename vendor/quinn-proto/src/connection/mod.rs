@@ -1296,6 +1296,10 @@ impl Connection {
     /// Returns connection statistics
     pub fn stats(&self) -> ConnectionStats {
         let mut stats = self.stats;
+        stats.datagrams_selection_delay = self.datagrams.selection_delay;
+        stats.datagrams_pending = self.datagrams.pending_count();
+        stats.datagrams_buffer_evicted = self.datagrams.buffer_evictions;
+        stats.datagrams_mtu_dropped = self.datagrams.mtu_drops;
         stats.path.rtt = self.path.rtt.get();
         stats.path.min_rtt = self.path.rtt.min();
         stats.path.cwnd = self.path.congestion.window();
@@ -3366,7 +3370,7 @@ impl Connection {
         // DATAGRAM
         let mut sent_datagrams = false;
         while buf.len() + Datagram::SIZE_BOUND < max_size && space_id == SpaceId::Data {
-            match self.datagrams.write(buf, max_size) {
+            match self.datagrams.write(now, buf, max_size) {
                 true => {
                     sent_datagrams = true;
                     sent.non_retransmits = true;

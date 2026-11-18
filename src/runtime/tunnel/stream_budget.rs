@@ -16,6 +16,7 @@ const SHARED_RECORDS: usize = 65_536;
 const RESERVED_RECORDS: usize = 128;
 use super::MAX_TCP_FLOWS;
 
+#[derive(Default)]
 struct Pool {
     shared: Mutex<Pressure>,
     notify: Arc<Notify>,
@@ -31,14 +32,6 @@ pub(super) struct Pressure {
     shared_records: usize,
     records: usize,
     peak_records: usize,
-}
-impl Default for Pool {
-    fn default() -> Self {
-        Self {
-            shared: Mutex::default(),
-            notify: Arc::default(),
-        }
-    }
 }
 pub(crate) struct Budget {
     flows: Arc<Semaphore>,

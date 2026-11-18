@@ -171,6 +171,14 @@ pub struct ConnectionStats {
     pub frame_tx: FrameStats,
     /// Statistics about frames received on a connection
     pub frame_rx: FrameStats,
+    /// Application DATAGRAM frames queued for packet assembly.
+    pub datagrams_pending: u64,
+    /// Tracked DATAGRAM queue delay at selection, binned by 1, 2, 5, 10 and 20 ms.
+    pub datagrams_selection_delay: [u64; 6],
+    /// Unsent application DATAGRAM frames removed to make room for new frames.
+    pub datagrams_buffer_evicted: u64,
+    /// Unsent application DATAGRAM frames removed after an MTU reduction.
+    pub datagrams_mtu_dropped: u64,
     /// Statistics related to the current transmission path
     pub path: PathStats,
 }

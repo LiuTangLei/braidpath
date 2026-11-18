@@ -34,6 +34,7 @@ import time
 
 from bench.native_lab import ROOT, free_address, save
 from bench.netem import latest_complete_snapshot
+from bench import mixed_load
 
 DIGEST = struct.Struct("!32sQ")
 
@@ -66,6 +67,8 @@ def parse_args(argv=None):
     parser.add_argument("--bytes", type=int, default=16 * 1024 * 1024)
     parser.add_argument("--chunk-bytes", type=int, default=0,
                         help="upload a block, wait for a one-byte target receipt, then send the next")
+    parser.add_argument("--mixed-seconds", type=int, default=0,
+                        help="fixed SOCKS5 duplex + UDP window; --bytes is each sender cap")
     parser.add_argument("--direction", choices=("up", "down", "both"), default="up")
     parser.add_argument("--entrance", choices=("fixed", "socks5"), default="fixed")
     parser.add_argument("--connections", type=int, default=1)
@@ -90,6 +93,10 @@ def parse_args(argv=None):
         parser.error("evidence must be under local/")
     if not 65_536 <= args.bytes <= 512 * 1024 * 1024 or not 1 <= len(args.path) <= 4:
         parser.error("bounded bytes/path count exceeded")
+    if args.mixed_seconds and (not 1 <= args.mixed_seconds <= 120 or args.entrance != "socks5"
+                               or args.direction != "both" or args.connections != 1
+                               or args.chunk_bytes or args.tail_seconds or args.event):
+        parser.error("mixed-seconds requires a single SOCKS5 connection per direction without chunks, tail or events")
     if args.chunk_bytes and (not 1 <= args.chunk_bytes <= args.bytes or args.direction != "up"):
         parser.error("chunk-bytes needs an upload and must be between 1 and bytes")
     if not 0 <= args.loss_percent <= 50:
@@ -476,6 +483,7 @@ def run(args):
         "paths": args.path, "bytes_per_connection": args.bytes, "connections": args.connections,
         "direction": args.direction, "seed": args.seed, "events": args.event,
         "chunk_bytes": args.chunk_bytes,
+        "mixed_seconds": args.mixed_seconds,
         "shared_forward_mbps": args.shared_forward_mbps,
         "shared_forward_burst_bytes": args.shared_forward_burst_bytes,
     })
@@ -497,16 +505,18 @@ def run(args):
         cert, key, token = (identity / name for name in ("cert.pem", "key.pem", "token"))
         data = payload(args.bytes, args.seed)
         directions = ["up", "down"] if args.direction == "both" else [args.direction]
-        targets = {direction: Target(direction, data, args.connections, args.timeout_seconds,
+        targets = {} if args.mixed_seconds else {direction: Target(direction, data, args.connections, args.timeout_seconds,
                                      chunk_bytes=args.chunk_bytes)
                    for direction in directions}
         for target in targets.values():
             target.start()
-        target = targets[directions[0]]
-        echo = Echo() if args.probe_interval_ms or args.fresh_probe_interval_ms else None
+        target = targets.get(directions[0])
+        echo = Echo() if args.mixed_seconds or args.probe_interval_ms or args.fresh_probe_interval_ms else None
         if echo:
             echo.start()
-        server_addr, udp_listen, tcp_listen = free_address(), free_address(), free_address()
+        server_addr, udp_listen = free_address(), free_address()
+        with socket.create_server(("127.0.0.1", 0)) as reservation:
+            tcp_listen = "127.0.0.1:%d" % reservation.getsockname()[1]
         lab = [args.lab_binary, "--server", server_addr, "--queue-packets", args.queue_packets,
                "--seed", args.seed, "--ready-file", args.output / "link-ready.json",
                "--stats-jsonl", args.output / "link.jsonl", "--final-file", args.output / "link-final.json"]
@@ -549,6 +559,16 @@ def run(args):
         wait_paths(args.output, len(entrances), client)
         time.sleep(0.5)
         stop = threading.Event()
+        if args.mixed_seconds:
+            probe = FreshProbe(tcp_listen, echo.address, 1.0, stop)
+            result = mixed_load.run(tcp_listen, socks_connect, args.mixed_seconds, data, probe)
+            save(args.output / "summary.json", result)
+            for process in (client, server):
+                process.send_signal(2)
+                process.wait(timeout=10)
+            emulator.stdin.close()
+            emulator.wait(timeout=10)
+            return result
         probe = fresh = None
         if args.probe_interval_ms:
             probe = Probe(tcp_listen, echo.address, args.probe_interval_ms / 1000, stop)
@@ -686,6 +706,9 @@ def run(args):
 
 def main(argv=None):
     summary = run(parse_args(argv))
+    if "reliable_exact" in summary:
+        print(json.dumps({key: summary[key] for key in ("reliable_exact", "generator_valid", "udp")}))
+        return 0 if summary["reliable_exact"] and summary["generator_valid"] else 1
     print(json.dumps({k: summary[k] for k in ("exact", "elapsed_seconds", "goodput_mbps",
                                               "used_capacity_mbps", "goodput_to_used_capacity")}))
     return 0 if summary["exact"] else 1

@@ -6,7 +6,7 @@ use tracing::{debug, trace};
 
 use super::{Connection, Event};
 use crate::{
-    TransportError,
+    Instant, TransportError,
     frame::{Datagram, FrameStruct},
 };
 
@@ -26,6 +26,16 @@ impl Datagrams<'_> {
     ///
     /// Returns `Err` iff a `len`-byte datagram cannot currently be sent.
     pub fn send(&mut self, data: Bytes, drop: bool) -> Result<(), SendDatagramError> {
+        self.send_observed(data, drop, None)
+    }
+
+    /// Queue a DATAGRAM and optionally sample its residence before packet assembly.
+    pub fn send_observed(
+        &mut self,
+        data: Bytes,
+        drop: bool,
+        queued_at: Option<Instant>,
+    ) -> Result<(), SendDatagramError> {
         if self.conn.config.datagram_receive_buffer_size.is_none() {
             return Err(SendDatagramError::Disabled);
         }
@@ -51,7 +61,7 @@ impl Datagrams<'_> {
             self.conn.datagrams.send_blocked = true;
             return Err(SendDatagramError::Blocked(data));
         }
-        self.conn.datagrams.outgoing.push_back(Datagram { data });
+        self.conn.datagrams.outgoing.push_back(Datagram { data, queued_at });
         Ok(())
     }
 
@@ -120,9 +130,16 @@ pub(super) struct DatagramState {
     pub(super) incoming: DatagramBuffer,
     pub(super) outgoing: DatagramBuffer,
     pub(super) send_blocked: bool,
+    pub(super) buffer_evictions: u64,
+    pub(super) mtu_drops: u64,
+    pub(super) selection_delay: [u64; 6],
 }
 
 impl DatagramState {
+    pub(super) fn pending_count(&self) -> u64 {
+        self.outgoing.queue.len() as u64
+    }
+
     pub(super) fn received(
         &mut self,
         datagram: Datagram,
@@ -158,6 +175,7 @@ impl DatagramState {
             let Some(prev) = self.outgoing.pop_front() else {
                 break;
             };
+            self.buffer_evictions += 1;
             trace!(len = prev.data.len(), "dropping outgoing datagram");
         }
     }
@@ -193,6 +211,7 @@ impl DatagramState {
                 );
                 self.outgoing.payload_bytes -= datagram.data.len();
                 dropped_any = true;
+                self.mtu_drops += 1;
             }
             result
         });
@@ -203,7 +222,7 @@ impl DatagramState {
     ///
     /// Returns whether a frame was written. At most `max_size` bytes will be written, including
     /// framing.
-    pub(super) fn write(&mut self, buf: &mut Vec<u8>, max_size: usize) -> bool {
+    pub(super) fn write(&mut self, now: Instant, buf: &mut Vec<u8>, max_size: usize) -> bool {
         let datagram = match self.outgoing.pop_front() {
             Some(x) => x,
             None => return false,
@@ -217,6 +236,11 @@ impl DatagramState {
         }
 
         trace!(len = datagram.data.len(), "DATAGRAM");
+        if let Some(queued_at) = datagram.queued_at {
+            let delay = now.saturating_duration_since(queued_at).as_micros();
+            let bin = [1_000, 2_000, 5_000, 10_000, 20_000].partition_point(|limit| delay > *limit);
+            self.selection_delay[bin] += 1;
+        }
         datagram.encode(true, buf);
         true
     }
@@ -269,19 +293,38 @@ mod tests {
     use super::*;
 
     #[test]
+    fn delay_is_sampled_only_when_the_datagram_is_selected() {
+        let mut state = DatagramState::default();
+        let start = Instant::now();
+        state.outgoing.push_back(Datagram {
+            data: Bytes::from_static(&[0; 32]),
+            queued_at: Some(start),
+        });
+        let mut packet = Vec::new();
+        assert!(!state.write(start, &mut packet, 1));
+        assert_eq!(state.selection_delay, [0; 6]);
+        assert!(state.write(start + crate::Duration::from_millis(11), &mut packet, 128));
+        assert_eq!(state.selection_delay, [0, 0, 0, 0, 1, 0]);
+        assert_eq!(state.pending_count(), 0);
+    }
+
+    #[test]
     fn make_space_for_accounts_for_new_datagram() {
         let mut state = DatagramState::default();
         state.outgoing.push_back(Datagram {
             data: Bytes::from_static(&[0; 7]),
+            queued_at: None,
         });
         state.outgoing.push_back(Datagram {
             data: Bytes::from_static(&[0; 2]),
+            queued_at: None,
         });
         state.make_space_for(4, 10 + 2 * size_of::<Datagram>());
 
         assert_eq!(state.outgoing.queue.len(), 1);
         assert_eq!(state.outgoing.queue[0].data.len(), 2);
         assert_eq!(state.outgoing.payload_bytes, 2);
+        assert_eq!(state.buffer_evictions, 1);
     }
 
     #[test]
@@ -289,6 +332,7 @@ mod tests {
         let mut state = DatagramState::default();
         state.outgoing.queue.push_back(Datagram {
             data: Bytes::from_static(&[0]),
+            queued_at: None,
         });
         state.outgoing.payload_bytes = usize::MAX - 1;
 
@@ -302,7 +346,7 @@ mod tests {
     fn make_space_for_accounts_for_empty_datagram_metadata() {
         let mut state = DatagramState::default();
         for _ in 0..2 {
-            state.outgoing.push_back(Datagram { data: Bytes::new() });
+            state.outgoing.push_back(Datagram { data: Bytes::new(), queued_at: None });
         }
         let window = 2 * size_of::<Datagram>();
 
@@ -310,7 +354,7 @@ mod tests {
         state.make_space_for(0, window);
         assert_eq!(state.outgoing.queue.len(), 1);
         assert!(state.has_send_buffer_space(0, window));
-        state.outgoing.push_back(Datagram { data: Bytes::new() });
+        state.outgoing.push_back(Datagram { data: Bytes::new(), queued_at: None });
         assert_eq!(state.outgoing.memory_used(), window);
     }
 
@@ -324,9 +368,11 @@ mod tests {
         let mut state = DatagramState::default();
         state.outgoing.push_back(Datagram {
             data: Bytes::from_static(&[0; 10]),
+            queued_at: None,
         });
         state.outgoing.push_back(Datagram {
             data: Bytes::from_static(&[0; 11]),
+            queued_at: None,
         });
 
         assert!(state.drop_oversized(10));
@@ -334,6 +380,7 @@ mod tests {
         assert_eq!(state.outgoing.queue.len(), 1);
         assert_eq!(state.outgoing.queue[0].data.len(), 10);
         assert_eq!(state.outgoing.payload_bytes, 10);
+        assert_eq!(state.mtu_drops, 1);
     }
 }
 
