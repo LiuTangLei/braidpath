@@ -1769,16 +1769,46 @@ fn publish_receiver_feedback(paths: &[OutPath], metrics: &Scope) {
     }
 }
 
-fn lock_sender_paths<'a>(
+enum SenderPaths<'a> {
+    Locked(std::sync::MutexGuard<'a, Vec<OutPath>>),
+    Snapshot(&'a [OutPath]),
+}
+
+impl std::ops::Deref for SenderPaths<'_> {
+    type Target = [OutPath];
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Locked(paths) => paths,
+            Self::Snapshot(paths) => paths,
+        }
+    }
+}
+
+fn sender_paths<'a>(
     paths: &'a Paths,
+    snapshot: Option<&'a mut Vec<OutPath>>,
     profile: &mut Option<profile::Sender>,
-) -> std::sync::MutexGuard<'a, Vec<OutPath>> {
+) -> SenderPaths<'a> {
     let at = profile.as_ref().map(|_| Instant::now());
     let locked = paths.lock().expect("paths lock");
     if let (Some(profile), Some(at)) = (profile, at) {
         profile.locked(at.elapsed());
     }
-    locked
+    let Some(snapshot) = snapshot else {
+        return SenderPaths::Locked(locked);
+    };
+    // Membership changes only when a path joins or retires. Reuse the handles
+    // until then, releasing the shared lock before controller work and sends.
+    let connections = |path: &OutPath| path.conn.stable_id();
+    if !snapshot
+        .iter()
+        .map(connections)
+        .eq(locked.iter().map(connections))
+    {
+        snapshot.clone_from(&locked);
+    }
+    SenderPaths::Snapshot(snapshot)
 }
 
 /// A single owner admits every business, repair, feedback and probe datagram.
@@ -1903,6 +1933,10 @@ async fn sender_with_game_input(
     let lifetime = policy.stream_lifetime();
     let mut profile = profile::Sender::new(metrics.direction);
     let mut waiting: Option<WaitingSend> = None;
+    // The client closes a retired connection before removing it. Its writer
+    // rejects new datagrams once closed, including work from a prior snapshot.
+    let mut game_paths = (policy.game_mode && metrics.direction == stats::FORWARD)
+        .then(|| Vec::with_capacity(MAX_PATHS));
     let mut liveness: [liveness::Liveness; MAX_PATHS] = Default::default();
     let mut input_open = true;
     const GAME_INPUT_BURST: usize = 4;
@@ -2077,7 +2111,7 @@ async fn sender_with_game_input(
             SenderEvent::Ready(SendReadiness::Admitted { at, next_cursor }) => {
                 frontier.readiness_admitted += 1;
                 let attempt = prepared.expect("selected readiness attempt");
-                let paths = lock_sender_paths(&shared_paths, &mut profile);
+                let paths = sender_paths(&shared_paths, game_paths.as_mut(), &mut profile);
                 if let Some(profile) = &mut profile {
                     profile.counters.admissions += 1;
                 }
@@ -2200,7 +2234,7 @@ async fn sender_with_game_input(
         for expired in expired {
             account_expired(&expired, now, &metrics);
         }
-        let paths = lock_sender_paths(&shared_paths, &mut profile);
+        let paths = sender_paths(&shared_paths, game_paths.as_mut(), &mut profile);
         if policy.streams || policy.proxy {
             transfer_telemetry.observe(
                 now_us,
