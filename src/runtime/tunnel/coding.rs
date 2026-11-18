@@ -136,6 +136,7 @@ enum Mode {
 pub(super) struct RecordEncoder {
     mode: Mode,
     game_mode: bool,
+    mixed_policy: bool,
     fragments: bool,
     // Only one block per coding lane can be open. Keep its ingress clock even
     // if many immediate small blocks evict its sender scheduling metadata.
@@ -171,6 +172,7 @@ impl RecordEncoder {
         Ok(Self {
             mode,
             game_mode: policy.game_mode,
+            mixed_policy: policy.game_mode && policy.native_return,
             fragments: policy.max_message_bytes > crate::runtime::MAX_PAYLOAD,
             clocks: [None; 2],
         })
@@ -178,7 +180,7 @@ impl RecordEncoder {
 
     #[cfg(test)]
     pub(super) fn encode(&mut self, record: &Record, now: Instant) -> Result<Vec<EncodedSymbol>> {
-        self.encode_attempt_ingress(record, now, 1, now)
+        self.encode_attempt_ingress(record, now, 1, now, false)
     }
 
     #[cfg(test)]
@@ -188,7 +190,7 @@ impl RecordEncoder {
         now: Instant,
         ingress: Instant,
     ) -> Result<Vec<EncodedSymbol>> {
-        self.encode_attempt_ingress(record, now, 1, ingress)
+        self.encode_attempt_ingress(record, now, 1, ingress, false)
     }
 
     #[cfg(test)]
@@ -198,7 +200,7 @@ impl RecordEncoder {
         now: Instant,
         attempt: u32,
     ) -> Result<Vec<EncodedSymbol>> {
-        self.encode_attempt_ingress(record, now, attempt, now)
+        self.encode_attempt_ingress(record, now, attempt, now, false)
     }
 
     pub(super) fn encode_attempt_ingress(
@@ -207,6 +209,7 @@ impl RecordEncoder {
         now: Instant,
         attempt: u32,
         ingress: Instant,
+        interactive_tcp: bool,
     ) -> Result<Vec<EncodedSymbol>> {
         let fragmented = self.fragments && record.flow & super::messages::FLAG != 0;
         let mut symbols = match &mut self.mode {
@@ -222,7 +225,11 @@ impl RecordEncoder {
                 // size cutoff. Short records get independent immediate blocks.
                 let gaming =
                     self.game_mode && super::super::stream::stream_id(record.flow).is_none();
+                let protected_tcp = self.mixed_policy
+                    && interactive_tcp
+                    && record.payload.len() <= crate::runtime::MAX_STREAM_PAYLOAD;
                 let control = gaming
+                    || protected_tcp
                     || (!fragmented
                         && (record.payload.len() <= 128
                             || record.flow
@@ -235,6 +242,7 @@ impl RecordEncoder {
                     // over the next packet. Immediate copies protect its tail
                     // even when clean bulk and superseding ACKs need no FEC.
                     let interactive = gaming
+                        || protected_tcp
                         || (super::super::stream::stream_id(record.flow).is_some()
                             && !super::super::stream::is_ack_flow(record.flow)
                             && record.payload.len() <= 128);
@@ -520,6 +528,31 @@ mod tests {
     }
 
     #[test]
+    fn mixed_policy_short_tcp_uses_the_existing_small_copy_lane() {
+        let mut p = policy(super::super::super::automatic_fec::AUTO, 0, false);
+        p.enable_game();
+        p.native_return = true;
+        p.proxy = true;
+        let now = Instant::now();
+        let short = Record {
+            id: 1,
+            flow: super::super::stream::data_flow(1),
+            payload: vec![0; 1024],
+        };
+        let mut encoder = RecordEncoder::new(&p).unwrap();
+        let protected = encoder
+            .encode_attempt_ingress(&short, now, 1, now, true)
+            .unwrap();
+        assert_eq!(protected.len(), 2);
+        assert!(protected.iter().all(|symbol| symbol.small));
+        let bulk = encoder
+            .encode_attempt_ingress(&short, now, 1, now, false)
+            .unwrap();
+        assert_eq!(bulk.len(), 1);
+        assert!(!bulk[0].small);
+    }
+
+    #[test]
     fn automatic_fec_change_preserves_pending_block_ingress() {
         let mut p = policy(super::super::super::automatic_fec::AUTO, 0, false);
         p.receiver_feedback = true;
@@ -532,6 +565,7 @@ mod tests {
                 ingress + Duration::from_millis(5),
                 1,
                 ingress,
+                false,
             )
             .unwrap();
         assert_eq!(encoded.len(), 1);
