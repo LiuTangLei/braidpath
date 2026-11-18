@@ -5561,7 +5561,7 @@ async fn client_session(
                 } else {forward.update(|d|{d.records.ingress_queue_enqueued+=1;});}
             },
             incoming=native_rx.recv(),if options.policy.native_return=>{
-                if let Some(incoming)=incoming && let Some(mux)=streams.as_mut() { mux.receive(incoming.record); }
+                if let Some(incoming)=incoming && let Some(mux)=streams.as_mut() { mux.receive_native(incoming); }
             },
             data=wire_rx.recv()=>{
                 let Some((pid,data))=data else {bail!("all receivers ended")};

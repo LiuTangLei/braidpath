@@ -2,10 +2,9 @@
 
 ## 0.7.0 release scope
 
-The current development version is **0.7.0-rc.1**. It is not a published release.
-This increment freezes the implemented download and Game policies, removes
-retired compatibility paths, and validates one combined source revision. Results
-from precursor branches remain evidence about those branches.
+The 0.7.0 line combines the native download return and Game policies and removes
+retired recovery interfaces. See the [release notes](releases/v0.7.0.md) and
+[release readiness checklist](release-readiness.md).
 
 Current commands and policy boundaries are documented in [runtime](runtime.md),
 [mesh](mesh.md), and [reliable streams](reliable-streams.md).
@@ -23,22 +22,6 @@ The ordinary UDP policy retains its existing defaults. Native return and Game
 are mutually exclusive session choices; use separate sessions/listeners. Their implementations are not a claim that every
 network gains throughput, that logical paths have independent capacity, or that
 a local deadline bounds end-to-end latency.
-
-## Work required to close 0.7.0
-
-- Finish removal of retired recovery modes, obsolete feedback decoding and
-  ineffective CLI aliases, including their callers, tests and current guidance.
-- Verify the combined source with the existing cross-platform CI and complete
-  release artifact matrix.
-- Validate the final selected policies in a bounded, fixed-endpoint comparison:
-  complete-file transfer and control responsiveness for download; complete UDP
-  populations, competing traffic and short uploads for Game.
-- Record the exact source and configuration, including failures and unresolved
-  regressions, before promotion. Follow [release readiness](release-readiness.md).
-
-A full-size download and a latency-only UDP window answer different questions.
-Game automatic startup can affect short-upload completion. That boundary remains
-part of acceptance even when isolated UDP latency improves.
 
 ## Work after this release
 

@@ -1447,6 +1447,15 @@ impl Mux {
             self.reset(id, "malformed frame");
             return;
         };
+        self.receive_frame(id, frame);
+    }
+
+    pub(super) fn receive_native(&mut self, incoming: super::native_return::Incoming) {
+        self.admissions();
+        self.receive_frame(incoming.decoded.stream_id, incoming.decoded.frame);
+    }
+
+    fn receive_frame(&mut self, id: u32, frame: Frame) {
         let now = Instant::now();
         match frame {
             Frame::Reset => {

@@ -1,11 +1,8 @@
 # Release readiness
 
-## Candidate status
-
-**0.7.0-rc.1 is an unpublished integration candidate.** Native download and Game
-precursor builds have their own validation records. Those records do not
-constitute acceptance of the combined, cleaned source or a general performance
-limit. Freeze the final source revision and configuration before release tests.
+Freeze the source revision, artifact hashes and operating configurations before
+a release run. Keep precursor results attached to their original revisions and
+record release acceptance against the combined build.
 
 ## Required integration gates
 
@@ -43,8 +40,8 @@ workloads to seek a better result or introduce unrelated optimization work.
 - Game's local UDP deadline is checked through writer and Quinn admission.
   It cannot recall data already accepted by Quinn or the kernel, and does not
   bound propagation or application round-trip time.
-- Game automatic startup still needs short-upload acceptance. Idle UDP results
-  do not establish performance while upload and download compete.
+- Measure Game idle restart and short uploads separately from mixed traffic.
+  Keep the fixed-cap and automatic-policy results with their tested settings.
 - Unequal RTT, independent jitter, partial path replacement and shared-bottleneck
   competition remain material operating conditions. Retain unresolved
   regressions and avoid claims beyond the exercised conditions.

@@ -125,7 +125,7 @@ async fn native_body_backpressure_keeps_reading_datagrams() {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(frame.record.id, id);
+        assert_eq!(frame.decoded.record_id, id);
     }
     pair.outgoing.close(0u32.into(), b"test completed");
     timeout(Duration::from_secs(3), task)

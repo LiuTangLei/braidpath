@@ -5,7 +5,7 @@
 //! credit remain authoritative, including recovery after a path disappears.
 use super::{OutPath, QueuedRecord, outbound, stream, wire::Record};
 use anyhow::{Result, ensure};
-use bytes::{Buf, Bytes, BytesMut};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 use std::{
     sync::{
         Arc, OnceLock,
@@ -360,22 +360,31 @@ pub(super) async fn write(
 /// Native ingress gets its own process-wide byte budget before entering a
 /// session queue; TCP receive credit then owns the retained/reordered bytes.
 pub(super) struct Incoming {
-    pub record: Record,
+    pub decoded: Decoded,
     _credit: OwnedSemaphorePermit,
 }
 impl Incoming {
-    pub async fn new(record: Record) -> Result<Self> {
+    pub async fn new(decoded: Decoded) -> Result<Self> {
         static BUDGET: OnceLock<Arc<Semaphore>> = OnceLock::new();
         let budget = BUDGET.get_or_init(|| Arc::new(Semaphore::new(32 * 1024 * 1024)));
         let credit = budget
             .clone()
-            .acquire_many_owned(record.payload.len() as u32)
+            .acquire_many_owned(decoded.payload_len as u32)
             .await?;
         Ok(Self {
-            record,
+            decoded,
             _credit: credit,
         })
     }
+}
+
+#[derive(Debug)]
+pub(super) struct Decoded {
+    pub stream_id: u32,
+    pub frame: stream::Frame,
+    payload_len: usize,
+    #[cfg(test)]
+    pub record_id: u64,
 }
 
 #[derive(Default)]
@@ -384,7 +393,7 @@ pub(super) struct Decoder {
 }
 impl Decoder {
     /// Reads at most one bounded frame; DATA boundaries are not record boundaries.
-    pub fn next(&mut self, input: &mut impl Buf) -> Result<Option<Record>> {
+    pub fn next(&mut self, input: &mut impl Buf) -> Result<Option<Decoded>> {
         loop {
             let need = if self.partial.len() < HEADER_BYTES {
                 HEADER_BYTES
@@ -399,7 +408,7 @@ impl Decoder {
             };
             let count = (need - self.partial.len()).min(input.remaining());
             if count > 0 {
-                self.partial.extend_from_slice(&input.copy_to_bytes(count));
+                self.partial.put((&mut *input).take(count));
             }
             if self.partial.len() < need {
                 return Ok(None);
@@ -407,21 +416,24 @@ impl Decoder {
             if need == HEADER_BYTES {
                 continue;
             }
-            let mut frame = self.partial.split().freeze();
-            let len = frame.get_u32() as usize;
-            let flow = frame.get_u32();
-            let id = frame.get_u64();
-            ensure!(data(flow, &frame), "return-stream frame is not TCP data");
-            ensure!(
-                stream::Frame::decode(&frame).is_some(),
-                "invalid return-stream TCP frame"
-            );
-            debug_assert_eq!(len, frame.len());
-            return Ok(Some(Record {
-                flow,
-                id,
-                payload: frame.to_vec(),
-            }));
+            let header = &self.partial[..HEADER_BYTES];
+            let payload = &self.partial[HEADER_BYTES..];
+            let flow = u32::from_be_bytes(header[4..8].try_into()?);
+            let stream_id = stream::stream_id(flow).filter(|_| !stream::is_ack_flow(flow));
+            let (Some(stream_id), Some(frame @ stream::Frame::Data { .. })) =
+                (stream_id, stream::Frame::decode(payload))
+            else {
+                anyhow::bail!("invalid return-stream TCP data frame");
+            };
+            let decoded = Decoded {
+                stream_id,
+                frame,
+                payload_len: payload.len(),
+                #[cfg(test)]
+                record_id: u64::from_be_bytes(header[8..16].try_into()?),
+            };
+            self.partial.clear();
+            return Ok(Some(decoded));
         }
     }
     pub fn finish(&self) -> Result<()> {
@@ -637,6 +649,7 @@ mod tests {
     #[test]
     fn arbitrary_body_splits_and_coalescing() {
         let encoded = encoded();
+        let expected_frame = stream::Frame::decode(&encoded[HEADER_BYTES..]).unwrap();
         for size in [1, 7, 16, 997, 65536] {
             let all = [encoded.as_ref(), encoded.as_ref()].concat();
             let mut decoder = Decoder::default();
@@ -650,9 +663,12 @@ mod tests {
             }
             decoder.finish().unwrap();
             assert_eq!(records.len(), 2);
-            assert_eq!(records[0].id, 42);
-            assert_eq!(records[0].flow, stream::data_flow(17));
-            assert_eq!(records[0].payload.len(), PAYLOAD);
+            for record in records {
+                assert_eq!(record.record_id, 42);
+                assert_eq!(record.stream_id, 17);
+                assert_eq!(record.payload_len, PAYLOAD);
+                assert_eq!(record.frame, expected_frame);
+            }
         }
     }
     #[test]

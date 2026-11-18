@@ -10,7 +10,7 @@ BraidPath is a Rust multipath transport project combining **forward error correc
 
 “Braid” means weaving several imperfect paths into a more resilient connection.
 
-> **Development candidate: v0.7.0-rc.1 — not published.** This tree integrates native TCP download return streams, the Game UDP policy, and removal of retired recovery and feedback compatibility paths. The combined source still requires release acceptance; results from its separate precursor builds do not qualify this candidate. See the [candidate notes](docs/releases/v0.7.0-rc.1.md) and [release gates](docs/release-readiness.md).
+> **BraidPath 0.7.0** integrates native TCP download return streams and the Game UDP policy. See the [release notes](docs/releases/v0.7.0.md) for an upgrade checklist and mode selection.
 
 The latest published release remains [v0.6.2](docs/releases/v0.6.2.md). Each selected exit provides a local SOCKS5 listener; the default is four cooperating paths. Upgrade clients and servers together for this candidate. Configure [proxy and distributed-server mode](docs/mesh.md), then select the [traffic policy](docs/runtime.md#traffic-modes) for the workload.
 
@@ -56,7 +56,7 @@ Entrance count is not independent capacity. Paths may share the last mile, trans
 - **Spend redundancy deliberately.** Measure FEC, retransmission, control traffic, and actual wire cost separately.
 - **Make progress measurable.** Compare application P95/P99, deadline misses, completion and goodput under matched conditions. CPU-efficiency optimization comes later.
 
-Native return and Game are mutually exclusive session policies. Use separate sessions or listeners; neither changes the normal policy's defaults. Game automatic rates can reduce short-upload performance, and a local send deadline does not bound Internet RTT. See the [current limitations](docs/release-readiness.md#operating-boundaries).
+Native return and Game are mutually exclusive session policies. Use separate sessions or listeners; neither changes the normal policy's defaults. Set directional caps for Game sessions that share the link with bulk traffic. The local Game send deadline covers application queueing through Quinn admission. See the [current limitations](docs/release-readiness.md#operating-boundaries).
 
 The UDP tunnel defaults to BBR; `--congestion cubic` selects CUBIC. Proxy clients and mesh servers use BBR in both directions. Adaptive mode adjusts per-path sending allowance using receiver feedback, local queue age and path health. The default local sender-age target is 20 ms. Client `--rate-bps` and server `--max-rate-bps` default to `auto`, with a 10 Gbit/s operational ceiling. Explicit aggregate and bottleneck-group limits remain active during recovery. See the [adaptive policy](docs/runtime.md#adaptive-mode).
 
