@@ -358,6 +358,7 @@ pub(super) fn drain(
     cursor: &mut usize,
     pacer: &mut outbound::Pacer,
     groups: &mut [outbound::Pacer; super::MAX_PATHS],
+    parallel_downloads: bool,
 ) {
     for _ in 0..16 {
         let Some(front) = queue.front(false) else {
@@ -372,6 +373,33 @@ pub(super) fn drain(
             .collect();
         if front.hold.as_ref().is_some_and(|hold| hold.interactive()) {
             order.sort_by_key(|&i| paths[i].conn.rtt_hint());
+        } else if !parallel_downloads
+            && paths
+                .iter()
+                .filter(|p| p.open() && silent & (1 << p.id) == 0 && p.native_return.is_some())
+                .count()
+                >= 3
+        {
+            // In-order TCP delivery waits for the oldest record. Account for
+            // the backlog ahead of it when choosing between available paths.
+            order.sort_by_cached_key(|&i| {
+                let path = &paths[i];
+                let Some(writer) = &path.native_return else {
+                    return (true, u64::MAX);
+                };
+                let slots = writer.tx.capacity();
+                if slots == 0 || !path.open() || silent & (1 << path.id) != 0 {
+                    return (true, u64::MAX);
+                }
+                let (_, unsent) = path.conn.stream_send_buffer_bytes();
+                let queued = unsent + ((writer.tx.max_capacity() - slots) * PAYLOAD) as u64;
+                let delay_us = path.conn.rtt_hint().as_micros() as u64 / 2;
+                let service = service_bound(&path.conn).max(1);
+                (
+                    path.conn.probing_rtt_hint(),
+                    delay_us + (queued + front.data.len() as u64) * 1_000 / service,
+                )
+            });
         }
         let ready = order.into_iter().find_map(|i| {
             let path = &paths[i];

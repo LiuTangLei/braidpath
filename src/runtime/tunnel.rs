@@ -2878,6 +2878,7 @@ async fn sender_with_game_input(
                 &mut native_cursor,
                 &mut pacer,
                 &mut groups,
+                metrics.parallel_downloads.load(Ordering::Relaxed),
             );
         }
         // Preserve one feedback route's group allowance as well as global credit.
