@@ -84,6 +84,7 @@ impl Drop for CancelGuard {
 enum Command {
     Open {
         target: Destination,
+        ordered_udp: bool,
         early_reply: bool,
         lease: Arc<Lease>,
         cancel: Arc<Cancel>,
@@ -199,6 +200,19 @@ impl Connector {
         target: Destination,
         early_reply: bool,
     ) -> anyhow::Result<Flow> {
+        self.open_addressed(target, false, early_reply).await
+    }
+
+    pub(crate) async fn open_ordered_udp(&self, target: Destination) -> anyhow::Result<Flow> {
+        self.open_addressed(target, true, false).await
+    }
+
+    async fn open_addressed(
+        &self,
+        target: Destination,
+        ordered_udp: bool,
+        early_reply: bool,
+    ) -> anyhow::Result<Flow> {
         let mut generation = self.0.active.subscribe();
         let channel = self.active_channel(&mut generation).await?;
         let lease = tokio::select! {
@@ -220,6 +234,7 @@ impl Connector {
             .commands
             .send(Command::Open {
                 target,
+                ordered_udp,
                 early_reply,
                 lease: lease.clone(),
                 cancel,
@@ -317,6 +332,8 @@ const PUBLISH_EVERY: Duration = Duration::from_millis(500);
 const RETRY_FULL: Duration = Duration::from_millis(1);
 /// Stream identifiers with this bit carry a destination header.
 const ADDRESSED: u32 = 1 << 28;
+/// Address header prefix for a reliable, length-prefixed UDP destination.
+const ORDERED_UDP: u8 = 9;
 /// A stream with at most this much unacknowledged data is latency-bound, not
 /// bandwidth-bound: its segments take the earliest path rather than a share
 /// of every path.
@@ -352,7 +369,8 @@ pub(super) enum Io {
     Failed(u32),
     Connected(u32, TcpStream),
     /// Server: an addressed stream reached its destination.
-    Reached(u32, TcpStream),
+    Reached(u32, TcpStream, SocketAddr),
+    OrderedUdpReached(u32, crate::runtime::proxy::ordered_udp::Target),
     /// Server: an addressed stream's destination failed with this status.
     Refused(u32, u8),
     /// Client: a local proxy handshake completed.
@@ -742,7 +760,7 @@ impl Mux {
             allow_associations: policy.proxy
                 && (targets.allow_associations
                     || (policy.game_mode && targets.proxy_gateway.is_some())),
-            proxy_gateway: targets.proxy_gateway.filter(|_| policy.game_mode),
+            proxy_gateway: targets.proxy_gateway.filter(|_| policy.proxy),
         };
         (targets.fixed.is_some() || targets.proxy.is_some()).then(|| {
             let mut mux = Self::new(Listeners::default(), targets, policy, scope);
@@ -938,6 +956,7 @@ impl Mux {
         match command {
             Command::Open {
                 target,
+                ordered_udp,
                 early_reply,
                 lease,
                 cancel,
@@ -963,7 +982,11 @@ impl Mux {
                 stream.completion = Some(done);
                 stream.status_pending = true;
                 stream.early_reply = early_reply;
-                if !stream.push(&target.encode()) {
+                let mut header = target.encode();
+                if ordered_udp {
+                    header.insert(0, ORDERED_UDP);
+                }
+                if !stream.push(&header) {
                     self.reset(id, "destination header budget exhausted");
                 }
             }
@@ -1116,21 +1139,12 @@ impl Mux {
             }
             Io::Failed(id) => self.reset(id, "local socket failed"),
             Io::Connected(id, tcp) => self.attach(id, tcp),
-            Io::Reached(id, tcp) => {
-                if let Some(s) = self.streams.get_mut(&id) {
-                    let mut response = vec![proxy::OK];
-                    match tcp.local_addr() {
-                        Ok(bound) => response.extend(Destination::Ip(bound).encode()),
-                        Err(_) => {
-                            self.reset(id, "destination bound address unavailable");
-                            return;
-                        }
-                    }
-                    if !s.push(&response) {
-                        self.reset(id, "status header budget exhausted");
-                        return;
-                    }
-                    self.attach(id, tcp);
+            Io::Reached(id, tcp, bound) => self.reached(id, tcp, bound),
+            Io::OrderedUdpReached(id, target) => {
+                if let Some(stream) = self.streams.get_mut(&id) {
+                    let (tcp, bound, relay) = target.into_relay();
+                    stream.tasks.push(self.tasks.spawn(relay));
+                    self.reached(id, tcp, bound);
                 }
             }
             Io::Refused(id, status) => {
@@ -1403,6 +1417,18 @@ impl Mux {
         true
     }
 
+    fn reached(&mut self, id: u32, tcp: TcpStream, bound: SocketAddr) {
+        if let Some(stream) = self.streams.get_mut(&id) {
+            let mut response = vec![proxy::OK];
+            response.extend(Destination::Ip(bound).encode());
+            if !stream.push(&response) {
+                self.reset(id, "status header budget exhausted");
+                return;
+            }
+            self.attach(id, tcp);
+        }
+    }
+
     /// Handle in-order bytes: destination headers and status bytes first.
     fn arrived(&mut self, id: u32, mut ready: Vec<u8>) {
         let window = self.window();
@@ -1412,26 +1438,45 @@ impl Mux {
         };
         if let Some(header) = &mut s.header {
             header.append(&mut ready);
-            match Destination::decode(header) {
+            let ordered = usize::from(header.first() == Some(&ORDERED_UDP));
+            match Destination::decode(&header[ordered..]) {
                 Ok(None) if s.recv.fin_received() => {
                     return self.reset(id, "incomplete destination");
                 }
                 Ok(None) => return,
                 Err(()) => return self.reset(id, "malformed destination"),
                 Ok(Some((destination, used))) => {
+                    let used = used + ordered;
                     let mut header = s.header.take().expect("header");
                     ready = header.split_off(used);
                     s.recv.consumed(used as u64, window);
                     s.lease.release_rx(used);
                     let events = self.events_tx.clone();
                     let owner = s.lease.clone();
+                    let gateway = self.targets.proxy_gateway.clone();
                     s.tasks.push(self.tasks.spawn(async move {
                         let _owner = owner;
-                        let _ =
-                            events.send(match proxy::connect(destination, allow_private).await {
-                                Ok(tcp) => Io::Reached(id, tcp),
+                        let event = if ordered != 0 {
+                            match crate::runtime::proxy::ordered_udp::connect(
+                                destination,
+                                allow_private,
+                                gateway,
+                            )
+                            .await
+                            {
+                                Ok(target) => Io::OrderedUdpReached(id, target),
                                 Err(status) => Io::Refused(id, status),
-                            });
+                            }
+                        } else {
+                            match proxy::connect(destination, allow_private).await {
+                                Ok(tcp) => match tcp.local_addr() {
+                                    Ok(bound) => Io::Reached(id, tcp, bound),
+                                    Err(_) => Io::Failed(id),
+                                },
+                                Err(status) => Io::Refused(id, status),
+                            }
+                        };
+                        let _ = events.send(event);
                     }));
                 }
             }
@@ -3264,6 +3309,7 @@ mod tests {
                 .commands
                 .try_send(Command::Open {
                     target: Destination::Ip("127.0.0.1:1".parse().unwrap()),
+                    ordered_udp: false,
                     early_reply: false,
                     lease: filler.clone(),
                     cancel: Arc::new(Cancel {

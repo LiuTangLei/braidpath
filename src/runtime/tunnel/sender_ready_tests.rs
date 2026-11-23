@@ -413,6 +413,7 @@ async fn native_return_avoids_an_open_but_unresponsive_path_and_reuses_it_after_
             &mut cursor,
             &mut pacer,
             &mut groups,
+            false,
         );
         assert!(queue.front(false).is_none());
         assert_eq!(

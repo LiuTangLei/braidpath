@@ -214,6 +214,14 @@ not interrupted by these admission checks. This is path selection, not a
 guarantee of loss-free UDP after admission. Upgrade both client and selected exit
 to a build with UDP health probes before using this admission behavior.
 
+For bulk UDP, repeat `proxy-client --ordered-udp-port PORT` to select destination
+ports. The selected exit opens a UDP socket for each destination and the
+aggregate carries length-prefixed datagrams in order, with retransmission.
+Different destinations use independent streams. Use this when a transfer
+benefits from recovering losses and can wait for a missing datagram. Upgrade
+the client and selected exit together. Game mode continues to use its own UDP
+delivery policy.
+
 By default, `proxy-client` pipelines the application's first TCP bytes with
 the destination request. It sends SOCKS5 CONNECT success with a bound address
 of `0.0.0.0:0` once the first destination record enters an authenticated
@@ -245,9 +253,9 @@ the same machine as these loopback SOCKS endpoints. This supplies the proxy
 service model requested for v0.3.2; its wire protocol is not Hysteria 2, so a
 Clash `hysteria2` entry cannot connect to it directly.
 
-TCP and SOCKS UDP use different profiles on the server's existing UDP port.
+TCP and native SOCKS UDP use different profiles on the server's existing UDP port.
 TCP uses `braidpath-stream/2` and the aggregate reliable-flow engine, including
-half-close. SOCKS UDP retains ALPN `braidpath-proxy/1`, QUIC DATAGRAM transport,
+half-close. Native SOCKS UDP uses ALPN `braidpath-proxy/1`, QUIC DATAGRAM transport,
 bounded fragmentation up to 65,507 payload bytes, and no retransmission or FEC.
 The SOCKS TCP control connection authorizes the association. UDP payloads
 remain separate datagrams across the mesh and are sent from a UDP socket at the

@@ -92,6 +92,7 @@ async fn local_listener_capacity(
         exit.to_owned(),
         Arc::new(Semaphore::new(capacity)),
         false,
+        Arc::from([]),
     )));
     (at, task)
 }
@@ -395,6 +396,78 @@ async fn socks_tcp_negotiates_larger_records_without_changing_byte_budgets() {
     .await
     .expect("new peers did not publish larger stream records");
     assert_eq!(pool.stream_budget.snapshot(), (0, 0));
+}
+
+#[tokio::test]
+async fn ordered_and_native_udp_share_a_socks_association() {
+    let root = tempfile::tempdir().unwrap();
+    let (at, _server) = start(root.path(), "a", None, true).await;
+    let identity = identity(root.path(), "client");
+    let pool = client::Pool::new(
+        identity.clone(),
+        vec![node("a", at)],
+        vec!["a".into()],
+        None,
+        false,
+    )
+    .unwrap();
+    let ordered = udp_socket("127.0.0.1:0".parse().unwrap()).await.unwrap();
+    let native = udp_socket("127.0.0.1:0".parse().unwrap()).await.unwrap();
+    let targets = [ordered.local_addr().unwrap(), native.local_addr().unwrap()];
+    let mut echoes = tokio::task::JoinSet::new();
+    for echo in [ordered, native] {
+        echoes.spawn(async move {
+            let mut bytes = vec![0; 65_536];
+            loop {
+                let (n, source) = echo.recv_from(&mut bytes).await.unwrap();
+                echo.send_to(&bytes[..n], source).await.unwrap();
+            }
+        });
+    }
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listen = listener.local_addr().unwrap();
+    let _listener = Task(tokio::spawn(client::listen(
+        listener,
+        pool,
+        "a".into(),
+        Arc::new(Semaphore::new(2)),
+        false,
+        Arc::from([targets[0].port()]),
+    )));
+    let udp = udp_socket("127.0.0.1:0".parse().unwrap()).await.unwrap();
+    let (control, status, bound) = socks(listen, UDP, Address::Ip(udp.local_addr().unwrap())).await;
+    assert_eq!(status, 0);
+    let Address::Ip(bound) = bound else { panic!() };
+    let mut response = vec![0; 65_536];
+    for (target, sizes) in [
+        (targets[0], &[0, 60_000, 1_470][..]),
+        (targets[1], &[82][..]),
+    ] {
+        for (id, size) in sizes.iter().enumerate() {
+            let mut request = vec![0, 0, 0];
+            Address::Ip(target).encode(&mut request);
+            request.resize(request.len() + size, id as u8);
+            udp.send_to(&request, bound).await.unwrap();
+        }
+        for (id, size) in sizes.iter().enumerate() {
+            let (n, source) = timeout(Duration::from_secs(10), udp.recv_from(&mut response))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(source, bound);
+            assert_eq!(&response[..3], &[0, 0, 0]);
+            let (address, body) = protocol::packet(&response[3..n]).await.unwrap();
+            assert_eq!(address, Address::Ip(target));
+            assert_eq!(body.len(), *size);
+            assert!(body.iter().all(|byte| *byte == id as u8));
+        }
+    }
+    let status = identity.status(at).await.unwrap().proxy.unwrap();
+    assert_eq!(status.tcp_flows, 1);
+    assert_eq!(status.udp_associations, 1);
+    assert_eq!(status.udp_destinations, 2);
+    drop(control);
+    empty(&identity, at).await;
 }
 
 #[tokio::test]
@@ -2044,6 +2117,7 @@ async fn one_client_serves_fixed_exits_and_socks_tcp_udp_with_exit_failure_isola
         paths: 2,
         interface: None,
         socks5_early_reply: false,
+        ordered_udp_ports: Vec::new(),
         game_mode: false,
     })));
     timeout(Duration::from_secs(5), async {

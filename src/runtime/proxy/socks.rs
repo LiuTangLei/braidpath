@@ -3,8 +3,9 @@ use super::{
     protocol::*,
     *,
 };
-use std::net::SocketAddr;
+use std::{collections::HashMap, net::SocketAddr};
 use tokio::time::timeout;
+use tokio::{net::UdpSocket, sync::mpsc, task::JoinSet};
 
 async fn reply(tcp: &mut TcpStream, status: u8, bound: SocketAddr) -> Result<()> {
     let mut response = vec![5, status, 0];
@@ -17,6 +18,7 @@ pub(super) async fn serve(
     pool: Arc<Pool>,
     exit: &str,
     early_reply: bool,
+    ordered_ports: Arc<[u16]>,
 ) -> Result<()> {
     let (command, target) = timeout(CONNECT_TIMEOUT, async {
         ensure!(tcp.read_u8().await? == 5, "SOCKS version must be 5");
@@ -90,91 +92,212 @@ pub(super) async fn serve(
         };
         return timeout(CONNECT_TIMEOUT, connector.associate(tcp, target.port())).await?;
     }
-    let setup = timeout(CONNECT_TIMEOUT, async {
+    // Preserve admission before replying for unchanged native-only listeners.
+    let native = if ordered_ports.is_empty() {
+        match open_native(&pool, exit).await {
+            Ok(native) => Some(native),
+            Err(error) => {
+                reply(
+                    &mut tcp,
+                    error.downcast_ref::<ReplyError>().map_or(4, |e| e.0),
+                    unspecified,
+                )
+                .await?;
+                return Ok(());
+            }
+        }
+    } else {
+        None
+    };
+    udp(tcp, pool, exit, target.port(), native, &ordered_ports).await
+}
+
+struct Native {
+    conn: Arc<UdpConnection>,
+    send: quinn::SendStream,
+    control: quinn::RecvStream,
+    registration: Registration,
+}
+
+async fn open_native(pool: &Pool, exit: &str) -> Result<Native> {
+    timeout(CONNECT_TIMEOUT, async {
         let conn = pool.udp_connection(exit).await?;
-        let (mut send, mut recv) = conn.raw.open_bi().await?;
+        let (mut send, mut control) = conn.raw.open_bi().await?;
         let registration = conn.router.register(send.id().index())?;
-        let request = [UDP];
-        send.write_all(&request).await?;
-        let status = recv.read_u8().await?;
+        send.write_all(&[UDP]).await?;
+        let status = control.read_u8().await?;
         if status != 0 {
             return Err(ReplyError(if status <= 8 { status } else { 1 }).into());
         }
         tracing::debug!(%exit, "UDP association pinned to exit");
-        Ok::<_, anyhow::Error>((conn, send, recv, registration))
+        Ok(Native {
+            conn,
+            send,
+            control,
+            registration,
+        })
     })
-    .await;
-    let (conn, send, recv, registration) = match setup {
-        Ok(Ok(value)) => value,
-        Ok(Err(error)) => {
-            reply(
-                &mut tcp,
-                error.downcast_ref::<ReplyError>().map_or(4, |e| e.0),
-                unspecified,
-            )
-            .await?;
-            return Ok(());
-        }
-        _ => {
-            reply(&mut tcp, 4, unspecified).await?;
-            return Ok(());
-        }
-    };
-    udp(tcp, conn, send, recv, registration, target.port()).await
+    .await?
 }
 
-async fn udp(
-    mut tcp: TcpStream,
-    conn: Arc<UdpConnection>,
-    mut send: quinn::SendStream,
-    mut control: quinn::RecvStream,
-    mut registration: Registration,
-    port: u16,
+pub(super) struct Relay {
+    socket: UdpSocket,
+    source: Mutex<Option<SocketAddr>>,
+    active: Mutex<Instant>,
+}
+
+impl Relay {
+    pub(super) async fn send(&self, response: &[u8]) -> std::io::Result<()> {
+        let source = *self.source.lock().expect("SOCKS UDP source");
+        if let Some(source) = source.filter(|_| response.len() <= MAX_UDP) {
+            self.socket.send_to(response, source).await?;
+            self.touch();
+        }
+        Ok(())
+    }
+
+    fn touch(&self) {
+        *self.active.lock().expect("SOCKS UDP activity") = Instant::now();
+    }
+}
+
+async fn native_forward(
+    mut native: Native,
+    relay: &Relay,
+    mut requests: mpsc::Receiver<Vec<u8>>,
 ) -> Result<()> {
-    let peer = tcp.peer_addr()?;
-    let socket = udp_socket(SocketAddr::new(tcp.local_addr()?.ip(), 0)).await?;
-    reply(&mut tcp, 0, socket.local_addr()?).await?;
-    let mut source = if port == 0 {
-        None
-    } else {
-        Some(SocketAddr::new(peer.ip(), port))
-    };
-    let mut bytes = vec![0; 65_536];
-    let mut closed = [0; 1];
     let mut ended = [0; 1];
     let mut reassembly = Reassembly::default();
     let mut counter = 0;
-    let mut active = Instant::now();
-    let mut maintenance = tokio::time::interval(Duration::from_secs(5));
     loop {
         tokio::select! {
-            _ = tcp.read(&mut closed) => break,
-            _ = control.read(&mut ended) => break,
-            _ = conn.raw.closed() => break,
-            _ = maintenance.tick() => { if active.elapsed() >= UDP_IDLE { break; } }
-            received = socket.recv_from(&mut bytes) => {
-                let (n, from) = received?;
-                if from.ip() != peer.ip() || source.is_some_and(|s| s != from) || n < 4 || bytes[..3] != [0,0,0] { continue; }
-                if packet(&bytes[3..n]).await.is_err() { continue; }
-                source = Some(from);
-                let packet_id = counter; counter += 1;
-                if send_packet(&conn.raw, send.id().index(), packet_id, &bytes[3..n]).await.is_err() {
-                    if conn.raw.close_reason().is_some() { break; }
-                    continue;
+            _ = native.control.read(&mut ended) => break,
+            _ = native.conn.raw.closed() => break,
+            request = requests.recv() => {
+                let Some(request) = request else { break; };
+                let packet_id = counter;
+                counter += 1;
+                if send_packet(&native.conn.raw, native.send.id().index(), packet_id, &request).await.is_err()
+                    && native.conn.raw.close_reason().is_some()
+                {
+                    break;
                 }
-                active = Instant::now();
             }
-            frame = registration.recv.recv() => {
+            frame = native.registration.recv.recv() => {
                 let Some(frame) = frame else { break; };
                 let Some(packet) = reassembly.receive(frame, Instant::now()) else { continue; };
-                if let Some(source) = source {
-                    if packet.len() + 3 > MAX_UDP { continue; }
-                    let mut out = Vec::with_capacity(packet.len() + 3); out.extend([0,0,0]); out.extend(packet);
-                    socket.send_to(&out, source).await?; active = Instant::now();
+                if packet.len() + 3 <= MAX_UDP {
+                    let mut response = Vec::with_capacity(packet.len() + 3);
+                    response.extend([0, 0, 0]);
+                    response.extend(packet);
+                    relay.send(&response).await?;
                 }
             }
         }
     }
-    send.finish()?;
+    native.send.finish()?;
+    Ok(())
+}
+
+const UDP_QUEUE: usize = 64;
+
+fn spawn_native(
+    tasks: &mut JoinSet<Result<()>>,
+    pool: Arc<Pool>,
+    exit: String,
+    relay: Arc<Relay>,
+    native: Option<Native>,
+) -> mpsc::Sender<Vec<u8>> {
+    let (send, recv) = mpsc::channel(UDP_QUEUE);
+    tasks.spawn(async move {
+        let native = match native {
+            Some(native) => native,
+            None => open_native(&pool, &exit).await?,
+        };
+        native_forward(native, &relay, recv).await
+    });
+    send
+}
+
+async fn udp(
+    mut tcp: TcpStream,
+    pool: Arc<Pool>,
+    exit: &str,
+    port: u16,
+    native: Option<Native>,
+    ordered_ports: &[u16],
+) -> Result<()> {
+    let peer = tcp.peer_addr()?;
+    let socket = udp_socket(SocketAddr::new(tcp.local_addr()?.ip(), 0)).await?;
+    let relay = Arc::new(Relay {
+        socket,
+        source: Mutex::new((port != 0).then(|| SocketAddr::new(peer.ip(), port))),
+        active: Mutex::new(Instant::now()),
+    });
+    reply(&mut tcp, 0, relay.socket.local_addr()?).await?;
+    let mut tasks = JoinSet::new();
+    let mut native = native.map(|native| {
+        spawn_native(
+            &mut tasks,
+            pool.clone(),
+            exit.into(),
+            relay.clone(),
+            Some(native),
+        )
+    });
+    let mut ordered = HashMap::<Address, mpsc::Sender<Vec<u8>>>::new();
+    let mut bytes = vec![0; 65_536];
+    let mut closed = [0; 1];
+    let mut maintenance = tokio::time::interval(Duration::from_secs(5));
+    loop {
+        tokio::select! {
+            _ = tcp.read(&mut closed) => break,
+            ended = tasks.join_next(), if !tasks.is_empty() => {
+                if ordered_ports.is_empty() { break; }
+                if let Some(Ok(Err(error))) = ended {
+                    tracing::debug!(%exit, %error, "UDP route ended");
+                }
+                ordered.retain(|_, route| !route.is_closed());
+            }
+            _ = maintenance.tick() => {
+                if relay.active.lock().expect("SOCKS UDP activity").elapsed() >= UDP_IDLE {
+                    break;
+                }
+            }
+            received = relay.socket.recv_from(&mut bytes) => {
+                let (n, from) = received?;
+                let source = *relay.source.lock().expect("SOCKS UDP source");
+                if from.ip() != peer.ip() || source.is_some_and(|s| s != from) || n < 4 || bytes[..3] != [0, 0, 0] {
+                    continue;
+                }
+                let Ok((address, payload)) = packet(&bytes[3..n]).await else { continue; };
+                *relay.source.lock().expect("SOCKS UDP source") = Some(from);
+                if ordered_ports.contains(&address.port()) {
+                    if !ordered.contains_key(&address) {
+                        if ordered.len() >= MAX_DESTINATIONS { continue; }
+                        let (send, recv) = mpsc::channel(UDP_QUEUE);
+                        ordered.insert(address.clone(), send);
+                        let pool = pool.clone();
+                        let relay = relay.clone();
+                        let exit = exit.to_owned();
+                        let address = address.clone();
+                        tasks.spawn(async move {
+                            super::ordered_udp::forward(&pool, &exit, address, &relay, recv).await
+                        });
+                    }
+                    if let Some(route) = ordered.get(&address) {
+                        let _ = route.try_send(payload.to_vec());
+                    }
+                } else {
+                    if native.as_ref().is_none_or(mpsc::Sender::is_closed) {
+                        if ordered_ports.is_empty() { break; }
+                        native = Some(spawn_native(&mut tasks, pool.clone(), exit.into(), relay.clone(), None));
+                    }
+                    let _ = native.as_ref().expect("native UDP route").try_send(bytes[3..n].to_vec());
+                }
+                relay.touch();
+            }
+        }
+    }
     Ok(())
 }

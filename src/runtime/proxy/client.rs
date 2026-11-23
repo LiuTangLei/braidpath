@@ -45,6 +45,7 @@ pub struct ClientOptions {
     pub paths: usize,
     pub interface: Option<String>,
     pub socks5_early_reply: bool,
+    pub ordered_udp_ports: Vec<u16>,
     pub game_mode: bool,
 }
 
@@ -945,6 +946,7 @@ pub async fn client(options: ClientOptions) -> Result<()> {
             options.game_mode,
         ));
     }
+    let ordered_udp_ports: Arc<[u16]> = options.ordered_udp_ports.into();
     for (listener, exit) in listeners {
         tracing::info!(address=%listener.local_addr()?, %exit, "SOCKS5 proxy ready");
         tasks.spawn(listen(
@@ -953,6 +955,7 @@ pub async fn client(options: ClientOptions) -> Result<()> {
             exit,
             permits.clone(),
             options.socks5_early_reply,
+            ordered_udp_ports.clone(),
         ));
     }
     let mut discovery = JoinSet::new();
@@ -1022,6 +1025,7 @@ pub(super) async fn listen(
     exit: String,
     permits: Arc<Semaphore>,
     early_reply: bool,
+    ordered_udp_ports: Arc<[u16]>,
 ) -> Result<()> {
     let mut tasks = JoinSet::new();
     loop {
@@ -1031,9 +1035,10 @@ pub(super) async fn listen(
                 let Ok(permit) = permits.clone().try_acquire_owned() else { continue; };
                 tcp.set_nodelay(true)?;
                 let pool = pool.clone(); let exit = exit.clone();
+                let ports = ordered_udp_ports.clone();
                 tasks.spawn(async move {
                     let _permit = permit;
-                    if let Err(error) = super::socks::serve(tcp, pool, &exit, early_reply).await { tracing::debug!(%error, %exit, "SOCKS5 client closed"); }
+                    if let Err(error) = super::socks::serve(tcp, pool, &exit, early_reply, ports).await { tracing::debug!(%error, %exit, "SOCKS5 client closed"); }
                 });
             }
             _ = tasks.join_next(), if !tasks.is_empty() => {}

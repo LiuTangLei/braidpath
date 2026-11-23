@@ -296,6 +296,9 @@ enum Command {
         /// Wait for the exit's bound address or SOCKS5 failure before replying to CONNECT.
         #[arg(long)]
         socks5_wait_for_connect: bool,
+        /// Carry SOCKS5 UDP to this destination port over ordered aggregate streams.
+        #[arg(long = "ordered-udp-port", value_parser = clap::value_parser!(u16).range(1..))]
+        ordered_udp_ports: Vec<u16>,
         /// Prefer timely UDP delivery over bulk throughput.
         #[arg(long, value_enum, default_value = "off")]
         game_mode: GameMode,
@@ -643,6 +646,7 @@ pub async fn run() -> Result<()> {
             paths,
             interface,
             socks5_wait_for_connect,
+            ordered_udp_ports,
             game_mode,
         } => {
             let identity = mesh::ClientIdentity::open(dir, &connection_key)?;
@@ -656,6 +660,7 @@ pub async fn run() -> Result<()> {
                 paths: usize::from(paths),
                 interface,
                 socks5_early_reply: !socks5_wait_for_connect,
+                ordered_udp_ports,
                 game_mode: matches!(game_mode, GameMode::On),
             })
             .await

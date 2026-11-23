@@ -12,6 +12,7 @@ use tokio::{
 
 mod client;
 mod health;
+pub(crate) mod ordered_udp;
 mod protocol;
 mod server;
 mod socks;
