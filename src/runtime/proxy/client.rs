@@ -251,6 +251,9 @@ pub(super) struct Pool {
     token: String,
     slots: BTreeMap<String, Slot>,
     nodes: RwLock<Vec<mesh::Node>>,
+    nodes_changed: tokio::sync::Notify,
+    udp_ifindex: Mutex<Option<u32>>,
+    udp_ifindex_missing: Mutex<bool>,
     path_limit: std::sync::atomic::AtomicUsize,
     pub(super) stream_budget: Arc<tunnel::tcp::Budget>,
     closed: std::sync::atomic::AtomicBool,
@@ -279,10 +282,6 @@ impl Pool {
         let mut slots = BTreeMap::new();
         for exit in &exits {
             ensure!(!slots.contains_key(exit), "duplicate proxy exit: {exit}");
-            ensure!(
-                nodes.iter().any(|n| n.id == *exit),
-                "proxy exit not discovered: {exit}"
-            );
             slots.insert(
                 exit.clone(),
                 Slot {
@@ -302,6 +301,7 @@ impl Pool {
             );
         }
         let token = transport::token(&identity.dir.join("token"))?;
+        let udp_ifindex = interface.as_deref().and_then(transport::interface_index);
         Ok(Arc::new(Self {
             identity,
             interface,
@@ -309,12 +309,46 @@ impl Pool {
             token,
             slots,
             nodes: RwLock::new(nodes),
+            nodes_changed: tokio::sync::Notify::new(),
+            udp_ifindex: Mutex::new(udp_ifindex),
+            udp_ifindex_missing: Mutex::new(false),
             path_limit: std::sync::atomic::AtomicUsize::new(4),
             stream_budget: Arc::new(tunnel::tcp::Budget::new()),
             closed: std::sync::atomic::AtomicBool::new(false),
             shutdown_done: std::sync::atomic::AtomicBool::new(false),
             shutdown_complete: tokio::sync::Notify::new(),
         }))
+    }
+    fn has_exit(&self, id: &str) -> bool {
+        self.nodes
+            .read()
+            .expect("proxy nodes")
+            .iter()
+            .any(|node| node.id == id)
+    }
+    fn stream_running(&self, id: &str) -> bool {
+        self.slots
+            .get(id)
+            .and_then(|slot| slot.aggregate.try_lock().ok())
+            .is_some_and(|guard| guard.as_ref().is_some_and(Aggregate::running))
+    }
+    async fn wait_for_exit_nodes(&self, id: &str) -> Result<Vec<mesh::Node>> {
+        loop {
+            ensure!(
+                !self.closed.load(std::sync::atomic::Ordering::Acquire),
+                "proxy client stopped"
+            );
+            let notified = self.nodes_changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            {
+                let nodes = self.nodes.read().expect("proxy nodes");
+                if nodes.iter().any(|node| node.id == id) {
+                    return Ok(nodes.clone());
+                }
+            }
+            notified.await;
+        }
     }
     async fn route_watch(
         &self,
@@ -330,7 +364,7 @@ impl Pool {
         let slot = self.slots.get(id).context("exit not selected")?;
         let mut routes = slot.routes.lock().await;
         if routes.is_none() {
-            let nodes = self.nodes.read().expect("proxy nodes").clone();
+            let nodes = self.wait_for_exit_nodes(id).await?;
             let limit = self.path_limit.load(std::sync::atomic::Ordering::Relaxed);
             let (_, guard) = self
                 .identity
@@ -575,7 +609,51 @@ impl Pool {
         Ok(conn)
     }
     pub(super) fn retire_stale_udp_paths(&self) {
+        let interface_rebound = if let Some(name) = self.interface.as_deref() {
+            let current = transport::interface_index(name);
+            let mut bound = self.udp_ifindex.lock().expect("udp ifindex");
+            let mut missing = self
+                .udp_ifindex_missing
+                .lock()
+                .expect("udp ifindex missing");
+            match current {
+                None => {
+                    if bound.is_some() {
+                        *missing = true;
+                    }
+                    false
+                }
+                Some(idx) => {
+                    if *missing || bound.is_some_and(|old| old != idx) {
+                        tracing::info!(
+                            interface = name,
+                            old_ifindex = ?*bound,
+                            new_ifindex = idx,
+                            "retiring cached UDP proxy paths after interface change"
+                        );
+                        *bound = Some(idx);
+                        *missing = false;
+                        true
+                    } else {
+                        if bound.is_none() {
+                            *bound = Some(idx);
+                        }
+                        false
+                    }
+                }
+            }
+        } else {
+            false
+        };
         for slot in self.slots.values() {
+            if interface_rebound {
+                for path in
+                    std::mem::take(&mut *slot.paths.lock().expect("proxy paths")).into_values()
+                {
+                    path.retire();
+                }
+                continue;
+            }
             let Ok(routes) = slot.routes.try_lock() else {
                 continue;
             };
@@ -650,6 +728,7 @@ impl Pool {
     }
     pub(super) async fn shutdown(self: &Arc<Self>) {
         if !self.closed.swap(true, std::sync::atomic::Ordering::AcqRel) {
+            self.nodes_changed.notify_waiters();
             // This task owns the complete traversal, including async Slot locks.
             // No handle is kept in Pool, so there is no owner/handle reference cycle.
             let owner = self.clone();
@@ -710,7 +789,20 @@ impl Pool {
         updates.borrow().clone()
     }
     fn refresh(&self, nodes: Vec<mesh::Node>) {
-        *self.nodes.write().expect("proxy nodes") = nodes;
+        let mut current = self.nodes.write().expect("proxy nodes");
+        // Merge incoming nodes by ID so a partial view of one exit never drops
+        // another selected exit learned from a different peer or cache.
+        let mut by_id: BTreeMap<String, mesh::Node> = current
+            .iter()
+            .cloned()
+            .map(|node| (node.id.clone(), node))
+            .collect();
+        for node in nodes {
+            by_id.insert(node.id.clone(), node);
+        }
+        *current = by_id.into_values().collect();
+        drop(current);
+        self.nodes_changed.notify_waiters();
     }
 }
 
@@ -813,23 +905,65 @@ pub(super) fn validate_tcp_forwards(forwards: &[Listener], socks: &[Listener]) -
     Ok(())
 }
 
-async fn fixed_forward(
+async fn discover_wanted(
+    identity: &mesh::ClientIdentity,
+    entries: &[SocketAddr],
+    wanted: &BTreeSet<String>,
+    uplink: &mesh::Uplink,
+) -> Result<(Vec<mesh::Node>, Vec<String>)> {
+    let mut nodes = identity.discover_any_on(entries, uplink).await?;
+    let mut missing_exits = Vec::new();
+    let mut missing = JoinSet::new();
+    for exit in wanted {
+        if !nodes.iter().any(|node| node.id == *exit) {
+            let identity = identity.clone();
+            let entries = entries.to_vec();
+            let exit = exit.clone();
+            let uplink = uplink.clone();
+            missing.spawn(async move {
+                let res = identity.discover_exit_on(&entries, &exit, &uplink).await;
+                (exit, res)
+            });
+        }
+    }
+    while let Some(result) = missing.join_next().await {
+        match result {
+            Ok((exit, Ok(found))) => {
+                if let Some(node) = found.into_iter().find(|n| n.id == exit) {
+                    nodes.push(node);
+                } else {
+                    missing_exits.push(exit);
+                }
+            }
+            Ok((exit, Err(error))) => {
+                tracing::debug!(%exit, %error, "selected exit not yet discovered");
+                missing_exits.push(exit);
+            }
+            Err(_) => {}
+        }
+    }
+    Ok((nodes, missing_exits))
+}
+
+struct FixedForwardConfig {
     identity: mesh::ClientIdentity,
-    nodes: Vec<mesh::Node>,
     mapping: Listener,
-    listener: TcpListener,
+    listener: Arc<TcpListener>,
     paths: usize,
     interface: Option<String>,
     game_mode: bool,
-) -> Result<()> {
+}
+
+async fn fixed_forward_once(config: &FixedForwardConfig, nodes: Vec<mesh::Node>) -> Result<()> {
     let uplink = mesh::Uplink {
-        interface: interface.clone(),
+        interface: config.interface.clone(),
         ..Default::default()
     };
-    let (entrances, leases) = identity
-        .entrances_on(nodes, &mapping.exit, paths, &uplink)
+    let (entrances, leases) = config
+        .identity
+        .entrances_on(nodes, &config.mapping.exit, config.paths, &uplink)
         .await?;
-    let mut policy = reliable_policy(game_mode);
+    let mut policy = reliable_policy(config.game_mode);
     policy.proxy = false;
     policy.streams = true;
     let options = tunnel::ClientOptions {
@@ -840,34 +974,97 @@ async fn fixed_forward(
         proxy_listen: None,
         stream_connector: None,
         entrances,
-        interfaces: interface.into_iter().collect(),
+        interfaces: config.interface.iter().cloned().collect(),
         path_binds: vec![],
         path_groups: vec![],
-        name: identity.name(),
-        ca: identity.dir.join("cert.pem"),
-        token: identity.dir.join("token"),
+        name: config.identity.name(),
+        ca: config.identity.dir.join("cert.pem"),
+        token: config.identity.dir.join("token"),
         datagram_send_buffer_bytes: transport::MAX_DATAGRAM_SEND_BUFFER_BYTES,
         congestion: transport::Congestion::Bbr,
         policy,
         stats: stats::Metrics::new("fixed-forward")
-            .with_summary_label(format!("fixed:{}", mapping.exit)),
+            .with_summary_label(format!("fixed:{}", config.mapping.exit)),
     };
     let result = tunnel::client_with_fixed_listener(
         options,
         leases.updates(),
         leases.health(),
-        mapping.exit,
-        listener,
+        config.mapping.exit.clone(),
+        config.listener.clone(),
     )
     .await;
     leases.shutdown().await;
     result
 }
 
+async fn fixed_forward_supervisor(
+    config: FixedForwardConfig,
+    mut nodes_rx: tokio::sync::watch::Receiver<Vec<mesh::Node>>,
+    mut stop_rx: tokio::sync::watch::Receiver<bool>,
+) {
+    let mut backoff = Duration::from_secs(1);
+    loop {
+        if *stop_rx.borrow() {
+            return;
+        }
+        let nodes = loop {
+            if *stop_rx.borrow() {
+                return;
+            }
+            let current = nodes_rx.borrow_and_update().clone();
+            if current.iter().any(|n| n.id == config.mapping.exit) {
+                break current;
+            }
+            tokio::select! {
+                _ = stop_rx.changed() => return,
+                changed = nodes_rx.changed() => {
+                    if changed.is_err() { return; }
+                }
+            }
+        };
+        let started = Instant::now();
+        let result = tokio::select! {
+            _ = stop_rx.changed() => return,
+            result = fixed_forward_once(&config, nodes) => result,
+        };
+        if *stop_rx.borrow() {
+            return;
+        }
+        if started.elapsed() >= Duration::from_secs(30) {
+            backoff = Duration::from_secs(1);
+        }
+        match result {
+            Ok(()) => return,
+            Err(error) => {
+                tracing::warn!(
+                    exit = %config.mapping.exit,
+                    retry_secs = backoff.as_secs(),
+                    %error,
+                    "fixed TCP forward unavailable; retaining listener and retrying"
+                );
+            }
+        }
+        tokio::select! {
+            _ = stop_rx.changed() => return,
+            _ = tokio::time::sleep(backoff) => {}
+        }
+        backoff = (backoff * 2).min(Duration::from_secs(15));
+    }
+}
+
 pub async fn client(options: ClientOptions) -> Result<()> {
     ensure!(
         !options.game_mode || options.ordered_udp_ports.is_empty(),
         "--ordered-udp-port cannot be combined with --game-mode on"
+    );
+    ensure!(
+        !options.connect.is_empty() && options.connect.len() <= 32,
+        "provide 1..32 discovery entries"
+    );
+    ensure!(
+        (1..=crate::runtime::MAX_PATHS).contains(&options.paths),
+        "invalid proxy path limit"
     );
     let planned = listener_plan(&options.exits, options.listen, &options.socks5)?;
     validate_tcp_forwards(&options.tcp_forward, &planned)?;
@@ -881,53 +1078,21 @@ pub async fn client(options: ClientOptions) -> Result<()> {
         wanted.len() <= crate::runtime::MAX_PATHS,
         "select at most eight mesh exits"
     );
-    let uplink = mesh::Uplink {
-        interface: options.interface.clone(),
-        ..Default::default()
-    };
-    let mut nodes = options
-        .identity
-        .discover_any_on(&options.connect, &uplink)
-        .await?;
-    let mut missing = JoinSet::new();
-    for exit in &wanted {
-        if !nodes.iter().any(|node| node.id == *exit) {
-            let identity = options.identity.clone();
-            let entries = options.connect.clone();
-            let exit = exit.clone();
-            let uplink = uplink.clone();
-            missing.spawn(async move {
-                let nodes = identity.discover_exit_on(&entries, &exit, &uplink).await?;
-                Ok::<_, anyhow::Error>(
-                    nodes
-                        .into_iter()
-                        .find(|n| n.id == exit)
-                        .expect("discovery requires selected exit"),
-                )
-            });
-        }
-    }
-    while let Some(result) = missing.join_next().await {
-        nodes.push(result??);
-    }
+    let initial_nodes = options.identity.cached_nodes();
     let selected_exits = options.exits.clone();
     let fixed_identity = options.identity.clone();
-    let fixed_nodes = nodes.clone();
     let fixed_interface = options.interface.clone();
     let pool = Pool::new(
         options.identity,
-        nodes,
+        initial_nodes.clone(),
         options.exits,
         options.interface,
         options.game_mode,
     )?;
-    ensure!(
-        (1..=crate::runtime::MAX_PATHS).contains(&options.paths),
-        "invalid proxy path limit"
-    );
     pool.path_limit
         .store(options.paths, std::sync::atomic::Ordering::Relaxed);
-    // Bind every requested port before publishing readiness or accepting clients.
+    // Bind every requested port before touching the network so cold boots and
+    // transient WAN outages keep local listeners bound and never crash-loop.
     let mut listeners = Vec::with_capacity(planned.len());
     for listener in planned {
         listeners.push((
@@ -939,23 +1104,29 @@ pub async fn client(options: ClientOptions) -> Result<()> {
     }
     let mut forwards = Vec::with_capacity(options.tcp_forward.len());
     for mapping in options.tcp_forward {
-        let listener = TcpListener::bind(mapping.address).await.with_context(|| {
+        let listener = Arc::new(TcpListener::bind(mapping.address).await.with_context(|| {
             format!("bind fixed TCP for {} at {}", mapping.exit, mapping.address)
-        })?;
+        })?);
         forwards.push((mapping, listener));
     }
+    let (nodes_tx, nodes_rx) = tokio::sync::watch::channel(initial_nodes);
+    let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
     let permits = Arc::new(Semaphore::new(crate::runtime::tunnel::tcp::MAX_TCP_FLOWS));
     let mut tasks = JoinSet::new();
+    let mut forward_tasks = JoinSet::new();
     for (mapping, listener) in forwards {
         tracing::info!(address=%listener.local_addr()?, exit=%mapping.exit, "fixed TCP forward bound");
-        tasks.spawn(fixed_forward(
-            fixed_identity.clone(),
-            fixed_nodes.clone(),
-            mapping,
-            listener,
-            options.paths,
-            fixed_interface.clone(),
-            options.game_mode,
+        forward_tasks.spawn(fixed_forward_supervisor(
+            FixedForwardConfig {
+                identity: fixed_identity.clone(),
+                mapping,
+                listener,
+                paths: options.paths,
+                interface: fixed_interface.clone(),
+                game_mode: options.game_mode,
+            },
+            nodes_rx.clone(),
+            stop_rx.clone(),
         ));
     }
     let ordered_udp_ports: Arc<[u16]> = options.ordered_udp_ports.into();
@@ -970,19 +1141,35 @@ pub async fn client(options: ClientOptions) -> Result<()> {
             ordered_udp_ports.clone(),
         ));
     }
-    let mut discovery = JoinSet::new();
-    // Prepare optional entrances without delaying the direct SOCKS listener or
-    // opening any target TCP connection. Every logical flow can then use them.
-    for exit in selected_exits {
-        let pool = pool.clone();
-        discovery.spawn(async move {
-            if let Err(error) = pool.prepare_stream(&exit).await {
-                tracing::warn!(%exit, %error, "aggregate proxy exit unavailable");
+    let mut discovery: JoinSet<Result<(Vec<mesh::Node>, Vec<String>)>> = JoinSet::new();
+    let mut warmups: JoinSet<()> = JoinSet::new();
+    let spawn_discovery = |discovery: &mut JoinSet<Result<(Vec<mesh::Node>, Vec<String>)>>,
+                           pool: &Arc<Pool>,
+                           entries: &[SocketAddr],
+                           wanted: &BTreeSet<String>| {
+        let identity = pool.identity.clone();
+        let uplink = pool.uplink();
+        let entries = entries.to_vec();
+        let wanted = wanted.clone();
+        discovery
+            .spawn(async move { discover_wanted(&identity, &entries, &wanted, &uplink).await });
+    };
+    let spawn_warmups = |warmups: &mut JoinSet<()>, pool: &Arc<Pool>, exits: &[String]| {
+        for exit in exits {
+            if pool.has_exit(exit) && !pool.stream_running(exit) {
+                let pool = pool.clone();
+                let exit = exit.clone();
+                warmups.spawn(async move {
+                    if let Err(error) = pool.prepare_stream(&exit).await {
+                        tracing::warn!(%exit, %error, "aggregate proxy exit unavailable");
+                    }
+                });
             }
-        });
-    }
-    let mut refresh = tokio::time::interval(Duration::from_secs(15));
-    refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        }
+    };
+    spawn_discovery(&mut discovery, &pool, &options.connect, &wanted);
+    let mut bootstrap_backoff = Duration::from_secs(1);
+    let mut next_discovery = tokio::time::Instant::now() + Duration::from_secs(15);
     // The aggregate runtime publishes path health; only native UDP caches
     // need this periodic retirement check after discovered exit address changes.
     let mut maintenance = tokio::time::interval(Duration::from_secs(1));
@@ -1014,19 +1201,64 @@ pub async fn client(options: ClientOptions) -> Result<()> {
                 }
             },
             result = tasks.join_next() => { result.context("proxy listeners stopped")???; bail!("proxy listener stopped"); }
-            _ = refresh.tick(), if discovery.is_empty() => {
-                let pool = pool.clone(); let entries = options.connect.clone();
-                discovery.spawn(async move {
-                    if let Ok(nodes) = pool.identity.discover_any_on(&entries, &pool.uplink()).await {
-                        pool.refresh(nodes);
-                    }
-                });
+            _ = forward_tasks.join_next(), if !forward_tasks.is_empty() => {}
+            _ = warmups.join_next(), if !warmups.is_empty() => {}
+            _ = tokio::time::sleep_until(next_discovery), if discovery.is_empty() => {
+                spawn_discovery(&mut discovery, &pool, &options.connect, &wanted);
             }
-            _ = discovery.join_next(), if !discovery.is_empty() => {}
+            Some(result) = discovery.join_next(), if !discovery.is_empty() => {
+                match result {
+                    Ok(Ok((nodes, missing_exits))) => {
+                        pool.refresh(nodes);
+                        let merged = pool.nodes.read().expect("proxy nodes").clone();
+                        nodes_tx.send_replace(merged);
+                        spawn_warmups(&mut warmups, &pool, &selected_exits);
+                        let all_present = missing_exits.is_empty()
+                            && wanted.iter().all(|exit| pool.has_exit(exit));
+                        if all_present {
+                            bootstrap_backoff = Duration::from_secs(1);
+                            next_discovery = tokio::time::Instant::now() + Duration::from_secs(15);
+                        } else {
+                            tracing::warn!(
+                                missing = ?missing_exits,
+                                retry_secs = bootstrap_backoff.as_secs(),
+                                "some proxy exits not yet discovered; retrying"
+                            );
+                            next_discovery = tokio::time::Instant::now() + bootstrap_backoff;
+                            bootstrap_backoff = (bootstrap_backoff * 2).min(Duration::from_secs(15));
+                        }
+                    }
+                    Ok(Err(error)) => {
+                        let any_missing = wanted.iter().any(|exit| !pool.has_exit(exit));
+                        if any_missing {
+                            tracing::warn!(
+                                retry_secs = bootstrap_backoff.as_secs(),
+                                %error,
+                                "mesh discovery unavailable; retaining local listeners and retrying"
+                            );
+                            next_discovery = tokio::time::Instant::now() + bootstrap_backoff;
+                            bootstrap_backoff = (bootstrap_backoff * 2).min(Duration::from_secs(15));
+                        } else {
+                            tracing::debug!(%error, "periodic mesh discovery unavailable");
+                            spawn_warmups(&mut warmups, &pool, &selected_exits);
+                            next_discovery = tokio::time::Instant::now() + Duration::from_secs(15);
+                        }
+                    }
+                    Err(_) => {
+                        next_discovery = tokio::time::Instant::now() + bootstrap_backoff;
+                        bootstrap_backoff = (bootstrap_backoff * 2).min(Duration::from_secs(15));
+                    }
+                }
+            }
         }
     }
+    let _ = stop_tx.send(true);
     tasks.abort_all();
     while tasks.join_next().await.is_some() {}
+    forward_tasks.abort_all();
+    while forward_tasks.join_next().await.is_some() {}
+    warmups.abort_all();
+    while warmups.join_next().await.is_some() {}
     discovery.abort_all();
     while discovery.join_next().await.is_some() {}
     pool.shutdown().await;

@@ -316,7 +316,7 @@ impl ClientIdentity {
                             if slot.guard.is_none() && now >= slot.retry_at {
                                 slot.start(&identity, &known, &exit).await;
                             }
-                            let capacity = if slot.guard.is_some() { known.iter().filter(|n| slot.uplink.supports(n.address)).count().clamp(1, MAX_PATHS) } else { 0 };
+                            let capacity = if slot.guard.is_some() { known.iter().filter(|n| n.addresses().any(|a| slot.uplink.supports(a))).count().clamp(1, MAX_PATHS) } else { 0 };
                             capacities.push(capacity);
                             let starting = now.saturating_duration_since(slot.started) < Duration::from_secs(10);
                             preferred.push(usable > 0 || starting);

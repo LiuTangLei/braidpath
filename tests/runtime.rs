@@ -1747,3 +1747,227 @@ fn independent_probe_session(guided: bool) {
         "probe reached the application target"
     );
 }
+
+#[test]
+fn mesh_client_and_proxy_client_survive_offline_boot_and_recover_on_same_listeners() {
+    use std::io::{Read, Write};
+    use std::net::{Shutdown, TcpListener, TcpStream};
+    let _serial = socket_fixture();
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    let server_dir = root.join("server");
+    let server_addr = port();
+
+    // Target TCP echo server used after the mesh comes online.
+    let target = TcpListener::bind("127.0.0.1:0").unwrap();
+    let target_addr = target.local_addr().unwrap();
+    let target_thread = thread::spawn(move || {
+        for _ in 0..3 {
+            let (mut stream, _) = target.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut request = Vec::new();
+            stream.read_to_end(&mut request).unwrap();
+            let mut reply = b"echo:".to_vec();
+            reply.extend_from_slice(&request);
+            stream.write_all(&reply).unwrap();
+            stream.shutdown(Shutdown::Write).unwrap();
+        }
+    });
+
+    // Bootstrap credentials once, then stop the server so clients boot offline.
+    {
+        let mut init = launch(
+            &args(&[
+                "mesh-server",
+                "--dir",
+                server_dir.to_str().unwrap(),
+                "--id",
+                "node-a",
+                "--listen",
+                &server_addr,
+                "--advertise",
+                &server_addr,
+                "--tcp-target",
+                &target_addr.to_string(),
+                "--proxy",
+                "--proxy-allow-private",
+            ]),
+            root,
+            "offline-init-server",
+        );
+        ready(&mut init, "HTTP/3 server ready");
+    }
+    let key = server_dir.join("client-key.json");
+
+    // Start both mesh-client and proxy-client while server_addr is completely unreachable.
+    let mut mesh_client = launch(
+        &args(&[
+            "mesh-client",
+            "--connect",
+            &server_addr,
+            "--connection-key",
+            key.to_str().unwrap(),
+            "--dir",
+            root.join("mesh-client").to_str().unwrap(),
+            "--exit",
+            "node-a",
+            "--listen",
+            "127.0.0.1:0",
+            "--tcp-listen",
+            "127.0.0.1:0",
+        ]),
+        root,
+        "offline-mesh-client",
+    );
+    ready(&mut mesh_client, "TCP listener bound");
+    let mesh_tcp_addr = fs::read_to_string(&mesh_client.log)
+        .unwrap()
+        .lines()
+        .find(|l| l.contains("TCP listener bound"))
+        .and_then(|l| l.split_whitespace().find_map(|p| p.strip_prefix("listen=")))
+        .unwrap()
+        .to_owned();
+
+    let mut proxy_client = launch(
+        &args(&[
+            "proxy-client",
+            "--connect",
+            &server_addr,
+            "--connection-key",
+            key.to_str().unwrap(),
+            "--dir",
+            root.join("proxy-client").to_str().unwrap(),
+            "--exit",
+            "node-a",
+            "--listen",
+            "127.0.0.1:0",
+            "--tcp-forward",
+            "node-a=127.0.0.1:0",
+        ]),
+        root,
+        "offline-proxy-client",
+    );
+    ready(&mut proxy_client, "SOCKS5 proxy ready");
+    ready(&mut proxy_client, "fixed TCP forward bound");
+    let proxy_log = fs::read_to_string(&proxy_client.log).unwrap();
+    let socks_addr = proxy_log
+        .lines()
+        .find(|l| l.contains("SOCKS5 proxy ready"))
+        .and_then(|l| {
+            l.split_whitespace()
+                .find_map(|p| p.strip_prefix("address="))
+        })
+        .unwrap()
+        .to_owned();
+    let forward_addr = proxy_log
+        .lines()
+        .find(|l| l.contains("fixed TCP forward bound"))
+        .and_then(|l| {
+            l.split_whitespace()
+                .find_map(|p| p.strip_prefix("address="))
+        })
+        .unwrap()
+        .to_owned();
+
+    // Both clients must remain alive during the outage.
+    thread::sleep(Duration::from_millis(1500));
+    assert!(
+        mesh_client.child.try_wait().unwrap().is_none(),
+        "mesh-client exited during offline boot: {}",
+        fs::read_to_string(&mesh_client.log).unwrap()
+    );
+    assert!(
+        proxy_client.child.try_wait().unwrap().is_none(),
+        "proxy-client exited during offline boot: {}",
+        fs::read_to_string(&proxy_client.log).unwrap()
+    );
+
+    // Bring the mesh server back online on the exact same address.
+    let mut server = launch(
+        &args(&[
+            "mesh-server",
+            "--dir",
+            server_dir.to_str().unwrap(),
+            "--id",
+            "node-a",
+            "--listen",
+            &server_addr,
+            "--advertise",
+            &server_addr,
+            "--tcp-target",
+            &target_addr.to_string(),
+            "--proxy",
+            "--proxy-allow-private",
+        ]),
+        root,
+        "online-mesh-server",
+    );
+    ready(&mut server, "HTTP/3 server ready");
+    ready(&mut mesh_client, "UDP client ready");
+
+    // 1. mesh-client original pre-bound TCP listener works automatically.
+    let mut s = TcpStream::connect(&mesh_tcp_addr).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    s.write_all(b"mesh-offline-ok").unwrap();
+    s.shutdown(Shutdown::Write).unwrap();
+    let mut out = Vec::new();
+    s.read_to_end(&mut out).unwrap();
+    assert_eq!(out, b"echo:mesh-offline-ok");
+
+    // 2. proxy-client original SOCKS5 listener works automatically (allow brief retry for discovery backoff).
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let mut sock = TcpStream::connect(&socks_addr).unwrap();
+        sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        sock.write_all(&[5, 1, 0]).unwrap();
+        let mut method = [0; 2];
+        sock.read_exact(&mut method).unwrap();
+        assert_eq!(method, [5, 0]);
+        let mut req = vec![5, 1, 0, 1];
+        req.extend_from_slice(&match target_addr.ip() {
+            std::net::IpAddr::V4(ip) => ip.octets(),
+            _ => unreachable!(),
+        });
+        req.extend_from_slice(&target_addr.port().to_be_bytes());
+        sock.write_all(&req).unwrap();
+        let mut rep = [0; 10];
+        if sock.read_exact(&mut rep).is_ok() && rep[1] == 0 {
+            sock.write_all(b"socks-offline-ok").unwrap();
+            sock.shutdown(Shutdown::Write).unwrap();
+            let mut reply = Vec::new();
+            if sock.read_to_end(&mut reply).is_ok() && reply == b"echo:socks-offline-ok" {
+                break;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "proxy-client SOCKS5 did not recover after server came online: {}",
+            fs::read_to_string(&proxy_client.log).unwrap()
+        );
+        thread::sleep(Duration::from_millis(200));
+    }
+
+    // 3. proxy-client original fixed --tcp-forward listener works automatically.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        if let Ok(mut fwd) = TcpStream::connect(&forward_addr) {
+            fwd.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            if fwd.write_all(b"fwd-offline-ok").is_ok() && fwd.shutdown(Shutdown::Write).is_ok() {
+                let mut reply = Vec::new();
+                if fwd.read_to_end(&mut reply).is_ok() && reply == b"echo:fwd-offline-ok" {
+                    break;
+                }
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "proxy-client fixed TCP forward did not recover: {}",
+            fs::read_to_string(&proxy_client.log).unwrap()
+        );
+        thread::sleep(Duration::from_millis(200));
+    }
+
+    target_thread.join().unwrap();
+}

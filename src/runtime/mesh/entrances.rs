@@ -7,23 +7,8 @@ const REBIND_RETRY_AFTER: Duration = Duration::from_secs(2);
 const BOUND_FAILURE_REBIND_AFTER: Duration = Duration::from_secs(15);
 const UNBOUND_FAILURE_REBIND_AFTER: Duration = Duration::from_secs(30);
 
-#[cfg(target_os = "linux")]
 fn interface_index(name: &str) -> Option<u32> {
-    if name.is_empty() || name == "." || name == ".." || name.contains('/') || name.contains('\0') {
-        return None;
-    }
-    let path = Path::new("/sys/class/net").join(name).join("ifindex");
-    std::fs::read_to_string(path)
-        .ok()?
-        .trim()
-        .parse::<u32>()
-        .ok()
-        .filter(|&index| index != 0)
-}
-
-#[cfg(not(target_os = "linux"))]
-fn interface_index(_name: &str) -> Option<u32> {
-    None
+    transport::interface_index(name)
 }
 
 #[cfg(test)]
@@ -290,10 +275,11 @@ impl Entrances {
         let direct = control
             .best_address(&selected, &identity.auth, None)
             .await
+            .or_else(|| control.ordered_addresses(&selected).into_iter().next())
             .or_else(|| {
                 selected
                     .addresses()
-                    .find(|address| control.supports(*address))
+                    .find(|address| control.has_endpoint(*address))
             });
         let (health, observed) = watch::channel(PathHealth::default());
         let directory = Directory {
@@ -466,7 +452,16 @@ impl Directory {
     }
 
     fn addresses(&self) -> Vec<SocketAddr> {
-        std::iter::once(self.direct.unwrap_or(self.selected.address))
+        let direct = self
+            .direct
+            .or_else(|| {
+                self.control
+                    .ordered_addresses(&self.selected)
+                    .into_iter()
+                    .next()
+            })
+            .unwrap_or(self.selected.address);
+        std::iter::once(direct)
             .chain(self.leases.values().map(|lease| lease.reply.address))
             .collect()
     }
@@ -782,10 +777,24 @@ impl Directory {
                 exit: allocation.exit.id,
                 lease: None,
                 request: Some(allocation.request),
-            }).expect("release request");
-            if let Err(error) = control.request::<ReleaseReply>(
-                allocation.node.address, &auth, "/mesh/release", Some(body),
-            ).await {
+            })
+            .expect("release request");
+            let addresses = control.ordered_addresses(&allocation.node);
+            let mut last_error = None;
+            for address in addresses {
+                match control
+                    .request::<ReleaseReply>(address, &auth, "/mesh/release", Some(body.clone()))
+                    .await
+                {
+                    Ok(_) => return,
+                    Err(error) if error.is::<super::control::Rejected>() => {
+                        tracing::debug!(node=%allocation.node.id, %address, %error, "lease release rejected; retaining idle expiry");
+                        return;
+                    }
+                    Err(error) => last_error = Some(error),
+                }
+            }
+            if let Some(error) = last_error {
                 tracing::debug!(node=%allocation.node.id, %error, "lease release unavailable; retaining idle expiry");
             }
         });
@@ -872,7 +881,7 @@ impl Directory {
             };
             let mut responded = false;
             let nodes = 'discovered: {
-                for address in preferred.addresses().filter(|a| control.supports(*a)) {
+                for address in control.ordered_addresses(&preferred) {
                     match query(address).await {
                         QueryOutcome::Ready(nodes) => break 'discovered nodes,
                         QueryOutcome::Responded => responded = true,
@@ -882,8 +891,7 @@ impl Directory {
                 let mut pending = JoinSet::new();
                 for address in candidates
                     .iter()
-                    .flat_map(Node::addresses)
-                    .filter(|a| control.supports(*a))
+                    .flat_map(|node| control.ordered_addresses(node))
                 {
                     pending.spawn(query(address));
                 }
@@ -988,7 +996,7 @@ impl Directory {
             .nodes
             .iter()
             .filter(|n| n.id != self.selected.id && !self.leases.contains_key(&n.id))
-            .filter(|n| self.control.supports(n.address))
+            .filter(|n| !self.control.ordered_addresses(n).is_empty())
             .filter(|n| self.explorer.available(&n.id, Instant::now()))
             .cloned()
             .collect::<Vec<_>>();
@@ -1052,17 +1060,39 @@ async fn allocate_request(
     auth: &str,
     allocation: &Allocation,
 ) -> Result<RelayReply> {
-    control.capabilities(allocation.node.address, auth).await?;
+    let addresses = control.ordered_addresses(&allocation.node);
+    ensure!(
+        !addresses.is_empty(),
+        "relay has no reachable control address on configured uplink"
+    );
     let body = serde_json::to_vec(&RelayRequest {
         exit: allocation.exit.id.clone(),
         lease: None,
         request: Some(allocation.request.clone()),
     })?;
-    let reply = control
-        .request(allocation.node.address, auth, "/mesh/relay", Some(body))
-        .await?;
-    validate_reply(&allocation.node, &reply)?;
-    Ok(reply)
+    let mut last_error = anyhow::anyhow!("relay allocation unavailable");
+    for address in addresses {
+        match control.capabilities(address, auth).await {
+            Ok(_) => {}
+            Err(error) if error.is::<super::control::Rejected>() => return Err(error),
+            Err(error) => {
+                last_error = error;
+                continue;
+            }
+        }
+        match control
+            .request(address, auth, "/mesh/relay", Some(body.clone()))
+            .await
+        {
+            Ok(reply) => {
+                validate_reply(&allocation.node, &reply)?;
+                return Ok(reply);
+            }
+            Err(error) if error.is::<super::control::Rejected>() => return Err(error),
+            Err(error) => last_error = error,
+        }
+    }
+    Err(last_error)
 }
 /// `Ok(None)`: the server rejected the lease and no replacement was allocated.
 async fn renew(
@@ -1077,8 +1107,14 @@ async fn renew(
         lease: Some(old.lease.clone()),
         request: None,
     })?;
+    // Renew over the same address family that created the lease so server-side
+    // source IP ownership matches.
+    let renew_address = node
+        .addresses()
+        .find(|address| address.is_ipv4() == old.address.is_ipv4() && control.supports(*address))
+        .unwrap_or(node.address);
     let result = control
-        .request::<RelayReply>(node.address, auth, "/mesh/relay", Some(body))
+        .request::<RelayReply>(renew_address, auth, "/mesh/relay", Some(body))
         .await;
     match result {
         Ok(reply) => {

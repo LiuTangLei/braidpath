@@ -175,6 +175,10 @@ impl Cache {
 }
 
 impl ClientIdentity {
+    pub(crate) fn cached_nodes(&self) -> Vec<Node> {
+        self.cache.known()
+    }
+
     pub async fn discover(&self, address: SocketAddr) -> Result<Vec<Node>> {
         self.query_entries(&[address], None).await
     }

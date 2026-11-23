@@ -727,6 +727,10 @@ pub async fn run() -> Result<()> {
             policy,
             stats,
         } => {
+            ensure!(
+                !connect.is_empty() && connect.len() <= 32,
+                "provide 1..32 discovery entries"
+            );
             let rate = client_rate(&policy)?;
             let group_rates = parse_group_rates(&policy.group_rates, rate)?;
             let mut session_policy = policy.build(rate, group_rates);
@@ -740,6 +744,7 @@ pub async fn run() -> Result<()> {
                     || interfaces.len() == source_ips.len(),
                 "interface and source-ip counts must match"
             );
+            ensure!(count <= super::MAX_PATHS, "uplink count must be 1..8");
             let uplinks: Vec<_> = (0..count)
                 .map(|i| mesh::Uplink {
                     interface: interfaces.get(i).cloned(),
@@ -747,11 +752,59 @@ pub async fn run() -> Result<()> {
                     group: i as u8,
                 })
                 .collect();
-            let nodes = identity.discover_on(&connect, &exit, &uplinks).await?;
             let reporter = stats::Reporter::new("mesh-client", stats)?;
-            let leases = identity
-                .networks_with_metrics(nodes, &exit, uplinks, reporter.metrics.clone())
-                .await?;
+            // Bind local UDP/TCP listeners before bootstrap discovery so cold
+            // boots and WAN outages keep local ports bound and never crash-loop.
+            let bound_udp = std::sync::Arc::new(tokio::net::UdpSocket::bind(listen).await?);
+            let bound_tcp = if let Some(address) = tcp_listen {
+                let listener = std::sync::Arc::new(tokio::net::TcpListener::bind(address).await?);
+                tracing::info!(listen=%listener.local_addr()?, "TCP listener bound");
+                if !address.ip().is_loopback() {
+                    tracing::warn!(
+                        listen = %address,
+                        "TCP listener is not on loopback; it has no authentication"
+                    );
+                }
+                Some(listener)
+            } else {
+                None
+            };
+            let mut shutdown = super::shutdown::Shutdown::new();
+            let mut backoff = std::time::Duration::from_secs(1);
+            let leases = loop {
+                let bootstrap = async {
+                    let nodes = identity.discover_on(&connect, &exit, &uplinks).await?;
+                    identity
+                        .networks_with_metrics(
+                            nodes,
+                            &exit,
+                            uplinks.clone(),
+                            reporter.metrics.clone(),
+                        )
+                        .await
+                };
+                tokio::select! {
+                    biased;
+                    _ = shutdown.wait() => return reporter.finish(Ok(())).await,
+                    result = bootstrap => match result {
+                        Ok(leases) => break leases,
+                        Err(error) => {
+                            tracing::warn!(
+                                %exit,
+                                retry_secs = backoff.as_secs(),
+                                %error,
+                                "mesh bootstrap unavailable; retaining local listeners and retrying"
+                            );
+                        }
+                    }
+                }
+                tokio::select! {
+                    biased;
+                    _ = shutdown.wait() => return reporter.finish(Ok(())).await,
+                    _ = tokio::time::sleep(backoff) => {}
+                }
+                backoff = (backoff * 2).min(std::time::Duration::from_secs(15));
+            };
             let entrances = leases
                 .routes()
                 .borrow()
@@ -759,11 +812,11 @@ pub async fn run() -> Result<()> {
                 .map(|r| r.address)
                 .collect::<Vec<_>>();
             tracing::info!(%exit, paths=entrances.len(), "selected mesh exit and cooperating entrances");
-            let result = tunnel::client_with_routes(
+            let result = tunnel::client_with_routes_and_sockets(
                 tunnel::ClientOptions {
                     stream_connector: None,
                     listen,
-                    tcp_listen,
+                    tcp_listen: None,
                     proxy_listen: None,
                     entrances,
                     interfaces: vec![],
@@ -782,6 +835,8 @@ pub async fn run() -> Result<()> {
                 leases.routes(),
                 leases.health(),
                 exit,
+                bound_udp,
+                bound_tcp,
             )
             .await;
             leases.shutdown().await;

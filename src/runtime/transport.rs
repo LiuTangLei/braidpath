@@ -529,6 +529,165 @@ fn client_with_alpn(
     )
 }
 
+#[cfg(target_os = "linux")]
+pub(crate) fn interface_index(name: &str) -> Option<u32> {
+    if name.is_empty() || name == "." || name == ".." || name.contains('/') || name.contains('\0') {
+        return None;
+    }
+    let path = Path::new("/sys/class/net").join(name).join("ifindex");
+    fs::read_to_string(path)
+        .ok()?
+        .trim()
+        .parse::<u32>()
+        .ok()
+        .filter(|&index| index != 0)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn interface_index(_name: &str) -> Option<u32> {
+    None
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum RouteQuality {
+    Preferred,
+    Degraded,
+    Unusable,
+}
+
+fn bind_udp_device(socket: &Socket, remote: SocketAddr, name: &str, log_macos: bool) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        let _ = (remote, log_macos);
+        socket
+            .bind_device(Some(name.as_bytes()))
+            .with_context(|| format!("bind interface {name}"))?;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // Darwin binds this socket without changing system routes or proxies.
+        let index: std::num::NonZeroU32 = name
+            .strip_prefix("ifindex:")
+            .context("macOS interface must be ifindex:<nonzero index>")?
+            .parse()
+            .context("invalid macOS interface index")?;
+        if remote.is_ipv4() {
+            socket
+                .bind_device_by_index_v4(Some(index))
+                .with_context(|| format!("bind IPv4 endpoint to interface {name}"))?;
+            ensure!(
+                socket.device_index_v4()? == Some(index),
+                "IPv4 interface binding not retained"
+            );
+        } else {
+            socket
+                .bind_device_by_index_v6(Some(index))
+                .with_context(|| format!("bind IPv6 endpoint to interface {name}"))?;
+            ensure!(
+                socket.device_index_v6()? == Some(index),
+                "IPv6 interface binding not retained"
+            );
+        }
+        if log_macos {
+            tracing::info!(
+                interface = name,
+                interface_index = index.get(),
+                "endpoint interface binding verified"
+            );
+        }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = (socket, remote, log_macos);
+        anyhow::bail!(
+            "explicit interface binding is currently supported only on Linux and macOS: {name}"
+        );
+    }
+    Ok(())
+}
+
+pub(crate) fn classify_source_for_remote(
+    local: std::net::IpAddr,
+    remote: std::net::IpAddr,
+    interface_bound: bool,
+) -> RouteQuality {
+    if !super::proxy::permitted(remote, false) {
+        return RouteQuality::Preferred;
+    }
+    match (local, remote) {
+        (std::net::IpAddr::V6(src), std::net::IpAddr::V6(_)) => {
+            if src.is_unspecified() || src.is_loopback() || src.is_unicast_link_local() {
+                RouteQuality::Unusable
+            } else if src.is_unique_local() {
+                if interface_bound {
+                    // Explicit WAN uplink fell back to a LAN/VPN ULA address
+                    // because the bound interface has no global IPv6 prefix.
+                    RouteQuality::Unusable
+                } else {
+                    // Unbound hosts behind a transparent proxy may still reach
+                    // public IPv6 via ULA, but prefer global IPv4 when available.
+                    RouteQuality::Degraded
+                }
+            } else {
+                RouteQuality::Preferred
+            }
+        }
+        (std::net::IpAddr::V4(src), std::net::IpAddr::V4(_)) => {
+            if src.is_unspecified() || src.is_loopback() || src.is_link_local() {
+                RouteQuality::Unusable
+            } else {
+                RouteQuality::Preferred
+            }
+        }
+        _ => RouteQuality::Unusable,
+    }
+}
+
+/// Pure kernel FIB + source-address-selection check (sends zero packets).
+pub(crate) fn route_quality(
+    remote: SocketAddr,
+    interface: Option<&str>,
+    bind: Option<SocketAddr>,
+) -> RouteQuality {
+    if let Some(bind) = bind
+        && bind.is_ipv4() != remote.is_ipv4()
+    {
+        return RouteQuality::Unusable;
+    }
+    let Ok(socket) = Socket::new(
+        if remote.is_ipv4() {
+            Domain::IPV4
+        } else {
+            Domain::IPV6
+        },
+        Type::DGRAM,
+        Some(Protocol::UDP),
+    ) else {
+        return RouteQuality::Unusable;
+    };
+    if let Some(name) = interface
+        && bind_udp_device(&socket, remote, name, false).is_err()
+    {
+        return RouteQuality::Unusable;
+    }
+    if let Some(bind) = bind
+        && socket.bind(&bind.into()).is_err()
+    {
+        return RouteQuality::Unusable;
+    }
+    if socket.connect(&remote.into()).is_err() {
+        return RouteQuality::Unusable;
+    }
+    let Some(local) = socket
+        .local_addr()
+        .ok()
+        .and_then(|address| address.as_socket())
+    else {
+        return RouteQuality::Unusable;
+    };
+    classify_source_for_remote(local.ip(), remote.ip(), interface.is_some())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn client_with_alpn_and_ack(
     remote: SocketAddr,
@@ -579,42 +738,7 @@ fn client_with_alpn_and_ack(
         Some(Protocol::UDP),
     )?;
     if let Some(name) = interface {
-        #[cfg(target_os = "linux")]
-        s.bind_device(Some(name.as_bytes()))
-            .with_context(|| format!("bind interface {name}"))?;
-        #[cfg(target_os = "macos")]
-        {
-            // Darwin binds this socket without changing system routes or proxies.
-            let index: std::num::NonZeroU32 = name
-                .strip_prefix("ifindex:")
-                .context("macOS interface must be ifindex:<nonzero index>")?
-                .parse()
-                .context("invalid macOS interface index")?;
-            if remote.is_ipv4() {
-                s.bind_device_by_index_v4(Some(index))
-                    .with_context(|| format!("bind IPv4 endpoint to interface {name}"))?;
-                ensure!(
-                    s.device_index_v4()? == Some(index),
-                    "IPv4 interface binding not retained"
-                );
-            } else {
-                s.bind_device_by_index_v6(Some(index))
-                    .with_context(|| format!("bind IPv6 endpoint to interface {name}"))?;
-                ensure!(
-                    s.device_index_v6()? == Some(index),
-                    "IPv6 interface binding not retained"
-                );
-            }
-            tracing::info!(
-                interface = name,
-                interface_index = index.get(),
-                "endpoint interface binding verified"
-            );
-        }
-        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-        anyhow::bail!(
-            "explicit interface binding is currently supported only on Linux and macOS: {name}"
-        );
+        bind_udp_device(&s, remote, name, true)?;
     }
     let bind: SocketAddr = bind.unwrap_or(
         if remote.is_ipv4() {
@@ -975,5 +1099,58 @@ mod tests {
         );
         client.close(0u32.into(), b"test complete");
         server.close(0u32.into(), b"test complete");
+    }
+
+    #[test]
+    fn classify_source_for_remote_handles_bound_ula_unbound_ula_link_local_and_nat_v4() {
+        let public_v6: std::net::IpAddr = "2a12:a304:4:3c7::a".parse().unwrap();
+        let public_v4: std::net::IpAddr = "45.129.9.12".parse().unwrap();
+        let ula: std::net::IpAddr = "fd50:12:50::1".parse().unwrap();
+        let link_local_v6: std::net::IpAddr = "fe80::1".parse().unwrap();
+        let global_v6: std::net::IpAddr = "2409:8a62:2842:57b0::1".parse().unwrap();
+        let lan_v4: std::net::IpAddr = "192.168.50.60".parse().unwrap();
+        let cgnat_v4: std::net::IpAddr = "100.64.0.8".parse().unwrap();
+        let link_local_v4: std::net::IpAddr = "169.254.1.1".parse().unwrap();
+        let loopback_v6: std::net::IpAddr = "::1".parse().unwrap();
+
+        // Explicit WAN interface falling back to LAN/VPN ULA cannot reach public IPv6.
+        assert_eq!(
+            classify_source_for_remote(ula, public_v6, true),
+            RouteQuality::Unusable
+        );
+        // Unbound host (e.g., LAN host behind transparent proxy) may still use ULA,
+        // deprioritized behind Preferred routes.
+        assert_eq!(
+            classify_source_for_remote(ula, public_v6, false),
+            RouteQuality::Degraded
+        );
+        // Global IPv6 (including DHCPv6-PD) is Preferred even on a bound interface.
+        assert_eq!(
+            classify_source_for_remote(global_v6, public_v6, true),
+            RouteQuality::Preferred
+        );
+        // Link-local IPv6 or IPv4 can never reach a public destination.
+        assert_eq!(
+            classify_source_for_remote(link_local_v6, public_v6, false),
+            RouteQuality::Unusable
+        );
+        assert_eq!(
+            classify_source_for_remote(link_local_v4, public_v4, false),
+            RouteQuality::Unusable
+        );
+        // RFC1918 and CGNAT IPv4 work behind standard NAT.
+        assert_eq!(
+            classify_source_for_remote(lan_v4, public_v4, false),
+            RouteQuality::Preferred
+        );
+        assert_eq!(
+            classify_source_for_remote(cgnat_v4, public_v4, true),
+            RouteQuality::Preferred
+        );
+        // Loopback/private destinations stay Preferred for local tests and LAN peers.
+        assert_eq!(
+            classify_source_for_remote(loopback_v6, loopback_v6, true),
+            RouteQuality::Preferred
+        );
     }
 }

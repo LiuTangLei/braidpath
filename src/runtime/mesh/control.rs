@@ -86,11 +86,67 @@ impl Connection {
     }
 }
 
+const FAMILY_COOLDOWN: Duration = Duration::from_secs(30);
+const DUAL_STACK_GRACE_MAX: Duration = Duration::from_millis(150);
+
 pub(super) struct Control {
     v4: Option<quinn::Endpoint>,
     v6: Option<quinn::Endpoint>,
+    uplink: super::Uplink,
+    family_cooldown: std::sync::Mutex<[Option<Instant>; 2]>,
     peers: std::sync::Mutex<BTreeMap<SocketAddr, Slot>>,
     capacity: usize,
+}
+
+fn family_index(address: SocketAddr) -> usize {
+    usize::from(address.is_ipv6())
+}
+
+fn dual_stack_grace(winner_rtt: Duration) -> Duration {
+    winner_rtt
+        .saturating_mul(2)
+        .saturating_add(Duration::from_millis(25))
+        .min(DUAL_STACK_GRACE_MAX)
+}
+
+async fn race_probes<F1, F2>(first: F1, second: F2) -> [Option<(SocketAddr, Duration)>; 2]
+where
+    F1: std::future::Future<Output = Option<(SocketAddr, Duration)>>,
+    F2: std::future::Future<Output = Option<(SocketAddr, Duration)>>,
+{
+    tokio::pin!(first);
+    tokio::pin!(second);
+    let mut first_done = false;
+    let mut second_done = false;
+    let mut samples = [None, None];
+    tokio::select! {
+        res = &mut first => {
+            first_done = true;
+            samples[0] = res;
+        }
+        res = &mut second => {
+            second_done = true;
+            samples[1] = res;
+        }
+    }
+    if first_done {
+        if let Some((_, rtt)) = samples[0] {
+            if let Ok(res) = tokio::time::timeout(dual_stack_grace(rtt), &mut second).await {
+                samples[1] = res;
+            }
+        } else {
+            samples[1] = second.await;
+        }
+    } else if second_done {
+        if let Some((_, rtt)) = samples[1] {
+            if let Ok(res) = tokio::time::timeout(dual_stack_grace(rtt), &mut first).await {
+                samples[0] = res;
+            }
+        } else {
+            samples[0] = first.await;
+        }
+    }
+    samples
 }
 
 fn select_address(
@@ -147,6 +203,8 @@ impl Control {
         Ok(Self {
             v4,
             v6,
+            uplink: uplink.clone(),
+            family_cooldown: std::sync::Mutex::new([None, None]),
             peers: std::sync::Mutex::new(BTreeMap::new()),
             capacity: MAX_NODES * 2,
         })
@@ -255,12 +313,69 @@ impl Control {
             .map(|(value, _)| value)
     }
 
-    pub(super) fn supports(&self, address: SocketAddr) -> bool {
+    pub(super) fn has_endpoint(&self, address: SocketAddr) -> bool {
         if address.is_ipv4() {
             self.v4.is_some()
         } else {
             self.v6.is_some()
         }
+    }
+
+    pub(super) fn route_quality(&self, address: SocketAddr) -> transport::RouteQuality {
+        if !self.has_endpoint(address) {
+            return transport::RouteQuality::Unusable;
+        }
+        transport::route_quality(
+            address,
+            self.uplink.interface.as_deref(),
+            self.uplink.bind.map(|ip| SocketAddr::new(ip, 0)),
+        )
+    }
+
+    pub(super) fn supports(&self, address: SocketAddr) -> bool {
+        self.route_quality(address) != transport::RouteQuality::Unusable
+    }
+
+    fn family_cooled_down(&self, address: SocketAddr) -> bool {
+        let now = Instant::now();
+        let mut cooldown = self.family_cooldown.lock().expect("family cooldown");
+        let slot = &mut cooldown[family_index(address)];
+        if slot.is_some_and(|until| now < until) {
+            true
+        } else {
+            *slot = None;
+            false
+        }
+    }
+
+    fn note_family_success(&self, address: SocketAddr) {
+        self.family_cooldown.lock().expect("family cooldown")[family_index(address)] = None;
+    }
+
+    fn cool_down_family(&self, address: SocketAddr) {
+        self.family_cooldown.lock().expect("family cooldown")[family_index(address)] =
+            Some(Instant::now() + FAMILY_COOLDOWN);
+    }
+
+    /// Usable addresses of `node`, prioritizing non-cooled-down families and
+    /// `Preferred` routes over `Degraded` (e.g., unbound ULA-to-public) routes.
+    pub(super) fn ordered_addresses(&self, node: &super::Node) -> Vec<SocketAddr> {
+        let mut candidates: Vec<_> = node
+            .addresses()
+            .filter_map(|address| {
+                let quality = self.route_quality(address);
+                (quality != transport::RouteQuality::Unusable).then_some((
+                    self.family_cooled_down(address),
+                    quality,
+                    address,
+                ))
+            })
+            .collect();
+        candidates.sort_by_key(|&(cooled, quality, _)| (cooled, quality));
+        candidates
+            .into_iter()
+            .map(|(_, _, address)| address)
+            .collect()
     }
 
     pub(super) async fn best_address(
@@ -282,16 +397,64 @@ impl Control {
             .ok()?;
             (status.node == *node).then_some((address, rtt))
         };
-        let Some(alternate) = node.alternate else {
-            return self.supports(node.address).then_some(node.address);
+        let usable = self.ordered_addresses(node);
+        let samples = match usable.as_slice() {
+            [] => return None,
+            &[only] => {
+                if node.alternate.is_none() {
+                    return Some(only);
+                }
+                [probe(only).await, None]
+            }
+            &[first, second] => {
+                // If one address family recently failed while the other succeeded,
+                // probe the healthy family first without paying even the grace wait.
+                if !self.family_cooled_down(first) && self.family_cooled_down(second) {
+                    if let Some(hit) = probe(first).await {
+                        self.note_family_success(first);
+                        [Some(hit), None]
+                    } else {
+                        let fallback = probe(second).await;
+                        if fallback.is_some() {
+                            self.note_family_success(second);
+                        }
+                        [None, fallback]
+                    }
+                } else {
+                    let samples = race_probes(probe(first), probe(second)).await;
+                    match samples {
+                        [Some(_), None] => {
+                            self.note_family_success(first);
+                            self.cool_down_family(second);
+                        }
+                        [None, Some(_)] => {
+                            self.note_family_success(second);
+                            self.cool_down_family(first);
+                        }
+                        [Some(_), Some(_)] => {
+                            self.note_family_success(first);
+                            self.note_family_success(second);
+                        }
+                        [None, None] => {}
+                    }
+                    samples
+                }
+            }
+            _ => unreachable!("Node has at most two addresses"),
         };
-        let (primary, secondary) = tokio::join!(probe(node.address), probe(alternate));
-        let selected = select_address([primary, secondary], current);
+        let selected = select_address(samples, current);
         if selected.is_some() && selected != current {
+            let rtt_for = |target| {
+                samples
+                    .into_iter()
+                    .flatten()
+                    .find(|(addr, _)| *addr == target)
+                    .map(|(_, rtt)| rtt.as_secs_f64() * 1000.0)
+            };
             tracing::info!(target: "braidpath::path_lifecycle", event="address_selected", node=%node.id,
                 old=?current, new=?selected,
-                primary_control_rtt_ms=?primary.map(|(_, rtt)| rtt.as_secs_f64()*1000.0),
-                alternate_control_rtt_ms=?secondary.map(|(_, rtt)| rtt.as_secs_f64()*1000.0));
+                primary_control_rtt_ms=?rtt_for(node.address),
+                alternate_control_rtt_ms=?node.alternate.and_then(rtt_for));
         }
         selected
     }
@@ -313,6 +476,12 @@ impl Control {
         // the server's bounded control processing. Other peers remain parallel.
         let mut cached = timeout_at(deadline, slot.lock()).await?;
         let mut connection = cached.take().filter(|conn| !conn.closed());
+        if connection.is_none() {
+            ensure!(
+                self.supports(address),
+                "control destination unreachable on configured uplink"
+            );
+        }
         let result = timeout_at(deadline, async {
             if connection.is_none() {
                 connection = Some(self.connect(address).await?);
@@ -327,6 +496,7 @@ impl Control {
         // Transport/protocol errors, timeout and cancellation discard it;
         // no request is replayed, including allocations with an unknown result.
         if result.is_ok() || result.as_ref().is_err_and(|error| error.is::<Rejected>()) {
+            self.note_family_success(address);
             if let Some(connection) = connection.as_mut() {
                 connection.used = Instant::now();
             }
@@ -632,5 +802,35 @@ mod tests {
                 .is_err()
         );
         assert!(control.slot(SocketAddr::from(([127, 0, 0, 1], 1))).is_ok());
+    }
+
+    #[tokio::test]
+    async fn race_probes_returns_fast_winner_without_waiting_for_blackholed_alternate() {
+        let v4: SocketAddr = "127.0.0.1:4433".parse().unwrap();
+        let v6: SocketAddr = "[::1]:4433".parse().unwrap();
+        let started = Instant::now();
+        let samples = race_probes(async { Some((v4, Duration::from_millis(15))) }, async {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            Some((v6, Duration::from_millis(5000)))
+        })
+        .await;
+        assert!(
+            started.elapsed() < Duration::from_millis(300),
+            "blackholed alternate stalled fast winner for {:?}",
+            started.elapsed()
+        );
+        assert_eq!(select_address(samples, None), Some(v4));
+    }
+
+    #[tokio::test]
+    async fn race_probes_compares_healthy_dual_stack_within_grace_window() {
+        let v4: SocketAddr = "127.0.0.1:4433".parse().unwrap();
+        let v6: SocketAddr = "[::1]:4433".parse().unwrap();
+        let samples = race_probes(async { Some((v4, Duration::from_millis(40))) }, async {
+            tokio::time::sleep(Duration::from_millis(15)).await;
+            Some((v6, Duration::from_millis(12)))
+        })
+        .await;
+        assert_eq!(select_address(samples, None), Some(v6));
     }
 }

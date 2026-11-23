@@ -4953,11 +4953,63 @@ async fn server_connection(
     result
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct InterfaceTracker {
+    bound_ifindex: Option<u32>,
+    missing: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InterfaceEvent {
+    Unchanged,
+    Appeared(u32),
+    Replaced { old: Option<u32>, new: u32 },
+}
+
+impl InterfaceTracker {
+    fn note_bound(&mut self, ifindex: Option<u32>) {
+        self.bound_ifindex = ifindex;
+        self.missing = false;
+    }
+
+    fn poll(&mut self, current: Option<u32>, has_live_or_inflight: bool) -> InterfaceEvent {
+        match current {
+            None => {
+                if self.bound_ifindex.is_some() {
+                    self.missing = true;
+                }
+                InterfaceEvent::Unchanged
+            }
+            Some(new) => {
+                if self.missing
+                    || (has_live_or_inflight && self.bound_ifindex.is_some_and(|old| old != new))
+                {
+                    let old = self.bound_ifindex;
+                    self.bound_ifindex = Some(new);
+                    self.missing = false;
+                    if has_live_or_inflight {
+                        InterfaceEvent::Replaced { old, new }
+                    } else {
+                        InterfaceEvent::Appeared(new)
+                    }
+                } else if self.bound_ifindex != Some(new) {
+                    self.bound_ifindex = Some(new);
+                    self.missing = false;
+                    InterfaceEvent::Appeared(new)
+                } else {
+                    InterfaceEvent::Unchanged
+                }
+            }
+        }
+    }
+}
+
 struct Rejoined {
     endpoint: quinn::Endpoint,
     conn: quinn::Connection,
     stream: u64,
     stream_payload: usize,
+    bound_ifindex: Option<u32>,
     driver: H3Client,
     request: H3Request,
     send: H3Send,
@@ -5163,6 +5215,7 @@ pub(crate) async fn client_with_health(
         health,
         None,
         None,
+        None,
     )
     .await
 }
@@ -5190,10 +5243,12 @@ pub(crate) async fn client_with_mesh_exit(
         health,
         Some(exit),
         None,
+        None,
     )
     .await
 }
 
+#[cfg(test)]
 pub(crate) async fn client_with_routes(
     options: ClientOptions,
     routes: watch::Receiver<Vec<mesh::Route>>,
@@ -5206,6 +5261,26 @@ pub(crate) async fn client_with_routes(
         Some(health),
         Some(exit),
         None,
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn client_with_routes_and_sockets(
+    options: ClientOptions,
+    routes: watch::Receiver<Vec<mesh::Route>>,
+    health: watch::Sender<mesh::PathHealth>,
+    exit: String,
+    socket: Arc<UdpSocket>,
+    fixed_listener: Option<Arc<TcpListener>>,
+) -> Result<()> {
+    client_inner(
+        options,
+        Some(EntranceUpdates::Routes(routes)),
+        Some(health),
+        Some(exit),
+        Some(socket),
+        fixed_listener,
     )
     .await
 }
@@ -5215,7 +5290,7 @@ pub(crate) async fn client_with_fixed_listener(
     entrances: watch::Receiver<Vec<SocketAddr>>,
     health: watch::Sender<mesh::PathHealth>,
     exit: String,
-    listener: TcpListener,
+    listener: Arc<TcpListener>,
 ) -> Result<()> {
     ensure!(
         options.interfaces.len() <= 1,
@@ -5230,6 +5305,7 @@ pub(crate) async fn client_with_fixed_listener(
         Some(EntranceUpdates::Addresses(entrances, uplink)),
         Some(health),
         Some(exit),
+        None,
         Some(listener),
     )
     .await
@@ -5240,7 +5316,8 @@ async fn client_inner(
     mut entrances: Option<EntranceUpdates>,
     health: Option<watch::Sender<mesh::PathHealth>>,
     exit: Option<String>,
-    fixed_listener: Option<TcpListener>,
+    bound_socket: Option<Arc<UdpSocket>>,
+    fixed_listener: Option<Arc<TcpListener>>,
 ) -> Result<()> {
     ensure!(
         options.tcp_listen.is_none() || fixed_listener.is_none(),
@@ -5293,10 +5370,13 @@ async fn client_inner(
             == (options.proxy_listen.is_some() || options.stream_connector.is_some()),
         "proxy streams require a proxy listener"
     );
-    let socket = Arc::new(UdpSocket::bind(options.listen).await?);
+    let socket = match bound_socket {
+        Some(socket) => socket,
+        None => Arc::new(UdpSocket::bind(options.listen).await?),
+    };
     let persistent_fixed = fixed_listener.is_some();
     let mut listeners = tcp::Listeners {
-        fixed: fixed_listener.map(Arc::new),
+        fixed: fixed_listener,
         ..Default::default()
     };
     // Neither listener authenticates its callers: every caller spends the
@@ -5387,6 +5467,9 @@ async fn client_session(
         std::array::from_fn(|_| Default::default());
     let mut inflight = [false; MAX_PATHS];
     let mut elective_inflight = [false; MAX_PATHS];
+    let mut interface_trackers: [InterfaceTracker; MAX_PATHS] = Default::default();
+    let mut attempt_cancels: [Option<watch::Sender<bool>>; MAX_PATHS] =
+        std::array::from_fn(|_| None);
     let mut delivery_health: [path_health::DeliveryHealth; MAX_PATHS] =
         std::array::from_fn(|_| Default::default());
     let mut reachability: [liveness::Liveness; MAX_PATHS] = Default::default();
@@ -5527,8 +5610,73 @@ async fn client_session(
                 }
                 if let Some(desired)=&desired {
                     reconcile_routes(desired,&mut configs,&inflight,&mut endpoints,&paths,&mut rotations);
+                    for (id, config) in configs.iter().enumerate() {
+                        if !config.enabled {
+                            interface_trackers[id] = Default::default();
+                        }
+                    }
                     let configured=configs.iter().filter(|c|c.enabled).count();
                     options.stats.state(|s|s.configured_paths=configured);
+                }
+                for (id, config) in configs.iter().enumerate() {
+                    if !config.enabled {
+                        continue;
+                    }
+                    let Some(name) = config.interface.as_deref() else {
+                        continue;
+                    };
+                    let current_ifindex = transport::interface_index(name);
+                    let has_live = endpoints[id].is_some()
+                        || paths
+                            .lock()
+                            .expect("paths lock")
+                            .iter()
+                            .any(|p| usize::from(p.id) == id && p.conn.close_reason().is_none());
+                    match interface_trackers[id].poll(current_ifindex, has_live || inflight[id]) {
+                        InterfaceEvent::Unchanged => {}
+                        InterfaceEvent::Appeared(ifindex) => {
+                            rotations[id] = scheduler::Rotation::default();
+                            info!(
+                                target: "braidpath::path_lifecycle",
+                                event = "path_interface_ready",
+                                session = %sid,
+                                path = id,
+                                interface = %name,
+                                ifindex,
+                                remote = %config.remote
+                            );
+                        }
+                        InterfaceEvent::Replaced { old, new } => {
+                            {
+                                let mut active = paths.lock().expect("paths lock");
+                                for path in active.iter().filter(|p| usize::from(p.id) == id) {
+                                    path.conn.close(0u32.into(), b"interface changed");
+                                }
+                                active.retain(|p| usize::from(p.id) != id);
+                            }
+                            if let Some(old_ep) = endpoints[id].take() {
+                                old_ep.close(0u32.into(), b"interface changed");
+                            }
+                            if let Some(cancel) = attempt_cancels[id].take() {
+                                let _ = cancel.send(true);
+                            }
+                            inflight[id] = false;
+                            elective_inflight[id] = false;
+                            rotations[id] = scheduler::Rotation::default();
+                            delivery_health[id] = Default::default();
+                            reachability[id] = Default::default();
+                            info!(
+                                target: "braidpath::path_lifecycle",
+                                event = "path_interface_rebind",
+                                session = %sid,
+                                path = id,
+                                interface = %name,
+                                old_ifindex = ?old,
+                                new_ifindex = new,
+                                remote = %config.remote
+                            );
+                        }
+                    }
                 }
                 peers.retain(|_,(id,last)|{if last.elapsed()<Duration::from_secs(60){true}else{reverse.remove(id);false}});
                 let current=paths.lock().expect("paths lock").clone();
@@ -5616,12 +5764,20 @@ async fn client_session(
                     let exit=exit.map(str::to_owned);
                     let datagram_send_buffer_bytes=options.datagram_send_buffer_bytes;
                     let mut cancelled=stop.subscribe();
+                    let (attempt_stop, mut attempt_cancelled) = watch::channel(false);
+                    attempt_cancels[id] = Some(attempt_stop);
                     inflight[id]=true;
                     elective_inflight[id]=elective;
                     forward.path(id as u8,|p|{p.reconnect_attempts+=1;if elective{p.rotation_attempts+=1;}});
                     tasks.spawn(async move {
                         let mut diagnostic=stats::ConnectionTrace::new(metrics,config.remote,Some(id as u8),"quic_connect");
                         let attempt:Result<Option<Rejoined>>=async {
+                            let bound_ifindex = config.interface.as_deref().and_then(transport::interface_index);
+                            if transport::route_quality(config.remote, config.interface.as_deref(), bind)
+                                == transport::RouteQuality::Unusable
+                            {
+                                bail!("path destination unreachable on configured uplink");
+                            }
                             let endpoint=transport::client_bound_with_session_alpn(config.remote,&ca,config.interface.as_deref(),congestion,bind,datagram_send_buffer_bytes,ack_request,policy.streams || policy.proxy,policy.native_return)?;
                             info!(path=id,generation,local=%endpoint.local_addr()?,remote=%config.remote,"path attempt source socket");
                             let connected=tokio::select! {
@@ -5631,11 +5787,16 @@ async fn client_session(
                                     diagnostic.cancelled();
                                     return Ok(None);
                                 },
+                                _=attempt_cancelled.changed()=>{
+                                    endpoint.close(0u32.into(),b"interface changed");
+                                    diagnostic.cancelled();
+                                    return Ok(None);
+                                },
                                 connected=timeout(Duration::from_secs(8),
                                     connect_path(&endpoint,config.remote,&name,&token,&sid,id as u8,config.group,generation,rejoin,&policy,exit.as_deref(),&mut diagnostic))=>connected??
                             };
                             let (conn,stream,driver,request,send,stream_payload)=connected;
-                            Ok(Some(Rejoined{endpoint,conn,stream,stream_payload,driver,request,send}))
+                            Ok(Some(Rejoined{endpoint,conn,stream,stream_payload,bound_ifindex,driver,request,send}))
                         }.await;
                         let attempt=match attempt {
                             Ok(None)=>return,
@@ -5659,7 +5820,13 @@ async fn client_session(
             },
             rebuilt=rejoin_rx.recv()=>{
                 let Some((pid,generation,rebuild))=rebuilt else {bail!("path supervisor ended")};
-                let id=usize::from(pid);inflight[id]=false;
+                let id=usize::from(pid);
+                if generation != configs[id].generation {
+                    if let Ok((value,_))=rebuild {value.endpoint.close(0u32.into(),b"stale path attempt");}
+                    continue;
+                }
+                inflight[id]=false;
+                attempt_cancels[id]=None;
                 if desired.as_ref().is_some_and(|addresses|!addresses.iter().any(|route| matches_route(&configs[id], route))) {
                     if let Ok((value,_))=rebuild {value.endpoint.close(0u32.into(),b"entrance retired");}
                     continue;
@@ -5667,6 +5834,18 @@ async fn client_session(
                 let now_us=epoch.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
                 match rebuild {
                     Ok((value,diagnostic))=>{
+                        if let Some(name) = configs[id].interface.as_deref() {
+                            let current_ifindex = transport::interface_index(name);
+                            if current_ifindex.is_some()
+                                && value.bound_ifindex.is_some()
+                                && current_ifindex != value.bound_ifindex
+                            {
+                                value.endpoint.close(0u32.into(), b"interface changed");
+                                rotations[id] = scheduler::Rotation::default();
+                                continue;
+                            }
+                            interface_trackers[id].note_bound(value.bound_ifindex.or(current_ifindex));
+                        }
                         if elective_inflight[id] {rotations[id].rotation_succeeded(now_us);}
                         else {rotations[id].connection_succeeded(now_us);}
                         let replacing=endpoints[id].is_some();
@@ -6599,5 +6778,37 @@ mod stream_profile_tests {
         ] {
             assert!(session_profile(transport, streams, proxy).is_err());
         }
+    }
+
+    #[test]
+    fn interface_tracker_detects_ifindex_change_disappear_return_and_initial_appear() {
+        let mut tracker = InterfaceTracker::default();
+        assert_eq!(tracker.poll(None, false), InterfaceEvent::Unchanged);
+        assert_eq!(tracker.poll(Some(34), false), InterfaceEvent::Appeared(34));
+        assert_eq!(tracker.poll(Some(34), true), InterfaceEvent::Unchanged);
+
+        // Direct ifindex change while path is live triggers immediate replace.
+        assert_eq!(
+            tracker.poll(Some(35), true),
+            InterfaceEvent::Replaced {
+                old: Some(34),
+                new: 35
+            }
+        );
+        assert_eq!(tracker.poll(Some(35), true), InterfaceEvent::Unchanged);
+
+        // Interface disappears during PPPoE redial and returns with same or new index.
+        assert_eq!(tracker.poll(None, true), InterfaceEvent::Unchanged);
+        assert_eq!(
+            tracker.poll(Some(35), true),
+            InterfaceEvent::Replaced {
+                old: Some(35),
+                new: 35
+            }
+        );
+
+        // Interface disappears while no path is live, then reappears -> Appeared resets backoff.
+        assert_eq!(tracker.poll(None, false), InterfaceEvent::Unchanged);
+        assert_eq!(tracker.poll(Some(36), false), InterfaceEvent::Appeared(36));
     }
 }
