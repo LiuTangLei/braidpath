@@ -1,7 +1,6 @@
 use super::protocol::*;
 use super::*;
-use crate::runtime::{mesh, stats, transport};
-use bytes::Bytes;
+use crate::runtime::{mesh, stats};
 use std::{net::SocketAddr, path::Path};
 use tokio::{
     net::{TcpListener, UdpSocket},
@@ -92,7 +91,6 @@ async fn local_listener_capacity(
         exit.to_owned(),
         Arc::new(Semaphore::new(capacity)),
         false,
-        Arc::from([]),
     )));
     (at, task)
 }
@@ -189,6 +187,7 @@ async fn empty(identity: &mesh::ClientIdentity, at: SocketAddr) {
             let s = identity.status(at).await.unwrap().proxy.unwrap();
             if s.streams == 0
                 && s.tcp_flows == 0
+                && s.udp_flows == 0
                 && s.buffered_bytes == 0
                 && s.control_streams == 0
                 && s.udp_associations == 0
@@ -291,15 +290,12 @@ async fn separate_tcp_listeners_pin_exits_half_close_and_share_connections() {
             s.capabilities
                 .features
                 .iter()
-                .any(|f| f == "proxy-stream-v2")
+                .any(|f| f == "proxy-stream-v3")
         );
-        assert!(s.capabilities.features.iter().any(|f| f == "proxy-udp-v1"));
-        assert!(
-            !s.capabilities
-                .features
-                .iter()
-                .any(|f| matches!(f.as_str(), "proxy-tcp-v1" | "proxy-bond-v2"))
-        );
+        assert!(!s.capabilities.features.iter().any(|f| matches!(
+            f.as_str(),
+            "proxy-tcp-v1" | "proxy-bond-v2" | "proxy-stream-v2" | "proxy-udp-v1"
+        )));
         assert_eq!(s.proxy.unwrap().streams, 1);
     }
     let (mut third, status, _) = socks(listen_a, TCP, Address::Ip(target)).await;
@@ -399,7 +395,7 @@ async fn socks_tcp_negotiates_larger_records_without_changing_byte_budgets() {
 }
 
 #[tokio::test]
-async fn ordered_and_native_udp_share_a_socks_association() {
+async fn default_ordered_udp_carries_arbitrary_ports_and_large_datagrams_over_aggregate() {
     let root = tempfile::tempdir().unwrap();
     let (at, _server) = start(root.path(), "a", None, true).await;
     let identity = identity(root.path(), "client");
@@ -411,11 +407,14 @@ async fn ordered_and_native_udp_share_a_socks_association() {
         false,
     )
     .unwrap();
-    let ordered = udp_socket("127.0.0.1:0".parse().unwrap()).await.unwrap();
-    let native = udp_socket("127.0.0.1:0".parse().unwrap()).await.unwrap();
-    let targets = [ordered.local_addr().unwrap(), native.local_addr().unwrap()];
+    let first_target = udp_socket("127.0.0.1:0".parse().unwrap()).await.unwrap();
+    let second_target = udp_socket("127.0.0.1:0".parse().unwrap()).await.unwrap();
+    let targets = [
+        first_target.local_addr().unwrap(),
+        second_target.local_addr().unwrap(),
+    ];
     let mut echoes = tokio::task::JoinSet::new();
-    for echo in [ordered, native] {
+    for echo in [first_target, second_target] {
         echoes.spawn(async move {
             let mut bytes = vec![0; 65_536];
             loop {
@@ -432,7 +431,6 @@ async fn ordered_and_native_udp_share_a_socks_association() {
         "a".into(),
         Arc::new(Semaphore::new(2)),
         false,
-        Arc::from([targets[0].port()]),
     )));
     let udp = udp_socket("127.0.0.1:0".parse().unwrap()).await.unwrap();
     let (control, status, bound) = socks(listen, UDP, Address::Ip(udp.local_addr().unwrap())).await;
@@ -441,7 +439,7 @@ async fn ordered_and_native_udp_share_a_socks_association() {
     let mut response = vec![0; 65_536];
     for (target, sizes) in [
         (targets[0], &[0, 60_000, 1_470][..]),
-        (targets[1], &[82][..]),
+        (targets[1], &[82, 32_768][..]),
     ] {
         for (id, size) in sizes.iter().enumerate() {
             let mut request = vec![0, 0, 0];
@@ -463,35 +461,19 @@ async fn ordered_and_native_udp_share_a_socks_association() {
         }
     }
     let status = identity.status(at).await.unwrap().proxy.unwrap();
-    assert_eq!(status.tcp_flows, 1);
-    assert_eq!(status.udp_associations, 1);
+    assert_eq!(status.tcp_flows, 0);
+    assert_eq!(status.udp_flows, 2);
+    assert_eq!(status.udp_associations, 0);
     assert_eq!(status.udp_destinations, 2);
     drop(control);
     empty(&identity, at).await;
 }
 
 #[tokio::test]
-async fn ordered_udp_handles_domain_refusal_and_rejects_game_mode_combination() {
+async fn ordered_udp_handles_domain_refusal_and_releases_resources() {
     let root = tempfile::tempdir().unwrap();
     let (at, _server, metrics) = start_metered(root.path(), "a", None, false).await;
     let identity = identity(root.path(), "client");
-    // Proxy client startup must explicitly reject combining --game-mode on with --ordered-udp-port.
-    let conflict = client(ClientOptions {
-        identity: identity.clone(),
-        connect: vec![at],
-        exits: vec!["a".into()],
-        listen: "127.0.0.1:0".parse().unwrap(),
-        socks5: Vec::new(),
-        tcp_forward: Vec::new(),
-        paths: 1,
-        interface: None,
-        socks5_early_reply: true,
-        ordered_udp_ports: vec![4500],
-        game_mode: true,
-    })
-    .await;
-    assert!(conflict.is_err());
-
     // Refused ordered destination (private address when allow_private=false) must release server resources.
     let pool = client::Pool::new(
         identity.clone(),
@@ -509,7 +491,6 @@ async fn ordered_udp_handles_domain_refusal_and_rejects_game_mode_combination() 
         "a".into(),
         Arc::new(Semaphore::new(4)),
         false,
-        Arc::from([4500]),
     )));
     let udp = udp_socket("127.0.0.1:0".parse().unwrap()).await.unwrap();
     let (control, status, bound) = socks(listen, UDP, Address::Ip(udp.local_addr().unwrap())).await;
@@ -530,7 +511,7 @@ async fn ordered_udp_handles_domain_refusal_and_rejects_game_mode_combination() 
                 .filter_map(|(_, d)| d["tcp_streams"]["rejected"].as_u64())
                 .sum::<u64>();
             let s = identity.status(at).await.unwrap().proxy.unwrap();
-            if rejected > 0 && s.tcp_flows == 0 && s.udp_destinations == 0 {
+            if rejected > 0 && s.tcp_flows == 0 && s.udp_flows == 0 && s.udp_destinations == 0 {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -572,7 +553,6 @@ async fn ordered_udp_supports_domain_and_reopens_after_peer_close() {
         "a".into(),
         Arc::new(Semaphore::new(4)),
         false,
-        Arc::from([echo_port]),
     )));
     let udp = udp_socket("127.0.0.1:0".parse().unwrap()).await.unwrap();
     let (control, status, bound) = socks(listen, UDP, Address::Ip(udp.local_addr().unwrap())).await;
@@ -638,7 +618,7 @@ async fn separate_udp_listeners_pin_exits_fragment_and_release_independently() {
             .unwrap();
         assert_eq!(&reply[..3], &[0, 0, 0]);
         let (address, body) = protocol::packet(&reply[3..n]).await.unwrap();
-        assert_eq!(address, Address::Ip(target));
+        assert_eq!(address, Address::Domain("localhost".into(), target.port()));
         assert_eq!(body, data);
     }
     let rogue = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -659,8 +639,9 @@ async fn separate_udp_listeners_pin_exits_fragment_and_release_independently() {
             .is_err()
     );
     let s = identity.status(at).await.unwrap().proxy.unwrap();
-    assert_eq!(s.udp_associations, 1);
+    assert_eq!(s.udp_flows, 1);
     assert_eq!(s.udp_destinations, 1);
+    assert_eq!(s.tcp_flows, 0);
     assert_eq!(
         identity.status(b).await.unwrap().proxy.unwrap().connections,
         0
@@ -672,16 +653,6 @@ async fn separate_udp_listeners_pin_exits_fragment_and_release_independently() {
     let Address::Ip(bound_b) = bound_b else {
         panic!()
     };
-    assert_eq!(
-        identity
-            .status(b)
-            .await
-            .unwrap()
-            .proxy
-            .unwrap()
-            .udp_associations,
-        1
-    );
     drop(tcp);
     empty(&identity, at).await;
     // Closing a's association must leave b's socket and exit usable.
@@ -694,53 +665,19 @@ async fn separate_udp_listeners_pin_exits_fragment_and_release_independently() {
     let (address, body) = protocol::packet(&reply[3..n]).await.unwrap();
     assert_eq!(address, Address::Ip(target));
     assert_eq!(body, b"must not forward");
-    assert_eq!(
-        identity
-            .status(b)
-            .await
-            .unwrap()
-            .proxy
-            .unwrap()
-            .udp_destinations,
-        1
-    );
+    let status_b = identity.status(b).await.unwrap().proxy.unwrap();
+    assert_eq!(status_b.udp_flows, 1);
+    assert_eq!(status_b.udp_destinations, 1);
     drop(tcp_b);
     empty(&identity, b).await;
 }
 
 #[tokio::test]
-async fn wrong_token_wrong_exit_private_destination_and_unsupported_command_are_rejected() {
+async fn private_destination_and_unsupported_command_are_rejected() {
     let root = tempfile::tempdir().unwrap();
     let root = root.path();
     let (at, _server) = start(root, "a", None, false).await;
     let identity = identity(root, "client");
-    let endpoint = transport::proxy_client(at, &identity.dir.join("cert.pem"), None).unwrap();
-    for (token, exit) in [
-        ("0".repeat(64), "a".to_owned()),
-        (
-            transport::token(&identity.dir.join("token")).unwrap(),
-            "wrong".into(),
-        ),
-    ] {
-        let conn = endpoint
-            .connect(at, &identity.name())
-            .unwrap()
-            .await
-            .unwrap();
-        let (mut send, mut recv) = conn.open_bi().await.unwrap();
-        let mut auth = vec![1];
-        auth.extend(token.as_bytes());
-        auth.push(exit.len() as u8);
-        auth.extend(exit.as_bytes());
-        send.write_all(&auth).await.unwrap();
-        send.finish().unwrap();
-        assert!(
-            timeout(Duration::from_secs(2), recv.read_to_end(1))
-                .await
-                .unwrap()
-                .is_err()
-        );
-    }
     let pool = client::Pool::new(
         identity.clone(),
         vec![node("a", at)],
@@ -880,7 +817,7 @@ async fn aggregate_proxy_requires_the_advertised_stream_capability() {
             .capabilities
             .features
             .iter()
-            .any(|f| f == "proxy-stream-v2")
+            .any(|f| f == "proxy-stream-v3")
     );
     let pool =
         client::Pool::new(identity, vec![node("a", at)], vec!["a".into()], None, false).unwrap();
@@ -925,49 +862,6 @@ fn address_policy_checks_mapped_and_private_ranges() {
     for ip in ["0.0.0.0", "224.0.0.1", "255.255.255.255", "::", "ff02::1"] {
         assert!(!permitted(ip.parse().unwrap(), true));
     }
-}
-
-#[test]
-fn udp_reassembly_is_bounded_out_of_order_and_does_not_extend_deadlines() {
-    fn frame(id: u64, total: u32, offset: u32, data: &[u8]) -> Bytes {
-        let mut b = Vec::new();
-        b.extend(id.to_be_bytes());
-        b.extend(total.to_be_bytes());
-        b.extend(offset.to_be_bytes());
-        b.extend(data);
-        b.into()
-    }
-    let now = Instant::now();
-    let mut r = Reassembly::default();
-    assert!(r.receive(frame(1, 1002, 1000, &[8, 9]), now).is_none());
-    let out = r.receive(frame(1, 1002, 0, &[7; 1000]), now).unwrap();
-    assert_eq!(&out[1000..], &[8, 9]);
-    assert!(r.receive(frame(1, 1002, 0, &[7; 1000]), now).is_none());
-    assert!(r.receive(frame(1, 1002, 1000, &[8, 9]), now).is_none());
-    for id in 10..14 {
-        assert!(r.receive(frame(id, 1001, 0, &[1; 1000]), now).is_none());
-    }
-    assert!(r.receive(frame(14, 1001, 0, &[1; 1000]), now).is_none());
-    assert!(r.receive(frame(14, 1001, 1000, &[2]), now).is_none());
-    assert!(
-        r.receive(frame(10, 1001, 0, &[1; 1000]), now + Duration::from_secs(1))
-            .is_none()
-    );
-    assert!(
-        r.receive(frame(10, 1001, 1000, &[2]), now + Duration::from_secs(3))
-            .is_none()
-    );
-    assert!(
-        r.receive(
-            frame(20, u32::MAX, 0, &[1; 1000]),
-            now + Duration::from_secs(3)
-        )
-        .is_none()
-    );
-    assert!(
-        r.receive(frame(10, 1001, 0, &[1; 1000]), now + Duration::from_secs(3))
-            .is_none()
-    );
 }
 
 #[tokio::test]
@@ -1038,27 +932,6 @@ async fn host_rate_budget_is_shared_and_cancellation_does_not_reserve_future_byt
     tokio::time::advance(Duration::from_secs(1)).await;
     assert!(rate.delay(8_000).is_none());
     assert!(rate.delay(1).is_some());
-}
-
-#[tokio::test]
-async fn association_dispatch_is_bounded_and_released_with_its_owner() {
-    let router = Arc::new(Router::default());
-    let mut registrations = Vec::new();
-    for id in 0..MAX_ASSOCIATIONS as u64 {
-        registrations.push(router.register(id).unwrap());
-    }
-    assert!(router.register(MAX_ASSOCIATIONS as u64).is_err());
-    assert!(router.register(0).is_err());
-    let mut data = 1u64.to_be_bytes().to_vec();
-    data.extend(b"only association one");
-    router.dispatch(data.into());
-    assert_eq!(
-        registrations[1].recv.recv().await.unwrap(),
-        &b"only association one"[..]
-    );
-    assert!(registrations[0].recv.try_recv().is_err());
-    drop(registrations);
-    assert!(router.register(0).is_ok());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1604,97 +1477,6 @@ async fn prepared_paths_do_not_open_targets_and_cold_relays_do_not_hold_download
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn udp_prefers_complete_datagram_delivery_over_a_faster_lossy_handshake() {
-    async fn entrance(target: SocketAddr, loss: bool) -> (SocketAddr, Task<()>) {
-        let front = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
-        let address = front.local_addr().unwrap();
-        let back = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        back.connect(target).await.unwrap();
-        let task = Task(tokio::spawn(async move {
-            let (mut up, mut down) = (vec![0; 65536], vec![0; 65536]);
-            let mut peer = None;
-            let mut small = 0;
-            let mut delayed = tokio::task::JoinSet::new();
-            loop {
-                tokio::select! {
-                    r = front.recv_from(&mut up) => {
-                        let (n, source) = r.unwrap();
-                        peer = Some(source);
-                        back.send(&up[..n]).await.unwrap();
-                    }
-                    r = back.recv(&mut down) => {
-                        let n = r.unwrap();
-                        if loss && n > 100 && down[0] & 0x80 == 0 {
-                            small += 1;
-                            if small % 3 == 0 { continue; }
-                        }
-                        if let Some(peer) = peer {
-                            if !loss && n > 100 {
-                                // Propagation delay applies independently to
-                                // packets; serial sleeps create an unintended
-                                // one-packet-per-timer-tick bandwidth cap.
-                                let front = front.clone();
-                                let data = down[..n].to_vec();
-                                delayed.spawn(async move {
-                                    tokio::time::sleep(Duration::from_millis(15)).await;
-                                    front.send_to(&data, peer).await.unwrap();
-                                });
-                            } else {
-                                front.send_to(&down[..n], peer).await.unwrap();
-                            }
-                        }
-                    }
-                    result = delayed.join_next(), if !delayed.is_empty() => { result.unwrap().unwrap(); }
-                }
-            }
-        }));
-        (address, task)
-    }
-    let root = tempfile::tempdir().unwrap();
-    let (at, _server) = start(root.path(), "a", None, true).await;
-    let pool = client::Pool::new(
-        identity(root.path(), "udp-health-client"),
-        vec![node("a", at)],
-        vec!["a".into()],
-        None,
-        false,
-    )
-    .unwrap();
-    let (lossy, _lossy) = entrance(at, true).await;
-    let (healthy, _healthy) = entrance(at, false).await;
-    pool.test_set_routes("a", vec![lossy, healthy]);
-    let selected = timeout(Duration::from_secs(4), pool.udp_connection("a"))
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(selected.raw.remote_address(), healthy);
-    let again = pool.udp_connection("a").await.unwrap();
-    assert!(
-        Arc::ptr_eq(&selected, &again),
-        "healthy cache should not probe for every flow"
-    );
-    pool.shutdown().await;
-
-    // With only an imperfect relay available, keep usable UDP rather than
-    // requiring a directly reachable or completely loss-free exit.
-    let pool = client::Pool::new(
-        identity(root.path(), "udp-partial-client"),
-        vec![node("a", at)],
-        vec!["a".into()],
-        None,
-        false,
-    )
-    .unwrap();
-    pool.test_set_routes("a", vec![lossy]);
-    let selected = timeout(Duration::from_secs(7), pool.udp_connection("a"))
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(selected.raw.remote_address(), lossy);
-    pool.shutdown().await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn failed_proxy_relay_is_reported_and_replaced_by_another_server() {
     let root = tempfile::tempdir().unwrap();
     let root = root.path();
@@ -1753,7 +1535,6 @@ async fn failed_proxy_relay_is_reported_and_replaced_by_another_server() {
             let mut reply = [0; 1024];
             tcp.read_exact(&mut reply).await.unwrap();
             assert_eq!(reply, [71; 1024]);
-            pool.retire_stale_udp_paths();
             let routes = pool.test_addresses("a").await;
             if routes.len() == 3
                 && routes.iter().any(|p| !original.contains(p))
@@ -1996,7 +1777,12 @@ async fn idle_streaming_flows_do_not_starve_an_active_flow_and_all_release() {
         false,
     )
     .unwrap();
-    let (listen, listener) = local_listener_capacity(pool.clone(), "a", MAX_STREAMS).await;
+    let (listen, listener) = local_listener_capacity(
+        pool.clone(),
+        "a",
+        crate::runtime::tunnel::tcp::MAX_TCP_FLOWS,
+    )
+    .await;
     let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let at = target.local_addr().unwrap();
     let peer = Task(tokio::spawn(async move {
@@ -2201,6 +1987,7 @@ async fn game_socks_download_and_fragmented_udp_share_one_aggregate_session() {
     let status = identity.status(at).await.unwrap().proxy.unwrap();
     assert_eq!(status.udp_associations, 1);
     assert_eq!(status.udp_destinations, 1);
+    assert_eq!(status.udp_flows, 0);
     assert_eq!(status.control_streams, 0);
     drop(control);
     drop(listener);
@@ -2242,7 +2029,6 @@ async fn one_client_serves_fixed_exits_and_socks_tcp_udp_with_exit_failure_isola
         paths: 2,
         interface: None,
         socks5_early_reply: false,
-        ordered_udp_ports: Vec::new(),
         game_mode: false,
     })));
     timeout(Duration::from_secs(5), async {
@@ -2377,4 +2163,151 @@ fn fixed_forward_plans_reject_exposure_and_conflicting_listeners() {
     ] {
         assert!(client::validate_tcp_forwards(&forwards, &socks).is_err());
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn default_ordered_udp_survives_single_path_failure_within_same_association() {
+    let root = tempfile::tempdir().unwrap();
+    let root = root.path();
+    let (a, _a) = start(root, "a", None, true).await;
+    let (b, relay_b) = start(root, "b", Some(a), true).await;
+    let (c, _c) = start(root, "c", Some(a), true).await;
+    let identity = identity(root, "udp-failover-client");
+    let pool = client::Pool::new(
+        identity.clone(),
+        vec![node("a", a), node("b", b), node("c", c)],
+        vec!["a".into()],
+        None,
+        false,
+    )
+    .unwrap();
+    timeout(Duration::from_secs(5), async {
+        while pool.test_addresses("a").await.len() < 3 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    pool.prepare_stream("a").await.unwrap();
+    timeout(Duration::from_secs(3), async {
+        while pool.transport_snapshot("a").len() != 3 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let (listen, _listener) = local_listener(pool.clone(), "a").await;
+    let echo = udp_socket("127.0.0.1:0".parse().unwrap()).await.unwrap();
+    let target = echo.local_addr().unwrap();
+    let _echo = Task(tokio::spawn(async move {
+        let mut buf = vec![0; 65_536];
+        loop {
+            let (n, peer) = echo.recv_from(&mut buf).await.unwrap();
+            echo.send_to(&buf[..n], peer).await.unwrap();
+        }
+    }));
+    let udp = udp_socket("127.0.0.1:0".parse().unwrap()).await.unwrap();
+    let (control, status, bound) = socks(listen, UDP, Address::Ip(udp.local_addr().unwrap())).await;
+    assert_eq!(status, 0);
+    let Address::Ip(bound) = bound else { panic!() };
+    let mut reply = vec![0; 65_536];
+    for (seq, size) in [(1u8, 1_200usize), (2u8, 32_768usize)] {
+        let mut req = vec![0, 0, 0];
+        Address::Ip(target).encode(&mut req);
+        req.resize(req.len() + size, seq);
+        udp.send_to(&req, bound).await.unwrap();
+        let (n, _) = timeout(Duration::from_secs(5), udp.recv_from(&mut reply))
+            .await
+            .unwrap()
+            .unwrap();
+        let (addr, body) = protocol::packet(&reply[3..n]).await.unwrap();
+        assert_eq!(addr, Address::Ip(target));
+        assert_eq!(body.len(), size);
+        assert!(body.iter().all(|b| *b == seq));
+    }
+    // Sever one relay path while keeping the same SOCKS5 UDP association alive.
+    drop(relay_b);
+    for seq in 10u8..18u8 {
+        let size = if seq % 2 == 0 { 16_384 } else { 1_350 };
+        let mut req = vec![0, 0, 0];
+        Address::Ip(target).encode(&mut req);
+        req.resize(req.len() + size, seq);
+        udp.send_to(&req, bound).await.unwrap();
+        let (n, _) = timeout(Duration::from_secs(8), udp.recv_from(&mut reply))
+            .await
+            .expect("ordered UDP association stalled after single path failure")
+            .unwrap();
+        let (addr, body) = protocol::packet(&reply[3..n]).await.unwrap();
+        assert_eq!(addr, Address::Ip(target));
+        assert_eq!(body.len(), size);
+        assert!(body.iter().all(|b| *b == seq));
+    }
+    drop(control);
+    empty(&identity, a).await;
+    pool.shutdown().await;
+}
+
+#[tokio::test]
+async fn ordered_udp_flows_do_not_consume_tcp_flow_permits() {
+    let root = tempfile::tempdir().unwrap();
+    let (at, _server) = start(root.path(), "a", None, true).await;
+    let identity = identity(root.path(), "udp-tcp-isolation");
+    let pool = client::Pool::new(
+        identity.clone(),
+        vec![node("a", at)],
+        vec!["a".into()],
+        None,
+        false,
+    )
+    .unwrap();
+    let (listen, _listener) = local_listener(pool.clone(), "a").await;
+    let mut udp_targets = Vec::new();
+    let mut echoes = tokio::task::JoinSet::new();
+    for _ in 0..4 {
+        let sock = udp_socket("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        udp_targets.push(sock.local_addr().unwrap());
+        echoes.spawn(async move {
+            let mut buf = [0; 2048];
+            loop {
+                let (n, peer) = sock.recv_from(&mut buf).await.unwrap();
+                sock.send_to(&buf[..n], peer).await.unwrap();
+            }
+        });
+    }
+    let udp = udp_socket("127.0.0.1:0".parse().unwrap()).await.unwrap();
+    let (control, status, bound) = socks(listen, UDP, Address::Ip(udp.local_addr().unwrap())).await;
+    assert_eq!(status, 0);
+    let Address::Ip(bound) = bound else { panic!() };
+    let mut reply = [0; 2048];
+    for target in &udp_targets {
+        let mut req = vec![0, 0, 0];
+        Address::Ip(*target).encode(&mut req);
+        req.extend_from_slice(b"dns-like");
+        udp.send_to(&req, bound).await.unwrap();
+        let (n, _) = timeout(Duration::from_secs(5), udp.recv_from(&mut reply))
+            .await
+            .unwrap()
+            .unwrap();
+        let (addr, body) = protocol::packet(&reply[3..n]).await.unwrap();
+        assert_eq!(addr, Address::Ip(*target));
+        assert_eq!(body, b"dns-like");
+    }
+    let snap = identity.status(at).await.unwrap().proxy.unwrap();
+    assert_eq!(snap.tcp_flows, 0);
+    assert_eq!(snap.udp_flows, 4);
+    assert_eq!(snap.udp_destinations, 4);
+    assert_eq!(snap.streams, 4);
+
+    let (tcp_target, _echo_tcp) = echo().await;
+    let (tcp1, status1, _) = socks(listen, TCP, Address::Ip(tcp_target)).await;
+    let (tcp2, status2, _) = socks(listen, TCP, Address::Ip(tcp_target)).await;
+    assert_eq!((status1, status2), (0, 0));
+    let snap = identity.status(at).await.unwrap().proxy.unwrap();
+    assert_eq!(snap.tcp_flows, 2);
+    assert_eq!(snap.udp_flows, 4);
+    assert_eq!(snap.streams, 6);
+
+    drop((tcp1, tcp2, control));
+    empty(&identity, at).await;
+    pool.shutdown().await;
 }

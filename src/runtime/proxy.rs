@@ -1,4 +1,4 @@
-//! Per-exit SOCKS5 entrances over aggregate TCP streams and native UDP associations.
+//! Per-exit SOCKS5 entrances over aggregate reliable streams and Game datagrams.
 use anyhow::{Result, ensure};
 use std::{
     sync::{Arc, Mutex},
@@ -11,7 +11,6 @@ use tokio::{
 };
 
 mod client;
-mod health;
 pub(crate) mod ordered_udp;
 mod protocol;
 mod server;
@@ -21,14 +20,11 @@ pub(crate) use protocol::ReplyError;
 pub(super) use protocol::permitted;
 pub use server::{Server, ServerConfig, Snapshot};
 
-pub(crate) const ALPN: &[u8] = b"braidpath-proxy/1";
-pub(crate) const STREAM_CAPABILITY: &str = "proxy-stream-v2";
+pub(crate) const STREAM_CAPABILITY: &str = "proxy-stream-v3";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
 const UDP_IDLE: Duration = Duration::from_secs(60);
-const MAX_CONNECTIONS: usize = 64;
-const MAX_STREAMS: usize = 256;
 const MAX_ASSOCIATIONS: usize = 64;
-pub(crate) const MAX_DESTINATIONS: usize = 32;
+pub(crate) const MAX_DESTINATIONS: usize = 256;
 
 async fn udp_socket(address: std::net::SocketAddr) -> Result<tokio::net::UdpSocket> {
     let socket = tokio::net::UdpSocket::bind(address).await?;
@@ -53,13 +49,9 @@ pub(crate) async fn resolve_stream_target(
     address.resolve(allow_private).await
 }
 
-struct CloseConnection(quinn::Connection);
-impl Drop for CloseConnection {
-    fn drop(&mut self) {
-        self.0.close(0u32.into(), b"proxy owner stopped");
-    }
-}
+#[cfg(test)]
 struct AbortTask(tokio::task::JoinHandle<()>);
+#[cfg(test)]
 impl Drop for AbortTask {
     fn drop(&mut self) {
         self.0.abort();

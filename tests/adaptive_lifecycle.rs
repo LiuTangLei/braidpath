@@ -435,7 +435,7 @@ async fn admit_generation(
         let token = fs::read_to_string(identity.join("token"))?;
         let mut request = Request::builder().method("POST").uri("https://localhost/session")
             .header("authorization", format!("Bearer {}", token.trim()))
-            .header("braidpath-version", "1").header("braidpath-policy", "1/datagram").header("braidpath-session", session)
+            .header("braidpath-version", "1").header("braidpath-policy", "2/datagram").header("braidpath-session", session)
             .header("braidpath-path", "0").header("braidpath-generation", generation)
             .header("braidpath-feedback", "2").header("braidpath-scheduler", "adaptive")
             .header("braidpath-fec", "0").header("braidpath-redundancy", "0")

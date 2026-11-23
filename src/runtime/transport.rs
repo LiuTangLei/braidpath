@@ -268,11 +268,7 @@ pub fn server_tls(cert: &Path, key_path: &Path) -> Result<rustls::ServerConfig> 
     let mut tls = rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(certificates(cert)?, key(key_path)?)?;
-    tls.alpn_protocols = vec![
-        b"h3".to_vec(),
-        super::proxy::ALPN.to_vec(),
-        super::tunnel::STREAM_ALPN.to_vec(),
-    ];
+    tls.alpn_protocols = vec![b"h3".to_vec(), super::tunnel::STREAM_ALPN.to_vec()];
     // 0-RTT. rustls accepts early data only with stateful resumption and takes
     // each ticket out of this store on use, so a replayed first flight cannot
     // have its early data accepted again. A restart forgets every ticket
@@ -491,22 +487,7 @@ pub(crate) fn client_bound_with_session_alpn(
     )
 }
 
-pub(crate) fn proxy_client(
-    remote: SocketAddr,
-    ca: &Path,
-    interface: Option<&str>,
-) -> Result<Endpoint> {
-    client_with_alpn(
-        remote,
-        ca,
-        interface,
-        Congestion::Bbr,
-        None,
-        DEFAULT_DATAGRAM_SEND_BUFFER_BYTES,
-        super::proxy::ALPN,
-    )
-}
-
+#[cfg(test)]
 fn client_with_alpn(
     remote: SocketAddr,
     ca: &Path,
@@ -754,7 +735,7 @@ fn client_with_alpn_and_ack(
     );
     s.bind(&bind.into())?;
     s.set_nonblocking(true)?;
-    if alpn == super::proxy::ALPN || alpn == super::tunnel::STREAM_ALPN {
+    if alpn == super::tunnel::STREAM_ALPN {
         datagram_socket_buffers(socket2::SockRef::from(&s), "proxy");
     } else {
         enlarge_receive_buffer(socket2::SockRef::from(&s));
@@ -888,10 +869,27 @@ mod tests {
         let missing = "bp-missing0";
         let address = "127.0.0.1:1".parse().unwrap();
         let cert = temp.path().join("identity/cert.pem");
-        let unbound = proxy_client(address, &cert, None).unwrap();
+        let unbound = client_with_alpn(
+            address,
+            &cert,
+            None,
+            Congestion::Bbr,
+            None,
+            DEFAULT_DATAGRAM_SEND_BUFFER_BYTES,
+            crate::runtime::tunnel::STREAM_ALPN,
+        )
+        .unwrap();
         unbound.close(0u32.into(), b"test complete");
-        let error =
-            proxy_client(address, &cert, Some(missing)).expect_err("invalid binding must fail");
+        let error = client_with_alpn(
+            address,
+            &cert,
+            Some(missing),
+            Congestion::Bbr,
+            None,
+            DEFAULT_DATAGRAM_SEND_BUFFER_BYTES,
+            crate::runtime::tunnel::STREAM_ALPN,
+        )
+        .expect_err("invalid binding must fail");
         assert!(format!("{error:#}").contains("interface"));
     }
 
@@ -911,7 +909,16 @@ mod tests {
         )
         .unwrap();
         let address = server.local_addr().unwrap();
-        let client = proxy_client(address, &identity.join("cert.pem"), None).unwrap();
+        let client = client_with_alpn(
+            address,
+            &identity.join("cert.pem"),
+            None,
+            Congestion::Bbr,
+            None,
+            DEFAULT_DATAGRAM_SEND_BUFFER_BYTES,
+            crate::runtime::tunnel::STREAM_ALPN,
+        )
+        .unwrap();
         tokio::time::timeout(Duration::from_secs(5), async {
             let (outgoing, incoming) =
                 tokio::join!(client.connect(address, "localhost").unwrap(), async {
@@ -1064,7 +1071,7 @@ mod tests {
             Congestion::Bbr,
             None,
             DEFAULT_DATAGRAM_SEND_BUFFER_BYTES,
-            super::super::proxy::ALPN,
+            crate::runtime::tunnel::STREAM_ALPN,
         )
         .unwrap();
         tokio::time::timeout(Duration::from_secs(60), async {

@@ -124,10 +124,9 @@ impl State {
             capabilities.features.push("fixed-tcp-stream-v2".into());
         }
         if self.proxy.is_some() {
-            capabilities.features.extend([
-                "proxy-udp-v1".into(),
-                crate::runtime::proxy::STREAM_CAPABILITY.into(),
-            ]);
+            capabilities
+                .features
+                .push(crate::runtime::proxy::STREAM_CAPABILITY.into());
         }
         capabilities
     }

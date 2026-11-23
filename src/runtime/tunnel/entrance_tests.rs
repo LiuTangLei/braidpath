@@ -215,7 +215,7 @@ async fn legacy_session_response_cannot_silently_remove_mesh_exit_binding() {
                     Response::builder()
                         .status(status)
                         .header("braidpath-version", "1")
-                        .header("braidpath-policy", "1/datagram")
+                        .header("braidpath-policy", "2/datagram")
                         .header("braidpath-max-payload", MAX_PAYLOAD)
                         .body(())
                         .unwrap(),

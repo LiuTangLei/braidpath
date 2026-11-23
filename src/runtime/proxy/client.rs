@@ -45,7 +45,6 @@ pub struct ClientOptions {
     pub paths: usize,
     pub interface: Option<String>,
     pub socks5_early_reply: bool,
-    pub ordered_udp_ports: Vec<u16>,
     pub game_mode: bool,
 }
 
@@ -110,38 +109,6 @@ pub(super) fn listener_plan(
             })
         })
         .collect()
-}
-pub(super) struct UdpConnection {
-    pub(super) raw: quinn::Connection,
-    pub(super) router: Arc<Router>,
-    healthy_until: Mutex<Instant>,
-    _reader: AbortTask,
-    _close: CloseConnection,
-    _endpoint: quinn::Endpoint,
-}
-struct UdpPath {
-    address: SocketAddr,
-    connection: Mutex<Option<Arc<UdpConnection>>>,
-    #[cfg(test)]
-    retired: std::sync::atomic::AtomicBool,
-}
-impl UdpPath {
-    fn new(address: SocketAddr) -> Self {
-        Self {
-            address,
-            connection: Mutex::new(None),
-            #[cfg(test)]
-            retired: std::sync::atomic::AtomicBool::new(false),
-        }
-    }
-    fn retire(&self) {
-        #[cfg(test)]
-        self.retired
-            .store(true, std::sync::atomic::Ordering::Release);
-        if let Some(conn) = self.connection.lock().expect("proxy connection").take() {
-            conn.raw.close(0u32.into(), b"UDP exit connection retired");
-        }
-    }
 }
 struct Routes {
     _guard: mesh::Entrances,
@@ -219,12 +186,9 @@ impl Drop for Aggregate {
     }
 }
 
-async fn stop_slot(aggregate: Option<Aggregate>, routes: Option<Routes>, paths: Vec<Arc<UdpPath>>) {
+async fn stop_slot(aggregate: Option<Aggregate>, routes: Option<Routes>) {
     if let Some(aggregate) = aggregate {
         aggregate.shutdown().await;
-    }
-    for path in paths {
-        path.retire();
     }
     if let Some(routes) = routes {
         routes._guard.shutdown().await;
@@ -232,8 +196,6 @@ async fn stop_slot(aggregate: Option<Aggregate>, routes: Option<Routes>, paths: 
 }
 
 struct Slot {
-    udp_setup: AsyncMutex<()>,
-    paths: Mutex<BTreeMap<SocketAddr, Arc<UdpPath>>>,
     routes: AsyncMutex<Option<Routes>>,
     aggregate: AsyncMutex<Option<Aggregate>>,
     stream_metrics: stats::Metrics,
@@ -248,12 +210,9 @@ pub(super) struct Pool {
     identity: mesh::ClientIdentity,
     interface: Option<String>,
     pub(super) game_mode: bool,
-    token: String,
     slots: BTreeMap<String, Slot>,
     nodes: RwLock<Vec<mesh::Node>>,
     nodes_changed: tokio::sync::Notify,
-    udp_ifindex: Mutex<Option<u32>>,
-    udp_ifindex_missing: Mutex<bool>,
     path_limit: std::sync::atomic::AtomicUsize,
     pub(super) stream_budget: Arc<tunnel::tcp::Budget>,
     closed: std::sync::atomic::AtomicBool,
@@ -285,8 +244,6 @@ impl Pool {
             slots.insert(
                 exit.clone(),
                 Slot {
-                    udp_setup: AsyncMutex::new(()),
-                    paths: Mutex::new(BTreeMap::new()),
                     routes: AsyncMutex::new(None),
                     aggregate: AsyncMutex::new(None),
                     stream_metrics: stats::Metrics::new("client")
@@ -300,18 +257,14 @@ impl Pool {
                 },
             );
         }
-        let token = transport::token(&identity.dir.join("token"))?;
-        let udp_ifindex = interface.as_deref().and_then(transport::interface_index);
+        let _ = transport::token(&identity.dir.join("token"))?;
         Ok(Arc::new(Self {
             identity,
             interface,
             game_mode,
-            token,
             slots,
             nodes: RwLock::new(nodes),
             nodes_changed: tokio::sync::Notify::new(),
-            udp_ifindex: Mutex::new(udp_ifindex),
-            udp_ifindex_missing: Mutex::new(false),
             path_limit: std::sync::atomic::AtomicUsize::new(4),
             stream_budget: Arc::new(tunnel::tcp::Budget::new()),
             closed: std::sync::atomic::AtomicBool::new(false),
@@ -473,206 +426,6 @@ impl Pool {
         let connector = self.prepare_stream(id).await?;
         connector.open(target.into(), early_reply).await
     }
-    async fn authenticate_udp(
-        identity: &mesh::ClientIdentity,
-        token: &str,
-        address: SocketAddr,
-        id: &str,
-        interface: Option<&str>,
-    ) -> Result<Arc<UdpConnection>> {
-        let endpoint = transport::proxy_client(address, &identity.dir.join("cert.pem"), interface)?;
-        let connection = timeout(CONNECT_TIMEOUT, async {
-            let raw = endpoint.connect(address, &identity.name())?.await?;
-            let close = CloseConnection(raw.clone());
-            let (mut send, mut recv) = raw.open_bi().await?;
-            let mut auth = vec![1];
-            auth.extend(token.as_bytes());
-            auth.push(id.len() as u8);
-            auth.extend(id.as_bytes());
-            send.write_all(&auth).await?;
-            send.finish()?;
-            ensure!(
-                recv.read_to_end(1).await? == [0],
-                "proxy authentication rejected"
-            );
-            let router = Arc::new(Router::default());
-            let dispatch = router.clone();
-            let read = raw.clone();
-            let reader = AbortTask(tokio::spawn(async move {
-                while let Ok(data) = read.read_datagram().await {
-                    dispatch.dispatch(data);
-                }
-            }));
-            Ok::<_, anyhow::Error>(Arc::new(UdpConnection {
-                raw,
-                router,
-                healthy_until: Mutex::new(Instant::now()),
-                _reader: reader,
-                _close: close,
-                _endpoint: endpoint,
-            }))
-        })
-        .await??;
-        Ok(connection)
-    }
-    pub(super) async fn udp_connection(&self, id: &str) -> Result<Arc<UdpConnection>> {
-        let slot = self.slots.get(id).context("exit not selected")?;
-        let _setup = slot.udp_setup.lock().await;
-        let (updates, _) = self.route_watch(id).await?;
-        #[cfg(test)]
-        let (_test_owner, updates) =
-            if let Some(addresses) = slot.test_routes.lock().unwrap().clone() {
-                let (sender, receiver) = tokio::sync::watch::channel(addresses);
-                (Some(sender), receiver)
-            } else {
-                (None, updates)
-            };
-        let cached = {
-            let paths = slot.paths.lock().expect("proxy paths");
-            updates.borrow().iter().find_map(|address| {
-                if let Some(path) = paths.get(address)
-                    && let Some(conn) = path.connection.lock().expect("proxy connection").as_ref()
-                    && conn.raw.close_reason().is_none()
-                {
-                    return Some(conn.clone());
-                }
-                None
-            })
-        };
-        if let Some(conn) = cached {
-            let valid = *conn.healthy_until.lock().expect("UDP health deadline") > Instant::now();
-            if valid || health::measure(&conn).await.is_ok_and(|q| q.complete()) {
-                if !valid {
-                    *conn.healthy_until.lock().expect("UDP health deadline") =
-                        Instant::now() + health::VALID_FOR;
-                }
-                return Ok(conn);
-            }
-            // New associations should not repeatedly rediscover this expired,
-            // lossy cache entry before reaching a healthier one. Existing flows
-            // retain their own Arc and are not closed by this removal.
-            slot.paths.lock().expect("proxy paths").retain(|_, path| {
-                path.connection
-                    .lock()
-                    .expect("proxy connection")
-                    .as_ref()
-                    .is_none_or(|cached| !Arc::ptr_eq(cached, &conn))
-            });
-        }
-        // A fast reliable-stream handshake says nothing about loss of native
-        // datagrams. Race measured paths, retaining the best partial result if
-        // every reachable route has loss; imperfect connectivity still works.
-        type Candidate = (health::Quality, SocketAddr, Arc<UdpConnection>);
-        let fallback: Arc<Mutex<Option<Candidate>>> = Arc::new(Mutex::new(None));
-        let (address, conn) = first_route(updates.clone(), |address| {
-            let identity = self.identity.clone();
-            let token = self.token.clone();
-            let exit = id.to_owned();
-            let interface = self.interface.clone();
-            let fallback = fallback.clone();
-            async move {
-                let conn =
-                    Self::authenticate_udp(&identity, &token, address, &exit, interface.as_deref())
-                        .await?;
-                let quality = health::measure(&conn).await?;
-                if quality.complete() {
-                    *conn.healthy_until.lock().expect("UDP health deadline") = Instant::now() + health::VALID_FOR;
-                    return Ok((address, conn));
-                }
-                if quality.received > 0 {
-                    let mut best = fallback.lock().expect("UDP partial routes");
-                    if best.as_ref().is_none_or(|(q, _, _)| quality.better_than(*q)) {
-                        *best = Some((quality, address, conn));
-                    }
-                }
-                bail!("UDP route lost health probes")
-            }
-        })
-        .await.or_else(|error| {
-            let Some((quality, address, conn)) = fallback.lock().expect("UDP partial routes").take() else {
-                return Err(error);
-            };
-            ensure!(updates.borrow().contains(&address) && conn.raw.close_reason().is_none(), "UDP fallback route retired");
-            tracing::warn!(%address, received = quality.received, "using best reachable UDP route with measured loss");
-            *conn.healthy_until.lock().expect("UDP health deadline") = Instant::now() + Duration::from_secs(5);
-            Ok((address, conn))
-        })?;
-        let mut paths = slot.paths.lock().expect("proxy paths");
-        ensure!(
-            !self.closed.load(std::sync::atomic::Ordering::Acquire),
-            "proxy client stopped"
-        );
-        ensure!(updates.borrow().contains(&address), "UDP route retired");
-        let path = Arc::new(UdpPath::new(address));
-        *path.connection.lock().expect("proxy connection") = Some(conn.clone());
-        paths.insert(path.address, path);
-        Ok(conn)
-    }
-    pub(super) fn retire_stale_udp_paths(&self) {
-        let interface_rebound = if let Some(name) = self.interface.as_deref() {
-            let current = transport::interface_index(name);
-            let mut bound = self.udp_ifindex.lock().expect("udp ifindex");
-            let mut missing = self
-                .udp_ifindex_missing
-                .lock()
-                .expect("udp ifindex missing");
-            match current {
-                None => {
-                    if bound.is_some() {
-                        *missing = true;
-                    }
-                    false
-                }
-                Some(idx) => {
-                    if *missing || bound.is_some_and(|old| old != idx) {
-                        tracing::info!(
-                            interface = name,
-                            old_ifindex = ?*bound,
-                            new_ifindex = idx,
-                            "retiring cached UDP proxy paths after interface change"
-                        );
-                        *bound = Some(idx);
-                        *missing = false;
-                        true
-                    } else {
-                        if bound.is_none() {
-                            *bound = Some(idx);
-                        }
-                        false
-                    }
-                }
-            }
-        } else {
-            false
-        };
-        for slot in self.slots.values() {
-            if interface_rebound {
-                for path in
-                    std::mem::take(&mut *slot.paths.lock().expect("proxy paths")).into_values()
-                {
-                    path.retire();
-                }
-                continue;
-            }
-            let Ok(routes) = slot.routes.try_lock() else {
-                continue;
-            };
-            let Some(routes) = routes.as_ref() else {
-                continue;
-            };
-            slot.paths
-                .lock()
-                .expect("proxy paths")
-                .retain(|address, path| {
-                    if routes.updates.borrow().contains(address) {
-                        true
-                    } else {
-                        path.retire();
-                        false
-                    }
-                });
-        }
-    }
     #[cfg(test)]
     pub(super) fn test_stream_metrics(&self, id: &str) -> stats::Metrics {
         self.slots[id].stream_metrics.clone()
@@ -758,16 +511,9 @@ impl Pool {
         for slot in self.slots.values() {
             let mut aggregate = slot.aggregate.lock().await;
             let mut routes = slot.routes.lock().await;
-            let paths = std::mem::take(&mut *slot.paths.lock().expect("proxy paths"))
-                .into_values()
-                .collect();
             // Dropping a waiter detaches this task; it must not abort cleanup
             // and release the guard while its aggregate runtime still runs.
-            releases.push(tokio::spawn(stop_slot(
-                aggregate.take(),
-                routes.take(),
-                paths,
-            )));
+            releases.push(tokio::spawn(stop_slot(aggregate.take(), routes.take())));
         }
         for release in releases {
             let _ = release.await;
@@ -812,18 +558,11 @@ impl Drop for Pool {
         for slot in self.slots.values_mut() {
             let aggregate = slot.aggregate.get_mut().take();
             let routes = slot.routes.get_mut().take();
-            let paths = std::mem::take(
-                slot.paths
-                    .get_mut()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner),
-            )
-            .into_values()
-            .collect::<Vec<_>>();
             if let Some(current) = &aggregate {
                 current.connector.close();
             }
-            if aggregate.is_some() || routes.is_some() || !paths.is_empty() {
-                owned.push((aggregate, routes, paths));
+            if aggregate.is_some() || routes.is_some() {
+                owned.push((aggregate, routes));
             }
         }
         if owned.is_empty() {
@@ -832,9 +571,7 @@ impl Drop for Pool {
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             let stopping: Vec<_> = owned
                 .into_iter()
-                .map(|(aggregate, routes, paths)| {
-                    runtime.spawn(stop_slot(aggregate, routes, paths))
-                })
+                .map(|(aggregate, routes)| runtime.spawn(stop_slot(aggregate, routes)))
                 .collect();
             runtime.spawn(async move {
                 for task in stopping {
@@ -1055,10 +792,6 @@ async fn fixed_forward_supervisor(
 
 pub async fn client(options: ClientOptions) -> Result<()> {
     ensure!(
-        !options.game_mode || options.ordered_udp_ports.is_empty(),
-        "--ordered-udp-port cannot be combined with --game-mode on"
-    );
-    ensure!(
         !options.connect.is_empty() && options.connect.len() <= 32,
         "provide 1..32 discovery entries"
     );
@@ -1129,7 +862,6 @@ pub async fn client(options: ClientOptions) -> Result<()> {
             stop_rx.clone(),
         ));
     }
-    let ordered_udp_ports: Arc<[u16]> = options.ordered_udp_ports.into();
     for (listener, exit) in listeners {
         tracing::info!(address=%listener.local_addr()?, %exit, "SOCKS5 proxy ready");
         tasks.spawn(listen(
@@ -1138,7 +870,6 @@ pub async fn client(options: ClientOptions) -> Result<()> {
             exit,
             permits.clone(),
             options.socks5_early_reply,
-            ordered_udp_ports.clone(),
         ));
     }
     let mut discovery: JoinSet<Result<(Vec<mesh::Node>, Vec<String>)>> = JoinSet::new();
@@ -1181,7 +912,6 @@ pub async fn client(options: ClientOptions) -> Result<()> {
             biased;
             _ = shutdown.wait() => break,
             _ = maintenance.tick() => {
-                pool.retire_stale_udp_paths();
                 if tracing::enabled!(tracing::Level::DEBUG)
                     && diagnostics.as_ref().is_none_or(|task| task.is_finished())
                 {
@@ -1273,7 +1003,6 @@ pub(super) async fn listen(
     exit: String,
     permits: Arc<Semaphore>,
     early_reply: bool,
-    ordered_udp_ports: Arc<[u16]>,
 ) -> Result<()> {
     let mut tasks = JoinSet::new();
     loop {
@@ -1283,10 +1012,9 @@ pub(super) async fn listen(
                 let Ok(permit) = permits.clone().try_acquire_owned() else { continue; };
                 tcp.set_nodelay(true)?;
                 let pool = pool.clone(); let exit = exit.clone();
-                let ports = ordered_udp_ports.clone();
                 tasks.spawn(async move {
                     let _permit = permit;
-                    if let Err(error) = super::socks::serve(tcp, pool, &exit, early_reply, ports).await { tracing::debug!(%error, %exit, "SOCKS5 client closed"); }
+                    if let Err(error) = super::socks::serve(tcp, pool, &exit, early_reply).await { tracing::debug!(%error, %exit, "SOCKS5 client closed"); }
                 });
             }
             _ = tasks.join_next(), if !tasks.is_empty() => {}
@@ -1387,8 +1115,18 @@ mod lifecycle_tests {
         )
         .unwrap();
         let address = server.local_addr().unwrap();
-        let client =
-            transport::proxy_client(address, &pool.identity.dir.join("cert.pem"), None).unwrap();
+        let client = transport::client_bound_with_session_alpn(
+            address,
+            &pool.identity.dir.join("cert.pem"),
+            None,
+            transport::Congestion::Bbr,
+            None,
+            transport::DEFAULT_DATAGRAM_SEND_BUFFER_BYTES,
+            transport::AckRequest::Unchanged,
+            true,
+            false,
+        )
+        .unwrap();
         let (outgoing, incoming) = timeout(Duration::from_secs(3), async {
             tokio::join!(client.connect(address, "localhost").unwrap(), async {
                 server.accept().await.unwrap().await
@@ -1420,25 +1158,24 @@ mod lifecycle_tests {
     }
 
     #[tokio::test]
-    async fn cancelling_shutdown_waiter_keeps_runtime_then_path_cleanup_owned() {
+    async fn cancelling_shutdown_waiter_keeps_runtime_cleanup_owned() {
+        use std::sync::atomic::{AtomicBool, Ordering};
         let root = tempfile::tempdir().unwrap();
         let pool = pool(root.path());
         let connector = tunnel::tcp::Connector::new(pool.stream_budget.clone());
         let stopped = connector.clone();
+        let finished = Arc::new(AtomicBool::new(false));
+        let observed = finished.clone();
         let (entered, waiting) = tokio::sync::oneshot::channel();
         let (release, released) = tokio::sync::oneshot::channel();
         let runtime = tokio::spawn(async move {
             stopped.closed().await;
             entered.send(()).unwrap();
             released.await.unwrap();
+            observed.store(true, Ordering::Release);
             Ok(())
         });
-        let path = Arc::new(UdpPath::new("127.0.0.1:1".parse().unwrap()));
         let slot = &pool.slots["exit"];
-        slot.paths
-            .lock()
-            .unwrap()
-            .insert(path.address, path.clone());
         *slot.aggregate.lock().await = Some(Aggregate {
             connector,
             task: Some(runtime),
@@ -1449,19 +1186,13 @@ mod lifecycle_tests {
             .await
             .unwrap()
             .unwrap();
-        assert!(
-            !path.retired.load(std::sync::atomic::Ordering::Acquire),
-            "path retired before runtime finished"
-        );
+        assert!(!finished.load(Ordering::Acquire));
         waiter.abort();
         let _ = waiter.await;
-        assert!(
-            !path.retired.load(std::sync::atomic::Ordering::Acquire),
-            "cancelling the waiter released resources before runtime finished"
-        );
+        assert!(!finished.load(Ordering::Acquire));
         release.send(()).unwrap();
         timeout(Duration::from_secs(3), async {
-            while !path.retired.load(std::sync::atomic::Ordering::Acquire) {
+            while !finished.load(Ordering::Acquire) {
                 tokio::task::yield_now().await;
             }
         })
@@ -1510,7 +1241,6 @@ mod lifecycle_tests {
             false,
         )
         .unwrap();
-        let mut paths = Vec::new();
         let mut finished = Vec::new();
         let (first_closed, closed) = tokio::sync::oneshot::channel();
         let mut first_closed = Some(first_closed);
@@ -1563,14 +1293,6 @@ mod lifecycle_tests {
                 connector,
                 task: Some(task),
             });
-            let path = Arc::new(super::UdpPath::new(
-                nodes.iter().find(|node| node.id == exit).unwrap().address,
-            ));
-            slot.paths
-                .lock()
-                .unwrap()
-                .insert(path.address, path.clone());
-            paths.push(path);
             finished.push(completed);
         }
         assert_eq!(identity.status(c).await.unwrap().leases, 2);
@@ -1587,17 +1309,11 @@ mod lifecycle_tests {
         waiter.abort();
         let _ = waiter.await;
         assert!(!finished[1].load(Ordering::Acquire));
-        assert!(!paths[1].retired.load(Ordering::Acquire));
         drop(second);
         timeout(Duration::from_secs(3), pool.shutdown())
             .await
             .expect("cancelled waiter stranded another exit");
         assert!(finished.iter().all(|done| done.load(Ordering::Acquire)));
-        assert!(
-            paths
-                .iter()
-                .all(|path| path.retired.load(Ordering::Acquire))
-        );
         assert_eq!(identity.status(a).await.unwrap().leases, 0);
         assert_eq!(identity.status(b).await.unwrap().leases, 0);
         assert_eq!(identity.status(c).await.unwrap().leases, 0);

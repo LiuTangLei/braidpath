@@ -1,35 +1,44 @@
 //! Preserve UDP message boundaries over the aggregate's reliable byte stream.
 use super::{client::Pool, protocol::*, *};
 use crate::runtime::tunnel::StreamTarget;
-use std::{io, net::SocketAddr};
+use std::{
+    io,
+    net::SocketAddr,
+    sync::atomic::{AtomicU64, Ordering},
+};
 use tokio::{
-    net::{TcpListener, UdpSocket},
+    io::DuplexStream,
+    net::UdpSocket,
     sync::{OwnedSemaphorePermit, mpsc},
     time::timeout,
 };
 
-// Keep the aggregate's TCP socket adapter and its existing flow control. The
-// connected pair is created on loopback and its listener closes immediately.
-async fn stream_pair() -> io::Result<(TcpStream, TcpStream)> {
-    // Reserve the connecting socket before listening, then verify which peer
-    // was accepted. Even a local process cannot inject the stream's bytes.
-    let client = tokio::net::TcpSocket::new_v4()?;
-    client.bind("127.0.0.1:0".parse().expect("loopback"))?;
-    let expected = client.local_addr()?;
-    let listener = TcpListener::bind("127.0.0.1:0").await?;
-    let (client, (server, peer)) =
-        tokio::try_join!(client.connect(listener.local_addr()?), listener.accept())?;
-    if peer != expected {
-        return Err(io::Error::other("unexpected loopback peer"));
+const DUPLEX_CAPACITY: usize = 128 * 1024;
+const EARLY_INITIAL_LIMIT: usize = 16 * 1024;
+/// Short-lived request/reply flows (e.g., DNS/NTP or <=4-packet exchanges)
+/// release resources faster than long-lived VPN/QUIC destinations.
+const SHORT_UDP_IDLE: Duration = Duration::from_secs(15);
+const BULK_FLOW_PACKETS: u64 = 4;
+const LAZY_RECV_BUF_PACKETS: u64 = 32;
+
+fn idle_limit(port: u16, packets: u64) -> Duration {
+    if matches!(port, 53 | 123) || packets <= BULK_FLOW_PACKETS {
+        SHORT_UDP_IDLE
+    } else {
+        UDP_IDLE
     }
-    client.set_nodelay(true)?;
-    server.set_nodelay(true)?;
-    Ok((client, server))
 }
 
 fn frame(buffer: &mut [u8], len: usize) -> &[u8] {
     buffer[..2].copy_from_slice(&(len as u16).to_be_bytes());
     &buffer[..2 + len]
+}
+
+fn encode_frame(payload: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(2 + payload.len());
+    out.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+    out.extend_from_slice(payload);
+    out
 }
 
 async fn read_frame(mut read: impl AsyncRead + Unpin, buffer: &mut [u8]) -> io::Result<&[u8]> {
@@ -45,31 +54,35 @@ async fn read_frame(mut read: impl AsyncRead + Unpin, buffer: &mut [u8]) -> io::
 }
 
 pub(crate) struct Target {
-    stream: TcpStream,
-    bridge: TcpStream,
+    stream: DuplexStream,
+    bridge: DuplexStream,
     udp: UdpSocket,
     bound: SocketAddr,
+    target_port: u16,
     _permit: OwnedSemaphorePermit,
 }
 
 impl Target {
-    pub(crate) fn into_relay(self) -> (TcpStream, SocketAddr, impl Future<Output = ()>) {
+    pub(crate) fn into_relay(self) -> (DuplexStream, SocketAddr, impl Future<Output = ()>) {
         let Self {
             stream,
-            mut bridge,
+            bridge,
             udp,
             bound,
+            target_port,
             _permit,
         } = self;
         let relay = async move {
             let _permit = _permit;
-            let (mut read, mut write) = bridge.split();
+            let (mut read, mut write) = tokio::io::split(bridge);
             let active = Mutex::new(Instant::now());
+            let packets = AtomicU64::new(0);
             let uplink = async {
                 let mut buffer = vec![0; MAX_UDP];
                 loop {
                     let payload = read_frame(&mut read, &mut buffer).await?;
                     udp.send(payload).await?;
+                    packets.fetch_add(1, Ordering::Relaxed);
                     *active.lock().expect("UDP activity") = Instant::now();
                 }
                 #[allow(unreachable_code)]
@@ -77,12 +90,20 @@ impl Target {
             };
             let downlink = async {
                 let mut buffer = vec![0; 2 + MAX_UDP + 1];
+                let mut rx_packets = 0u64;
                 loop {
                     let n = udp.recv(&mut buffer[2..]).await?;
                     if n > MAX_UDP {
                         continue;
                     }
+                    rx_packets += 1;
+                    if rx_packets == LAZY_RECV_BUF_PACKETS {
+                        // Only sustained flows (VPN, HTTP/3 download) allocate
+                        // a 2 MiB kernel receive buffer.
+                        enlarge_recv_buffer(socket2::SockRef::from(&udp));
+                    }
                     write.write_all(frame(&mut buffer, n)).await?;
+                    packets.fetch_add(1, Ordering::Relaxed);
                     *active.lock().expect("UDP activity") = Instant::now();
                 }
                 #[allow(unreachable_code)]
@@ -92,7 +113,8 @@ impl Target {
                 let mut maintenance = tokio::time::interval(Duration::from_secs(5));
                 loop {
                     maintenance.tick().await;
-                    if active.lock().expect("UDP activity").elapsed() >= UDP_IDLE {
+                    let limit = idle_limit(target_port, packets.load(Ordering::Relaxed));
+                    if active.lock().expect("UDP activity").elapsed() >= limit {
                         break;
                     }
                 }
@@ -173,15 +195,15 @@ pub(crate) async fn connect(
             if udp.connect(address).await.is_err() {
                 continue;
             }
-            enlarge_recv_buffer(socket2::SockRef::from(&udp));
             let bound = udp.local_addr().map_err(|_| 1u8)?;
-            let (stream, bridge) = stream_pair().await.map_err(|_| 1u8)?;
+            let (stream, bridge) = tokio::io::duplex(DUPLEX_CAPACITY);
             tracing::debug!(port = address.port(), "ordered UDP destination opened");
             return Ok(Target {
                 stream,
                 bridge,
                 udp,
                 bound,
+                target_port: address.port(),
                 _permit: permit,
             });
         }
@@ -196,24 +218,41 @@ pub(super) async fn forward(
     exit: &str,
     target: Address,
     relay: &super::socks::Relay,
+    first_payload: Vec<u8>,
     mut requests: mpsc::Receiver<Vec<u8>>,
 ) -> Result<()> {
-    let (flow, mut bridge, header) = timeout(CONNECT_TIMEOUT, async {
+    let target_port = target.port();
+    let first_framed = encode_frame(&first_payload);
+    let (initial, deferred_first) = if first_framed.len() <= EARLY_INITIAL_LIMIT {
+        (first_framed, None)
+    } else {
+        (Vec::new(), Some(first_framed))
+    };
+    let (flow, stream, bridge, header) = timeout(CONNECT_TIMEOUT, async {
         let connector = pool.prepare_stream(exit).await?;
         let mut header = vec![0, 0, 0];
         target.encode(&mut header);
-        let flow = connector.open_ordered_udp(target.into()).await?;
-        let (stream, bridge) = stream_pair().await?;
-        Ok::<_, anyhow::Error>(((flow, stream), bridge, header))
+        let flow = connector.open_ordered_udp(target.into(), initial).await?;
+        let (stream, bridge) = tokio::io::duplex(DUPLEX_CAPACITY);
+        Ok::<_, anyhow::Error>((flow, stream, bridge, header))
     })
     .await??;
-    let (flow, stream) = flow;
-    let (mut read, mut write) = bridge.split();
+    let (mut read, mut write) = tokio::io::split(bridge);
+    let active = Mutex::new(Instant::now());
+    let packets = AtomicU64::new(1);
     let uplink = async {
+        if let Some(first) = deferred_first {
+            write.write_all(&first).await?;
+        }
         let mut buffer = vec![0; 2 + MAX_UDP];
         while let Some(payload) = requests.recv().await {
+            if payload.len() > MAX_UDP {
+                continue;
+            }
             buffer[2..2 + payload.len()].copy_from_slice(&payload);
             write.write_all(frame(&mut buffer, payload.len())).await?;
+            packets.fetch_add(1, Ordering::Relaxed);
+            *active.lock().expect("UDP activity") = Instant::now();
         }
         Ok::<_, io::Error>(())
     };
@@ -226,14 +265,27 @@ pub(super) async fn forward(
             response.truncate(offset);
             response.extend_from_slice(payload);
             relay.send(&response).await?;
+            packets.fetch_add(1, Ordering::Relaxed);
+            *active.lock().expect("UDP activity") = Instant::now();
         }
         #[allow(unreachable_code)]
         Ok::<_, io::Error>(())
     };
+    let idle = async {
+        let mut maintenance = tokio::time::interval(Duration::from_secs(5));
+        loop {
+            maintenance.tick().await;
+            let limit = idle_limit(target_port, packets.load(Ordering::Relaxed));
+            if active.lock().expect("UDP activity").elapsed() >= limit {
+                break;
+            }
+        }
+    };
     tokio::select! {
-        result = flow.run(stream) => result,
+        result = flow.run_memory(stream) => result,
         result = uplink => Ok(result?),
         result = downlink => Ok(result?),
+        _ = idle => Ok(()),
     }
 }
 
@@ -272,5 +324,14 @@ mod tests {
         let mut explicit_v6 = vec![v6];
         prefer_ipv4(&mut explicit_v6);
         assert_eq!(explicit_v6, vec![v6]);
+    }
+
+    #[test]
+    fn adaptive_idle_ttl_reclaims_dns_and_short_exchanges_faster() {
+        assert_eq!(idle_limit(53, 100), SHORT_UDP_IDLE);
+        assert_eq!(idle_limit(123, 100), SHORT_UDP_IDLE);
+        assert_eq!(idle_limit(443, 2), SHORT_UDP_IDLE);
+        assert_eq!(idle_limit(443, 10), UDP_IDLE);
+        assert_eq!(idle_limit(4500, 10), UDP_IDLE);
     }
 }

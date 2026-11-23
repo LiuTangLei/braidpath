@@ -14,7 +14,7 @@ const RESERVED: usize = 128 * 1024;
 // existing byte limit first. Gap repairs retain private slots per flow.
 const SHARED_RECORDS: usize = 65_536;
 const RESERVED_RECORDS: usize = 128;
-use super::MAX_TCP_FLOWS;
+use super::{MAX_TCP_FLOWS, MAX_UDP_FLOWS};
 
 #[derive(Default)]
 struct Pool {
@@ -35,6 +35,7 @@ pub(super) struct Pressure {
 }
 pub(crate) struct Budget {
     flows: Arc<Semaphore>,
+    udp_flows: Arc<Semaphore>,
     pub(super) range_slots: Arc<Semaphore>,
     tx: Arc<Pool>,
     rx: Arc<Pool>,
@@ -49,6 +50,7 @@ impl Budget {
     pub(crate) fn new() -> Self {
         Self {
             flows: Arc::new(Semaphore::new(MAX_TCP_FLOWS)),
+            udp_flows: Arc::new(Semaphore::new(MAX_UDP_FLOWS)),
             range_slots: Arc::new(Semaphore::new(SHARED_RECORDS)),
             tx: Arc::default(),
             rx: Arc::default(),
@@ -67,6 +69,9 @@ impl Budget {
             self.tx.shared.lock().expect("stream budget").held
                 + self.rx.shared.lock().expect("stream budget").held,
         )
+    }
+    pub(crate) fn udp_flows(&self) -> usize {
+        MAX_UDP_FLOWS - self.udp_flows.available_permits()
     }
     pub(super) fn pressure(&self) -> (Pressure, Pressure, usize) {
         (
@@ -91,24 +96,7 @@ impl Budget {
             crate::runtime::stream::MAX_WINDOW,
         )
     }
-    pub(super) fn try_flow(&self) -> Option<Arc<Lease>> {
-        let permit = Arc::new(self.flows.clone().try_acquire_owned().ok()?);
-        Some(Arc::new(Lease {
-            tx: Arc::new(Allowance::new(self.tx.clone(), permit.clone())),
-            rx: Arc::new(Allowance::new(self.rx.clone(), permit)),
-            tx_held: Mutex::default(),
-            rx_held: Mutex::default(),
-            rate: self.rate.clone(),
-        }))
-    }
-    pub(super) async fn flow(&self) -> Arc<Lease> {
-        let permit = Arc::new(
-            self.flows
-                .clone()
-                .acquire_owned()
-                .await
-                .expect("stream flow budget"),
-        );
+    fn lease(&self, permit: Arc<OwnedSemaphorePermit>) -> Arc<Lease> {
         Arc::new(Lease {
             tx: Arc::new(Allowance::new(self.tx.clone(), permit.clone())),
             rx: Arc::new(Allowance::new(self.rx.clone(), permit)),
@@ -116,6 +104,37 @@ impl Budget {
             rx_held: Mutex::default(),
             rate: self.rate.clone(),
         })
+    }
+    #[cfg(test)]
+    pub(super) fn try_flow(&self) -> Option<Arc<Lease>> {
+        self.try_flow_for(false)
+    }
+    pub(super) fn try_flow_for(&self, ordered_udp: bool) -> Option<Arc<Lease>> {
+        let sem = if ordered_udp {
+            &self.udp_flows
+        } else {
+            &self.flows
+        };
+        let permit = Arc::new(sem.clone().try_acquire_owned().ok()?);
+        Some(self.lease(permit))
+    }
+    #[cfg(test)]
+    pub(super) async fn flow(&self) -> Arc<Lease> {
+        self.flow_for(false).await
+    }
+    pub(super) async fn flow_for(&self, ordered_udp: bool) -> Arc<Lease> {
+        let sem = if ordered_udp {
+            &self.udp_flows
+        } else {
+            &self.flows
+        };
+        let permit = Arc::new(
+            sem.clone()
+                .acquire_owned()
+                .await
+                .expect("stream flow budget"),
+        );
+        self.lease(permit)
     }
 }
 pub(super) struct RangeSlot {

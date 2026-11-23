@@ -29,10 +29,8 @@ use std::{
     },
     time::{Duration, Instant},
 };
-#[cfg(test)]
-use tokio::io::AsyncReadExt;
 use tokio::{
-    io::AsyncWriteExt,
+    io::{AsyncReadExt, AsyncWriteExt, DuplexStream, ReadHalf, WriteHalf},
     net::{
         TcpListener, TcpStream, UdpSocket,
         tcp::{OwnedReadHalf, OwnedWriteHalf},
@@ -81,17 +79,52 @@ impl Drop for CancelGuard {
         self.0.wake.notify_one();
     }
 }
+pub(crate) enum LocalStream {
+    Tcp(TcpStream),
+    Memory(DuplexStream),
+}
+impl LocalStream {
+    fn set_abort_linger(&self) {
+        if let Self::Tcp(tcp) = self {
+            let _ = socket2::SockRef::from(tcp).set_linger(Some(Duration::ZERO));
+        }
+    }
+    fn split(self) -> (LocalRead, LocalWrite) {
+        match self {
+            Self::Tcp(tcp) => {
+                let _ = socket2::SockRef::from(&tcp).set_linger(None);
+                let _ = tcp.set_nodelay(true);
+                let (read, write) = tcp.into_split();
+                (LocalRead::Tcp(read), LocalWrite::Tcp(write))
+            }
+            Self::Memory(stream) => {
+                let (read, write) = tokio::io::split(stream);
+                (LocalRead::Memory(read), LocalWrite::Memory(write))
+            }
+        }
+    }
+}
+enum LocalRead {
+    Tcp(OwnedReadHalf),
+    Memory(ReadHalf<DuplexStream>),
+}
+enum LocalWrite {
+    Tcp(OwnedWriteHalf),
+    Memory(WriteHalf<DuplexStream>),
+}
+
 enum Command {
     Open {
         target: Destination,
         ordered_udp: bool,
         early_reply: bool,
+        initial: Vec<u8>,
         lease: Arc<Lease>,
         cancel: Arc<Cancel>,
         reply: oneshot::Sender<Result<(u32, SocketAddr), u8>>,
         done: oneshot::Sender<Result<(), String>>,
     },
-    Attach(u32, TcpStream),
+    Attach(u32, LocalStream),
     Associate(TcpStream, u16),
 }
 struct ConnectorState {
@@ -200,11 +233,16 @@ impl Connector {
         target: Destination,
         early_reply: bool,
     ) -> anyhow::Result<Flow> {
-        self.open_addressed(target, false, early_reply).await
+        self.open_addressed(target, false, early_reply, Vec::new())
+            .await
     }
 
-    pub(crate) async fn open_ordered_udp(&self, target: Destination) -> anyhow::Result<Flow> {
-        self.open_addressed(target, true, false).await
+    pub(crate) async fn open_ordered_udp(
+        &self,
+        target: Destination,
+        initial: Vec<u8>,
+    ) -> anyhow::Result<Flow> {
+        self.open_addressed(target, true, true, initial).await
     }
 
     async fn open_addressed(
@@ -212,11 +250,12 @@ impl Connector {
         target: Destination,
         ordered_udp: bool,
         early_reply: bool,
+        initial: Vec<u8>,
     ) -> anyhow::Result<Flow> {
         let mut generation = self.0.active.subscribe();
         let channel = self.active_channel(&mut generation).await?;
         let lease = tokio::select! {
-            lease = self.0.budget.flow() => lease,
+            lease = self.0.budget.flow_for(ordered_udp) => lease,
             _ = generation.changed() => anyhow::bail!("aggregate generation changed during admission"),
         };
         anyhow::ensure!(
@@ -236,6 +275,7 @@ impl Connector {
                 target,
                 ordered_udp,
                 early_reply,
+                initial,
                 lease: lease.clone(),
                 cancel,
                 reply,
@@ -290,17 +330,23 @@ impl Flow {
     pub(crate) fn bound(&self) -> SocketAddr {
         self.bound
     }
-    pub(crate) async fn run(mut self, tcp: TcpStream) -> anyhow::Result<()> {
+    pub(crate) async fn run(self, tcp: TcpStream) -> anyhow::Result<()> {
+        self.run_local(LocalStream::Tcp(tcp)).await
+    }
+    pub(crate) async fn run_memory(self, stream: DuplexStream) -> anyhow::Result<()> {
+        self.run_local(LocalStream::Memory(stream)).await
+    }
+    async fn run_local(mut self, stream: LocalStream) -> anyhow::Result<()> {
         // Before Attach succeeds, any failure or cancelled channel send must
         // reset the accepted socket rather than imply a complete empty stream.
-        let _ = socket2::SockRef::from(&tcp).set_linger(Some(Duration::ZERO));
+        stream.set_abort_linger();
         anyhow::ensure!(
             !self.channel.closed.load(Ordering::Acquire),
             "aggregate flow belongs to a retired generation"
         );
         self.channel
             .commands
-            .send(Command::Attach(self.id, tcp))
+            .send(Command::Attach(self.id, stream))
             .await
             .map_err(|_| anyhow::anyhow!("aggregate generation ended"))?;
         self.completion
@@ -315,7 +361,10 @@ impl Flow {
 /// Host TCP admission limit. The proxy listener and retained-byte budgets
 /// use the same count so concurrent CONNECTs do not hit a lower front-door cap.
 pub(crate) const MAX_TCP_FLOWS: usize = 512;
-const MAX_CONTROL: usize = 2 * MAX_TCP_FLOWS;
+/// Separate admission limit for ordered reliable UDP destinations so UDP fanout
+/// cannot starve concurrent TCP streams.
+pub(crate) const MAX_UDP_FLOWS: usize = 512;
+const MAX_CONTROL: usize = 2 * (MAX_TCP_FLOWS + MAX_UDP_FLOWS);
 const READ_CHUNK: usize = 64 * 1024;
 /// Local read-ahead beyond the peer's window, so sending never waits on a read.
 const READ_AHEAD: u64 = 256 * 1024;
@@ -332,6 +381,9 @@ const PUBLISH_EVERY: Duration = Duration::from_millis(500);
 const RETRY_FULL: Duration = Duration::from_millis(1);
 /// Stream identifiers with this bit carry a destination header.
 const ADDRESSED: u32 = 1 << 28;
+/// Stream identifiers with this bit carry an ordered reliable UDP destination
+/// billed against `MAX_UDP_FLOWS` instead of `MAX_TCP_FLOWS`.
+const ORDERED_UDP_STREAM: u32 = 1 << 26;
 /// Address header prefix for a reliable, length-prefixed UDP destination.
 const ORDERED_UDP: u8 = 9;
 /// A stream with at most this much unacknowledged data is latency-bound, not
@@ -844,8 +896,13 @@ impl Mux {
     pub(super) async fn wake(&mut self) -> Wake {
         let now = Instant::now();
         let deadline = tokio::time::Instant::from_std(self.deadline(now));
-        let accepting = self.streams.len() < MAX_TCP_FLOWS
-            && self.accept_paused_until.is_none_or(|at| now >= at);
+        let tcp_streams = self
+            .streams
+            .keys()
+            .filter(|id| **id & ORDERED_UDP_STREAM == 0)
+            .count();
+        let accepting =
+            tcp_streams < MAX_TCP_FLOWS && self.accept_paused_until.is_none_or(|at| now >= at);
         let fixed = self.listeners.fixed.clone().filter(|_| accepting);
         let proxy = self.listeners.proxy.clone().filter(|_| accepting);
         let registration = self.registration.as_ref().map(|r| r.channel.clone());
@@ -872,15 +929,13 @@ impl Mux {
         self.budget.receive_window()
     }
 
-    fn attach(&mut self, id: u32, tcp: TcpStream) {
+    fn attach(&mut self, id: u32, stream: LocalStream) {
         let Some(s) = self.streams.get_mut(&id) else {
-            // The stream already reset: close with RST, not FIN.
-            let _ = socket2::SockRef::from(&tcp).set_linger(Some(Duration::ZERO));
+            // The stream already reset: close TCP with RST, not FIN.
+            stream.set_abort_linger();
             return;
         };
-        let _ = socket2::SockRef::from(&tcp).set_linger(None);
-        let _ = tcp.set_nodelay(true);
-        let (read, write) = tcp.into_split();
+        let (read, write) = stream.split();
         let reads = Arc::new(Semaphore::new(0));
         let (writer, ops) = mpsc::unbounded_channel();
         let reset = Arc::new(Notify::new());
@@ -911,7 +966,8 @@ impl Mux {
     }
 
     fn open(&mut self, id: u32, open: bool) -> bool {
-        let Some(lease) = self.budget.try_flow() else {
+        let ordered_udp = id & ORDERED_UDP_STREAM != 0;
+        let Some(lease) = self.budget.try_flow_for(ordered_udp) else {
             return false;
         };
         self.open_lease(id, open, lease);
@@ -958,6 +1014,7 @@ impl Mux {
                 target,
                 ordered_udp,
                 early_reply,
+                initial,
                 lease,
                 cancel,
                 reply,
@@ -971,7 +1028,7 @@ impl Mux {
                 {
                     return;
                 }
-                let Some(id) = self.next_id(true) else {
+                let Some(id) = self.next_id(true, ordered_udp) else {
                     let _ = reply.send(Err(proxy::GENERAL_FAILURE));
                     return;
                 };
@@ -985,6 +1042,12 @@ impl Mux {
                 let mut header = target.encode();
                 if ordered_udp {
                     header.insert(0, ORDERED_UDP);
+                }
+                // Coalesce 0-RTT initial payload (e.g., first DNS/QUIC datagram)
+                // into the opening flight when it fits inside EARLY_OPEN_BYTES.
+                if !initial.is_empty() && initial.len() <= EARLY_OPEN_BYTES as usize {
+                    header.extend_from_slice(&initial);
+                    self.stats.bytes_from_application += initial.len() as u64;
                 }
                 if !stream.push(&header) {
                     self.reset(id, "destination header budget exhausted");
@@ -1003,7 +1066,7 @@ impl Mux {
                         .spawn(refuse(tcp, proxy::Kind::Socks, proxy::GENERAL_FAILURE));
                 }
             }
-            Command::Attach(id, tcp) => {
+            Command::Attach(id, stream) => {
                 let valid = self.streams.get(&id).is_some_and(|s| {
                     (!s.status_pending || s.early_status_deadline.is_some())
                         && s.cancel
@@ -1014,9 +1077,9 @@ impl Mux {
                     .as_ref()
                     .is_some_and(|r| !r.channel.closed.load(Ordering::Acquire));
                 if valid {
-                    self.attach(id, tcp);
+                    self.attach(id, stream);
                 } else {
-                    let _ = socket2::SockRef::from(&tcp).set_linger(Some(Duration::ZERO));
+                    stream.set_abort_linger();
                 }
             }
         }
@@ -1084,10 +1147,10 @@ impl Mux {
             Wake::Io(event) => self.io(event),
             Wake::GameIo(event) => self.game_io(event),
             Wake::Accept(Ok((tcp, _))) => {
-                if let Some(id) = self.next_id(false)
+                if let Some(id) = self.next_id(false, false)
                     && self.open(id, true)
                 {
-                    self.attach(id, tcp);
+                    self.attach(id, LocalStream::Tcp(tcp));
                 }
             }
             Wake::ProxyAccept(Ok((mut tcp, _))) => {
@@ -1138,13 +1201,13 @@ impl Mux {
                 }
             }
             Io::Failed(id) => self.reset(id, "local socket failed"),
-            Io::Connected(id, tcp) => self.attach(id, tcp),
-            Io::Reached(id, tcp, bound) => self.reached(id, tcp, bound),
+            Io::Connected(id, tcp) => self.attach(id, LocalStream::Tcp(tcp)),
+            Io::Reached(id, tcp, bound) => self.reached(id, LocalStream::Tcp(tcp), bound),
             Io::OrderedUdpReached(id, target) => {
                 if let Some(stream) = self.streams.get_mut(&id) {
-                    let (tcp, bound, relay) = target.into_relay();
+                    let (memory, bound, relay) = target.into_relay();
                     stream.tasks.push(self.tasks.spawn(relay));
-                    self.reached(id, tcp, bound);
+                    self.reached(id, LocalStream::Memory(memory), bound);
                 }
             }
             Io::Refused(id, status) => {
@@ -1190,13 +1253,18 @@ impl Mux {
                 }
             }
             Io::Proxied(tcp, request) => {
-                if self.streams.len() >= MAX_TCP_FLOWS {
+                let tcp_streams = self
+                    .streams
+                    .keys()
+                    .filter(|id| **id & ORDERED_UDP_STREAM == 0)
+                    .count();
+                if tcp_streams >= MAX_TCP_FLOWS {
                     self.stats.rejected += 1;
                     self.tasks
                         .spawn(refuse(tcp, request.kind, proxy::GENERAL_FAILURE));
                     return;
                 }
-                let Some(id) = self.next_id(true) else {
+                let Some(id) = self.next_id(true, false) else {
                     self.tasks
                         .spawn(refuse(tcp, request.kind, proxy::GENERAL_FAILURE));
                     return;
@@ -1354,21 +1422,32 @@ impl Mux {
         }
     }
 
-    /// Client stream identifiers; addressed streams set `ADDRESSED`.
-    fn next_id(&mut self, addressed: bool) -> Option<u32> {
-        if self.next_stream + 1 >= associate::FLAG {
+    /// Client stream identifiers; addressed streams set `ADDRESSED` and ordered
+    /// reliable UDP streams additionally set `ORDERED_UDP_STREAM`.
+    fn next_id(&mut self, addressed: bool, ordered_udp: bool) -> Option<u32> {
+        if self.next_stream + 1 >= ORDERED_UDP_STREAM {
             warn!("stream identifiers exhausted; refusing local connection");
             self.stats.rejected += 1;
             return None;
         }
         self.next_stream += 1;
-        Some(self.next_stream | if addressed { ADDRESSED } else { 0 })
+        let mut id = self.next_stream;
+        if addressed {
+            id |= ADDRESSED;
+        }
+        if ordered_udp {
+            id |= ORDERED_UDP_STREAM;
+        }
+        Some(id)
     }
 
     /// Open a peer-initiated stream if this session accepts its kind.
     fn accept_stream(&mut self, id: u32, now: Instant) -> bool {
         let addressed = id & ADDRESSED != 0;
-        let accepted = if addressed {
+        let ordered_udp = id & ORDERED_UDP_STREAM != 0;
+        let accepted = if ordered_udp {
+            addressed && self.targets.proxy.is_some()
+        } else if addressed {
             self.targets.proxy.is_some()
         } else {
             self.targets.fixed.is_some()
@@ -1385,7 +1464,17 @@ impl Mux {
             self.queue_control(stream::data_flow(id), Frame::Reset.encode());
             return false;
         }
-        if self.streams.len() >= MAX_TCP_FLOWS {
+        let kind_count = self
+            .streams
+            .keys()
+            .filter(|existing| (**existing & ORDERED_UDP_STREAM != 0) == ordered_udp)
+            .count();
+        let kind_limit = if ordered_udp {
+            MAX_UDP_FLOWS
+        } else {
+            MAX_TCP_FLOWS
+        };
+        if kind_count >= kind_limit {
             self.stats.rejected += 1;
             self.remember_closed(id, now, None);
             self.queue_control(stream::data_flow(id), Frame::Reset.encode());
@@ -1417,15 +1506,15 @@ impl Mux {
         true
     }
 
-    fn reached(&mut self, id: u32, tcp: TcpStream, bound: SocketAddr) {
-        if let Some(stream) = self.streams.get_mut(&id) {
+    fn reached(&mut self, id: u32, stream: LocalStream, bound: SocketAddr) {
+        if let Some(s) = self.streams.get_mut(&id) {
             let mut response = vec![proxy::OK];
             response.extend(Destination::Ip(bound).encode());
-            if !stream.push(&response) {
+            if !s.push(&response) {
                 self.reset(id, "status header budget exhausted");
                 return;
             }
-            self.attach(id, tcp);
+            self.attach(id, stream);
         }
     }
 
@@ -1439,6 +1528,9 @@ impl Mux {
         if let Some(header) = &mut s.header {
             header.append(&mut ready);
             let ordered = usize::from(header.first() == Some(&ORDERED_UDP));
+            if !header.is_empty() && (ordered != 0) != (id & ORDERED_UDP_STREAM != 0) {
+                return self.reset(id, "mismatched ordered UDP stream flag");
+            }
             match Destination::decode(&header[ordered..]) {
                 Ok(None) if s.recv.fin_received() => {
                     return self.reset(id, "incomplete destination");
@@ -2051,7 +2143,7 @@ async fn refuse(mut tcp: TcpStream, kind: proxy::Kind, status: u8) {
 
 async fn read_loop(
     id: u32,
-    read: OwnedReadHalf,
+    mut read: LocalRead,
     reads: Arc<Semaphore>,
     events: mpsc::UnboundedSender<Io>,
     lease: Arc<Lease>,
@@ -2071,37 +2163,67 @@ async fn read_loop(
                 .forget();
         }
         let capacity = extra + 1;
-        // Idle sockets keep their flow slot, never shared data credit. A
-        // readiness false positive returns both credits before waiting again.
-        if read.readable().await.is_err() {
-            let _ = events.send(Io::Failed(id));
-            return;
-        }
-        let mut credit = lease.tx.take(capacity).await;
-        match read.try_read(&mut buffer[..capacity]) {
-            Ok(0) => {
-                let _ = events.send(Io::ReadEnd(id));
-                return;
-            }
-            Ok(n) => {
-                reads.add_permits(capacity - n);
-                credit.truncate(n);
-                if let Some(rate) = &lease.rate {
-                    rate.acquire(n).await;
-                }
-                if events
-                    .send(Io::ReadBudgeted(id, buffer[..n].to_vec(), credit))
-                    .is_err()
-                {
+        match &mut read {
+            LocalRead::Tcp(tcp) => {
+                // Idle sockets keep their flow slot, never shared data credit. A
+                // readiness false positive returns both credits before waiting again.
+                if tcp.readable().await.is_err() {
+                    let _ = events.send(Io::Failed(id));
                     return;
                 }
+                let mut credit = lease.tx.take(capacity).await;
+                match tcp.try_read(&mut buffer[..capacity]) {
+                    Ok(0) => {
+                        let _ = events.send(Io::ReadEnd(id));
+                        return;
+                    }
+                    Ok(n) => {
+                        reads.add_permits(capacity - n);
+                        credit.truncate(n);
+                        if let Some(rate) = &lease.rate {
+                            rate.acquire(n).await;
+                        }
+                        if events
+                            .send(Io::ReadBudgeted(id, buffer[..n].to_vec(), credit))
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        reads.add_permits(capacity);
+                    }
+                    Err(_) => {
+                        let _ = events.send(Io::Failed(id));
+                        return;
+                    }
+                }
             }
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                reads.add_permits(capacity);
-            }
-            Err(_) => {
-                let _ = events.send(Io::Failed(id));
-                return;
+            LocalRead::Memory(stream) => {
+                // In-memory duplex channels wait without holding shared TX credit.
+                match stream.read(&mut buffer[..capacity]).await {
+                    Ok(0) => {
+                        let _ = events.send(Io::ReadEnd(id));
+                        return;
+                    }
+                    Ok(n) => {
+                        reads.add_permits(capacity - n);
+                        let credit = lease.tx.take(n).await;
+                        if let Some(rate) = &lease.rate {
+                            rate.acquire(n).await;
+                        }
+                        if events
+                            .send(Io::ReadBudgeted(id, buffer[..n].to_vec(), credit))
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                    Err(_) => {
+                        let _ = events.send(Io::Failed(id));
+                        return;
+                    }
+                }
             }
         }
     }
@@ -2111,7 +2233,7 @@ async fn read_loop(
 /// a FIN that could make a truncated stream look complete.
 async fn write_loop(
     id: u32,
-    mut write: OwnedWriteHalf,
+    mut write: LocalWrite,
     mut ops: mpsc::UnboundedReceiver<WriteOp>,
     reset: Arc<Notify>,
     events: mpsc::UnboundedSender<Io>,
@@ -2147,7 +2269,16 @@ async fn write_loop(
                 let written = tokio::select! {
                     biased;
                     _ = reset.notified() => break false,
-                    written = write_payload(id, &mut write, &data, &lease, &events) => written,
+                    written = async {
+                        match &mut write {
+                            LocalWrite::Tcp(tcp) => {
+                                write_payload(id, tcp, &data, &lease, &events).await
+                            }
+                            LocalWrite::Memory(stream) => {
+                                write_payload(id, stream, &data, &lease, &events).await
+                            }
+                        }
+                    } => written,
                 };
                 if written.is_err() {
                     let _ = events.send(Io::Failed(id));
@@ -2165,13 +2296,19 @@ async fn write_loop(
                     );
                 }
             }
-            Some(WriteOp::Finish) => break write.shutdown().await.is_ok(),
+            Some(WriteOp::Finish) => {
+                let ok = match &mut write {
+                    LocalWrite::Tcp(tcp) => tcp.shutdown().await.is_ok(),
+                    LocalWrite::Memory(stream) => stream.shutdown().await.is_ok(),
+                };
+                break ok;
+            }
             None => break false,
         }
     };
-    if !finished {
-        let _ = socket2::SockRef::from(write.as_ref()).set_linger(Some(Duration::ZERO));
-        write.forget();
+    if !finished && let LocalWrite::Tcp(tcp) = write {
+        let _ = socket2::SockRef::from(tcp.as_ref()).set_linger(Some(Duration::ZERO));
+        tcp.forget();
     }
 }
 
@@ -2426,7 +2563,7 @@ mod tests {
             drop(ops);
             let task = tokio::spawn(write_loop(
                 1,
-                write,
+                LocalWrite::Tcp(write),
                 input,
                 Arc::new(Notify::new()),
                 events,
@@ -3314,6 +3451,7 @@ mod tests {
                     target: Destination::Ip("127.0.0.1:1".parse().unwrap()),
                     ordered_udp: false,
                     early_reply: false,
+                    initial: Vec::new(),
                     lease: filler.clone(),
                     cancel: Arc::new(Cancel {
                         cancelled: AtomicBool::new(true),

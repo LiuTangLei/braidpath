@@ -176,9 +176,11 @@ fn versioned_session_policy_round_trips_and_rejects_malformed_or_wrong_echo() {
         requested.native_return = !native;
         assert!(confirm_mode(&headers, &requested).is_err());
     }
-    headers.append(MODE_HEADER, http::HeaderValue::from_static("1/mixed"));
+    headers.append(MODE_HEADER, http::HeaderValue::from_static("2/mixed"));
     assert!(read_mode(&headers).is_err());
-    headers.insert(MODE_HEADER, http::HeaderValue::from_static("2/mixed"));
+    headers.insert(MODE_HEADER, http::HeaderValue::from_static("1/mixed"));
+    assert!(read_mode(&headers).is_err());
+    headers.insert(MODE_HEADER, http::HeaderValue::from_static("3/mixed"));
     assert!(read_mode(&headers).is_err());
 }
 

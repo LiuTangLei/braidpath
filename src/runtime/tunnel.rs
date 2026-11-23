@@ -301,10 +301,10 @@ const MODE_HEADER: &str = "braidpath-policy";
 
 fn mode_value(game: bool, native: bool) -> &'static str {
     match (game, native) {
-        (false, false) => "1/datagram",
-        (false, true) => "1/native",
-        (true, false) => "1/game",
-        (true, true) => "1/mixed",
+        (false, false) => "2/datagram",
+        (false, true) => "2/native",
+        (true, false) => "2/game",
+        (true, true) => "2/mixed",
     }
 }
 
@@ -313,10 +313,10 @@ fn read_mode(headers: &http::HeaderMap) -> Result<(bool, bool)> {
     let value = values.next().context("missing session policy")?.to_str()?;
     ensure!(values.next().is_none(), "duplicate session policy");
     match value {
-        "1/datagram" => Ok((false, false)),
-        "1/native" => Ok((false, true)),
-        "1/game" => Ok((true, false)),
-        "1/mixed" => Ok((true, true)),
+        "2/datagram" => Ok((false, false)),
+        "2/native" => Ok((false, true)),
+        "2/game" => Ok((true, false)),
+        "2/mixed" => Ok((true, true)),
         _ => bail!("unsupported session policy"),
     }
 }
@@ -4410,7 +4410,7 @@ async fn serve_with_budgets(
             incoming=endpoint.accept()=>{
                 let Some(incoming)=incoming else{break};
                 let Ok(permit)=pending_connections.clone().try_acquire_owned() else{incoming.refuse();continue};
-                let sessions=sessions.clone(); let secret=secret.clone(); let target=options.target; let settings=ServerSessionSettings{max_rate:options.max_rate,adaptive_fec_retention:options.adaptive_fec_retention,mesh:mesh.clone(),data_connections:data_connections.clone(),proxy:options.proxy.clone(),tcp_budget:tcp_budget.clone(),tcp:tcp::Targets{fixed:options.tcp_target,proxy:options.stream_proxy,allow_associations:mesh.is_none() && options.proxy.is_none(),proxy_gateway:options.proxy.clone()}}; let metrics=options.stats.clone();
+                let sessions=sessions.clone(); let secret=secret.clone(); let target=options.target; let settings=ServerSessionSettings{max_rate:options.max_rate,adaptive_fec_retention:options.adaptive_fec_retention,mesh:mesh.clone(),data_connections:data_connections.clone(),tcp_budget:tcp_budget.clone(),tcp:tcp::Targets{fixed:options.tcp_target,proxy:options.stream_proxy,allow_associations:mesh.is_none() && options.proxy.is_none(),proxy_gateway:options.proxy.clone()}}; let metrics=options.stats.clone();
                 tasks.spawn(async move {
                     let mut diagnostic=stats::ConnectionTrace::new(metrics.clone(),incoming.remote_address(),None,"incoming");
                     let result=server_connection(incoming,permit,sessions,secret,target,settings,metrics,&mut diagnostic).await;
@@ -4470,7 +4470,6 @@ async fn serve_with_budgets(
 
 #[derive(Clone)]
 struct ServerSessionSettings {
-    proxy: Option<Arc<super::proxy::Server>>,
     data_connections: Arc<Semaphore>,
     mesh: Option<Arc<mesh::State>>,
     max_rate: u64,
@@ -4578,7 +4577,6 @@ async fn server_connection(
     diagnostic: &mut stats::ConnectionTrace,
 ) -> Result<()> {
     let ServerSessionSettings {
-        proxy,
         data_connections,
         mesh,
         max_rate,
@@ -4592,13 +4590,6 @@ async fn server_connection(
         .handshake_data()
         .and_then(|data| data.downcast::<quinn::crypto::rustls::HandshakeData>().ok())
         .and_then(|data| data.protocol);
-    if protocol.as_deref() == Some(super::proxy::ALPN) {
-        let Some(proxy) = proxy else {
-            conn.close(0u32.into(), b"proxy disabled");
-            bail!("proxy service disabled");
-        };
-        return proxy.connection(conn, permit).await;
-    }
     let stream_transport = match aggregate_protocol(protocol.as_deref()) {
         Ok(stream_transport) => stream_transport,
         Err(error) => {
@@ -6743,7 +6734,7 @@ mod stream_profile_tests {
         assert!(!aggregate_protocol(Some(b"h3")).unwrap());
         assert!(aggregate_protocol(Some(STREAM_ALPN)).unwrap());
         assert!(aggregate_protocol(None).is_err());
-        assert!(aggregate_protocol(Some(super::super::proxy::ALPN)).is_err());
+        assert!(aggregate_protocol(Some(b"braidpath-proxy/1")).is_err());
         assert!(aggregate_protocol(Some(b"braidpath-stream/1")).is_err());
     }
 
