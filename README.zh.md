@@ -10,9 +10,9 @@ BraidPath 是一个从零构建的 Rust 多路径传输项目，结合 **前向�
 
 “Braid” 是编织：把多条不完美的路径编成一条更稳定的连接。
 
-> **BraidPath 0.7.0** 整合原生 TCP 下载回程和 Game UDP 策略。升级检查与模式选用见[版本说明](docs/releases/v0.7.0.md)。
+> **BraidPath 0.7.2** 修复 Linux 重建绑定接口后 Mesh 控制连接无法恢复的问题。详见[版本说明](docs/releases/v0.7.2.md)。
 
-最近公开发布的版本仍为 [v0.6.2](docs/releases/v0.6.2.md)。每个选定出口提供一个本地 SOCKS5 入口，默认使用四条协同路径。使用本候选时请一并升级客户端与服务端；配置见[代理与分布式运行指南](docs/mesh.md)，模式选择见[流量策略](docs/runtime.md#traffic-modes)。
+每个选定出口提供一个本地 SOCKS5 入口，默认使用四条协同路径。配置见[代理与分布式运行指南](docs/mesh.md)，模式选择见[流量策略](docs/runtime.md#traffic-modes)。
 
 固定目标 TCP 已接入标准 mesh 自动协同：使用 `mesh-server --tcp-target` 与 `mesh-client --tcp-listen`，复用发现、租约和聚合字节流，无需开放任意私网代理权限。见[固定目标接入说明](docs/mesh.md#fixed-target-tcp-over-the-mesh-v058)。
 

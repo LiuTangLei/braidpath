@@ -182,7 +182,8 @@ impl ClientIdentity {
     /// Explicit entries take precedence. Cached authenticated members provide
     /// a second bounded attempt when every requested bootstrap is unavailable.
     pub async fn discover_any(&self, entries: &[SocketAddr]) -> Result<Vec<Node>> {
-        self.discover_for_on(entries, None, &Uplink::default()).await
+        self.discover_for_on(entries, None, &Uplink::default())
+            .await
     }
 
     pub(crate) async fn discover_any_on(
@@ -249,7 +250,8 @@ impl ClientIdentity {
     }
 
     async fn query_entries(&self, entries: &[SocketAddr], exit: Option<&str>) -> Result<Vec<Node>> {
-        self.query_entries_on(entries, exit, &Uplink::default()).await
+        self.query_entries_on(entries, exit, &Uplink::default())
+            .await
     }
 
     async fn query_entries_on(

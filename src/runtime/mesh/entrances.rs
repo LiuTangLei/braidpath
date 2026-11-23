@@ -9,12 +9,7 @@ const UNBOUND_FAILURE_REBIND_AFTER: Duration = Duration::from_secs(30);
 
 #[cfg(target_os = "linux")]
 fn interface_index(name: &str) -> Option<u32> {
-    if name.is_empty()
-        || name == "."
-        || name == ".."
-        || name.contains('/')
-        || name.contains('\0')
-    {
+    if name.is_empty() || name == "." || name == ".." || name.contains('/') || name.contains('\0') {
         return None;
     }
     let path = Path::new("/sys/class/net").join(name).join("ifindex");
@@ -117,7 +112,11 @@ impl ControlRecovery {
                 .is_none_or(|at| at.elapsed() >= self.failure_rebind_after)
     }
 
-    fn try_rebind(&mut self, reason: &'static str, respect_retry_cooldown: bool) -> Option<Arc<Control>> {
+    fn try_rebind(
+        &mut self,
+        reason: &'static str,
+        respect_retry_cooldown: bool,
+    ) -> Option<Arc<Control>> {
         if respect_retry_cooldown
             && self
                 .last_rebind_attempt

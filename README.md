@@ -10,9 +10,9 @@ BraidPath is a Rust multipath transport project combining **forward error correc
 
 “Braid” means weaving several imperfect paths into a more resilient connection.
 
-> **BraidPath 0.7.0** integrates native TCP download return streams and the Game UDP policy. See the [release notes](docs/releases/v0.7.0.md) for an upgrade checklist and mode selection.
+> **BraidPath 0.7.2** restores mesh control connections after Linux recreates a bound uplink. See the [release notes](docs/releases/v0.7.2.md).
 
-The latest published release remains [v0.6.2](docs/releases/v0.6.2.md). Each selected exit provides a local SOCKS5 listener; the default is four cooperating paths. Upgrade clients and servers together for this candidate. Configure [proxy and distributed-server mode](docs/mesh.md), then select the [traffic policy](docs/runtime.md#traffic-modes) for the workload.
+Each selected exit provides a local SOCKS5 listener, with four cooperating paths by default. Configure [proxy and distributed-server mode](docs/mesh.md), then select the [traffic policy](docs/runtime.md#traffic-modes) for the workload.
 
 Fixed-target TCP also supports standard mesh discovery and relay leases: use `mesh-server --tcp-target` and `mesh-client --tcp-listen`. This requires no private-network proxy permission; see the [fixed-target guide](docs/mesh.md#fixed-target-tcp-over-the-mesh-v058).
 
