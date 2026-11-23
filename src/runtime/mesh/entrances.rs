@@ -378,6 +378,15 @@ struct Discovery {
     preferred: Option<(Node, SocketAddr)>,
 }
 
+enum DiscoveryOutcome {
+    Updated(Discovery),
+    // At least one peer replied over HTTP/3 (for example, a directory that
+    // temporarily omits the selected exit or an HTTP rejection), proving the
+    // control transport socket itself is alive.
+    DirectoryIncomplete,
+    TransportUnavailable,
+}
+
 pub(super) fn validate_nodes(nodes: &[Node]) -> Result<()> {
     ensure!(
         !nodes.is_empty() && nodes.len() <= MAX_NODES,
@@ -399,7 +408,7 @@ impl Directory {
     fn replace_control(
         &mut self,
         new_control: Arc<Control>,
-        discovery: &mut JoinSet<Option<Discovery>>,
+        discovery: &mut JoinSet<DiscoveryOutcome>,
         allocations: &mut JoinSet<(Allocation, Result<RelayReply>)>,
         renewals: &mut JoinSet<Renewal>,
         renewing: &mut std::collections::BTreeSet<String>,
@@ -417,7 +426,7 @@ impl Directory {
 
     fn rebind_if_interface_changed(
         &mut self,
-        discovery: &mut JoinSet<Option<Discovery>>,
+        discovery: &mut JoinSet<DiscoveryOutcome>,
         allocations: &mut JoinSet<(Allocation, Result<RelayReply>)>,
         renewals: &mut JoinSet<Renewal>,
         renewing: &mut std::collections::BTreeSet<String>,
@@ -438,7 +447,7 @@ impl Directory {
 
     fn rebind_after_discovery_failure(
         &mut self,
-        discovery: &mut JoinSet<Option<Discovery>>,
+        discovery: &mut JoinSet<DiscoveryOutcome>,
         allocations: &mut JoinSet<(Allocation, Result<RelayReply>)>,
         renewals: &mut JoinSet<Renewal>,
         renewing: &mut std::collections::BTreeSet<String>,
@@ -575,7 +584,7 @@ impl Directory {
                 }
                 Some(result) = discovery.join_next() => {
                     match result {
-                        Ok(Some(Discovery { nodes, preferred })) => {
+                        Ok(DiscoveryOutcome::Updated(Discovery { nodes, preferred })) => {
                             if let Some(recovery) = &mut self.recovery {
                                 recovery.note_control_success();
                             }
@@ -603,7 +612,21 @@ impl Directory {
                                 renewing.clear();
                             }
                         }
-                        Ok(None) => {
+                        Ok(DiscoveryOutcome::DirectoryIncomplete) => {
+                            tracing::debug!("mesh directory refresh incomplete; retaining known peers");
+                            if let Some(recovery) = &mut self.recovery {
+                                recovery.note_control_success();
+                            }
+                            if self.rebind_if_interface_changed(
+                                &mut discovery,
+                                &mut allocations,
+                                &mut renewals,
+                                &mut renewing,
+                            ) {
+                                continue;
+                            }
+                        }
+                        Ok(DiscoveryOutcome::TransportUnavailable) => {
                             tracing::debug!("mesh directory refresh unavailable; retaining known peers");
                             if self.rebind_if_interface_changed(
                                 &mut discovery,
@@ -806,7 +829,7 @@ impl Directory {
         retired
     }
 
-    fn discovery(&mut self) -> impl Future<Output = Option<Discovery>> + Send + 'static {
+    fn discovery(&mut self) -> impl Future<Output = DiscoveryOutcome> + Send + 'static {
         // Rotate the discovery entry so the original bootstrap is never a
         // dependency. Only a failed request triggers bounded parallel fallback.
         let mut candidates = self.known.clone();
@@ -818,25 +841,43 @@ impl Directory {
         let exit = self.selected.id.clone();
         let current = self.direct;
         async move {
+            enum QueryOutcome {
+                Ready(Vec<Node>),
+                Responded,
+                TransportFailed,
+            }
             let query = |address: SocketAddr| {
                 let control = control.clone();
                 let auth = auth.clone();
                 let exit = exit.clone();
                 async move {
-                    let nodes: Vec<Node> =
-                        control.request(address, &auth, "/mesh/nodes", None).await?;
-                    validate_nodes(&nodes)?;
-                    ensure!(
-                        nodes.iter().any(|node| node.id == exit),
-                        "selected exit absent from directory"
-                    );
-                    Ok::<_, anyhow::Error>(nodes)
+                    match control
+                        .request::<Vec<Node>>(address, &auth, "/mesh/nodes", None)
+                        .await
+                    {
+                        Ok(nodes) => {
+                            if validate_nodes(&nodes).is_ok()
+                                && nodes.iter().any(|node| node.id == exit)
+                            {
+                                QueryOutcome::Ready(nodes)
+                            } else {
+                                QueryOutcome::Responded
+                            }
+                        }
+                        Err(error) if error.is::<super::control::Rejected>() => {
+                            QueryOutcome::Responded
+                        }
+                        Err(_) => QueryOutcome::TransportFailed,
+                    }
                 }
             };
+            let mut responded = false;
             let nodes = 'discovered: {
                 for address in preferred.addresses().filter(|a| control.supports(*a)) {
-                    if let Ok(nodes) = query(address).await {
-                        break 'discovered nodes;
+                    match query(address).await {
+                        QueryOutcome::Ready(nodes) => break 'discovered nodes,
+                        QueryOutcome::Responded => responded = true,
+                        QueryOutcome::TransportFailed => {}
                     }
                 }
                 let mut pending = JoinSet::new();
@@ -848,11 +889,17 @@ impl Directory {
                     pending.spawn(query(address));
                 }
                 while let Some(result) = pending.join_next().await {
-                    if let Ok(Ok(nodes)) = result {
-                        break 'discovered nodes;
+                    match result {
+                        Ok(QueryOutcome::Ready(nodes)) => break 'discovered nodes,
+                        Ok(QueryOutcome::Responded) => responded = true,
+                        Ok(QueryOutcome::TransportFailed) | Err(_) => {}
                     }
                 }
-                return None;
+                return if responded {
+                    DiscoveryOutcome::DirectoryIncomplete
+                } else {
+                    DiscoveryOutcome::TransportUnavailable
+                };
             };
             let node = nodes
                 .iter()
@@ -862,7 +909,7 @@ impl Directory {
                 .best_address(node, &auth, current)
                 .await
                 .map(|address| (node.clone(), address));
-            Some(Discovery { nodes, preferred })
+            DiscoveryOutcome::Updated(Discovery { nodes, preferred })
         }
     }
 
@@ -2078,5 +2125,78 @@ mod tests {
         .await
         .expect("control fallback rebind must recover relay allocation after discovery failure");
         assert!(rebinds.load(Ordering::SeqCst) >= 1);
+    }
+
+    #[tokio::test]
+    async fn directory_missing_selected_exit_does_not_rebind_healthy_control() {
+        use super::super::tests::{address, server, wait_nodes};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let peer_address = address();
+        let _peer = server(root, "peer", peer_address, address(), None).await;
+        let identity =
+            ClientIdentity::open(root.join("client"), &root.join("peer/client-key.json")).unwrap();
+        let nodes = wait_nodes(&identity, peer_address, &["peer"]).await;
+        let missing_exit = Node {
+            id: "missing-exit".into(),
+            address: address(),
+            alternate: None,
+            incarnation: 0,
+        };
+
+        let ca = identity.dir.join("cert.pem");
+        let healthy_control = Arc::new(Control::new(&ca, false).unwrap());
+        let rebinds = Arc::new(AtomicUsize::new(0));
+        let rebinds_counter = rebinds.clone();
+        let ca_for_builder = ca.clone();
+        let mut recovery = ControlRecovery::new(
+            ca,
+            false,
+            Uplink {
+                interface: Some("ppp0".into()),
+                ..Default::default()
+            },
+            None,
+        );
+        recovery.rebind_retry_after = Duration::ZERO;
+        recovery.failure_rebind_after = Duration::ZERO;
+        recovery.ifindex_override = Some(Arc::new(|_| None));
+        recovery.builder_override = Some(Arc::new(move || {
+            rebinds_counter.fetch_add(1, Ordering::SeqCst);
+            Control::new(&ca_for_builder, false)
+        }));
+
+        let directory = Directory {
+            health: watch::channel(PathHealth::default()).1,
+            control: healthy_control,
+            recovery: Some(recovery),
+            auth: identity.auth.clone(),
+            selected: missing_exit.clone(),
+            direct: Some(missing_exit.address),
+            cache: identity.cache.clone(),
+            nodes: vec![missing_exit.clone()],
+            known: nodes,
+            leases: BTreeMap::new(),
+            requests: BTreeMap::new(),
+            limit: 2,
+            discovery_cursor: 0,
+            allocation_cursor: 0,
+            explorer: selection::Explorer::default(),
+        };
+        let (tx, _updates) = watch::channel(directory.addresses());
+        let _maintenance = AbortTask(tokio::spawn(
+            directory.maintain(tx, Duration::from_millis(50)),
+        ));
+        // Several discovery cycles hit the healthy peer and receive valid
+        // `/mesh/nodes` responses that omit `missing-exit`; control stays bound.
+        tokio::time::sleep(Duration::from_millis(350)).await;
+        assert_eq!(
+            rebinds.load(Ordering::SeqCst),
+            0,
+            "valid /mesh/nodes missing selected exit must not trigger socket rebind"
+        );
     }
 }
