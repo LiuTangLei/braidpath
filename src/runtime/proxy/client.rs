@@ -865,6 +865,10 @@ async fn fixed_forward(
 }
 
 pub async fn client(options: ClientOptions) -> Result<()> {
+    ensure!(
+        !options.game_mode || options.ordered_udp_ports.is_empty(),
+        "--ordered-udp-port cannot be combined with --game-mode on"
+    );
     let planned = listener_plan(&options.exits, options.listen, &options.socks5)?;
     validate_tcp_forwards(&options.tcp_forward, &planned)?;
     let wanted: BTreeSet<_> = options

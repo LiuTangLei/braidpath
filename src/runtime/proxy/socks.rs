@@ -246,6 +246,8 @@ async fn udp(
         )
     });
     let mut ordered = HashMap::<Address, mpsc::Sender<Vec<u8>>>::new();
+    let mut ordered_drops = 0u64;
+    let mut native_drops = 0u64;
     let mut bytes = vec![0; 65_536];
     let mut closed = [0; 1];
     let mut maintenance = tokio::time::interval(Duration::from_secs(5));
@@ -260,6 +262,16 @@ async fn udp(
                 ordered.retain(|_, route| !route.is_closed());
             }
             _ = maintenance.tick() => {
+                if ordered_drops != 0 || native_drops != 0 {
+                    tracing::info!(
+                        %exit,
+                        ordered_queue_drops = ordered_drops,
+                        native_queue_drops = native_drops,
+                        "SOCKS UDP queue dropped datagrams"
+                    );
+                    ordered_drops = 0;
+                    native_drops = 0;
+                }
                 if relay.active.lock().expect("SOCKS UDP activity").elapsed() >= UDP_IDLE {
                     break;
                 }
@@ -273,7 +285,8 @@ async fn udp(
                 let Ok((address, payload)) = packet(&bytes[3..n]).await else { continue; };
                 *relay.source.lock().expect("SOCKS UDP source") = Some(from);
                 if ordered_ports.contains(&address.port()) {
-                    if !ordered.contains_key(&address) {
+                    if ordered.get(&address).is_none_or(mpsc::Sender::is_closed) {
+                        ordered.retain(|_, route| !route.is_closed());
                         if ordered.len() >= MAX_DESTINATIONS { continue; }
                         let (send, recv) = mpsc::channel(UDP_QUEUE);
                         ordered.insert(address.clone(), send);
@@ -285,15 +298,24 @@ async fn udp(
                             super::ordered_udp::forward(&pool, &exit, address, &relay, recv).await
                         });
                     }
-                    if let Some(route) = ordered.get(&address) {
-                        let _ = route.try_send(payload.to_vec());
+                    if let Some(route) = ordered.get(&address)
+                        && route.try_send(payload.to_vec()).is_err()
+                    {
+                        ordered_drops += 1;
                     }
                 } else {
                     if native.as_ref().is_none_or(mpsc::Sender::is_closed) {
                         if ordered_ports.is_empty() { break; }
                         native = Some(spawn_native(&mut tasks, pool.clone(), exit.into(), relay.clone(), None));
                     }
-                    let _ = native.as_ref().expect("native UDP route").try_send(bytes[3..n].to_vec());
+                    if native
+                        .as_ref()
+                        .expect("native UDP route")
+                        .try_send(bytes[3..n].to_vec())
+                        .is_err()
+                    {
+                        native_drops += 1;
+                    }
                 }
                 relay.touch();
             }

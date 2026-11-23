@@ -32,10 +32,7 @@ fn frame(buffer: &mut [u8], len: usize) -> &[u8] {
     &buffer[..2 + len]
 }
 
-async fn read_frame<'a>(
-    mut read: impl AsyncRead + Unpin,
-    buffer: &'a mut [u8],
-) -> io::Result<&'a [u8]> {
+async fn read_frame(mut read: impl AsyncRead + Unpin, buffer: &mut [u8]) -> io::Result<&[u8]> {
     let len = usize::from(read.read_u16().await?);
     if len > MAX_UDP {
         return Err(io::Error::new(
@@ -110,6 +107,42 @@ impl Target {
     }
 }
 
+const ORDERED_RECV_BUFFER_BYTES: usize = 2 * 1024 * 1024;
+const MIN_ORDERED_RECV_BUFFER_BYTES: usize = 256 * 1024;
+
+fn request_recv_buffer(
+    max_bytes: usize,
+    min_bytes: usize,
+    mut set: impl FnMut(usize) -> io::Result<()>,
+) -> Option<usize> {
+    let mut requested = max_bytes;
+    loop {
+        if set(requested).is_ok() {
+            return Some(requested);
+        }
+        if requested <= min_bytes {
+            return None;
+        }
+        requested = (requested / 2).max(min_bytes);
+    }
+}
+
+fn enlarge_recv_buffer(socket: socket2::SockRef<'_>) {
+    let requested = request_recv_buffer(
+        ORDERED_RECV_BUFFER_BYTES,
+        MIN_ORDERED_RECV_BUFFER_BYTES,
+        |bytes| socket.set_recv_buffer_size(bytes),
+    );
+    let granted = socket.recv_buffer_size().ok();
+    tracing::debug!(requested, granted, "ordered UDP receive buffer");
+}
+
+fn prefer_ipv4(addresses: &mut [SocketAddr]) {
+    // UDP connect cannot detect an unreachable dual-stack peer.
+    // Prefer A records; an explicit IPv6 address stays IPv6.
+    addresses.sort_by_key(|address| address.is_ipv6());
+}
+
 pub(crate) async fn connect(
     destination: StreamTarget,
     allow_private: bool,
@@ -120,13 +153,14 @@ pub(crate) async fn connect(
             .ok_or(2u8)?
             .reserve_udp_destination()
             .map_err(|_| 1u8)?;
-        let addresses = resolve_stream_target(&destination, allow_private)
+        let mut addresses = resolve_stream_target(&destination, allow_private)
             .await
             .map_err(|error| {
                 error
                     .downcast_ref::<ReplyError>()
                     .map_or(4, |error| error.0)
             })?;
+        prefer_ipv4(&mut addresses);
         for address in addresses {
             let ip = if address.is_ipv4() {
                 "0.0.0.0:0"
@@ -139,9 +173,7 @@ pub(crate) async fn connect(
             if udp.connect(address).await.is_err() {
                 continue;
             }
-            socket2::SockRef::from(&udp)
-                .set_recv_buffer_size(2 * 1024 * 1024)
-                .map_err(|_| 1u8)?;
+            enlarge_recv_buffer(socket2::SockRef::from(&udp));
             let bound = udp.local_addr().map_err(|_| 1u8)?;
             let (stream, bridge) = stream_pair().await.map_err(|_| 1u8)?;
             tracing::debug!(port = address.port(), "ordered UDP destination opened");
@@ -202,5 +234,43 @@ pub(super) async fn forward(
         result = flow.run(stream) => result,
         result = uplink => Ok(result?),
         result = downlink => Ok(result?),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recv_buffer_request_falls_back_when_os_caps_below_two_mebibytes() {
+        let mut attempts = Vec::new();
+        let granted = request_recv_buffer(2 * 1024 * 1024, 256 * 1024, |bytes| {
+            attempts.push(bytes);
+            if bytes > 1_864_135 {
+                Err(io::Error::other("buffer limit"))
+            } else {
+                Ok(())
+            }
+        });
+        assert_eq!(granted, Some(1024 * 1024));
+        assert_eq!(attempts, vec![2 * 1024 * 1024, 1024 * 1024]);
+
+        let none = request_recv_buffer(2 * 1024 * 1024, 256 * 1024, |_| {
+            Err(io::Error::other("buffer limit"))
+        });
+        assert_eq!(none, None);
+    }
+
+    #[test]
+    fn ordered_udp_prefers_ipv4_for_dual_stack_resolution() {
+        let v6: SocketAddr = "[2001:db8::1]:4500".parse().unwrap();
+        let v4: SocketAddr = "198.51.100.1:4500".parse().unwrap();
+        let mut mixed = vec![v6, v4];
+        prefer_ipv4(&mut mixed);
+        assert_eq!(mixed, vec![v4, v6]);
+
+        let mut explicit_v6 = vec![v6];
+        prefer_ipv4(&mut explicit_v6);
+        assert_eq!(explicit_v6, vec![v6]);
     }
 }

@@ -95,6 +95,23 @@ mod proxy_cli_tests {
         ] {
             assert!(Cli::try_parse_from(client.into_iter().chain(flag.iter().copied())).is_err());
         }
+        let parsed = Cli::try_parse_from(client.into_iter().chain([
+            "--game-mode",
+            "on",
+            "--ordered-udp-port",
+            "4500",
+        ]))
+        .unwrap();
+        assert!(matches!(
+            parsed.command,
+            Command::ProxyClient {
+                game_mode: GameMode::On,
+                ref ordered_udp_ports,
+                ..
+            } if ordered_udp_ports.as_slice() == [4500]
+        ));
+        assert!(validate_ordered_udp_mode(GameMode::On, &[4500]).is_err());
+        assert!(validate_ordered_udp_mode(GameMode::Off, &[4500]).is_ok());
         let parsed =
             Cli::try_parse_from(client.into_iter().chain(["--interface", "ifindex:6"])).unwrap();
         assert!(
@@ -296,7 +313,7 @@ enum Command {
         /// Wait for the exit's bound address or SOCKS5 failure before replying to CONNECT.
         #[arg(long)]
         socks5_wait_for_connect: bool,
-        /// Carry SOCKS5 UDP to this destination port over ordered aggregate streams.
+        /// Carry SOCKS5 UDP to this destination port over ordered aggregate streams (ordinary mode only).
         #[arg(long = "ordered-udp-port", value_parser = clap::value_parser!(u16).range(1..))]
         ordered_udp_ports: Vec<u16>,
         /// Prefer timely UDP delivery over bulk throughput.
@@ -524,6 +541,14 @@ enum GameMode {
     Off,
 }
 
+fn validate_ordered_udp_mode(game_mode: GameMode, ordered_udp_ports: &[u16]) -> Result<()> {
+    ensure!(
+        !matches!(game_mode, GameMode::On) || ordered_udp_ports.is_empty(),
+        "--ordered-udp-port cannot be combined with --game-mode on"
+    );
+    Ok(())
+}
+
 #[derive(Args)]
 struct PolicyArgs {
     /// Prefer low UDP delay: earliest-ready paths, immediate bounded protection,
@@ -649,6 +674,7 @@ pub async fn run() -> Result<()> {
             ordered_udp_ports,
             game_mode,
         } => {
+            validate_ordered_udp_mode(game_mode, &ordered_udp_ports)?;
             let identity = mesh::ClientIdentity::open(dir, &connection_key)?;
             proxy::client(proxy::ClientOptions {
                 identity,

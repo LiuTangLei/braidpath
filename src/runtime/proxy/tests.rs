@@ -471,6 +471,131 @@ async fn ordered_and_native_udp_share_a_socks_association() {
 }
 
 #[tokio::test]
+async fn ordered_udp_handles_domain_refusal_and_rejects_game_mode_combination() {
+    let root = tempfile::tempdir().unwrap();
+    let (at, _server, metrics) = start_metered(root.path(), "a", None, false).await;
+    let identity = identity(root.path(), "client");
+    // Proxy client startup must explicitly reject combining --game-mode on with --ordered-udp-port.
+    let conflict = client(ClientOptions {
+        identity: identity.clone(),
+        connect: vec![at],
+        exits: vec!["a".into()],
+        listen: "127.0.0.1:0".parse().unwrap(),
+        socks5: Vec::new(),
+        tcp_forward: Vec::new(),
+        paths: 1,
+        interface: None,
+        socks5_early_reply: true,
+        ordered_udp_ports: vec![4500],
+        game_mode: true,
+    })
+    .await;
+    assert!(conflict.is_err());
+
+    // Refused ordered destination (private address when allow_private=false) must release server resources.
+    let pool = client::Pool::new(
+        identity.clone(),
+        vec![node("a", at)],
+        vec!["a".into()],
+        None,
+        false,
+    )
+    .unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listen = listener.local_addr().unwrap();
+    let _listener = Task(tokio::spawn(client::listen(
+        listener,
+        pool,
+        "a".into(),
+        Arc::new(Semaphore::new(4)),
+        false,
+        Arc::from([4500]),
+    )));
+    let udp = udp_socket("127.0.0.1:0".parse().unwrap()).await.unwrap();
+    let (control, status, bound) = socks(listen, UDP, Address::Ip(udp.local_addr().unwrap())).await;
+    assert_eq!(status, 0);
+    let Address::Ip(bound) = bound else { panic!() };
+    let mut refused = vec![0, 0, 0];
+    Address::Domain("localhost".into(), 4500).encode(&mut refused);
+    refused.extend_from_slice(b"blocked");
+    udp.send_to(&refused, bound).await.unwrap();
+    // Wait for the refused aggregate stream to report rejection and verify zero leaked flows/destinations.
+    timeout(Duration::from_secs(5), async {
+        loop {
+            let snap = metrics.snapshot(false, "test", None).unwrap();
+            let rejected = snap["stats"]["directions"]
+                .as_object()
+                .into_iter()
+                .flatten()
+                .filter_map(|(_, d)| d["tcp_streams"]["rejected"].as_u64())
+                .sum::<u64>();
+            let s = identity.status(at).await.unwrap().proxy.unwrap();
+            if rejected > 0 && s.tcp_flows == 0 && s.udp_destinations == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    drop(control);
+    empty(&identity, at).await;
+}
+
+#[tokio::test]
+async fn ordered_udp_supports_domain_and_reopens_after_peer_close() {
+    let root = tempfile::tempdir().unwrap();
+    let (at, _server) = start(root.path(), "a", None, true).await;
+    let identity = identity(root.path(), "client");
+    let pool = client::Pool::new(
+        identity.clone(),
+        vec![node("a", at)],
+        vec!["a".into()],
+        None,
+        false,
+    )
+    .unwrap();
+    let echo_sock = udp_socket("127.0.0.1:0".parse().unwrap()).await.unwrap();
+    let echo_port = echo_sock.local_addr().unwrap().port();
+    let _echo = Task(tokio::spawn(async move {
+        let mut bytes = vec![0; 4096];
+        loop {
+            let (n, source) = echo_sock.recv_from(&mut bytes).await.unwrap();
+            echo_sock.send_to(&bytes[..n], source).await.unwrap();
+        }
+    }));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listen = listener.local_addr().unwrap();
+    let _listener = Task(tokio::spawn(client::listen(
+        listener,
+        pool,
+        "a".into(),
+        Arc::new(Semaphore::new(4)),
+        false,
+        Arc::from([echo_port]),
+    )));
+    let udp = udp_socket("127.0.0.1:0".parse().unwrap()).await.unwrap();
+    let (control, status, bound) = socks(listen, UDP, Address::Ip(udp.local_addr().unwrap())).await;
+    assert_eq!(status, 0);
+    let Address::Ip(bound) = bound else { panic!() };
+    let mut request = vec![0, 0, 0];
+    Address::Domain("localhost".into(), echo_port).encode(&mut request);
+    request.extend_from_slice(b"domain-ordered");
+    udp.send_to(&request, bound).await.unwrap();
+    let mut response = vec![0; 4096];
+    let (n, source) = timeout(Duration::from_secs(10), udp.recv_from(&mut response))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(source, bound);
+    let (address, body) = protocol::packet(&response[3..n]).await.unwrap();
+    assert_eq!(address, Address::Domain("localhost".into(), echo_port));
+    assert_eq!(body, b"domain-ordered");
+    drop(control);
+    empty(&identity, at).await;
+}
+
+#[tokio::test]
 async fn separate_udp_listeners_pin_exits_fragment_and_release_independently() {
     let root = tempfile::tempdir().unwrap();
     let root = root.path();
