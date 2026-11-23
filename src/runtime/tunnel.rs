@@ -1878,7 +1878,7 @@ async fn sender_with_game_input(
     };
     let mut queue = outbound::Queue::default();
     let mut native_queue = outbound::Queue::default();
-    let native_returning = policy.native_return && metrics.direction == stats::RETURN;
+    let native_returning = policy.native_return;
     let mut native_cursor = 0;
     let mut mixed_writes =
         (native_returning && policy.game_mode).then(native_return::MixedWrites::default);
@@ -4043,6 +4043,7 @@ struct Session {
     generations: Mutex<[Option<u64>; MAX_PATHS]>,
     empty_since: Mutex<Option<Instant>>,
     events: mpsc::Sender<Event>,
+    native_ingress: [native_return::Ingress; MAX_PATHS],
     paths: Paths,
     stop: watch::Sender<bool>,
     policy: Policy,
@@ -4086,6 +4087,7 @@ async fn stream_wake(streams: &mut Option<tcp::Mux>) -> tcp::Wake {
 async fn session_loop(
     session: Arc<Session>,
     mut events: mpsc::Receiver<Event>,
+    mut native_rx: mpsc::Receiver<native_return::Incoming>,
     target: Option<SocketAddr>,
     tcp: tcp::Targets,
     tcp_budget: Arc<tcp::Budget>,
@@ -4145,10 +4147,15 @@ async fn session_loop(
     let mut telemetry: [transport::ProxyTelemetry; MAX_PATHS] =
         std::array::from_fn(|_| Default::default());
     let mut dropped = 0u64;
+    let native_credit = streams
+        .as_ref()
+        .filter(|_| session.policy.native_return)
+        .map(tcp::Mux::native_credit_watch);
     loop {
         if *stop.borrow() {
             break;
         }
+        let credit_changed = native_credit.as_ref().map(|credit| credit.notified());
         if let Some(mux) = streams.as_mut() {
             mux.service_io();
             mux.set_payload_limit(if session.policy.native_return {
@@ -4180,6 +4187,10 @@ async fn session_loop(
             _=retention_deadline(&decoder)=>{decoder.expire_adaptive(Instant::now());publish_retention(&decoder,&session.forward);},
             _=messages::deadline(&messages)=>{messages.expire(Instant::now()); publish_messages(&mut messages, &session.forward);},
             completed=delivery.ready()=>dropped+=completed,
+            _=async {credit_changed.expect("native receive credit").await},if native_credit.is_some() && streams.as_ref().is_some_and(tcp::Mux::has_pending_native)=>{},
+            incoming=native_rx.recv(),if session.policy.native_return=>{
+                if let Some(incoming)=incoming && let Some(mux)=streams.as_mut() { mux.receive_native(incoming); }
+            },
             e=events.recv()=>match e {
                 Some(Event::Wire(pid,data))=>{
                     let records=receive_records(&mut decoder,&session.forward,pid,&data,streams.as_ref());
@@ -4374,6 +4385,7 @@ async fn serve_with_budgets(
         options.proxy.is_some(),
         Some(&options.key.with_extension("tickets")),
         mesh.as_deref().is_some_and(mesh::State::dual_stack),
+        options.tcp_target.is_some() || options.stream_proxy.is_some() || options.proxy.is_some(),
     )?;
     let secret = Arc::new(format!("Bearer {}", transport::token(&options.token)?));
     let sessions: Sessions = Arc::new(Mutex::new(HashMap::new()));
@@ -4621,7 +4633,8 @@ async fn server_connection(
         }
     };
     diagnostic.succeeded();
-    let mut joined: Option<(String, Arc<Session>, u8, u64, u64, usize)> = None;
+    type JoinedPath = (String, Arc<Session>, u8, u64, u64, usize);
+    let mut joined: Option<JoinedPath> = None;
     let mut request: Option<h3::server::RequestStream<h3_quinn::RecvStream, Bytes>> = None;
     let mut response_send = None;
     let mut return_tasks = JoinSet::new();
@@ -4651,6 +4664,94 @@ async fn server_connection(
         }
     };
     let processing = async {
+        let mut upload_decoder = native_return::Decoder::default();
+        let handle_datagram = |data: Bytes, joined: &Option<JoinedPath>| {
+            if let Some((_, session, pid, stream, generation, stream_payload)) = joined {
+                let trace_key = trace::PathKey {
+                    path_id: *pid,
+                    generation: *generation,
+                    connection_id: conn.stable_id() as u64,
+                };
+                trace_http(
+                    &session.forward,
+                    trace::Stage::PeerHttpReceived,
+                    &data,
+                    *stream,
+                    session.policy.receiver_feedback,
+                    trace_key,
+                    None,
+                );
+                session
+                    .forward
+                    .path(*pid, |p| p.http_datagrams_received += 1);
+                if let Ok(payload) = wire::http_payload(&data, *stream)
+                    && payload.len()
+                        <= payload::wire_limit(*stream_payload, session.policy.receiver_feedback)
+                {
+                    match measured_payload(
+                        &session.paths,
+                        *pid,
+                        payload,
+                        session.policy.receiver_feedback,
+                        &session.returning,
+                        session.observation_notify.as_deref(),
+                    ) {
+                        Ok(Some(payload)) => {
+                            if let Err(error) = session.events.try_send(Event::Wire(*pid, payload))
+                            {
+                                if let Event::Wire(_, payload) = rejected_item(&error) {
+                                    session.forward.trace_symbol(
+                                        trace::Stage::SymbolDropped,
+                                        payload,
+                                        Some(trace_key),
+                                        Some(data.len()),
+                                        Some(queue_trace_reason(QueueLayer::Receiver, &error)),
+                                    );
+                                }
+                                session.ingress_drops.fetch_add(1, Ordering::Relaxed);
+                                queue_error(
+                                    &session.forward,
+                                    QueueLayer::Receiver,
+                                    &error,
+                                    Some(*pid),
+                                );
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(_) => {
+                            trace_http(
+                                &session.forward,
+                                trace::Stage::SymbolDropped,
+                                &data,
+                                *stream,
+                                session.policy.receiver_feedback,
+                                trace_key,
+                                Some(trace::Reason::InvalidHttp),
+                            );
+                            session
+                                .forward
+                                .path(*pid, |p| p.invalid_http_datagrams_dropped += 1);
+                        }
+                    }
+                } else {
+                    trace_http(
+                        &session.forward,
+                        trace::Stage::SymbolDropped,
+                        &data,
+                        *stream,
+                        session.policy.receiver_feedback,
+                        trace_key,
+                        Some(trace::Reason::InvalidHttp),
+                    );
+                    session
+                        .forward
+                        .path(*pid, |p| p.invalid_http_datagrams_dropped += 1);
+                    session
+                        .forward
+                        .update(|d| d.records.invalid_symbols_dropped += 1);
+                }
+            }
+        };
         loop {
             tokio::select! {
                             _=tokio::time::sleep_until(admission_deadline),if joined.is_none()=>{
@@ -4792,10 +4893,12 @@ async fn server_connection(
                                         } else {
                                             ensure!(map.len()<16,"session limit");
                                             let (tx,rx)=session_events(policy.streams,policy.proxy);let (stop,_)=watch::channel(false);
+                                            let (native_tx, native_rx) = mpsc::channel(MAX_PATHS * native_return::RX_PATH_RECORDS);
+                                            let native_ingress: [_; MAX_PATHS] = std::array::from_fn(|_| native_return::Ingress::new(native_tx.clone()));
                                             let observation_notify=policy.adaptive.then(||Arc::new(Notify::new()));
-                                            let session=Arc::new(Session{adaptive_fec_retention,generations:Mutex::new([None;MAX_PATHS]),empty_since:Mutex::new(Some(Instant::now())),events:tx,paths:Arc::new(Mutex::new(Vec::new())),stop,policy,observation_notify,ingress_drops:Arc::new(AtomicU64::new(0)),forward:metrics.scope(&sid,stats::FORWARD),returning:metrics.scope(&sid,stats::RETURN),finished:tokio::sync::Notify::new(),done:std::sync::atomic::AtomicBool::new(false)});
+                                            let session=Arc::new(Session{adaptive_fec_retention,generations:Mutex::new([None;MAX_PATHS]),empty_since:Mutex::new(Some(Instant::now())),events:tx,native_ingress,paths:Arc::new(Mutex::new(Vec::new())),stop,policy,observation_notify,ingress_drops:Arc::new(AtomicU64::new(0)),forward:metrics.scope(&sid,stats::FORWARD),returning:metrics.scope(&sid,stats::RETURN),finished:tokio::sync::Notify::new(),done:std::sync::atomic::AtomicBool::new(false)});
                                             map.insert(sid.clone(),session.clone());
-                                            tokio::spawn(session_loop(session.clone(),rx,target,tcp.clone(),tcp_budget.clone()));
+                                            tokio::spawn(session_loop(session.clone(),rx,native_rx,target,tcp.clone(),tcp_budget.clone()));
                                             session
                                         };
                                         {
@@ -4860,19 +4963,47 @@ async fn server_connection(
                                 info!(path=pid,remote=%conn.remote_address(),"authenticated path joined");
                             },
                             data=conn.read_datagram()=>{
-                                let data=data?;
-                                if let Some((_,session,pid,stream,generation,stream_payload))=&joined {
-                                    let trace_key=trace::PathKey{path_id:*pid,generation:*generation,connection_id:conn.stable_id() as u64};
-                                    trace_http(&session.forward,trace::Stage::PeerHttpReceived,&data,*stream,session.policy.receiver_feedback,trace_key,None);
-                                    session.forward.path(*pid,|p|p.http_datagrams_received+=1);
-                                    if let Ok(payload)=wire::http_payload(&data,*stream) && payload.len()<=payload::wire_limit(*stream_payload,session.policy.receiver_feedback) {
-                                        match measured_payload(&session.paths,*pid,payload,session.policy.receiver_feedback,&session.returning,session.observation_notify.as_deref()) {
-                                        Ok(Some(payload))=>{if let Err(error)=session.events.try_send(Event::Wire(*pid,payload)){if let Event::Wire(_,payload)=rejected_item(&error){session.forward.trace_symbol(trace::Stage::SymbolDropped,payload,Some(trace_key),Some(data.len()),Some(queue_trace_reason(QueueLayer::Receiver,&error)));}session.ingress_drops.fetch_add(1,Ordering::Relaxed);queue_error(&session.forward,QueueLayer::Receiver,&error,Some(*pid));}},Ok(None)=>{},Err(_)=>{trace_http(&session.forward,trace::Stage::SymbolDropped,&data,*stream,session.policy.receiver_feedback,trace_key,Some(trace::Reason::InvalidHttp));session.forward.path(*pid,|p|p.invalid_http_datagrams_dropped+=1);}}
-                                    } else {trace_http(&session.forward,trace::Stage::SymbolDropped,&data,*stream,session.policy.receiver_feedback,trace_key,Some(trace::Reason::InvalidHttp));session.forward.path(*pid,|p|p.invalid_http_datagrams_dropped+=1);session.forward.update(|d|d.records.invalid_symbols_dropped+=1);}
-                                }
+                                handle_datagram(data?, &joined);
                             },
                             body=async {request.as_mut().expect("guarded request").recv_data().await},if request.is_some()=>{
-                                let _=body?; break; // No reliable data is defined for this request; FIN ends membership.
+                                let Some(mut body) = body? else {
+                                    upload_decoder.finish()?;
+                                    break;
+                                };
+                                let Some((_, session, pid, _, _, _)) = &joined else {
+                                    bail!("unexpected reliable request data before join");
+                                };
+                                ensure!(
+                                    session.policy.native_return,
+                                    "unexpected reliable request data"
+                                );
+                                let ingress = session.native_ingress[usize::from(*pid)].clone();
+                                let admission = async {
+                                    while let Some(record) = upload_decoder.next(&mut body)? {
+                                        let incoming = native_return::Incoming::new(
+                                            record,
+                                            ingress.slots.clone(),
+                                        )
+                                        .await?;
+                                        ingress
+                                            .tx
+                                            .send(incoming)
+                                            .await
+                                            .context("native upload receiver closed")?;
+                                    }
+                                    Ok::<(), anyhow::Error>(())
+                                };
+                                tokio::pin!(admission);
+                                loop {
+                                    tokio::select! {
+                                        biased;
+                                        result = &mut admission => {
+                                            result?;
+                                            break;
+                                        }
+                                        data = conn.read_datagram() => handle_datagram(data?, &joined),
+                                    }
+                                }
                             }
                         }
         }
@@ -5573,7 +5704,9 @@ async fn client_session(
             mux.service_io();
             // A busy path metadata refresh cannot delay Game UDP dispatch.
             // The sender still checks the current path size before admission.
-            if let Some(limit) = client_stream_payload_limit(&paths, &options.policy) {
+            if options.policy.native_return {
+                mux.set_payload_limit(native_return::PAYLOAD);
+            } else if let Some(limit) = client_stream_payload_limit(&paths, &options.policy) {
                 mux.set_payload_limit(limit);
             }
             mux.flush(&mut tcp::Out{tx:&tx,game_tx:game_tx.as_ref(),next_id:&mut next_id,scope:&forward,small_threshold});
@@ -5843,13 +5976,28 @@ async fn client_session(
                             p.reconnect_successes+=1;
                             if elective_inflight[id] {p.rotation_successes+=1;}
                         });
+                        let (upload_writer, upload_reader) = if options.policy.native_return {
+                            let (tx, rx) = if options.policy.game_mode {
+                                native_return::mixed_channel()
+                            } else {
+                                native_return::channel()
+                            };
+                            value.conn.set_send_window(if options.policy.game_mode {
+                                native_return::MIXED_SEND_WINDOW
+                            } else {
+                                u64::from(native_return::WINDOW)
+                            });
+                            (Some(tx), Some(rx))
+                        } else {
+                            (None, None)
+                        };
                         {
                             let mut active=paths.lock().expect("paths lock");
                             for old in active.iter().filter(|p|p.id==pid) {old.conn.close(0u32.into(),b"path replaced");}
                             active.retain(|p|p.id!=pid);
                             let quality = Arc::new(Mutex::new(quality::State::new(generation)));
                             active.push(OutPath{id:pid,group:configs[id].group,conn:value.conn.clone(),stream:value.stream,stream_payload:value.stream_payload,
-                                native_return:None,writer:writer::Writer::spawn(&value.conn, Some(writer::Observations {
+                                native_return:upload_writer,writer:writer::Writer::spawn(&value.conn, Some(writer::Observations {
                                     scope: forward.clone(),
                                     path: trace::PathKey { path_id: pid, generation, connection_id: value.conn.stable_id() as u64 },
                                     stream: value.stream,
@@ -5861,7 +6009,7 @@ async fn client_session(
                         }
                         if let Some(old)=endpoints[id].replace(value.endpoint) {old.close(0u32.into(),b"path replaced");}
                         tasks.spawn(drive_client_path(value.conn,value.stream,value.driver,value.request,value.send,diagnostic,pid,generation,
-                            wire_tx.clone(),native_ingress[id].clone(),options.policy.native_return,ingress_drops.clone(),returning.clone(),forward.clone(),paths.clone(),options.policy.receiver_feedback,value.stream_payload,observation_notify.clone()));
+                            wire_tx.clone(),native_ingress[id].clone(),upload_reader,options.policy.native_return,ingress_drops.clone(),returning.clone(),forward.clone(),paths.clone(),options.policy.receiver_feedback,value.stream_payload,observation_notify.clone()));
                         has_session=true;
                         if recover_paths && !announced {
                             options.stats.readiness(true,configs.iter().filter(|c|c.enabled).count());
@@ -5976,13 +6124,14 @@ async fn drive_client_path(
     conn: quinn::Connection,
     stream: u64,
     mut driver: H3Client,
-    mut request: H3Request,
+    request: H3Request,
     send: H3Send,
     mut diagnostic: stats::ConnectionTrace,
     pid: u8,
     generation: u64,
     tx: mpsc::Sender<(u8, Bytes)>,
     native_ingress: native_return::Ingress,
+    upload_reader: Option<native_return::Reader>,
     native_return: bool,
     ingress_drops: Arc<AtomicU64>,
     returning: Scope,
@@ -5994,6 +6143,18 @@ async fn drive_client_path(
 ) {
     // Dropping the last SendRequest closes the HTTP/3 connection.
     let _send = send;
+    let (request_send, mut request_recv) = request.split();
+    let mut upload_tasks = JoinSet::new();
+    let _request_send = if let Some(reader) = upload_reader {
+        upload_tasks.spawn(native_return::write_client(
+            conn.clone(),
+            request_send,
+            reader,
+        ));
+        None
+    } else {
+        Some(request_send)
+    };
     let trace_key = trace::PathKey {
         path_id: pid,
         generation,
@@ -6079,7 +6240,7 @@ async fn drive_client_path(
         loop {
             let mut body = tokio::select! {
                 e = driver.wait_idle() => return Err(e.into()),
-                body = request.recv_data() => {
+                body = request_recv.recv_data() => {
                     let Some(body) = body? else { return decoder.finish() };
                     ensure!(native_return, "unexpected reliable response data");
                     body

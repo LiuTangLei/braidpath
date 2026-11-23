@@ -802,6 +802,45 @@ pub(super) async fn write(
     }
 }
 
+pub(super) async fn write_client(
+    conn: quinn::Connection,
+    mut stream: h3::client::RequestStream<h3_quinn::SendStream<Bytes>, Bytes>,
+    mut input: Reader,
+) {
+    let mut flight = None;
+    loop {
+        let Some(mut part) = (tokio::select! {
+            value = input.rx.recv() => value,
+            _ = conn.closed() => break,
+        }) else {
+            break;
+        };
+        if let Some(start) = part.start.take() {
+            debug_assert!(flight.is_none());
+            flight = Some(start);
+        }
+        let result = tokio::select! {
+            biased;
+            _ = conn.closed() => break,
+            result = async {
+                if let Some(reservation) = part.reservation.as_mut() {
+                    // Once write starts, a failing H3 operation may have
+                    // submitted a prefix. Charge the grant conservatively.
+                    reservation.cost = 0;
+                }
+                stream.send_data(part.data).await
+            } => result,
+        };
+        if result.is_err() {
+            conn.close(0u32.into(), b"upload stream failed");
+            break;
+        }
+        if part.last {
+            flight.take().expect("native record started").written = true;
+        }
+    }
+}
+
 // The channel and deferred queue hold the same permits. A slow path can
 // use at most eight staged records, across old and new generations. Each
 // driver can also be holding one decoded record while waiting for admission.

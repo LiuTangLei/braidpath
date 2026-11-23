@@ -330,6 +330,7 @@ pub(crate) fn server_with_proxy(
         proxy,
         None,
         false,
+        false,
     )
 }
 
@@ -345,6 +346,7 @@ pub(crate) fn server_with_session_config(
     proxy: bool,
     tickets: Option<&Path>,
     dual_stack: bool,
+    native_stream: bool,
 ) -> Result<Endpoint> {
     ensure!(
         (MIN_DATAGRAM_SEND_BUFFER_BYTES..=MAX_DATAGRAM_SEND_BUFFER_BYTES)
@@ -367,6 +369,10 @@ pub(crate) fn server_with_session_config(
     let mut transport = config(congestion);
     transport.datagram_send_buffer_size(datagram_send_buffer_bytes);
     ack_request.apply(&mut transport);
+    if native_stream {
+        transport.receive_window(super::tunnel::NATIVE_RETURN_WINDOW.into());
+        transport.stream_receive_window(super::tunnel::NATIVE_RETURN_WINDOW.into());
+    }
     conf.transport_config(Arc::new(transport));
     let socket = if dual_stack {
         let socket = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;

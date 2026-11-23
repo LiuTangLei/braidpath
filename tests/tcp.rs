@@ -779,15 +779,106 @@ fn native_return_keeps_upload_half_close_udp_and_survives_one_path_closing() {
     );
     let deadline = Instant::now() + Duration::from_secs(3);
     loop {
-        if topology
-            .streams("server")
-            .is_some_and(|s| s["max_data_segment_bytes"].as_u64().unwrap_or(0) > 1400)
-        {
+        let server_ok = topology.streams("server").is_some_and(|s| {
+            s["max_data_segment_bytes"].as_u64().unwrap_or(0) > 1400
+                && s["native_return_accepted_bytes"].as_u64().unwrap_or(0) > 1024 * 1024
+        });
+        let client_ok = topology.streams("client").is_some_and(|s| {
+            s["max_data_segment_bytes"].as_u64().unwrap_or(0) > 1400
+                && s["native_return_accepted_bytes"].as_u64().unwrap_or(0) > 1024 * 1024
+        });
+        if server_ok && client_ok {
             break;
         }
         assert!(
             Instant::now() < deadline,
-            "native download never emitted a large stream segment"
+            "symmetric native stream did not emit/accept large frames on both client and server: server={:?} client={:?}",
+            topology.streams("server"),
+            topology.streams("client"),
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[test]
+fn native_upload_survives_path_cutover_and_keeps_interactive_responsive() {
+    let sink = TcpListener::bind("127.0.0.1:0").unwrap();
+    let sink_addr = sink.local_addr().unwrap().to_string();
+    let expected: Vec<u8> = (0..8u32 << 20)
+        .map(|i| (i.wrapping_mul(2246822519) >> 24) as u8)
+        .collect();
+    let expected_sink = expected.clone();
+    let (progress_tx, progress_rx) = std::sync::mpsc::channel();
+    let sink_thread = thread::spawn(move || {
+        let (mut stream, _) = sink.accept().unwrap();
+        let mut received = Vec::with_capacity(expected_sink.len());
+        let mut buf = vec![0u8; 65_536];
+        let mut signaled = false;
+        loop {
+            let n = stream.read(&mut buf).unwrap();
+            if n == 0 {
+                break;
+            }
+            received.extend_from_slice(&buf[..n]);
+            if !signaled && received.len() >= 1024 * 1024 {
+                let _ = progress_tx.send(());
+                signaled = true;
+            }
+        }
+        assert_eq!(received.len(), expected_sink.len());
+        assert_eq!(received, expected_sink);
+        stream.write_all(b"VERIFIED").unwrap();
+        stream.shutdown(Shutdown::Write).unwrap();
+    });
+    let echo = echo_target();
+    let mut topology = topology_options(
+        &["--proxy", "--proxy-allow-private"],
+        &["13"],
+        "--proxy-listen",
+        &["--native-return-stream"],
+    );
+    let proxy = topology.tcp_listen.clone();
+    let (status, mut upload_conn) = socks(&proxy, &socks_ipv4(&sink_addr));
+    assert_eq!(status, 0);
+    let uploader = thread::spawn(move || {
+        upload_conn.write_all(&expected).unwrap();
+        upload_conn.shutdown(Shutdown::Write).unwrap();
+        let mut ack = Vec::new();
+        upload_conn.read_to_end(&mut ack).unwrap();
+        assert_eq!(ack, b"VERIFIED");
+    });
+    // Wait for >= 1 MiB to arrive at the server target, then kill the relay path mid-upload.
+    progress_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("upload did not reach 1 MiB");
+    let cut_at = Instant::now();
+    topology._processes[1].child.kill().unwrap();
+    topology._processes[1].child.wait().unwrap();
+
+    // Concurrent interactive TCP request must stay snappy while bulk upload repairs.
+    let (status, mut interactive) = socks(&proxy, &socks_ipv4(&echo));
+    assert_eq!(status, 0);
+    assert_eq!(read_exact_or_eof(&mut interactive, 7), b"banner\n");
+    interactive.write_all(b"quick-turn").unwrap();
+    assert_eq!(read_exact_or_eof(&mut interactive, 10), b"quick-turn");
+    assert!(
+        cut_at.elapsed() < Duration::from_secs(4),
+        "interactive request stalled behind bulk native upload"
+    );
+
+    uploader.join().unwrap();
+    sink_thread.join().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        if topology.streams("server").is_some_and(|s| {
+            s["native_return_accepted_bytes"].as_u64().unwrap_or(0) >= 4 * 1024 * 1024
+        }) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "server did not accept multi-MiB upload natively: {:?}",
+            topology.streams("server")
         );
         thread::sleep(Duration::from_millis(50));
     }

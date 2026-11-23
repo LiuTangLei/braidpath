@@ -766,7 +766,7 @@ impl Mux {
             lifetime: policy.admission_lifetime(),
             drain: Drain::new(now),
             payload_limit: crate::runtime::MAX_PAYLOAD,
-            native_return: policy.native_return && scope.direction == crate::runtime::stats::RETURN,
+            native_return: policy.native_return,
             native_pending: VecDeque::new(),
             blocked_until: None,
             accept_paused_until: None,
@@ -3806,45 +3806,50 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn native_bulk_keeps_large_frames_while_short_responses_fit_the_bypass_lane() {
-        let mut policy = proxy_policy();
-        policy.native_return = true;
-        let scope = stats::Metrics::new("server").scope("native-mixed", stats::RETURN);
-        let mut mux = Mux::new(
-            Listeners::default(),
-            Targets::default(),
-            &policy,
-            scope.clone(),
-        );
-        mux.set_payload_limit(stream::RELIABLE_PAYLOAD);
-        for (id, size) in [(1, 8192), (2, 128 * 1024)] {
-            assert!(mux.open(id, false));
-            mux.streams.get_mut(&id).unwrap().send.push(&vec![7; size]);
-        }
-        let (tx, mut rx) = mpsc::channel(32);
-        mux.pump(
-            &mut Out {
-                game_tx: None,
-                tx: &tx,
-                next_id: &mut 0,
-                scope: &scope,
-                small_threshold: 0,
-            },
-            Instant::now(),
-        );
-        let mut small = false;
-        let mut bulk = false;
-        while let Ok(item) = rx.try_recv() {
-            if item.record.flow == stream::data_flow(1) {
-                assert!(item.record.payload.len() <= crate::runtime::MAX_PAYLOAD);
-                assert!(item.hold.as_ref().unwrap().interactive());
-                small = true;
-            } else {
-                assert_eq!(item.record.payload.len(), stream::RELIABLE_PAYLOAD);
-                assert!(!item.hold.as_ref().unwrap().interactive());
-                bulk = true;
+        for direction in [stats::RETURN, stats::FORWARD] {
+            let mut policy = proxy_policy();
+            policy.native_return = true;
+            let scope = stats::Metrics::new("peer").scope("native-mixed", direction);
+            let mut mux = Mux::new(
+                Listeners::default(),
+                Targets::default(),
+                &policy,
+                scope.clone(),
+            );
+            mux.set_payload_limit(stream::RELIABLE_PAYLOAD);
+            for (id, size) in [(1, 8192), (2, 128 * 1024)] {
+                assert!(mux.open(id, false));
+                mux.streams.get_mut(&id).unwrap().send.push(&vec![7; size]);
             }
+            let (tx, mut rx) = mpsc::channel(32);
+            mux.pump(
+                &mut Out {
+                    game_tx: None,
+                    tx: &tx,
+                    next_id: &mut 0,
+                    scope: &scope,
+                    small_threshold: 0,
+                },
+                Instant::now(),
+            );
+            let mut small = false;
+            let mut bulk = false;
+            while let Ok(item) = rx.try_recv() {
+                if item.record.flow == stream::data_flow(1) {
+                    assert!(item.record.payload.len() <= crate::runtime::MAX_PAYLOAD);
+                    assert!(item.hold.as_ref().unwrap().interactive());
+                    small = true;
+                } else {
+                    assert_eq!(item.record.payload.len(), stream::RELIABLE_PAYLOAD);
+                    assert!(!item.hold.as_ref().unwrap().interactive());
+                    bulk = true;
+                }
+            }
+            assert!(
+                small && bulk,
+                "both carriers must retain producer progress for {direction}"
+            );
         }
-        assert!(small && bulk, "both carriers must retain producer progress");
     }
 
     #[tokio::test(flavor = "current_thread")]

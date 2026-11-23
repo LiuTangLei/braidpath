@@ -2311,3 +2311,109 @@ async fn ordered_udp_flows_do_not_consume_tcp_flow_permits() {
     empty(&identity, at).await;
     pool.shutdown().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn proxy_native_upload_handles_slow_target_backpressure_without_stalling_interactive_and_udp()
+{
+    let root = tempfile::tempdir().unwrap();
+    let (at, _server, server_metrics) = start_metered(root.path(), "a", None, true).await;
+    let identity = identity(root.path(), "native-upload-backpressure");
+    let pool = client::Pool::new(
+        identity.clone(),
+        vec![node("a", at)],
+        vec!["a".into()],
+        None,
+        false,
+    )
+    .unwrap();
+    let (listen, _listener) = local_listener(pool.clone(), "a").await;
+    let slow_target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let slow_at = slow_target.local_addr().unwrap();
+    let payload: Vec<u8> = (0..2 * 1024 * 1024).map(|i| (i % 241) as u8).collect();
+    let expected = payload.clone();
+    let slow_reader = tokio::spawn(async move {
+        let (mut tcp, _) = slow_target.accept().await.unwrap();
+        let mut received = Vec::with_capacity(expected.len());
+        let mut chunk = vec![0u8; 65_536];
+        while received.len() < expected.len() {
+            let n = tcp.read(&mut chunk).await.unwrap();
+            assert!(n > 0, "unexpected EOF at {}", received.len());
+            received.extend_from_slice(&chunk[..n]);
+            // Pace reads to exercise server-side native receive backpressure.
+            tokio::time::sleep(Duration::from_millis(15)).await;
+        }
+        assert_eq!(received, expected);
+        tcp.write_all(b"SLOW-OK").await.unwrap();
+        tcp.shutdown().await.unwrap();
+    });
+    let (mut upload, status, _) = socks(listen, TCP, Address::Ip(slow_at)).await;
+    assert_eq!(status, 0);
+    let upload_task = tokio::spawn(async move {
+        upload.write_all(&payload).await.unwrap();
+        upload.shutdown().await.unwrap();
+        let mut ack = Vec::new();
+        upload.read_to_end(&mut ack).await.unwrap();
+        assert_eq!(ack, b"SLOW-OK");
+    });
+
+    // While slow bulk upload is active, both interactive TCP and ordered UDP stay responsive.
+    let (echo_at, _echo) = echo().await;
+    let (mut interactive, status, _) = socks(listen, TCP, Address::Ip(echo_at)).await;
+    assert_eq!(status, 0);
+    interactive.write_all(b"ping-under-upload").await.unwrap();
+    let mut pong = [0u8; 17];
+    timeout(Duration::from_secs(3), interactive.read_exact(&mut pong))
+        .await
+        .expect("interactive TCP stalled under native upload")
+        .unwrap();
+    assert_eq!(&pong, b"ping-under-upload");
+    drop(interactive);
+
+    let udp_echo = udp_socket("127.0.0.1:0".parse().unwrap()).await.unwrap();
+    let udp_target = udp_echo.local_addr().unwrap();
+    let _udp_echo = Task(tokio::spawn(async move {
+        let mut buf = [0u8; 2048];
+        loop {
+            let (n, peer) = udp_echo.recv_from(&mut buf).await.unwrap();
+            udp_echo.send_to(&buf[..n], peer).await.unwrap();
+        }
+    }));
+    let udp = udp_socket("127.0.0.1:0".parse().unwrap()).await.unwrap();
+    let (control, status, bound) = socks(listen, UDP, Address::Ip(udp.local_addr().unwrap())).await;
+    assert_eq!(status, 0);
+    let Address::Ip(bound) = bound else { panic!() };
+    let mut req = vec![0, 0, 0];
+    Address::Ip(udp_target).encode(&mut req);
+    req.extend_from_slice(b"udp-under-upload");
+    udp.send_to(&req, bound).await.unwrap();
+    let mut reply = [0u8; 2048];
+    let (n, _) = timeout(Duration::from_secs(3), udp.recv_from(&mut reply))
+        .await
+        .expect("ordered UDP stalled under native upload")
+        .unwrap();
+    let (_, body) = protocol::packet(&reply[3..n]).await.unwrap();
+    assert_eq!(body, b"udp-under-upload");
+    drop(control);
+
+    timeout(Duration::from_secs(15), upload_task)
+        .await
+        .expect("slow native upload timed out")
+        .unwrap();
+    slow_reader.await.unwrap();
+    let mut native_accepted = 0u64;
+    server_metrics.state(|state| {
+        for directions in state.sessions.values() {
+            for direction in directions.values() {
+                if let Some(streams) = &direction.tcp_streams {
+                    native_accepted += streams.native_return_accepted_bytes;
+                }
+            }
+        }
+    });
+    assert!(
+        native_accepted >= 1024 * 1024,
+        "server accepted only {native_accepted} bytes natively"
+    );
+    empty(&identity, at).await;
+    pool.shutdown().await;
+}
