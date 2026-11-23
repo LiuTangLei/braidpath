@@ -210,6 +210,18 @@ impl Control {
         })
     }
 
+    /// Close cached control connections and endpoints when replacing a stale
+    /// control socket (for example after an uplink interface is recreated).
+    pub(super) fn close(&self) {
+        self.peers.lock().expect("control peers").clear();
+        if let Some(endpoint) = &self.v4 {
+            endpoint.close(0u32.into(), b"mesh control replaced");
+        }
+        if let Some(endpoint) = &self.v6 {
+            endpoint.close(0u32.into(), b"mesh control replaced");
+        }
+    }
+
     /// Close cached connections unused for `idle` and forget their slots, so
     /// keepalives do not pin connections to rotated or departed members.
     pub(super) fn prune(&self, idle: Duration) {

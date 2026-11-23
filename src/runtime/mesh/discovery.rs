@@ -182,21 +182,53 @@ impl ClientIdentity {
     /// Explicit entries take precedence. Cached authenticated members provide
     /// a second bounded attempt when every requested bootstrap is unavailable.
     pub async fn discover_any(&self, entries: &[SocketAddr]) -> Result<Vec<Node>> {
-        self.discover_for(entries, None).await
+        self.discover_for_on(entries, None, &Uplink::default()).await
+    }
+
+    pub(crate) async fn discover_any_on(
+        &self,
+        entries: &[SocketAddr],
+        uplink: &Uplink,
+    ) -> Result<Vec<Node>> {
+        self.discover_for_on(entries, None, uplink).await
     }
 
     /// A partial member view is useful for listing, but cannot complete a
     /// client bootstrap until it contains the selected exit.
     pub async fn discover_exit(&self, entries: &[SocketAddr], exit: &str) -> Result<Vec<Node>> {
-        self.discover_for(entries, Some(exit)).await
+        self.discover_for_on(entries, Some(exit), &Uplink::default())
+            .await
     }
 
-    async fn discover_for(&self, entries: &[SocketAddr], exit: Option<&str>) -> Result<Vec<Node>> {
+    pub(crate) async fn discover_exit_on(
+        &self,
+        entries: &[SocketAddr],
+        exit: &str,
+        uplink: &Uplink,
+    ) -> Result<Vec<Node>> {
+        self.discover_for_on(entries, Some(exit), uplink).await
+    }
+
+    async fn discover_for_on(
+        &self,
+        entries: &[SocketAddr],
+        exit: Option<&str>,
+        uplink: &Uplink,
+    ) -> Result<Vec<Node>> {
         ensure!(
             !entries.is_empty() && entries.len() <= MAX_NODES,
             "provide 1..32 discovery entries"
         );
-        let failure = match self.query_entries(entries, exit).await {
+        let entries: Vec<_> = entries
+            .iter()
+            .copied()
+            .filter(|address| uplink.supports(*address))
+            .collect();
+        ensure!(
+            !entries.is_empty(),
+            "no discovery entry matches uplink address family"
+        );
+        let failure = match self.query_entries_on(&entries, exit, uplink).await {
             Ok(nodes) => return Ok(nodes),
             Err(error) => error,
         };
@@ -205,21 +237,31 @@ impl ClientIdentity {
             .known()
             .iter()
             .flat_map(Node::addresses)
-            .filter(|address| !entries.contains(address))
+            .filter(|address| uplink.supports(*address) && !entries.contains(address))
             .collect();
         if alternatives.is_empty() {
             return Err(failure).context("no discovery entry available");
         }
         tracing::info!("discovery entries unavailable; trying previously authenticated members");
-        self.query_entries(&alternatives, exit)
+        self.query_entries_on(&alternatives, exit, uplink)
             .await
             .context("cached discovery entries unavailable")
     }
 
     async fn query_entries(&self, entries: &[SocketAddr], exit: Option<&str>) -> Result<Vec<Node>> {
-        let control = Arc::new(Control::new(
+        self.query_entries_on(entries, exit, &Uplink::default()).await
+    }
+
+    async fn query_entries_on(
+        &self,
+        entries: &[SocketAddr],
+        exit: Option<&str>,
+        uplink: &Uplink,
+    ) -> Result<Vec<Node>> {
+        let control = Arc::new(Control::bound(
             &self.dir.join("cert.pem"),
             entries.iter().any(|a| a.is_ipv6()),
+            uplink,
         )?);
         self.query_with(control, entries, exit).await
     }

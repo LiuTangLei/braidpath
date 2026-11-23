@@ -881,15 +881,23 @@ pub async fn client(options: ClientOptions) -> Result<()> {
         wanted.len() <= crate::runtime::MAX_PATHS,
         "select at most eight mesh exits"
     );
-    let mut nodes = options.identity.discover_any(&options.connect).await?;
+    let uplink = mesh::Uplink {
+        interface: options.interface.clone(),
+        ..Default::default()
+    };
+    let mut nodes = options
+        .identity
+        .discover_any_on(&options.connect, &uplink)
+        .await?;
     let mut missing = JoinSet::new();
     for exit in &wanted {
         if !nodes.iter().any(|node| node.id == *exit) {
             let identity = options.identity.clone();
             let entries = options.connect.clone();
             let exit = exit.clone();
+            let uplink = uplink.clone();
             missing.spawn(async move {
-                let nodes = identity.discover_exit(&entries, &exit).await?;
+                let nodes = identity.discover_exit_on(&entries, &exit, &uplink).await?;
                 Ok::<_, anyhow::Error>(
                     nodes
                         .into_iter()
@@ -1008,7 +1016,11 @@ pub async fn client(options: ClientOptions) -> Result<()> {
             result = tasks.join_next() => { result.context("proxy listeners stopped")???; bail!("proxy listener stopped"); }
             _ = refresh.tick(), if discovery.is_empty() => {
                 let pool = pool.clone(); let entries = options.connect.clone();
-                discovery.spawn(async move { if let Ok(nodes) = pool.identity.discover_any(&entries).await { pool.refresh(nodes); } });
+                discovery.spawn(async move {
+                    if let Ok(nodes) = pool.identity.discover_any_on(&entries, &pool.uplink()).await {
+                        pool.refresh(nodes);
+                    }
+                });
             }
             _ = discovery.join_next(), if !discovery.is_empty() => {}
         }

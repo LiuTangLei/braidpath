@@ -3,6 +3,166 @@ use tokio::sync::watch;
 
 // Renew several times per lease lifetime, independently of discovery.
 const RENEW_EVERY: Duration = Duration::from_secs(LEASE_FOR.as_secs() / 4);
+const REBIND_RETRY_AFTER: Duration = Duration::from_secs(2);
+const BOUND_FAILURE_REBIND_AFTER: Duration = Duration::from_secs(15);
+const UNBOUND_FAILURE_REBIND_AFTER: Duration = Duration::from_secs(30);
+
+#[cfg(target_os = "linux")]
+fn interface_index(name: &str) -> Option<u32> {
+    if name.is_empty()
+        || name == "."
+        || name == ".."
+        || name.contains('/')
+        || name.contains('\0')
+    {
+        return None;
+    }
+    let path = Path::new("/sys/class/net").join(name).join("ifindex");
+    std::fs::read_to_string(path)
+        .ok()?
+        .trim()
+        .parse::<u32>()
+        .ok()
+        .filter(|&index| index != 0)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn interface_index(_name: &str) -> Option<u32> {
+    None
+}
+
+#[cfg(test)]
+type IfIndexLookup = Arc<dyn Fn(&str) -> Option<u32> + Send + Sync>;
+#[cfg(test)]
+type ControlBuilder = Arc<dyn Fn() -> Result<Control> + Send + Sync>;
+
+struct ControlRecovery {
+    ca: PathBuf,
+    ipv6: bool,
+    uplink: Uplink,
+    bound_ifindex: Option<u32>,
+    interface_missing: bool,
+    consecutive_discovery_failures: u32,
+    last_rebind_attempt: Option<Instant>,
+    rebind_retry_after: Duration,
+    failure_rebind_after: Duration,
+    #[cfg(test)]
+    ifindex_override: Option<IfIndexLookup>,
+    #[cfg(test)]
+    builder_override: Option<ControlBuilder>,
+}
+
+impl ControlRecovery {
+    fn new(ca: PathBuf, ipv6: bool, uplink: Uplink, bound_ifindex: Option<u32>) -> Self {
+        let is_bound = uplink.interface.is_some() || uplink.bind.is_some();
+        Self {
+            ca,
+            ipv6,
+            uplink,
+            bound_ifindex,
+            interface_missing: false,
+            consecutive_discovery_failures: 0,
+            last_rebind_attempt: None,
+            rebind_retry_after: REBIND_RETRY_AFTER,
+            failure_rebind_after: if is_bound {
+                BOUND_FAILURE_REBIND_AFTER
+            } else {
+                UNBOUND_FAILURE_REBIND_AFTER
+            },
+            #[cfg(test)]
+            ifindex_override: None,
+            #[cfg(test)]
+            builder_override: None,
+        }
+    }
+
+    fn is_bound(&self) -> bool {
+        self.uplink.interface.is_some() || self.uplink.bind.is_some()
+    }
+
+    fn current_ifindex(&self) -> Option<u32> {
+        let name = self.uplink.interface.as_deref()?;
+        #[cfg(test)]
+        if let Some(lookup) = &self.ifindex_override {
+            return lookup(name);
+        }
+        interface_index(name)
+    }
+
+    fn note_control_success(&mut self) {
+        self.consecutive_discovery_failures = 0;
+    }
+
+    fn interface_changed(&mut self) -> bool {
+        if self.uplink.interface.is_none() {
+            return false;
+        }
+        match self.current_ifindex() {
+            None => {
+                if self.bound_ifindex.is_some() {
+                    self.interface_missing = true;
+                }
+                false
+            }
+            Some(current) => self.interface_missing || self.bound_ifindex != Some(current),
+        }
+    }
+
+    fn should_rebind_after_discovery_failure(&mut self) -> bool {
+        self.consecutive_discovery_failures = self.consecutive_discovery_failures.saturating_add(1);
+        let threshold = if self.is_bound() { 1 } else { 2 };
+        self.consecutive_discovery_failures >= threshold
+            && self
+                .last_rebind_attempt
+                .is_none_or(|at| at.elapsed() >= self.failure_rebind_after)
+    }
+
+    fn try_rebind(&mut self, reason: &'static str, respect_retry_cooldown: bool) -> Option<Arc<Control>> {
+        if respect_retry_cooldown
+            && self
+                .last_rebind_attempt
+                .is_some_and(|at| at.elapsed() < self.rebind_retry_after)
+        {
+            return None;
+        }
+        // Capture ifindex before binding so an interface bounce during bind
+        // still appears as a mismatch on the next check instead of being missed.
+        let next_ifindex = self.current_ifindex();
+        self.last_rebind_attempt = Some(Instant::now());
+        #[cfg(test)]
+        let built = if let Some(builder) = &self.builder_override {
+            builder()
+        } else {
+            Control::bound(&self.ca, self.ipv6, &self.uplink)
+        };
+        #[cfg(not(test))]
+        let built = Control::bound(&self.ca, self.ipv6, &self.uplink);
+        match built {
+            Ok(control) => {
+                tracing::info!(
+                    reason,
+                    interface = ?self.uplink.interface,
+                    old_ifindex = ?self.bound_ifindex,
+                    new_ifindex = ?next_ifindex,
+                    "rebound mesh control endpoint"
+                );
+                self.bound_ifindex = next_ifindex;
+                self.interface_missing = false;
+                self.consecutive_discovery_failures = 0;
+                Some(Arc::new(control))
+            }
+            Err(error) => {
+                tracing::debug!(
+                    reason,
+                    interface = ?self.uplink.interface,
+                    %error,
+                    "mesh control endpoint rebind unavailable; bounded retry scheduled"
+                );
+                None
+            }
+        }
+    }
+}
 
 /// Periodic data-plane evidence; an abandoned reporter expires with the lease.
 #[derive(Clone)]
@@ -122,13 +282,12 @@ impl Entrances {
             .find(|n| n.id == exit)
             .context("selected exit not found")?
             .clone();
-        let control = Arc::new(Control::bound(
-            &identity.dir.join("cert.pem"),
-            nodes
-                .iter()
-                .any(|n| n.address.is_ipv6() && n.alternate.is_none()),
-            uplink,
-        )?);
+        let ipv6 = nodes
+            .iter()
+            .any(|n| n.address.is_ipv6() && n.alternate.is_none());
+        let ca = identity.dir.join("cert.pem");
+        let bound_ifindex = uplink.interface.as_deref().and_then(interface_index);
+        let control = Arc::new(Control::bound(&ca, ipv6, uplink)?);
         let direct = control
             .best_address(&selected, &identity.auth, None)
             .await
@@ -141,6 +300,12 @@ impl Entrances {
         let directory = Directory {
             health: observed,
             control,
+            recovery: Some(ControlRecovery::new(
+                ca,
+                ipv6,
+                uplink.clone(),
+                bound_ifindex,
+            )),
             auth: identity.auth.clone(),
             selected,
             direct,
@@ -193,6 +358,7 @@ struct Renewal {
 struct Directory {
     health: watch::Receiver<PathHealth>,
     control: Arc<Control>,
+    recovery: Option<ControlRecovery>,
     auth: String,
     selected: Node,
     direct: Option<SocketAddr>,
@@ -230,6 +396,67 @@ pub(super) fn validate_nodes(nodes: &[Node]) -> Result<()> {
 }
 
 impl Directory {
+    fn replace_control(
+        &mut self,
+        new_control: Arc<Control>,
+        discovery: &mut JoinSet<Option<Discovery>>,
+        allocations: &mut JoinSet<(Allocation, Result<RelayReply>)>,
+        renewals: &mut JoinSet<Renewal>,
+        renewing: &mut std::collections::BTreeSet<String>,
+    ) {
+        let old = std::mem::replace(&mut self.control, new_control);
+        old.close();
+        *discovery = JoinSet::new();
+        *allocations = JoinSet::new();
+        *renewals = JoinSet::new();
+        renewing.clear();
+        discovery.spawn(self.discovery());
+        self.start_renewals(renewals, renewing);
+        *allocations = self.allocations();
+    }
+
+    fn rebind_if_interface_changed(
+        &mut self,
+        discovery: &mut JoinSet<Option<Discovery>>,
+        allocations: &mut JoinSet<(Allocation, Result<RelayReply>)>,
+        renewals: &mut JoinSet<Renewal>,
+        renewing: &mut std::collections::BTreeSet<String>,
+    ) -> bool {
+        let new_control = self.recovery.as_mut().and_then(|recovery| {
+            recovery
+                .interface_changed()
+                .then(|| recovery.try_rebind("interface_changed", true))
+                .flatten()
+        });
+        if let Some(new_control) = new_control {
+            self.replace_control(new_control, discovery, allocations, renewals, renewing);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn rebind_after_discovery_failure(
+        &mut self,
+        discovery: &mut JoinSet<Option<Discovery>>,
+        allocations: &mut JoinSet<(Allocation, Result<RelayReply>)>,
+        renewals: &mut JoinSet<Renewal>,
+        renewing: &mut std::collections::BTreeSet<String>,
+    ) -> bool {
+        let new_control = self.recovery.as_mut().and_then(|recovery| {
+            recovery
+                .should_rebind_after_discovery_failure()
+                .then(|| recovery.try_rebind("discovery_failed", false))
+                .flatten()
+        });
+        if let Some(new_control) = new_control {
+            self.replace_control(new_control, discovery, allocations, renewals, renewing);
+            true
+        } else {
+            false
+        }
+    }
+
     fn addresses(&self) -> Vec<SocketAddr> {
         std::iter::once(self.direct.unwrap_or(self.selected.address))
             .chain(self.leases.values().map(|lease| lease.reply.address))
@@ -303,6 +530,12 @@ impl Directory {
                     if result.is_err() { health_open = false; continue; }
                     let health = self.health.borrow_and_update().clone();
                     let now = Instant::now();
+                    self.rebind_if_interface_changed(
+                        &mut discovery,
+                        &mut allocations,
+                        &mut renewals,
+                        &mut renewing,
+                    );
                     if health.all_failed(&self.addresses()) && now >= recovery_after && discovery.is_empty() {
                         recovery_after = now + Duration::from_secs(2);
                         tracing::debug!(stage="discovery", "mesh has no usable paths; refreshing directory");
@@ -318,18 +551,43 @@ impl Directory {
                 }
                 _ = renew.tick() => {
                     self.expire_leases();
+                    if self.rebind_if_interface_changed(
+                        &mut discovery,
+                        &mut allocations,
+                        &mut renewals,
+                        &mut renewing,
+                    ) {
+                        self.publish(&tx);
+                        continue;
+                    }
                     self.start_renewals(&mut renewals, &mut renewing);
                     self.publish(&tx);
                 }
                 _ = discover.tick(), if discovery.is_empty() => {
-                    discovery.spawn(self.discovery());
+                    if !self.rebind_if_interface_changed(
+                        &mut discovery,
+                        &mut allocations,
+                        &mut renewals,
+                        &mut renewing,
+                    ) {
+                        discovery.spawn(self.discovery());
+                    }
                 }
                 Some(result) = discovery.join_next() => {
                     match result {
                         Ok(Some(Discovery { nodes, preferred })) => {
+                            if let Some(recovery) = &mut self.recovery {
+                                recovery.note_control_success();
+                            }
                             let previous_exit = self.selected.clone();
                             for allocation in self.apply_nodes(nodes) {
                                 self.start_release(&mut releases, allocation);
+                            }
+                            if let Some(recovery) = &mut self.recovery {
+                                recovery.ipv6 = self
+                                    .nodes
+                                    .iter()
+                                    .any(|n| n.address.is_ipv6() && n.alternate.is_none());
                             }
                             if let Some((node, address)) = preferred
                                 && node == self.selected
@@ -345,7 +603,24 @@ impl Directory {
                                 renewing.clear();
                             }
                         }
-                        _ => tracing::debug!("mesh directory refresh unavailable; retaining known peers"),
+                        Ok(None) => {
+                            tracing::debug!("mesh directory refresh unavailable; retaining known peers");
+                            if self.rebind_if_interface_changed(
+                                &mut discovery,
+                                &mut allocations,
+                                &mut renewals,
+                                &mut renewing,
+                            ) || self.rebind_after_discovery_failure(
+                                &mut discovery,
+                                &mut allocations,
+                                &mut renewals,
+                                &mut renewing,
+                            ) {
+                                continue;
+                            }
+                        }
+                        Err(error) if error.is_cancelled() => continue,
+                        Err(_) => tracing::debug!("mesh directory refresh unavailable; retaining known peers"),
                     }
                     // In-flight requests keep their captured node and exit.
                     // Their completions are checked before publishing, so a
@@ -359,6 +634,9 @@ impl Directory {
                 Some(result) = allocations.join_next() => {
                     match result {
                         Ok((allocation, Ok(reply))) => {
+                            if let Some(recovery) = &mut self.recovery {
+                                recovery.note_control_success();
+                            }
                             if self.current(&allocation) && self.leases.len() < self.limit - 1 {
                                 let node = allocation.node;
                                 self.leases.insert(node.id.clone(), ClientLease {
@@ -372,6 +650,7 @@ impl Directory {
                             }
                         }
                         Ok((allocation, Err(error))) => tracing::debug!(node=%allocation.node.id, %error, "optional entrance unavailable"),
+                        Err(error) if error.is_cancelled() => {}
                         Err(error) => tracing::warn!(%error, "entrance allocation task failed"),
                     }
                 }
@@ -379,12 +658,27 @@ impl Directory {
                     match result {
                         Ok(renewal) => {
                             renewing.remove(&renewal.allocation.node.id);
+                            let failed = renewal.result.is_err();
+                            if !failed
+                                && let Some(recovery) = &mut self.recovery
+                            {
+                                recovery.note_control_success();
+                            }
                             if self.current(&renewal.allocation) {
                                 self.apply_renewal(renewal, &tx);
                             } else {
                                 self.start_release(&mut releases, renewal.allocation);
                             }
+                            if failed {
+                                self.rebind_if_interface_changed(
+                                    &mut discovery,
+                                    &mut allocations,
+                                    &mut renewals,
+                                    &mut renewing,
+                                );
+                            }
                         }
+                        Err(error) if error.is_cancelled() => {}
                         Err(error) => tracing::warn!(%error, "entrance renewal task failed"),
                     }
                 }
@@ -958,6 +1252,7 @@ mod tests {
         let directory = Directory {
             health: watch::channel(PathHealth::default()).1,
             control: Arc::new(Control::new(&dir.join("cert.pem"), false).unwrap()),
+            recovery: None,
             auth: format!("Bearer {}", transport::token(&dir.join("token")).unwrap()),
             selected: selected.clone(),
             direct: None,
@@ -1231,6 +1526,7 @@ mod tests {
         let mut directory = Directory {
             health: observed.clone(),
             control: Arc::new(Control::new(&identity.dir.join("cert.pem"), false).unwrap()),
+            recovery: None,
             auth: identity.auth.clone(),
             selected,
             direct: None,
@@ -1395,6 +1691,7 @@ mod tests {
         let mut directory = Directory {
             health: watch::channel(PathHealth::default()).1,
             control: Arc::new(Control::new(&identity.dir.join("cert.pem"), false).unwrap()),
+            recovery: None,
             auth: identity.auth.clone(),
             selected,
             direct: None,
@@ -1471,6 +1768,7 @@ mod tests {
         let mut directory = Directory {
             health: watch::channel(PathHealth::default()).1,
             control: Arc::new(Control::new(&dir.join("cert.pem"), false).unwrap()),
+            recovery: None,
             auth: String::new(),
             selected: nodes[0].clone(),
             direct: None,
@@ -1531,5 +1829,254 @@ mod tests {
             directory.leases.is_empty(),
             "old immutable relay targets survived exit migration"
         );
+    }
+
+    #[tokio::test]
+    async fn control_rebinds_on_interface_index_change_while_direct_path_stays_usable() {
+        use super::super::tests::{address, server, wait_nodes};
+        use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let exit_address = address();
+        let _exit = server(root, "exit", exit_address, address(), None).await;
+        let identity =
+            ClientIdentity::open(root.join("client"), &root.join("exit/client-key.json")).unwrap();
+        wait_nodes(&identity, exit_address, &["exit"]).await;
+        let relay_address = address();
+        let _relay = server(
+            root,
+            "relay",
+            relay_address,
+            address(),
+            Some((exit_address, root.join("exit/server-key.json"))),
+        )
+        .await;
+        let nodes = wait_nodes(&identity, relay_address, &["exit", "relay"]).await;
+        let selected = nodes.iter().find(|n| n.id == "exit").unwrap().clone();
+        let relay = nodes.iter().find(|n| n.id == "relay").unwrap().clone();
+
+        // Simulate a control endpoint pinned to an old interface index by closing it.
+        let ca = identity.dir.join("cert.pem");
+        let stale_control = Arc::new(Control::new(&ca, false).unwrap());
+        stale_control.close();
+        let old_entrance = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let ifindex = Arc::new(AtomicU32::new(34));
+        let rebinds = Arc::new(AtomicUsize::new(0));
+        let ifindex_lookup = ifindex.clone();
+        let rebinds_counter = rebinds.clone();
+        let ca_for_builder = ca.clone();
+        let mut recovery = ControlRecovery::new(
+            ca,
+            false,
+            Uplink {
+                interface: Some("ppp0".into()),
+                ..Default::default()
+            },
+            Some(34),
+        );
+        recovery.rebind_retry_after = Duration::ZERO;
+        recovery.ifindex_override = Some(Arc::new(move |_| {
+            let value = ifindex_lookup.load(Ordering::SeqCst);
+            (value != 0).then_some(value)
+        }));
+        recovery.builder_override = Some(Arc::new(move || {
+            rebinds_counter.fetch_add(1, Ordering::SeqCst);
+            Control::new(&ca_for_builder, false)
+        }));
+
+        let (health_tx, health_rx) = watch::channel(PathHealth {
+            checked: Instant::now(),
+            addresses: vec![exit_address],
+            samples: vec![PathSample {
+                address: exit_address,
+                group: 0,
+                delivered: true,
+                failed: false,
+                rtt_ms: 5.0,
+                loss: 0.0,
+            }],
+        });
+        let directory = Directory {
+            health: health_rx,
+            control: stale_control,
+            recovery: Some(recovery),
+            auth: identity.auth.clone(),
+            selected,
+            direct: Some(exit_address),
+            cache: identity.cache.clone(),
+            nodes: nodes.clone(),
+            known: nodes,
+            leases: BTreeMap::from([(
+                relay.id.clone(),
+                ClientLease {
+                    node: relay,
+                    reply: RelayReply {
+                        lease: "0".repeat(32),
+                        address: old_entrance.local_addr().unwrap(),
+                    },
+                    renewed: Instant::now(),
+                },
+            )]),
+            requests: BTreeMap::new(),
+            limit: 2,
+            discovery_cursor: 0,
+            allocation_cursor: 0,
+            explorer: selection::Explorer::default(),
+        };
+        let (tx, mut updates) = watch::channel(directory.addresses());
+        let _maintenance = AbortTask(tokio::spawn(
+            directory.maintain(tx, Duration::from_secs(60)),
+        ));
+
+        // While ifindex stays 34 and direct Path 0 stays usable, no rebind occurs.
+        health_tx.send_replace(PathHealth {
+            checked: Instant::now(),
+            addresses: vec![exit_address],
+            samples: vec![PathSample {
+                address: exit_address,
+                group: 0,
+                delivered: true,
+                failed: false,
+                rtt_ms: 5.0,
+                loss: 0.0,
+            }],
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(rebinds.load(Ordering::SeqCst), 0);
+        assert_eq!(updates.borrow()[1], old_entrance.local_addr().unwrap());
+
+        // Interface is recreated with new ifindex=35 while direct Path 0 stays usable.
+        ifindex.store(35, Ordering::SeqCst);
+        health_tx.send_replace(PathHealth {
+            checked: Instant::now(),
+            addresses: vec![exit_address],
+            samples: vec![PathSample {
+                address: exit_address,
+                group: 0,
+                delivered: true,
+                failed: false,
+                rtt_ms: 5.0,
+                loss: 0.0,
+            }],
+        });
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while updates.borrow_and_update()[1] == old_entrance.local_addr().unwrap() {
+                updates.changed().await.unwrap();
+            }
+        })
+        .await
+        .expect("rebind on interface index change must replace stale relay lease");
+        assert_eq!(rebinds.load(Ordering::SeqCst), 1);
+        assert_eq!(updates.borrow().len(), 2);
+        assert_eq!(updates.borrow()[0], exit_address);
+        assert_ne!(updates.borrow()[1], old_entrance.local_addr().unwrap());
+    }
+
+    #[test]
+    fn interface_missing_then_returning_with_same_index_triggers_rebind() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        let ifindex = Arc::new(AtomicU32::new(34));
+        let lookup = ifindex.clone();
+        let mut recovery = ControlRecovery::new(
+            PathBuf::from("unused"),
+            false,
+            Uplink {
+                interface: Some("ppp0".into()),
+                ..Default::default()
+            },
+            Some(34),
+        );
+        recovery.ifindex_override = Some(Arc::new(move |_| {
+            let value = lookup.load(Ordering::SeqCst);
+            (value != 0).then_some(value)
+        }));
+        assert!(!recovery.interface_changed());
+        ifindex.store(0, Ordering::SeqCst);
+        assert!(!recovery.interface_changed());
+        assert!(recovery.interface_missing);
+        ifindex.store(34, Ordering::SeqCst);
+        assert!(recovery.interface_changed());
+    }
+
+    #[tokio::test]
+    async fn control_rebinds_after_discovery_failure_without_ifindex_change() {
+        use super::super::tests::{address, server, wait_nodes};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let exit_address = address();
+        let _exit = server(root, "exit", exit_address, address(), None).await;
+        let identity =
+            ClientIdentity::open(root.join("client"), &root.join("exit/client-key.json")).unwrap();
+        wait_nodes(&identity, exit_address, &["exit"]).await;
+        let relay_address = address();
+        let _relay = server(
+            root,
+            "relay",
+            relay_address,
+            address(),
+            Some((exit_address, root.join("exit/server-key.json"))),
+        )
+        .await;
+        let nodes = wait_nodes(&identity, relay_address, &["exit", "relay"]).await;
+        let selected = nodes.iter().find(|n| n.id == "exit").unwrap().clone();
+
+        let ca = identity.dir.join("cert.pem");
+        let stale_control = Arc::new(Control::new(&ca, false).unwrap());
+        stale_control.close();
+        let rebinds = Arc::new(AtomicUsize::new(0));
+        let rebinds_counter = rebinds.clone();
+        let ca_for_builder = ca.clone();
+        let mut recovery = ControlRecovery::new(
+            ca,
+            false,
+            Uplink {
+                interface: Some("ppp0".into()),
+                ..Default::default()
+            },
+            None,
+        );
+        recovery.rebind_retry_after = Duration::ZERO;
+        recovery.failure_rebind_after = Duration::ZERO;
+        recovery.ifindex_override = Some(Arc::new(|_| None));
+        recovery.builder_override = Some(Arc::new(move || {
+            rebinds_counter.fetch_add(1, Ordering::SeqCst);
+            Control::new(&ca_for_builder, false)
+        }));
+
+        let directory = Directory {
+            health: watch::channel(PathHealth::default()).1,
+            control: stale_control,
+            recovery: Some(recovery),
+            auth: identity.auth.clone(),
+            selected,
+            direct: Some(exit_address),
+            cache: identity.cache.clone(),
+            nodes: nodes.clone(),
+            known: nodes,
+            leases: BTreeMap::new(),
+            requests: BTreeMap::new(),
+            limit: 2,
+            discovery_cursor: 0,
+            allocation_cursor: 0,
+            explorer: selection::Explorer::default(),
+        };
+        let (tx, mut updates) = watch::channel(directory.addresses());
+        let _maintenance = AbortTask(tokio::spawn(
+            directory.maintain(tx, Duration::from_millis(50)),
+        ));
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while updates.borrow_and_update().len() != 2 {
+                updates.changed().await.unwrap();
+            }
+        })
+        .await
+        .expect("control fallback rebind must recover relay allocation after discovery failure");
+        assert!(rebinds.load(Ordering::SeqCst) >= 1);
     }
 }
