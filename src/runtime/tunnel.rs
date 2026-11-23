@@ -1935,7 +1935,12 @@ async fn sender_with_game_input(
     if policy.game_mode {
         business = business.map(|pacer| pacer.with_packet_reserve(GAME_PACKET_RESERVE));
     }
-    let mut game_startup = policy.game_mode.then(game_startup::Budget::default);
+    // The 4 Mbps DATAGRAM startup budget protects cold DATAGRAM bulk streams.
+    // On `native_returning`, bulk TCP travels on QUIC STREAM (`PathPace` + BBR),
+    // so keeping the DATAGRAM business pacer pinned at 4 Mbps only stalls
+    // interactive short TCP replies for ~12-15 ms behind `GAME_PACKET_RESERVE`.
+    let mut game_startup =
+        (policy.game_mode && !native_returning).then(game_startup::Budget::default);
     let mut game_data_demand = false;
     if let (Some(budget), Some(pacer)) = (&game_startup, &mut business) {
         pacer.set_aggregate_limit(budget.rate_bps());
@@ -1952,8 +1957,16 @@ async fn sender_with_game_input(
     let mut feedback_schedule = quality::FeedbackSchedule::default();
     let mut pending_feedback: Option<(Bytes, quality::ReportKind)> = None;
     let mut observation_schedule = policy.adaptive.then(outbound::ObservationSchedule::default);
-    let mut reverse_guard = policy.adaptive.then(reverse_guard::Guard::default);
-    let mut forward_guard = policy.adaptive.then(forward_guard::Guard::default);
+    // The shared reverse/forward guards infer aggregate sending rate from
+    // DATAGRAM symbol counts (`q.snapshot.sent_bytes`) and apply their trial
+    // cap to the shared `pacer`. On `native_returning`, bulk downloads leave
+    // the DATAGRAM lane for QUIC STREAM, so DATAGRAM-only counts see ~1-2 Mbps
+    // of UDP/ACK/short traffic and would cap a 60+ Mbps return flow to ~1.8 Mbps.
+    // Native BBR, `Credit`, and `PathPace` own congestion control there.
+    let mut reverse_guard =
+        (policy.adaptive && !native_returning).then(reverse_guard::Guard::default);
+    let mut forward_guard =
+        (policy.adaptive && !native_returning).then(forward_guard::Guard::default);
     let mut repair_turn = false;
     let mut tick = interval(Duration::from_millis(1));
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -2550,6 +2563,12 @@ async fn sender_with_game_input(
                         cwnd,
                         rtt_us,
                     );
+                }
+                if let Some(mixed_pace) = mixed_writes
+                    .as_ref()
+                    .and_then(|writes| writes.path_pace_bps(path.id, path.conn.stable_id()))
+                {
+                    controllers[usize::from(path.id)].floor_mixed_datagram_pace(now_us, mixed_pace);
                 }
                 if policy.capacity_probe_bps > 0 {
                     let group_paths = paths
@@ -3365,7 +3384,15 @@ async fn sender_with_game_input(
                     frontier.add(path.id, is_small, Gate::PathIneligible);
                     continue;
                 }
-                if is_small && repair && !small_delivery::copy_ready(path, used) {
+                if is_small
+                    && repair
+                    && (!small_delivery::copy_ready(path, used)
+                        || (policy.game_mode
+                            && policy.native_return
+                            && !gaming_datagram
+                            && used & (1 << path.id) != 0
+                            && front.created.elapsed() < Duration::from_millis(3)))
+                {
                     frontier.add(path.id, is_small, Gate::CopySpacing);
                     continue;
                 }

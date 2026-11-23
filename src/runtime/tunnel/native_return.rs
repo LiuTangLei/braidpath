@@ -126,6 +126,26 @@ pub(super) fn service_bound(conn: &quinn::Connection) -> u64 {
     conn.cwnd_hint().saturating_mul(1_000) / conn.rtt_hint().as_micros().max(1) as u64
 }
 
+fn single_path_rank(
+    probing: bool,
+    rtt_us: u64,
+    queued_bytes: u64,
+    next_bytes: u64,
+    service_bytes_per_ms: u64,
+) -> (bool, u64) {
+    let delay_us = rtt_us / 2;
+    let service = service_bytes_per_ms.max(1);
+    (
+        probing,
+        delay_us.saturating_add(
+            queued_bytes
+                .saturating_add(next_bytes)
+                .saturating_mul(1_000)
+                / service,
+        ),
+    )
+}
+
 impl Credit {
     pub(super) fn observe(
         &mut self,
@@ -393,11 +413,12 @@ pub(super) fn drain(
                 }
                 let (_, unsent) = path.conn.stream_send_buffer_bytes();
                 let queued = unsent + ((writer.tx.max_capacity() - slots) * PAYLOAD) as u64;
-                let delay_us = path.conn.rtt_hint().as_micros() as u64 / 2;
-                let service = service_bound(&path.conn).max(1);
-                (
+                single_path_rank(
                     path.conn.probing_rtt_hint(),
-                    delay_us + (queued + front.data.len() as u64) * 1_000 / service,
+                    path.conn.rtt_hint().as_micros() as u64,
+                    queued,
+                    front.data.len() as u64,
+                    service_bound(&path.conn),
                 )
             });
         }
@@ -450,12 +471,13 @@ struct PathPace {
     sampled_us: u64,
     packets: u64,
     lost: u64,
+    tx_bytes: u64,
     queue_braked: bool,
     last_pressure_us: Option<u64>,
 }
 impl PathPace {
     fn new(connection: usize, now_us: u64, ceiling: u64) -> Self {
-        let mut credit = outbound::Pacer::new(ceiling.min(20_000_000), 2 * PART_WIRE_BYTES);
+        let mut credit = outbound::Pacer::for_sender(ceiling.min(20_000_000), 2 * PART_WIRE_BYTES);
         credit.set_rate(now_us, credit.rate());
         Self {
             connection,
@@ -463,40 +485,65 @@ impl PathPace {
             sampled_us: now_us,
             packets: 0,
             lost: 0,
+            tx_bytes: 0,
             queue_braked: false,
             last_pressure_us: None,
         }
     }
 
     fn observe(&mut self, conn: &quinn::Connection, now_us: u64, ceiling: u64) {
-        if now_us.saturating_sub(self.sampled_us) < 100_000 {
+        let elapsed_us = now_us.saturating_sub(self.sampled_us);
+        if elapsed_us < 100_000 {
             self.credit.refill(now_us);
             return;
         }
-        let path = conn.stats().path;
+        let stats = conn.stats();
+        let path = stats.path;
         let packets = path.sent_packets.saturating_sub(self.packets);
         let lost = path.lost_packets.saturating_sub(self.lost);
+        let tx_bytes = stats.udp_tx.bytes.saturating_sub(self.tx_bytes);
         self.packets = path.sent_packets;
         self.lost = path.lost_packets;
+        self.tx_bytes = stats.udp_tx.bytes;
         self.sampled_us = now_us;
 
         let rate = self.credit.rate();
-        let queued = path.rtt.saturating_sub(path.min_rtt) > std::time::Duration::from_millis(8);
+        let actual_bps = (u128::from(tx_bytes) * 8_000_000 / u128::from(elapsed_us.max(1)))
+            .min(u128::from(ceiling)) as u64;
+        let loss_base = if actual_bps >= 4_000_000 {
+            rate.min(actual_bps.max(rate * 3 / 4))
+        } else {
+            rate
+        };
+        let rtt_excess = path.rtt.saturating_sub(path.min_rtt);
+        let queued = rtt_excess > std::time::Duration::from_millis(10);
+        let deeply_queued = packets >= 64 && rtt_excess > std::time::Duration::from_millis(15);
         let lossy = packets >= 64 && lost.saturating_mul(200) > packets;
-        // RTT includes both directions. Apply one delay brake per episode;
-        // repeated local loss can still request another reduction.
+        // RTT includes both directions. Apply one gentle delay brake per
+        // moderate episode without exiting initial ramp on a single upload RTT
+        // bump; deep queueing or local loss records real bottleneck pressure so
+        // the pacer cruises gently without repeatedly hitting tail drop.
         let next = if lossy {
             self.last_pressure_us = Some(now_us);
-            (rate * 9 / 10).max(4_000_000)
-        } else if queued && !self.queue_braked && !conn.probing_rtt_hint() {
+            (loss_base * 19 / 20).max(4_000_000)
+        } else if deeply_queued && !conn.probing_rtt_hint() {
             self.last_pressure_us = Some(now_us);
             (rate * 19 / 20).max(4_000_000)
-        } else if !queued && packets >= 64 && !conn.probing_rtt_hint() {
-            match self.last_pressure_us {
-                None => rate + rate / 10,
-                Some(at) if now_us.saturating_sub(at) >= 500_000 => rate + 500_000,
-                Some(_) => rate,
+        } else if queued && !self.queue_braked && !conn.probing_rtt_hint() {
+            if self.last_pressure_us.is_some() {
+                self.last_pressure_us = Some(now_us);
             }
+            (rate * 19 / 20).max(4_000_000)
+        } else if !queued && packets >= 64 && !conn.probing_rtt_hint() {
+            let (grown, headroom) = match self.last_pressure_us {
+                None => (rate + rate / 10, 112),
+                Some(at) if now_us.saturating_sub(at) >= 600_000 => {
+                    (rate + (rate / 64).max(300_000), 105)
+                }
+                Some(_) => (rate, 105),
+            };
+            let envelope = (actual_bps.saturating_mul(headroom) / 100).max(20_000_000);
+            grown.min(envelope.max(rate))
         } else {
             rate
         };
@@ -514,6 +561,13 @@ pub(super) struct MixedWrites {
 }
 
 impl MixedWrites {
+    pub fn path_pace_bps(&self, id: u8, connection: usize) -> Option<u64> {
+        self.path_pace[usize::from(id)]
+            .as_ref()
+            .filter(|pace| pace.connection == connection)
+            .map(|pace| pace.credit.rate())
+    }
+
     pub fn refund(
         &self,
         pacer: &mut outbound::Pacer,
@@ -596,10 +650,13 @@ impl MixedWrites {
             }
             let path_pace = slot.as_mut().expect("path pacer");
             path_pace.observe(&path.conn, now_us, ceiling);
-            if !path_pace.credit.available(cost) {
+            // Charge actual QUIC STREAM packet overhead on the per-path mixed
+            // pacer while keeping the conservative wire allowance on shared caps.
+            let pace_cost = count + H3_PART_ALLOWANCE + count.div_ceil(1200) * 48;
+            if !path_pace.credit.available(pace_cost) {
                 continue;
             }
-            path_pace.credit.spend(cost);
+            path_pace.credit.spend(pace_cost);
             let data = bytes.slice(..count);
             let last = count == bytes.len();
             let remaining = (!last).then(|| (connection, bytes.slice(count..)));
@@ -1164,6 +1221,33 @@ mod tests {
             }
         }
     }
+    #[test]
+    fn single_download_backlog_rank_accounts_for_queue_and_probing() {
+        let fast_clear = single_path_rank(false, 100_000, 0, 32_768, 12_500);
+        let fast_backlogged = single_path_rank(false, 100_000, 512 * 1024, 32_768, 12_500);
+        let medium_clear = single_path_rank(false, 110_000, 0, 32_768, 8_000);
+        let slow_clear = single_path_rank(false, 120_000, 0, 32_768, 2_000);
+        let fast_probing = single_path_rank(true, 100_000, 0, 32_768, 12_500);
+        assert!(fast_clear < medium_clear);
+        assert!(medium_clear < slow_clear);
+        assert!(medium_clear < fast_backlogged);
+        assert!(slow_clear < fast_probing);
+    }
+
+    #[test]
+    fn mixed_path_pace_exposes_active_connection_rate_with_rate_aware_burst() {
+        let mut pace = PathPace::new(77, 100_000, 50_000_000);
+        assert_eq!(pace.credit.rate(), 20_000_000);
+        // Rate-aware burst holds > 2 ms of 50 Mbps after refill without fixed 4 KiB stall.
+        pace.credit.set_rate(100_000, 50_000_000);
+        pace.credit.refill(105_000);
+        assert!(pace.credit.available(12_000));
+        let mut writes = MixedWrites::default();
+        writes.path_pace[0] = Some(pace);
+        assert_eq!(writes.path_pace_bps(0, 77), Some(50_000_000));
+        assert_eq!(writes.path_pace_bps(0, 88), None);
+    }
+
     #[test]
     fn rejects_unbounded_non_data_and_truncation() {
         let mut invalid = Bytes::from_static(&[255; 16]);

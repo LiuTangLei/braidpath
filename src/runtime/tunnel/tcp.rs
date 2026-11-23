@@ -1846,15 +1846,25 @@ impl Mux {
         let limit = self.drain.limit(self.lifetime);
         self.gauge.set_low_water(limit / 2);
         let mut idle = 0;
-        // A bulk-filled admission watermark must not hide a tiny request
-        // before it reaches the sender's existing per-flow fair queue. The
-        // reserve is at most two maximum segments plus one tiny frame;
-        // bulk keeps the original limit and all wire budgets remain shared.
-        while self.gauge.queued() < limit + 2 * self.payload_limit && idle < self.turns.len() {
+        // A bulk-filled admission watermark (including one 32 KiB native record
+        // overshoot) must not hide a short interactive request before it
+        // reaches the sender's existing per-flow fair queue. Bulk keeps the
+        // original limit and all wire budgets remain shared.
+        let interactive_cap = (2 * self.payload_limit) as u64;
+        let interactive_limit = limit
+            + if self.native_return {
+                native_return::PAYLOAD
+            } else {
+                0
+            }
+            + 2 * self.payload_limit;
+        while self.gauge.queued() < interactive_limit && idle < self.turns.len() {
             let id = self.turns.pop_front().expect("turn");
             self.turns.push_back(id);
             let s = self.streams.get_mut(&id).expect("stream turn");
-            if self.gauge.queued() >= limit && s.send.written() - s.send.retained_from() > 128 {
+            if self.gauge.queued() >= limit
+                && s.send.written() - s.send.retained_from() > interactive_cap
+            {
                 idle += 1;
                 continue;
             }
@@ -3784,6 +3794,81 @@ mod tests {
         mux.pump(&mut out, Instant::now());
         assert!(mux.gauge.queued() <= MIN_QUEUED + 3 * stream::MAX_SEGMENT);
         drop(first);
+        drop(held);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn interactive_one_kib_reply_bypasses_native_record_overshoot() {
+        let policy = Policy {
+            game_mode: true,
+            native_return: true,
+            max_message_bytes: 4096,
+            streams: true,
+            proxy: true,
+            fec_repairs: 1,
+            adaptive: true,
+            capacity_probe_bps: 0,
+            probe_guided_recovery: false,
+            latency_target_ms: 10,
+            group_rates: [80_000_000; MAX_PATHS],
+            receiver_feedback: true,
+            quality_schedule: true,
+            fec: super::super::super::automatic_fec::AUTO,
+            small_fec_bytes: 0,
+            mixed_fec: false,
+            redundancy: 30,
+            rate: 80_000_000,
+            block_ms: 3,
+            queue_ms: 100,
+        };
+        policy.validate().unwrap();
+        let metrics = stats::Metrics::new("server");
+        let scope = metrics.scope("mixed-interactive", stats::RETURN);
+        let mut mux = Mux::new(
+            Listeners::default(),
+            Targets::default(),
+            &policy,
+            scope.clone(),
+        );
+        mux.set_payload_limit(crate::runtime::MAX_PAYLOAD);
+        mux.open(1, false);
+        mux.open(2, false);
+        mux.streams
+            .get_mut(&1)
+            .unwrap()
+            .send
+            .push(&vec![7; native_return::PAYLOAD * 2]);
+        mux.streams.get_mut(&2).unwrap().send.push(&[9; 1024]);
+        // Simulate one queued 32 KiB native record overshooting the bulk watermark.
+        let held = mux
+            .gauge
+            .hold(1, 0, 1, MIN_QUEUED + native_return::PAYLOAD, false, false);
+        let (tx, mut rx) = mpsc::channel(32);
+        let mut next_id = 0;
+        let mut out = Out {
+            game_tx: None,
+            tx: &tx,
+            next_id: &mut next_id,
+            scope: &scope,
+            small_threshold: 0,
+        };
+        mux.pump(&mut out, Instant::now());
+        let mut received = 0usize;
+        while let Ok(item) = rx.try_recv() {
+            assert_eq!(
+                item.record.flow,
+                stream::data_flow(2),
+                "bulk remains bounded"
+            );
+            if let Some(Frame::Data { data, .. }) = Frame::decode(&item.record.payload) {
+                received += data.len();
+            }
+        }
+        assert_eq!(
+            received, 1024,
+            "1 KiB interactive reply must bypass a queued native record"
+        );
+        assert_eq!(mux.streams[&1].send.retained_from(), 0);
         drop(held);
     }
 

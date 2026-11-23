@@ -3941,6 +3941,17 @@ impl PathController {
         }
     }
 
+    /// Prevent the DATAGRAM lane of an active mixed return path from
+    /// collapsing below its own measured native H3 pace when bulk downloads
+    /// leave only sparse UDP and interactive TCP replies on DATAGRAM.
+    pub(crate) fn floor_mixed_datagram_pace(&mut self, now_us: u64, floor_bps: u64) {
+        self.refill(now_us);
+        let floor = floor_bps.min(self.maximum_bps);
+        if self.rate_bps < floor {
+            self.rate_bps = floor;
+        }
+    }
+
     pub fn allow(&mut self, now_us: u64, bytes: usize, queue_age_ms: f64) -> bool {
         self.refill(now_us);
         self.eligible(now_us)
@@ -15475,5 +15486,21 @@ mod tests {
             "eight seconds of dense stable feedback must replace the underfilled initial half: {:?}",
             c.light_baseline
         );
+    }
+
+    #[test]
+    fn floor_mixed_datagram_pace_raises_rate_without_creating_tokens() {
+        let mut c = PathController::new(40_000_000, 10);
+        c.rate_bps = 1_000_000;
+        c.refill(100_000);
+        let tokens_before = c.tokens;
+        c.floor_mixed_datagram_pace(100_000, 30_000_000);
+        assert_eq!(c.pacing_bps(), 30_000_000);
+        assert_eq!(c.tokens, tokens_before);
+        // Never exceeds the configured maximum rate or lowers a faster pace.
+        c.floor_mixed_datagram_pace(100_000, 80_000_000);
+        assert_eq!(c.pacing_bps(), 40_000_000);
+        c.floor_mixed_datagram_pace(100_000, 10_000_000);
+        assert_eq!(c.pacing_bps(), 40_000_000);
     }
 }

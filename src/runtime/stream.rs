@@ -967,6 +967,7 @@ impl Sender {
         if progressed {
             self.last_progress = Some(now);
             self.probe_count = 0;
+            self.probe_due = false;
             self.tail_probe_due = false;
         }
         self.acked = cumulative;
@@ -1140,7 +1141,7 @@ impl Sender {
                 })
                 .min(),
             self.repeated.first().map(|(at, _)| *at),
-            self.needs_probe()
+            (self.needs_probe() && !self.probe_due)
                 .then(|| self.probe_at.map(|at| at + self.probe_interval(now)))
                 .flatten(),
             self.awaiting_peer()
@@ -1154,11 +1155,14 @@ impl Sender {
     /// Returns true when a window or open probe became due.
     pub fn on_timeout(&mut self, now: Instant) -> bool {
         self.detect_losses(now);
-        let head = self.head_probe_deadline().is_some_and(|(_, at)| now >= at);
+        let head =
+            !self.head_probe_due && self.head_probe_deadline().is_some_and(|(_, at)| now >= at);
         self.head_probe_due |= head;
-        let tail = self.tail_probe_deadline().is_some_and(|(at, _)| now >= at);
+        let tail =
+            !self.tail_probe_due && self.tail_probe_deadline().is_some_and(|(at, _)| now >= at);
         self.tail_probe_due |= tail;
-        if !self.needs_probe()
+        if self.probe_due
+            || !self.needs_probe()
             || self
                 .probe_at
                 .is_some_and(|at| now < at + self.probe_interval(now))
@@ -2087,6 +2091,40 @@ mod tests {
             .poll_transmit_sized(probe_at, super::super::MAX_STREAM_PAYLOAD)
             .unwrap();
         assert!(probe.tail_probe && probe.start == 0);
+    }
+
+    #[test]
+    fn deferred_ack_probe_does_not_leave_an_expired_wakeup() {
+        let now = Instant::now();
+        let mut sender = Sender::new(false);
+        sender.push(&vec![7; RELIABLE_PAYLOAD - DATA_HEADER]);
+        let original = sender
+            .poll_transmit_reliable(now, RELIABLE_PAYLOAD)
+            .unwrap();
+        let reachable = Arc::new(AtomicBool::new(true));
+        sender.admitted_reliable(
+            original.start,
+            original.transmission,
+            0,
+            Duration::from_millis(40),
+            now,
+            reachable,
+        );
+        let probe_at = now + sender.probe_interval(now);
+        assert!(sender.on_timeout(probe_at));
+        assert!(sender.has_transmit());
+        // While backpressured before `poll_transmit`, `on_timeout` must not
+        // re-fire or leave a past wakeup timer spinning.
+        assert!(!sender.on_timeout(probe_at + Duration::from_millis(1)));
+        assert!(
+            sender
+                .next_deadline(probe_at + Duration::from_millis(1))
+                .is_none_or(|at| at > probe_at + Duration::from_millis(1))
+        );
+        let probe = sender
+            .poll_transmit_reliable(probe_at + Duration::from_millis(2), RELIABLE_PAYLOAD)
+            .unwrap();
+        assert_eq!(probe.transmission, 0);
     }
 
     #[test]
