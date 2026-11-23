@@ -126,15 +126,29 @@ pub(super) fn service_bound(conn: &quinn::Connection) -> u64 {
     conn.cwnd_hint().saturating_mul(1_000) / conn.rtt_hint().as_micros().max(1) as u64
 }
 
-fn single_path_rank(
+const COLD_PATH_MIN_PACKETS: u64 = 64;
+
+fn path_completion_rank(
     probing: bool,
     rtt_us: u64,
     queued_bytes: u64,
     next_bytes: u64,
     service_bytes_per_ms: u64,
+    cold_unmeasured: bool,
+    best_service_bytes_per_ms: u64,
 ) -> (bool, u64) {
     let delay_us = rtt_us / 2;
-    let service = service_bytes_per_ms.max(1);
+    // A freshly joined path starts at initial cwnd and would otherwise look
+    // artificially tiny until its sibling completely fills its 2-4 MiB buffer.
+    // Give a cold idle path one bounded probe-level service floor while it has
+    // zero queued backlog so BBR can measure its actual bandwidth.
+    let service = if cold_unmeasured && queued_bytes == 0 {
+        service_bytes_per_ms
+            .max(best_service_bytes_per_ms / 2)
+            .max(1)
+    } else {
+        service_bytes_per_ms.max(1)
+    };
     (
         probing,
         delay_us.saturating_add(
@@ -378,7 +392,6 @@ pub(super) fn drain(
     cursor: &mut usize,
     pacer: &mut outbound::Pacer,
     groups: &mut [outbound::Pacer; super::MAX_PATHS],
-    parallel_downloads: bool,
 ) {
     for _ in 0..16 {
         let Some(front) = queue.front(false) else {
@@ -391,17 +404,26 @@ pub(super) fn drain(
         let mut order: Vec<_> = (0..paths.len())
             .map(|n| (*cursor + n) % paths.len())
             .collect();
-        if front.hold.as_ref().is_some_and(|hold| hold.interactive()) {
-            order.sort_by_key(|&i| paths[i].conn.rtt_hint());
-        } else if !parallel_downloads
-            && paths
+        let active_native = paths
+            .iter()
+            .filter(|p| p.open() && silent & (1 << p.id) == 0 && p.native_return.is_some())
+            .count();
+        if active_native >= 2 {
+            // In-order TCP delivery waits for the oldest record, and interactive
+            // responses larger than the DATAGRAM bypass should avoid a deeply
+            // queued or RTT-probing sibling path. Rank 2+ paths by estimated
+            // completion time (one-way delay + queued backlog drain time).
+            let best_service = paths
                 .iter()
-                .filter(|p| p.open() && silent & (1 << p.id) == 0 && p.native_return.is_some())
-                .count()
-                >= 3
-        {
-            // In-order TCP delivery waits for the oldest record. Account for
-            // the backlog ahead of it when choosing between available paths.
+                .filter(|p| {
+                    p.open()
+                        && silent & (1 << p.id) == 0
+                        && p.native_return.is_some()
+                        && !p.conn.probing_rtt_hint()
+                })
+                .map(|p| service_bound(&p.conn))
+                .max()
+                .unwrap_or(0);
             order.sort_by_cached_key(|&i| {
                 let path = &paths[i];
                 let Some(writer) = &path.native_return else {
@@ -413,12 +435,15 @@ pub(super) fn drain(
                 }
                 let (_, unsent) = path.conn.stream_send_buffer_bytes();
                 let queued = unsent + ((writer.tx.max_capacity() - slots) * PAYLOAD) as u64;
-                single_path_rank(
+                let cold = path.conn.stats().path.sent_packets < COLD_PATH_MIN_PACKETS;
+                path_completion_rank(
                     path.conn.probing_rtt_hint(),
                     path.conn.rtt_hint().as_micros() as u64,
                     queued,
                     front.data.len() as u64,
                     service_bound(&path.conn),
+                    cold,
+                    best_service,
                 )
             });
         }
@@ -596,8 +621,59 @@ impl MixedWrites {
         reserved_group: Option<u8>,
     ) {
         let start = *cursor;
-        for n in 0..paths.len() {
-            let i = (start + n) % paths.len();
+        let mut order: Vec<_> = (0..paths.len())
+            .map(|n| (start + n) % paths.len())
+            .collect();
+        let active_native = paths
+            .iter()
+            .filter(|p| p.open() && silent & (1 << p.id) == 0 && p.native_return.is_some())
+            .count();
+        if active_native >= 2 {
+            let best_service = paths
+                .iter()
+                .filter(|p| {
+                    p.open()
+                        && silent & (1 << p.id) == 0
+                        && p.native_return.is_some()
+                        && !p.conn.probing_rtt_hint()
+                })
+                .map(|p| service_bound(&p.conn))
+                .max()
+                .unwrap_or(0);
+            let next_bytes = queue
+                .front(false)
+                .map_or(PART_BYTES as u64, |p| p.data.len() as u64);
+            // Finish already-started partial records first, then rank idle paths
+            // by estimated completion time for new records.
+            order.sort_by_cached_key(|&i| {
+                let path = &paths[i];
+                let id = usize::from(path.id);
+                let has_partial = self.partial[id]
+                    .as_ref()
+                    .is_some_and(|(owner, _)| *owner == path.conn.stable_id() && path.open());
+                let Some(writer) = &path.native_return else {
+                    return (!has_partial, true, u64::MAX);
+                };
+                if !path.open() || silent & (1 << id) != 0 || writer.tx.capacity() == 0 {
+                    return (!has_partial, true, u64::MAX);
+                }
+                let (_, unsent) = path.conn.stream_send_buffer_bytes();
+                let queued = unsent
+                    + ((writer.tx.max_capacity() - writer.tx.capacity()) * PART_BYTES) as u64;
+                let cold = path.conn.stats().path.sent_packets < COLD_PATH_MIN_PACKETS;
+                let (probing, ect) = path_completion_rank(
+                    path.conn.probing_rtt_hint(),
+                    path.conn.rtt_hint().as_micros() as u64,
+                    queued,
+                    next_bytes,
+                    service_bound(&path.conn),
+                    cold,
+                    best_service,
+                );
+                (!has_partial, probing, ect)
+            });
+        }
+        for i in order {
             let path = &paths[i];
             let id = usize::from(path.id);
             let connection = path.conn.stable_id();
@@ -1223,15 +1299,34 @@ mod tests {
     }
     #[test]
     fn single_download_backlog_rank_accounts_for_queue_and_probing() {
-        let fast_clear = single_path_rank(false, 100_000, 0, 32_768, 12_500);
-        let fast_backlogged = single_path_rank(false, 100_000, 512 * 1024, 32_768, 12_500);
-        let medium_clear = single_path_rank(false, 110_000, 0, 32_768, 8_000);
-        let slow_clear = single_path_rank(false, 120_000, 0, 32_768, 2_000);
-        let fast_probing = single_path_rank(true, 100_000, 0, 32_768, 12_500);
+        let fast_clear = path_completion_rank(false, 100_000, 0, 32_768, 12_500, false, 12_500);
+        let fast_backlogged =
+            path_completion_rank(false, 100_000, 512 * 1024, 32_768, 12_500, false, 12_500);
+        let medium_clear = path_completion_rank(false, 110_000, 0, 32_768, 8_000, false, 12_500);
+        let slow_clear = path_completion_rank(false, 120_000, 0, 32_768, 2_000, false, 12_500);
+        let fast_probing = path_completion_rank(true, 100_000, 0, 32_768, 12_500, false, 12_500);
         assert!(fast_clear < medium_clear);
         assert!(medium_clear < slow_clear);
         assert!(medium_clear < fast_backlogged);
         assert!(slow_clear < fast_probing);
+    }
+
+    #[test]
+    fn cold_idle_sibling_gets_bounded_warmup_floor_when_primary_builds_backlog() {
+        let primary_clear = path_completion_rank(false, 40_000, 0, 32_768, 25_000, false, 25_000);
+        let primary_queued =
+            path_completion_rank(false, 40_000, 512 * 1024, 32_768, 25_000, false, 25_000);
+        // Freshly joined path has tiny initial cwnd (service=200 B/ms) and 60 ms RTT.
+        let cold_idle = path_completion_rank(false, 60_000, 0, 32_768, 200, true, 25_000);
+        let cold_already_queued =
+            path_completion_rank(false, 60_000, 32_768, 32_768, 200, true, 25_000);
+        // While primary is uncongested, primary stays preferred.
+        assert!(primary_clear < cold_idle);
+        // Once primary builds meaningful backlog (~21 ms), cold idle sibling wins
+        // one bounded warmup record instead of starving at initial cwnd.
+        assert!(cold_idle < primary_queued);
+        // Once the cold path already holds a queued record, real measured service governs.
+        assert!(primary_queued < cold_already_queued);
     }
 
     #[test]
