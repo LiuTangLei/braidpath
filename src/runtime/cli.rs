@@ -98,6 +98,26 @@ mod proxy_cli_tests {
         assert!(
             Cli::try_parse_from(client.into_iter().chain(["--ordered-udp-port", "4500"])).is_err()
         );
+        let parsed = Cli::try_parse_from(
+            client
+                .into_iter()
+                .chain(["--status-socket", "/tmp/bp-proxy.sock"]),
+        )
+        .unwrap();
+        assert!(matches!(
+            parsed.command,
+            Command::ProxyClient {
+                status_socket: Some(ref path),
+                ..
+            } if path == std::path::Path::new("/tmp/bp-proxy.sock")
+        ));
+        let parsed =
+            Cli::try_parse_from(["braidpath", "client-status", "--socket", "/tmp/bp.sock"])
+                .unwrap();
+        assert!(matches!(
+            parsed.command,
+            Command::ClientStatus { ref socket } if socket == std::path::Path::new("/tmp/bp.sock")
+        ));
         let parsed =
             Cli::try_parse_from(client.into_iter().chain(["--interface", "ifindex:6"])).unwrap();
         assert!(
@@ -302,6 +322,9 @@ enum Command {
         /// Prefer timely UDP delivery over bulk throughput.
         #[arg(long, value_enum, default_value = "off")]
         game_mode: GameMode,
+        /// Optional local Unix socket for on-demand read-only JSON status queries.
+        #[arg(long)]
+        status_socket: Option<PathBuf>,
     },
     /// Discover live distributed servers through any member using a client key.
     Nodes {
@@ -321,6 +344,11 @@ enum Command {
         connection_key: PathBuf,
         #[arg(long)]
         dir: PathBuf,
+    },
+    /// Read live local client paths, queues and stream occupancy from a --status-socket.
+    ClientStatus {
+        #[arg(long)]
+        socket: PathBuf,
     },
     /// Select an exit and automatically use the other servers as encrypted entrances.
     MeshClient {
@@ -348,6 +376,9 @@ enum Command {
         policy: PolicyArgs,
         #[command(flatten)]
         stats: stats::Options,
+        /// Optional local Unix socket for on-demand read-only JSON status queries.
+        #[arg(long)]
+        status_socket: Option<PathBuf>,
     },
     /// Serve authenticated UDP sessions and optional addressed TCP streams.
     Server {
@@ -647,6 +678,7 @@ pub async fn run() -> Result<()> {
             interface,
             socks5_wait_for_connect,
             game_mode,
+            status_socket,
         } => {
             let identity = mesh::ClientIdentity::open(dir, &connection_key)?;
             proxy::client(proxy::ClientOptions {
@@ -660,6 +692,7 @@ pub async fn run() -> Result<()> {
                 interface,
                 socks5_early_reply: !socks5_wait_for_connect,
                 game_mode: matches!(game_mode, GameMode::On),
+                status_socket,
             })
             .await
         }
@@ -687,6 +720,13 @@ pub async fn run() -> Result<()> {
             );
             Ok(())
         }
+        Command::ClientStatus { socket } => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&super::status_socket::query(&socket).await?)?
+            );
+            Ok(())
+        }
         Command::MeshClient {
             connect,
             connection_key,
@@ -698,6 +738,7 @@ pub async fn run() -> Result<()> {
             source_ips,
             policy,
             stats,
+            status_socket,
         } => {
             ensure!(
                 !connect.is_empty() && connect.len() <= 32,
@@ -738,6 +779,42 @@ pub async fn run() -> Result<()> {
                     );
                 }
                 Some(listener)
+            } else {
+                None
+            };
+            let _status_guard = if let Some(path) = status_socket {
+                let status_metrics = reporter.metrics.clone();
+                let status_exit = exit.clone();
+                let status_interfaces = interfaces.clone();
+                let status_listen = bound_udp.local_addr()?.to_string();
+                let status_tcp = bound_tcp
+                    .as_ref()
+                    .and_then(|l| l.local_addr().ok())
+                    .map(|a| a.to_string());
+                Some(super::status_socket::spawn(
+                    path,
+                    std::sync::Arc::new(move || {
+                        let iface_info: Vec<_> = status_interfaces
+                            .iter()
+                            .map(|name| {
+                                serde_json::json!({
+                                    "name": name,
+                                    "ifindex": transport::interface_index(name),
+                                })
+                            })
+                            .collect();
+                        serde_json::json!({
+                            "schema_version": 1,
+                            "role": "mesh-client",
+                            "pid": std::process::id(),
+                            "exit": status_exit,
+                            "listen": status_listen,
+                            "tcp_listen": status_tcp,
+                            "interfaces": iface_info,
+                            "session": super::status_socket::metrics_summary(&status_metrics),
+                        })
+                    }),
+                )?)
             } else {
                 None
             };

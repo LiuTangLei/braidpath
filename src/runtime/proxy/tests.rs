@@ -2030,6 +2030,7 @@ async fn one_client_serves_fixed_exits_and_socks_tcp_udp_with_exit_failure_isola
         interface: None,
         socks5_early_reply: false,
         game_mode: false,
+        status_socket: None,
     })));
     timeout(Duration::from_secs(5), async {
         loop {

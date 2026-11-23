@@ -46,6 +46,7 @@ pub struct ClientOptions {
     pub interface: Option<String>,
     pub socks5_early_reply: bool,
     pub game_mode: bool,
+    pub status_socket: Option<std::path::PathBuf>,
 }
 
 pub(super) fn listener_plan(
@@ -225,6 +226,63 @@ impl Pool {
             interface: self.interface.clone(),
             ..mesh::Uplink::default()
         }
+    }
+
+    fn status_json(
+        &self,
+        forwards: &Mutex<BTreeMap<String, (SocketAddr, stats::Metrics)>>,
+    ) -> serde_json::Value {
+        let (tcp_flows, buffered_bytes) = self.stream_budget.snapshot();
+        let udp_flows = self.stream_budget.udp_flows();
+        let mut node_ids: Vec<String> = self
+            .nodes
+            .read()
+            .expect("mesh nodes")
+            .iter()
+            .map(|n| n.id.clone())
+            .collect();
+        node_ids.sort();
+        let mut exits = serde_json::Map::new();
+        for (exit, slot) in &self.slots {
+            exits.insert(
+                exit.clone(),
+                crate::runtime::status_socket::metrics_summary(&slot.stream_metrics),
+            );
+        }
+        let mut tcp_forwards = serde_json::Map::new();
+        for (exit, (addr, metrics)) in forwards.lock().expect("forward status").iter() {
+            let mut summary = crate::runtime::status_socket::metrics_summary(metrics);
+            if let Some(obj) = summary.as_object_mut() {
+                obj.insert("address".into(), serde_json::json!(addr.to_string()));
+            }
+            tcp_forwards.insert(exit.clone(), summary);
+        }
+        let interface_index = self
+            .interface
+            .as_deref()
+            .and_then(transport::interface_index);
+        serde_json::json!({
+            "schema_version": 1,
+            "role": "proxy-client",
+            "pid": std::process::id(),
+            "game_mode": self.game_mode,
+            "path_limit": self.path_limit.load(std::sync::atomic::Ordering::Relaxed),
+            "interface": self.interface,
+            "interface_index": interface_index,
+            "discovered_nodes": {
+                "count": node_ids.len(),
+                "ids": node_ids,
+            },
+            "budget": {
+                "tcp_flows": tcp_flows,
+                "udp_flows": udp_flows,
+                "buffered_bytes": buffered_bytes,
+                "max_tcp_flows": tunnel::tcp::MAX_TCP_FLOWS,
+                "max_udp_flows": tunnel::tcp::MAX_UDP_FLOWS,
+            },
+            "exits": exits,
+            "tcp_forwards": tcp_forwards,
+        })
     }
 
     pub(super) fn new(
@@ -689,6 +747,7 @@ struct FixedForwardConfig {
     paths: usize,
     interface: Option<String>,
     game_mode: bool,
+    metrics: stats::Metrics,
 }
 
 async fn fixed_forward_once(config: &FixedForwardConfig, nodes: Vec<mesh::Node>) -> Result<()> {
@@ -720,8 +779,7 @@ async fn fixed_forward_once(config: &FixedForwardConfig, nodes: Vec<mesh::Node>)
         datagram_send_buffer_bytes: transport::MAX_DATAGRAM_SEND_BUFFER_BYTES,
         congestion: transport::Congestion::Bbr,
         policy,
-        stats: stats::Metrics::new("fixed-forward")
-            .with_summary_label(format!("fixed:{}", config.mapping.exit)),
+        stats: config.metrics.clone(),
     };
     let result = tunnel::client_with_fixed_listener(
         options,
@@ -845,10 +903,18 @@ pub async fn client(options: ClientOptions) -> Result<()> {
     let (nodes_tx, nodes_rx) = tokio::sync::watch::channel(initial_nodes);
     let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
     let permits = Arc::new(Semaphore::new(crate::runtime::tunnel::tcp::MAX_TCP_FLOWS));
+    let forward_status = Arc::new(Mutex::new(BTreeMap::new()));
     let mut tasks = JoinSet::new();
     let mut forward_tasks = JoinSet::new();
     for (mapping, listener) in forwards {
-        tracing::info!(address=%listener.local_addr()?, exit=%mapping.exit, "fixed TCP forward bound");
+        let local_addr = listener.local_addr()?;
+        tracing::info!(address=%local_addr, exit=%mapping.exit, "fixed TCP forward bound");
+        let metrics = stats::Metrics::new("fixed-forward")
+            .with_summary_label(format!("fixed:{}", mapping.exit));
+        forward_status
+            .lock()
+            .expect("forward status")
+            .insert(mapping.exit.clone(), (local_addr, metrics.clone()));
         forward_tasks.spawn(fixed_forward_supervisor(
             FixedForwardConfig {
                 identity: fixed_identity.clone(),
@@ -857,11 +923,22 @@ pub async fn client(options: ClientOptions) -> Result<()> {
                 paths: options.paths,
                 interface: fixed_interface.clone(),
                 game_mode: options.game_mode,
+                metrics,
             },
             nodes_rx.clone(),
             stop_rx.clone(),
         ));
     }
+    let _status_guard = if let Some(path) = options.status_socket {
+        let status_pool = pool.clone();
+        let status_forwards = forward_status.clone();
+        Some(crate::runtime::status_socket::spawn(
+            path,
+            Arc::new(move || status_pool.status_json(&status_forwards)),
+        )?)
+    } else {
+        None
+    };
     for (listener, exit) in listeners {
         tracing::info!(address=%listener.local_addr()?, %exit, "SOCKS5 proxy ready");
         tasks.spawn(listen(

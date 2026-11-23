@@ -1802,25 +1802,31 @@ fn mesh_client_and_proxy_client_survive_offline_boot_and_recover_on_same_listene
     let key = server_dir.join("client-key.json");
 
     // Start both mesh-client and proxy-client while server_addr is completely unreachable.
-    let mut mesh_client = launch(
-        &args(&[
-            "mesh-client",
-            "--connect",
-            &server_addr,
-            "--connection-key",
-            key.to_str().unwrap(),
-            "--dir",
-            root.join("mesh-client").to_str().unwrap(),
-            "--exit",
-            "node-a",
-            "--listen",
-            "127.0.0.1:0",
-            "--tcp-listen",
-            "127.0.0.1:0",
-        ]),
-        root,
-        "offline-mesh-client",
-    );
+    #[cfg(unix)]
+    let mesh_sock = root.join("mesh-client.sock");
+    #[cfg(unix)]
+    let proxy_sock = root.join("proxy-client.sock");
+    let mut mesh_args = args(&[
+        "mesh-client",
+        "--connect",
+        &server_addr,
+        "--connection-key",
+        key.to_str().unwrap(),
+        "--dir",
+        root.join("mesh-client").to_str().unwrap(),
+        "--exit",
+        "node-a",
+        "--listen",
+        "127.0.0.1:0",
+        "--tcp-listen",
+        "127.0.0.1:0",
+    ]);
+    #[cfg(unix)]
+    {
+        mesh_args.push("--status-socket".into());
+        mesh_args.push(mesh_sock.to_str().unwrap().into());
+    }
+    let mut mesh_client = launch(&mesh_args, root, "offline-mesh-client");
     ready(&mut mesh_client, "TCP listener bound");
     let mesh_tcp_addr = fs::read_to_string(&mesh_client.log)
         .unwrap()
@@ -1830,25 +1836,27 @@ fn mesh_client_and_proxy_client_survive_offline_boot_and_recover_on_same_listene
         .unwrap()
         .to_owned();
 
-    let mut proxy_client = launch(
-        &args(&[
-            "proxy-client",
-            "--connect",
-            &server_addr,
-            "--connection-key",
-            key.to_str().unwrap(),
-            "--dir",
-            root.join("proxy-client").to_str().unwrap(),
-            "--exit",
-            "node-a",
-            "--listen",
-            "127.0.0.1:0",
-            "--tcp-forward",
-            "node-a=127.0.0.1:0",
-        ]),
-        root,
-        "offline-proxy-client",
-    );
+    let mut proxy_args = args(&[
+        "proxy-client",
+        "--connect",
+        &server_addr,
+        "--connection-key",
+        key.to_str().unwrap(),
+        "--dir",
+        root.join("proxy-client").to_str().unwrap(),
+        "--exit",
+        "node-a",
+        "--listen",
+        "127.0.0.1:0",
+        "--tcp-forward",
+        "node-a=127.0.0.1:0",
+    ]);
+    #[cfg(unix)]
+    {
+        proxy_args.push("--status-socket".into());
+        proxy_args.push(proxy_sock.to_str().unwrap().into());
+    }
+    let mut proxy_client = launch(&proxy_args, root, "offline-proxy-client");
     ready(&mut proxy_client, "SOCKS5 proxy ready");
     ready(&mut proxy_client, "fixed TCP forward bound");
     let proxy_log = fs::read_to_string(&proxy_client.log).unwrap();
@@ -1883,6 +1891,22 @@ fn mesh_client_and_proxy_client_survive_offline_boot_and_recover_on_same_listene
         "proxy-client exited during offline boot: {}",
         fs::read_to_string(&proxy_client.log).unwrap()
     );
+    #[cfg(unix)]
+    {
+        for (sock, role) in [(&mesh_sock, "mesh-client"), (&proxy_sock, "proxy-client")] {
+            let out = run(&args(&[
+                "client-status",
+                "--socket",
+                sock.to_str().unwrap(),
+            ]));
+            assert!(
+                out.status.success(),
+                "client-status failed offline for {role}"
+            );
+            let status: Value = serde_json::from_slice(&out.stdout).unwrap();
+            assert_eq!(status["role"], role);
+        }
+    }
 
     // Bring the mesh server back online on the exact same address.
     let mut server = launch(
@@ -1970,4 +1994,40 @@ fn mesh_client_and_proxy_client_survive_offline_boot_and_recover_on_same_listene
     }
 
     target_thread.join().unwrap();
+    #[cfg(unix)]
+    {
+        let mesh_out = run(&args(&[
+            "client-status",
+            "--socket",
+            mesh_sock.to_str().unwrap(),
+        ]));
+        assert!(mesh_out.status.success());
+        let mesh_status: Value = serde_json::from_slice(&mesh_out.stdout).unwrap();
+        assert_eq!(mesh_status["role"], "mesh-client");
+        assert_eq!(mesh_status["session"]["ready"], true);
+        assert!(mesh_status["session"]["active_paths"].as_u64().unwrap_or(0) >= 1);
+
+        let proxy_out = run(&args(&[
+            "client-status",
+            "--socket",
+            proxy_sock.to_str().unwrap(),
+        ]));
+        assert!(proxy_out.status.success());
+        let proxy_status: Value = serde_json::from_slice(&proxy_out.stdout).unwrap();
+        assert_eq!(proxy_status["role"], "proxy-client");
+        assert_eq!(proxy_status["exits"]["node-a"]["ready"], true);
+        assert!(
+            proxy_status["exits"]["node-a"]["active_paths"]
+                .as_u64()
+                .unwrap_or(0)
+                >= 1
+        );
+        assert_eq!(proxy_status["tcp_forwards"]["node-a"]["ready"], true);
+        assert!(
+            proxy_status["budget"]["max_udp_flows"]
+                .as_u64()
+                .unwrap_or(0)
+                == 512
+        );
+    }
 }

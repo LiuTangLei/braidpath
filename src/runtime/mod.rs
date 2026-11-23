@@ -18,6 +18,7 @@ pub mod scheduler;
 pub mod sender_frontier;
 mod shutdown;
 pub mod stats;
+pub(crate) mod status_socket;
 pub mod stream;
 pub mod trace;
 pub mod transport;
