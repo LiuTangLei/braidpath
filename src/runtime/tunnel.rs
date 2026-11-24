@@ -1478,6 +1478,10 @@ fn latency_candidates(
             .flow
             .is_none_or(|flow| stream::stream_id(flow).is_none())
         || front.hold.as_ref().is_some_and(|hold| hold.local_retry())
+        || front
+            .hold
+            .as_ref()
+            .is_some_and(|hold| hold.transmission() >= 3)
         || (front.data.len() > LATENCY_RECORD_BYTES
             && !front
                 .hold
@@ -2372,6 +2376,7 @@ async fn sender_with_inputs(
                         now_us,
                         policy.latency_target_ms,
                         best_native_service,
+                        writer.written_bytes(),
                     )
                 {
                     path.conn.set_send_window(window);
@@ -3335,17 +3340,10 @@ async fn sender_with_inputs(
                     ))
             {
                 // Small records, latency-bound streams and native-return UDP
-                // fragments take the earliest ready path. Splitting one UDP
-                // message over disparate paths adds the slow fragment's tail.
-                // Bulk keeps the weighted spread across paths. Where the
-                // small-delivery policy applies, its delay and loss ranking
-                // decides instead.
-                let mut ranked: Vec<_> = order
-                    .iter()
-                    .map(|&i| (small_delivery::delay_ms(&paths[i]), i))
-                    .collect();
-                ranked.sort_by(|a, b| a.0.total_cmp(&b.0));
-                order = ranked.into_iter().map(|(_, i)| i).collect();
+                // fragments take the earliest healthy ready path within the
+                // latency target slack, demoting high-loss timely paths behind
+                // cleaner timely siblings without removing any fallback.
+                order = native_return::udp_order(order, &paths, policy.latency_target_ms);
             }
             if gaming_datagram {
                 // Prefer the earliest ready route; a blocked best route keeps
@@ -3423,6 +3421,14 @@ async fn sender_with_inputs(
                 && native_return::latency_datagram(native_returning, policy.game_mode, front.flow)
             {
                 order = native_return::udp_order(order, &paths, policy.latency_target_ms);
+            }
+            if !repair
+                && order.len() > 1
+                && let Some(avoid) = front.hold.as_ref().and_then(|hold| hold.avoid_path())
+            {
+                // Network retries and probes move away from the path that just
+                // failed while retaining it as the last-resort fallback.
+                order.sort_by_key(|&i| paths[i].id == avoid);
             }
             let mut wait_candidate = None;
             for i in order {

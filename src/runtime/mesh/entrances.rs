@@ -196,6 +196,7 @@ impl PathSample {
 /// Owns maintenance and its bounded, best-effort remote lease cleanup.
 pub struct Entrances {
     limit: watch::Sender<usize>,
+    nodes: watch::Sender<Option<Vec<Node>>>,
     health: watch::Sender<PathHealth>,
     updates: watch::Receiver<Vec<SocketAddr>>,
     stop: Option<tokio::sync::oneshot::Sender<()>>,
@@ -218,6 +219,9 @@ impl Entrances {
                 true
             }
         });
+    }
+    pub(crate) fn nodes_sender(&self) -> watch::Sender<Option<Vec<Node>>> {
+        self.nodes.clone()
     }
     pub(crate) fn health(&self) -> watch::Sender<PathHealth> {
         self.health.clone()
@@ -308,13 +312,18 @@ impl Entrances {
         let (tx, updates) = watch::channel(initial.clone());
         let (stop, stopped) = tokio::sync::oneshot::channel();
         let (limit_tx, limit_rx) = watch::channel(limit);
-        let maintenance = tokio::spawn(directory.run(tx, interval, Some(limit_rx), async {
-            let _ = stopped.await;
-        }));
+        let (nodes_tx, nodes_rx) = watch::channel(None);
+        let maintenance =
+            tokio::spawn(
+                directory.run(tx, interval, Some(limit_rx), Some(nodes_rx), async {
+                    let _ = stopped.await;
+                }),
+            );
         Ok((
             initial,
             Self {
                 limit: limit_tx,
+                nodes: nodes_tx,
                 health,
                 updates,
                 stop: Some(stop),
@@ -395,6 +404,7 @@ impl Directory {
         new_control: Arc<Control>,
         discovery: &mut JoinSet<DiscoveryOutcome>,
         allocations: &mut JoinSet<(Allocation, Result<RelayReply>)>,
+        in_flight: &mut std::collections::BTreeSet<String>,
         renewals: &mut JoinSet<Renewal>,
         renewing: &mut std::collections::BTreeSet<String>,
     ) {
@@ -402,17 +412,19 @@ impl Directory {
         old.close();
         *discovery = JoinSet::new();
         *allocations = JoinSet::new();
+        in_flight.clear();
         *renewals = JoinSet::new();
         renewing.clear();
         discovery.spawn(self.discovery());
         self.start_renewals(renewals, renewing);
-        *allocations = self.allocations();
+        self.spawn_missing_allocations(allocations, in_flight);
     }
 
     fn rebind_if_interface_changed(
         &mut self,
         discovery: &mut JoinSet<DiscoveryOutcome>,
         allocations: &mut JoinSet<(Allocation, Result<RelayReply>)>,
+        in_flight: &mut std::collections::BTreeSet<String>,
         renewals: &mut JoinSet<Renewal>,
         renewing: &mut std::collections::BTreeSet<String>,
     ) -> bool {
@@ -423,7 +435,14 @@ impl Directory {
                 .flatten()
         });
         if let Some(new_control) = new_control {
-            self.replace_control(new_control, discovery, allocations, renewals, renewing);
+            self.replace_control(
+                new_control,
+                discovery,
+                allocations,
+                in_flight,
+                renewals,
+                renewing,
+            );
             true
         } else {
             false
@@ -434,6 +453,7 @@ impl Directory {
         &mut self,
         discovery: &mut JoinSet<DiscoveryOutcome>,
         allocations: &mut JoinSet<(Allocation, Result<RelayReply>)>,
+        in_flight: &mut std::collections::BTreeSet<String>,
         renewals: &mut JoinSet<Renewal>,
         renewing: &mut std::collections::BTreeSet<String>,
     ) -> bool {
@@ -444,7 +464,14 @@ impl Directory {
                 .flatten()
         });
         if let Some(new_control) = new_control {
-            self.replace_control(new_control, discovery, allocations, renewals, renewing);
+            self.replace_control(
+                new_control,
+                discovery,
+                allocations,
+                in_flight,
+                renewals,
+                renewing,
+            );
             true
         } else {
             false
@@ -481,7 +508,8 @@ impl Directory {
 
     #[cfg(test)]
     async fn maintain(self, tx: watch::Sender<Vec<SocketAddr>>, interval: Duration) {
-        self.run(tx, interval, None, std::future::pending()).await;
+        self.run(tx, interval, None, None, std::future::pending())
+            .await;
     }
 
     async fn run(
@@ -489,6 +517,7 @@ impl Directory {
         tx: watch::Sender<Vec<SocketAddr>>,
         interval: Duration,
         mut limits: Option<watch::Receiver<usize>>,
+        mut external_nodes: Option<watch::Receiver<Option<Vec<Node>>>>,
         stop: impl Future<Output = ()>,
     ) {
         let renew_every = interval.min(RENEW_EVERY);
@@ -510,10 +539,17 @@ impl Directory {
         let mut discovery = JoinSet::new();
         let mut recovery_after = Instant::now();
         let mut health_open = true;
-        let mut allocations = self.allocations();
+        let mut allocations = JoinSet::new();
+        let mut in_flight = std::collections::BTreeSet::new();
+        self.spawn_missing_allocations(&mut allocations, &mut in_flight);
         let initial_alloc_retry = Duration::from_secs(2).min(interval);
         let mut alloc_backoff = initial_alloc_retry;
         let mut next_alloc_retry: Option<tokio::time::Instant> = None;
+        let initial_discover_retry = Duration::from_secs(1).min(interval);
+        let mut discover_backoff = initial_discover_retry;
+        let mut next_discover_retry: Option<tokio::time::Instant> = self
+            .needs_more_peers()
+            .then(|| tokio::time::Instant::now() + discover_backoff);
         let mut renewals = JoinSet::new();
         let mut renewing = std::collections::BTreeSet::new();
         let mut releases = JoinSet::new();
@@ -526,12 +562,57 @@ impl Directory {
                     self.limit = (*limits.as_mut().expect("limits").borrow_and_update()).clamp(1, MAX_PATHS);
                     self.explorer.reset();
                     allocations.abort_all();
+                    allocations = JoinSet::new();
+                    in_flight.clear();
                     for allocation in self.resize() {
                         self.start_release(&mut releases, allocation);
                     }
                     alloc_backoff = initial_alloc_retry;
                     next_alloc_retry = None;
-                    allocations = self.allocations();
+                    discover_backoff = initial_discover_retry;
+                    next_discover_retry = self
+                        .needs_more_peers()
+                        .then(|| tokio::time::Instant::now() + discover_backoff);
+                    self.spawn_missing_allocations(&mut allocations, &mut in_flight);
+                    self.publish(&tx);
+                }
+                result = async { external_nodes.as_mut().expect("external nodes").changed().await }, if external_nodes.is_some() => {
+                    if result.is_err() { external_nodes = None; continue; }
+                    let incoming = external_nodes
+                        .as_mut()
+                        .expect("external nodes")
+                        .borrow_and_update()
+                        .clone();
+                    let Some(nodes) = incoming else { continue };
+                    if validate_nodes(&nodes).is_err() || !nodes.iter().any(|n| n.id == self.selected.id) {
+                        continue;
+                    }
+                    let previous_exit = self.selected.clone();
+                    for allocation in self.apply_nodes(nodes) {
+                        self.start_release(&mut releases, allocation);
+                    }
+                    if let Some(recovery) = &mut self.recovery {
+                        recovery.ipv6 = self
+                            .nodes
+                            .iter()
+                            .any(|n| n.address.is_ipv6() && n.alternate.is_none());
+                    }
+                    if self.selected != previous_exit {
+                        self.explorer.reset();
+                        allocations.abort_all();
+                        allocations = JoinSet::new();
+                        in_flight.clear();
+                        renewals.abort_all();
+                        renewals = JoinSet::new();
+                        renewing.clear();
+                    }
+                    alloc_backoff = initial_alloc_retry;
+                    next_alloc_retry = None;
+                    if !self.needs_more_peers() {
+                        discover_backoff = initial_discover_retry;
+                        next_discover_retry = None;
+                    }
+                    self.spawn_missing_allocations(&mut allocations, &mut in_flight);
                     self.publish(&tx);
                 }
                 result = self.health.changed(), if health_open => {
@@ -541,6 +622,7 @@ impl Directory {
                     self.rebind_if_interface_changed(
                         &mut discovery,
                         &mut allocations,
+                        &mut in_flight,
                         &mut renewals,
                         &mut renewing,
                     );
@@ -552,11 +634,12 @@ impl Directory {
                     if allocations.is_empty()
                         && let Some(retired) = self.explorer.advance(&self.nodes, &self.selected, &self.leases, &health, self.limit, now) {
                         self.leases.remove(&retired);
+                        in_flight.remove(&retired);
                         if let Some(allocation) = self.requests.remove(&retired) { self.start_release(&mut releases, allocation); }
                         self.publish(&tx);
                         alloc_backoff = initial_alloc_retry;
                         next_alloc_retry = None;
-                        allocations = self.allocations();
+                        self.spawn_missing_allocations(&mut allocations, &mut in_flight);
                     }
                 }
                 _ = renew.tick() => {
@@ -564,6 +647,7 @@ impl Directory {
                     if self.rebind_if_interface_changed(
                         &mut discovery,
                         &mut allocations,
+                        &mut in_flight,
                         &mut renewals,
                         &mut renewing,
                     ) {
@@ -574,20 +658,40 @@ impl Directory {
                     self.publish(&tx);
                 }
                 _ = discover.tick(), if discovery.is_empty() => {
+                    next_discover_retry = None;
                     if !self.rebind_if_interface_changed(
                         &mut discovery,
                         &mut allocations,
+                        &mut in_flight,
                         &mut renewals,
                         &mut renewing,
                     ) {
                         discovery.spawn(self.discovery());
                     }
                 }
+                _ = async { tokio::time::sleep_until(next_discover_retry.expect("discovery retry")).await },
+                    if discovery.is_empty() && next_discover_retry.is_some() => {
+                    next_discover_retry = None;
+                    if self.needs_more_peers() {
+                        if !self.rebind_if_interface_changed(
+                            &mut discovery,
+                            &mut allocations,
+                            &mut in_flight,
+                            &mut renewals,
+                            &mut renewing,
+                        ) {
+                            discovery.spawn(self.discovery());
+                        }
+                        discover_backoff = (discover_backoff * 2).min(interval);
+                    } else {
+                        discover_backoff = initial_discover_retry;
+                    }
+                }
                 _ = async { tokio::time::sleep_until(next_alloc_retry.expect("allocation retry")).await },
                     if allocations.is_empty() && next_alloc_retry.is_some() => {
                     next_alloc_retry = None;
-                    if self.needs_more_leases() {
-                        allocations = self.allocations();
+                    if self.needs_more_leases(&in_flight) {
+                        self.spawn_missing_allocations(&mut allocations, &mut in_flight);
                         alloc_backoff = (alloc_backoff * 2).min(interval);
                     } else {
                         alloc_backoff = initial_alloc_retry;
@@ -618,6 +722,7 @@ impl Directory {
                                 self.explorer.reset();
                                 allocations.abort_all();
                                 allocations = JoinSet::new();
+                                in_flight.clear();
                                 renewals.abort_all();
                                 renewals = JoinSet::new();
                                 renewing.clear();
@@ -633,6 +738,7 @@ impl Directory {
                             if self.rebind_if_interface_changed(
                                 &mut discovery,
                                 &mut allocations,
+                                &mut in_flight,
                                 &mut renewals,
                                 &mut renewing,
                             ) {
@@ -644,11 +750,13 @@ impl Directory {
                             if self.rebind_if_interface_changed(
                                 &mut discovery,
                                 &mut allocations,
+                                &mut in_flight,
                                 &mut renewals,
                                 &mut renewing,
                             ) || self.rebind_after_discovery_failure(
                                 &mut discovery,
                                 &mut allocations,
+                                &mut in_flight,
                                 &mut renewals,
                                 &mut renewing,
                             ) {
@@ -662,14 +770,21 @@ impl Directory {
                     // Their completions are checked before publishing, so a
                     // changed directory never reintroduces a stale route.
                     self.control.prune(renew_every * 3);
-                    if allocations.is_empty() {
-                        allocations = self.allocations();
+                    if self.needs_more_peers() {
+                        if next_discover_retry.is_none() && discover_backoff < interval {
+                            next_discover_retry = Some(tokio::time::Instant::now() + discover_backoff);
+                        }
+                    } else {
+                        discover_backoff = initial_discover_retry;
+                        next_discover_retry = None;
                     }
+                    self.spawn_missing_allocations(&mut allocations, &mut in_flight);
                     self.publish(&tx);
                 }
                 Some(result) = allocations.join_next() => {
                     match result {
                         Ok((allocation, Ok(reply))) => {
+                            in_flight.remove(&allocation.node.id);
                             if let Some(recovery) = &mut self.recovery {
                                 recovery.note_control_success();
                             }
@@ -685,12 +800,16 @@ impl Directory {
                                 self.start_release(&mut releases, allocation);
                             }
                         }
-                        Ok((allocation, Err(error))) => tracing::debug!(node=%allocation.node.id, %error, "optional entrance unavailable"),
+                        Ok((allocation, Err(error))) => {
+                            in_flight.remove(&allocation.node.id);
+                            tracing::debug!(node=%allocation.node.id, %error, "optional entrance unavailable");
+                        }
                         Err(error) if error.is_cancelled() => {}
                         Err(error) => tracing::warn!(%error, "entrance allocation task failed"),
                     }
                     if allocations.is_empty() {
-                        if self.needs_more_leases() {
+                        in_flight.clear();
+                        if self.needs_more_leases(&in_flight) {
                             next_alloc_retry = Some(tokio::time::Instant::now() + alloc_backoff);
                         } else {
                             alloc_backoff = initial_alloc_retry;
@@ -717,6 +836,7 @@ impl Directory {
                                 self.rebind_if_interface_changed(
                                     &mut discovery,
                                     &mut allocations,
+                                    &mut in_flight,
                                     &mut renewals,
                                     &mut renewing,
                                 );
@@ -1017,39 +1137,55 @@ impl Directory {
         });
     }
 
-    fn needs_more_leases(&self) -> bool {
-        self.leases.len() + 1 < self.limit
+    fn needs_more_peers(&self) -> bool {
+        self.leases.len() + 1 < self.limit && self.nodes.len() < self.limit
+    }
+
+    fn needs_more_leases(&self, in_flight: &std::collections::BTreeSet<String>) -> bool {
+        self.leases.len() + in_flight.len() + 1 < self.limit
             && self.nodes.iter().any(|n| {
                 n.id != self.selected.id
                     && !self.leases.contains_key(&n.id)
+                    && !in_flight.contains(&n.id)
                     && !self.control.ordered_addresses(n).is_empty()
                     && self.explorer.available(&n.id, Instant::now())
             })
     }
 
-    fn allocations(&mut self) -> JoinSet<(Allocation, Result<RelayReply>)> {
-        let mut pending = JoinSet::new();
+    fn spawn_missing_allocations(
+        &mut self,
+        pending: &mut JoinSet<(Allocation, Result<RelayReply>)>,
+        in_flight: &mut std::collections::BTreeSet<String>,
+    ) {
+        let needed = (self.limit - 1).saturating_sub(self.leases.len() + in_flight.len());
+        if needed == 0 {
+            return;
+        }
         let mut candidates = self
             .nodes
             .iter()
-            .filter(|n| n.id != self.selected.id && !self.leases.contains_key(&n.id))
+            .filter(|n| {
+                n.id != self.selected.id
+                    && !self.leases.contains_key(&n.id)
+                    && !in_flight.contains(&n.id)
+            })
             .filter(|n| !self.control.ordered_addresses(n).is_empty())
             .filter(|n| self.explorer.available(&n.id, Instant::now()))
             .cloned()
             .collect::<Vec<_>>();
         if candidates.is_empty() {
-            return pending;
+            return;
         }
         self.allocation_cursor %= candidates.len();
         candidates.rotate_left(self.allocation_cursor);
         if let Some(preferred) = &self.explorer.preferred {
             candidates.sort_by_key(|n| n.id != *preferred);
         }
-        let available = self.limit - 1 - self.leases.len();
-        self.allocation_cursor += available;
+        self.allocation_cursor += needed;
         // Each completion is consumed by maintenance independently of slower
         // optional peers. Renewal and discovery remain independently scheduled.
-        for node in candidates.into_iter().take(available) {
+        for node in candidates.into_iter().take(needed) {
+            in_flight.insert(node.id.clone());
             let control = self.control.clone();
             let auth = self.auth.clone();
             let allocation = self.request_for(&node);
@@ -1058,7 +1194,6 @@ impl Directory {
                 (allocation, reply)
             });
         }
-        pending
     }
 }
 
@@ -2270,5 +2405,57 @@ mod tests {
             0,
             "valid /mesh/nodes missing selected exit must not trigger socket rebind"
         );
+    }
+
+    #[tokio::test]
+    async fn external_node_push_allocates_late_relays_without_waiting_for_periodic_discovery() {
+        use super::super::tests::{address, server, wait_nodes};
+
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let exit_addr = address();
+        let relay1_addr = address();
+        let relay2_addr = address();
+        let relay3_addr = address();
+        let _exit = server(root, "exit", exit_addr, address(), None).await;
+        let join = Some((exit_addr, root.join("exit/server-key.json")));
+        let _r1 = server(root, "relay-1", relay1_addr, address(), join.clone()).await;
+        let _r2 = server(root, "relay-2", relay2_addr, address(), join.clone()).await;
+        let _r3 = server(root, "relay-3", relay3_addr, address(), join).await;
+
+        let identity =
+            ClientIdentity::open(root.join("client"), &root.join("exit/client-key.json")).unwrap();
+        let full_nodes = wait_nodes(
+            &identity,
+            exit_addr,
+            &["exit", "relay-1", "relay-2", "relay-3"],
+        )
+        .await;
+        let partial_nodes: Vec<_> = full_nodes
+            .iter()
+            .filter(|n| n.id == "exit" || n.id == "relay-1")
+            .cloned()
+            .collect();
+
+        // Use a 60s interval so periodic discovery cannot fire; pushing the
+        // newly discovered nodes must immediately allocate all 3 relays.
+        let started = Instant::now();
+        let (_, guard) =
+            Entrances::start(&identity, partial_nodes, "exit", 4, Duration::from_secs(60))
+                .await
+                .unwrap();
+        let mut updates = guard.updates();
+        let _ = guard.nodes_sender().send(Some(full_nodes));
+
+        tokio::time::timeout(Duration::from_millis(1500), async {
+            while updates.borrow_and_update().len() < 4 {
+                updates.changed().await.unwrap();
+            }
+        })
+        .await
+        .expect("late-discovered relays must allocate immediately without 15s wait");
+        assert!(started.elapsed() < Duration::from_secs(2));
+        guard.shutdown().await;
     }
 }

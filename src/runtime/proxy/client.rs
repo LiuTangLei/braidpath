@@ -198,6 +198,7 @@ async fn stop_slot(aggregate: Option<Aggregate>, routes: Option<Routes>) {
 
 struct Slot {
     routes: AsyncMutex<Option<Routes>>,
+    route_nodes: Mutex<Option<tokio::sync::watch::Sender<Option<Vec<mesh::Node>>>>>,
     aggregate: AsyncMutex<Option<Aggregate>>,
     stream_metrics: stats::Metrics,
     #[cfg(test)]
@@ -303,6 +304,7 @@ impl Pool {
                 exit.clone(),
                 Slot {
                     routes: AsyncMutex::new(None),
+                    route_nodes: Mutex::new(None),
                     aggregate: AsyncMutex::new(None),
                     stream_metrics: stats::Metrics::new("client")
                         .with_summary_label(format!("socks:{exit}")),
@@ -385,6 +387,10 @@ impl Pool {
                 !self.closed.load(std::sync::atomic::Ordering::Acquire),
                 "proxy client stopped"
             );
+            let nodes_tx = guard.nodes_sender();
+            let latest = self.nodes.read().expect("proxy nodes").clone();
+            let _ = nodes_tx.send(Some(latest));
+            *slot.route_nodes.lock().expect("route nodes") = Some(nodes_tx);
             *routes = Some(Routes {
                 updates: guard.updates(),
                 _guard: guard,
@@ -569,6 +575,7 @@ impl Pool {
         for slot in self.slots.values() {
             let mut aggregate = slot.aggregate.lock().await;
             let mut routes = slot.routes.lock().await;
+            slot.route_nodes.lock().expect("route nodes").take();
             // Dropping a waiter detaches this task; it must not abort cleanup
             // and release the guard while its aggregate runtime still runs.
             releases.push(tokio::spawn(stop_slot(aggregate.take(), routes.take())));
@@ -604,8 +611,14 @@ impl Pool {
         for node in nodes {
             by_id.insert(node.id.clone(), node);
         }
-        *current = by_id.into_values().collect();
+        let merged: Vec<mesh::Node> = by_id.into_values().collect();
+        *current = merged.clone();
         drop(current);
+        for slot in self.slots.values() {
+            if let Some(tx) = slot.route_nodes.lock().expect("route nodes").as_ref() {
+                let _ = tx.send(Some(merged.clone()));
+            }
+        }
         self.nodes_changed.notify_waiters();
     }
 }
@@ -710,7 +723,11 @@ struct FixedForwardConfig {
     metrics: stats::Metrics,
 }
 
-async fn fixed_forward_once(config: &FixedForwardConfig, nodes: Vec<mesh::Node>) -> Result<()> {
+async fn fixed_forward_once(
+    config: &FixedForwardConfig,
+    nodes: Vec<mesh::Node>,
+    mut nodes_rx: tokio::sync::watch::Receiver<Vec<mesh::Node>>,
+) -> Result<()> {
     let uplink = mesh::Uplink {
         interface: config.interface.clone(),
         ..Default::default()
@@ -719,6 +736,9 @@ async fn fixed_forward_once(config: &FixedForwardConfig, nodes: Vec<mesh::Node>)
         .identity
         .entrances_on(nodes, &config.mapping.exit, config.paths, &uplink)
         .await?;
+    let lease_nodes = leases.nodes_sender();
+    let latest = nodes_rx.borrow_and_update().clone();
+    let _ = lease_nodes.send(Some(latest));
     let mut policy = reliable_policy(config.game_mode);
     policy.proxy = false;
     policy.streams = true;
@@ -741,14 +761,22 @@ async fn fixed_forward_once(config: &FixedForwardConfig, nodes: Vec<mesh::Node>)
         policy,
         stats: config.metrics.clone(),
     };
-    let result = tunnel::client_with_fixed_listener(
-        options,
-        leases.updates(),
-        leases.health(),
-        config.mapping.exit.clone(),
-        config.listener.clone(),
-    )
-    .await;
+    let push_nodes = async move {
+        while nodes_rx.changed().await.is_ok() {
+            let _ = lease_nodes.send(Some(nodes_rx.borrow_and_update().clone()));
+        }
+        std::future::pending::<()>().await
+    };
+    let result = tokio::select! {
+        res = tunnel::client_with_fixed_listener(
+            options,
+            leases.updates(),
+            leases.health(),
+            config.mapping.exit.clone(),
+            config.listener.clone(),
+        ) => res,
+        _ = push_nodes => unreachable!(),
+    };
     leases.shutdown().await;
     result
 }
@@ -781,7 +809,7 @@ async fn fixed_forward_supervisor(
         let started = Instant::now();
         let result = tokio::select! {
             _ = stop_rx.changed() => return,
-            result = fixed_forward_once(&config, nodes) => result,
+            result = fixed_forward_once(&config, nodes, nodes_rx.clone()) => result,
         };
         if *stop_rx.borrow() {
             return;

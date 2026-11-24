@@ -345,6 +345,7 @@ struct Segment {
     path: usize,
     sent_at: Instant,
     transmissions: u32,
+    network_transmissions: u32,
     /// Consecutive retransmissions without any acknowledgment progress between them.
     stalls: u32,
     /// Backed-off deadline while stalled; otherwise timed from `sent_at`.
@@ -608,6 +609,7 @@ impl Sender {
             path: UNKNOWN_PATH,
             sent_at: now,
             transmissions: 0,
+            network_transmissions: 0,
             stalls: 0,
             deadline: None,
             probe_transmission: None,
@@ -615,11 +617,16 @@ impl Sender {
             reliable: None,
         });
         let local_retry = !probe && std::mem::take(&mut segment.local_retry_pending);
+        let previous_path =
+            (segment.path != UNKNOWN_PATH && !local_retry).then_some(segment.path as u8);
         if !probe && segment.transmissions > 0 && !local_retry {
             let stalled = progress.is_none_or(|at| at <= segment.sent_at);
             segment.stalls = if stalled { segment.stalls + 1 } else { 0 };
         }
         segment.transmissions += 1;
+        if !probe && !local_retry {
+            segment.network_transmissions += 1;
+        }
         let transmission = segment.transmissions;
         if probe {
             // A probe is a bounded additional copy, not a loss declaration.
@@ -640,6 +647,11 @@ impl Sender {
             segment.deadline = Some(at);
             self.repeated.insert((at, start));
         }
+        let avoid_path = if probe || (transmission > 1 && !local_retry) {
+            previous_path
+        } else {
+            None
+        };
         Transmit {
             frame: Frame::Data {
                 offset: start,
@@ -652,7 +664,7 @@ impl Sender {
             tail_probe: probe,
             head_copy: false,
             local_retry,
-            avoid_path: None,
+            avoid_path,
         }
     }
     /// Split only a selected oversized flight record. Already queued callbacks
@@ -683,7 +695,7 @@ impl Sender {
     }
 
     pub(crate) fn poll_transmit_sized(&mut self, now: Instant, payload: usize) -> Option<Transmit> {
-        self.poll_transmit_limited(now, payload, super::MAX_STREAM_PAYLOAD)
+        self.poll_transmit_limited(now, payload, crate::runtime::MAX_STREAM_PAYLOAD)
     }
     pub(crate) fn poll_transmit_reliable(
         &mut self,
@@ -705,7 +717,7 @@ impl Sender {
             }
             let end = self.segments[&start].end;
             let t = self.send_segment(start, end, now, false);
-            if start == self.acked {
+            if start == self.acked && !t.local_retry {
                 self.head_copy = Some((start, t.transmission));
             }
             return Some(t);
@@ -935,7 +947,7 @@ impl Sender {
         let mut newest_sample: Option<Instant> = None;
         let mut path_samples: [Option<Instant>; MAX_PATHS] = [None; MAX_PATHS];
         for segment in delivered {
-            if segment.transmissions == 1 {
+            if segment.network_transmissions == 1 && segment.probe_transmission.is_none() {
                 newest_sample =
                     Some(newest_sample.map_or(segment.sent_at, |at| at.max(segment.sent_at)));
                 if segment.path != UNKNOWN_PATH {
@@ -1056,7 +1068,8 @@ impl Sender {
             return;
         };
         if start != self.acked
-            || segment.transmissions != 1
+            || segment.network_transmissions != 1
+            || segment.probe_transmission.is_some()
             || segment.path == UNKNOWN_PATH
             || self.lost.contains(&start)
             || self.rack.is_none_or(|later| later <= segment.sent_at)
@@ -1103,12 +1116,12 @@ impl Sender {
         let (&start, s) = self.segments.first_key_value()?;
         if s.path == UNKNOWN_PATH
             || s.reliable.is_some()
-            || s.transmissions != 1
+            || s.network_transmissions != 1
             || s.probe_transmission.is_some()
             // A sparse HTTPS response can occupy a full negotiated segment.
             // It still has no following packet to reveal loss with a SACK.
             // Keep the one-segment/one-probe bound, including the FIN byte.
-            || s.end - start > super::MAX_STREAM_PAYLOAD as u64
+            || s.end - start > crate::runtime::MAX_STREAM_PAYLOAD as u64
             // A lone SACK hole below delivered data is not a tail. Its RACK
             // and bounded head-probe policy already control recovery.
             || s.end < self.next + u64::from(self.fin_sent && self.fin == Some(self.next))
@@ -1543,7 +1556,10 @@ mod tests {
             panic!("expected data")
         };
         assert_eq!(large.len(), RELIABLE_PAYLOAD - DATA_HEADER);
-        assert_eq!(small.len(), super::super::MAX_STREAM_PAYLOAD - DATA_HEADER);
+        assert_eq!(
+            small.len(),
+            crate::runtime::MAX_STREAM_PAYLOAD - DATA_HEADER
+        );
     }
 
     #[test]
@@ -2058,13 +2074,13 @@ mod tests {
 
     #[test]
     fn full_segment_tail_probe_is_bounded_and_cancelled_by_ack() {
-        for bytes in [1032, super::super::MAX_STREAM_PAYLOAD - DATA_HEADER] {
+        for bytes in [1032, crate::runtime::MAX_STREAM_PAYLOAD - DATA_HEADER] {
             for acknowledged in [false, true] {
                 let now = Instant::now();
                 let mut sender = Sender::new(false);
                 sender.push(&vec![7; bytes]);
                 let original = sender
-                    .poll_transmit_sized(now, super::super::MAX_STREAM_PAYLOAD)
+                    .poll_transmit_sized(now, crate::runtime::MAX_STREAM_PAYLOAD)
                     .unwrap();
                 assert!(sender.tail_probe_deadline().is_none());
                 sender.admitted(0, original.transmission, 0, Duration::from_millis(90), now);
@@ -2088,7 +2104,7 @@ mod tests {
                 } else {
                     sender.on_timeout(probe_at);
                     let probe = sender
-                        .poll_transmit_sized(probe_at, super::super::MAX_STREAM_PAYLOAD)
+                        .poll_transmit_sized(probe_at, crate::runtime::MAX_STREAM_PAYLOAD)
                         .unwrap();
                     assert!(probe.tail_probe && probe.retransmission);
                     sender.admitted(
@@ -2111,7 +2127,7 @@ mod tests {
         let mut sender = Sender::new(false);
         sender.push(&vec![7; 1032]);
         let original = sender
-            .poll_transmit_sized(now, super::super::MAX_STREAM_PAYLOAD)
+            .poll_transmit_sized(now, crate::runtime::MAX_STREAM_PAYLOAD)
             .unwrap();
         sender.admitted(0, original.transmission, 0, Duration::from_millis(90), now);
         let (probe_at, _) = sender.tail_probe_deadline().unwrap();
@@ -2125,7 +2141,7 @@ mod tests {
             Some(loss_at)
         );
         let probe = sender
-            .poll_transmit_sized(probe_at, super::super::MAX_STREAM_PAYLOAD)
+            .poll_transmit_sized(probe_at, crate::runtime::MAX_STREAM_PAYLOAD)
             .unwrap();
         assert!(probe.tail_probe && probe.start == 0);
     }
@@ -3507,5 +3523,50 @@ mod tests {
         }
         assert!(now - start >= DEAD_AFTER && now - start < DEAD_AFTER + MAX_PTO * 4);
         assert!((5..20).contains(&transmissions), "{transmissions}");
+    }
+
+    #[test]
+    fn datagram_tail_probe_and_retransmission_avoid_failed_path() {
+        let t0 = Instant::now();
+        let mut sender = Sender::new(false);
+        sender.push(&vec![9u8; 990]);
+
+        let first = sender
+            .poll_transmit_sized(t0, crate::runtime::MAX_STREAM_PAYLOAD)
+            .expect("initial segment");
+        assert_eq!(first.avoid_path, None);
+
+        // Local pre-admission drop must not blame any network path.
+        assert!(sender.locally_dropped(first.start, first.transmission));
+        let local_retry = sender
+            .poll_transmit_sized(t0, crate::runtime::MAX_STREAM_PAYLOAD)
+            .expect("local retry");
+        assert!(local_retry.local_retry);
+        assert_eq!(local_retry.avoid_path, None);
+
+        // Admit onto path 1 (e.g., high-loss path). Both tail probe and loss
+        // retransmission must prefer any non-1 sibling path.
+        sender.admitted(
+            local_retry.start,
+            local_retry.transmission,
+            1,
+            Duration::from_millis(85),
+            t0,
+        );
+        let probe_at = sender.next_deadline(t0).expect("tail probe deadline");
+        sender.on_timeout(probe_at);
+        let probe = sender
+            .poll_transmit_sized(probe_at, crate::runtime::MAX_STREAM_PAYLOAD)
+            .expect("tail probe");
+        assert!(probe.tail_probe);
+        assert_eq!(probe.avoid_path, Some(1));
+
+        let loss_at = sender.next_deadline(probe_at).expect("loss deadline");
+        sender.on_timeout(loss_at);
+        let retry = sender
+            .poll_transmit_sized(loss_at, crate::runtime::MAX_STREAM_PAYLOAD)
+            .expect("loss retransmit");
+        assert!(retry.retransmission);
+        assert_eq!(retry.avoid_path, Some(1));
     }
 }
