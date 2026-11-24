@@ -2027,12 +2027,12 @@ impl Mux {
             self.stats.local_small_retry_frames +=
                 u64::from(t.local_retry && payload.len() <= super::LATENCY_RECORD_BYTES);
             let hold = (t.transmission > 0).then(|| {
-                let avoid = if interactive || t.head_copy {
-                    t.avoid_path
+                let (avoid, avoid_mask) = if interactive || t.head_copy {
+                    (t.avoid_path, t.avoid_mask)
                 } else {
-                    None
+                    (None, 0)
                 };
-                self.gauge.hold_with_avoid(
+                self.gauge.hold_with_avoid_mask(
                     id,
                     t.start,
                     t.transmission,
@@ -2040,6 +2040,7 @@ impl Mux {
                     interactive,
                     t.local_retry,
                     avoid,
+                    avoid_mask,
                 )
             });
             if !out.enqueue(stream::data_flow(id), payload, hold) {

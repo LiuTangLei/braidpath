@@ -2042,8 +2042,8 @@ fn proxy_client_warms_discovered_exits_without_waiting_for_missing_exit() {
     let server_dir = root.join("server");
     let server_addr = port();
 
-    // Silent UDP socket that absorbs packets without replying (triggers a full
-    // 4-second control timeout if `discover_exit_on` blocks discovery).
+    // A silent discovery entry takes the full control timeout to fail.
+    // A usable reply from another entry must start the known exit immediately.
     let blackhole = UdpSocket::bind("127.0.0.1:0").unwrap();
     let blackhole_addr = blackhole.local_addr().unwrap().to_string();
 

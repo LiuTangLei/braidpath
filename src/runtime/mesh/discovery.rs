@@ -1,4 +1,5 @@
 use super::*;
+use std::collections::BTreeSet;
 
 const CACHE: &str = "client-peers.json";
 
@@ -180,7 +181,8 @@ impl ClientIdentity {
     }
 
     pub async fn discover(&self, address: SocketAddr) -> Result<Vec<Node>> {
-        self.query_entries(&[address], None).await
+        self.query_entries_on(&[address], &Uplink::default(), |_| true)
+            .await
     }
 
     /// Explicit entries take precedence. Cached authenticated members provide
@@ -190,12 +192,25 @@ impl ClientIdentity {
             .await
     }
 
-    pub(crate) async fn discover_any_on(
+    /// Reuse the same requests after a partial response and publish every
+    /// authenticated view, including peers useful for relay allocation.
+    pub(crate) async fn discover_progressively_on(
         &self,
         entries: &[SocketAddr],
         uplink: &Uplink,
-    ) -> Result<Vec<Node>> {
-        self.discover_for_on(entries, None, uplink).await
+        wanted: &BTreeSet<String>,
+        mut publish: impl FnMut(&[Node]),
+    ) -> Result<()> {
+        let mut remaining = wanted.clone();
+        self.discover_until_on(entries, uplink, |nodes| {
+            for node in nodes {
+                remaining.remove(&node.id);
+            }
+            publish(nodes);
+            remaining.is_empty()
+        })
+        .await
+        .map(drop)
     }
 
     /// A partial member view is useful for listing, but cannot complete a
@@ -205,20 +220,23 @@ impl ClientIdentity {
             .await
     }
 
-    pub(crate) async fn discover_exit_on(
-        &self,
-        entries: &[SocketAddr],
-        exit: &str,
-        uplink: &Uplink,
-    ) -> Result<Vec<Node>> {
-        self.discover_for_on(entries, Some(exit), uplink).await
-    }
-
     async fn discover_for_on(
         &self,
         entries: &[SocketAddr],
         exit: Option<&str>,
         uplink: &Uplink,
+    ) -> Result<Vec<Node>> {
+        self.discover_until_on(entries, uplink, |nodes| {
+            exit.is_none_or(|exit| nodes.iter().any(|node| node.id == exit))
+        })
+        .await
+    }
+
+    async fn discover_until_on(
+        &self,
+        entries: &[SocketAddr],
+        uplink: &Uplink,
+        mut complete: impl FnMut(&[Node]) -> bool,
     ) -> Result<Vec<Node>> {
         ensure!(
             !entries.is_empty() && entries.len() <= MAX_NODES,
@@ -233,7 +251,7 @@ impl ClientIdentity {
             !entries.is_empty(),
             "no discovery entry matches uplink address family"
         );
-        let failure = match self.query_entries_on(&entries, exit, uplink).await {
+        let failure = match self.query_entries_on(&entries, uplink, &mut complete).await {
             Ok(nodes) => return Ok(nodes),
             Err(error) => error,
         };
@@ -248,28 +266,23 @@ impl ClientIdentity {
             return Err(failure).context("no discovery entry available");
         }
         tracing::info!("discovery entries unavailable; trying previously authenticated members");
-        self.query_entries_on(&alternatives, exit, uplink)
+        self.query_entries_on(&alternatives, uplink, complete)
             .await
             .context("cached discovery entries unavailable")
-    }
-
-    async fn query_entries(&self, entries: &[SocketAddr], exit: Option<&str>) -> Result<Vec<Node>> {
-        self.query_entries_on(entries, exit, &Uplink::default())
-            .await
     }
 
     async fn query_entries_on(
         &self,
         entries: &[SocketAddr],
-        exit: Option<&str>,
         uplink: &Uplink,
+        complete: impl FnMut(&[Node]) -> bool,
     ) -> Result<Vec<Node>> {
         let control = Arc::new(Control::bound(
             &self.dir.join("cert.pem"),
             entries.iter().any(|a| a.is_ipv6()),
             uplink,
         )?);
-        self.query_with(control, entries, exit).await
+        self.query_until_with(control, entries, complete).await
     }
 
     pub(super) async fn query_with(
@@ -278,12 +291,20 @@ impl ClientIdentity {
         entries: &[SocketAddr],
         exit: Option<&str>,
     ) -> Result<Vec<Node>> {
+        self.query_until_with(control, entries, |nodes| {
+            exit.is_none_or(|exit| nodes.iter().any(|node| node.id == exit))
+        })
+        .await
+    }
+
+    async fn query_until_with(
+        &self,
+        control: Arc<Control>,
+        entries: &[SocketAddr],
+        mut complete: impl FnMut(&[Node]) -> bool,
+    ) -> Result<Vec<Node>> {
         let mut pending = JoinSet::new();
-        for address in entries
-            .iter()
-            .copied()
-            .collect::<std::collections::BTreeSet<_>>()
-        {
+        for address in entries.iter().copied().collect::<BTreeSet<_>>() {
             let control = control.clone();
             let auth = self.auth.clone();
             pending.spawn(async move {
@@ -309,13 +330,10 @@ impl ClientIdentity {
                             continue;
                         }
                     };
-                    if exit.is_none_or(|exit| nodes.iter().any(|node| node.id == exit)) {
+                    if complete(&nodes) {
                         return Ok(nodes);
                     }
-                    last = anyhow::anyhow!(
-                        "discovery response does not contain selected exit {}",
-                        exit.unwrap()
-                    );
+                    last = anyhow::anyhow!("discovery responses did not cover the required exits");
                 }
                 Ok(Err(error)) => last = error,
                 Err(error) => last = error.into(),
@@ -455,7 +473,11 @@ mod tests {
         assert_eq!(writes.load(Ordering::SeqCst), 2);
     }
 
-    async fn reply_once(identity: &ClientIdentity, id: &str, delay: Duration) -> (Node, AbortTask) {
+    async fn reply_once(
+        identity: &ClientIdentity,
+        id: &str,
+        ready: impl Future<Output = ()> + Send + 'static,
+    ) -> (Node, AbortTask) {
         let endpoint = transport::server(
             "127.0.0.1:0".parse().unwrap(),
             &identity.dir.join("cert.pem"),
@@ -487,7 +509,7 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(request.headers()["authorization"], auth);
-            tokio::time::sleep(delay).await;
+            ready.await;
             stream
                 .send_response(http::Response::builder().status(200).body(()).unwrap())
                 .await
@@ -510,9 +532,14 @@ mod tests {
             let auth = format!("Bearer {}", transport::token(&dir.join("token")).unwrap());
             let cache = Cache::open(dir.clone());
             let identity = ClientIdentity { dir, auth, cache };
-            let (partial, _partial) = reply_once(&identity, "partial", Duration::ZERO).await;
-            let (complete, _complete) =
-                reply_once(&identity, "exit", Duration::from_millis(100)).await;
+            let (partial, _partial) =
+                reply_once(&identity, "partial", std::future::ready(())).await;
+            let (complete, _complete) = reply_once(
+                &identity,
+                "exit",
+                tokio::time::sleep(Duration::from_millis(100)),
+            )
+            .await;
             let entries = if use_cache {
                 identity
                     .cache
@@ -533,6 +560,46 @@ mod tests {
         }
     }
     #[tokio::test]
+    async fn progressive_discovery_publishes_partial_views_without_redialing() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("identity");
+        transport::initialize(&dir, NAME).unwrap();
+        let auth = format!("Bearer {}", transport::token(&dir.join("token")).unwrap());
+        let cache = Cache::open(dir.clone());
+        let identity = ClientIdentity { dir, auth, cache };
+        let (first, _first) = reply_once(&identity, "first", std::future::ready(())).await;
+        let (release, wait) = tokio::sync::oneshot::channel();
+        let (second, _second) = reply_once(&identity, "second", async {
+            wait.await.unwrap();
+        })
+        .await;
+        let (publish, mut views) = tokio::sync::mpsc::unbounded_channel();
+        let entries = [first.address, second.address];
+        let wanted = BTreeSet::from([first.id.clone(), second.id.clone()]);
+        let discover = tokio::spawn(async move {
+            identity
+                .discover_progressively_on(&entries, &Uplink::default(), &wanted, |nodes| {
+                    publish.send(nodes.to_vec()).unwrap();
+                })
+                .await
+                .unwrap();
+        });
+        let early = tokio::time::timeout(Duration::from_secs(2), views.recv())
+            .await
+            .expect("first view was held behind the second peer");
+        assert_eq!(early, Some(vec![first]));
+        assert!(!discover.is_finished());
+        release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), discover)
+            .await
+            .expect("the pending second request was not consumed")
+            .unwrap();
+        assert_eq!(views.recv().await, Some(vec![second]));
+        assert_eq!(views.recv().await, None);
+    }
+
+    #[tokio::test]
     async fn bootstrap_does_not_regress_a_newer_authenticated_exit_incarnation() {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let temp = tempfile::tempdir().unwrap();
@@ -541,7 +608,7 @@ mod tests {
         let auth = format!("Bearer {}", transport::token(&dir.join("token")).unwrap());
         let cache = Cache::open(dir.clone());
         let identity = ClientIdentity { dir, auth, cache };
-        let (stale, _server) = reply_once(&identity, "exit", Duration::ZERO).await;
+        let (stale, _server) = reply_once(&identity, "exit", std::future::ready(())).await;
         let mut newer = stale.clone();
         newer.address.set_port(if stale.address.port() == 20000 {
             20001

@@ -3289,3 +3289,181 @@ async fn native_liveness_hints_track_real_data_and_ack_progress() {
     assert!(acks <= actual.frame_rx.acks);
     assert!(eliciting <= actual.frame_tx.datagram + actual.frame_tx.stream + actual.frame_tx.ping);
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn small_stream_retry_escapes_fast_lossy_small_mask_anchor() {
+    let fast = Pair::connect().await;
+    let mid_lossy = Pair::connect().await;
+    let slow_clean = Pair::connect().await;
+    let path0 = fast.path();
+    let mut path1 = mid_lossy.path();
+    path1.id = 1;
+    let mut path2 = slow_clean.path();
+    path2.id = 2;
+    // Give paths 1 and 2 >20 ms extra one-way delay (`45 ms` and `65 ms`) so
+    // `small_mask` excludes both on transmission 1; then verify transmission 3
+    // (`avoid_mask = (1 << 0) | (1 << 1)`, `avoid_path = Some(1)`) selects
+    // untried path 2 instead of ping-ponging back onto path 0.
+    let now_us1 = quality_time(&path1);
+    path1.quality.lock().unwrap().snapshot.sender_estimate = quality::Estimate {
+        updated_us: Some(now_us1),
+        delay_variation_ms: 45.0,
+        ..Default::default()
+    };
+    let now_us2 = quality_time(&path2);
+    path2.quality.lock().unwrap().snapshot.sender_estimate = quality::Estimate {
+        updated_us: Some(now_us2),
+        delay_variation_ms: 65.0,
+        ..Default::default()
+    };
+    let paths = Arc::new(Mutex::new(vec![
+        path0.clone(),
+        path1.clone(),
+        path2.clone(),
+    ]));
+    let mut policy = policy();
+    policy.adaptive = true;
+    policy.quality_schedule = true;
+    policy.fec = automatic_fec::AUTO;
+    policy.rate = 125_000_000;
+    policy.group_rates = [policy.rate; MAX_PATHS];
+
+    let metrics = stats::Metrics::new("client");
+    let scope = metrics.scope("small-retry-escape", stats::FORWARD);
+    let (tx, rx) = mpsc::channel(QUEUE);
+    let (stop, stopped) = watch::channel(false);
+    let task = tokio::spawn(sender(
+        rx,
+        paths.clone(),
+        policy.clone(),
+        stopped,
+        scope,
+        None,
+    ));
+
+    let gauge = Arc::new(outbound::Gauge::default());
+    let payload = stream::Frame::Data {
+        offset: 0,
+        fin: false,
+        data: vec![0x42; 24],
+    }
+    .encode();
+
+    // Transmission 1 (no `avoid_path`) stays on the timely `small_mask` anchor (path 0).
+    tx.send(QueuedRecord {
+        record: Record {
+            flow: stream::data_flow(1),
+            id: 1,
+            payload: payload.clone(),
+        },
+        created: Instant::now(),
+        hold: Some(gauge.hold_with_avoid(1, 0, 1, payload.len(), true, false, None)),
+    })
+    .await
+    .unwrap();
+    let mut q0 = quality::State::new(7);
+    let mut rx0 = Receiver::default();
+    let first = timeout(Duration::from_secs(1), async {
+        loop {
+            let datagram = fast.receive().await;
+            let http = wire::http_payload(&datagram, 0).unwrap();
+            let Ok(inner) = q0.receive(http, 0) else {
+                continue;
+            };
+            for rec in rx0.receive(inner, Instant::now()).unwrap() {
+                if rec.id == 1 {
+                    return rec;
+                }
+            }
+        }
+    })
+    .await
+    .expect("initial small stream open/header uses fast anchor");
+    assert_eq!(first.payload, payload);
+
+    // Transmission 2 (`avoid_path = Some(0)`) escapes `small_mask` onto path 1.
+    tx.send(QueuedRecord {
+        record: Record {
+            flow: stream::data_flow(1),
+            id: 2,
+            payload: payload.clone(),
+        },
+        created: Instant::now(),
+        hold: Some(gauge.hold_with_avoid_mask(
+            1,
+            0,
+            2,
+            payload.len(),
+            true,
+            false,
+            Some(0),
+            1 << 0,
+        )),
+    })
+    .await
+    .unwrap();
+    let mut q1 = quality::State::new(7);
+    let mut rx1 = Receiver::default();
+    let escaped1 = timeout(Duration::from_secs(1), async {
+        loop {
+            let datagram = mid_lossy.receive().await;
+            let http = wire::http_payload(&datagram, 0).unwrap();
+            let Ok(inner) = q1.receive(http, 0) else {
+                continue;
+            };
+            for rec in rx1.receive(inner, Instant::now()).unwrap() {
+                if rec.id == 2 {
+                    return rec;
+                }
+            }
+        }
+    })
+    .await
+    .expect("retry 1 escapes fast `small_mask` anchor onto path 1");
+    assert_eq!(escaped1.payload, payload);
+
+    // Transmission 3 (`avoid_mask = {0, 1}`, `avoid_path = Some(1)`) must visit
+    // untried path 2 rather than ping-ponging back onto faster path 0.
+    tx.send(QueuedRecord {
+        record: Record {
+            flow: stream::data_flow(1),
+            id: 3,
+            payload: payload.clone(),
+        },
+        created: Instant::now(),
+        hold: Some(gauge.hold_with_avoid_mask(
+            1,
+            0,
+            3,
+            payload.len(),
+            true,
+            false,
+            Some(1),
+            (1 << 0) | (1 << 1),
+        )),
+    })
+    .await
+    .unwrap();
+    let mut q2 = quality::State::new(7);
+    let mut rx2 = Receiver::default();
+    let escaped2 = timeout(Duration::from_secs(1), async {
+        loop {
+            let datagram = slow_clean.receive().await;
+            let http = wire::http_payload(&datagram, 0).unwrap();
+            let Ok(inner) = q2.receive(http, 0) else {
+                continue;
+            };
+            for rec in rx2.receive(inner, Instant::now()).unwrap() {
+                if rec.id == 3 {
+                    return rec;
+                }
+            }
+        }
+    })
+    .await
+    .expect("retry 2 visits untried path 2 instead of ping-ponging back onto path 0");
+    assert_eq!(escaped2.payload, payload);
+
+    let _ = stop.send(true);
+    let _ = task.await;
+}

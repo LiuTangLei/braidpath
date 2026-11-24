@@ -101,6 +101,29 @@ impl Gauge {
         local_retry: bool,
         avoid_path: Option<u8>,
     ) -> Arc<Hold> {
+        self.hold_with_avoid_mask(
+            stream,
+            start,
+            transmission,
+            bytes,
+            interactive,
+            local_retry,
+            avoid_path,
+            avoid_path.map_or(0, |p| 1u8.checked_shl(u32::from(p)).unwrap_or(0)),
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub fn hold_with_avoid_mask(
+        self: &Arc<Self>,
+        stream: u32,
+        start: u64,
+        transmission: u32,
+        bytes: usize,
+        interactive: bool,
+        local_retry: bool,
+        avoid_path: Option<u8>,
+        avoid_mask: u8,
+    ) -> Arc<Hold> {
         self.queued.fetch_add(bytes, Ordering::AcqRel);
         Arc::new(Hold {
             gauge: self.clone(),
@@ -109,6 +132,7 @@ impl Gauge {
             interactive,
             local_retry,
             avoid_path,
+            avoid_mask,
             admitted: AtomicBool::new(false),
             queue_reserved: AtomicBool::new(true),
         })
@@ -124,6 +148,8 @@ pub struct Hold {
     local_retry: bool,
     /// Path already carrying a stalled reliable copy; prefer a healthy sibling.
     avoid_path: Option<u8>,
+    /// Bitmask of paths already tried for this segment across network retries.
+    avoid_mask: u8,
     admitted: AtomicBool,
     queue_reserved: AtomicBool,
 }
@@ -139,6 +165,9 @@ impl Hold {
     }
     pub fn avoid_path(&self) -> Option<u8> {
         self.avoid_path
+    }
+    pub fn avoid_mask(&self) -> u8 {
+        self.avoid_mask
     }
     /// A bounded reliable writer now owns this frame. Give end-to-end repair
     /// its chosen path immediately; native flow-control waits must not pin the

@@ -1250,7 +1250,15 @@ impl PreparedSend {
         now_us: u64,
         age: Duration,
     ) -> bool {
-        if policy.gaming_symbol(&self.front) || !small_delivery::applies(policy, &self.front) {
+        if policy.gaming_symbol(&self.front)
+            || !small_delivery::applies(policy, &self.front)
+            || (!self.repair
+                && self
+                    .front
+                    .hold
+                    .as_ref()
+                    .is_some_and(|hold| hold.avoid_path().is_some() || hold.avoid_mask() != 0))
+        {
             return true;
         }
         let candidates: Vec<_> = paths
@@ -2371,6 +2379,11 @@ async fn sender_with_inputs(
             if let Some(writer) = &path.native_return {
                 writer.set_reachable(path.open() && !liveness[usize::from(path.id)].silent());
                 if mixed_writes.is_none() {
+                    let initial_window = if metrics.direction == stats::FORWARD {
+                        native_return::INITIAL_UPLOAD_SEND_WINDOW
+                    } else {
+                        native_return::INITIAL_SEND_WINDOW
+                    };
                     let credit = &mut native_credit[usize::from(path.id)];
                     if let Some(window) = credit.observe(
                         &path.conn,
@@ -2378,6 +2391,7 @@ async fn sender_with_inputs(
                         policy.latency_target_ms,
                         best_native_service,
                         writer.written_bytes(),
+                        initial_window,
                     ) {
                         path.conn.set_send_window(window);
                         info!(target: "braidpath::native_credit", path=path.id, window_bytes=window,
@@ -3301,7 +3315,16 @@ async fn sender_with_inputs(
             } else {
                 u8::MAX
             };
-            if is_small {
+            let (avoid_for_retry, avoid_mask) = if !repair {
+                (
+                    front.hold.as_ref().and_then(|hold| hold.avoid_path()),
+                    front.hold.as_ref().map_or(0, |hold| hold.avoid_mask()),
+                )
+            } else {
+                (None, 0)
+            };
+            let escaping_retry = avoid_for_retry.is_some() || avoid_mask != 0;
+            if is_small && !escaping_retry {
                 candidates.retain(|(id, _)| small_mask & (1 << id) != 0);
             }
             if policy.adaptive {
@@ -3326,7 +3349,7 @@ async fn sender_with_inputs(
                     .map(|n| (cursor + n) % paths.len())
                     .collect()
             };
-            if is_small {
+            if is_small && !escaping_retry {
                 order.retain(|i| small_mask & (1 << paths[*i].id) != 0);
             }
             if repair {
@@ -3363,7 +3386,8 @@ async fn sender_with_inputs(
             // AUTO originals prefer a ready faster route in the same protection
             // tier. Repairs/fixed policies retain the opt-in frontier treatment.
             // Reordering never removes a fallback or bypasses any gate below.
-            if is_small && policy.adaptive && !gaming_datagram && order.len() > 1 {
+            if is_small && policy.adaptive && !gaming_datagram && !escaping_retry && order.len() > 1
+            {
                 frontier.small_rank_evaluations += 1;
                 let ids: Vec<_> = order.iter().map(|i| paths[*i].id).collect();
                 let samples: Vec<_> = order
@@ -3416,6 +3440,8 @@ async fn sender_with_inputs(
                             frontier.small_rank_changes += 1;
                         }
                     }
+                } else if !repair {
+                    order = native_return::udp_order(order, &paths, policy.latency_target_ms);
                 }
             }
             let mut accepted = None;
@@ -3424,13 +3450,20 @@ async fn sender_with_inputs(
             {
                 order = native_return::udp_order(order, &paths, policy.latency_target_ms);
             }
-            if !repair
-                && order.len() > 1
-                && let Some(avoid) = front.hold.as_ref().and_then(|hold| hold.avoid_path())
-            {
-                // Network retries and probes move away from the path that just
-                // failed while retaining it as the last-resort fallback.
-                order.sort_by_key(|&i| paths[i].id == avoid);
+            if escaping_retry && order.len() > 1 {
+                // Network retries and probes escape a failing `small_mask` anchor,
+                // prioritize untried siblings across 3+ paths so retries never
+                // ping-pong between two lossy routes, and keep `avoid_for_retry`
+                // strictly last.
+                let any_untried = order.iter().any(|&i| avoid_mask & (1 << paths[i].id) == 0);
+                order = native_return::udp_order(order, &paths, policy.latency_target_ms);
+                order.sort_by_key(|&i| {
+                    let id = paths[i].id;
+                    (
+                        any_untried && (avoid_mask & (1 << id) != 0),
+                        avoid_for_retry == Some(id),
+                    )
+                });
             }
             let mut wait_candidate = None;
             for i in order {
@@ -6079,7 +6112,7 @@ async fn client_session(
                             value.conn.set_send_window(if options.policy.game_mode {
                                 native_return::MIXED_SEND_WINDOW
                             } else {
-                                native_return::INITIAL_SEND_WINDOW
+                                native_return::INITIAL_UPLOAD_SEND_WINDOW
                             });
                             (Some(tx), Some(rx))
                         } else {

@@ -31,10 +31,19 @@ struct UdpRoute {
     loss: Option<f64>,
 }
 fn rank_udp(routes: &mut [UdpRoute], slack_ms: f64) {
-    let fastest = routes
+    let healthy_fastest = routes
         .iter()
+        .filter(|p| !p.loss.is_some_and(|loss| loss >= 0.20))
         .map(|p| p.delay_ms)
         .fold(f64::INFINITY, f64::min);
+    let fastest = if healthy_fastest.is_finite() {
+        healthy_fastest
+    } else {
+        routes
+            .iter()
+            .map(|p| p.delay_ms)
+            .fold(f64::INFINITY, f64::min)
+    };
     let timely = fastest + slack_ms;
     let has_unmeasured_timely = routes
         .iter()
@@ -44,8 +53,16 @@ fn rank_udp(routes: &mut [UdpRoute], slack_ms: f64) {
         .filter(|p| p.delay_ms <= timely)
         .filter_map(|p| p.loss)
         .fold(1.0f64, f64::min);
+    let best_overall_loss = routes
+        .iter()
+        .map(|p| p.loss.unwrap_or(0.0))
+        .fold(1.0f64, f64::min);
     let tier = |p: &UdpRoute| {
-        if p.delay_ms > timely {
+        if p.loss
+            .is_some_and(|loss| loss >= 0.20 && loss > best_overall_loss + 0.10)
+        {
+            3
+        } else if p.delay_ms > timely {
             2
         } else if p
             .loss
@@ -125,6 +142,12 @@ const fn wire_cost(bytes: usize) -> usize {
 /// while idle or newly-warmed high-BDP paths retain enough initial flight for
 /// immediate multi-path BBR Startup.
 pub(super) const INITIAL_SEND_WINDOW: u64 = 1024 * 1024;
+/// Client-to-server access uplinks are frequently asymmetric (sub-megabit to
+/// tens of Mbit/s). Start upload streams at 256 KiB so a 0.4 Mbps straggler
+/// drains within ~6-7 s rather than absorbing 1 MiB (~19 s), while healthy
+/// multi-megabit uplinks already start at full BDP and double to `MAX_SEND_WINDOW`
+/// via Quinn's native flow-control waker.
+pub(super) const INITIAL_UPLOAD_SEND_WINDOW: u64 = MIN_SEND_WINDOW;
 const MIN_SEND_WINDOW: u64 = 128 * 1024;
 const SLOW_PATH_MIN_WINDOW: u64 = 96 * 1024;
 pub(super) const RECEIVE_WINDOW: u32 = 4 * 1024 * 1024;
@@ -151,6 +174,7 @@ pub(super) struct Credit {
     sampled_us: u64,
     sent: u64,
     lost: u64,
+    acked: u64,
     current: u64,
     loss_ceiling: Option<u64>,
     loss_hold_until_us: u64,
@@ -170,6 +194,7 @@ struct CreditSample {
     deeply_queued: bool,
     probing: bool,
     storage_limited: bool,
+    ack_progress: bool,
     retained: u64,
     unsent: u64,
     bulk_written: u64,
@@ -179,7 +204,19 @@ struct CreditSample {
 // A cwnd/RTT bound is sufficient to distinguish a much slower path. Actual
 // unsent bytes must also show that its current window is building a queue.
 pub(super) fn service_bound(conn: &quinn::Connection) -> u64 {
-    conn.cwnd_hint().saturating_mul(1_000) / conn.rtt_hint().as_micros().max(1) as u64
+    let cwnd_service =
+        conn.cwnd_hint().saturating_mul(1_000) / conn.rtt_hint().as_micros().max(1) as u64;
+    // When a slow bufferbloated link drains back to `min_rtt`, BBR can briefly
+    // retain a large historical `cwnd` while `pacing_rate` already reflects the
+    // true sub-megabit bottleneck. `pacing_bps / 3_000` equals `2.0 * bw` even
+    // during ProbeBW's 0.75x drain phase (`8/3 * 0.75 = 2.0`), so healthy paths
+    // are untouched while a 0.4 Mbps straggler cannot masquerade as 36 Mbps and
+    // poison `best_service` / `faster_route` against real multi-megabit paths.
+    if let Some(pacing_bps) = conn.congestion_state().metrics().pacing_rate {
+        cwnd_service.min((pacing_bps / 3_000).max(1))
+    } else {
+        cwnd_service
+    }
 }
 
 fn path_completion_rank(
@@ -222,16 +259,20 @@ impl Credit {
         target_ms: u64,
         best_service: u64,
         bulk_written: u64,
+        initial_window: u64,
     ) -> Option<u64> {
         let identity = conn.stable_id();
         if self.connection != Some(identity) {
             let stats = conn.stats();
+            let (retained, unsent) = conn.stream_send_buffer_bytes();
+            let in_flight = retained.saturating_sub(unsent);
             *self = Self {
                 connection: Some(identity),
                 sampled_us: now_us,
                 sent: stats.path.sent_packets,
                 lost: stats.path.lost_packets,
-                current: INITIAL_SEND_WINDOW,
+                acked: stats.stream_frame_bytes_tx.saturating_sub(in_flight),
+                current: initial_window,
                 loss_ceiling: None,
                 loss_hold_until_us: 0,
                 loss_cautious_until_us: 0,
@@ -250,6 +291,14 @@ impl Credit {
         let rtt_us = rtt.as_micros().min(u128::from(u64::MAX)) as u64;
         let queued_ms = rtt.saturating_sub(conn.min_rtt_hint()).as_secs_f64() * 1000.0;
         let (retained, unsent) = conn.stream_send_buffer_bytes();
+        let in_flight = retained.saturating_sub(unsent);
+        let acked = stats.stream_frame_bytes_tx.saturating_sub(in_flight);
+        let ack_progress = acked.saturating_sub(self.acked) >= PAYLOAD as u64;
+        if ack_progress {
+            self.acked = acked;
+        } else {
+            self.acked = self.acked.max(acked);
+        }
         self.update(
             now_us,
             CreditSample {
@@ -264,6 +313,7 @@ impl Credit {
                 // storage is well utilized and QUIC has packetized most of it.
                 storage_limited: retained + 2 * PAYLOAD as u64 >= self.current
                     && unsent <= 3 * PAYLOAD as u64,
+                ack_progress,
                 retained,
                 unsent,
                 bulk_written,
@@ -336,7 +386,11 @@ impl Credit {
         let actually_pinned = sample.storage_limited
             && sample.retained.saturating_add(2 * PAYLOAD as u64) >= self.current
             && sample.unsent <= SLOW_PATH_WRITER_MARGIN;
-        let retained_floor = if !exercised_slow && !sample.deeply_queued && actually_pinned {
+        let retained_floor = if !exercised_slow
+            && !sample.deeply_queued
+            && actually_pinned
+            && (sample.ack_progress || sample.bulk_written >= INITIAL_SEND_WINDOW)
+        {
             sample
                 .retained
                 .saturating_add(4 * PAYLOAD as u64)
@@ -410,7 +464,8 @@ impl Credit {
                 && sample.unsent > SLOW_PATH_BACKLOG_THRESHOLD);
         let restore_floor = (self.current < MIN_SEND_WINDOW && !sample.faster_route)
             || self.current < retained_floor;
-        let can_grow = sample.storage_limited && packets >= 12 && !sample.deeply_queued;
+        let can_grow =
+            sample.storage_limited && sample.ack_progress && packets >= 12 && !sample.deeply_queued;
         if !must_shrink
             && !restore_floor
             && !can_grow
@@ -420,7 +475,7 @@ impl Credit {
         {
             return None;
         }
-        let next = if self.current < retained_floor {
+        let next = if self.current < retained_floor && !can_grow {
             retained_floor
         } else if severe_loss {
             // Shrink excess buffering above `bdp_floor` at most once per RTT on
@@ -436,10 +491,14 @@ impl Credit {
                     } else {
                         MIN_SEND_WINDOW
                     };
-                    (self.current / 2).max(floor).min(effective_cap)
+                    (self.current / 2)
+                        .max(floor)
+                        .min(self.current)
+                        .min(effective_cap)
                 } else {
                     (self.current.saturating_mul(3) / 4)
                         .max(bdp_floor)
+                        .min(self.current)
                         .min(effective_cap)
                 };
                 self.loss_ceiling = Some(target);
@@ -452,7 +511,7 @@ impl Credit {
             && slow_window < effective_cap
             && sample.unsent > SLOW_PATH_BACKLOG_THRESHOLD
         {
-            slow_window
+            slow_window.min(self.current)
         } else if sample.deeply_queued
             && sample.unsent > SLOW_PATH_WRITER_MARGIN
             && self.current > bdp_floor
@@ -461,6 +520,7 @@ impl Credit {
             self.last_brake_us = now_us;
             (self.current.saturating_mul(3) / 4)
                 .max(bdp_floor)
+                .min(self.current)
                 .min(effective_cap)
         } else if sample.queued
             && sample.unsent > SLOW_PATH_WRITER_MARGIN
@@ -474,22 +534,26 @@ impl Credit {
             self.current
                 .saturating_sub(SEND_WINDOW_BRAKE)
                 .max(bdp_floor)
+                .min(self.current)
                 .min(effective_cap)
-        } else if restore_floor {
+        } else if self.current < MIN_SEND_WINDOW && !sample.faster_route {
             MIN_SEND_WINDOW.min(cwnd_cap)
         } else if can_grow {
             if now_us < self.loss_hold_until_us {
                 self.loss_ceiling
                     .map_or(self.current, |ceiling| self.current.min(ceiling))
+                    .max(retained_floor)
                     .min(cwnd_cap)
             } else if now_us < self.loss_cautious_until_us {
-                (self.current + SEND_WINDOW_GROWTH).min(cwnd_cap)
+                (self.current + SEND_WINDOW_GROWTH)
+                    .max(retained_floor)
+                    .min(cwnd_cap)
             } else {
                 self.loss_ceiling = None;
                 let step = self
                     .current
                     .clamp(SEND_WINDOW_GROWTH, SEND_WINDOW_MAX_GROWTH);
-                (self.current + step).min(cwnd_cap)
+                (self.current + step).max(retained_floor).min(cwnd_cap)
             }
         } else {
             self.current.min(effective_cap)
@@ -709,6 +773,7 @@ pub(super) fn drain(
         }
         let id = usize::from(path.id);
         let (retained, unsent) = path.conn.stream_send_buffer_bytes();
+        let cwnd = path.conn.cwnd_hint();
         let staged = ((writer.tx.max_capacity() - writer.tx.capacity()) * PAYLOAD) as u64;
         let probing = path.conn.probing_rtt_hint();
         let raw_rtt_us = path.conn.rtt_hint().as_micros() as u64;
@@ -725,6 +790,13 @@ pub(super) fn drain(
             // `min_cwnd` for one RTT while `pacing_rate` still reflects the
             // measured bottleneck bandwidth.
             service = service.max(pacing_bps / 8_000);
+        } else if unsent > 0
+            && cwnd <= PAYLOAD as u64
+            && let Some(pacing_bps) = path.conn.congestion_state().metrics().pacing_rate
+        {
+            // Near BBR's `min_cwnd` floor, `cwnd / RTT` stops shrinking even on a
+            // sub-megabit uplink; bound service by the actual pacing rate.
+            service = service.min((pacing_bps / 8_000).max(1));
         }
         let rtt_us = if loss_permille >= 150 {
             let surviving = 1_000u64.saturating_sub(loss_permille);
@@ -797,7 +869,8 @@ pub(super) fn drain(
                     .retained
                     .saturating_add(snap.staged)
                     .saturating_add(local_dispatched[id]);
-                let cold = snap.written.saturating_add(local_dispatched[id]) < COLD_BULK_MIN_BYTES
+                let total_written = snap.written.saturating_add(local_dispatched[id]);
+                let cold = total_written < COLD_BULK_MIN_BYTES
                     && snap.unsent.saturating_add(local_dispatched[id])
                         <= SLOW_PATH_BACKLOG_THRESHOLD;
                 let rank = path_completion_rank(
@@ -824,7 +897,8 @@ pub(super) fn drain(
                     return (true, true, true, u64::MAX);
                 };
                 let full = writer.tx.capacity() == 0;
-                let (probing, ect) = path_ranks[usize::from(path.id)];
+                let id = usize::from(path.id);
+                let (probing, ect) = path_ranks[id];
                 (avoided, full, probing, ect)
             });
         }
@@ -840,7 +914,19 @@ pub(super) fn drain(
                 }
                 if straggler_limit_us < u64::MAX {
                     let (probing, ect) = path_ranks[id];
-                    if probing || ect > straggler_limit_us {
+                    if snapshots[id].service.saturating_mul(3) < best_service
+                        && snapshots[id].rtt_us > 400_000
+                    {
+                        return None;
+                    }
+                    let path_limit_us = if best_service >= 2_000
+                        && snapshots[id].service.saturating_mul(2) < best_service
+                    {
+                        straggler_limit_us.min(420_000)
+                    } else {
+                        straggler_limit_us
+                    };
+                    if probing || ect > path_limit_us {
                         return None;
                     }
                 }
@@ -1464,6 +1550,28 @@ mod tests {
         ];
         rank_udp(&mut high_loss_vs_fresh, 20.0);
         assert_eq!(high_loss_vs_fresh.map(|p| p.index), [2, 1]);
+
+        // A severely lossy fast anchor (>=20% loss) cannot exclude or outrank a
+        // clean route whose delay exceeds `fast + slack_ms` (`48 + 20 < 70.3 ms`).
+        let mut lossy_fast_anchor = [
+            UdpRoute {
+                index: 2,
+                delay_ms: 48.0,
+                loss: Some(0.28),
+            },
+            UdpRoute {
+                index: 1,
+                delay_ms: 65.7,
+                loss: Some(0.02),
+            },
+            UdpRoute {
+                index: 3,
+                delay_ms: 70.3,
+                loss: Some(0.0),
+            },
+        ];
+        rank_udp(&mut lossy_fast_anchor, 20.0);
+        assert_eq!(lossy_fast_anchor.map(|p| p.index), [3, 1, 2]);
     }
 
     #[test]
@@ -1502,6 +1610,7 @@ mod tests {
             deeply_queued: false,
             probing: false,
             storage_limited: false,
+            ack_progress: true,
             retained: 2 * 1024 * 1024,
             unsent: 0,
             bulk_written: INITIAL_SEND_WINDOW,
@@ -1621,6 +1730,7 @@ mod tests {
             deeply_queued: true,
             probing: false,
             storage_limited: false,
+            ack_progress: true,
             retained: cwnd + 200 * 1024,
             unsent: 200 * 1024,
             bulk_written: INITIAL_SEND_WINDOW,
@@ -1689,6 +1799,7 @@ mod tests {
             deeply_queued: false,
             probing: false,
             storage_limited: false,
+            ack_progress: true,
             retained: 0,
             unsent: 0,
             bulk_written: 0,
@@ -2272,5 +2383,83 @@ mod tests {
             .or_else(|_| r1.rx.try_recv())
             .expect("normal flow still dispatches");
         assert_eq!(&delivered.data[8..16], &18u64.to_be_bytes());
+    }
+
+    #[test]
+    fn upload_credit_starts_at_bounded_window_and_ramps_or_clamps() {
+        // An unacked burst into a deep router queue (`sent_packets` advancing
+        // with `unsent == 0` but `ack_progress == false`) must NOT expand a
+        // 0.43 Mbps straggler before remote stream ACKs arrive.
+        let mut unacked = Credit {
+            current: INITIAL_UPLOAD_SEND_WINDOW,
+            ..Default::default()
+        };
+        let unacked_sample = CreditSample {
+            cwnd: 240 * 1024,
+            rtt_us: 96_000,
+            sent: 135,
+            lost: 0,
+            queued: false,
+            deeply_queued: false,
+            probing: false,
+            storage_limited: true,
+            ack_progress: false,
+            retained: INITIAL_UPLOAD_SEND_WINDOW,
+            unsent: 0,
+            bulk_written: INITIAL_UPLOAD_SEND_WINDOW / 2,
+            faster_route: false,
+        };
+        assert_eq!(unacked.update(100_000, unacked_sample), None);
+        assert_eq!(unacked.current, INITIAL_UPLOAD_SEND_WINDOW);
+
+        let mut slow = Credit {
+            current: INITIAL_UPLOAD_SEND_WINDOW,
+            ..Default::default()
+        };
+        let slow_sample = CreditSample {
+            cwnd: 19 * 1024,
+            rtt_us: 100_000,
+            sent: 30,
+            lost: 0,
+            queued: true,
+            deeply_queued: true,
+            probing: false,
+            storage_limited: false,
+            ack_progress: false,
+            retained: INITIAL_UPLOAD_SEND_WINDOW,
+            unsent: 160 * 1024,
+            bulk_written: COLD_BULK_MIN_BYTES,
+            faster_route: true,
+        };
+        assert_eq!(
+            slow.update(100_000, slow_sample),
+            Some(SLOW_PATH_MIN_WINDOW)
+        );
+
+        let mut fast = Credit {
+            current: INITIAL_UPLOAD_SEND_WINDOW,
+            ..Default::default()
+        };
+        let mut fast_sample = CreditSample {
+            cwnd: 512 * 1024,
+            rtt_us: 100_000,
+            sent: 100,
+            lost: 0,
+            queued: false,
+            deeply_queued: false,
+            probing: false,
+            storage_limited: true,
+            ack_progress: true,
+            retained: INITIAL_UPLOAD_SEND_WINDOW,
+            unsent: 0,
+            bulk_written: INITIAL_UPLOAD_SEND_WINDOW * 2,
+            faster_route: false,
+        };
+        let step1 = fast.update(100_000, fast_sample).expect("fast ramp step 1");
+        assert!(step1 >= INITIAL_UPLOAD_SEND_WINDOW * 2);
+        fast_sample.retained = fast.current;
+        fast_sample.sent += 200;
+        let step2 = fast.update(200_000, fast_sample).expect("fast ramp step 2");
+        assert!(step2 >= INITIAL_UPLOAD_SEND_WINDOW * 4);
     }
 }

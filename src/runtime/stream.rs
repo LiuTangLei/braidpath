@@ -343,6 +343,7 @@ impl Rtt {
 struct Segment {
     end: u64,
     path: usize,
+    tried_paths: u8,
     sent_at: Instant,
     expected_ack_rtt: Duration,
     transmissions: u32,
@@ -417,6 +418,8 @@ pub struct Transmit {
     pub local_retry: bool,
     /// Path already carrying a stalled reliable segment; rescue prefers a sibling.
     pub avoid_path: Option<u8>,
+    /// Bitmask of paths already tried for this segment across network retries.
+    pub avoid_mask: u8,
 }
 
 impl Sender {
@@ -608,6 +611,7 @@ impl Sender {
         let segment = self.segments.entry(start).or_insert(Segment {
             end,
             path: UNKNOWN_PATH,
+            tried_paths: 0,
             sent_at: now,
             expected_ack_rtt: Duration::ZERO,
             transmissions: 0,
@@ -621,6 +625,7 @@ impl Sender {
         let local_retry = !probe && std::mem::take(&mut segment.local_retry_pending);
         let previous_path =
             (segment.path != UNKNOWN_PATH && !local_retry).then_some(segment.path as u8);
+        let tried_paths = segment.tried_paths;
         if !probe && segment.transmissions > 0 && !local_retry {
             let stalled = progress.is_none_or(|at| at <= segment.sent_at);
             segment.stalls = if stalled { segment.stalls + 1 } else { 0 };
@@ -649,10 +654,10 @@ impl Sender {
             segment.deadline = Some(at);
             self.repeated.insert((at, start));
         }
-        let avoid_path = if probe || (transmission > 1 && !local_retry) {
-            previous_path
+        let (avoid_path, avoid_mask) = if probe || (transmission > 1 && !local_retry) {
+            (previous_path, tried_paths)
         } else {
-            None
+            (None, 0)
         };
         Transmit {
             frame: Frame::Data {
@@ -667,6 +672,7 @@ impl Sender {
             head_copy: false,
             local_retry,
             avoid_path,
+            avoid_mask,
         }
     }
     /// Split only a selected oversized flight record. Already queued callbacks
@@ -747,7 +753,13 @@ impl Sender {
                 self.head_probe = None;
                 self.last_head_probe = Some(now);
                 let mut t = self.send_segment(start, end, now, true);
-                (t.tail_probe, t.head_copy, t.avoid_path) = (false, true, avoid_path);
+                let avoid_mask = if avoid_path.is_some() {
+                    t.avoid_mask
+                } else {
+                    0
+                };
+                (t.tail_probe, t.head_copy, t.avoid_path, t.avoid_mask) =
+                    (false, true, avoid_path, avoid_mask);
                 return Some(t);
             }
         }
@@ -798,6 +810,7 @@ impl Sender {
                 head_copy: false,
                 local_retry: false,
                 avoid_path: None,
+                avoid_mask: 0,
             });
         }
         None
@@ -876,6 +889,9 @@ impl Sender {
             return;
         }
         if let Some(bytes) = self.pending_copies.remove(&(start, transmission)) {
+            if let Some(segment) = self.segments.get_mut(&start) {
+                segment.tried_paths |= 1 << path;
+            }
             self.expected_duplicates =
                 (self.expected_duplicates + bytes).min(EXPECTED_DUPLICATES_MAX);
             return;
@@ -896,6 +912,7 @@ impl Sender {
         let segment = self.segments.get_mut(&start).expect("admitted segment");
         segment.local_retry_pending = false;
         segment.path = path;
+        segment.tried_paths |= 1 << path;
         segment.sent_at = at;
         segment.expected_ack_rtt = expected_ack_rtt;
         segment.reliable = reliable;

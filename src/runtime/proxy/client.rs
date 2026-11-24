@@ -570,7 +570,7 @@ impl Pool {
         let (updates, _) = self.route_watch(id).await.unwrap();
         updates.borrow().clone()
     }
-    fn refresh(&self, nodes: Vec<mesh::Node>) {
+    fn refresh(&self, nodes: &[mesh::Node]) -> Option<Vec<mesh::Node>> {
         let mut current = self.nodes.write().expect("proxy nodes");
         // Merge incoming nodes by ID so a partial view of one exit never drops
         // another selected exit learned from a different peer or cache.
@@ -579,10 +579,13 @@ impl Pool {
             .cloned()
             .map(|node| (node.id.clone(), node))
             .collect();
-        for node in nodes {
+        for node in nodes.iter().cloned() {
             by_id.insert(node.id.clone(), node);
         }
         let merged: Vec<mesh::Node> = by_id.into_values().collect();
+        if *current == merged {
+            return None;
+        }
         *current = merged.clone();
         drop(current);
         for slot in self.slots.values() {
@@ -591,6 +594,7 @@ impl Pool {
             }
         }
         self.nodes_changed.notify_waiters();
+        Some(merged)
     }
 }
 
@@ -908,35 +912,24 @@ pub async fn client(options: ClientOptions) -> Result<()> {
             options.socks5_early_reply,
         ));
     }
-    let mut discovery: JoinSet<Result<Vec<mesh::Node>>> = JoinSet::new();
-    let mut missing_discovery: JoinSet<(String, Result<Vec<mesh::Node>>)> = JoinSet::new();
-    let mut missing_in_flight = BTreeSet::new();
+    let mut discovery: JoinSet<Result<()>> = JoinSet::new();
+    let mut stream_nodes = nodes_rx;
     let mut warmups: JoinSet<()> = JoinSet::new();
-    let spawn_discovery = |discovery: &mut JoinSet<Result<Vec<mesh::Node>>>,
-                           pool: &Arc<Pool>,
-                           entries: &[SocketAddr]| {
-        let identity = pool.identity.clone();
-        let uplink = pool.uplink();
-        let entries = entries.to_vec();
-        discovery.spawn(async move { identity.discover_any_on(&entries, &uplink).await });
-    };
-    let spawn_missing = |missing_discovery: &mut JoinSet<(String, Result<Vec<mesh::Node>>)>,
-                         missing_in_flight: &mut BTreeSet<String>,
-                         pool: &Arc<Pool>,
-                         entries: &[SocketAddr],
-                         wanted: &BTreeSet<String>| {
-        for exit in wanted {
-            if !pool.has_exit(exit) && missing_in_flight.insert(exit.clone()) {
-                let identity = pool.identity.clone();
-                let uplink = pool.uplink();
-                let entries = entries.to_vec();
-                let exit = exit.clone();
-                missing_discovery.spawn(async move {
-                    let res = identity.discover_exit_on(&entries, &exit, &uplink).await;
-                    (exit, res)
-                });
-            }
-        }
+    let spawn_discovery = |discovery: &mut JoinSet<Result<()>>, pool: &Arc<Pool>| {
+        let pool = pool.clone();
+        let entries = options.connect.clone();
+        let wanted = wanted.clone();
+        let nodes_tx = nodes_tx.clone();
+        discovery.spawn(async move {
+            let uplink = pool.uplink();
+            pool.identity
+                .discover_progressively_on(&entries, &uplink, &wanted, |nodes| {
+                    if let Some(merged) = pool.refresh(nodes) {
+                        nodes_tx.send_replace(merged);
+                    }
+                })
+                .await
+        });
     };
     let spawn_warmups = |warmups: &mut JoinSet<()>, pool: &Arc<Pool>, exits: &[String]| {
         for exit in exits {
@@ -954,7 +947,7 @@ pub async fn client(options: ClientOptions) -> Result<()> {
     // Warm up exits already known from the persistent node cache immediately
     // while fresh discovery runs in parallel.
     spawn_warmups(&mut warmups, &pool, &selected_exits);
-    spawn_discovery(&mut discovery, &pool, &options.connect);
+    spawn_discovery(&mut discovery, &pool);
     let mut bootstrap_backoff = Duration::from_secs(1);
     let mut next_discovery = tokio::time::Instant::now() + Duration::from_secs(15);
     // The aggregate runtime publishes path health; only native UDP caches
@@ -990,89 +983,27 @@ pub async fn client(options: ClientOptions) -> Result<()> {
             _ = forward_tasks.join_next(), if !forward_tasks.is_empty() => {}
             _ = warmups.join_next(), if !warmups.is_empty() => {}
             _ = tokio::time::sleep_until(next_discovery), if discovery.is_empty() => {
-                spawn_discovery(&mut discovery, &pool, &options.connect);
+                spawn_discovery(&mut discovery, &pool);
             }
-            Some(result) = missing_discovery.join_next(), if !missing_discovery.is_empty() => {
-                match result {
-                    Ok((exit, Ok(found))) => {
-                        missing_in_flight.remove(&exit);
-                        let matched: Vec<_> = found.into_iter().filter(|n| n.id == exit).collect();
-                        if !matched.is_empty() {
-                            pool.refresh(matched);
-                            let merged = pool.nodes.read().expect("proxy nodes").clone();
-                            nodes_tx.send_replace(merged);
-                            spawn_warmups(&mut warmups, &pool, &selected_exits);
-                            if wanted.iter().all(|wanted_exit| pool.has_exit(wanted_exit)) {
-                                bootstrap_backoff = Duration::from_secs(1);
-                                next_discovery = tokio::time::Instant::now() + Duration::from_secs(15);
-                            }
-                        }
-                    }
-                    Ok((exit, Err(error))) => {
-                        missing_in_flight.remove(&exit);
-                        tracing::debug!(%exit, %error, "selected exit not yet discovered");
-                    }
-                    Err(_) => {
-                        if missing_discovery.is_empty() {
-                            missing_in_flight.clear();
-                        }
-                    }
-                }
+            _ = stream_nodes.changed() => {
+                spawn_warmups(&mut warmups, &pool, &selected_exits);
             }
             Some(result) = discovery.join_next(), if !discovery.is_empty() => {
-                match result {
-                    Ok(Ok(nodes)) => {
-                        // Publish every already-discovered exit immediately so one
-                        // missing or slow exit never stalls warmups for healthy exits.
-                        pool.refresh(nodes);
-                        let merged = pool.nodes.read().expect("proxy nodes").clone();
-                        nodes_tx.send_replace(merged);
-                        spawn_warmups(&mut warmups, &pool, &selected_exits);
-                        let missing_exits: Vec<_> = wanted
-                            .iter()
-                            .filter(|exit| !pool.has_exit(exit))
-                            .cloned()
-                            .collect();
-                        if missing_exits.is_empty() {
-                            bootstrap_backoff = Duration::from_secs(1);
-                            next_discovery = tokio::time::Instant::now() + Duration::from_secs(15);
-                        } else {
-                            spawn_missing(
-                                &mut missing_discovery,
-                                &mut missing_in_flight,
-                                &pool,
-                                &options.connect,
-                                &wanted,
-                            );
-                            tracing::warn!(
-                                missing = ?missing_exits,
-                                retry_secs = bootstrap_backoff.as_secs(),
-                                "some proxy exits not yet discovered; retrying"
-                            );
-                            next_discovery = tokio::time::Instant::now() + bootstrap_backoff;
-                            bootstrap_backoff = (bootstrap_backoff * 2).min(Duration::from_secs(15));
-                        }
+                let missing: Vec<_> = wanted.iter().filter(|exit| !pool.has_exit(exit)).collect();
+                if missing.is_empty() {
+                    bootstrap_backoff = Duration::from_secs(1);
+                    next_discovery = tokio::time::Instant::now() + Duration::from_secs(15);
+                    if !matches!(result, Ok(Ok(()))) {
+                        tracing::debug!(?result, "periodic mesh discovery unavailable");
                     }
-                    Ok(Err(error)) => {
-                        let any_missing = wanted.iter().any(|exit| !pool.has_exit(exit));
-                        if any_missing {
-                            tracing::warn!(
-                                retry_secs = bootstrap_backoff.as_secs(),
-                                %error,
-                                "mesh discovery unavailable; retaining local listeners and retrying"
-                            );
-                            next_discovery = tokio::time::Instant::now() + bootstrap_backoff;
-                            bootstrap_backoff = (bootstrap_backoff * 2).min(Duration::from_secs(15));
-                        } else {
-                            tracing::debug!(%error, "periodic mesh discovery unavailable");
-                            spawn_warmups(&mut warmups, &pool, &selected_exits);
-                            next_discovery = tokio::time::Instant::now() + Duration::from_secs(15);
-                        }
-                    }
-                    Err(_) => {
-                        next_discovery = tokio::time::Instant::now() + bootstrap_backoff;
-                        bootstrap_backoff = (bootstrap_backoff * 2).min(Duration::from_secs(15));
-                    }
+                    spawn_warmups(&mut warmups, &pool, &selected_exits);
+                } else {
+                    tracing::warn!(
+                        ?missing, ?result, retry_secs = bootstrap_backoff.as_secs(),
+                        "some proxy exits not yet discovered; retaining local listeners and retrying"
+                    );
+                    next_discovery = tokio::time::Instant::now() + bootstrap_backoff;
+                    bootstrap_backoff = (bootstrap_backoff * 2).min(Duration::from_secs(15));
                 }
             }
         }
@@ -1086,8 +1017,6 @@ pub async fn client(options: ClientOptions) -> Result<()> {
     while warmups.join_next().await.is_some() {}
     discovery.abort_all();
     while discovery.join_next().await.is_some() {}
-    missing_discovery.abort_all();
-    while missing_discovery.join_next().await.is_some() {}
     pool.shutdown().await;
     if let Some(diagnostics) = diagnostics {
         let _ = diagnostics.await;
