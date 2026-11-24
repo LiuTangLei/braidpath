@@ -1135,11 +1135,16 @@ impl Sender {
             // tail chunks recover promptly onto a healthier sibling path.
             let rtt = self.transport_rtt[segment.path].max(Duration::from_millis(20));
             let expected = segment.expected_ack_rtt.max(rtt);
+            // Measure stall deadline against the queue-aware expected ACK RTT
+            // recorded at native handoff so healthy BDP queues send zero
+            // spurious duplicates, while overtaken stragglers or stalled tail
+            // chunks recover promptly onto a clean sibling (`native_return::drain`
+            // suppresses speculative copies when all siblings are in heavy loss).
             let stall_delay = if overtaken {
                 expected
-                    .mul_f64(1.75)
-                    .max(rtt.mul_f64(2.0))
-                    .clamp(Duration::from_millis(250), Duration::from_millis(1_000))
+                    .mul_f64(2.0)
+                    .max(rtt.mul_f64(3.0))
+                    .clamp(Duration::from_millis(320), Duration::from_millis(950))
             } else {
                 expected
                     .mul_f64(2.2)
@@ -1150,7 +1155,11 @@ impl Sender {
             let settle_at =
                 now + (rtt / 2).clamp(Duration::from_millis(40), Duration::from_millis(120));
             let rate_limit_at = self.last_head_probe.map_or(now, |last| {
-                last + (rtt / 2).clamp(Duration::from_millis(60), Duration::from_millis(150))
+                last + if is_reliable_tail {
+                    rtt.max(Duration::from_millis(120))
+                } else {
+                    rtt.mul_f64(2.0).max(Duration::from_millis(260))
+                }
             });
             let at = stall_at.max(settle_at).max(rate_limit_at);
             self.head_probe = Some((start, segment.transmissions, at));

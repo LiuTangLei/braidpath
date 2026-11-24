@@ -2418,3 +2418,52 @@ async fn proxy_native_upload_handles_slow_target_backpressure_without_stalling_i
     empty(&identity, at).await;
     pool.shutdown().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_cold_socks_streams_coalesce_with_background_warmup() {
+    let root = tempfile::tempdir().unwrap();
+    let root = root.path();
+    let (at, _server) = start(root, "a", None, true).await;
+    let identity = identity(root, "cold-coalesce-client");
+    let pool = client::Pool::new(
+        identity.clone(),
+        vec![node("a", at)],
+        vec!["a".into()],
+        None,
+        false,
+    )
+    .unwrap();
+    let (listen, _listener) = local_listener(pool.clone(), "a").await;
+    let (target, _echo) = echo().await;
+    let warmup = {
+        let pool = pool.clone();
+        tokio::spawn(async move { pool.prepare_stream("a").await })
+    };
+    let mut clients = tokio::task::JoinSet::new();
+    for i in 0..4u8 {
+        clients.spawn(async move {
+            let (mut tcp, status, _) = socks(listen, TCP, Address::Ip(target)).await;
+            assert_eq!(status, 0);
+            let msg = [i + 1; 4096];
+            tcp.write_all(&msg).await.unwrap();
+            tcp.shutdown().await.unwrap();
+            let mut out = Vec::new();
+            tcp.read_to_end(&mut out).await.unwrap();
+            assert_eq!(&out[..msg.len()], &msg);
+            assert_eq!(&out[msg.len()..], b"FIN");
+        });
+    }
+    warmup.await.unwrap().unwrap();
+    while let Some(res) = clients.join_next().await {
+        res.unwrap();
+    }
+    let mut sessions = 0;
+    pool.test_stream_metrics("a")
+        .state(|state| sessions = state.sessions.len());
+    assert_eq!(
+        sessions, 1,
+        "warmup and 4 cold SOCKS streams must share 1 session"
+    );
+    empty(&identity, at).await;
+    pool.shutdown().await;
+}

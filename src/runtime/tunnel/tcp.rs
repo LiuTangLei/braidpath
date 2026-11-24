@@ -130,6 +130,8 @@ enum Command {
 struct ConnectorState {
     budget: Arc<Budget>,
     active: watch::Sender<Option<Arc<Channel>>>,
+    ready: AtomicBool,
+    rejected: std::sync::Mutex<Option<String>>,
     stopped: AtomicBool,
     stop: Notify,
 }
@@ -142,9 +144,43 @@ impl Connector {
         Self(Arc::new(ConnectorState {
             budget,
             active,
+            ready: AtomicBool::new(false),
+            rejected: std::sync::Mutex::new(None),
             stopped: AtomicBool::new(false),
             stop: Notify::new(),
         }))
+    }
+    pub(crate) fn reset_ready(&self) {
+        self.0.ready.store(false, Ordering::Release);
+        *self.0.rejected.lock().expect("connector rejected") = None;
+    }
+    pub(crate) fn clear_rejected(&self) {
+        *self.0.rejected.lock().expect("connector rejected") = None;
+    }
+    pub(crate) fn mark_rejected(&self, reason: String) {
+        *self.0.rejected.lock().expect("connector rejected") = Some(reason);
+        self.0.stop.notify_waiters();
+    }
+    pub(crate) fn mark_ready(&self) {
+        *self.0.rejected.lock().expect("connector rejected") = None;
+        if !self.0.ready.swap(true, Ordering::Release) {
+            self.0.stop.notify_waiters();
+        }
+    }
+    pub(crate) async fn wait_ready(&self) -> anyhow::Result<()> {
+        loop {
+            let notified = self.0.stop.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            anyhow::ensure!(!self.is_closed(), "aggregate proxy session unavailable");
+            if self.0.ready.load(Ordering::Acquire) {
+                return Ok(());
+            }
+            if let Some(reason) = self.0.rejected.lock().expect("connector rejected").clone() {
+                anyhow::bail!("{reason}");
+            }
+            notified.await;
+        }
     }
     pub(crate) fn is_closed(&self) -> bool {
         self.0.stopped.load(Ordering::Acquire)

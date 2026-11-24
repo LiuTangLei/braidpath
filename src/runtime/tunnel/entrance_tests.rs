@@ -10,6 +10,7 @@ fn entrance_changes_preserve_ids_and_wait_for_inflight_slots() {
             group: 0,
             generation: 100 + id as u64,
             attempted: true,
+            rejected: false,
             enabled: true,
         })
         .collect();

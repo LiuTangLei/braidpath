@@ -29,6 +29,7 @@ impl Default for Capabilities {
     }
 }
 impl Capabilities {
+    #[cfg(test)]
     pub(crate) fn require_proxy_stream(&self) -> Result<()> {
         self.check()?;
         ensure!(

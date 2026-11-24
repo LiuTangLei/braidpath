@@ -2370,18 +2370,20 @@ async fn sender_with_inputs(
         for path in paths.iter() {
             if let Some(writer) = &path.native_return {
                 writer.set_reachable(path.open() && !liveness[usize::from(path.id)].silent());
-                if mixed_writes.is_none()
-                    && let Some(window) = native_credit[usize::from(path.id)].observe(
+                if mixed_writes.is_none() {
+                    let credit = &mut native_credit[usize::from(path.id)];
+                    if let Some(window) = credit.observe(
                         &path.conn,
                         now_us,
                         policy.latency_target_ms,
                         best_native_service,
                         writer.written_bytes(),
-                    )
-                {
-                    path.conn.set_send_window(window);
-                    info!(target: "braidpath::native_credit", path=path.id, window_bytes=window,
-                        "native return storage credit changed");
+                    ) {
+                        path.conn.set_send_window(window);
+                        info!(target: "braidpath::native_credit", path=path.id, window_bytes=window,
+                            "native return storage credit changed");
+                    }
+                    writer.set_loss_permille(credit.loss_permille());
                 }
             }
             if native_returning && mixed_writes.is_none() && policy.adaptive && path.open() {
@@ -4930,8 +4932,16 @@ async fn server_connection(
                                 let streams=req.headers().get("braidpath-streams").map(|v|v.to_str()).transpose()?;
                                 let proxy=req.headers().get("braidpath-proxy").map(|v|v.to_str()).transpose()?;
                                 let (streams,proxy)=session_profile(stream_transport,streams,proxy)?;
-                                ensure!(!streams || tcp.fixed.is_some(),"TCP streams are not enabled on this server");
-                                ensure!(!proxy || tcp.proxy.is_some(),"proxy streams are not enabled on this server");
+                                if (streams && tcp.fixed.is_none()) || (proxy && tcp.proxy.is_none()) {
+                                    diagnostic.failed("profile_not_enabled");
+                                    let mut response=Response::builder().status(StatusCode::NOT_IMPLEMENTED);
+                                    if let Some(state)=&mesh {response=response.header("braidpath-exit",state.node_id());}
+                                    stream.send_response(response.body(())?).await?;
+                                    stream.finish().await?;
+                                    let _=timeout(Duration::from_secs(1),conn.closed()).await;
+                                    ensure!(!streams || tcp.fixed.is_some(),"TCP streams are not enabled on this server");
+                                    bail!("proxy streams are not enabled on this server");
+                                }
                                 let stream_payload=payload::negotiate(req.headers(),streams || proxy)?;
                                 let (game_mode,native_return)=read_mode(req.headers())?;
                                 ensure!(!native_return || streams || proxy,"return stream requires TCP profile");
@@ -5234,6 +5244,15 @@ impl std::fmt::Display for ExitStopped {
 }
 impl std::error::Error for ExitStopped {}
 
+#[derive(Debug)]
+struct AdmissionRejected(String);
+impl std::fmt::Display for AdmissionRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+impl std::error::Error for AdmissionRejected {}
+
 #[derive(Clone)]
 struct PathConfig {
     remote: SocketAddr,
@@ -5242,6 +5261,7 @@ struct PathConfig {
     group: u8,
     generation: u64,
     attempted: bool,
+    rejected: bool,
     enabled: bool,
 }
 
@@ -5352,6 +5372,7 @@ fn reconcile_routes(
             config.group = remote.uplink.group;
             config.enabled = true;
             config.attempted = false;
+            config.rejected = false;
             // Preserve the generation counter when reusing a path ID so the
             // selected exit's replay protection accepts the replacement.
             rotations[id] = scheduler::Rotation::default();
@@ -5363,6 +5384,7 @@ fn reconcile_routes(
                 group: remote.uplink.group,
                 generation: rand::random::<u64>() >> 1,
                 attempted: false,
+                rejected: false,
                 enabled: true,
             });
         }
@@ -5690,6 +5712,7 @@ async fn client_session(
                         .unwrap_or(interface_index as u8),
                     generation: rand::random::<u64>() >> 1,
                     attempted: false,
+                    rejected: false,
                     enabled: true,
                 });
             }
@@ -5715,6 +5738,9 @@ async fn client_session(
         observation_notify.clone(),
         native_writable.clone(),
     ));
+    if let Some(connector) = &options.stream_connector {
+        connector.reset_ready();
+    }
     // Streams do not survive a session epoch; a new epoch accepts new connections.
     let mut streams = tcp::Mux::client(
         listeners,
@@ -5781,6 +5807,9 @@ async fn client_session(
             _=async {options.stream_connector.as_ref().expect("connector").closed().await},if options.stream_connector.is_some()=>break,
             updated=entrances_changed(entrances)=>{
                 ensure!(!updated.is_empty() && updated.len()<=MAX_PATHS,"invalid entrance update");
+                if let Some(connector) = &options.stream_connector {
+                    connector.clear_rejected();
+                }
                 desired=Some(updated);
             },
             _=retention_deadline(&decoder)=>{decoder.expire_adaptive(Instant::now());publish_retention(&decoder,&returning);},
@@ -6075,7 +6104,11 @@ async fn client_session(
                         if let Some(old)=endpoints[id].replace(value.endpoint) {old.close(0u32.into(),b"path replaced");}
                         tasks.spawn(drive_client_path(value.conn,value.stream,value.driver,value.request,value.send,diagnostic,pid,generation,
                             wire_tx.clone(),native_ingress[id].clone(),upload_reader,options.policy.native_return,ingress_drops.clone(),returning.clone(),forward.clone(),paths.clone(),options.policy.receiver_feedback,value.stream_payload,observation_notify.clone()));
+                        configs[id].rejected=false;
                         has_session=true;
+                        if let Some(connector)=&options.stream_connector {
+                            connector.mark_ready();
+                        }
                         if recover_paths && !announced {
                             options.stats.readiness(true,configs.iter().filter(|c|c.enabled).count());
                             announced=true;
@@ -6087,6 +6120,15 @@ async fn client_session(
                         rotations[id].connection_failed(now_us);
                         forward.path(pid,|p|{p.reconnect_failures+=1;if elective_inflight[id]{p.rotation_failures+=1;}});
                         if error.is::<SessionExpired>() {return Err(error);}
+                        if error.is::<AdmissionRejected>() {
+                            configs[id].rejected=true;
+                            if !has_session
+                                && let Some(connector)=&options.stream_connector
+                                && configs.iter().enumerate().filter(|(_,c)|c.enabled).all(|(i,c)|c.attempted && !inflight[i] && c.rejected)
+                            {
+                                connector.mark_rejected(error.to_string());
+                            }
+                        }
                         warn!(path=pid,error=%error,"path attempt failed; bounded retry policy applies");
                     }
                 }
@@ -6593,30 +6635,39 @@ async fn admit_path(
     let response = tokio::select! {e=driver.wait_idle()=>bail!("HTTP/3 closed during admission: {e}"),r=stream.recv_response()=>r?};
     // Check before 410 handling: an old or different exit must never trigger
     // an automatic fresh epoch with shared cluster credentials.
-    ensure!(
-        response
-            .headers()
-            .get("braidpath-exit")
-            .and_then(|v| v.to_str().ok())
-            == exit
-            && response.status() != StatusCode::PRECONDITION_FAILED,
-        "mesh exit identity mismatch or unsupported peer; selected exit {:?}",
-        exit
-    );
+    if response
+        .headers()
+        .get("braidpath-exit")
+        .and_then(|v| v.to_str().ok())
+        != exit
+        || response.status() == StatusCode::PRECONDITION_FAILED
+    {
+        diagnostic.rejected("exit_identity_mismatch");
+        conn.close(0u32.into(), b"admission rejected");
+        return Err(AdmissionRejected(format!(
+            "mesh exit identity mismatch or unsupported peer; selected exit {exit:?}"
+        ))
+        .into());
+    }
     if response.status() == StatusCode::GONE {
         diagnostic.rejected("session_expired");
         conn.close(0u32.into(), b"session epoch expired");
         return Err(SessionExpired.into());
     }
-    ensure!(
-        response.status() == StatusCode::OK
-            && response
-                .headers()
-                .get("braidpath-version")
-                .is_some_and(|v| v == "1"),
-        "session admission rejected: {}",
-        response.status()
-    );
+    if response.status() != StatusCode::OK
+        || !response
+            .headers()
+            .get("braidpath-version")
+            .is_some_and(|v| v == "1")
+    {
+        diagnostic.rejected("admission_rejected");
+        conn.close(0u32.into(), b"admission rejected");
+        return Err(AdmissionRejected(format!(
+            "session admission rejected: {}",
+            response.status()
+        ))
+        .into());
+    }
     confirm_mode(response.headers(), policy)?;
     diagnostic.enter("http3", "peer_settings");
     // Poll the driver so peer SETTINGS are processed before datagrams are used.
@@ -6673,11 +6724,12 @@ async fn admit_path(
         .get("braidpath-proxy")
         .map(|v| v.to_str())
         .transpose()?;
-    ensure!(
-        session_profile(policy.streams || policy.proxy, echoed_streams, echoed_proxy)?
-            == (policy.streams, policy.proxy),
-        "aggregate stream profile not negotiated"
-    );
+    if session_profile(policy.streams || policy.proxy, echoed_streams, echoed_proxy)?
+        != (policy.streams, policy.proxy)
+    {
+        conn.close(0u32.into(), b"admission rejected");
+        return Err(AdmissionRejected("aggregate stream profile not negotiated".into()).into());
+    }
     validate_fec_repairs_echo(response.headers(), policy.fec_repairs)?;
     validate_message_echo(response.headers(), policy.max_message_bytes)?;
     ensure!(

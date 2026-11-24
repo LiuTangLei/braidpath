@@ -116,48 +116,6 @@ struct Routes {
     updates: tokio::sync::watch::Receiver<Vec<SocketAddr>>,
 }
 
-// Relay leases arrive asynchronously. A failed direct probe must not prevent
-// the same SOCKS request from using a lease that becomes available.
-async fn first_route<T, F>(
-    mut updates: tokio::sync::watch::Receiver<Vec<SocketAddr>>,
-    dial: impl Fn(SocketAddr) -> F,
-) -> Result<T>
-where
-    T: Send + 'static,
-    F: Future<Output = Result<T>> + Send + 'static,
-{
-    // Leave time in the SOCKS handshake budget for opening the target stream.
-    timeout(Duration::from_secs(5), async {
-        let mut attempted = BTreeSet::new();
-        let mut pending = JoinSet::new();
-        loop {
-            {
-                let current = updates.borrow_and_update();
-                attempted.retain(|address| current.contains(address));
-                for &address in current.iter() {
-                    if attempted.insert(address) {
-                        let attempt = dial(address);
-                        pending.spawn(async move { (address, attempt.await) });
-                    }
-                }
-            }
-            tokio::select! {
-                change = updates.changed() => change.context("SOCKS routes stopped")?,
-                Some(attempt) = pending.join_next() => {
-                    let (address, result) = attempt?;
-                    match result {
-                        Ok(value) if updates.borrow().contains(&address) => return Ok(value),
-                        Ok(_) => {}
-                        Err(error) => tracing::debug!(%address, %error, "SOCKS route unavailable"),
-                    }
-                }
-            }
-        }
-    })
-    .await
-    .context("no reachable SOCKS route")?
-}
-
 struct Aggregate {
     connector: tunnel::tcp::Connector,
     task: Option<tokio::task::JoinHandle<Result<()>>>,
@@ -406,79 +364,92 @@ impl Pool {
             "proxy client stopped"
         );
         let slot = self.slots.get(id).context("exit not selected")?;
-        let mut aggregate = slot.aggregate.lock().await;
-        if let Some(current) = aggregate.as_ref().filter(|current| current.running()) {
-            return Ok(current.connector.clone());
-        }
-        if let Some(old) = aggregate.take() {
-            old.shutdown().await;
+        {
+            let aggregate = slot.aggregate.lock().await;
+            if let Some(current) = aggregate
+                .as_ref()
+                .filter(|current| current.running() && !current.connector.is_closed())
+            {
+                let connector = current.connector.clone();
+                drop(aggregate);
+                connector.wait_ready().await?;
+                return Ok(connector);
+            }
         }
         // This reporter owns the entrance health channel for this exit. Native
         // UDP remains lazy and must not overwrite aggregate-path evidence.
         let (updates, health) = self.route_watch(id).await?;
-        let status = first_route(updates.clone(), |address| {
-            let identity = self.identity.clone();
-            let uplink = self.uplink();
-            let exit = id.to_owned();
-            async move {
-                let status = identity.status_on(address, &uplink).await?;
-                ensure!(status.node.id == exit, "proxy exit identity changed");
-                Ok(status)
-            }
-        })
-        .await?;
-        status.capabilities.require_proxy_stream()?;
-        #[cfg(test)]
-        let updates = {
-            *slot.stream_health.lock().expect("stream health") = Some(health.clone());
-            if let Some(addresses) = slot.test_routes.lock().expect("test routes").clone() {
-                let (sender, receiver) = tokio::sync::watch::channel(addresses);
-                *slot.test_stream_updates.lock().expect("test stream routes") = Some(sender);
-                receiver
+        let connector = {
+            let mut aggregate = slot.aggregate.lock().await;
+            if let Some(current) = aggregate
+                .as_ref()
+                .filter(|current| current.running() && !current.connector.is_closed())
+            {
+                current.connector.clone()
             } else {
-                updates
-            }
-        };
-        let connector = tunnel::tcp::Connector::new(self.stream_budget.clone());
-        let options = tunnel::ClientOptions {
-            adaptive_fec_retention: false,
-            rotate_source_port: false,
-            listen: "127.0.0.1:0".parse().expect("loopback address"),
-            tcp_listen: None,
-            proxy_listen: None,
-            stream_connector: Some(connector.clone()),
-            entrances: updates.borrow().clone(),
-            interfaces: self.interface.iter().cloned().collect(),
-            path_binds: vec![],
-            datagram_send_buffer_bytes: transport::MAX_DATAGRAM_SEND_BUFFER_BYTES,
-            path_groups: vec![],
-            name: self.identity.name(),
-            ca: self.identity.dir.join("cert.pem"),
-            token: self.identity.dir.join("token"),
-            policy: reliable_policy(self.game_mode),
-            congestion: transport::Congestion::Bbr,
-            stats: slot.stream_metrics.clone(),
-        };
-        ensure!(
-            !self.closed.load(std::sync::atomic::Ordering::Acquire),
-            "proxy client stopped"
-        );
-        let exit = id.to_owned();
-        let closer = connector.clone();
-        let task = tokio::spawn(async move {
-            let result =
-                tunnel::client_with_mesh_exit(options, Some(updates), Some(health), exit.clone())
+                if let Some(old) = aggregate.take() {
+                    old.shutdown().await;
+                }
+                #[cfg(test)]
+                let updates = {
+                    *slot.stream_health.lock().expect("stream health") = Some(health.clone());
+                    if let Some(addresses) = slot.test_routes.lock().expect("test routes").clone() {
+                        let (sender, receiver) = tokio::sync::watch::channel(addresses);
+                        *slot.test_stream_updates.lock().expect("test stream routes") =
+                            Some(sender);
+                        receiver
+                    } else {
+                        updates
+                    }
+                };
+                let connector = tunnel::tcp::Connector::new(self.stream_budget.clone());
+                let options = tunnel::ClientOptions {
+                    adaptive_fec_retention: false,
+                    rotate_source_port: false,
+                    listen: "127.0.0.1:0".parse().expect("loopback address"),
+                    tcp_listen: None,
+                    proxy_listen: None,
+                    stream_connector: Some(connector.clone()),
+                    entrances: updates.borrow().clone(),
+                    interfaces: self.interface.iter().cloned().collect(),
+                    path_binds: vec![],
+                    datagram_send_buffer_bytes: transport::MAX_DATAGRAM_SEND_BUFFER_BYTES,
+                    path_groups: vec![],
+                    name: self.identity.name(),
+                    ca: self.identity.dir.join("cert.pem"),
+                    token: self.identity.dir.join("token"),
+                    policy: reliable_policy(self.game_mode),
+                    congestion: transport::Congestion::Bbr,
+                    stats: slot.stream_metrics.clone(),
+                };
+                ensure!(
+                    !self.closed.load(std::sync::atomic::Ordering::Acquire),
+                    "proxy client stopped"
+                );
+                let exit = id.to_owned();
+                let closer = connector.clone();
+                let task = tokio::spawn(async move {
+                    let result = tunnel::client_with_mesh_exit(
+                        options,
+                        Some(updates),
+                        Some(health),
+                        exit.clone(),
+                    )
                     .await;
-            closer.close();
-            if let Err(error) = &result {
-                tracing::warn!(%exit, %error, "aggregate proxy session stopped");
+                    closer.close();
+                    if let Err(error) = &result {
+                        tracing::warn!(%exit, %error, "aggregate proxy session stopped");
+                    }
+                    result
+                });
+                *aggregate = Some(Aggregate {
+                    connector: connector.clone(),
+                    task: Some(task),
+                });
+                connector
             }
-            result
-        });
-        *aggregate = Some(Aggregate {
-            connector: connector.clone(),
-            task: Some(task),
-        });
+        };
+        connector.wait_ready().await?;
         Ok(connector)
     }
     pub(super) async fn open_stream(

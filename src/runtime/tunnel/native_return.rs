@@ -62,6 +62,34 @@ fn rank_udp(routes: &mut [UdpRoute], slack_ms: f64) {
             .then_with(|| a.delay_ms.total_cmp(&b.delay_ms))
     });
 }
+fn observed_path_loss(path: &OutPath) -> Option<f64> {
+    let stats = path.conn.stats();
+    let quic_loss = (stats.path.sent_packets >= 64
+        || (stats.path.sent_packets >= 16 && stats.path.lost_packets >= 4))
+        .then(|| (stats.path.lost_packets as f64 / stats.path.sent_packets as f64).min(1.0));
+    let feedback_loss = {
+        let now_us = super::quality_time(path);
+        let q = path.quality.lock().expect("quality lock");
+        let est = &q.snapshot.sender_estimate;
+        (est.expected >= 16
+            && est
+                .updated_us
+                .is_some_and(|at| now_us.saturating_sub(at) <= 3_000_000)
+            && est.loss_rate.is_finite())
+        .then(|| est.loss_rate.clamp(0.0, 1.0))
+    };
+    let writer_loss = path
+        .native_return
+        .as_ref()
+        .map(Writer::loss_permille)
+        .filter(|&p| p > 0)
+        .map(|p| (p as f64 / 1_000.0).clamp(0.0, 1.0));
+    [quic_loss, feedback_loss, writer_loss]
+        .into_iter()
+        .flatten()
+        .reduce(f64::max)
+}
+
 /// A near-equal, demonstrably healthier route is worth a few milliseconds for
 /// an unreliable fragment or interactive segment. QUIC loss and fresh receiver
 /// feedback are transport/session evidence; this is only ordering and never
@@ -71,33 +99,10 @@ pub(super) fn udp_order(order: Vec<usize>, paths: &[OutPath], target_ms: u64) ->
         .into_iter()
         .map(|index| {
             let path = &paths[index];
-            let stats = path.conn.stats();
-            let quic_loss = (stats.path.sent_packets >= 64
-                || (stats.path.sent_packets >= 16 && stats.path.lost_packets >= 4))
-                .then(|| {
-                    (stats.path.lost_packets as f64 / stats.path.sent_packets as f64).min(1.0)
-                });
-            let feedback_loss = {
-                let now_us = super::quality_time(path);
-                let q = path.quality.lock().expect("quality lock");
-                let est = &q.snapshot.sender_estimate;
-                (est.expected >= 16
-                    && est
-                        .updated_us
-                        .is_some_and(|at| now_us.saturating_sub(at) <= 3_000_000)
-                    && est.loss_rate.is_finite())
-                .then(|| est.loss_rate.clamp(0.0, 1.0))
-            };
-            let loss = match (quic_loss, feedback_loss) {
-                (Some(a), Some(b)) => Some(a.max(b)),
-                (Some(a), None) => Some(a),
-                (None, Some(b)) => Some(b),
-                (None, None) => None,
-            };
             UdpRoute {
                 index,
                 delay_ms: super::small_delivery::delay_ms(path),
-                loss,
+                loss: observed_path_loss(path),
             }
         })
         .collect();
@@ -152,7 +157,8 @@ pub(super) struct Credit {
     loss_cautious_until_us: u64,
     last_brake_us: u64,
     first_backlog_us: Option<u64>,
-    policer_streak: u8,
+    lossy_streak: u8,
+    loss_permille: u64,
 }
 #[derive(Clone, Copy)]
 struct CreditSample {
@@ -231,7 +237,8 @@ impl Credit {
                 loss_cautious_until_us: 0,
                 last_brake_us: 0,
                 first_backlog_us: None,
-                policer_streak: 0,
+                lossy_streak: 0,
+                loss_permille: 0,
             };
             return None;
         }
@@ -265,19 +272,42 @@ impl Credit {
         )
     }
 
+    pub(super) fn loss_permille(&self) -> u64 {
+        if self.lossy_streak >= 3 {
+            self.loss_permille
+        } else {
+            0
+        }
+    }
+
     fn update(&mut self, now_us: u64, sample: CreditSample) -> Option<u64> {
         let packets = sample.sent.saturating_sub(self.sent);
         let losses = sample.lost.saturating_sub(self.lost);
         self.sampled_us = now_us;
         self.sent = sample.sent;
         self.lost = sample.lost;
+        if packets >= 16 {
+            let sample_permille = (losses.saturating_mul(1_000) / packets).min(1_000);
+            self.loss_permille = if self.loss_permille == 0 {
+                sample_permille
+            } else {
+                (self.loss_permille * 3 + sample_permille * 5) / 8
+            };
+            if sample_permille >= 120 {
+                self.lossy_streak = self.lossy_streak.saturating_add(1);
+            } else if sample_permille < 80 {
+                self.lossy_streak = 0;
+            }
+        } else if sample.retained == 0 && sample.unsent == 0 {
+            self.loss_permille = (self.loss_permille * 3) / 4;
+            self.lossy_streak = 0;
+        }
         if sample.unsent > SLOW_PATH_BACKLOG_THRESHOLD {
             self.first_backlog_us.get_or_insert(now_us);
         } else {
             self.first_backlog_us = None;
         }
         if sample.retained == 0 && sample.unsent == 0 {
-            self.policer_streak = 0;
             if self.current < MIN_SEND_WINDOW && !sample.faster_route {
                 self.current = MIN_SEND_WINDOW;
                 return Some(MIN_SEND_WINDOW);
@@ -290,7 +320,30 @@ impl Credit {
         let backlog_persisted = self.first_backlog_us.is_some_and(|since| {
             now_us.saturating_sub(since) >= sample.rtt_us.max(BRAKE_COOLDOWN_MIN_US)
         });
-        let exercised = sample.bulk_written >= INITIAL_SEND_WINDOW || backlog_persisted;
+        let min_bulk = if sample.faster_route {
+            COLD_BULK_MIN_BYTES
+        } else {
+            INITIAL_SEND_WINDOW
+        };
+        let exercised = sample.bulk_written >= min_bulk || backlog_persisted;
+        let exercised_slow = exercised && sample.faster_route;
+        // When Quinn has already packetized and sent nearly all local stream data
+        // (`unsent <= 64 KiB`) without deep RTT queueing, `retained` represents
+        // in-network RACK packet-retransmission history (which can span 2-4 RTTs
+        // under WAN packet loss even while `RecoveryState` dips `cwnd`). Keep at
+        // least `4 * PAYLOAD` (128 KiB) of write headroom above `retained` so
+        // unacknowledged RACK history never starves new packet transmission.
+        let actually_pinned = sample.storage_limited
+            && sample.retained.saturating_add(2 * PAYLOAD as u64) >= self.current
+            && sample.unsent <= SLOW_PATH_WRITER_MARGIN;
+        let retained_floor = if !exercised_slow && !sample.deeply_queued && actually_pinned {
+            sample
+                .retained
+                .saturating_add(4 * PAYLOAD as u64)
+                .min(MAX_SEND_WINDOW)
+        } else {
+            0
+        };
         // Bound QUIC stream send storage proportionally to actual `cwnd` once
         // bulk traffic has exercised the path, so a 25-95 KiB cwnd link never
         // buffers 2 MiB of stale stream bytes. Do not pull an earned window
@@ -300,13 +353,20 @@ impl Credit {
             .cwnd
             .saturating_mul(2)
             .max(sample.cwnd.saturating_add(SLOW_PATH_WRITER_MARGIN))
+            .max(retained_floor)
             .clamp(MIN_SEND_WINDOW, MAX_SEND_WINDOW);
-        let cwnd_cap = if exercised {
+        let slow_cap = sample
+            .cwnd
+            .saturating_add(SLOW_PATH_WRITER_MARGIN)
+            .clamp(SLOW_PATH_MIN_WINDOW, MAX_SEND_WINDOW);
+        let cwnd_cap = if exercised_slow {
+            slow_cap
+        } else if exercised {
             raw_cwnd_cap
         } else {
             raw_cwnd_cap.max(INITIAL_SEND_WINDOW)
         };
-        let effective_cap = if backlog_persisted {
+        let effective_cap = if backlog_persisted || exercised_slow {
             cwnd_cap
         } else {
             cwnd_cap.max(self.current).min(MAX_SEND_WINDOW)
@@ -318,24 +378,22 @@ impl Credit {
         let bdp_floor = sample
             .cwnd
             .saturating_add(2 * SLOW_PATH_WRITER_MARGIN)
+            .max(retained_floor)
             .clamp(
                 MIN_SEND_WINDOW,
-                (MAX_SEND_WINDOW * 3 / 4).min(effective_cap),
+                (MAX_SEND_WINDOW * 3 / 4)
+                    .max(retained_floor)
+                    .min(effective_cap.max(MIN_SEND_WINDOW)),
             );
-        let slow_window = sample
-            .cwnd
-            .saturating_add(SLOW_PATH_WRITER_MARGIN)
-            .clamp(SLOW_PATH_MIN_WINDOW, effective_cap);
-        let exercised_slow = exercised && sample.faster_route;
-        if packets >= 32 && losses.saturating_mul(100) >= packets.saturating_mul(40) {
-            self.policer_streak = self.policer_streak.saturating_add(1);
-        } else if packets >= 16 {
-            self.policer_streak = 0;
-        }
-        let policer_loss = (exercised_slow
-            && packets >= 32
-            && losses.saturating_mul(100) >= packets.saturating_mul(25))
-            || self.policer_streak >= 2;
+        let slow_window = slow_cap.min(effective_cap);
+        // Never crush a primary or peer-speed path below `bdp_floor` (`cwnd + 128 KiB`)
+        // under heavy WAN packet loss: QUIC stream `retained` bytes must span 2-3 RTTs
+        // of RACK packet retransmission without stalling new packet transmission. Only
+        // an already-outpaced slow sibling (`exercised_slow`) steps down to
+        // `SLOW_PATH_MIN_WINDOW` under >=25% loss.
+        let policer_loss = exercised_slow
+            && packets >= 24
+            && losses.saturating_mul(100) >= packets.saturating_mul(25);
         // Only severe loss (>= 5%, or >= 3% while also queued) indicates buffer
         // overflow / policer overshoot; 1-2% random WAN loss must not collapse
         // a healthy BBR path's stream window.
@@ -350,7 +408,8 @@ impl Credit {
             || (exercised_slow
                 && slow_window < self.current
                 && sample.unsent > SLOW_PATH_BACKLOG_THRESHOLD);
-        let restore_floor = self.current < MIN_SEND_WINDOW && !sample.faster_route;
+        let restore_floor = (self.current < MIN_SEND_WINDOW && !sample.faster_route)
+            || self.current < retained_floor;
         let can_grow = sample.storage_limited && packets >= 12 && !sample.deeply_queued;
         if !must_shrink
             && !restore_floor
@@ -361,7 +420,9 @@ impl Credit {
         {
             return None;
         }
-        let next = if severe_loss {
+        let next = if self.current < retained_floor {
+            retained_floor
+        } else if severe_loss {
             // Shrink excess buffering above `bdp_floor` at most once per RTT on
             // moderate loss. Under >=20% policer loss (where BBRv1 ignores loss
             // on shallow/zero-queue policers and inflates `cwnd`), allow the
@@ -446,6 +507,7 @@ pub(super) struct Writer {
     pub(super) tx: mpsc::Sender<WritePart>,
     reachable: Arc<AtomicBool>,
     written_bytes: Arc<AtomicU64>,
+    loss_permille: Arc<AtomicU64>,
 }
 impl Writer {
     pub(super) fn set_reachable(&self, reachable: bool) {
@@ -454,6 +516,13 @@ impl Writer {
     }
     pub(super) fn written_bytes(&self) -> u64 {
         self.written_bytes.load(Ordering::Relaxed)
+    }
+    pub(super) fn set_loss_permille(&self, loss_permille: u64) {
+        self.loss_permille
+            .store(loss_permille.min(1_000), Ordering::Relaxed);
+    }
+    pub(super) fn loss_permille(&self) -> u64 {
+        self.loss_permille.load(Ordering::Relaxed)
     }
 }
 pub(super) struct Reader {
@@ -557,6 +626,7 @@ fn writer_channel(queue: usize, ready: Option<Arc<Notify>>) -> (Writer, Reader) 
             tx,
             reachable: reachable.clone(),
             written_bytes: Arc::new(AtomicU64::new(0)),
+            loss_permille: Arc::new(AtomicU64::new(0)),
         },
         Reader {
             rx,
@@ -618,9 +688,11 @@ pub(super) fn drain(
         probing: bool,
         rtt_us: u64,
         retained: u64,
+        staged: u64,
         unsent: u64,
         service: u64,
         written: u64,
+        loss_permille: u64,
     }
     let mut snapshots = [PathSnapshot::default(); super::MAX_PATHS];
     let mut active_native = 0usize;
@@ -637,8 +709,13 @@ pub(super) fn drain(
         }
         let id = usize::from(path.id);
         let (retained, unsent) = path.conn.stream_send_buffer_bytes();
+        let staged = ((writer.tx.max_capacity() - writer.tx.capacity()) * PAYLOAD) as u64;
         let probing = path.conn.probing_rtt_hint();
-        let rtt_us = path.conn.rtt_hint().as_micros() as u64;
+        let raw_rtt_us = path.conn.rtt_hint().as_micros() as u64;
+        // Use only sustained sliding-window loss (`Credit::loss_permille`), not
+        // cumulative `lost_packets / sent_packets` which retains BBR Startup
+        // full-pipe probe drops long after the path has stabilized in ProbeBW.
+        let loss_permille = writer.loss_permille().min(1_000);
         let mut service = service_bound(&path.conn);
         if retained == 0
             && unsent == 0
@@ -649,14 +726,24 @@ pub(super) fn drain(
             // measured bottleneck bandwidth.
             service = service.max(pacing_bps / 8_000);
         }
+        let rtt_us = if loss_permille >= 150 {
+            let surviving = 1_000u64.saturating_sub(loss_permille);
+            service =
+                (service.saturating_mul(surviving).saturating_mul(surviving) / 1_000_000).max(1);
+            raw_rtt_us.saturating_mul(2)
+        } else {
+            raw_rtt_us
+        };
         snapshots[id] = PathSnapshot {
             active: true,
             probing,
             rtt_us,
             retained,
+            staged,
             unsent,
             service,
             written: writer.written_bytes(),
+            loss_permille,
         };
         active_native += 1;
         if !probing {
@@ -669,6 +756,20 @@ pub(super) fn drain(
         let Some(front) = queue.front(false) else {
             break;
         };
+        let avoid_path = front.hold.as_ref().and_then(|hold| hold.avoid_path());
+        if let Some(avoid) = avoid_path {
+            let healthy_rescue_sibling = paths.iter().any(|p| {
+                let pid = usize::from(p.id);
+                p.id != avoid && snapshots[pid].active && snapshots[pid].loss_permille < 120
+            });
+            if !healthy_rescue_sibling {
+                // Every active sibling is missing or itself in >=12% sustained
+                // loss: drop the speculative 32 KiB duplicate so QUIC packet-level
+                // retransmission preserves scarce link capacity.
+                let _ = queue.pop(false);
+                continue;
+            }
+        }
         let cost = wire_cost(front.data.len());
         if !pacer.available(cost) {
             break;
@@ -676,7 +777,6 @@ pub(super) fn drain(
         let mut order: Vec<_> = (0..paths.len())
             .map(|n| (*cursor + n) % paths.len())
             .collect();
-        let avoid_path = front.hold.as_ref().and_then(|hold| hold.avoid_path());
         let mut path_ranks: [(bool, u64); super::MAX_PATHS] = [(true, u64::MAX); super::MAX_PATHS];
         let mut straggler_limit_us = u64::MAX;
         let has_non_avoid = avoid_path.is_some() && active_native >= 2;
@@ -684,9 +784,8 @@ pub(super) fn drain(
             // In-order TCP delivery waits for the oldest record, and interactive
             // responses larger than the DATAGRAM bypass should avoid a deeply
             // queued or RTT-probing sibling path. Rank 2+ paths by estimated
-            // completion time using total unacknowledged stream bytes (`retained`
-            // plus staged channel records) so paths fill proportionally to drain
-            // rate and finish together without straggler tail stalls.
+            // completion time using batch-start snapshot backlog (`retained + staged`)
+            // plus `local_dispatched` so each record is counted once.
             let mut best_ect_us = u64::MAX;
             for path in paths.iter() {
                 let id = usize::from(path.id);
@@ -694,14 +793,9 @@ pub(super) fn drain(
                 if !snap.active {
                     continue;
                 }
-                let Some(writer) = &path.native_return else {
-                    continue;
-                };
-                let slots = writer.tx.capacity();
-                let staged = ((writer.tx.max_capacity() - slots) * PAYLOAD) as u64;
                 let queued = snap
                     .retained
-                    .saturating_add(staged)
+                    .saturating_add(snap.staged)
                     .saturating_add(local_dispatched[id]);
                 let cold = snap.written.saturating_add(local_dispatched[id]) < COLD_BULK_MIN_BYTES
                     && snap.unsent.saturating_add(local_dispatched[id])
@@ -1541,6 +1635,7 @@ mod tests {
         assert_eq!(credit.current, expected_floor);
         // Once unsent == 0, RTT inflation alone never cuts below `cwnd + headroom`.
         sample.unsent = 0;
+        sample.retained = cwnd;
         sample.sent += 200;
         now_us += BRAKE_COOLDOWN_MIN_US;
         assert_eq!(credit.update(now_us, sample), None);
@@ -1556,15 +1651,27 @@ mod tests {
             credit.update(now_us, sample);
         }
         assert_eq!(credit.current, expected_floor);
-        // Hard (>=20%) policer loss where BBRv1 ignores packet loss steps down
-        // below the inflated BDP floor to MIN_SEND_WINDOW.
-        for _ in 0..4 {
-            sample.sent += 100;
-            sample.lost += 50;
+        // Even heavy (33%) WAN packet loss on a non-slow path must preserve
+        // `bdp_floor` (`cwnd + headroom`) so QUIC RACK packet retransmissions
+        // never exhaust local `send_window` and stall the connection; only an
+        // outpaced slow sibling (`faster_route = true`) steps down to
+        // `SLOW_PATH_MIN_WINDOW`.
+        for _ in 0..5 {
+            sample.sent += 24;
+            sample.lost += 8;
             now_us += BRAKE_COOLDOWN_MIN_US;
             credit.update(now_us, sample);
         }
-        assert_eq!(credit.current, MIN_SEND_WINDOW);
+        assert_eq!(credit.current, expected_floor);
+        sample.faster_route = true;
+        sample.cwnd = 40 * 1024;
+        for _ in 0..4 {
+            sample.sent += 24;
+            sample.lost += 8;
+            now_us += BRAKE_COOLDOWN_MIN_US;
+            credit.update(now_us, sample);
+        }
+        assert_eq!(credit.current, SLOW_PATH_MIN_WINDOW);
     }
 
     #[test]
@@ -2050,5 +2157,120 @@ mod tests {
             assert_eq!(&rescue.data[8..16], &17u64.to_be_bytes());
             assert!(queue.is_empty());
         }
+    }
+
+    #[tokio::test]
+    async fn native_drain_counts_intra_batch_dispatched_bytes_once() {
+        let pair = super::super::sender_ready_tests::Pair::connect().await;
+        // Share one connection's exact cwnd/RTT so any rank difference comes
+        // strictly from queued byte accounting (`staged + local_dispatched`).
+        let mut p0 = pair.path();
+        let mut p1 = pair.path();
+        p0.id = 0;
+        p1.id = 1;
+        let (w0, mut r0) = channel();
+        let (w1, mut r1) = channel();
+        w0.written_bytes
+            .store(COLD_BULK_MIN_BYTES * 2, Ordering::Relaxed);
+        w1.written_bytes
+            .store(COLD_BULK_MIN_BYTES * 2, Ordering::Relaxed);
+        p0.native_return = Some(w0);
+        p1.native_return = Some(w1);
+        let paths = [p0, p1];
+        // Pre-stage 2 records (64 KiB) on path 1 while path 0 starts empty.
+        let tx1 = &paths[1].native_return.as_ref().unwrap().tx;
+        let held_p1 = [tx1.try_reserve().unwrap(), tx1.try_reserve().unwrap()];
+
+        let mut queue = outbound::Queue::default();
+        for seq in 0..3u64 {
+            let mut data = encoded().to_vec();
+            data[8..16].copy_from_slice(&seq.to_be_bytes());
+            queue
+                .push(outbound::Pending {
+                    game_datagram: false,
+                    data: data.into(),
+                    created: Instant::now(),
+                    record_id: Some(seq),
+                    flow: Some(stream::data_flow(21)),
+                    block: None,
+                    small: false,
+                    hold: None,
+                })
+                .ok()
+                .unwrap();
+        }
+        let mut cursor = 0;
+        let mut pacer = outbound::Pacer::for_sender(500_000_000, BURST * 4);
+        let mut groups =
+            std::array::from_fn(|_| outbound::Pacer::for_sender(500_000_000, BURST * 4));
+        pacer.refill(2_000_000);
+        for g in &mut groups {
+            g.refill(2_000_000);
+        }
+        drain(&mut queue, &paths, 0, &mut cursor, &mut pacer, &mut groups);
+        assert!(queue.is_empty());
+        // Path 0 must receive 2 records (reaching 64 KiB) before path 1 (already
+        // holding 64 KiB staged) receives the 3rd; double-counting `staged` +
+        // `local_dispatched` would have diverted the 2nd record to path 1.
+        assert!(r0.rx.try_recv().is_ok());
+        assert!(r0.rx.try_recv().is_ok());
+        assert!(r0.rx.try_recv().is_err());
+        assert!(r1.rx.try_recv().is_ok());
+        assert!(r1.rx.try_recv().is_err());
+        drop(held_p1);
+    }
+
+    #[tokio::test]
+    async fn native_drain_drops_speculative_rescue_when_all_siblings_have_heavy_loss() {
+        let pair0 = super::super::sender_ready_tests::Pair::connect().await;
+        let pair1 = super::super::sender_ready_tests::Pair::connect().await;
+        let mut p0 = pair0.path();
+        let mut p1 = pair1.path();
+        p0.id = 0;
+        p1.id = 1;
+        let (w0, mut r0) = channel();
+        let (w1, mut r1) = channel();
+        w0.set_loss_permille(350);
+        w1.set_loss_permille(410);
+        p0.native_return = Some(w0);
+        p1.native_return = Some(w1);
+        let paths = [p0, p1];
+
+        let gauge = Arc::new(outbound::Gauge::default());
+        let mut queue = outbound::Queue::default();
+        for (id, avoid) in [(17u32, Some(0u8)), (18u32, None)] {
+            let mut data = encoded().to_vec();
+            data[8..16].copy_from_slice(&u64::from(id).to_be_bytes());
+            queue
+                .push(outbound::Pending {
+                    game_datagram: false,
+                    data: data.into(),
+                    created: Instant::now(),
+                    record_id: Some(u64::from(id)),
+                    flow: Some(stream::data_flow(id)),
+                    block: None,
+                    small: false,
+                    hold: Some(gauge.hold_with_avoid(id, 0, 2, PAYLOAD, false, false, avoid)),
+                })
+                .ok()
+                .unwrap();
+        }
+        let mut cursor = 0;
+        let mut pacer = outbound::Pacer::for_sender(100_000_000, BURST * 2);
+        let mut groups =
+            std::array::from_fn(|_| outbound::Pacer::for_sender(100_000_000, BURST * 2));
+        pacer.refill(1_000_000);
+        for g in &mut groups {
+            g.refill(1_000_000);
+        }
+        drain(&mut queue, &paths, 0, &mut cursor, &mut pacer, &mut groups);
+        assert!(queue.is_empty());
+        assert_eq!(gauge.take_dropped(), vec![(17, 0, 2)]);
+        let delivered = r0
+            .rx
+            .try_recv()
+            .or_else(|_| r1.rx.try_recv())
+            .expect("normal flow still dispatches");
+        assert_eq!(&delivered.data[8..16], &18u64.to_be_bytes());
     }
 }
