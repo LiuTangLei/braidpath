@@ -590,6 +590,7 @@ fn bind_udp_device(socket: &Socket, remote: SocketAddr, name: &str, log_macos: b
             "explicit interface binding is currently supported only on Linux and macOS: {name}"
         );
     }
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     Ok(())
 }
 

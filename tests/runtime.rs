@@ -1806,7 +1806,7 @@ fn mesh_client_and_proxy_client_survive_offline_boot_and_recover_on_same_listene
     let mesh_sock = root.join("mesh-client.sock");
     #[cfg(unix)]
     let proxy_sock = root.join("proxy-client.sock");
-    let mut mesh_args = args(&[
+    let mesh_args = args(&[
         "mesh-client",
         "--connect",
         &server_addr,
@@ -1820,12 +1820,11 @@ fn mesh_client_and_proxy_client_survive_offline_boot_and_recover_on_same_listene
         "127.0.0.1:0",
         "--tcp-listen",
         "127.0.0.1:0",
+        #[cfg(unix)]
+        "--status-socket",
+        #[cfg(unix)]
+        mesh_sock.to_str().unwrap(),
     ]);
-    #[cfg(unix)]
-    {
-        mesh_args.push("--status-socket".into());
-        mesh_args.push(mesh_sock.to_str().unwrap().into());
-    }
     let mut mesh_client = launch(&mesh_args, root, "offline-mesh-client");
     ready(&mut mesh_client, "TCP listener bound");
     let mesh_tcp_addr = fs::read_to_string(&mesh_client.log)
@@ -1836,7 +1835,7 @@ fn mesh_client_and_proxy_client_survive_offline_boot_and_recover_on_same_listene
         .unwrap()
         .to_owned();
 
-    let mut proxy_args = args(&[
+    let proxy_args = args(&[
         "proxy-client",
         "--connect",
         &server_addr,
@@ -1850,12 +1849,11 @@ fn mesh_client_and_proxy_client_survive_offline_boot_and_recover_on_same_listene
         "127.0.0.1:0",
         "--tcp-forward",
         "node-a=127.0.0.1:0",
+        #[cfg(unix)]
+        "--status-socket",
+        #[cfg(unix)]
+        proxy_sock.to_str().unwrap(),
     ]);
-    #[cfg(unix)]
-    {
-        proxy_args.push("--status-socket".into());
-        proxy_args.push(proxy_sock.to_str().unwrap().into());
-    }
     let mut proxy_client = launch(&proxy_args, root, "offline-proxy-client");
     ready(&mut proxy_client, "SOCKS5 proxy ready");
     ready(&mut proxy_client, "fixed TCP forward bound");
