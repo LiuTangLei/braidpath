@@ -183,13 +183,52 @@ const fn ack_ceiling_idle_reset_us(rtt_us: u64) -> u64 {
 /// manufacture an artificial ceiling below `cwnd`.
 #[derive(Default)]
 struct AckService {
-    start: Option<(u64, u64)>,
+    start: Option<(u64, u64, u64)>,
     peak_buffered: u64,
     ceiling_bytes_per_ms: Option<u64>,
     idle_since_us: Option<u64>,
+    last_drought_us: u64,
+    last_drought_acked: u64,
 }
 
 impl AckService {
+    fn record_drought(&mut self, now_us: u64, acked: u64, ceiling: u64) {
+        self.ceiling_bytes_per_ms = Some(ceiling.max(1));
+        self.last_drought_us = now_us;
+        self.last_drought_acked = acked;
+    }
+
+    fn observe_flush(
+        &mut self,
+        now_us: u64,
+        rtt_us: u64,
+        cwnd: u64,
+        loss_permille: u64,
+        acked: u64,
+    ) {
+        let Some(prev) = self.ceiling_bytes_per_ms else {
+            return;
+        };
+        let flushed = acked.saturating_sub(self.last_drought_acked);
+        if flushed < 2 * PAYLOAD as u64 {
+            return;
+        }
+        let elapsed = now_us
+            .saturating_sub(self.last_drought_us)
+            .max(rtt_us)
+            .max(1);
+        let delivered_rate = (flushed.saturating_mul(1_000) / elapsed).max(1);
+        if delivered_rate <= prev {
+            return;
+        }
+        let cwnd_service = (cwnd.min(MAX_SEND_WINDOW).saturating_mul(1_000) / rtt_us.max(1)).max(1);
+        let lifted = delivered_rate.min(cwnd_service);
+        self.ceiling_bytes_per_ms =
+            (loss_permille >= 80 || lifted < cwnd_service).then_some(lifted);
+        self.last_drought_us = now_us;
+        self.last_drought_acked = acked;
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn observe(
         &mut self,
@@ -203,6 +242,9 @@ impl AckService {
     ) {
         let idle_reset_us = ack_ceiling_idle_reset_us(rtt_us);
         if retained < PAYLOAD as u64 {
+            if retained == 0 && unsent == 0 {
+                self.observe_flush(now_us, rtt_us, cwnd, loss_permille, acked);
+            }
             self.start = None;
             self.peak_buffered = 0;
             let idle_since = *self.idle_since_us.get_or_insert(now_us);
@@ -219,18 +261,27 @@ impl AckService {
         // Quinn's retained total already includes unsent stream bytes.
         self.peak_buffered = self.peak_buffered.max(retained);
         let window_us = rtt_us.saturating_mul(2).max(200_000);
-        let (start_us, start_acked) = *self.start.get_or_insert((now_us, acked));
+        let effective_cwnd = cwnd.min(MAX_SEND_WINDOW);
+        let (start_us, start_acked, start_cwnd) =
+            *self.start.get_or_insert((now_us, acked, effective_cwnd));
         let elapsed = now_us.saturating_sub(start_us);
         if elapsed >= window_us {
             let acked_delta = acked.saturating_sub(start_acked);
             // Leave room to probe faster service without treating a historical
             // congestion window as delivered bandwidth during an ACK drought.
             let rate = (acked_delta.saturating_mul(2_000) / elapsed).max(1);
-            let cwnd_service = (cwnd.saturating_mul(1_000) / rtt_us.max(1)).max(1);
-            let network_limited = acked_delta == 0
-                || self.peak_buffered >= cwnd / 2
-                || unsent > PAYLOAD as u64
-                || acked_delta.saturating_mul(2) < self.peak_buffered;
+            let cwnd_service = (effective_cwnd.saturating_mul(1_000) / rtt_us.max(1)).max(1);
+            // During clean BBR Startup / ProbeBW cwnd expansion from a small
+            // initial window, delivered bytes over 2*RTT are bounded by
+            // `start_cwnd` rather than an ACK drought; clamping `ceiling` here
+            // would starve secondary WAN relays behind a pre-filled 1 MiB window.
+            let ramping_cwnd =
+                loss_permille < 120 && effective_cwnd > start_cwnd && acked_delta >= start_cwnd;
+            let network_limited = !ramping_cwnd
+                && (acked_delta == 0
+                    || self.peak_buffered >= effective_cwnd / 2
+                    || unsent > PAYLOAD as u64
+                    || acked_delta.saturating_mul(2) < self.peak_buffered);
             if network_limited {
                 let next = if let Some(prev) = self.ceiling_bytes_per_ms
                     && rate > prev
@@ -245,20 +296,28 @@ impl AckService {
                 } else {
                     rate
                 };
-                self.ceiling_bytes_per_ms = Some(next);
+                if loss_permille < 80 && next >= cwnd_service {
+                    self.ceiling_bytes_per_ms = None;
+                } else {
+                    self.record_drought(now_us, acked, next);
+                }
             } else if let Some(prev) = self.ceiling_bytes_per_ms {
                 if loss_permille < 80 {
                     let lifted = prev.saturating_mul(2).max(rate);
-                    self.ceiling_bytes_per_ms = (lifted < cwnd_service).then_some(lifted);
+                    if lifted < cwnd_service {
+                        self.record_drought(now_us, acked, lifted);
+                    } else {
+                        self.ceiling_bytes_per_ms = None;
+                    }
                 } else if rate > prev {
-                    self.ceiling_bytes_per_ms = Some(
-                        prev.saturating_mul(2)
-                            .max(prev.saturating_add(64))
-                            .min(rate),
-                    );
+                    let next = prev
+                        .saturating_mul(2)
+                        .max(prev.saturating_add(64))
+                        .min(rate);
+                    self.record_drought(now_us, acked, next);
                 }
             }
-            self.start = Some((now_us, acked));
+            self.start = Some((now_us, acked, effective_cwnd));
             self.peak_buffered = retained;
         }
     }
@@ -280,6 +339,8 @@ pub(super) struct Credit {
     acked: u64,
     delivery: AckService,
     current: u64,
+    max_cwnd: u64,
+    last_cwnd_growth_us: u64,
     loss_ceiling: Option<u64>,
     loss_hold_until_us: u64,
     loss_cautious_until_us: u64,
@@ -308,9 +369,11 @@ struct CreditSample {
 
 // A cwnd/RTT bound is sufficient to distinguish a much slower path. Actual
 // unsent bytes must also show that its current window is building a queue.
+// By Little's Law, a stream bounded by `MAX_SEND_WINDOW` cannot sustain more
+// than `MAX_SEND_WINDOW` bytes per RTT even when BBR Startup overshoots `cwnd`.
 pub(super) fn service_bound(conn: &quinn::Connection) -> u64 {
-    let cwnd_service =
-        conn.cwnd_hint().saturating_mul(1_000) / conn.rtt_hint().as_micros().max(1) as u64;
+    let cwnd_service = conn.cwnd_hint().min(MAX_SEND_WINDOW).saturating_mul(1_000)
+        / conn.rtt_hint().as_micros().max(1) as u64;
     // When a slow bufferbloated link drains back to `min_rtt`, BBR can briefly
     // retain a large historical `cwnd` while `pacing_rate` already reflects the
     // true sub-megabit bottleneck. `pacing_bps / 3_000` equals `2.0 * bw` even
@@ -379,6 +442,8 @@ impl Credit {
                 acked: stats.stream_payload_bytes_acked,
                 delivery: AckService::default(),
                 current: initial_window,
+                max_cwnd: stats.path.cwnd,
+                last_cwnd_growth_us: 0,
                 loss_ceiling: None,
                 loss_hold_until_us: 0,
                 loss_cautious_until_us: 0,
@@ -390,6 +455,20 @@ impl Credit {
             return None;
         }
         if now_us.saturating_sub(self.sampled_us) < 100_000 {
+            if self.delivery.ceiling_bytes_per_ms.is_some() {
+                let (retained, unsent) = conn.stream_send_buffer_bytes();
+                if retained == 0 && unsent == 0 {
+                    let acked = conn.stats().stream_payload_bytes_acked;
+                    let rtt_us = conn.rtt_hint().as_micros().min(u128::from(u64::MAX)) as u64;
+                    self.delivery.observe_flush(
+                        now_us,
+                        rtt_us,
+                        conn.cwnd_hint(),
+                        self.loss_permille(),
+                        acked,
+                    );
+                }
+            }
             return None;
         }
         let stats = conn.stats();
@@ -416,7 +495,7 @@ impl Credit {
             && retained >= PAYLOAD as u64
             && acked_delta == 0
         {
-            self.delivery.ceiling_bytes_per_ms = Some(1);
+            self.delivery.record_drought(now_us, acked, 1);
         }
         let mut own_service = service_bound(conn);
         if let Some(ceiling) = self.delivery.ceiling_bytes_per_ms
@@ -490,13 +569,18 @@ impl Credit {
             } else {
                 (self.loss_permille * 3 + sample_permille * 5) / 8
             };
-            if loss_packets >= 64 && sample_permille >= 300 {
-                self.lossy_streak = self.lossy_streak.max(3);
+            if loss_packets >= 64 && sample_permille >= 350 {
+                // Require a second consecutive loss window (>=3) before penalizing
+                // path service, so a single 1-RTT BBR Startup full-pipe probe
+                // tail-drop burst on a shallow queue never masquerades as a
+                // sustained lossy link while genuine blackholes engage in ~200 ms.
+                self.lossy_streak = self.lossy_streak.saturating_add(2);
                 self.loss_permille = self.loss_permille.max(sample_permille);
             } else if sample_permille >= 120 {
                 self.lossy_streak = self.lossy_streak.saturating_add(1);
             } else if sample_permille < 80 {
                 self.lossy_streak = 0;
+                self.loss_permille /= 2;
             }
         } else if sample.retained == 0
             && sample.unsent == 0
@@ -524,15 +608,34 @@ impl Credit {
         if sample.probing {
             return None;
         }
-        let backlog_persisted = self.first_backlog_us.is_some_and(|since| {
-            now_us.saturating_sub(since) >= sample.rtt_us.max(BRAKE_COOLDOWN_MIN_US)
-        });
+        if self.max_cwnd == 0 {
+            self.max_cwnd = sample.cwnd;
+        } else if !sample.deeply_queued
+            && sample.cwnd >= PAYLOAD as u64
+            && sample.cwnd > self.max_cwnd.saturating_add(8 * 1024)
+        {
+            self.max_cwnd = sample.cwnd;
+            self.last_cwnd_growth_us = now_us;
+        }
+        let ramp_grace_us = sample.rtt_us.saturating_mul(2).max(250_000);
+        let startup_ramping = self.acked < sample.initial_window
+            && self.last_cwnd_growth_us > 0
+            && !sample.deeply_queued
+            && (packets < 24 || losses.saturating_mul(100) < packets.saturating_mul(25))
+            && now_us.saturating_sub(self.last_cwnd_growth_us) <= ramp_grace_us;
+        if startup_ramping && sample.unsent > SLOW_PATH_BACKLOG_THRESHOLD {
+            self.first_backlog_us = Some(now_us);
+        }
+        let backlog_persisted = !startup_ramping
+            && self.first_backlog_us.is_some_and(|since| {
+                now_us.saturating_sub(since) >= sample.rtt_us.max(BRAKE_COOLDOWN_MIN_US)
+            });
         let min_bulk = if sample.faster_route {
             COLD_BULK_MIN_BYTES
         } else {
             INITIAL_SEND_WINDOW
         };
-        let exercised = sample.bulk_written >= min_bulk || backlog_persisted;
+        let exercised = (sample.bulk_written >= min_bulk && !startup_ramping) || backlog_persisted;
         let exercised_slow = exercised && sample.faster_route;
         // When Quinn has already packetized and sent nearly all local stream data
         // (`unsent <= 64 KiB`) without deep RTT queueing, `retained` represents
@@ -572,7 +675,9 @@ impl Credit {
             .clamp(MIN_SEND_WINDOW, MAX_SEND_WINDOW);
         let slow_cap = sample
             .cwnd
-            .saturating_add(SLOW_PATH_WRITER_MARGIN)
+            .saturating_mul(3)
+            .div_ceil(2)
+            .max(sample.cwnd.saturating_add(SLOW_PATH_WRITER_MARGIN))
             .clamp(SLOW_PATH_MIN_WINDOW, MAX_SEND_WINDOW);
         let cwnd_cap = if exercised_slow {
             slow_cap
@@ -581,7 +686,7 @@ impl Credit {
         } else {
             raw_cwnd_cap.max(INITIAL_SEND_WINDOW)
         };
-        let effective_cap = if backlog_persisted || exercised_slow {
+        let effective_cap = if backlog_persisted {
             cwnd_cap
         } else {
             cwnd_cap.max(self.current).min(MAX_SEND_WINDOW)
@@ -590,8 +695,14 @@ impl Credit {
         // so Quinn BBR never becomes `app_limited` (`in_flight < cwnd` with
         // `unsent == 0`), which would trap BBR in `Mode::Startup` (`2.89x`
         // pacing gain) or starve `ProbeBw` below full pipe occupancy.
-        let bdp_floor = sample
-            .cwnd
+        let effective_bdp_cwnd =
+            if !exercised_slow && !sample.deeply_queued && sample.unsent <= SLOW_PATH_WRITER_MARGIN
+            {
+                sample.cwnd.max(self.max_cwnd / 2)
+            } else {
+                sample.cwnd
+            };
+        let bdp_floor = effective_bdp_cwnd
             .saturating_add(2 * SLOW_PATH_WRITER_MARGIN)
             .max(retained_floor)
             .clamp(
@@ -629,12 +740,13 @@ impl Credit {
             sample.storage_limited && sample.ack_progress && packets >= 12 && !sample.deeply_queued;
         let is_return_bulk = sample.initial_window >= INITIAL_SEND_WINDOW;
         let bdp_catchup = is_return_bulk
-            && !exercised_slow
+            && !policer_loss
+            && (!exercised_slow || !sample.deeply_queued)
             && sample.storage_limited
             && sample.unsent <= SLOW_PATH_WRITER_MARGIN
             && sample.ack_progress
             && packets >= 12
-            && self.current < bdp_floor
+            && self.current < bdp_floor.min(cwnd_cap)
             && (!can_grow || severe_loss || now_us < self.loss_hold_until_us);
         if !must_shrink
             && !restore_floor
@@ -693,7 +805,7 @@ impl Credit {
                 self.current.min(effective_cap)
             }
         } else if exercised_slow
-            && slow_window < effective_cap
+            && slow_window < self.current
             && sample.unsent > SLOW_PATH_BACKLOG_THRESHOLD
         {
             slow_window.min(self.current)
@@ -724,6 +836,7 @@ impl Credit {
         } else if self.current < MIN_SEND_WINDOW && !sample.faster_route {
             MIN_SEND_WINDOW.min(cwnd_cap)
         } else if can_grow {
+            let sample_has_loss = packets >= 16 && losses.saturating_mul(100) >= packets;
             if now_us < self.loss_hold_until_us {
                 self.loss_ceiling
                     .map_or(self.current, |ceiling| self.current.min(ceiling))
@@ -731,6 +844,11 @@ impl Credit {
                     .min(cwnd_cap)
             } else if now_us < self.loss_cautious_until_us {
                 (self.current + SEND_WINDOW_GROWTH)
+                    .max(retained_floor)
+                    .min(cwnd_cap)
+            } else if sample_has_loss {
+                (self.current + SEND_WINDOW_GROWTH)
+                    .min(bdp_floor.max(self.current))
                     .max(retained_floor)
                     .min(cwnd_cap)
             } else {
@@ -1179,9 +1297,12 @@ pub(super) fn drain(
         written_bytes.fetch_add(len, Ordering::Relaxed);
         let rtt = paths[i].conn.rtt_hint();
         let expected_rtt = if active_native >= 2 && path_ranks[id].1 < u64::MAX {
-            std::time::Duration::from_micros(
-                path_ranks[id].1.saturating_add(snapshots[id].rtt_us / 2),
-            )
+            let full_queued = snapshots[id]
+                .retained
+                .saturating_add(snapshots[id].staged)
+                .saturating_add(local_dispatched[id]);
+            let drain_us = full_queued.saturating_mul(1_000) / snapshots[id].service.max(1);
+            std::time::Duration::from_micros(snapshots[id].rtt_us.saturating_add(drain_us))
         } else {
             std::time::Duration::ZERO
         };
@@ -2906,5 +3027,93 @@ mod tests {
         };
         assert_eq!(upload.update(100_000, upload_queued), None);
         assert_eq!(upload.current, INITIAL_UPLOAD_SEND_WINDOW);
+    }
+
+    #[test]
+    fn secondary_relay_startup_ramp_and_recovery_dips_do_not_starve_window_or_ack_service() {
+        // 1. AckService must not clamp a healthy secondary relay ramping BBR
+        // Startup from 14 KiB with 512 KiB pre-staged in INITIAL_SEND_WINDOW.
+        let mut ack_service = AckService::default();
+        ack_service.observe(22_000_000, 120_000, 14 * 1024, 512 * 1024, 498 * 1024, 0, 0);
+        ack_service.observe(
+            22_250_000,
+            120_000,
+            120 * 1024,
+            454 * 1024,
+            334 * 1024,
+            0,
+            58 * 1024,
+        );
+        assert_eq!(
+            ack_service.ceiling_bytes_per_ms, None,
+            "clean BBR Startup cwnd growth must not manufacture a false drought ceiling"
+        );
+        ack_service.observe(
+            22_500_000,
+            120_000,
+            960 * 1024,
+            512 * 1024,
+            0,
+            0,
+            512 * 1024,
+        );
+        assert_eq!(ack_service.ceiling_bytes_per_ms, None);
+
+        // 2. Credit must preserve INITIAL_SEND_WINDOW on a secondary relay
+        // (`faster_route == true`) while its cwnd is actively ramping over
+        // 128 ms RTT ticks (including sub-RTT pigeonhole ticks), and must not
+        // ratchet down an earned window on a 1-RTT RecoveryState cwnd dip when
+        // Quinn has already packetized all local bytes (`unsent == 0`).
+        let mut relay = Credit {
+            current: INITIAL_SEND_WINDOW,
+            max_cwnd: 14 * 1024,
+            ..Default::default()
+        };
+        let mut sample = CreditSample {
+            cwnd: 42 * 1024,
+            rtt_us: 128_000,
+            sent: 45,
+            lost: 0,
+            queued: false,
+            deeply_queued: false,
+            probing: false,
+            storage_limited: false,
+            ack_progress: true,
+            retained: 640 * 1024,
+            unsent: 598 * 1024,
+            bulk_written: 640 * 1024,
+            initial_window: INITIAL_SEND_WINDOW,
+            faster_route: true,
+        };
+        relay.acked = 14 * 1024;
+        assert_eq!(relay.update(22_130_000, sample), None);
+        assert_eq!(relay.current, INITIAL_SEND_WINDOW);
+
+        // Sub-RTT tick before next ACK round arrives (`cwnd` unchanged for 100 ms):
+        sample.sent += 20;
+        sample.ack_progress = false;
+        assert_eq!(relay.update(22_230_000, sample), None);
+        assert_eq!(relay.current, INITIAL_SEND_WINDOW);
+
+        // Next RTT doubles cwnd again (`122 KiB -> 353 KiB`):
+        relay.acked = 180 * 1024;
+        sample.cwnd = 353 * 1024;
+        sample.unsent = 287 * 1024;
+        sample.sent += 80;
+        sample.ack_progress = true;
+        assert_eq!(relay.update(22_360_000, sample), None);
+        assert_eq!(relay.current, INITIAL_SEND_WINDOW);
+
+        // Once steady-state ProbeBW has packetized all local data (`unsent == 0`),
+        // a 1-RTT BBR RecoveryState dip (`cwnd = 220 KiB`) must NOT pull down
+        // `current` (`1 MiB`), preventing the app_limited downward ratchet.
+        relay.acked = 2 * INITIAL_SEND_WINDOW;
+        sample.cwnd = 220 * 1024;
+        sample.retained = 400 * 1024;
+        sample.unsent = 0;
+        sample.sent += 60;
+        sample.lost += 2;
+        assert_eq!(relay.update(23_000_000, sample), None);
+        assert_eq!(relay.current, INITIAL_SEND_WINDOW);
     }
 }
