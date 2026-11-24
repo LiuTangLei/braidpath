@@ -1622,11 +1622,12 @@ impl Mux {
             let (id, start, transmission) = sent.identity;
             if let Some(s) = self.streams.get_mut(&id) {
                 if let Some(reliable) = sent.reliable {
-                    s.send.admitted_reliable(
+                    s.send.admitted_reliable_with_ect(
                         start,
                         transmission,
                         sent.path,
                         sent.rtt,
+                        sent.expected_rtt,
                         sent.at,
                         reliable,
                     );

@@ -47,6 +47,7 @@ pub struct StreamAdmission {
     pub identity: (u32, u64, u32),
     pub path: u8,
     pub rtt: Duration,
+    pub expected_rtt: Duration,
     pub at: Instant,
     /// A reliable carrier owns these bytes until it becomes unreachable.
     pub reliable: Option<Arc<AtomicBool>>,
@@ -142,14 +143,15 @@ impl Hold {
     /// A bounded reliable writer now owns this frame. Give end-to-end repair
     /// its chosen path immediately; native flow-control waits must not pin the
     /// shared producer watermark or leave the segment on an unknown path.
-    pub(crate) fn reliable_handoff(
+    pub(crate) fn reliable_handoff_with_ect(
         &self,
         path: u8,
         rtt: Duration,
+        expected_rtt: Duration,
         at: Instant,
         reachable: Arc<AtomicBool>,
     ) {
-        self.admitted_via(path, rtt, at, Some(reachable));
+        self.admitted_via(path, rtt, expected_rtt, at, Some(reachable));
         self.release_queue();
     }
     /// The reliable writer dropped the frame before completing its write.
@@ -165,12 +167,13 @@ impl Hold {
         }
     }
     pub fn admitted(&self, path: u8, rtt: Duration, at: Instant) {
-        self.admitted_via(path, rtt, at, None);
+        self.admitted_via(path, rtt, Duration::ZERO, at, None);
     }
     fn admitted_via(
         &self,
         path: u8,
         rtt: Duration,
+        expected_rtt: Duration,
         at: Instant,
         reliable: Option<Arc<AtomicBool>>,
     ) {
@@ -183,6 +186,7 @@ impl Hold {
                     identity: self.identity,
                     path,
                     rtt,
+                    expected_rtt,
                     at,
                     reliable,
                 });

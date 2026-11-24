@@ -344,6 +344,7 @@ struct Segment {
     end: u64,
     path: usize,
     sent_at: Instant,
+    expected_ack_rtt: Duration,
     transmissions: u32,
     network_transmissions: u32,
     /// Consecutive retransmissions without any acknowledgment progress between them.
@@ -608,6 +609,7 @@ impl Sender {
             end,
             path: UNKNOWN_PATH,
             sent_at: now,
+            expected_ack_rtt: Duration::ZERO,
             transmissions: 0,
             network_transmissions: 0,
             stalls: 0,
@@ -810,11 +812,12 @@ impl Sender {
         rtt: Duration,
         at: Instant,
     ) {
-        self.admitted_via(start, transmission, path, rtt, at, None);
+        self.admitted_via(start, transmission, path, rtt, Duration::ZERO, at, None);
     }
 
     /// Native stream admission delegates loss recovery to that carrier. A
     /// cross-path SACK or its local write queue is not a native packet loss.
+    #[cfg(test)]
     pub(crate) fn admitted_reliable(
         &mut self,
         start: u64,
@@ -824,15 +827,47 @@ impl Sender {
         at: Instant,
         reachable: Arc<AtomicBool>,
     ) {
-        self.admitted_via(start, transmission, path, rtt, at, Some(reachable));
+        self.admitted_reliable_with_ect(
+            start,
+            transmission,
+            path,
+            rtt,
+            Duration::ZERO,
+            at,
+            reachable,
+        );
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn admitted_reliable_with_ect(
+        &mut self,
+        start: u64,
+        transmission: u32,
+        path: u8,
+        rtt: Duration,
+        expected_ack_rtt: Duration,
+        at: Instant,
+        reachable: Arc<AtomicBool>,
+    ) {
+        self.admitted_via(
+            start,
+            transmission,
+            path,
+            rtt,
+            expected_ack_rtt,
+            at,
+            Some(reachable),
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn admitted_via(
         &mut self,
         start: u64,
         transmission: u32,
         path: u8,
         rtt: Duration,
+        expected_ack_rtt: Duration,
         at: Instant,
         reliable: Option<Arc<AtomicBool>>,
     ) {
@@ -857,15 +892,20 @@ impl Sender {
         }
         self.transport_rtt[path] = rtt.max(Duration::from_millis(1));
         let threshold = self.path_threshold(path, at);
+        let is_reliable = reliable.is_some();
         let segment = self.segments.get_mut(&start).expect("admitted segment");
         segment.local_retry_pending = false;
         segment.path = path;
         segment.sent_at = at;
+        segment.expected_ack_rtt = expected_ack_rtt;
         segment.reliable = reliable;
-        if segment.reliable.is_some() {
+        if is_reliable {
             segment.deadline = None;
             self.reliable_flight.insert(start);
             self.probe_at.get_or_insert(at);
+            if self.fin_sent {
+                self.schedule_head_probe(at);
+            }
         } else if segment.stalls == 0 {
             segment.deadline = None;
             self.fresh[path].insert((at, start));
@@ -1067,31 +1107,51 @@ impl Sender {
         let Some((&start, segment)) = self.segments.first_key_value() else {
             return;
         };
+        let overtaken = self.rack.is_some_and(|later| later > segment.sent_at);
+        let has_sibling_path = self
+            .transport_rtt
+            .iter()
+            .enumerate()
+            .any(|(i, d)| i != segment.path && !d.is_zero());
+        let is_reliable_tail = segment.reliable.is_some()
+            && has_sibling_path
+            && self.fin_sent
+            && self.next >= self.written
+            && self.segments.len() <= 2;
         if start != self.acked
             || segment.network_transmissions != 1
             || segment.probe_transmission.is_some()
             || segment.path == UNKNOWN_PATH
             || self.lost.contains(&start)
-            || self.rack.is_none_or(|later| later <= segment.sent_at)
+            || (!overtaken && !is_reliable_tail)
         {
             return;
         }
         if segment.reliable.is_some() {
-            // Bounded cross-path head rescue for reliable stream segments:
-            // `rack > sent_at` is only possible when a healthier sibling path
-            // has already overtaken this path and delivered later data. Wait
-            // well past normal cross-path RTT skew so balanced transfers send
-            // zero duplicates, then rescue the oldest blocked offset once.
+            // Bounded cross-path rescue for reliable stream segments:
+            // measure stall deadline against the queue-aware expected ACK RTT
+            // recorded at native handoff so healthy BDP queues send zero
+            // spurious duplicates, while overtaken holes or stalled multi-path
+            // tail chunks recover promptly onto a healthier sibling path.
             let rtt = self.transport_rtt[segment.path].max(Duration::from_millis(20));
-            let stall_at = segment.sent_at
-                + rtt
-                    .mul_f64(2.0)
-                    .clamp(Duration::from_millis(250), Duration::from_millis(800));
+            let expected = segment.expected_ack_rtt.max(rtt);
+            let stall_delay = if overtaken {
+                expected
+                    .mul_f64(1.75)
+                    .max(rtt.mul_f64(2.0))
+                    .clamp(Duration::from_millis(250), Duration::from_millis(1_000))
+            } else {
+                expected
+                    .mul_f64(2.2)
+                    .max(rtt.mul_f64(2.5))
+                    .clamp(Duration::from_millis(350), Duration::from_millis(1_000))
+            };
+            let stall_at = segment.sent_at + stall_delay;
             let settle_at =
-                now + (rtt / 2).clamp(Duration::from_millis(50), Duration::from_millis(150));
-            let rate_limit_at = self
-                .last_head_probe
-                .map_or(now, |last| last + rtt.max(Duration::from_millis(250)));
+                now + (rtt / 2).clamp(Duration::from_millis(40), Duration::from_millis(120));
+            let rate_limit_at = self.last_head_probe.map_or(now, |last| {
+                last + (rtt / 2).clamp(Duration::from_millis(60), Duration::from_millis(150))
+            });
             let at = stall_at.max(settle_at).max(rate_limit_at);
             self.head_probe = Some((start, segment.transmissions, at));
             return;
@@ -3568,5 +3628,83 @@ mod tests {
             .expect("loss retransmit");
         assert!(retry.retransmission);
         assert_eq!(retry.avoid_path, Some(1));
+    }
+
+    #[test]
+    fn multipath_reliable_tail_rescues_final_stalled_chunk_and_skips_single_path() {
+        let t0 = Instant::now();
+        // Single-path streams must never schedule a redundant tail rescue on
+        // their own QUIC stream.
+        let mut single = Sender::new(false);
+        single.push(&vec![3u8; 32 * 1024]);
+        single.finish();
+        let only = single
+            .poll_transmit_reliable(t0, RELIABLE_PAYLOAD)
+            .expect("single tail");
+        single.admitted_reliable_with_ect(
+            only.start,
+            only.transmission,
+            1,
+            Duration::from_millis(100),
+            Duration::from_millis(120),
+            t0,
+            Arc::new(AtomicBool::new(true)),
+        );
+        assert!(single.head_probe_deadline().is_none());
+
+        // Multi-path stream: chunk 0 completes on fast path 1 while final
+        // chunk 1 (+ FIN) stalls on slower path 3 with no following chunk to
+        // advance `rack`. It must arm one bounded cross-path rescue avoiding 3.
+        let mut multi = Sender::new(false);
+        let chunk_len = RELIABLE_PAYLOAD - DATA_HEADER;
+        multi.push(&vec![5u8; 2 * chunk_len]);
+        multi.finish();
+        let seg0 = multi
+            .poll_transmit_reliable(t0, RELIABLE_PAYLOAD)
+            .expect("seg0");
+        let seg1 = multi
+            .poll_transmit_reliable(t0, RELIABLE_PAYLOAD)
+            .expect("seg1");
+        multi.admitted_reliable_with_ect(
+            seg0.start,
+            seg0.transmission,
+            1,
+            Duration::from_millis(95),
+            Duration::from_millis(110),
+            t0,
+            Arc::new(AtomicBool::new(true)),
+        );
+        multi.admitted_reliable_with_ect(
+            seg1.start,
+            seg1.transmission,
+            3,
+            Duration::from_millis(140),
+            Duration::from_millis(160),
+            t0 + Duration::from_millis(5),
+            Arc::new(AtomicBool::new(true)),
+        );
+        multi.on_ack(
+            &Ack {
+                cumulative: chunk_len as u64,
+                limit: MAX_WINDOW,
+                duplicate_bytes: 0,
+                ranges: Vec::new(),
+            },
+            t0 + Duration::from_millis(105),
+        );
+        let (tail_start, tail_at) = multi
+            .head_probe_deadline()
+            .expect("stalled multi-path final chunk arms rescue");
+        assert_eq!(tail_start, seg1.start);
+        assert!(tail_at >= t0 + Duration::from_millis(350));
+        assert!(multi.on_timeout(tail_at));
+        assert!(multi.head_probe_is_reliable());
+        let rescue = multi
+            .poll_transmit_reliable(tail_at, RELIABLE_PAYLOAD)
+            .expect("tail rescue transmit");
+        assert!(rescue.head_copy);
+        assert_eq!(rescue.start, seg1.start);
+        assert_eq!(rescue.avoid_path, Some(3));
+        assert!(multi.head_probe_deadline().is_none());
     }
 }
