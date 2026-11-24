@@ -1871,11 +1871,12 @@ async fn sender(
 }
 
 fn native_datagram_pace_floor(cwnd: u64, rtt_us: u64, max_rate: u64) -> u64 {
-    // On `2/native` (non-game), bulk TCP flows over QUIC STREAM under Quinn BBR
-    // and `native_return::Credit`. The DATAGRAM lane carries only ACKs, control,
-    // <=16 KiB interactive streams, and ordered UDP. Keep its pace above
-    // `QueueBrake`'s 64 Kbps floor whenever bulk stream queueing or WAN RTT
-    // jitter adds delay, while still respecting low operator caps and tiny cwnd.
+    // On `native_return` sessions (both `2/native` and Game `2/mixed`), bulk
+    // TCP flows over QUIC STREAM under Quinn BBR, `Credit`, or `PathPace`. The
+    // DATAGRAM lane carries only Game UDP, ordered UDP, ACKs/control, and
+    // <=16 KiB interactive streams. Keep its pace above `QueueBrake`'s 64 Kbps
+    // floor whenever sparse UDP delivery or shared-link RTT jitter triggers a
+    // queue brake, while still respecting low operator caps and tiny cwnd.
     let floor = if rtt_us > 0 && cwnd > 0 {
         let native_cwnd_bps =
             (u128::from(cwnd) * 8_000_000 / u128::from(rtt_us)).min(u128::from(max_rate)) as u64;
@@ -2401,10 +2402,15 @@ async fn sender_with_inputs(
                     writer.set_loss_permille(credit.loss_permille());
                 }
             }
-            if native_returning && mixed_writes.is_none() && policy.adaptive && path.open() {
+            if native_returning && policy.adaptive && path.open() {
                 let cwnd = path.conn.cwnd_hint();
                 let rtt_us = path.conn.rtt_hint().as_micros().min(u128::from(u64::MAX)) as u64;
-                let floor = native_datagram_pace_floor(cwnd, rtt_us, policy.rate);
+                let max_rate = policy.rate.min(policy.group_rates[usize::from(path.group)]);
+                let base_floor = native_datagram_pace_floor(cwnd, rtt_us, max_rate);
+                let floor = mixed_writes
+                    .as_ref()
+                    .and_then(|writes| writes.path_pace_bps(path.id, path.conn.stable_id()))
+                    .map_or(base_floor, |pace| pace.max(base_floor));
                 controllers[usize::from(path.id)].floor_mixed_datagram_pace(now_us, floor);
             }
             path.writer.set_pace(if policy.adaptive {
@@ -2632,13 +2638,13 @@ async fn sender_with_inputs(
                         rtt_us,
                     );
                 }
-                if let Some(mixed_pace) = mixed_writes
-                    .as_ref()
-                    .and_then(|writes| writes.path_pace_bps(path.id, path.conn.stable_id()))
-                {
-                    controllers[usize::from(path.id)].floor_mixed_datagram_pace(now_us, mixed_pace);
-                } else if native_returning && mixed_writes.is_none() {
-                    let floor = native_datagram_pace_floor(cwnd, rtt_us, policy.rate);
+                if native_returning {
+                    let max_rate = policy.rate.min(policy.group_rates[usize::from(path.group)]);
+                    let base_floor = native_datagram_pace_floor(cwnd, rtt_us, max_rate);
+                    let floor = mixed_writes
+                        .as_ref()
+                        .and_then(|writes| writes.path_pace_bps(path.id, path.conn.stable_id()))
+                        .map_or(base_floor, |pace| pace.max(base_floor));
                     controllers[usize::from(path.id)].floor_mixed_datagram_pace(now_us, floor);
                 }
                 if policy.capacity_probe_bps > 0 {
@@ -3373,17 +3379,21 @@ async fn sender_with_inputs(
                 order = native_return::udp_order(order, &paths, policy.latency_target_ms);
             }
             if gaming_datagram {
-                // Prefer the earliest ready route; a blocked best route keeps
-                // every eligible fallback. Put a repair on an unused route
-                // first, without waiting for the original's acknowledgement.
-                order.sort_by(|&a, &b| {
-                    let used_a = repair && used & (1 << paths[a].id) != 0;
-                    let used_b = repair && used & (1 << paths[b].id) != 0;
-                    used_a.cmp(&used_b).then_with(|| {
-                        small_delivery::delay_ms(&paths[a])
-                            .total_cmp(&small_delivery::delay_ms(&paths[b]))
-                    })
-                });
+                // Prefer the earliest healthy route within the 10 ms Game slack
+                // so a lossy route under mixed TCP load yields to a clean timely
+                // sibling, while keeping every fallback. Rank unused routes
+                // independently before used routes so the first immediate copy
+                // chooses the cleanest surviving sibling.
+                let slack_ms = policy.control_latency_target_ms(stats::RETURN).min(10);
+                if repair {
+                    let (unused, already_used): (Vec<_>, Vec<_>) = order
+                        .into_iter()
+                        .partition(|&i| used & (1 << paths[i].id) == 0);
+                    order = native_return::udp_order(unused, &paths, slack_ms);
+                    order.extend(native_return::udp_order(already_used, &paths, slack_ms));
+                } else {
+                    order = native_return::udp_order(order, &paths, slack_ms);
+                }
             }
             // AUTO originals prefer a ready faster route in the same protection
             // tier. Repairs/fixed policies retain the opt-in frontier treatment.

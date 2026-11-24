@@ -341,6 +341,7 @@ pub(super) struct Credit {
     current: u64,
     max_cwnd: u64,
     last_cwnd_growth_us: u64,
+    last_flush_check_us: u64,
     loss_ceiling: Option<u64>,
     loss_hold_until_us: u64,
     loss_cautious_until_us: u64,
@@ -369,11 +370,17 @@ struct CreditSample {
 
 // A cwnd/RTT bound is sufficient to distinguish a much slower path. Actual
 // unsent bytes must also show that its current window is building a queue.
-// By Little's Law, a stream bounded by `MAX_SEND_WINDOW` cannot sustain more
-// than `MAX_SEND_WINDOW` bytes per RTT even when BBR Startup overshoots `cwnd`.
+// By Little's Law, a stream bounded by `window_cap` cannot sustain more than
+// `window_cap` bytes per RTT even when BBR Startup overshoots `cwnd`.
+#[cfg(test)]
 pub(super) fn service_bound(conn: &quinn::Connection) -> u64 {
-    let cwnd_service = conn.cwnd_hint().min(MAX_SEND_WINDOW).saturating_mul(1_000)
-        / conn.rtt_hint().as_micros().max(1) as u64;
+    service_bound_capped(conn, MAX_SEND_WINDOW)
+}
+
+fn service_bound_capped(conn: &quinn::Connection, window_cap: u64) -> u64 {
+    let cap = window_cap.clamp(SLOW_PATH_MIN_WINDOW, MAX_SEND_WINDOW);
+    let cwnd_service =
+        conn.cwnd_hint().min(cap).saturating_mul(1_000) / conn.rtt_hint().as_micros().max(1) as u64;
     // When a slow bufferbloated link drains back to `min_rtt`, BBR can briefly
     // retain a large historical `cwnd` while `pacing_rate` already reflects the
     // true sub-megabit bottleneck. `pacing_bps / 3_000` equals `2.0 * bw` even
@@ -444,6 +451,7 @@ impl Credit {
                 current: initial_window,
                 max_cwnd: stats.path.cwnd,
                 last_cwnd_growth_us: 0,
+                last_flush_check_us: now_us,
                 loss_ceiling: None,
                 loss_hold_until_us: 0,
                 loss_cautious_until_us: 0,
@@ -455,7 +463,10 @@ impl Credit {
             return None;
         }
         if now_us.saturating_sub(self.sampled_us) < 100_000 {
-            if self.delivery.ceiling_bytes_per_ms.is_some() {
+            if self.delivery.ceiling_bytes_per_ms.is_some()
+                && now_us.saturating_sub(self.last_flush_check_us) >= 20_000
+            {
+                self.last_flush_check_us = now_us;
                 let (retained, unsent) = conn.stream_send_buffer_bytes();
                 if retained == 0 && unsent == 0 {
                     let acked = conn.stats().stream_payload_bytes_acked;
@@ -471,6 +482,7 @@ impl Credit {
             }
             return None;
         }
+        self.last_flush_check_us = now_us;
         let stats = conn.stats();
         let rtt = conn.rtt_hint();
         let rtt_us = rtt.as_micros().min(u128::from(u64::MAX)) as u64;
@@ -497,7 +509,7 @@ impl Credit {
         {
             self.delivery.record_drought(now_us, acked, 1);
         }
-        let mut own_service = service_bound(conn);
+        let mut own_service = service_bound_capped(conn, self.window_bound(conn));
         if let Some(ceiling) = self.delivery.ceiling_bytes_per_ms
             && ceiling.saturating_mul(4) < own_service
         {
@@ -527,8 +539,16 @@ impl Credit {
         )
     }
 
+    pub(super) fn window_bound(&self, conn: &quinn::Connection) -> u64 {
+        if self.connection == Some(conn.stable_id()) && self.current > 0 {
+            self.current
+        } else {
+            MAX_SEND_WINDOW
+        }
+    }
+
     pub(super) fn effective_service(&self, conn: &quinn::Connection) -> u64 {
-        let mut service = service_bound(conn);
+        let mut service = service_bound_capped(conn, self.window_bound(conn));
         if self.connection != Some(conn.stable_id()) {
             return service.max(1);
         }
@@ -651,14 +671,17 @@ impl Credit {
             && actually_pinned
             && (sample.ack_progress || sample.bulk_written >= INITIAL_SEND_WINDOW)
         {
-            sample
-                .retained
-                .saturating_add(4 * PAYLOAD as u64)
-                .min(if sample.ack_progress {
-                    MAX_SEND_WINDOW
-                } else {
-                    self.current
-                })
+            let max_retained = if sample.queued {
+                2 * INITIAL_SEND_WINDOW
+            } else {
+                MAX_SEND_WINDOW * 3 / 4
+            };
+            let cap = if sample.ack_progress {
+                max_retained
+            } else {
+                self.current.min(max_retained)
+            };
+            sample.retained.saturating_add(4 * PAYLOAD as u64).min(cap)
         } else {
             0
         };
@@ -691,10 +714,11 @@ impl Credit {
         } else {
             cwnd_cap.max(self.current).min(MAX_SEND_WINDOW)
         };
-        // Queue-only braking trims excess unsent buffer above `cwnd + headroom`
-        // so Quinn BBR never becomes `app_limited` (`in_flight < cwnd` with
-        // `unsent == 0`), which would trap BBR in `Mode::Startup` (`2.89x`
-        // pacing gain) or starve `ProbeBw` below full pipe occupancy.
+        // Queue-only braking trims excess buffer above `bdp_floor` (`<= 2 MiB`,
+        // matching 0.7.2's `WINDOW` floor) so multi-path sessions never pin
+        // 3-4 MiB per path of standing queue when an overshot BBR Startup `cwnd`
+        // gets trapped in `app_limited`, while keeping Quinn out of `app_limited`
+        // on moderate-BDP WAN paths.
         let effective_bdp_cwnd =
             if !exercised_slow && !sample.deeply_queued && sample.unsent <= SLOW_PATH_WRITER_MARGIN
             {
@@ -702,12 +726,17 @@ impl Credit {
             } else {
                 sample.cwnd
             };
+        let bdp_cap = if sample.deeply_queued || (sample.queued && sample.cwnd > MAX_SEND_WINDOW) {
+            2 * INITIAL_SEND_WINDOW
+        } else {
+            MAX_SEND_WINDOW * 3 / 4
+        };
         let bdp_floor = effective_bdp_cwnd
             .saturating_add(2 * SLOW_PATH_WRITER_MARGIN)
             .max(retained_floor)
             .clamp(
                 MIN_SEND_WINDOW,
-                (MAX_SEND_WINDOW * 3 / 4)
+                bdp_cap
                     .max(retained_floor)
                     .min(effective_cap.max(MIN_SEND_WINDOW)),
             );
@@ -762,12 +791,7 @@ impl Credit {
             if severe_loss {
                 self.loss_cautious_until_us = now_us.saturating_add(LOSS_CAUTIOUS_US);
             }
-            let max_step = if sample.deeply_queued {
-                SEND_WINDOW_MAX_GROWTH / 2
-            } else {
-                SEND_WINDOW_MAX_GROWTH
-            };
-            let step = self.current.clamp(SEND_WINDOW_GROWTH, max_step);
+            let step = (self.current / 2).clamp(SEND_WINDOW_GROWTH, SEND_WINDOW_MAX_GROWTH / 2);
             (self.current + step)
                 .min(bdp_floor)
                 .max(retained_floor)
@@ -809,11 +833,7 @@ impl Credit {
             && sample.unsent > SLOW_PATH_BACKLOG_THRESHOLD
         {
             slow_window.min(self.current)
-        } else if sample.deeply_queued
-            && sample.unsent > SLOW_PATH_WRITER_MARGIN
-            && self.current > bdp_floor
-            && brake_ready
-        {
+        } else if sample.deeply_queued && self.current > bdp_floor && brake_ready {
             self.last_brake_us = now_us;
             (self.current.saturating_mul(3) / 4)
                 .max(bdp_floor)
@@ -842,13 +862,13 @@ impl Credit {
                     .map_or(self.current, |ceiling| self.current.min(ceiling))
                     .max(retained_floor)
                     .min(cwnd_cap)
-            } else if now_us < self.loss_cautious_until_us {
-                (self.current + SEND_WINDOW_GROWTH)
-                    .max(retained_floor)
-                    .min(cwnd_cap)
-            } else if sample_has_loss {
+            } else if sample_has_loss || sample.queued {
                 (self.current + SEND_WINDOW_GROWTH)
                     .min(bdp_floor.max(self.current))
+                    .max(retained_floor)
+                    .min(cwnd_cap)
+            } else if now_us < self.loss_cautious_until_us {
+                (self.current + SEND_WINDOW_GROWTH)
                     .max(retained_floor)
                     .min(cwnd_cap)
             } else {
@@ -914,6 +934,7 @@ pub(super) struct Flight {
     written: bool,
 }
 impl Flight {
+    #[cfg(test)]
     fn new(
         pending: outbound::Pending,
         path: u8,
@@ -1093,7 +1114,7 @@ pub(super) fn drain(
             .loss_permille()
             .max(credits[id].loss_permille())
             .min(1_000);
-        let mut service = service_bound(&path.conn);
+        let mut service = service_bound_capped(&path.conn, credits[id].window_bound(&path.conn));
         if unsent > 0
             && cwnd <= PAYLOAD as u64
             && let Some(pacing_bps) = path.conn.congestion_state().metrics().pacing_rate
@@ -1337,10 +1358,12 @@ struct PathPace {
     packets: u64,
     lost: u64,
     tx_bytes: u64,
+    loss_permille: u64,
     queue_braked: bool,
     last_pressure_us: Option<u64>,
 }
 impl PathPace {
+    #[cfg(test)]
     fn new(connection: usize, now_us: u64, ceiling: u64) -> Self {
         let mut credit = outbound::Pacer::for_sender(ceiling.min(20_000_000), 2 * PART_WIRE_BYTES);
         credit.set_rate(now_us, credit.rate());
@@ -1351,6 +1374,51 @@ impl PathPace {
             packets: 0,
             lost: 0,
             tx_bytes: 0,
+            loss_permille: 0,
+            queue_braked: false,
+            last_pressure_us: None,
+        }
+    }
+
+    fn for_connection(
+        connection: usize,
+        conn: &quinn::Connection,
+        now_us: u64,
+        ceiling: u64,
+        multipath: bool,
+    ) -> Self {
+        let stats = conn.stats();
+        let prior_lossy = stats.path.sent_packets >= 32
+            && stats.path.lost_packets.saturating_mul(200) > stats.path.sent_packets;
+        let initial_cap = if multipath && prior_lossy {
+            8_000_000
+        } else {
+            20_000_000
+        };
+        let initial_rate = ceiling.min(initial_cap);
+        let mut credit = outbound::Pacer::for_sender(initial_rate, 2 * PART_WIRE_BYTES);
+        credit.set_rate(now_us, credit.rate());
+        let loss_permille = if prior_lossy {
+            (stats.path.lost_packets.saturating_mul(1_000) / stats.path.sent_packets.max(1))
+                .min(1_000)
+        } else {
+            0
+        };
+        if multipath && prior_lossy {
+            let (retained, _) = conn.stream_send_buffer_bytes();
+            let win = (384 * 1024)
+                .max(retained.saturating_add(2 * PART_BYTES as u64))
+                .min(MIXED_SEND_WINDOW);
+            conn.set_send_window(win);
+        }
+        Self {
+            connection,
+            credit,
+            sampled_us: now_us,
+            packets: stats.path.sent_packets,
+            lost: stats.path.lost_packets,
+            tx_bytes: stats.udp_tx.bytes,
+            loss_permille,
             queue_braked: false,
             last_pressure_us: None,
         }
@@ -1372,6 +1440,15 @@ impl PathPace {
         self.tx_bytes = stats.udp_tx.bytes;
         self.sampled_us = now_us;
 
+        if packets >= 16 {
+            let sample_permille = (lost.saturating_mul(1_000) / packets).min(1_000);
+            self.loss_permille = if sample_permille < 10 {
+                self.loss_permille / 2
+            } else {
+                (self.loss_permille * 3 + sample_permille * 5) / 8
+            };
+        }
+
         let rate = self.credit.rate();
         let actual_bps = (u128::from(tx_bytes) * 8_000_000 / u128::from(elapsed_us.max(1)))
             .min(u128::from(ceiling)) as u64;
@@ -1383,14 +1460,24 @@ impl PathPace {
         let rtt_excess = path.rtt.saturating_sub(path.min_rtt);
         let queued = rtt_excess > std::time::Duration::from_millis(10);
         let deeply_queued = packets >= 64 && rtt_excess > std::time::Duration::from_millis(15);
-        let lossy = packets >= 64 && lost.saturating_mul(200) > packets;
+        let heavy_loss = packets >= 32 && lost.saturating_mul(20) >= packets;
+        let lossy = packets >= 48 && lost.saturating_mul(200) > packets;
         // RTT includes both directions. Apply one gentle delay brake per
         // moderate episode without exiting initial ramp on a single upload RTT
         // bump; deep queueing or local loss records real bottleneck pressure so
-        // the pacer cruises gently without repeatedly hitting tail drop.
-        let next = if lossy {
+        // the pacer cruises gently without repeatedly hitting tail drop on a
+        // shared Game session.
+        let next = if heavy_loss {
             self.last_pressure_us = Some(now_us);
-            (loss_base * 19 / 20).max(4_000_000)
+            let cap_base = if actual_bps >= 2_000_000 {
+                rate.min(actual_bps)
+            } else {
+                rate
+            };
+            (cap_base * 4 / 5).max(3_000_000)
+        } else if lossy {
+            self.last_pressure_us = Some(now_us);
+            (loss_base * 9 / 10).max(4_000_000)
         } else if deeply_queued && !conn.probing_rtt_hint() {
             self.last_pressure_us = Some(now_us);
             (rate * 19 / 20).max(4_000_000)
@@ -1399,21 +1486,39 @@ impl PathPace {
                 self.last_pressure_us = Some(now_us);
             }
             (rate * 19 / 20).max(4_000_000)
-        } else if !queued && packets >= 64 && !conn.probing_rtt_hint() {
+        } else if !queued && packets >= 48 && !conn.probing_rtt_hint() {
             let (grown, headroom) = match self.last_pressure_us {
-                None => (rate + rate / 10, 112),
+                None => (rate + rate / 10, 115),
+                Some(at) if now_us.saturating_sub(at) >= 500_000 && self.loss_permille < 10 => {
+                    (rate + (rate / 32).max(500_000), 110)
+                }
                 Some(at) if now_us.saturating_sub(at) >= 600_000 => {
                     (rate + (rate / 64).max(300_000), 105)
                 }
                 Some(_) => (rate, 105),
             };
-            let envelope = (actual_bps.saturating_mul(headroom) / 100).max(20_000_000);
+            let min_envelope = if self.last_pressure_us.is_none() {
+                20_000_000
+            } else {
+                4_000_000
+            };
+            let envelope = (actual_bps.saturating_mul(headroom) / 100).max(min_envelope);
             grown.min(envelope.max(rate))
         } else {
             rate
         };
         self.queue_braked = queued;
-        self.credit.set_rate(now_us, next.min(ceiling));
+        let applied = next.min(ceiling);
+        self.credit.set_rate(now_us, applied);
+        let rtt_us = path.rtt.as_micros().min(u128::from(u64::MAX)) as u64;
+        if rtt_us > 0 && (self.loss_permille >= 10 || self.last_pressure_us.is_some()) {
+            let (retained, _) = conn.stream_send_buffer_bytes();
+            let bdp = (u128::from(applied) * u128::from(rtt_us) / 8_000_000) as u64;
+            let target_win = (bdp.saturating_mul(2) + 128 * 1024)
+                .max(retained.saturating_add(2 * PART_BYTES as u64))
+                .clamp(256 * 1024, MIXED_SEND_WINDOW);
+            conn.set_send_window(target_win);
+        }
     }
 }
 
@@ -1431,6 +1536,24 @@ impl MixedWrites {
             .as_ref()
             .filter(|pace| pace.connection == connection)
             .map(|pace| pace.credit.rate())
+    }
+
+    fn mixed_path_service(&self, path: &OutPath) -> u64 {
+        let mut service = service_bound_capped(&path.conn, MIXED_SEND_WINDOW);
+        let id = usize::from(path.id);
+        let connection = path.conn.stable_id();
+        if let Some(pace) = self.path_pace[id]
+            .as_ref()
+            .filter(|p| p.connection == connection)
+        {
+            service = service.min((pace.credit.rate() / 8_000).max(1));
+            if pace.loss_permille >= 50 {
+                let surviving = 1_000u64.saturating_sub(pace.loss_permille.min(1_000));
+                service = (service.saturating_mul(surviving).saturating_mul(surviving) / 1_000_000)
+                    .max(1);
+            }
+        }
+        service.max(1)
     }
 
     pub fn refund(
@@ -1474,6 +1597,8 @@ impl MixedWrites {
                         .is_some_and(|w| w.reachable.load(Ordering::Acquire))
             })
             .count();
+        let mut path_ranks: [(bool, u64); super::MAX_PATHS] = [(true, u64::MAX); super::MAX_PATHS];
+        let mut straggler_limit_us = u64::MAX;
         if active_native >= 2 {
             let best_service = paths
                 .iter()
@@ -1483,12 +1608,46 @@ impl MixedWrites {
                         && p.native_return.is_some()
                         && !p.conn.probing_rtt_hint()
                 })
-                .map(|p| service_bound(&p.conn))
+                .map(|p| self.mixed_path_service(p))
                 .max()
                 .unwrap_or(0);
             let next_bytes = queue
                 .front(false)
                 .map_or(PART_BYTES as u64, |p| p.data.len() as u64);
+            let mut best_ect_us = u64::MAX;
+            for path in paths.iter() {
+                let id = usize::from(path.id);
+                let Some(writer) = &path.native_return else {
+                    continue;
+                };
+                if !path.open()
+                    || silent & (1 << id) != 0
+                    || !writer.reachable.load(Ordering::Acquire)
+                {
+                    continue;
+                }
+                let (retained, unsent) = path.conn.stream_send_buffer_bytes();
+                let queued = retained
+                    + ((writer.tx.max_capacity() - writer.tx.capacity()) * PART_BYTES) as u64;
+                let cold = writer.written_bytes() < COLD_BULK_MIN_BYTES
+                    && unsent <= SLOW_PATH_BACKLOG_THRESHOLD;
+                let rank = path_completion_rank(
+                    path.conn.probing_rtt_hint(),
+                    path.conn.rtt_hint().as_micros() as u64,
+                    queued,
+                    next_bytes,
+                    self.mixed_path_service(path),
+                    cold,
+                    best_service,
+                );
+                path_ranks[id] = rank;
+                if !rank.0 {
+                    best_ect_us = best_ect_us.min(rank.1);
+                }
+            }
+            if best_ect_us < u64::MAX {
+                straggler_limit_us = best_ect_us.saturating_mul(2).saturating_add(150_000);
+            }
             // Finish already-started partial records first, then rank idle paths
             // by estimated completion time for new records.
             order.sort_by_cached_key(|&i| {
@@ -1503,20 +1662,7 @@ impl MixedWrites {
                 if !path.open() || silent & (1 << id) != 0 || writer.tx.capacity() == 0 {
                     return (!has_partial, true, u64::MAX);
                 }
-                let (retained, unsent) = path.conn.stream_send_buffer_bytes();
-                let queued = retained
-                    + ((writer.tx.max_capacity() - writer.tx.capacity()) * PART_BYTES) as u64;
-                let cold = writer.written_bytes() < COLD_BULK_MIN_BYTES
-                    && unsent <= SLOW_PATH_BACKLOG_THRESHOLD;
-                let (probing, ect) = path_completion_rank(
-                    path.conn.probing_rtt_hint(),
-                    path.conn.rtt_hint().as_micros() as u64,
-                    queued,
-                    next_bytes,
-                    service_bound(&path.conn),
-                    cold,
-                    best_service,
-                );
+                let (probing, ect) = path_ranks[id];
                 (!has_partial, probing, ect)
             });
         }
@@ -1561,6 +1707,17 @@ impl MixedWrites {
                 if avoids_path(queue) {
                     continue;
                 }
+                let is_rescue = queue
+                    .front(false)
+                    .and_then(|record| record.hold.as_ref())
+                    .and_then(|hold| hold.avoid_path())
+                    .is_some();
+                if !is_rescue && straggler_limit_us < u64::MAX {
+                    let (probing, ect) = path_ranks[id];
+                    if probing || ect > straggler_limit_us {
+                        continue;
+                    }
+                }
             }
             let Some(bytes) = self.partial[id]
                 .as_ref()
@@ -1589,10 +1746,17 @@ impl MixedWrites {
                 .as_ref()
                 .is_none_or(|pace| pace.connection != connection)
             {
-                *slot = Some(PathPace::new(connection, now_us, ceiling));
+                *slot = Some(PathPace::for_connection(
+                    connection,
+                    &path.conn,
+                    now_us,
+                    ceiling,
+                    active_native >= 2,
+                ));
             }
             let path_pace = slot.as_mut().expect("path pacer");
             path_pace.observe(&path.conn, now_us, ceiling);
+            writer.set_loss_permille(path_pace.loss_permille);
             // Charge actual QUIC STREAM packet overhead on the per-path mixed
             // pacer while keeping the conservative wire allowance on shared caps.
             let pace_cost = count + H3_PART_ALLOWANCE + count.div_ceil(1200) * 48;
@@ -1604,10 +1768,28 @@ impl MixedWrites {
             let last = count == bytes.len();
             let remaining = (!last).then(|| (connection, bytes.slice(count..)));
             let flight = self.partial[id].is_none().then(|| {
-                Flight::new(
-                    queue.pop(false).expect("native queue front"),
+                let pending = queue.pop(false).expect("native queue front");
+                let rtt = path.conn.rtt_hint();
+                let expected_rtt = if active_native >= 2 {
+                    let (retained, _) = path.conn.stream_send_buffer_bytes();
+                    let staged =
+                        ((writer.tx.max_capacity() - writer.tx.capacity()) * PART_BYTES) as u64;
+                    let full_queued = retained
+                        .saturating_add(staged)
+                        .saturating_add(pending.data.len() as u64);
+                    let service = self.mixed_path_service(path).max(1);
+                    let rtt_us = rtt.as_micros().min(u128::from(u64::MAX)) as u64;
+                    std::time::Duration::from_micros(
+                        rtt_us.saturating_add(full_queued.saturating_mul(1_000) / service),
+                    )
+                } else {
+                    std::time::Duration::ZERO
+                };
+                Flight::new_with_ect(
+                    pending,
                     path.id,
-                    path.conn.rtt_hint(),
+                    rtt,
+                    expected_rtt,
                     writer.reachable.clone(),
                 )
             });
@@ -3115,5 +3297,136 @@ mod tests {
         sample.lost += 2;
         assert_eq!(relay.update(23_000_000, sample), None);
         assert_eq!(relay.current, INITIAL_SEND_WINDOW);
+    }
+
+    #[tokio::test]
+    async fn overshot_startup_cwnd_brakes_to_two_mib_and_mixed_drain_bounds_stragglers() {
+        // 1. When BBR Startup overshoots `cwnd` to 10 MiB and packetizes all
+        // 4 MiB into a congested bottleneck (`unsent == 0`, `deeply_queued`),
+        // `Credit` must brake back down to `2 * INITIAL_SEND_WINDOW` (2 MiB)
+        // rather than pinning 3-4 MiB per path of standing bufferbloat.
+        let mut bloated = Credit {
+            current: MAX_SEND_WINDOW,
+            max_cwnd: 10 * 1024 * 1024,
+            ..Default::default()
+        };
+        let mut sample = CreditSample {
+            cwnd: 10 * 1024 * 1024,
+            rtt_us: 120_000,
+            sent: 400,
+            lost: 0,
+            queued: true,
+            deeply_queued: true,
+            probing: false,
+            storage_limited: false,
+            ack_progress: true,
+            retained: 3 * 1024 * 1024,
+            unsent: 0,
+            bulk_written: 8 * INITIAL_SEND_WINDOW,
+            initial_window: INITIAL_SEND_WINDOW,
+            faster_route: false,
+        };
+        bloated.acked = 8 * INITIAL_SEND_WINDOW;
+        let mut now_us = 1_000_000;
+        for _ in 0..6 {
+            sample.sent += 300;
+            now_us += BRAKE_COOLDOWN_MIN_US;
+            bloated.update(now_us, sample);
+            sample.retained = bloated.current;
+        }
+        assert_eq!(bloated.current, 2 * INITIAL_SEND_WINDOW);
+
+        // Mild queueing or >=1% packet loss must not re-inflate above 2 MiB.
+        sample.deeply_queued = false;
+        sample.queued = true;
+        sample.storage_limited = true;
+        sample.sent += 200;
+        now_us += BRAKE_COOLDOWN_MIN_US;
+        assert_eq!(bloated.update(now_us, sample), None);
+        assert_eq!(bloated.current, 2 * INITIAL_SEND_WINDOW);
+
+        // 2. Multi-path `MixedWrites::drain` starts clean siblings at 12 Mbps,
+        // records non-zero `expected_rtt`, and skips starting new 32 KiB records
+        // on a heavily lossy slow straggler while a fast sibling is open.
+        let pair0 = super::super::sender_ready_tests::Pair::connect().await;
+        let pair1 = super::super::sender_ready_tests::Pair::connect().await;
+        let mut fast = pair0.path();
+        let mut slow = pair1.path();
+        fast.id = 0;
+        slow.id = 1;
+        let (w0, mut r0) = mixed_channel();
+        let (w1, mut r1) = mixed_channel();
+        w0.written_bytes
+            .store(COLD_BULK_MIN_BYTES, Ordering::Relaxed);
+        w1.written_bytes
+            .store(COLD_BULK_MIN_BYTES, Ordering::Relaxed);
+        fast.native_return = Some(w0);
+        slow.native_return = Some(w1);
+        let fast_cid = fast.conn.stable_id();
+        let slow_cid = slow.conn.stable_id();
+        let paths = [fast, slow];
+
+        let gauge = Arc::new(outbound::Gauge::default());
+        let mut queue = outbound::Queue::default();
+        for id in [1u64, 2] {
+            let hold = gauge.hold(21, (id - 1) * PAYLOAD as u64, 1, PAYLOAD, false, false);
+            queue
+                .push(outbound::Pending {
+                    game_datagram: false,
+                    data: encoded(),
+                    created: Instant::now(),
+                    flow: Some(stream::data_flow(21)),
+                    record_id: Some(id),
+                    block: None,
+                    small: false,
+                    hold: Some(hold),
+                })
+                .ok()
+                .unwrap();
+        }
+        let mut writes = MixedWrites::default();
+        let mut slow_pace =
+            PathPace::for_connection(slow_cid, &paths[1].conn, 100_000, 100_000_000, true);
+        assert_eq!(slow_pace.credit.rate(), 20_000_000);
+        slow_pace.credit.set_rate(100_000, 3_000_000);
+        slow_pace.loss_permille = 850;
+        writes.path_pace[1] = Some(slow_pace);
+
+        let mut fast_pace =
+            PathPace::for_connection(fast_cid, &paths[0].conn, 100_000, 100_000_000, true);
+        fast_pace.credit.set_rate(100_000, 80_000_000);
+        writes.path_pace[0] = Some(fast_pace);
+
+        let mut cursor = 0;
+        let mut pacer = outbound::Pacer::for_sender(100_000_000, 32 * 1024)
+            .with_packet_reserve(super::super::GAME_PACKET_RESERVE);
+        let mut groups = std::array::from_fn(|_| {
+            outbound::Pacer::for_sender(100_000_000, 32 * 1024)
+                .with_packet_reserve(super::super::GAME_PACKET_RESERVE)
+        });
+        pacer.refill(150_000);
+        for g in &mut groups {
+            g.refill(150_000);
+        }
+        writes.drain(
+            &mut queue,
+            &paths,
+            0,
+            &mut cursor,
+            &mut pacer,
+            &mut groups,
+            150_000,
+            0,
+            None,
+        );
+        assert!(r0.rx.try_recv().is_ok(), "fast sibling starts record 1");
+        assert!(
+            r1.rx.try_recv().is_err(),
+            "heavily lossy straggler must not steal record 2 ahead of fast sibling"
+        );
+        assert_eq!(queue.len(), 1);
+        let sent = gauge.take_sent();
+        assert_eq!(sent.len(), 1);
+        assert!(sent[0].expected_rtt > std::time::Duration::ZERO);
     }
 }
