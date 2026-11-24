@@ -1169,13 +1169,23 @@ impl Sender {
                     .clamp(Duration::from_millis(350), Duration::from_millis(1_000))
             };
             let stall_at = segment.sent_at + stall_delay;
+            let rescue_rtt = self
+                .transport_rtt
+                .iter()
+                .enumerate()
+                .filter(|&(i, d)| i != segment.path && !d.is_zero())
+                .map(|(_, &d)| d)
+                .min()
+                .unwrap_or(rtt);
             let settle_at =
-                now + (rtt / 2).clamp(Duration::from_millis(40), Duration::from_millis(120));
+                now + (rescue_rtt / 2).clamp(Duration::from_millis(40), Duration::from_millis(120));
             let rate_limit_at = self.last_head_probe.map_or(now, |last| {
                 last + if is_reliable_tail {
-                    rtt.max(Duration::from_millis(120))
+                    rescue_rtt.clamp(Duration::from_millis(120), Duration::from_millis(260))
                 } else {
-                    rtt.mul_f64(2.0).max(Duration::from_millis(260))
+                    rescue_rtt
+                        .mul_f64(2.0)
+                        .clamp(Duration::from_millis(260), Duration::from_millis(500))
                 }
             });
             let at = stall_at.max(settle_at).max(rate_limit_at);

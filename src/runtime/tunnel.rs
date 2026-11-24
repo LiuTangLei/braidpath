@@ -2369,7 +2369,7 @@ async fn sender_with_inputs(
                         && !liveness[usize::from(path.id)].silent()
                         && !path.conn.probing_rtt_hint()
                 })
-                .map(|path| native_return::service_bound(&path.conn))
+                .map(|path| native_credit[usize::from(path.id)].effective_service(&path.conn))
                 .max()
                 .unwrap_or(0)
         } else {
@@ -2377,7 +2377,8 @@ async fn sender_with_inputs(
         };
         for path in paths.iter() {
             if let Some(writer) = &path.native_return {
-                writer.set_reachable(path.open() && !liveness[usize::from(path.id)].silent());
+                let path_reachable = path.open() && !liveness[usize::from(path.id)].silent();
+                writer.set_reachable(path_reachable);
                 if mixed_writes.is_none() {
                     let initial_window = if metrics.direction == stats::FORWARD {
                         native_return::INITIAL_UPLOAD_SEND_WINDOW
@@ -2385,14 +2386,16 @@ async fn sender_with_inputs(
                         native_return::INITIAL_SEND_WINDOW
                     };
                     let credit = &mut native_credit[usize::from(path.id)];
-                    if let Some(window) = credit.observe(
+                    let restored = credit.observe_reachability(path_reachable);
+                    let observed = credit.observe(
                         &path.conn,
                         now_us,
                         policy.latency_target_ms,
                         best_native_service,
                         writer.written_bytes(),
                         initial_window,
-                    ) {
+                    );
+                    if let Some(window) = observed.or(restored) {
                         path.conn.set_send_window(window);
                         info!(target: "braidpath::native_credit", path=path.id, window_bytes=window,
                             "native return storage credit changed");
