@@ -40,14 +40,18 @@ impl SendBuffer {
         self.unacked_segments.push_back(data);
     }
 
-    /// Discard a range of acknowledged stream data
-    pub(super) fn ack(&mut self, mut range: Range<u64>) {
+    /// Discard acknowledged stream data and return newly acknowledged payload bytes.
+    pub(super) fn ack(&mut self, mut range: Range<u64>) -> u64 {
         // Clamp the range to data which is still tracked
         let base_offset = self.offset - self.unacked_len as u64;
         range.start = base_offset.max(range.start);
         range.end = base_offset.max(range.end);
 
-        self.acks.insert(range);
+        if range.is_empty() {
+            return 0;
+        }
+        let len = range.end - range.start;
+        let overlap: u64 = self.acks.replace(range).map(|r| r.end - r.start).sum();
 
         while self.acks.min() == Some(self.offset - self.unacked_len as u64) {
             let prefix = self.acks.pop_min().unwrap();
@@ -75,6 +79,7 @@ impl SendBuffer {
                 }
             }
         }
+        len - overlap
     }
 
     /// Compute the next range to transmit on this stream and update state to account for that

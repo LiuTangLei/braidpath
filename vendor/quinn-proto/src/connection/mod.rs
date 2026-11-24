@@ -1658,7 +1658,7 @@ impl Connection {
         }
 
         for frame in info.stream_frames {
-            self.streams.received_ack_of(frame);
+            self.stats.stream_payload_bytes_acked += self.streams.received_ack_of(frame);
         }
     }
 

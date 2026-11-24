@@ -111,10 +111,10 @@ impl Send {
         }
     }
 
-    /// Returns whether the stream has been finished and all data has been acknowledged by the peer
-    pub(super) fn ack(&mut self, frame: frame::StreamMeta) -> bool {
-        self.pending.ack(frame.offsets);
-        match self.state {
+    /// Returns whether the stream finished and how many payload bytes were newly acknowledged.
+    pub(super) fn ack(&mut self, frame: frame::StreamMeta) -> (bool, u64) {
+        let newly_acked = self.pending.ack(frame.offsets);
+        let finished = match self.state {
             SendState::DataSent {
                 ref mut finish_acked,
             } => {
@@ -122,7 +122,8 @@ impl Send {
                 *finish_acked && self.pending.is_fully_acked()
             }
             _ => false,
-        }
+        };
+        (finished, newly_acked)
     }
 
     /// Handle increase to stream-level flow control limit

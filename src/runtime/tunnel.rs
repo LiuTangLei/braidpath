@@ -2963,6 +2963,7 @@ async fn sender_with_inputs(
             native_return::drain(
                 &mut native_queue,
                 &paths,
+                &native_credit,
                 silent,
                 &mut native_cursor,
                 &mut pacer,

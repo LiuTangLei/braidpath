@@ -694,9 +694,9 @@ impl StreamsState {
         }
     }
 
-    pub(crate) fn received_ack_of(&mut self, frame: frame::StreamMeta) {
+    pub(crate) fn received_ack_of(&mut self, frame: frame::StreamMeta) -> u64 {
         let mut entry = match self.send.entry(frame.id) {
-            hash_map::Entry::Vacant(_) => return,
+            hash_map::Entry::Vacant(_) => return 0,
             hash_map::Entry::Occupied(e) => e,
         };
 
@@ -707,26 +707,26 @@ impl StreamsState {
                 // this closure should be unreachable. If we did somehow screw that up,
                 // then we might hit an underflow below with unpredictable effects down
                 // the line. Best to short-circuit.
-                return;
+                return 0;
             }
         };
 
         if stream.is_reset() {
             // We account for outstanding data on reset streams at time of reset
-            return;
+            return 0;
         }
         let id = frame.id;
         let buffered = stream.pending.buffered();
-        let finished = stream.ack(frame);
+        let (finished, newly_acked) = stream.ack(frame);
         self.buffered_data -= buffered - stream.pending.buffered();
         if !finished {
-            // The stream is unfinished or may still need retransmits
-            return;
+            return newly_acked;
         }
 
         entry.remove_entry();
         self.stream_freed(id, StreamHalf::Send);
         self.events.push_back(StreamEvent::Finished { id });
+        newly_acked
     }
 
     pub(crate) fn retransmit(&mut self, frame: frame::StreamMeta) {
@@ -1112,21 +1112,35 @@ mod tests {
         assert_eq!(send.pending.poll_transmit(16).0, 16..23);
         assert_eq!(send.pending.poll_transmit(16).0, 23..24);
 
-        server.received_ack_of(frame::StreamMeta {
+        let suffix = frame::StreamMeta {
             id,
             offsets: 16..23,
             fin: false,
-        });
+        };
+        server.retransmit(suffix.clone());
+        assert_eq!(server.received_ack_of(suffix.clone()), 7);
+        assert_eq!(server.received_ack_of(suffix), 0);
+        assert_eq!(
+            server.received_ack_of(frame::StreamMeta {
+                id,
+                offsets: 12..20,
+                fin: false
+            }),
+            4
+        );
         assert_eq!(
             server.write_limit(),
             0,
             "acknowledged suffix still occupies storage"
         );
-        server.received_ack_of(frame::StreamMeta {
-            id,
-            offsets: 0..16,
-            fin: false,
-        });
+        assert_eq!(
+            server.received_ack_of(frame::StreamMeta {
+                id,
+                offsets: 0..16,
+                fin: false
+            }),
+            12
+        );
         assert_eq!(
             server.write_limit(),
             0,

@@ -174,6 +174,8 @@ pub struct ConnectionStats {
     /// Encoded STREAM frame bytes selected for transmission, including repairs.
     /// Excludes packet headers, padding and UDP/IP overhead.
     pub stream_frame_bytes_tx: u64,
+    /// Unique STREAM payload bytes acknowledged by the peer across all streams.
+    pub stream_payload_bytes_acked: u64,
     /// Encoded DATAGRAM frame bytes selected for transmission.
     pub datagram_frame_bytes_tx: u64,
     /// Encoded ACK frame bytes selected for transmission.

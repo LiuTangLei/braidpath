@@ -143,8 +143,8 @@ const fn wire_cost(bytes: usize) -> usize {
 /// immediate multi-path BBR Startup.
 pub(super) const INITIAL_SEND_WINDOW: u64 = 1024 * 1024;
 /// Client-to-server access uplinks are frequently asymmetric (sub-megabit to
-/// tens of Mbit/s). Start upload streams at 256 KiB so a 0.4 Mbps straggler
-/// drains within ~6-7 s rather than absorbing 1 MiB (~19 s), while healthy
+/// tens of Mbit/s). Start upload streams at 128 KiB so a 0.4 Mbps straggler
+/// drains within ~3 s rather than absorbing 1 MiB (~19 s), while healthy
 /// multi-megabit uplinks already start at full BDP and double to `MAX_SEND_WINDOW`
 /// via Quinn's native flow-control waker.
 pub(super) const INITIAL_UPLOAD_SEND_WINDOW: u64 = MIN_SEND_WINDOW;
@@ -163,6 +163,32 @@ const SLOW_PATH_WRITER_MARGIN: u64 = 2 * PAYLOAD as u64;
 const COLD_BULK_MIN_BYTES: u64 = 256 * 1024;
 const PATH_QUEUE: usize = 4;
 
+/// Measure delivered STREAM payload only while the path has at least one
+/// record outstanding. Application idle time would understate its capacity.
+#[derive(Default)]
+struct AckService {
+    start: Option<(u64, u64)>,
+    ceiling_bytes_per_ms: Option<u64>,
+}
+
+impl AckService {
+    fn observe(&mut self, now_us: u64, rtt_us: u64, retained: u64, acked: u64) {
+        if retained < PAYLOAD as u64 {
+            *self = Self::default();
+            return;
+        }
+        let (start_us, start_acked) = *self.start.get_or_insert((now_us, acked));
+        let elapsed = now_us.saturating_sub(start_us);
+        if elapsed >= rtt_us.saturating_mul(2).max(200_000) {
+            // Leave room to probe faster service without treating a historical
+            // congestion window as delivered bandwidth during an ACK drought.
+            let rate = acked.saturating_sub(start_acked).saturating_mul(2_000) / elapsed;
+            self.ceiling_bytes_per_ms = Some(rate.max(1));
+            self.start = Some((now_us, acked));
+        }
+    }
+}
+
 /// Keep startup/backpressure bounded by measured native `cwnd` and severe loss.
 /// Idle intervals (zero buffered stream bytes) must never crush earned or
 /// initial `send_window` on keepalive loss or opposite-direction RTT inflation;
@@ -175,6 +201,7 @@ pub(super) struct Credit {
     sent: u64,
     lost: u64,
     acked: u64,
+    delivery: AckService,
     current: u64,
     loss_ceiling: Option<u64>,
     loss_hold_until_us: u64,
@@ -264,14 +291,13 @@ impl Credit {
         let identity = conn.stable_id();
         if self.connection != Some(identity) {
             let stats = conn.stats();
-            let (retained, unsent) = conn.stream_send_buffer_bytes();
-            let in_flight = retained.saturating_sub(unsent);
             *self = Self {
                 connection: Some(identity),
                 sampled_us: now_us,
                 sent: stats.path.sent_packets,
                 lost: stats.path.lost_packets,
-                acked: stats.stream_frame_bytes_tx.saturating_sub(in_flight),
+                acked: stats.stream_payload_bytes_acked,
+                delivery: AckService::default(),
                 current: initial_window,
                 loss_ceiling: None,
                 loss_hold_until_us: 0,
@@ -291,14 +317,10 @@ impl Credit {
         let rtt_us = rtt.as_micros().min(u128::from(u64::MAX)) as u64;
         let queued_ms = rtt.saturating_sub(conn.min_rtt_hint()).as_secs_f64() * 1000.0;
         let (retained, unsent) = conn.stream_send_buffer_bytes();
-        let in_flight = retained.saturating_sub(unsent);
-        let acked = stats.stream_frame_bytes_tx.saturating_sub(in_flight);
+        let acked = stats.stream_payload_bytes_acked;
         let ack_progress = acked.saturating_sub(self.acked) >= PAYLOAD as u64;
-        if ack_progress {
-            self.acked = acked;
-        } else {
-            self.acked = self.acked.max(acked);
-        }
+        self.acked = acked;
+        self.delivery.observe(now_us, rtt_us, retained, acked);
         self.update(
             now_us,
             CreditSample {
@@ -394,7 +416,11 @@ impl Credit {
             sample
                 .retained
                 .saturating_add(4 * PAYLOAD as u64)
-                .min(MAX_SEND_WINDOW)
+                .min(if sample.ack_progress {
+                    MAX_SEND_WINDOW
+                } else {
+                    self.current
+                })
         } else {
             0
         };
@@ -738,6 +764,7 @@ pub(super) fn enqueue(item: QueuedRecord, queue: &mut outbound::Queue) {
 pub(super) fn drain(
     queue: &mut outbound::Queue,
     paths: &[OutPath],
+    credits: &[Credit; super::MAX_PATHS],
     silent: u8,
     cursor: &mut usize,
     pacer: &mut outbound::Pacer,
@@ -806,6 +833,9 @@ pub(super) fn drain(
         } else {
             raw_rtt_us
         };
+        if let Some(ceiling) = credits[id].delivery.ceiling_bytes_per_ms {
+            service = service.min(ceiling);
+        }
         snapshots[id] = PathSnapshot {
             active: true,
             probing,
@@ -2179,7 +2209,15 @@ mod tests {
         for g in &mut groups {
             g.refill(1_000_000);
         }
-        drain(&mut queue, &paths, 0, &mut cursor, &mut pacer, &mut groups);
+        drain(
+            &mut queue,
+            &paths,
+            &Default::default(),
+            0,
+            &mut cursor,
+            &mut pacer,
+            &mut groups,
+        );
         assert!(queue.is_empty());
         assert!(
             r0.rx.try_recv().is_err(),
@@ -2250,7 +2288,15 @@ mod tests {
                         None,
                     );
                 } else {
-                    drain(queue, &paths, 0, &mut cursor, &mut pacer, &mut groups);
+                    drain(
+                        queue,
+                        &paths,
+                        &Default::default(),
+                        0,
+                        &mut cursor,
+                        &mut pacer,
+                        &mut groups,
+                    );
                 }
             };
             run(1_000_000, &mut queue);
@@ -2318,7 +2364,15 @@ mod tests {
         for g in &mut groups {
             g.refill(2_000_000);
         }
-        drain(&mut queue, &paths, 0, &mut cursor, &mut pacer, &mut groups);
+        drain(
+            &mut queue,
+            &paths,
+            &Default::default(),
+            0,
+            &mut cursor,
+            &mut pacer,
+            &mut groups,
+        );
         assert!(queue.is_empty());
         // Path 0 must receive 2 records (reaching 64 KiB) before path 1 (already
         // holding 64 KiB staged) receives the 3rd; double-counting `staged` +
@@ -2374,7 +2428,15 @@ mod tests {
         for g in &mut groups {
             g.refill(1_000_000);
         }
-        drain(&mut queue, &paths, 0, &mut cursor, &mut pacer, &mut groups);
+        drain(
+            &mut queue,
+            &paths,
+            &Default::default(),
+            0,
+            &mut cursor,
+            &mut pacer,
+            &mut groups,
+        );
         assert!(queue.is_empty());
         assert_eq!(gauge.take_dropped(), vec![(17, 0, 2)]);
         let delivered = r0
@@ -2383,6 +2445,22 @@ mod tests {
             .or_else(|_| r1.rx.try_recv())
             .expect("normal flow still dispatches");
         assert_eq!(&delivered.data[8..16], &18u64.to_be_bytes());
+    }
+
+    #[test]
+    fn backlogged_path_rank_tracks_unique_delivery_and_excludes_idle_time() {
+        let mut delivery = AckService::default();
+        let queued = 1024 * 1024;
+        delivery.observe(0, 120_000, queued, 0);
+        delivery.observe(100_000, 120_000, queued, 0);
+        assert_eq!(delivery.ceiling_bytes_per_ms, None);
+        delivery.observe(250_000, 120_000, queued, 0);
+        assert_eq!(delivery.ceiling_bytes_per_ms, Some(1));
+        delivery.observe(500_000, 120_000, queued, 500_000);
+        assert_eq!(delivery.ceiling_bytes_per_ms, Some(4_000));
+        delivery.observe(600_000, 120_000, 0, 510_000);
+        delivery.observe(10_000_000, 120_000, queued, 510_000);
+        assert_eq!(delivery.ceiling_bytes_per_ms, None);
     }
 
     #[test]
@@ -2411,6 +2489,12 @@ mod tests {
         };
         assert_eq!(unacked.update(100_000, unacked_sample), None);
         assert_eq!(unacked.current, INITIAL_UPLOAD_SEND_WINDOW);
+
+        let warm_no_ack = CreditSample {
+            bulk_written: INITIAL_SEND_WINDOW,
+            ..unacked_sample
+        };
+        assert_eq!(unacked.update(200_000, warm_no_ack), None);
 
         let mut slow = Credit {
             current: INITIAL_UPLOAD_SEND_WINDOW,
