@@ -577,6 +577,22 @@ impl Connection {
         self.0.shared.hints.cwnd.load(Ordering::Relaxed)
     }
 
+    /// The controller's pacing rate in bits per second as last published.
+    pub fn pacing_rate_bps_hint(&self) -> Option<u64> {
+        self.0
+            .shared
+            .hints
+            .pacing_rate_bps
+            .load(Ordering::Relaxed)
+            .checked_sub(1)
+    }
+
+    /// Acknowledged STREAM payload bytes at the latest driver publication,
+    /// or zero when send storage still contained outstanding STREAM data.
+    pub fn drained_stream_ack_hint(&self) -> u64 {
+        self.0.shared.hints.drained_stream_ack.load(Ordering::Relaxed)
+    }
+
     /// Whether BBR was probing RTT when the driver last published its hints.
     /// Other controllers report false; no connection lock is taken.
     pub fn probing_rtt_hint(&self) -> bool {
@@ -1099,6 +1115,9 @@ struct Hints {
     rtt_us: AtomicU64,
     min_rtt_us: AtomicU64,
     cwnd: AtomicU64,
+    /// Zero means unavailable. Otherwise this holds the pacing rate plus one.
+    pacing_rate_bps: AtomicU64,
+    drained_stream_ack: AtomicU64,
     probing_rtt: AtomicBool,
     acks: AtomicU64,
     eliciting: AtomicU64,
@@ -1354,8 +1373,23 @@ impl State {
             .min_rtt_us
             .store(micros(stats.path.min_rtt), Ordering::Relaxed);
         hints.cwnd.store(stats.path.cwnd, Ordering::Relaxed);
-        hints.probing_rtt.store(
-            self.inner.congestion_state().is_probing_rtt(),
+        let congestion = self.inner.congestion_state();
+        hints
+            .probing_rtt
+            .store(congestion.is_probing_rtt(), Ordering::Relaxed);
+        hints.pacing_rate_bps.store(
+            congestion
+                .metrics()
+                .pacing_rate
+                .map_or(0, |rate| rate.saturating_add(1)),
+            Ordering::Relaxed,
+        );
+        hints.drained_stream_ack.store(
+            if self.inner.stream_send_buffer_empty() {
+                stats.stream_payload_bytes_acked
+            } else {
+                0
+            },
             Ordering::Relaxed,
         );
         hints.eliciting.store(

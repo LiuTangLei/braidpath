@@ -424,21 +424,24 @@ bidirectional echo after all configured paths are ready.
 
 ## Traffic modes
 
-The unified `proxy-client` uses native HTTP/3 bulk return by default
-(`--game-mode off`). In ordinary mode (`--game-mode off`), repeatable
-`--ordered-udp-port PORT` routes SOCKS5 UDP for matching destination ports over
-per-destination reliable aggregate streams to avoid cross-path UDP reordering;
-it is rejected when combined with `--game-mode on`. Use `--game-mode on` to
-choose Game for the instance; SOCKS5 UDP then shares the Game aggregate session
-with the exit's native TCP downloads. The server applies the same UDP
-association, destination and rate limits for either mode. Upgrade servers first
-and clients second so both participating endpoints share the current version.
+The unified `proxy-client` uses bidirectional native HTTP/3 streams for bulk
+TCP. Ordinary SOCKS5 UDP (`--game-mode off`) uses reliable, ordered streams
+per destination across the aggregate. Game UDP (`--game-mode on`) uses the
+deadline-bound DATAGRAM lane alongside bulk TCP. Remove `--ordered-udp-port PORT`
+from service definitions. Upgrade servers first, then clients.
 
-The `client` and `mesh-client` commands select the mixed policy through `--game-mode --native-return-stream` with a TCP-capable entry. All aggregate paths require the same versioned policy through the `braidpath-policy` header. `--native-return-stream` negotiates a reliable HTTP/3 response body for bulk TCP download DATA/FIN with a bounded 4 MiB per-path receive window. Standalone native sender storage starts at 2 MiB. Mixed native storage is capped at 1 MiB per connection. Each path separately paces native grants using observed transport bytes, queue delay and loss to qualify growth and brake before tail-drop bursts. Mixed writes use up to 2 KiB per scheduling grant and leave credit for Game original fragments. The same direction and group allowances fund both carriers. For standalone native, a 100 ms sample can add 64 KiB when at least 64 packets were sent, loss stays at or below 1%, and RTT inflation stays within one quarter of the delay target. The send buffer must be within one native payload of capacity with no more than two payloads waiting for their first packetization. The window is capped at three quarters of the native congestion window, within 2–4 MiB. When a much faster route exists and unsent backlog exceeds 256 KiB, a slow path can lower its write-ahead below 2 MiB to three quarters of its congestion window plus two native payloads, returning to 2 MiB once no faster route dominates. When three or more native paths serve a single download, path selection orders routes by propagation delay plus queued bytes divided by service rate while avoiding paths currently probing RTT. Moderate queueing removes 128 KiB. A sample exceeding the full delay target or 1% loss returns to 2 MiB. A native RTT probe holds the current window. This changes buffering, not the native congestion window, packet pacing or operator limits. Interactive stream data uses bounded DATAGRAM records and can bypass a single queued bulk native record at the mux watermark so short responses do not wait behind a queued bulk response body. The carrier respects the same QUIC ACK-silence exclusion as DATAGRAM scheduling, so new data and repairs avoid an unresponsive route while another route is available. Uploads, stream acknowledgments, resets and UDP use the DATAGRAM carrier. Both endpoints must support and acknowledge the requested capability.
+The `client` and `mesh-client` commands select the mixed policy with
+`--game-mode --native-return-stream` and a TCP-capable entry. Every path in a
+session negotiates the same version 2 policy. Bulk writers take receiver credit,
+pace each mixed path and reserve capacity for Game datagrams. Ordinary native
+paths estimate completion time using RTT, queued bytes and the path's service
+rate. STREAM payload acknowledgements and queue pressure guide the send window.
 
 Native receive admission preserves the process-wide byte budget and bounded channel. While a decoded record waits for byte credit or a channel slot, the client continues handling DATAGRAMs. Between response chunks it arbitrates another DATAGRAM read before resuming native decoding. This isolates application receive waiting without enlarging the budget or claiming independent transport capacity.
 
-Once the reliable writer owns bulk DATA, its QUIC connection handles packet loss. Cross-path stream SACKs do not start another repair or head copy of the same native bytes. A failed write or loss of QUIC ACK progress returns those retained offsets to stream recovery. Reachability uses the existing two-RTT plus ACK-delay test, with a 100 ms floor; streams with native bytes outstanding recheck ownership within 50 ms even without new stream ACKs. Native bulk waits while no native writer is reachable; control probes continue. DATAGRAM-carried stream data retains its normal loss timers and bounded copies. Upload pacing is unchanged.
+QUIC retransmits lost packets on each native path. A bounded copy of a missing
+stream head can use a healthy sibling after evidence of a stalled flight.
+Stream offsets let the receiver discard duplicates and preserve byte order.
 
 Stream ACKs still use unreliable DATAGRAMs. A native flight with missing stream ACKs therefore keeps the existing backed-off, empty ACK-request probe. The request travels on the short DATAGRAM lane, without another copy of the native payload or a wait behind the native body. A new ACK releases retained bytes and receive-window credit as usual.
 

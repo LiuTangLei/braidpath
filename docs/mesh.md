@@ -154,7 +154,7 @@ destination TCP sockets. This aggregation takes place within the application
 connection and does not require Clash load balancing or multiple downloads.
 The selected exit belongs to that session, without a permanent cluster leader.
 
-TCP bytes travel as aggregate HTTP Datagrams inside QUIC DATAGRAM frames. The
+Bulk TCP in a native session travels in HTTP/3 request and response bodies. Short records and stream feedback use QUIC DATAGRAM frames. The
 stream engine uses byte offsets, cumulative and selective acknowledgments,
 bounded retransmission, receiver credit and acknowledged final offsets. Missing
 segments can be repaired on another healthy path. Automatic FEC uses qualified
@@ -200,27 +200,11 @@ The remote link requires the existing pinned certificate and client token, and
 authenticates the requested exit ID before accepting destinations. There is no
 public unauthenticated SOCKS port. Domains are sent to the selected exit for
 resolution; both IPv4 and IPv6 destinations are supported. UDP prefers IPv4 when
-DNS provides both families; an explicit IPv6 destination uses IPv6. A new UDP
-association can start through an authenticated relay and stays on that route
-for the life of the association. Before choosing a native UDP connection, the
-client races bounded, authenticated datagram echo probes on the available paths.
-It prefers a path that returns every probe over one that merely completes its
-reliable handshake first. The probes cover small and larger datagrams, require
-no external destination, and are included in the exit's rate budget. A healthy
-result is cached for 60 seconds; a new association rechecks an expired result.
-If every reachable path has loss, the best measured partial result remains
-usable instead of requiring a perfect or direct path. Existing associations are
-not interrupted by these admission checks. This is path selection, not a
-guarantee of loss-free UDP after admission. Upgrade both client and selected exit
-to a build with UDP health probes before using this admission behavior.
-
-For bulk UDP, repeat `proxy-client --ordered-udp-port PORT` to select destination
-ports. The selected exit opens a UDP socket for each destination and the
-aggregate carries length-prefixed datagrams in order, with retransmission.
-Different destinations use independent streams. Use this when a transfer
-benefits from recovering losses and can wait for a missing datagram. Upgrade
-the client and selected exit together. Game mode continues to use its own UDP
-delivery policy.
+DNS provides both families. Explicit IPv6 destinations use IPv6. Ordinary SOCKS5
+UDP uses a reliable stream per destination on the selected exit's aggregate
+session. A gap delays later datagrams for that destination. Game listeners use
+deadline-bound DATAGRAM delivery. Remove `--ordered-udp-port PORT` from existing
+launch commands when upgrading to 0.7.3.
 
 By default, `proxy-client` pipelines the application's first TCP bytes with
 the destination request. It sends SOCKS5 CONNECT success with a bound address

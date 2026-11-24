@@ -10,7 +10,7 @@ BraidPath 是一个从零构建的 Rust 多路径传输项目，结合 **前向�
 
 “Braid” 是编织：把多条不完美的路径编成一条更稳定的连接。
 
-> **BraidPath 0.7.2** 修复 Linux 重建绑定接口后 Mesh 控制连接无法恢复的问题。详见[版本说明](docs/releases/v0.7.2.md)。
+> **BraidPath 0.7.3** 使用原生 HTTP/3 流双向传输大流量 TCP，普通 SOCKS5 UDP 按目的地有序交付。详见[版本说明](docs/releases/v0.7.3.md)。
 
 每个选定出口提供一个本地 SOCKS5 入口，默认使用四条协同路径。配置见[代理与分布式运行指南](docs/mesh.md)，模式选择见[流量策略](docs/runtime.md#traffic-modes)。
 
@@ -93,7 +93,7 @@ cargo test --all-targets --locked
 | 大包双独立修复方程 | 可选混合 16+2 |
 | 聚合 DATAGRAM 上的可靠 TCP 字节流 | 已实现；字节 SACK、跨路补发、半关闭和有界回收 |
 | TCP 聚合的自动 FEC 强度 | 已实现；使用经过资格确认的接收丢包反馈和有界修复额度 |
-| 原生可靠 TCP 下载回程 | 可选 HTTP/3 响应体承载；有界接收信用，等待期间继续处理 DATAGRAM |
+| 原生大流量 TCP | 双向 HTTP/3 流，有界接收信用，等待期间继续处理 DATAGRAM |
 | Game UDP 策略 | 可选优先队列、错开副本、检查至 Quinn 准入的本地期限及本地丢弃校正；统一候选的外网验收待完成 |
 | 自动识别共享瓶颈与耦合拥塞控制 | 单独研究 |
 | TUN、可靠流承载回退、浏览器指纹整形 | 待实现或后置 |

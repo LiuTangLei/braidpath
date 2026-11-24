@@ -1314,6 +1314,11 @@ impl Connection {
         self.streams.send_buffer_bytes()
     }
 
+    /// Whether no unacknowledged STREAM data remains in connection send storage.
+    pub fn stream_send_buffer_empty(&self) -> bool {
+        self.streams.send_buffer_empty()
+    }
+
     /// Ping the remote endpoint
     ///
     /// Causes an ACK-eliciting packet to be transmitted.

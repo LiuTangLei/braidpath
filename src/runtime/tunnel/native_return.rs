@@ -341,7 +341,6 @@ pub(super) struct Credit {
     current: u64,
     max_cwnd: u64,
     last_cwnd_growth_us: u64,
-    last_flush_check_us: u64,
     loss_ceiling: Option<u64>,
     loss_hold_until_us: u64,
     loss_cautious_until_us: u64,
@@ -387,7 +386,7 @@ fn service_bound_capped(conn: &quinn::Connection, window_cap: u64) -> u64 {
     // during ProbeBW's 0.75x drain phase (`8/3 * 0.75 = 2.0`), so healthy paths
     // are untouched while a 0.4 Mbps straggler cannot masquerade as 36 Mbps and
     // poison `best_service` / `faster_route` against real multi-megabit paths.
-    if let Some(pacing_bps) = conn.congestion_state().metrics().pacing_rate {
+    if let Some(pacing_bps) = conn.pacing_rate_bps_hint() {
         cwnd_service.min((pacing_bps / 3_000).max(1))
     } else {
         cwnd_service
@@ -451,7 +450,6 @@ impl Credit {
                 current: initial_window,
                 max_cwnd: stats.path.cwnd,
                 last_cwnd_growth_us: 0,
-                last_flush_check_us: now_us,
                 loss_ceiling: None,
                 loss_hold_until_us: 0,
                 loss_cautious_until_us: 0,
@@ -463,26 +461,17 @@ impl Credit {
             return None;
         }
         if now_us.saturating_sub(self.sampled_us) < 100_000 {
-            if self.delivery.ceiling_bytes_per_ms.is_some()
-                && now_us.saturating_sub(self.last_flush_check_us) >= 20_000
-            {
-                self.last_flush_check_us = now_us;
-                let (retained, unsent) = conn.stream_send_buffer_bytes();
-                if retained == 0 && unsent == 0 {
-                    let acked = conn.stats().stream_payload_bytes_acked;
-                    let rtt_us = conn.rtt_hint().as_micros().min(u128::from(u64::MAX)) as u64;
-                    self.delivery.observe_flush(
-                        now_us,
-                        rtt_us,
-                        conn.cwnd_hint(),
-                        self.loss_permille(),
-                        acked,
-                    );
-                }
+            if self.delivery.ceiling_bytes_per_ms.is_some() {
+                self.delivery.observe_flush(
+                    now_us,
+                    conn.rtt_hint().as_micros() as u64,
+                    conn.cwnd_hint(),
+                    self.loss_permille(),
+                    conn.drained_stream_ack_hint(),
+                );
             }
             return None;
         }
-        self.last_flush_check_us = now_us;
         let stats = conn.stats();
         let rtt = conn.rtt_hint();
         let rtt_us = rtt.as_micros().min(u128::from(u64::MAX)) as u64;
@@ -1117,7 +1106,7 @@ pub(super) fn drain(
         let mut service = service_bound_capped(&path.conn, credits[id].window_bound(&path.conn));
         if unsent > 0
             && cwnd <= PAYLOAD as u64
-            && let Some(pacing_bps) = path.conn.congestion_state().metrics().pacing_rate
+            && let Some(pacing_bps) = path.conn.pacing_rate_bps_hint()
         {
             // Near BBR's `min_cwnd` floor, `cwnd / RTT` stops shrinking even on a
             // sub-megabit uplink; bound service by the actual pacing rate.
@@ -1130,7 +1119,7 @@ pub(super) fn drain(
             && queued_us <= 30_000
             && loss_permille < 120
             && credits[id].delivery.ceiling_bytes_per_ms.is_none()
-            && let Some(pacing_bps) = path.conn.congestion_state().metrics().pacing_rate
+            && let Some(pacing_bps) = path.conn.pacing_rate_bps_hint()
         {
             // Exiting idle after a clean keepalive loss can leave BBR `window()`
             // at `min_cwnd` for one RTT. Allow at most one wakeup record (`queued == 0`)
@@ -1358,6 +1347,7 @@ struct PathPace {
     packets: u64,
     lost: u64,
     tx_bytes: u64,
+    send_window: u64,
     loss_permille: u64,
     queue_braked: bool,
     last_pressure_us: Option<u64>,
@@ -1374,6 +1364,7 @@ impl PathPace {
             packets: 0,
             lost: 0,
             tx_bytes: 0,
+            send_window: MIXED_SEND_WINDOW,
             loss_permille: 0,
             queue_braked: false,
             last_pressure_us: None,
@@ -1404,13 +1395,16 @@ impl PathPace {
         } else {
             0
         };
-        if multipath && prior_lossy {
+        let send_window = if multipath && prior_lossy {
             let (retained, _) = conn.stream_send_buffer_bytes();
             let win = (384 * 1024)
                 .max(retained.saturating_add(2 * PART_BYTES as u64))
                 .min(MIXED_SEND_WINDOW);
             conn.set_send_window(win);
-        }
+            win
+        } else {
+            MIXED_SEND_WINDOW
+        };
         Self {
             connection,
             credit,
@@ -1418,6 +1412,7 @@ impl PathPace {
             packets: stats.path.sent_packets,
             lost: stats.path.lost_packets,
             tx_bytes: stats.udp_tx.bytes,
+            send_window,
             loss_permille,
             queue_braked: false,
             last_pressure_us: None,
@@ -1517,7 +1512,17 @@ impl PathPace {
             let target_win = (bdp.saturating_mul(2) + 128 * 1024)
                 .max(retained.saturating_add(2 * PART_BYTES as u64))
                 .clamp(256 * 1024, MIXED_SEND_WINDOW);
-            conn.set_send_window(target_win);
+            self.set_window(conn, target_win);
+        } else if self.send_window < MIXED_SEND_WINDOW && !queued && lost == 0 && packets >= 48 {
+            // Clean traffic can outgrow the reduced window selected from handshake loss.
+            self.set_window(conn, (self.send_window + 128 * 1024).min(MIXED_SEND_WINDOW));
+        }
+    }
+
+    fn set_window(&mut self, conn: &quinn::Connection, target: u64) {
+        if self.send_window != target {
+            conn.set_send_window(target);
+            self.send_window = target;
         }
     }
 }

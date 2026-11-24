@@ -10,7 +10,7 @@ BraidPath is a Rust multipath transport project combining **forward error correc
 
 “Braid” means weaving several imperfect paths into a more resilient connection.
 
-> **BraidPath 0.7.2** restores mesh control connections after Linux recreates a bound uplink. See the [release notes](docs/releases/v0.7.2.md).
+> **BraidPath 0.7.3** carries bulk TCP in both directions over native HTTP/3 streams. Ordinary SOCKS5 UDP uses ordered delivery per destination. See the [release notes](docs/releases/v0.7.3.md).
 
 Each selected exit provides a local SOCKS5 listener, with four cooperating paths by default. Configure [proxy and distributed-server mode](docs/mesh.md), then select the [traffic policy](docs/runtime.md#traffic-modes) for the workload.
 
@@ -95,7 +95,7 @@ Follow the [runtime guide](docs/runtime.md) for credentials, local forwarding, m
 | Two independent bulk repair equations | Opt-in mixed 16+2 mode |
 | Reliable ordered TCP over aggregate DATAGRAMs | Implemented; byte SACK, cross-path repair, half-close and bounded cleanup |
 | Automatic FEC strength for aggregate TCP | Implemented using qualified receiver loss feedback and bounded repair credit |
-| Native reliable TCP download return | Opt-in HTTP/3 response-body carrier; bounded receive credit and DATAGRAM receive arbitration |
+| Native bulk TCP | Bidirectional HTTP/3 streams, bounded receive credit and concurrent DATAGRAM handling |
 | Game UDP policy | Opt-in priority queues, spaced copies, local deadlines through Quinn admission, and local-drop-aware loss feedback; combined-candidate field acceptance pending |
 | Automatic shared-bottleneck detection and coupled congestion control | Separate research work |
 | TUN, reliable-carrier fallback, browser fingerprint shaping | Planned or deferred |

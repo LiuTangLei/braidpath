@@ -1421,10 +1421,11 @@ impl Receiver {
         &mut self,
         offset: u64,
         fin: bool,
-        data: Vec<u8>,
+        mut data: Vec<u8>,
         now: Instant,
     ) -> Result<Vec<u8>, Violation> {
         let end = offset + data.len() as u64;
+        let ack_immediately = data.is_empty() || fin;
         if end > self.advertised {
             return Err(Violation::FlowControl);
         }
@@ -1463,10 +1464,16 @@ impl Receiver {
                 .range(start..)
                 .next()
                 .map_or(end, |(k, _)| (*k).min(end));
-            let piece = data[(start - offset) as usize..(gap_end - offset) as usize].to_vec();
+            // Take ownership of a whole record. Only an overlap needs a
+            // new allocation for the uncovered slice.
+            let piece = if start == offset && gap_end == end {
+                std::mem::take(&mut data)
+            } else {
+                data[(start - offset) as usize..(gap_end - offset) as usize].to_vec()
+            };
             if start == self.cumulative {
                 self.cumulative = gap_end;
-                ready.extend(piece);
+                ready = piece;
             } else {
                 self.out_of_order += piece.len() as u64;
                 // Data arriving after a hole extends the range before it, so
@@ -1500,7 +1507,7 @@ impl Receiver {
         }
         self.duplicates += duplicate;
         self.unacknowledged += 1;
-        if data.is_empty() || fin {
+        if ack_immediately {
             self.ack_now = true;
         } else if duplicate > 0 {
             // One immediate duplicate report preserves loss-recovery feedback.

@@ -3125,15 +3125,17 @@ async fn sender_with_inputs(
             .then(|| Instant::now() + Duration::from_millis(1));
         let mut drain_attempted = false;
         'drain: loop {
-            if drain_attempted
-                && game_slice_end.is_some_and(|end| {
-                    Instant::now() >= end || game_input.as_ref().is_some_and(|rx| !rx.is_empty())
-                })
-            {
-                // A single drain can otherwise hold paths and run for longer
-                // than an entire Game deadline while bulk remains writable.
-                yield_after_drain = true;
-                break;
+            if drain_attempted && let Some(end) = game_slice_end {
+                if game_input.as_ref().is_some_and(|rx| !rx.is_empty()) {
+                    // The next turn can take an already queued Game record.
+                    // Yielding to the runtime here delays that record again.
+                    break;
+                }
+                if Instant::now() >= end {
+                    // Let other tasks run when bulk still owns this turn.
+                    yield_after_drain = true;
+                    break;
+                }
             }
             drain_attempted = true;
             if deferred_input
