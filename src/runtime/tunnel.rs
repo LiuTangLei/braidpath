@@ -2386,16 +2386,14 @@ async fn sender_with_inputs(
                         native_return::INITIAL_SEND_WINDOW
                     };
                     let credit = &mut native_credit[usize::from(path.id)];
-                    let restored = credit.observe_reachability(path_reachable);
-                    let observed = credit.observe(
+                    if let Some(window) = credit.observe(
                         &path.conn,
+                        writer,
                         now_us,
                         policy.latency_target_ms,
                         best_native_service,
-                        writer.written_bytes(),
                         initial_window,
-                    );
-                    if let Some(window) = observed.or(restored) {
+                    ) {
                         path.conn.set_send_window(window);
                         info!(target: "braidpath::native_credit", path=path.id, window_bytes=window,
                             "native return storage credit changed");

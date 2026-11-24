@@ -216,8 +216,8 @@ impl AckService {
         {
             self.ceiling_bytes_per_ms = None;
         }
-        let buffered = retained.saturating_add(unsent);
-        self.peak_buffered = self.peak_buffered.max(buffered);
+        // Quinn's retained total already includes unsent stream bytes.
+        self.peak_buffered = self.peak_buffered.max(retained);
         let window_us = rtt_us.saturating_mul(2).max(200_000);
         let (start_us, start_acked) = *self.start.get_or_insert((now_us, acked));
         let elapsed = now_us.saturating_sub(start_us);
@@ -259,7 +259,7 @@ impl AckService {
                 }
             }
             self.start = Some((now_us, acked));
-            self.peak_buffered = buffered;
+            self.peak_buffered = retained;
         }
     }
 }
@@ -287,7 +287,6 @@ pub(super) struct Credit {
     first_backlog_us: Option<u64>,
     lossy_streak: u8,
     loss_permille: u64,
-    quarantined: bool,
 }
 #[derive(Clone, Copy)]
 struct CreditSample {
@@ -361,10 +360,10 @@ impl Credit {
     pub(super) fn observe(
         &mut self,
         conn: &quinn::Connection,
+        writer: &Writer,
         now_us: u64,
         target_ms: u64,
         best_service: u64,
-        bulk_written: u64,
         initial_window: u64,
     ) -> Option<u64> {
         let identity = conn.stable_id();
@@ -387,7 +386,6 @@ impl Credit {
                 first_backlog_us: None,
                 lossy_streak: 0,
                 loss_permille: 0,
-                quarantined: false,
             };
             return None;
         }
@@ -400,7 +398,8 @@ impl Credit {
         let queued_ms = rtt.saturating_sub(conn.min_rtt_hint()).as_secs_f64() * 1000.0;
         let (retained, unsent) = conn.stream_send_buffer_bytes();
         let acked = stats.stream_payload_bytes_acked;
-        let ack_progress = acked.saturating_sub(self.acked) >= PAYLOAD as u64;
+        let acked_delta = acked.saturating_sub(self.acked);
+        let ack_progress = acked_delta >= PAYLOAD as u64;
         self.acked = acked;
         self.delivery.observe(
             now_us,
@@ -411,6 +410,14 @@ impl Credit {
             self.loss_permille(),
             acked,
         );
+        // Liveness can recover on a PING ACK. Keep the delivery estimate and
+        // loss history on the same connection while Quinn probes its backlog.
+        if !writer.reachable.load(Ordering::Acquire)
+            && retained >= PAYLOAD as u64
+            && acked_delta == 0
+        {
+            self.delivery.ceiling_bytes_per_ms = Some(1);
+        }
         let mut own_service = service_bound(conn);
         if let Some(ceiling) = self.delivery.ceiling_bytes_per_ms
             && ceiling.saturating_mul(4) < own_service
@@ -434,7 +441,7 @@ impl Credit {
                 ack_progress,
                 retained,
                 unsent,
-                bulk_written,
+                bulk_written: writer.written_bytes(),
                 initial_window,
                 faster_route: own_service.saturating_mul(3) < best_service,
             },
@@ -443,6 +450,9 @@ impl Credit {
 
     pub(super) fn effective_service(&self, conn: &quinn::Connection) -> u64 {
         let mut service = service_bound(conn);
+        if self.connection != Some(conn.stable_id()) {
+            return service.max(1);
+        }
         let loss_permille = self.loss_permille().min(1_000);
         if loss_permille >= 150 {
             let surviving = 1_000u64.saturating_sub(loss_permille);
@@ -453,28 +463,6 @@ impl Credit {
             service = service.min(ceiling);
         }
         service.max(1)
-    }
-
-    pub(super) fn observe_reachability(&mut self, reachable: bool) -> Option<u64> {
-        if !reachable {
-            self.quarantined = true;
-            return None;
-        }
-        if self.quarantined {
-            self.quarantined = false;
-            self.delivery = AckService::default();
-            self.loss_window_sent = self.sent;
-            self.loss_window_lost = self.lost;
-            self.lossy_streak = 0;
-            self.loss_permille = 0;
-            self.loss_ceiling = None;
-            self.loss_hold_until_us = 0;
-            if self.connection.is_some() && self.current < MIN_SEND_WINDOW {
-                self.current = MIN_SEND_WINDOW;
-                return Some(MIN_SEND_WINDOW);
-            }
-        }
-        None
     }
 
     pub(super) fn loss_permille(&self) -> u64 {
@@ -2669,8 +2657,8 @@ mod tests {
         // App-limited bursts (`peak_buffered < cwnd / 2` and promptly ACKed)
         // must not manufacture a false low ceiling on a healthy secondary path.
         let mut app_limited = AckService::default();
-        app_limited.observe(0, 200_000, 1600 * 1024, 192 * 1024, 0, 0, 0);
-        app_limited.observe(450_000, 200_000, 1600 * 1024, 32 * 1024, 0, 0, 160 * 1024);
+        app_limited.observe(0, 100_000, 512 * 1024, 240 * 1024, 24 * 1024, 0, 0);
+        app_limited.observe(220_000, 100_000, 512 * 1024, 40 * 1024, 0, 0, 200 * 1024);
         assert_eq!(app_limited.ceiling_bytes_per_ms, None);
     }
 
@@ -2762,7 +2750,7 @@ mod tests {
     }
 
     #[test]
-    fn ack_service_preserves_drought_across_short_drain_and_clears_on_quarantine_recovery() {
+    fn ack_service_preserves_drought_across_short_drain() {
         let mut credit = Credit {
             connection: Some(42),
             current: SLOW_PATH_MIN_WINDOW,
@@ -2813,14 +2801,55 @@ mod tests {
             1_660_000,
         );
         assert_eq!(credit.delivery.ceiling_bytes_per_ms, None);
+    }
 
-        // Quarantine recovery (`reachable: false -> true`) immediately clears
-        // drought ceiling and restores MIN_SEND_WINDOW.
+    #[tokio::test]
+    async fn credit_keeps_drought_on_same_connection_and_resets_for_replacement() {
+        let old_pair = super::super::sender_ready_tests::Pair::connect().await;
+        let new_pair = super::super::sender_ready_tests::Pair::connect().await;
+        let old = old_pair.path();
+        let replacement = new_pair.path();
+        let (writer, _reader) = channel();
+        let mut credit = Credit {
+            connection: Some(old.conn.stable_id()),
+            sampled_us: 1_000_000,
+            current: SLOW_PATH_MIN_WINDOW,
+            lossy_streak: 5,
+            loss_permille: 600,
+            ..Default::default()
+        };
         credit.delivery.ceiling_bytes_per_ms = Some(1);
-        credit.lossy_streak = 5;
-        credit.loss_permille = 900;
-        assert_eq!(credit.observe_reachability(false), None);
-        assert_eq!(credit.observe_reachability(true), Some(MIN_SEND_WINDOW));
+        for (now, reachable) in [(1_010_000, false), (1_020_000, true)] {
+            writer.set_reachable(reachable);
+            assert_eq!(
+                credit.observe(&old.conn, &writer, now, 20, 0, INITIAL_SEND_WINDOW),
+                None,
+            );
+        }
+        assert_eq!(credit.current, SLOW_PATH_MIN_WINDOW);
+        assert_eq!(credit.delivery.ceiling_bytes_per_ms, Some(1));
+        assert_eq!(credit.loss_permille(), 600);
+
+        writer.set_reachable(false);
+        credit.observe(&old.conn, &writer, 1_030_000, 20, 0, INITIAL_SEND_WINDOW);
+        writer.set_reachable(true);
+        assert_eq!(
+            credit.effective_service(&replacement.conn),
+            service_bound(&replacement.conn).max(1),
+        );
+        assert_eq!(
+            credit.observe(
+                &replacement.conn,
+                &writer,
+                1_040_000,
+                20,
+                0,
+                INITIAL_SEND_WINDOW
+            ),
+            None,
+            "a replacement starts with the window set during path admission"
+        );
+        assert_eq!(credit.current, INITIAL_SEND_WINDOW);
         assert_eq!(credit.delivery.ceiling_bytes_per_ms, None);
         assert_eq!(credit.loss_permille(), 0);
     }
