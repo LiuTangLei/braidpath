@@ -511,6 +511,9 @@ impl Directory {
         let mut recovery_after = Instant::now();
         let mut health_open = true;
         let mut allocations = self.allocations();
+        let initial_alloc_retry = Duration::from_secs(2).min(interval);
+        let mut alloc_backoff = initial_alloc_retry;
+        let mut next_alloc_retry: Option<tokio::time::Instant> = None;
         let mut renewals = JoinSet::new();
         let mut renewing = std::collections::BTreeSet::new();
         let mut releases = JoinSet::new();
@@ -526,6 +529,8 @@ impl Directory {
                     for allocation in self.resize() {
                         self.start_release(&mut releases, allocation);
                     }
+                    alloc_backoff = initial_alloc_retry;
+                    next_alloc_retry = None;
                     allocations = self.allocations();
                     self.publish(&tx);
                 }
@@ -549,6 +554,8 @@ impl Directory {
                         self.leases.remove(&retired);
                         if let Some(allocation) = self.requests.remove(&retired) { self.start_release(&mut releases, allocation); }
                         self.publish(&tx);
+                        alloc_backoff = initial_alloc_retry;
+                        next_alloc_retry = None;
                         allocations = self.allocations();
                     }
                 }
@@ -574,6 +581,16 @@ impl Directory {
                         &mut renewing,
                     ) {
                         discovery.spawn(self.discovery());
+                    }
+                }
+                _ = async { tokio::time::sleep_until(next_alloc_retry.expect("allocation retry")).await },
+                    if allocations.is_empty() && next_alloc_retry.is_some() => {
+                    next_alloc_retry = None;
+                    if self.needs_more_leases() {
+                        allocations = self.allocations();
+                        alloc_backoff = (alloc_backoff * 2).min(interval);
+                    } else {
+                        alloc_backoff = initial_alloc_retry;
                     }
                 }
                 Some(result) = discovery.join_next() => {
@@ -605,6 +622,8 @@ impl Directory {
                                 renewals = JoinSet::new();
                                 renewing.clear();
                             }
+                            alloc_backoff = initial_alloc_retry;
+                            next_alloc_retry = None;
                         }
                         Ok(DiscoveryOutcome::DirectoryIncomplete) => {
                             tracing::debug!("mesh directory refresh incomplete; retaining known peers");
@@ -669,6 +688,14 @@ impl Directory {
                         Ok((allocation, Err(error))) => tracing::debug!(node=%allocation.node.id, %error, "optional entrance unavailable"),
                         Err(error) if error.is_cancelled() => {}
                         Err(error) => tracing::warn!(%error, "entrance allocation task failed"),
+                    }
+                    if allocations.is_empty() {
+                        if self.needs_more_leases() {
+                            next_alloc_retry = Some(tokio::time::Instant::now() + alloc_backoff);
+                        } else {
+                            alloc_backoff = initial_alloc_retry;
+                            next_alloc_retry = None;
+                        }
                     }
                 }
                 Some(result) = renewals.join_next() => {
@@ -988,6 +1015,16 @@ impl Directory {
                 || (health.checked.elapsed() < LEASE_FOR
                     && health.addresses.contains(&lease.reply.address))
         });
+    }
+
+    fn needs_more_leases(&self) -> bool {
+        self.leases.len() + 1 < self.limit
+            && self.nodes.iter().any(|n| {
+                n.id != self.selected.id
+                    && !self.leases.contains_key(&n.id)
+                    && !self.control.ordered_addresses(n).is_empty()
+                    && self.explorer.available(&n.id, Instant::now())
+            })
     }
 
     fn allocations(&mut self) -> JoinSet<(Allocation, Result<RelayReply>)> {

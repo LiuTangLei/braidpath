@@ -2031,3 +2031,115 @@ fn mesh_client_and_proxy_client_survive_offline_boot_and_recover_on_same_listene
         );
     }
 }
+
+#[test]
+fn proxy_client_warms_discovered_exits_without_waiting_for_missing_exit() {
+    use std::io::{Read, Write};
+    use std::net::{Shutdown, TcpListener, TcpStream, UdpSocket};
+    let _serial = socket_fixture();
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    let server_dir = root.join("server");
+    let server_addr = port();
+
+    // Silent UDP socket that absorbs packets without replying (triggers a full
+    // 4-second control timeout if `discover_exit_on` blocks discovery).
+    let blackhole = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let blackhole_addr = blackhole.local_addr().unwrap().to_string();
+
+    let target = TcpListener::bind("127.0.0.1:0").unwrap();
+    let target_addr = target.local_addr().unwrap();
+    let target_thread = thread::spawn(move || {
+        let (mut stream, _) = target.accept().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut request = Vec::new();
+        stream.read_to_end(&mut request).unwrap();
+        let mut reply = b"fast:".to_vec();
+        reply.extend_from_slice(&request);
+        stream.write_all(&reply).unwrap();
+        stream.shutdown(Shutdown::Write).unwrap();
+    });
+
+    let mut server = launch(
+        &args(&[
+            "mesh-server",
+            "--dir",
+            server_dir.to_str().unwrap(),
+            "--id",
+            "node-a",
+            "--listen",
+            &server_addr,
+            "--advertise",
+            &server_addr,
+            "--tcp-target",
+            &target_addr.to_string(),
+            "--proxy",
+            "--proxy-allow-private",
+        ]),
+        root,
+        "partial-disc-server",
+    );
+    ready(&mut server, "HTTP/3 server ready");
+    let key = server_dir.join("client-key.json");
+
+    let started = Instant::now();
+    let mut proxy_client = launch(
+        &args(&[
+            "proxy-client",
+            "--connect",
+            &server_addr,
+            "--connect",
+            &blackhole_addr,
+            "--connection-key",
+            key.to_str().unwrap(),
+            "--dir",
+            root.join("proxy-client").to_str().unwrap(),
+            "--exit",
+            "node-a",
+            "--exit",
+            "missing-exit",
+            "--listen",
+            "127.0.0.1:0",
+            "--tcp-forward",
+            "node-a=127.0.0.1:0",
+        ]),
+        root,
+        "partial-disc-client",
+    );
+    ready(&mut proxy_client, "fixed TCP forward bound");
+    let forward_addr = fs::read_to_string(&proxy_client.log)
+        .unwrap()
+        .lines()
+        .find(|l| l.contains("fixed TCP forward bound"))
+        .and_then(|l| {
+            l.split_whitespace()
+                .find_map(|p| p.strip_prefix("address="))
+        })
+        .unwrap()
+        .to_owned();
+
+    // Must become usable well before the 4-second control timeout on the
+    // blackholed peer for `missing-exit`.
+    let deadline = started + Duration::from_millis(3200);
+    loop {
+        if let Ok(mut fwd) = TcpStream::connect(&forward_addr) {
+            fwd.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            if fwd.write_all(b"partial-ok").is_ok() && fwd.shutdown(Shutdown::Write).is_ok() {
+                let mut reply = Vec::new();
+                if fwd.read_to_end(&mut reply).is_ok() && reply == b"fast:partial-ok" {
+                    break;
+                }
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "discovered exit node-a was blocked by missing-exit discovery: {}",
+            fs::read_to_string(&proxy_client.log).unwrap()
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+    target_thread.join().unwrap();
+    drop(blackhole);
+}

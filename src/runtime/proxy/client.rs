@@ -700,46 +700,6 @@ pub(super) fn validate_tcp_forwards(forwards: &[Listener], socks: &[Listener]) -
     Ok(())
 }
 
-async fn discover_wanted(
-    identity: &mesh::ClientIdentity,
-    entries: &[SocketAddr],
-    wanted: &BTreeSet<String>,
-    uplink: &mesh::Uplink,
-) -> Result<(Vec<mesh::Node>, Vec<String>)> {
-    let mut nodes = identity.discover_any_on(entries, uplink).await?;
-    let mut missing_exits = Vec::new();
-    let mut missing = JoinSet::new();
-    for exit in wanted {
-        if !nodes.iter().any(|node| node.id == *exit) {
-            let identity = identity.clone();
-            let entries = entries.to_vec();
-            let exit = exit.clone();
-            let uplink = uplink.clone();
-            missing.spawn(async move {
-                let res = identity.discover_exit_on(&entries, &exit, &uplink).await;
-                (exit, res)
-            });
-        }
-    }
-    while let Some(result) = missing.join_next().await {
-        match result {
-            Ok((exit, Ok(found))) => {
-                if let Some(node) = found.into_iter().find(|n| n.id == exit) {
-                    nodes.push(node);
-                } else {
-                    missing_exits.push(exit);
-                }
-            }
-            Ok((exit, Err(error))) => {
-                tracing::debug!(%exit, %error, "selected exit not yet discovered");
-                missing_exits.push(exit);
-            }
-            Err(_) => {}
-        }
-    }
-    Ok((nodes, missing_exits))
-}
-
 struct FixedForwardConfig {
     identity: mesh::ClientIdentity,
     mapping: Listener,
@@ -949,18 +909,35 @@ pub async fn client(options: ClientOptions) -> Result<()> {
             options.socks5_early_reply,
         ));
     }
-    let mut discovery: JoinSet<Result<(Vec<mesh::Node>, Vec<String>)>> = JoinSet::new();
+    let mut discovery: JoinSet<Result<Vec<mesh::Node>>> = JoinSet::new();
+    let mut missing_discovery: JoinSet<(String, Result<Vec<mesh::Node>>)> = JoinSet::new();
+    let mut missing_in_flight = BTreeSet::new();
     let mut warmups: JoinSet<()> = JoinSet::new();
-    let spawn_discovery = |discovery: &mut JoinSet<Result<(Vec<mesh::Node>, Vec<String>)>>,
+    let spawn_discovery = |discovery: &mut JoinSet<Result<Vec<mesh::Node>>>,
                            pool: &Arc<Pool>,
-                           entries: &[SocketAddr],
-                           wanted: &BTreeSet<String>| {
+                           entries: &[SocketAddr]| {
         let identity = pool.identity.clone();
         let uplink = pool.uplink();
         let entries = entries.to_vec();
-        let wanted = wanted.clone();
-        discovery
-            .spawn(async move { discover_wanted(&identity, &entries, &wanted, &uplink).await });
+        discovery.spawn(async move { identity.discover_any_on(&entries, &uplink).await });
+    };
+    let spawn_missing = |missing_discovery: &mut JoinSet<(String, Result<Vec<mesh::Node>>)>,
+                         missing_in_flight: &mut BTreeSet<String>,
+                         pool: &Arc<Pool>,
+                         entries: &[SocketAddr],
+                         wanted: &BTreeSet<String>| {
+        for exit in wanted {
+            if !pool.has_exit(exit) && missing_in_flight.insert(exit.clone()) {
+                let identity = pool.identity.clone();
+                let uplink = pool.uplink();
+                let entries = entries.to_vec();
+                let exit = exit.clone();
+                missing_discovery.spawn(async move {
+                    let res = identity.discover_exit_on(&entries, &exit, &uplink).await;
+                    (exit, res)
+                });
+            }
+        }
     };
     let spawn_warmups = |warmups: &mut JoinSet<()>, pool: &Arc<Pool>, exits: &[String]| {
         for exit in exits {
@@ -975,7 +952,10 @@ pub async fn client(options: ClientOptions) -> Result<()> {
             }
         }
     };
-    spawn_discovery(&mut discovery, &pool, &options.connect, &wanted);
+    // Warm up exits already known from the persistent node cache immediately
+    // while fresh discovery runs in parallel.
+    spawn_warmups(&mut warmups, &pool, &selected_exits);
+    spawn_discovery(&mut discovery, &pool, &options.connect);
     let mut bootstrap_backoff = Duration::from_secs(1);
     let mut next_discovery = tokio::time::Instant::now() + Duration::from_secs(15);
     // The aggregate runtime publishes path health; only native UDP caches
@@ -1011,21 +991,60 @@ pub async fn client(options: ClientOptions) -> Result<()> {
             _ = forward_tasks.join_next(), if !forward_tasks.is_empty() => {}
             _ = warmups.join_next(), if !warmups.is_empty() => {}
             _ = tokio::time::sleep_until(next_discovery), if discovery.is_empty() => {
-                spawn_discovery(&mut discovery, &pool, &options.connect, &wanted);
+                spawn_discovery(&mut discovery, &pool, &options.connect);
+            }
+            Some(result) = missing_discovery.join_next(), if !missing_discovery.is_empty() => {
+                match result {
+                    Ok((exit, Ok(found))) => {
+                        missing_in_flight.remove(&exit);
+                        let matched: Vec<_> = found.into_iter().filter(|n| n.id == exit).collect();
+                        if !matched.is_empty() {
+                            pool.refresh(matched);
+                            let merged = pool.nodes.read().expect("proxy nodes").clone();
+                            nodes_tx.send_replace(merged);
+                            spawn_warmups(&mut warmups, &pool, &selected_exits);
+                            if wanted.iter().all(|wanted_exit| pool.has_exit(wanted_exit)) {
+                                bootstrap_backoff = Duration::from_secs(1);
+                                next_discovery = tokio::time::Instant::now() + Duration::from_secs(15);
+                            }
+                        }
+                    }
+                    Ok((exit, Err(error))) => {
+                        missing_in_flight.remove(&exit);
+                        tracing::debug!(%exit, %error, "selected exit not yet discovered");
+                    }
+                    Err(_) => {
+                        if missing_discovery.is_empty() {
+                            missing_in_flight.clear();
+                        }
+                    }
+                }
             }
             Some(result) = discovery.join_next(), if !discovery.is_empty() => {
                 match result {
-                    Ok(Ok((nodes, missing_exits))) => {
+                    Ok(Ok(nodes)) => {
+                        // Publish every already-discovered exit immediately so one
+                        // missing or slow exit never stalls warmups for healthy exits.
                         pool.refresh(nodes);
                         let merged = pool.nodes.read().expect("proxy nodes").clone();
                         nodes_tx.send_replace(merged);
                         spawn_warmups(&mut warmups, &pool, &selected_exits);
-                        let all_present = missing_exits.is_empty()
-                            && wanted.iter().all(|exit| pool.has_exit(exit));
-                        if all_present {
+                        let missing_exits: Vec<_> = wanted
+                            .iter()
+                            .filter(|exit| !pool.has_exit(exit))
+                            .cloned()
+                            .collect();
+                        if missing_exits.is_empty() {
                             bootstrap_backoff = Duration::from_secs(1);
                             next_discovery = tokio::time::Instant::now() + Duration::from_secs(15);
                         } else {
+                            spawn_missing(
+                                &mut missing_discovery,
+                                &mut missing_in_flight,
+                                &pool,
+                                &options.connect,
+                                &wanted,
+                            );
                             tracing::warn!(
                                 missing = ?missing_exits,
                                 retry_secs = bootstrap_backoff.as_secs(),
@@ -1068,6 +1087,8 @@ pub async fn client(options: ClientOptions) -> Result<()> {
     while warmups.join_next().await.is_some() {}
     discovery.abort_all();
     while discovery.join_next().await.is_some() {}
+    missing_discovery.abort_all();
+    while missing_discovery.join_next().await.is_some() {}
     pool.shutdown().await;
     if let Some(diagnostics) = diagnostics {
         let _ = diagnostics.await;
