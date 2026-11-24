@@ -1858,7 +1858,48 @@ async fn sender(
     .await;
 }
 
+fn native_datagram_pace_floor(cwnd: u64, rtt_us: u64, max_rate: u64) -> u64 {
+    // On `2/native` (non-game), bulk TCP flows over QUIC STREAM under Quinn BBR
+    // and `native_return::Credit`. The DATAGRAM lane carries only ACKs, control,
+    // <=16 KiB interactive streams, and ordered UDP. Keep its pace above
+    // `QueueBrake`'s 64 Kbps floor whenever bulk stream queueing or WAN RTT
+    // jitter adds delay, while still respecting low operator caps and tiny cwnd.
+    let floor = if rtt_us > 0 && cwnd > 0 {
+        let native_cwnd_bps =
+            (u128::from(cwnd) * 8_000_000 / u128::from(rtt_us)).min(u128::from(max_rate)) as u64;
+        native_cwnd_bps.clamp(512_000, 8_000_000)
+    } else {
+        2_000_000
+    };
+    floor.min(max_rate)
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
 async fn sender_with_game_input(
+    input: mpsc::Receiver<QueuedRecord>,
+    game_input: Option<mpsc::Receiver<QueuedRecord>>,
+    shared_paths: Paths,
+    policy: Policy,
+    stop: watch::Receiver<bool>,
+    metrics: Scope,
+    observation_notify: Option<Arc<Notify>>,
+) {
+    sender_with_inputs(
+        input,
+        game_input,
+        shared_paths,
+        policy,
+        stop,
+        metrics,
+        observation_notify,
+        None,
+    )
+    .await;
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn sender_with_inputs(
     mut input: mpsc::Receiver<QueuedRecord>,
     mut game_input: Option<mpsc::Receiver<QueuedRecord>>,
     shared_paths: Paths,
@@ -1866,6 +1907,7 @@ async fn sender_with_game_input(
     mut stop: watch::Receiver<bool>,
     metrics: Scope,
     observation_notify: Option<Arc<Notify>>,
+    native_writable_notify: Option<Arc<Notify>>,
 ) {
     let mut encoder = coding::RecordEncoder::new(&policy).expect("validated policy");
     let mut fec_control =
@@ -1882,7 +1924,10 @@ async fn sender_with_game_input(
     let mut native_cursor = 0;
     let mut mixed_writes =
         (native_returning && policy.game_mode).then(native_return::MixedWrites::default);
-    let native_writable = mixed_writes.as_ref().map(|writes| writes.ready.clone());
+    let native_writable = mixed_writes
+        .as_ref()
+        .map(|writes| writes.ready.clone())
+        .or(native_writable_notify);
     let mut blocks = BTreeMap::<u64, BlockSend>::new();
     let mut budget = outbound::RepairBudget::new(policy.redundancy);
     if policy.fec == automatic_fec::AUTO {
@@ -1913,12 +1958,11 @@ async fn sender_with_game_input(
     let mut next_summary_gauge_us = 0u64;
     let mut logged_guard = forward_guard::Snapshot::default();
     let reliable_native_service = policy.streams || policy.proxy;
+    let datagram_burst = if policy.adaptive { 2400 } else { 9600 };
     let burst = if native_returning && mixed_writes.is_none() {
         native_return::BURST
-    } else if policy.adaptive {
-        2400
     } else {
-        9600
+        datagram_burst
     };
     let reserve = if policy.game_mode {
         GAME_PACKET_RESERVE
@@ -1931,7 +1975,7 @@ async fn sender_with_game_input(
     });
     let mut business = policy
         .adaptive
-        .then(|| outbound::BusinessPacer::new(policy.rate, policy.group_rates, burst));
+        .then(|| outbound::BusinessPacer::new(policy.rate, policy.group_rates, datagram_burst));
     if policy.game_mode {
         business = business.map(|pacer| pacer.with_packet_reserve(GAME_PACKET_RESERVE));
     }
@@ -2335,6 +2379,12 @@ async fn sender_with_game_input(
                         "native return storage credit changed");
                 }
             }
+            if native_returning && mixed_writes.is_none() && policy.adaptive && path.open() {
+                let cwnd = path.conn.cwnd_hint();
+                let rtt_us = path.conn.rtt_hint().as_micros().min(u128::from(u64::MAX)) as u64;
+                let floor = native_datagram_pace_floor(cwnd, rtt_us, policy.rate);
+                controllers[usize::from(path.id)].floor_mixed_datagram_pace(now_us, floor);
+            }
             path.writer.set_pace(if policy.adaptive {
                 controllers[usize::from(path.id)].pacing_bps()
             } else {
@@ -2565,6 +2615,9 @@ async fn sender_with_game_input(
                     .and_then(|writes| writes.path_pace_bps(path.id, path.conn.stable_id()))
                 {
                     controllers[usize::from(path.id)].floor_mixed_datagram_pace(now_us, mixed_pace);
+                } else if native_returning && mixed_writes.is_none() {
+                    let floor = native_datagram_pace_floor(cwnd, rtt_us, policy.rate);
+                    controllers[usize::from(path.id)].floor_mixed_datagram_pace(now_us, floor);
                 }
                 if policy.capacity_probe_bps > 0 {
                     let group_paths = paths
@@ -4048,6 +4101,7 @@ struct Session {
     stop: watch::Sender<bool>,
     policy: Policy,
     observation_notify: Option<Arc<Notify>>,
+    native_writable: Option<Arc<Notify>>,
     ingress_drops: Arc<AtomicU64>,
     forward: Scope,
     returning: Scope,
@@ -4104,7 +4158,7 @@ async fn session_loop(
         game_rx,
     } = ingress::channels(session.policy.game_mode);
     let mut tasks = JoinSet::new();
-    tasks.spawn(sender_with_game_input(
+    tasks.spawn(sender_with_inputs(
         rx,
         game_rx,
         session.paths.clone(),
@@ -4112,6 +4166,7 @@ async fn session_loop(
         session.stop.subscribe(),
         session.returning.clone(),
         session.observation_notify.clone(),
+        session.native_writable.clone(),
     ));
     let mut stop = session.stop.subscribe();
     let mut decoder = Receiver::configured(
@@ -4874,7 +4929,6 @@ async fn server_connection(
                                 let stream_payload=payload::negotiate(req.headers(),streams || proxy)?;
                                 let (game_mode,native_return)=read_mode(req.headers())?;
                                 ensure!(!native_return || streams || proxy,"return stream requires TCP profile");
-                                let (return_writer,return_reader)=if native_return { let (tx,rx)=if game_mode { native_return::mixed_channel() } else { native_return::channel() }; (Some(tx),Some(rx)) } else { (None,None) };
                                 let policy=Policy{game_mode,native_return,max_message_bytes,streams,proxy,
             fec_repairs,small_fec_bytes,mixed_fec,probe_guided_recovery,capacity_probe_bps,adaptive:quality_schedule==Some("adaptive"),latency_target_ms,group_rates,quality_schedule:quality_schedule.is_some(),receiver_feedback:feedback.is_some(),fec:parse_fec(header("braidpath-fec")?).map_err(anyhow::Error::msg)?,redundancy:header("braidpath-redundancy")?.parse()?,rate,block_ms:header("braidpath-block-ms")?.parse()?,queue_ms:header("braidpath-queue-ms")?.parse()?};policy.validate()?;
                                 if policy.fec==automatic_fec::AUTO {ensure!(req.headers().get_all("braidpath-auto-small").iter().count()==1 && req.headers().get("braidpath-auto-small").is_some_and(|v|v=="1"),"automatic small protection not negotiated");}
@@ -4896,11 +4950,13 @@ async fn server_connection(
                                             let (native_tx, native_rx) = mpsc::channel(MAX_PATHS * native_return::RX_PATH_RECORDS);
                                             let native_ingress: [_; MAX_PATHS] = std::array::from_fn(|_| native_return::Ingress::new(native_tx.clone()));
                                             let observation_notify=policy.adaptive.then(||Arc::new(Notify::new()));
-                                            let session=Arc::new(Session{adaptive_fec_retention,generations:Mutex::new([None;MAX_PATHS]),empty_since:Mutex::new(Some(Instant::now())),events:tx,native_ingress,paths:Arc::new(Mutex::new(Vec::new())),stop,policy,observation_notify,ingress_drops:Arc::new(AtomicU64::new(0)),forward:metrics.scope(&sid,stats::FORWARD),returning:metrics.scope(&sid,stats::RETURN),finished:tokio::sync::Notify::new(),done:std::sync::atomic::AtomicBool::new(false)});
+                                            let native_writable=(policy.native_return && !policy.game_mode).then(||Arc::new(Notify::new()));
+                                            let session=Arc::new(Session{adaptive_fec_retention,generations:Mutex::new([None;MAX_PATHS]),empty_since:Mutex::new(Some(Instant::now())),events:tx,native_ingress,paths:Arc::new(Mutex::new(Vec::new())),stop,policy,observation_notify,native_writable,ingress_drops:Arc::new(AtomicU64::new(0)),forward:metrics.scope(&sid,stats::FORWARD),returning:metrics.scope(&sid,stats::RETURN),finished:tokio::sync::Notify::new(),done:std::sync::atomic::AtomicBool::new(false)});
                                             map.insert(sid.clone(),session.clone());
                                             tokio::spawn(session_loop(session.clone(),rx,native_rx,target,tcp.clone(),tcp_budget.clone()));
                                             session
                                         };
+                                        let (return_writer,return_reader)=if native_return { let (tx,rx)=if game_mode { native_return::mixed_channel() } else { native_return::channel_with_notify(session.native_writable.clone()) }; (Some(tx),Some(rx)) } else { (None,None) };
                                         {
                                             let mut paths=session.paths.lock().expect("paths lock");
                                             let existing=paths.iter().position(|p|p.id==pid);
@@ -4919,10 +4975,10 @@ async fn server_connection(
                                             })),stream:stream_id,stream_payload,native_return:return_writer,quality,capacity_probe:Arc::new(Mutex::new(capacity_probe::State::new(generation))),capacity_probe_enabled:capacity_probe_bps>0,epoch:Instant::now(),probe_reply:Arc::new(Mutex::new(None))});
                                             *session.empty_since.lock().expect("empty time lock")=None;
                                         }
-                                        Some(session)
+                                        Some((session, return_reader))
                                     }
                                 };
-                                let Some(session)=admitted else {
+                                let Some((session, return_reader))=admitted else {
                                     diagnostic.rejected("session_expired");
                                     let mut response=Response::builder().status(StatusCode::GONE);
                                     if let Some(state)=&mesh {response=response.header("braidpath-exit",state.node_id());}
@@ -4954,7 +5010,7 @@ async fn server_connection(
                                 if let Some(scheduler)=quality_schedule {response=response.header("braidpath-scheduler",scheduler);}stream.send_response(response.body(())?).await?;
                                 let (send,recv)=stream.split();
                                 if let Some(reader)=return_reader {
-                                    conn.set_send_window(if game_mode { native_return::MIXED_SEND_WINDOW } else { u64::from(native_return::WINDOW) });
+                                    conn.set_send_window(if game_mode { native_return::MIXED_SEND_WINDOW } else { native_return::INITIAL_SEND_WINDOW });
                                     return_tasks.spawn(native_return::write(conn.clone(),send,reader));
                                 } else { response_send=Some(send); }
                                 request=Some(recv);
@@ -5641,7 +5697,9 @@ async fn client_session(
     } = ingress::channels(options.policy.game_mode);
     let (stop, stop_rx) = watch::channel(false);
     let observation_notify = options.policy.adaptive.then(|| Arc::new(Notify::new()));
-    tasks.spawn(sender_with_game_input(
+    let native_writable = (options.policy.native_return && !options.policy.game_mode)
+        .then(|| Arc::new(Notify::new()));
+    tasks.spawn(sender_with_inputs(
         rx,
         game_rx,
         paths.clone(),
@@ -5649,6 +5707,7 @@ async fn client_session(
         stop_rx,
         forward.clone(),
         observation_notify.clone(),
+        native_writable.clone(),
     ));
     // Streams do not survive a session epoch; a new epoch accepts new connections.
     let mut streams = tcp::Mux::client(
@@ -5980,12 +6039,12 @@ async fn client_session(
                             let (tx, rx) = if options.policy.game_mode {
                                 native_return::mixed_channel()
                             } else {
-                                native_return::channel()
+                                native_return::channel_with_notify(native_writable.clone())
                             };
                             value.conn.set_send_window(if options.policy.game_mode {
                                 native_return::MIXED_SEND_WINDOW
                             } else {
-                                u64::from(native_return::WINDOW)
+                                native_return::INITIAL_SEND_WINDOW
                             });
                             (Some(tx), Some(rx))
                         } else {
@@ -6957,5 +7016,28 @@ mod stream_profile_tests {
         // Interface disappears while no path is live, then reappears -> Appeared resets backoff.
         assert_eq!(tracker.poll(None, false), InterfaceEvent::Unchanged);
         assert_eq!(tracker.poll(Some(36), false), InterfaceEvent::Appeared(36));
+    }
+
+    #[test]
+    fn native_datagram_pace_floor_prevents_queue_brake_collapse_and_respects_caps() {
+        // Healthy 480 KB cwnd @ 120 ms RTT (~32 Mbps) floors DATAGRAM lane at 8 Mbps.
+        assert_eq!(
+            native_datagram_pace_floor(480_000, 120_000, 100_000_000),
+            8_000_000
+        );
+        // Degraded 25 KB cwnd @ 90 ms RTT (~2.2 Mbps) follows native service.
+        let degraded = native_datagram_pace_floor(25_000, 90_000, 100_000_000);
+        assert!(degraded > 2_000_000 && degraded < 2_500_000);
+        // Tiny cwnd still stays above 512 Kbps (so <=1 KiB interactive frames
+        // never hit the 20 ms queue expiry), unless operator rate cap is lower.
+        assert_eq!(
+            native_datagram_pace_floor(2_000, 200_000, 100_000_000),
+            512_000
+        );
+        assert_eq!(
+            native_datagram_pace_floor(480_000, 120_000, 256_000),
+            256_000
+        );
+        assert_eq!(native_datagram_pace_floor(0, 0, 100_000_000), 2_000_000);
     }
 }

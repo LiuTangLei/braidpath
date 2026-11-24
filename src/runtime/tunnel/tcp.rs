@@ -1961,7 +1961,9 @@ impl Mux {
                 continue;
             }
             let before_splits = s.send.pmtu_splits;
-            let interactive = s.send.written() - s.send.retained_from() <= INTERACTIVE_BYTES;
+            let reliable_rescue = self.native_return && s.send.head_probe_is_reliable();
+            let interactive = !reliable_rescue
+                && (s.send.written() - s.send.retained_from() <= INTERACTIVE_BYTES);
             let transmit = if self.native_return && !interactive {
                 s.send.poll_transmit_reliable(now, self.payload_limit)
             } else {
@@ -1988,13 +1990,14 @@ impl Mux {
             self.stats.local_small_retry_frames +=
                 u64::from(t.local_retry && payload.len() <= super::LATENCY_RECORD_BYTES);
             let hold = (t.transmission > 0).then(|| {
-                self.gauge.hold(
+                self.gauge.hold_with_avoid(
                     id,
                     t.start,
                     t.transmission,
                     payload.len(),
                     interactive,
                     t.local_retry,
+                    t.avoid_path,
                 )
             });
             if !out.enqueue(stream::data_flow(id), payload, hold) {

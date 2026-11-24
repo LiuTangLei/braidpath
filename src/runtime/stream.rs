@@ -55,7 +55,7 @@ const MAX_PTO: Duration = Duration::from_secs(2);
 const DEAD_AFTER: Duration = Duration::from_secs(30);
 /// Copies sent without a loss declaration may produce up to this many duplicate
 /// bytes that are not evidence of reordering.
-const EXPECTED_DUPLICATES_MAX: u64 = 2 * (super::MAX_STREAM_PAYLOAD - DATA_HEADER) as u64;
+const EXPECTED_DUPLICATES_MAX: u64 = 2 * (RELIABLE_PAYLOAD - DATA_HEADER) as u64;
 /// A persistent SACK hole in a bulk flight may get one bounded extra copy.
 /// Small tails already have their separate probe policy.
 const HEAD_PROBE_MIN_FLIGHT: u64 = 64 * 1024;
@@ -413,6 +413,8 @@ pub struct Transmit {
     pub head_copy: bool,
     /// This attempt replaces an original that never reached native admission.
     pub local_retry: bool,
+    /// Path already carrying a stalled reliable segment; rescue prefers a sibling.
+    pub avoid_path: Option<u8>,
 }
 
 impl Sender {
@@ -612,13 +614,13 @@ impl Sender {
             local_retry_pending: false,
             reliable: None,
         });
-        if !probe && segment.transmissions > 0 {
+        let local_retry = !probe && std::mem::take(&mut segment.local_retry_pending);
+        if !probe && segment.transmissions > 0 && !local_retry {
             let stalled = progress.is_none_or(|at| at <= segment.sent_at);
             segment.stalls = if stalled { segment.stalls + 1 } else { 0 };
         }
         segment.transmissions += 1;
         let transmission = segment.transmissions;
-        let local_retry = !probe && std::mem::take(&mut segment.local_retry_pending);
         if probe {
             // A probe is a bounded additional copy, not a loss declaration.
             // Preserve the original timer, route and failure/backoff evidence.
@@ -650,6 +652,7 @@ impl Sender {
             tail_probe: probe,
             head_copy: false,
             local_retry,
+            avoid_path: None,
         }
     }
     /// Split only a selected oversized flight record. Already queued callbacks
@@ -724,11 +727,13 @@ impl Sender {
                 if self.split_for_payload(start, maximum) {
                     return self.poll_transmit_limited(now, payload, bound);
                 }
-                let end = self.segments[&start].end;
+                let segment = &self.segments[&start];
+                let end = segment.end;
+                let avoid_path = segment.reliable.is_some().then_some(segment.path as u8);
                 self.head_probe = None;
                 self.last_head_probe = Some(now);
                 let mut t = self.send_segment(start, end, now, true);
-                (t.tail_probe, t.head_copy) = (false, true);
+                (t.tail_probe, t.head_copy, t.avoid_path) = (false, true, avoid_path);
                 return Some(t);
             }
         }
@@ -778,6 +783,7 @@ impl Sender {
                 tail_probe: false,
                 head_copy: false,
                 local_retry: false,
+                avoid_path: None,
             });
         }
         None
@@ -1018,11 +1024,21 @@ impl Sender {
         .then_some((start, s.end))
     }
 
+    pub(crate) fn head_probe_is_reliable(&self) -> bool {
+        self.lost.is_empty()
+            && self.head_copy_ready().is_none()
+            && self.head_probe_due
+            && self.head_probe_deadline().is_some_and(|(start, _)| {
+                self.segments
+                    .get(&start)
+                    .is_some_and(|s| s.reliable.is_some())
+            })
+    }
+
     fn head_probe_deadline(&self) -> Option<(u64, Instant)> {
         let (start, transmission, at) = self.head_probe?;
         let segment = self.segments.get(&start)?;
         (start == self.acked
-            && segment.reliable.is_none()
             && segment.transmissions == transmission
             && segment.path != UNKNOWN_PATH
             && segment.probe_transmission.is_none()
@@ -1040,13 +1056,34 @@ impl Sender {
             return;
         };
         if start != self.acked
-            || segment.reliable.is_some()
-            || self.written - self.base <= HEAD_PROBE_MIN_FLIGHT
             || segment.transmissions != 1
             || segment.path == UNKNOWN_PATH
             || self.lost.contains(&start)
             || self.rack.is_none_or(|later| later <= segment.sent_at)
         {
+            return;
+        }
+        if segment.reliable.is_some() {
+            // Bounded cross-path head rescue for reliable stream segments:
+            // `rack > sent_at` is only possible when a healthier sibling path
+            // has already overtaken this path and delivered later data. Wait
+            // well past normal cross-path RTT skew so balanced transfers send
+            // zero duplicates, then rescue the oldest blocked offset once.
+            let rtt = self.transport_rtt[segment.path].max(Duration::from_millis(20));
+            let stall_at = segment.sent_at
+                + rtt
+                    .mul_f64(2.0)
+                    .clamp(Duration::from_millis(250), Duration::from_millis(800));
+            let settle_at =
+                now + (rtt / 2).clamp(Duration::from_millis(50), Duration::from_millis(150));
+            let rate_limit_at = self
+                .last_head_probe
+                .map_or(now, |last| last + rtt.max(Duration::from_millis(250)));
+            let at = stall_at.max(settle_at).max(rate_limit_at);
+            self.head_probe = Some((start, segment.transmissions, at));
+            return;
+        }
+        if self.written - self.base <= HEAD_PROBE_MIN_FLIGHT {
             return;
         }
         let rtt = self.transport_rtt[segment.path].max(Duration::from_millis(1));
@@ -3289,6 +3326,117 @@ mod tests {
         assert!(
             !sender.locally_dropped(first.start, first.transmission),
             "stale report"
+        );
+        // Local queue drops before any network admission must not trigger
+        // exponential network stall backoff on the first actual transmission.
+        assert_eq!(sender.segments[&0].stalls, 0);
+    }
+
+    #[test]
+    fn reliable_head_rescue_emits_bounded_cross_path_copy_when_overtaken_by_sibling() {
+        let t0 = Instant::now();
+        let mut sender = Sender::new(false);
+        sender.on_ack(
+            &Ack {
+                cumulative: 0,
+                limit: 256 * 1024,
+                duplicate_bytes: 0,
+                ranges: vec![],
+            },
+            t0,
+        );
+        sender.push(&vec![9u8; 64 * 1024]);
+        let seg0 = sender.poll_transmit_reliable(t0, RELIABLE_PAYLOAD).unwrap();
+        let seg1 = sender
+            .poll_transmit_reliable(t0 + Duration::from_millis(1), RELIABLE_PAYLOAD)
+            .unwrap();
+        let reachable0 = Arc::new(AtomicBool::new(true));
+        let reachable1 = Arc::new(AtomicBool::new(true));
+        sender.admitted_reliable(
+            seg0.start,
+            seg0.transmission,
+            1,
+            Duration::from_millis(100),
+            t0,
+            reachable0,
+        );
+        sender.admitted_reliable(
+            seg1.start,
+            seg1.transmission,
+            2,
+            Duration::from_millis(100),
+            t0 + Duration::from_millis(1),
+            reachable1,
+        );
+        // Without a sibling overtaking seg0, no reliable head rescue is armed.
+        assert!(sender.head_probe_deadline().is_none());
+
+        // Sibling path 2 delivers seg1 while seg0 remains stuck on path 1.
+        let ack_at = t0 + Duration::from_millis(110);
+        let seg1_end = seg1.start
+            + match &seg1.frame {
+                Frame::Data { data, .. } => data.len() as u64,
+                _ => unreachable!(),
+            };
+        sender.on_ack(
+            &Ack {
+                cumulative: 0,
+                limit: 256 * 1024,
+                duplicate_bytes: 0,
+                ranges: vec![(seg1.start, seg1_end)],
+            },
+            ack_at,
+        );
+        let (rescue_start, rescue_at) = sender.head_probe_deadline().expect("rescue armed");
+        assert_eq!(rescue_start, seg0.start);
+        assert!(rescue_at >= t0 + Duration::from_millis(250));
+
+        // Before the stall threshold, nothing fires.
+        assert!(!sender.on_timeout(rescue_at - Duration::from_millis(1)));
+        assert!(!sender.head_probe_is_reliable());
+
+        // At deadline, one bounded rescue copy fires, avoiding stuck path 1.
+        assert!(sender.on_timeout(rescue_at));
+        assert!(sender.head_probe_is_reliable());
+        let rescue = sender
+            .poll_transmit_reliable(rescue_at, RELIABLE_PAYLOAD)
+            .expect("rescue transmit");
+        assert!(rescue.head_copy);
+        assert_eq!(rescue.start, seg0.start);
+        assert_eq!(rescue.avoid_path, Some(1));
+        assert!(
+            sender.head_probe_deadline().is_none(),
+            "at most one rescue copy per stuck transmission"
+        );
+
+        // Admitting the rescue copy registers expected duplicate bytes so the
+        // eventual late arrival from path 1 is not misclassified as spurious.
+        let seg0_len = match &seg0.frame {
+            Frame::Data { data, .. } => data.len() as u64,
+            _ => unreachable!(),
+        };
+        sender.admitted_reliable(
+            rescue.start,
+            rescue.transmission,
+            2,
+            Duration::from_millis(100),
+            rescue_at,
+            Arc::new(AtomicBool::new(true)),
+        );
+        let (_, spurious) = sender
+            .on_ack(
+                &Ack {
+                    cumulative: seg1_end,
+                    limit: 256 * 1024 + seg1_end,
+                    duplicate_bytes: seg0_len,
+                    ranges: vec![],
+                },
+                rescue_at + Duration::from_millis(100),
+            )
+            .expect("ack");
+        assert!(
+            !spurious,
+            "expected duplicate from rescued 32 KiB segment must not count as spurious"
         );
     }
 

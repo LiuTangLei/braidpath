@@ -79,6 +79,27 @@ impl Gauge {
         interactive: bool,
         local_retry: bool,
     ) -> Arc<Hold> {
+        self.hold_with_avoid(
+            stream,
+            start,
+            transmission,
+            bytes,
+            interactive,
+            local_retry,
+            None,
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub fn hold_with_avoid(
+        self: &Arc<Self>,
+        stream: u32,
+        start: u64,
+        transmission: u32,
+        bytes: usize,
+        interactive: bool,
+        local_retry: bool,
+        avoid_path: Option<u8>,
+    ) -> Arc<Hold> {
         self.queued.fetch_add(bytes, Ordering::AcqRel);
         Arc::new(Hold {
             gauge: self.clone(),
@@ -86,6 +107,7 @@ impl Gauge {
             bytes,
             interactive,
             local_retry,
+            avoid_path,
             admitted: AtomicBool::new(false),
             queue_reserved: AtomicBool::new(true),
         })
@@ -99,6 +121,8 @@ pub struct Hold {
     /// The stream has little outstanding data: send it on the earliest path.
     interactive: bool,
     local_retry: bool,
+    /// Path already carrying a stalled reliable copy; prefer a healthy sibling.
+    avoid_path: Option<u8>,
     admitted: AtomicBool,
     queue_reserved: AtomicBool,
 }
@@ -111,6 +135,9 @@ impl Hold {
     }
     pub fn local_retry(&self) -> bool {
         self.local_retry
+    }
+    pub fn avoid_path(&self) -> Option<u8> {
+        self.avoid_path
     }
     /// A bounded reliable writer now owns this frame. Give end-to-end repair
     /// its chosen path immediately; native flow-control waits must not pin the

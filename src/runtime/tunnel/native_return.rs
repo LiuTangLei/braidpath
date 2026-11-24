@@ -88,17 +88,29 @@ pub(super) const BURST: usize = wire_cost(PAYLOAD + HEADER_BYTES);
 const fn wire_cost(bytes: usize) -> usize {
     bytes + bytes.div_ceil(PACKET_PAYLOAD) * PACKET_ALLOWANCE
 }
-pub(super) const WINDOW: u32 = 2 * 1024 * 1024;
+/// Start each native stream with a bounded send window so low-bandwidth or
+/// freshly-joined paths cannot accumulate multi-second QUIC stream backlogs
+/// before BBR measures actual `cwnd`. Clean fast paths ramp multiplicatively
+/// to `MAX_SEND_WINDOW`, while small-cwnd paths shrink to `cwnd_cap` on the
+/// first sample.
+pub(super) const INITIAL_SEND_WINDOW: u64 = 512 * 1024;
+const MIN_SEND_WINDOW: u64 = 128 * 1024;
+const SLOW_PATH_MIN_WINDOW: u64 = 96 * 1024;
 pub(super) const RECEIVE_WINDOW: u32 = 4 * 1024 * 1024;
 const MAX_SEND_WINDOW: u64 = RECEIVE_WINDOW as u64;
 const SEND_WINDOW_GROWTH: u64 = 64 * 1024;
+const SEND_WINDOW_MAX_GROWTH: u64 = 512 * 1024;
 const SEND_WINDOW_BRAKE: u64 = 128 * 1024;
-const SLOW_PATH_BACKLOG_THRESHOLD: u64 = 256 * 1024;
+const LOSS_HOLD_US: u64 = 1_000_000;
+const LOSS_CAUTIOUS_US: u64 = 3_000_000;
+const BRAKE_COOLDOWN_MIN_US: u64 = 200_000;
+const SLOW_PATH_BACKLOG_THRESHOLD: u64 = 128 * 1024;
 const SLOW_PATH_WRITER_MARGIN: u64 = 2 * PAYLOAD as u64;
 const PATH_QUEUE: usize = 4;
 
-/// Keep startup/backpressure at the established budget. Expand only against
-/// exercised native service, without exceeding the current native cwnd.
+/// Keep startup/backpressure bounded by measured native `cwnd` and severe loss.
+/// Expand only against exercised clean service, trim excess stream buffer above
+/// `~1 BDP + headroom` when queued, and hold/grow additively after severe loss.
 #[derive(Default)]
 pub(super) struct Credit {
     connection: Option<usize>,
@@ -106,10 +118,15 @@ pub(super) struct Credit {
     sent: u64,
     lost: u64,
     current: u64,
+    loss_ceiling: Option<u64>,
+    loss_hold_until_us: u64,
+    loss_cautious_until_us: u64,
+    last_brake_us: u64,
 }
 #[derive(Clone, Copy)]
 struct CreditSample {
     cwnd: u64,
+    rtt_us: u64,
     sent: u64,
     lost: u64,
     queued: bool,
@@ -176,7 +193,11 @@ impl Credit {
                 sampled_us: now_us,
                 sent: stats.path.sent_packets,
                 lost: stats.path.lost_packets,
-                current: u64::from(WINDOW),
+                current: INITIAL_SEND_WINDOW,
+                loss_ceiling: None,
+                loss_hold_until_us: 0,
+                loss_cautious_until_us: 0,
+                last_brake_us: 0,
             };
             return None;
         }
@@ -184,16 +205,15 @@ impl Credit {
             return None;
         }
         let stats = conn.stats();
-        let queued_ms = conn
-            .rtt_hint()
-            .saturating_sub(conn.min_rtt_hint())
-            .as_secs_f64()
-            * 1000.0;
+        let rtt = conn.rtt_hint();
+        let rtt_us = rtt.as_micros().min(u128::from(u64::MAX)) as u64;
+        let queued_ms = rtt.saturating_sub(conn.min_rtt_hint()).as_secs_f64() * 1000.0;
         let (retained, unsent) = conn.stream_send_buffer_bytes();
         self.update(
             now_us,
             CreditSample {
                 cwnd: stats.path.cwnd,
+                rtt_us,
                 sent: stats.path.sent_packets,
                 lost: stats.path.lost_packets,
                 queued: queued_ms > target_ms as f64 * 0.25,
@@ -215,35 +235,99 @@ impl Credit {
         self.sampled_us = now_us;
         self.sent = sample.sent;
         self.lost = sample.lost;
-        let floor = u64::from(WINDOW);
-        let restore_default = self.current < floor && !sample.faster_route;
-        if sample.probing || (!restore_default && packets < 64 && !sample.queued && losses == 0) {
+        if sample.probing {
             return None;
         }
-        let ceiling = (sample.cwnd.saturating_mul(3) / 4).clamp(floor, MAX_SEND_WINDOW);
-        // BBR's cwnd already includes headroom beyond a typical flight.
-        // Keep the writer fed without giving the slow path another long queue.
+        // Bound QUIC stream send storage proportionally to actual `cwnd` on
+        // every path, so a 25-95 KiB cwnd link never buffers 2 MiB (10-20s)
+        // of stale/unsent stream bytes behind a reset or stalled flow.
+        let cwnd_cap = (sample.cwnd.saturating_mul(3) / 2)
+            .max(sample.cwnd.saturating_add(SLOW_PATH_WRITER_MARGIN))
+            .clamp(MIN_SEND_WINDOW, MAX_SEND_WINDOW);
+        // Queue-only braking trims excess stream buffer above ~1 BDP + writer
+        // headroom (`cwnd/2` under BBRv1) without starving healthy paths below
+        // full pipe occupancy during routine BBR ProbeBW RTT bumps.
+        let bdp_floor = (sample.cwnd / 2)
+            .saturating_add(SLOW_PATH_WRITER_MARGIN)
+            .clamp(MIN_SEND_WINDOW, (MAX_SEND_WINDOW / 2).min(cwnd_cap));
         let slow_window = (sample.cwnd.saturating_mul(3) / 4)
             .saturating_add(SLOW_PATH_WRITER_MARGIN)
-            .min(floor);
-        let next = if sample.faster_route
-            && slow_window < floor
-            && (self.current < floor || sample.unsent > SLOW_PATH_BACKLOG_THRESHOLD)
+            .clamp(SLOW_PATH_MIN_WINDOW, cwnd_cap);
+        // Only severe loss (>= 5%, or >= 3% while also queued) indicates buffer
+        // overflow / policer overshoot; 1-2% random WAN loss must not collapse
+        // a healthy BBR path's stream window.
+        let severe_loss = packets >= 24
+            && (losses.saturating_mul(100) >= packets.saturating_mul(5)
+                || (sample.queued && losses.saturating_mul(100) >= packets.saturating_mul(3)));
+        let brake_ready = self.last_brake_us == 0
+            || now_us.saturating_sub(self.last_brake_us)
+                >= sample.rtt_us.max(BRAKE_COOLDOWN_MIN_US);
+        let must_shrink = self.current > cwnd_cap
+            || (sample.faster_route
+                && slow_window < self.current
+                && sample.unsent > SLOW_PATH_BACKLOG_THRESHOLD);
+        let restore_floor = self.current < MIN_SEND_WINDOW && !sample.faster_route;
+        if !must_shrink && !restore_floor && packets < 32 && !sample.queued && !severe_loss {
+            return None;
+        }
+        let next = if severe_loss {
+            // Shrink excess buffering above `bdp_floor` at most once per RTT on
+            // severe loss, hold briefly, and recover additively rather than
+            // doubling straight back into loss — without starving healthy BDP
+            // down to `MIN_SEND_WINDOW` on random WAN loss or bursty policers.
+            self.loss_hold_until_us = now_us.saturating_add(LOSS_HOLD_US);
+            self.loss_cautious_until_us = now_us.saturating_add(LOSS_CAUTIOUS_US);
+            if brake_ready {
+                let target = (self.current.saturating_mul(3) / 4)
+                    .max(bdp_floor)
+                    .min(cwnd_cap);
+                self.loss_ceiling = Some(target);
+                self.last_brake_us = now_us;
+                target
+            } else {
+                self.current.min(cwnd_cap)
+            }
+        } else if sample.faster_route
+            && slow_window < cwnd_cap
+            && (self.current <= slow_window || sample.unsent > SLOW_PATH_BACKLOG_THRESHOLD)
         {
             slow_window
-        } else if self.current < floor
-            || sample.deeply_queued
-            || losses.saturating_mul(100) > packets
+        } else if sample.deeply_queued && self.current > bdp_floor && brake_ready {
+            self.last_brake_us = now_us;
+            (self.current.saturating_mul(3) / 4)
+                .max(bdp_floor)
+                .min(cwnd_cap)
+        } else if sample.queued
+            && sample.unsent > SLOW_PATH_WRITER_MARGIN
+            && self.current > bdp_floor
+            && brake_ready
         {
-            floor
-        } else if sample.queued {
             // A short RTT excursion need not discard an entire flight of
-            // earned storage. Severe congestion or loss still resets it.
-            ceiling.min(self.current.saturating_sub(SEND_WINDOW_BRAKE).max(floor))
-        } else if sample.storage_limited {
-            ceiling.min(self.current + SEND_WINDOW_GROWTH)
+            // earned storage. Only trim when unsent stream backlog exists
+            // above the path's BDP floor.
+            self.last_brake_us = now_us;
+            self.current
+                .saturating_sub(SEND_WINDOW_BRAKE)
+                .max(bdp_floor)
+                .min(cwnd_cap)
+        } else if restore_floor {
+            MIN_SEND_WINDOW.min(cwnd_cap)
+        } else if sample.storage_limited && packets >= 32 && !sample.queued {
+            if now_us < self.loss_hold_until_us {
+                self.loss_ceiling
+                    .map_or(self.current, |ceiling| self.current.min(ceiling))
+                    .min(cwnd_cap)
+            } else if now_us < self.loss_cautious_until_us {
+                (self.current + SEND_WINDOW_GROWTH).min(cwnd_cap)
+            } else {
+                self.loss_ceiling = None;
+                let step = self
+                    .current
+                    .clamp(SEND_WINDOW_GROWTH, SEND_WINDOW_MAX_GROWTH);
+                (self.current + step).min(cwnd_cap)
+            }
         } else {
-            ceiling.min(self.current)
+            self.current.min(cwnd_cap)
         };
         if next == self.current {
             return None;
@@ -267,11 +351,15 @@ impl Writer {
 pub(super) struct Reader {
     pub(super) rx: mpsc::Receiver<WritePart>,
     reachable: Arc<AtomicBool>,
+    ready: Option<Arc<Notify>>,
 }
 impl Drop for Reader {
     fn drop(&mut self) {
         self.rx.close();
         self.reachable.store(false, Ordering::Release);
+        if let Some(ready) = &self.ready {
+            ready.notify_one();
+        }
     }
 }
 
@@ -330,15 +418,20 @@ impl Drop for Reservation {
     }
 }
 
+#[cfg(test)]
 pub(super) fn channel() -> (Writer, Reader) {
-    writer_channel(PATH_QUEUE)
+    writer_channel(PATH_QUEUE, None)
+}
+
+pub(super) fn channel_with_notify(ready: Option<Arc<Notify>>) -> (Writer, Reader) {
+    writer_channel(PATH_QUEUE, ready)
 }
 
 pub(super) fn mixed_channel() -> (Writer, Reader) {
-    writer_channel(1)
+    writer_channel(1, None)
 }
 
-fn writer_channel(queue: usize) -> (Writer, Reader) {
+fn writer_channel(queue: usize, ready: Option<Arc<Notify>>) -> (Writer, Reader) {
     let (tx, rx) = mpsc::channel(queue);
     let reachable = Arc::new(AtomicBool::new(true));
     (
@@ -346,7 +439,11 @@ fn writer_channel(queue: usize) -> (Writer, Reader) {
             tx,
             reachable: reachable.clone(),
         },
-        Reader { rx, reachable },
+        Reader {
+            rx,
+            reachable,
+            ready,
+        },
     )
 }
 
@@ -404,39 +501,64 @@ pub(super) fn drain(
         let mut order: Vec<_> = (0..paths.len())
             .map(|n| (*cursor + n) % paths.len())
             .collect();
+        let avoid_path = front.hold.as_ref().and_then(|hold| hold.avoid_path());
         let active_native = paths
             .iter()
-            .filter(|p| p.open() && silent & (1 << p.id) == 0 && p.native_return.is_some())
+            .filter(|p| {
+                p.open()
+                    && silent & (1 << p.id) == 0
+                    && p.native_return
+                        .as_ref()
+                        .is_some_and(|w| w.reachable.load(Ordering::Acquire))
+            })
             .count();
+        let mut path_ranks: [(bool, u64); super::MAX_PATHS] = [(true, u64::MAX); super::MAX_PATHS];
+        let mut straggler_limit_us = u64::MAX;
+        let has_non_avoid = avoid_path.is_some()
+            && paths.iter().any(|p| {
+                p.open()
+                    && silent & (1 << p.id) == 0
+                    && Some(p.id) != avoid_path
+                    && p.native_return
+                        .as_ref()
+                        .is_some_and(|w| w.reachable.load(Ordering::Acquire))
+            });
         if active_native >= 2 {
             // In-order TCP delivery waits for the oldest record, and interactive
             // responses larger than the DATAGRAM bypass should avoid a deeply
             // queued or RTT-probing sibling path. Rank 2+ paths by estimated
-            // completion time (one-way delay + queued backlog drain time).
+            // completion time (one-way delay + queued backlog drain time), and
+            // refuse to dump into a massively backlogged straggler solely
+            // because a faster path's small channel is momentarily full.
             let best_service = paths
                 .iter()
                 .filter(|p| {
                     p.open()
                         && silent & (1 << p.id) == 0
-                        && p.native_return.is_some()
+                        && p.native_return
+                            .as_ref()
+                            .is_some_and(|w| w.reachable.load(Ordering::Acquire))
                         && !p.conn.probing_rtt_hint()
                 })
                 .map(|p| service_bound(&p.conn))
                 .max()
                 .unwrap_or(0);
-            order.sort_by_cached_key(|&i| {
-                let path = &paths[i];
+            let mut best_ect_us = u64::MAX;
+            for path in paths.iter() {
+                if !path.open() || silent & (1 << path.id) != 0 {
+                    continue;
+                }
                 let Some(writer) = &path.native_return else {
-                    return (true, u64::MAX);
+                    continue;
                 };
-                let slots = writer.tx.capacity();
-                if slots == 0 || !path.open() || silent & (1 << path.id) != 0 {
-                    return (true, u64::MAX);
+                if !writer.reachable.load(Ordering::Acquire) {
+                    continue;
                 }
                 let (_, unsent) = path.conn.stream_send_buffer_bytes();
+                let slots = writer.tx.capacity();
                 let queued = unsent + ((writer.tx.max_capacity() - slots) * PAYLOAD) as u64;
                 let cold = path.conn.stats().path.sent_packets < COLD_PATH_MIN_PACKETS;
-                path_completion_rank(
+                let rank = path_completion_rank(
                     path.conn.probing_rtt_hint(),
                     path.conn.rtt_hint().as_micros() as u64,
                     queued,
@@ -444,7 +566,24 @@ pub(super) fn drain(
                     service_bound(&path.conn),
                     cold,
                     best_service,
-                )
+                );
+                path_ranks[usize::from(path.id)] = rank;
+                if !rank.0 && (!has_non_avoid || Some(path.id) != avoid_path) {
+                    best_ect_us = best_ect_us.min(rank.1);
+                }
+            }
+            if best_ect_us < u64::MAX {
+                straggler_limit_us = best_ect_us.saturating_mul(2).saturating_add(150_000);
+            }
+            order.sort_by_cached_key(|&i| {
+                let path = &paths[i];
+                let avoided = Some(path.id) == avoid_path;
+                let Some(writer) = &path.native_return else {
+                    return (true, true, true, u64::MAX);
+                };
+                let full = writer.tx.capacity() == 0;
+                let (probing, ect) = path_ranks[usize::from(path.id)];
+                (avoided, full, probing, ect)
             });
         }
         let ready = order.into_iter().find_map(|i| {
@@ -454,6 +593,17 @@ pub(super) fn drain(
                 || !groups[usize::from(path.group)].available(cost)
             {
                 return None;
+            }
+            if active_native >= 2 {
+                if has_non_avoid && Some(path.id) == avoid_path {
+                    return None;
+                }
+                if straggler_limit_us < u64::MAX {
+                    let (probing, ect) = path_ranks[usize::from(path.id)];
+                    if probing || ect > straggler_limit_us {
+                        return None;
+                    }
+                }
             }
             let writer = path.native_return.as_ref()?;
             if !writer.reachable.load(Ordering::Acquire) {
@@ -776,6 +926,9 @@ pub(super) async fn write(
         }) else {
             break;
         };
+        if let Some(ready) = &input.ready {
+            ready.notify_one();
+        }
         if let Some(start) = part.start.take() {
             debug_assert!(flight.is_none());
             flight = Some(start);
@@ -815,6 +968,9 @@ pub(super) async fn write_client(
         }) else {
             break;
         };
+        if let Some(ready) = &input.ready {
+            ready.notify_one();
+        }
         if let Some(start) = part.start.take() {
             debug_assert!(flight.is_none());
             flight = Some(start);
@@ -1020,13 +1176,13 @@ mod tests {
 
     #[test]
     fn native_credit_grows_only_on_clean_storage_limited_service() {
-        let floor = u64::from(WINDOW);
         let mut credit = Credit {
-            current: floor,
+            current: INITIAL_SEND_WINDOW,
             ..Default::default()
         };
         let mut sample = CreditSample {
             cwnd: 8 * 1024 * 1024,
+            rtt_us: 100_000,
             sent: 500,
             lost: 0,
             queued: false,
@@ -1038,72 +1194,178 @@ mod tests {
         };
         assert_eq!(credit.update(100_000, sample), None);
         sample.storage_limited = true;
-        let growth_samples = (MAX_SEND_WINDOW - floor) / SEND_WINDOW_GROWTH;
-        for step in 1..=growth_samples {
+        let mut now_us = 100_000;
+        let mut steps = 0;
+        while credit.current < MAX_SEND_WINDOW {
+            now_us += 100_000;
             sample.sent += 500;
-            assert_eq!(
-                credit.update((step + 1) * 100_000, sample),
-                Some(floor + step * SEND_WINDOW_GROWTH)
+            let next = credit.update(now_us, sample).expect("clean ramp step");
+            assert!(next > INITIAL_SEND_WINDOW);
+            steps += 1;
+            assert!(
+                steps <= 12,
+                "clean ramp must reach MAX_SEND_WINDOW promptly"
             );
         }
-        let full_at = (growth_samples + 1) * 100_000;
+        assert_eq!(credit.current, MAX_SEND_WINDOW);
+
         sample.probing = true;
         sample.queued = true;
+        sample.unsent = 256 * 1024;
         sample.sent += 500;
-        assert_eq!(credit.update(full_at + 100_000, sample), None);
+        now_us += 100_000;
+        assert_eq!(credit.update(now_us, sample), None);
         assert_eq!(credit.current, MAX_SEND_WINDOW);
 
         sample.probing = false;
         sample.sent += 500;
+        now_us += 100_000;
         assert_eq!(
-            credit.update(full_at + 200_000, sample),
+            credit.update(now_us, sample),
             Some(MAX_SEND_WINDOW - SEND_WINDOW_BRAKE)
         );
+        // Brake cooldown prevents consecutive cuts inside one RTT.
+        let after_mild = credit.current;
         sample.deeply_queued = true;
         sample.sent += 500;
-        assert_eq!(credit.update(full_at + 300_000, sample), Some(floor));
+        now_us += 100_000;
+        assert_eq!(credit.update(now_us, sample), None);
+        assert_eq!(credit.current, after_mild);
+
+        // After the cooldown expires, deeply_queued cuts by 3/4 (down to bdp_floor).
+        sample.sent += 500;
+        now_us += BRAKE_COOLDOWN_MIN_US;
+        assert_eq!(credit.update(now_us, sample), Some(after_mild * 3 / 4));
+
+        // 2% random unqueued WAN loss does not collapse the stream window.
+        let before_random = credit.current;
         sample.deeply_queued = false;
         sample.queued = false;
+        sample.unsent = 0;
+        sample.storage_limited = false;
         sample.sent += 500;
+        sample.lost += 10;
+        now_us += BRAKE_COOLDOWN_MIN_US;
+        assert_eq!(credit.update(now_us, sample), None);
+        assert_eq!(credit.current, before_random);
+
+        // Severe (>=5%) packet loss shrinks once per cooldown, holds for LOSS_HOLD_US,
+        // and recovers additively (never doubling) during LOSS_CAUTIOUS_US.
+        sample.storage_limited = true;
+        sample.sent += 500;
+        sample.lost += 30;
+        now_us += BRAKE_COOLDOWN_MIN_US;
+        let after_loss = before_random * 3 / 4;
+        assert_eq!(credit.update(now_us, sample), Some(after_loss));
+
+        // Immediate repeat loss inside cooldown refreshes hold without double-cutting.
+        sample.sent += 500;
+        sample.lost += 30;
+        now_us += 100_000;
+        assert_eq!(credit.update(now_us, sample), None);
+        assert_eq!(credit.current, after_loss);
+
+        // Clean samples during the loss hold cannot re-expand.
+        sample.sent += 500;
+        now_us += 100_000;
+        assert_eq!(credit.update(now_us, sample), None);
+        assert_eq!(credit.current, after_loss);
+
+        // Once the loss hold expires, multiple ticks stay strictly additive.
+        sample.sent += 500;
+        now_us += LOSS_HOLD_US;
         assert_eq!(
-            credit.update(full_at + 400_000, sample),
-            Some(floor + SEND_WINDOW_GROWTH)
+            credit.update(now_us, sample),
+            Some(after_loss + SEND_WINDOW_GROWTH)
         );
         sample.sent += 500;
-        sample.lost += 20;
-        assert_eq!(credit.update(full_at + 500_000, sample), Some(floor));
+        now_us += 100_000;
+        assert_eq!(
+            credit.update(now_us, sample),
+            Some(after_loss + 2 * SEND_WINDOW_GROWTH)
+        );
     }
+
     #[test]
-    fn native_credit_limits_slow_path_write_ahead_while_a_faster_path_is_available() {
-        let floor = u64::from(WINDOW);
+    fn native_credit_preserves_bdp_on_healthy_probe_bw_rtt_bumps() {
+        // Healthy 25 Mbps / 100 ms BBR path (~600 KiB cwnd, ~300 KiB BDP):
+        // normal ProbeBW RTT spikes trim excess above ~1 BDP + headroom but
+        // must never starve the path down to MIN_SEND_WINDOW (128 KiB).
         let mut credit = Credit {
-            current: floor,
+            current: INITIAL_SEND_WINDOW,
+            ..Default::default()
+        };
+        let cwnd = 600 * 1024;
+        let expected_floor = (cwnd / 2) + SLOW_PATH_WRITER_MARGIN;
+        let mut sample = CreditSample {
+            cwnd,
+            rtt_us: 120_000,
+            sent: 500,
+            lost: 0,
+            queued: true,
+            deeply_queued: true,
+            probing: false,
+            storage_limited: false,
+            unsent: 0,
+            faster_route: false,
+        };
+        let mut now_us = 100_000;
+        for _ in 0..10 {
+            sample.sent += 200;
+            now_us += 100_000;
+            credit.update(now_us, sample);
+        }
+        assert_eq!(credit.current, expected_floor);
+        // Even severe loss on a high-cwnd link trims excess buffer without
+        // collapsing the stream window below its BDP floor.
+        sample.queued = false;
+        sample.deeply_queued = false;
+        for _ in 0..5 {
+            sample.sent += 100;
+            sample.lost += 10;
+            now_us += BRAKE_COOLDOWN_MIN_US;
+            credit.update(now_us, sample);
+        }
+        assert_eq!(credit.current, expected_floor);
+    }
+
+    #[test]
+    fn native_credit_bounds_slow_and_degraded_paths_even_without_a_faster_sibling() {
+        // Even a single degraded path with tiny cwnd and <32 packets shrinks
+        // immediately from INITIAL_SEND_WINDOW to MIN_SEND_WINDOW (128 KiB)
+        // instead of holding a 2 MiB backlog.
+        let mut credit = Credit {
+            current: INITIAL_SEND_WINDOW,
             ..Default::default()
         };
         let mut sample = CreditSample {
-            cwnd: 512 * 1024,
-            sent: 500,
+            cwnd: 25 * 1024,
+            rtt_us: 90_000,
+            sent: 10,
             lost: 0,
             queued: false,
             deeply_queued: false,
             probing: false,
             storage_limited: false,
-            unsent: 1024 * 1024,
+            unsent: 0,
             faster_route: false,
         };
-        assert_eq!(credit.update(100_000, sample), None);
+        assert_eq!(credit.update(100_000, sample), Some(MIN_SEND_WINDOW));
+
+        // When a much faster sibling joins and backlog forms, tighten further
+        // to SLOW_PATH_MIN_WINDOW, then restore MIN_SEND_WINDOW once alone again.
         sample.faster_route = true;
-        sample.sent += 500;
-        let limited = sample.cwnd * 3 / 4 + SLOW_PATH_WRITER_MARGIN;
-        assert_eq!(credit.update(200_000, sample), Some(limited));
+        sample.unsent = 200 * 1024;
+        sample.sent += 10;
+        assert_eq!(credit.update(200_000, sample), Some(SLOW_PATH_MIN_WINDOW));
 
         sample.unsent = 0;
-        sample.sent += 500;
+        sample.sent += 50;
         assert_eq!(credit.update(300_000, sample), None);
-        assert_eq!(credit.current, limited);
+        assert_eq!(credit.current, SLOW_PATH_MIN_WINDOW);
 
         sample.faster_route = false;
-        assert_eq!(credit.update(400_000, sample), Some(floor));
+        assert_eq!(credit.update(400_000, sample), Some(MIN_SEND_WINDOW));
     }
 
     #[tokio::test]
@@ -1393,5 +1655,53 @@ mod tests {
         let mut bad = encoded().to_vec();
         bad[16] = 2;
         assert!(Decoder::default().next(&mut Bytes::from(bad)).is_err());
+    }
+
+    #[tokio::test]
+    async fn native_drain_avoids_stalled_path_for_head_rescue() {
+        let pair0 = super::super::sender_ready_tests::Pair::connect().await;
+        let pair1 = super::super::sender_ready_tests::Pair::connect().await;
+        let mut p0 = pair0.path();
+        let mut p1 = pair1.path();
+        p0.id = 0;
+        p1.id = 1;
+        let (w0, mut r0) = channel();
+        let (w1, mut r1) = channel();
+        p0.native_return = Some(w0);
+        p1.native_return = Some(w1);
+        let paths = [p0, p1];
+        let gauge = Arc::new(outbound::Gauge::default());
+        let hold = gauge.hold_with_avoid(17, 0, 2, PAYLOAD, false, false, Some(0));
+        let mut queue = outbound::Queue::default();
+        queue
+            .push(outbound::Pending {
+                game_datagram: false,
+                data: encoded(),
+                created: Instant::now(),
+                record_id: Some(42),
+                flow: Some(stream::data_flow(17)),
+                block: None,
+                small: false,
+                hold: Some(hold),
+            })
+            .ok()
+            .unwrap();
+        let mut cursor = 0;
+        let mut pacer = outbound::Pacer::for_sender(100_000_000, BURST);
+        let mut groups = std::array::from_fn(|_| outbound::Pacer::for_sender(100_000_000, BURST));
+        pacer.refill(1_000_000);
+        for g in &mut groups {
+            g.refill(1_000_000);
+        }
+        drain(&mut queue, &paths, 0, &mut cursor, &mut pacer, &mut groups);
+        assert!(queue.is_empty());
+        assert!(
+            r0.rx.try_recv().is_err(),
+            "rescue copy must avoid stalled path 0"
+        );
+        assert!(
+            r1.rx.try_recv().is_ok(),
+            "rescue copy must route onto healthy sibling path 1"
+        );
     }
 }
