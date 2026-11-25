@@ -1,4 +1,8 @@
-use super::{client::Pool, protocol::*, *};
+use super::{
+    client::{Pool, SessionKey, SessionMode},
+    protocol::*,
+    *,
+};
 use std::{collections::HashMap, net::SocketAddr};
 use tokio::time::timeout;
 use tokio::{net::UdpSocket, sync::mpsc, task::JoinSet};
@@ -13,7 +17,7 @@ async fn reply(tcp: &mut TcpStream, status: u8, bound: SocketAddr) -> Result<()>
 pub(super) async fn serve(
     mut tcp: TcpStream,
     pool: Arc<Pool>,
-    exit: &str,
+    key: &SessionKey,
     early_reply: bool,
 ) -> Result<()> {
     let (command, target) = timeout(CONNECT_TIMEOUT, async {
@@ -49,7 +53,7 @@ pub(super) async fn serve(
         return Ok(());
     }
     if command == TCP {
-        let opened = timeout(CONNECT_TIMEOUT, pool.open_stream(exit, target, early_reply)).await;
+        let opened = timeout(CONNECT_TIMEOUT, pool.open_stream(key, target, early_reply)).await;
         let flow = match opened {
             Ok(Ok(flow)) => flow,
             Ok(Err(error)) => {
@@ -78,17 +82,17 @@ pub(super) async fn serve(
         reply(&mut tcp, 0, flow.bound()).await?;
         return flow.run(tcp).await;
     }
-    let connector = match timeout(CONNECT_TIMEOUT, pool.prepare_stream(exit)).await {
+    let connector = match timeout(CONNECT_TIMEOUT, pool.prepare_stream(key)).await {
         Ok(Ok(connector)) => connector,
         _ => {
             reply(&mut tcp, 4, unspecified).await?;
             return Ok(());
         }
     };
-    if pool.game_mode {
+    if key.mode == SessionMode::Game {
         return timeout(CONNECT_TIMEOUT, connector.associate(tcp, target.port())).await?;
     }
-    udp(tcp, pool, exit, target.port()).await
+    udp(tcp, pool, key, target.port()).await
 }
 
 pub(super) struct Relay {
@@ -119,7 +123,7 @@ struct RouteEntry {
     last_used: Instant,
 }
 
-async fn udp(mut tcp: TcpStream, pool: Arc<Pool>, exit: &str, port: u16) -> Result<()> {
+async fn udp(mut tcp: TcpStream, pool: Arc<Pool>, key: &SessionKey, port: u16) -> Result<()> {
     let peer = tcp.peer_addr()?;
     let socket = udp_socket(SocketAddr::new(tcp.local_addr()?.ip(), 0)).await?;
     let relay = Arc::new(Relay {
@@ -140,14 +144,14 @@ async fn udp(mut tcp: TcpStream, pool: Arc<Pool>, exit: &str, port: u16) -> Resu
             _ = tcp.read(&mut closed) => break,
             ended = tasks.join_next(), if !tasks.is_empty() => {
                 if let Some(Ok(Err(error))) = ended {
-                    tracing::debug!(%exit, %error, "ordered UDP route ended");
+                    tracing::debug!(session=%key, %error, "ordered UDP route ended");
                 }
                 ordered.retain(|_, route| !route.send.is_closed());
             }
             _ = maintenance.tick() => {
                 if ordered_drops != 0 || ordered_evictions != 0 {
                     tracing::info!(
-                        %exit,
+                        session=%key,
                         ordered_queue_drops = ordered_drops,
                         ordered_lru_evictions = ordered_evictions,
                         "SOCKS ordered UDP maintenance"
@@ -183,10 +187,10 @@ async fn udp(mut tcp: TcpStream, pool: Arc<Pool>, exit: &str, port: u16) -> Resu
                     ordered.insert(address.clone(), RouteEntry { send, last_used: now });
                     let pool = pool.clone();
                     let relay = relay.clone();
-                    let exit = exit.to_owned();
+                    let key = key.clone();
                     let first_payload = payload.to_vec();
                     tasks.spawn(async move {
-                        super::ordered_udp::forward(&pool, &exit, address, &relay, first_payload, recv).await
+                        super::ordered_udp::forward(&pool, &key, address, &relay, first_payload, recv).await
                     });
                 } else if let Some(entry) = ordered.get_mut(&address) {
                     entry.last_used = now;

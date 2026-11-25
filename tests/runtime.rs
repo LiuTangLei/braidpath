@@ -512,7 +512,7 @@ fn proxy_cli_creates_one_socks_endpoint_per_exit_with_remote_half_close() {
         root,
         "proxy-client",
     );
-    ready(&mut client, "exit=node-a");
+    ready(&mut client, "session=socks:node-a");
     let log = fs::read_to_string(&client.log).unwrap();
     let listeners: Vec<_> = log
         .lines()
@@ -520,7 +520,7 @@ fn proxy_cli_creates_one_socks_endpoint_per_exit_with_remote_half_close() {
         .map(|line| {
             (
                 line.split_whitespace()
-                    .find_map(|p| p.strip_prefix("exit="))
+                    .find_map(|p| p.strip_prefix("session=socks:"))
                     .unwrap(),
                 line.split_whitespace()
                     .find_map(|p| p.strip_prefix("address="))
@@ -1762,7 +1762,7 @@ fn mesh_client_and_proxy_client_survive_offline_boot_and_recover_on_same_listene
     let target = TcpListener::bind("127.0.0.1:0").unwrap();
     let target_addr = target.local_addr().unwrap();
     let target_thread = thread::spawn(move || {
-        for _ in 0..3 {
+        for _ in 0..4 {
             let (mut stream, _) = target.accept().unwrap();
             stream
                 .set_read_timeout(Some(Duration::from_secs(5)))
@@ -1847,6 +1847,8 @@ fn mesh_client_and_proxy_client_survive_offline_boot_and_recover_on_same_listene
         "node-a",
         "--listen",
         "127.0.0.1:0",
+        "--game-socks5",
+        "node-a=127.0.0.1:0",
         "--tcp-forward",
         "node-a=127.0.0.1:0",
         #[cfg(unix)]
@@ -1855,18 +1857,21 @@ fn mesh_client_and_proxy_client_survive_offline_boot_and_recover_on_same_listene
         proxy_sock.to_str().unwrap(),
     ]);
     let mut proxy_client = launch(&proxy_args, root, "offline-proxy-client");
-    ready(&mut proxy_client, "SOCKS5 proxy ready");
+    ready(&mut proxy_client, "session=socks:node-a");
+    ready(&mut proxy_client, "session=game:node-a");
     ready(&mut proxy_client, "fixed TCP forward bound");
     let proxy_log = fs::read_to_string(&proxy_client.log).unwrap();
-    let socks_addr = proxy_log
-        .lines()
-        .find(|l| l.contains("SOCKS5 proxy ready"))
-        .and_then(|l| {
-            l.split_whitespace()
-                .find_map(|p| p.strip_prefix("address="))
-        })
-        .unwrap()
-        .to_owned();
+    let socks_addresses = ["session=socks:node-a", "session=game:node-a"].map(|key| {
+        proxy_log
+            .lines()
+            .find(|l| l.contains(key) && l.contains("SOCKS5 proxy ready"))
+            .and_then(|l| {
+                l.split_whitespace()
+                    .find_map(|p| p.strip_prefix("address="))
+            })
+            .unwrap()
+    });
+    assert_ne!(socks_addresses[0], socks_addresses[1]);
     let forward_addr = proxy_log
         .lines()
         .find(|l| l.contains("fixed TCP forward bound"))
@@ -1903,6 +1908,17 @@ fn mesh_client_and_proxy_client_survive_offline_boot_and_recover_on_same_listene
             );
             let status: Value = serde_json::from_slice(&out.stdout).unwrap();
             assert_eq!(status["role"], role);
+            if role == "proxy-client" {
+                assert_eq!(status["schema_version"], 2);
+                assert_eq!(
+                    status["exits"]["socks:node-a"]["address"],
+                    socks_addresses[0]
+                );
+                assert_eq!(
+                    status["exits"]["game:node-a"]["address"],
+                    socks_addresses[1]
+                );
+            }
         }
     }
 
@@ -1939,36 +1955,38 @@ fn mesh_client_and_proxy_client_survive_offline_boot_and_recover_on_same_listene
     assert_eq!(out, b"echo:mesh-offline-ok");
 
     // 2. proxy-client original SOCKS5 listener works automatically (allow brief retry for discovery backoff).
-    let deadline = Instant::now() + Duration::from_secs(15);
-    loop {
-        let mut sock = TcpStream::connect(&socks_addr).unwrap();
-        sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-        sock.write_all(&[5, 1, 0]).unwrap();
-        let mut method = [0; 2];
-        sock.read_exact(&mut method).unwrap();
-        assert_eq!(method, [5, 0]);
-        let mut req = vec![5, 1, 0, 1];
-        req.extend_from_slice(&match target_addr.ip() {
-            std::net::IpAddr::V4(ip) => ip.octets(),
-            _ => unreachable!(),
-        });
-        req.extend_from_slice(&target_addr.port().to_be_bytes());
-        sock.write_all(&req).unwrap();
-        let mut rep = [0; 10];
-        if sock.read_exact(&mut rep).is_ok() && rep[1] == 0 {
-            sock.write_all(b"socks-offline-ok").unwrap();
-            sock.shutdown(Shutdown::Write).unwrap();
-            let mut reply = Vec::new();
-            if sock.read_to_end(&mut reply).is_ok() && reply == b"echo:socks-offline-ok" {
-                break;
+    for address in socks_addresses {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let mut sock = TcpStream::connect(address).unwrap();
+            sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            sock.write_all(&[5, 1, 0]).unwrap();
+            let mut method = [0; 2];
+            sock.read_exact(&mut method).unwrap();
+            assert_eq!(method, [5, 0]);
+            let mut req = vec![5, 1, 0, 1];
+            req.extend_from_slice(&match target_addr.ip() {
+                std::net::IpAddr::V4(ip) => ip.octets(),
+                _ => unreachable!(),
+            });
+            req.extend_from_slice(&target_addr.port().to_be_bytes());
+            sock.write_all(&req).unwrap();
+            let mut rep = [0; 10];
+            if sock.read_exact(&mut rep).is_ok() && rep[1] == 0 {
+                sock.write_all(b"socks-offline-ok").unwrap();
+                sock.shutdown(Shutdown::Write).unwrap();
+                let mut reply = Vec::new();
+                if sock.read_to_end(&mut reply).is_ok() && reply == b"echo:socks-offline-ok" {
+                    break;
+                }
             }
+            assert!(
+                Instant::now() < deadline,
+                "proxy-client SOCKS5 did not recover after server came online: {}",
+                fs::read_to_string(&proxy_client.log).unwrap()
+            );
+            thread::sleep(Duration::from_millis(200));
         }
-        assert!(
-            Instant::now() < deadline,
-            "proxy-client SOCKS5 did not recover after server came online: {}",
-            fs::read_to_string(&proxy_client.log).unwrap()
-        );
-        thread::sleep(Duration::from_millis(200));
     }
 
     // 3. proxy-client original fixed --tcp-forward listener works automatically.
@@ -2013,12 +2031,18 @@ fn mesh_client_and_proxy_client_survive_offline_boot_and_recover_on_same_listene
         assert!(proxy_out.status.success());
         let proxy_status: Value = serde_json::from_slice(&proxy_out.stdout).unwrap();
         assert_eq!(proxy_status["role"], "proxy-client");
-        assert_eq!(proxy_status["exits"]["node-a"]["ready"], true);
-        assert!(
-            proxy_status["exits"]["node-a"]["active_paths"]
-                .as_u64()
-                .unwrap_or(0)
-                >= 1
+        let normal = &proxy_status["exits"]["socks:node-a"];
+        let game = &proxy_status["exits"]["game:node-a"];
+        for (entry, mode) in [(normal, "normal"), (game, "game")] {
+            assert_eq!(entry["ready"], true);
+            assert_eq!(entry["mode"], mode);
+            assert_eq!(entry["exit"], "node-a");
+            assert!(entry["active_paths"].as_u64().unwrap_or(0) >= 1);
+            assert!(entry["paths"][0]["session_id"].is_string());
+        }
+        assert_ne!(
+            normal["paths"][0]["session_id"],
+            game["paths"][0]["session_id"]
         );
         assert_eq!(proxy_status["tcp_forwards"]["node-a"]["ready"], true);
         assert!(

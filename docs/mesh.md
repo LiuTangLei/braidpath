@@ -105,37 +105,38 @@ braidpath mesh-server --dir local/node-b --id node-b \
   --listen 0.0.0.0:4433 --advertise 192.0.2.20:4433 --proxy \
   --join 192.0.2.10:4433 --join-key local/server-key.json
 
-# One SOCKS5 endpoint per exit: node-a on 1080, node-b on 1081.
+# Ordinary SOCKS5 on 1080 and 1081, plus a Game SOCKS5 listener on 1090.
 braidpath proxy-client --connect 192.0.2.10:4433 \
   --connection-key local/client-key.json --dir local/proxy-client \
-  --exit node-a --exit node-b --listen 127.0.0.1:1080
+  --exit node-a --exit node-b --listen 127.0.0.1:1080 \
+  --game-exit node-a --game-listen 127.0.0.1:1090
 ```
 
-Repeat `--exit` for up to eight nodes, or specify just one for a fixed exit.
-Each selected exit gets exactly one SOCKS5 listener. Ports increase from
-`--listen` (default `127.0.0.1:1080`) in `--exit` argument order, independently of
-discovery order. Both TCP connections and UDP associations on that port always
+Repeat `--exit` for ordinary SOCKS5 listeners and `--game-exit` for Game SOCKS5
+listeners. Ports increase from `--listen` (default `127.0.0.1:1080`) and
+`--game-listen` (default `127.0.0.1:1090`) in their respective argument order.
+An exit can have one listener of each mode. Both TCP connections and UDP
+associations on that port always
 use its assigned exit, including all destinations within one UDP association.
 There is no pooled listener or automatic switch to another exit: failures are
 returned to the application, so Clash controls exit selection and failover.
 Other exits continue serving their own streams.
 
-The default `--game-mode off` uses adaptive scheduling with native HTTP/3 return
-streams for bulk TCP responses on SOCKS5 and fixed TCP listeners. Small responses,
-stream control, and uploads retain their low-overhead DATAGRAM lanes. SOCKS5 UDP
-uses the dedicated per-exit association. Select `--game-mode on` for latency-sensitive
-UDP. It uses the aggregate Game scheduler and native TCP return in the same
-per-exit session. Server-wide proxy limits apply in both modes. Upgrade participating
-clients and servers together to use the versioned session policy.
+Both modes use native HTTP/3 streams for bulk TCP in both directions. Ordinary
+SOCKS5 UDP uses a reliable ordered stream per destination. Game listeners use
+deadline-bound DATAGRAMs for latency-sensitive UDP. Each mode maintains its own
+aggregate session and relay leases. Both modes warm up discovered exits in the
+background and share the client's SOCKS5 flow and retained-byte budgets.
 
-Use `--socks5 node-a=127.0.0.1:2080` to override that exit's automatically
-assigned address. This replaces its listener rather than adding another one;
-other exits keep the ports corresponding to their original positions. Repeat
-for other exits to keep explicit mappings stable when changing the `--exit`
-order. Duplicate exits, multiple overrides for one exit, unknown exit IDs,
-conflicting addresses and port overflow are rejected. Every listener is bound
-before readiness is reported; startup logs list each exit and its actual address.
-Port zero requests a separate OS-assigned port for each exit.
+Use `--socks5 node-a=127.0.0.1:2080` or
+`--game-socks5 node-a=127.0.0.1:2090` to declare a listener explicitly or
+override its automatic address. Other entries keep their original port positions.
+A client can run with only Game listeners or only fixed TCP forwards. One process
+supports up to eight distinct exits and up to 16 total listeners across both modes
+and fixed forwards. Use distinct loopback addresses and ports. Port zero asks the
+OS to choose an available port. Listeners bind before network discovery starts.
+With a status socket enabled, `client-status` reports keys such as `socks:node-a`
+and `game:node-a`, each with its mode, bound address and path health.
 
 Clients discover address updates in the background every 15 seconds;
 new connections use updated addresses while existing connections retain their
@@ -147,7 +148,7 @@ can authenticate and reach its chosen exit through a relay when the direct
 route is unavailable.
 
 A single SOCKS TCP connection maps to exactly one destination TCP connection at
-its chosen exit. Each exit reuses one aggregate session across its authenticated
+its chosen exit. Each SOCKS5 listener reuses one aggregate session across its authenticated
 direct and relay paths; its application connections remain separate reliable
 byte streams. Relays forward encrypted packets and never open additional
 destination TCP sockets. This aggregation takes place within the application
@@ -213,10 +214,9 @@ path's QUIC send queue. If the exit refuses the destination or its status
 times out, the local connection resets. The client reads at most 16 KiB of
 application data before the exit confirms the connection.
 
-Set `--socks5-wait-for-connect` for clients that need the exit's bound address
-or a specific SOCKS5 failure code. It applies to CONNECT on all listeners in
-that client process. Default pipelining and this explicit wait policy are the
-two supported behaviors.
+Set `--socks5-wait-for-connect` on ordinary listeners or
+`--game-socks5-wait-for-connect` on Game listeners when clients need the exit's
+bound address or a specific SOCKS5 failure code.
 
 For [Clash/Mihomo SOCKS5 nodes](https://wiki.metacubex.one/en/config/proxies/socks/),
 merge these entries into the application's existing configuration:

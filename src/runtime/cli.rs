@@ -77,20 +77,24 @@ mod proxy_cli_tests {
                 Command::ProxyClient { socks5_wait_for_connect, .. } if socks5_wait_for_connect == wait
             ));
         }
-        for (flag, expected) in [
-            (&[][..], GameMode::Off),
-            (&["--game-mode", "off"][..], GameMode::Off),
-            (&["--game-mode", "on"][..], GameMode::On),
-        ] {
-            let parsed =
-                Cli::try_parse_from(client.into_iter().chain(flag.iter().copied())).unwrap();
-            assert!(
-                matches!(parsed.command, Command::ProxyClient { game_mode, .. } if game_mode == expected)
-            );
-        }
+        let parsed = Cli::try_parse_from(client.into_iter().chain([
+            "--game-exit",
+            "a",
+            "--game-listen",
+            "127.0.0.1:1090",
+            "--game-socks5",
+            "c=127.0.0.1:1091",
+        ]))
+        .unwrap();
+        assert!(matches!(
+            parsed.command,
+            Command::ProxyClient { game_exit, game_listen, game_socks5, .. }
+            if game_exit == ["a"] && game_listen.port() == 1090
+                && game_socks5.len() == 1 && game_socks5[0].exit == "c"
+        ));
         for flag in [
             &["--game-mode"][..],
-            &["--game-mode", "auto"][..],
+            &["--game-mode", "on"][..],
             &["--native-return-stream"][..],
         ] {
             assert!(Cli::try_parse_from(client.into_iter().chain(flag.iter().copied())).is_err());
@@ -298,15 +302,24 @@ enum Command {
         connection_key: PathBuf,
         #[arg(long)]
         dir: PathBuf,
-        /// Repeat to select exits; each gets its own SOCKS5 listener, in this order.
-        #[arg(long, required = true)]
+        /// Repeat to select ordinary SOCKS5 exits in listener order.
+        #[arg(long)]
         exit: Vec<String>,
         /// Base loopback address; successive exits use successive ports (1080, 1081, ...).
         #[arg(long, default_value = "127.0.0.1:1080")]
         listen: SocketAddr,
-        /// Override one exit's SOCKS5 address, EXIT=127.0.0.1:PORT; one listener per exit.
+        /// Set an ordinary SOCKS5 listener explicitly, EXIT=127.0.0.1:PORT.
         #[arg(long)]
         socks5: Vec<proxy::Listener>,
+        /// Repeat to select Game SOCKS5 exits in listener order.
+        #[arg(long)]
+        game_exit: Vec<String>,
+        /// Base loopback address for consecutive Game SOCKS5 listeners.
+        #[arg(long, default_value = "127.0.0.1:1090")]
+        game_listen: SocketAddr,
+        /// Set a Game SOCKS5 listener explicitly, EXIT=127.0.0.1:PORT.
+        #[arg(long)]
+        game_socks5: Vec<proxy::Listener>,
         /// Forward loopback TCP to an exit's fixed --tcp-target, EXIT=127.0.0.1:PORT.
         #[arg(long)]
         tcp_forward: Vec<proxy::Listener>,
@@ -316,12 +329,12 @@ enum Command {
         /// Bind all proxy data paths to an uplink (Linux name; macOS ifindex:N).
         #[arg(long)]
         interface: Option<String>,
-        /// Wait for the exit's bound address or SOCKS5 failure before replying to CONNECT.
+        /// Wait for the exit's CONNECT result on ordinary SOCKS5 listeners.
         #[arg(long)]
         socks5_wait_for_connect: bool,
-        /// Prefer timely UDP delivery over bulk throughput.
-        #[arg(long, value_enum, default_value = "off")]
-        game_mode: GameMode,
+        /// Wait for the exit's CONNECT result on Game SOCKS5 listeners.
+        #[arg(long)]
+        game_socks5_wait_for_connect: bool,
         /// Optional local Unix socket for on-demand read-only JSON status queries.
         #[arg(long)]
         status_socket: Option<PathBuf>,
@@ -549,12 +562,6 @@ mod dual_cli_tests {
         assert!(policy.mixed_fec);
     }
 }
-#[derive(Clone, Copy, Eq, PartialEq, clap::ValueEnum)]
-enum GameMode {
-    On,
-    Off,
-}
-
 #[derive(Args)]
 struct PolicyArgs {
     /// Prefer low UDP delay: earliest-ready paths, immediate bounded protection,
@@ -673,11 +680,14 @@ pub async fn run() -> Result<()> {
             exit,
             listen,
             socks5,
+            game_exit,
+            game_listen,
+            game_socks5,
             tcp_forward,
             paths,
             interface,
             socks5_wait_for_connect,
-            game_mode,
+            game_socks5_wait_for_connect,
             status_socket,
         } => {
             let identity = mesh::ClientIdentity::open(dir, &connection_key)?;
@@ -687,11 +697,14 @@ pub async fn run() -> Result<()> {
                 exits: exit,
                 listen,
                 socks5,
+                game_exits: game_exit,
+                game_listen,
+                game_socks5,
                 tcp_forward,
                 paths: usize::from(paths),
                 interface,
                 socks5_early_reply: !socks5_wait_for_connect,
-                game_mode: matches!(game_mode, GameMode::On),
+                game_socks5_early_reply: !game_socks5_wait_for_connect,
                 status_socket,
             })
             .await

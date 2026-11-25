@@ -585,11 +585,12 @@ def run(args):
                 "--stats-interval-ms", "100", *args.server_arg,
             ])
             wait_log(args.output / "server.log", "HTTP/3 server ready", server)
+            listener_flag = "--game-socks5" if args.unified_game == "on" else "--socks5"
             client = spawn("client", [
                 args.binary, "proxy-client", "--dir", args.output / "client-identity",
-                "--connection-key", identity / "client-key.json", "--exit", "lab-exit",
-                "--connect", entrances[0], "--paths", "1", "--listen", tcp_listen,
-                "--game-mode", args.unified_game,
+                "--connection-key", identity / "client-key.json",
+                "--connect", entrances[0], "--paths", "1",
+                listener_flag, f"lab-exit={tcp_listen}",
             ])
             wait_log(args.output / "client.log", "SOCKS5 proxy ready", client)
         else:

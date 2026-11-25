@@ -41,12 +41,51 @@ pub struct ClientOptions {
     pub exits: Vec<String>,
     pub listen: SocketAddr,
     pub socks5: Vec<Listener>,
+    pub game_exits: Vec<String>,
+    pub game_listen: SocketAddr,
+    pub game_socks5: Vec<Listener>,
     pub tcp_forward: Vec<Listener>,
     pub paths: usize,
     pub interface: Option<String>,
     pub socks5_early_reply: bool,
-    pub game_mode: bool,
+    pub game_socks5_early_reply: bool,
     pub status_socket: Option<std::path::PathBuf>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) enum SessionMode {
+    Normal,
+    Game,
+}
+
+impl SessionMode {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Normal => "socks",
+            Self::Game => "game",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) struct SessionKey {
+    pub(super) exit: String,
+    pub(super) mode: SessionMode,
+}
+
+impl SessionKey {
+    pub(super) fn new(exit: impl Into<String>, mode: SessionMode) -> Self {
+        Self {
+            exit: exit.into(),
+            mode,
+        }
+    }
+}
+
+impl std::fmt::Display for SessionKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}:{}", self.mode.label(), self.exit)
+    }
 }
 
 pub(super) fn listener_plan(
@@ -55,8 +94,8 @@ pub(super) fn listener_plan(
     overrides: &[Listener],
 ) -> Result<Vec<Listener>> {
     ensure!(
-        !exits.is_empty() && exits.len() <= 8,
-        "select 1..8 proxy exits"
+        exits.len() <= crate::runtime::MAX_PATHS,
+        "select at most eight exits per mode"
     );
     ensure!(
         base.ip().is_loopback(),
@@ -64,11 +103,7 @@ pub(super) fn listener_plan(
     );
     let mut by_exit = BTreeMap::new();
     for listener in overrides {
-        ensure!(
-            exits.contains(&listener.exit),
-            "SOCKS5 listener exit not selected: {}",
-            listener.exit
-        );
+        ensure!(!listener.exit.is_empty(), "missing SOCKS5 exit");
         ensure!(
             listener.address.ip().is_loopback(),
             "SOCKS5 listeners must use loopback addresses"
@@ -81,21 +116,22 @@ pub(super) fn listener_plan(
     }
     let mut seen_exits = BTreeSet::new();
     let mut addresses = BTreeSet::new();
-    exits
+    let mut planned = exits
         .iter()
         .enumerate()
         .map(|(index, exit)| {
+            ensure!(!exit.is_empty(), "missing SOCKS5 exit");
             ensure!(seen_exits.insert(exit), "duplicate proxy exit: {exit}");
-            let address = match by_exit.get(exit) {
-                Some(address) => *address,
+            let address = match by_exit.remove(exit) {
+                Some(address) => address,
                 None => {
                     // Port zero requests a separate OS-assigned port for each exit.
                     let port = if base.port() == 0 {
                         0
                     } else {
-                        base.port()
-                            .checked_add(index as u16)
-                            .context("SOCKS5 port range exceeds 65535; use --socks5 EXIT=ADDRESS")?
+                        base.port().checked_add(index as u16).context(
+                            "SOCKS5 port range exceeds 65535; specify listener addresses",
+                        )?
                     };
                     SocketAddr::new(base.ip(), port)
                 }
@@ -109,7 +145,18 @@ pub(super) fn listener_plan(
                 address,
             })
         })
-        .collect()
+        .collect::<Result<Vec<_>>>()?;
+    for (exit, address) in by_exit {
+        ensure!(
+            address.port() == 0 || addresses.insert(address),
+            "duplicate SOCKS5 listener address: {address}"
+        );
+        planned.push(Listener {
+            exit: exit.clone(),
+            address,
+        });
+    }
+    Ok(planned)
 }
 struct Routes {
     _guard: mesh::Entrances,
@@ -169,8 +216,7 @@ struct Slot {
 pub(super) struct Pool {
     identity: mesh::ClientIdentity,
     interface: Option<String>,
-    pub(super) game_mode: bool,
-    slots: BTreeMap<String, Slot>,
+    slots: BTreeMap<SessionKey, Slot>,
     nodes: RwLock<Vec<mesh::Node>>,
     nodes_changed: tokio::sync::Notify,
     path_limit: std::sync::atomic::AtomicUsize,
@@ -189,6 +235,7 @@ impl Pool {
 
     fn status_json(
         &self,
+        socks_addresses: &BTreeMap<SessionKey, SocketAddr>,
         forwards: &Mutex<BTreeMap<String, (SocketAddr, stats::Metrics)>>,
     ) -> serde_json::Value {
         let (tcp_flows, buffered_bytes) = self.stream_budget.snapshot();
@@ -202,11 +249,15 @@ impl Pool {
             .collect();
         node_ids.sort();
         let mut exits = serde_json::Map::new();
-        for (exit, slot) in &self.slots {
-            exits.insert(
-                exit.clone(),
-                crate::runtime::status_socket::metrics_summary(&slot.stream_metrics),
-            );
+        for (key, slot) in &self.slots {
+            let mut summary = crate::runtime::status_socket::metrics_summary(&slot.stream_metrics);
+            summary["address"] = serde_json::json!(socks_addresses[key].to_string());
+            summary["exit"] = serde_json::json!(key.exit);
+            summary["mode"] = serde_json::json!(match key.mode {
+                SessionMode::Normal => "normal",
+                SessionMode::Game => "game",
+            });
+            exits.insert(key.to_string(), summary);
         }
         let mut tcp_forwards = serde_json::Map::new();
         for (exit, (addr, metrics)) in forwards.lock().expect("forward status").iter() {
@@ -221,10 +272,9 @@ impl Pool {
             .as_deref()
             .and_then(transport::interface_index);
         serde_json::json!({
-            "schema_version": 1,
+            "schema_version": 2,
             "role": "proxy-client",
             "pid": std::process::id(),
-            "game_mode": self.game_mode,
             "path_limit": self.path_limit.load(std::sync::atomic::Ordering::Relaxed),
             "interface": self.interface,
             "interface_index": interface_index,
@@ -247,25 +297,20 @@ impl Pool {
     pub(super) fn new(
         identity: mesh::ClientIdentity,
         nodes: Vec<mesh::Node>,
-        exits: Vec<String>,
+        sessions: Vec<SessionKey>,
         interface: Option<String>,
-        game_mode: bool,
     ) -> Result<Arc<Self>> {
-        ensure!(
-            !exits.is_empty() && exits.len() <= 8,
-            "select 1..8 proxy exits"
-        );
         let mut slots = BTreeMap::new();
-        for exit in &exits {
-            ensure!(!slots.contains_key(exit), "duplicate proxy exit: {exit}");
+        for key in sessions {
+            ensure!(!slots.contains_key(&key), "duplicate proxy session: {key}");
+            let label = key.to_string();
             slots.insert(
-                exit.clone(),
+                key,
                 Slot {
                     routes: AsyncMutex::new(None),
                     route_nodes: Mutex::new(None),
                     aggregate: AsyncMutex::new(None),
-                    stream_metrics: stats::Metrics::new("client")
-                        .with_summary_label(format!("socks:{exit}")),
+                    stream_metrics: stats::Metrics::new("client").with_summary_label(label),
                     #[cfg(test)]
                     stream_health: Mutex::new(None),
                     #[cfg(test)]
@@ -279,7 +324,6 @@ impl Pool {
         Ok(Arc::new(Self {
             identity,
             interface,
-            game_mode,
             slots,
             nodes: RwLock::new(nodes),
             nodes_changed: tokio::sync::Notify::new(),
@@ -297,9 +341,9 @@ impl Pool {
             .iter()
             .any(|node| node.id == id)
     }
-    fn stream_running(&self, id: &str) -> bool {
+    fn stream_running(&self, key: &SessionKey) -> bool {
         self.slots
-            .get(id)
+            .get(key)
             .and_then(|slot| slot.aggregate.try_lock().ok())
             .is_some_and(|guard| guard.as_ref().is_some_and(Aggregate::running))
     }
@@ -323,7 +367,7 @@ impl Pool {
     }
     async fn route_watch(
         &self,
-        id: &str,
+        key: &SessionKey,
     ) -> Result<(
         tokio::sync::watch::Receiver<Vec<SocketAddr>>,
         tokio::sync::watch::Sender<mesh::PathHealth>,
@@ -332,14 +376,14 @@ impl Pool {
             !self.closed.load(std::sync::atomic::Ordering::Acquire),
             "proxy client stopped"
         );
-        let slot = self.slots.get(id).context("exit not selected")?;
+        let slot = self.slots.get(key).context("proxy session not selected")?;
         let mut routes = slot.routes.lock().await;
         if routes.is_none() {
-            let nodes = self.wait_for_exit_nodes(id).await?;
+            let nodes = self.wait_for_exit_nodes(&key.exit).await?;
             let limit = self.path_limit.load(std::sync::atomic::Ordering::Relaxed);
             let (_, guard) = self
                 .identity
-                .entrances_on(nodes, id, limit, &self.uplink())
+                .entrances_on(nodes, &key.exit, limit, &self.uplink())
                 .await?;
             ensure!(
                 !self.closed.load(std::sync::atomic::Ordering::Acquire),
@@ -357,13 +401,13 @@ impl Pool {
         let routes = routes.as_ref().expect("proxy routes");
         Ok((routes.updates.clone(), routes._guard.health()))
     }
-    /// Prepare one aggregate session for an exit without opening a destination.
-    pub(super) async fn prepare_stream(&self, id: &str) -> Result<tunnel::tcp::Connector> {
+    /// Prepare one aggregate session without opening a destination.
+    pub(super) async fn prepare_stream(&self, key: &SessionKey) -> Result<tunnel::tcp::Connector> {
         ensure!(
             !self.closed.load(std::sync::atomic::Ordering::Acquire),
             "proxy client stopped"
         );
-        let slot = self.slots.get(id).context("exit not selected")?;
+        let slot = self.slots.get(key).context("proxy session not selected")?;
         {
             let aggregate = slot.aggregate.lock().await;
             if let Some(current) = aggregate
@@ -376,9 +420,8 @@ impl Pool {
                 return Ok(connector);
             }
         }
-        // This reporter owns the entrance health channel for this exit. Native
-        // UDP remains lazy and must not overwrite aggregate-path evidence.
-        let (updates, health) = self.route_watch(id).await?;
+        // Each session owns its entrance leases and reports its own path health.
+        let (updates, health) = self.route_watch(key).await?;
         let connector = {
             let mut aggregate = slot.aggregate.lock().await;
             if let Some(current) = aggregate
@@ -418,7 +461,7 @@ impl Pool {
                     name: self.identity.name(),
                     ca: self.identity.dir.join("cert.pem"),
                     token: self.identity.dir.join("token"),
-                    policy: reliable_policy(self.game_mode),
+                    policy: reliable_policy(key.mode),
                     congestion: transport::Congestion::Bbr,
                     stats: slot.stream_metrics.clone(),
                 };
@@ -426,19 +469,19 @@ impl Pool {
                     !self.closed.load(std::sync::atomic::Ordering::Acquire),
                     "proxy client stopped"
                 );
-                let exit = id.to_owned();
+                let key = key.clone();
                 let closer = connector.clone();
                 let task = tokio::spawn(async move {
                     let result = tunnel::client_with_mesh_exit(
                         options,
                         Some(updates),
                         Some(health),
-                        exit.clone(),
+                        key.exit.clone(),
                     )
                     .await;
                     closer.close();
                     if let Err(error) = &result {
-                        tracing::warn!(%exit, %error, "aggregate proxy session stopped");
+                        tracing::warn!(session = %key, %error, "aggregate proxy session stopped");
                     }
                     result
                 });
@@ -454,24 +497,24 @@ impl Pool {
     }
     pub(super) async fn open_stream(
         &self,
-        id: &str,
+        key: &SessionKey,
         target: Address,
         early_reply: bool,
     ) -> Result<tunnel::tcp::Flow> {
-        let connector = self.prepare_stream(id).await?;
+        let connector = self.prepare_stream(key).await?;
         connector.open(target.into(), early_reply).await
     }
     #[cfg(test)]
-    pub(super) fn test_stream_metrics(&self, id: &str) -> stats::Metrics {
-        self.slots[id].stream_metrics.clone()
+    pub(super) fn test_stream_metrics(&self, key: &SessionKey) -> stats::Metrics {
+        self.slots[key].stream_metrics.clone()
     }
 
     #[cfg(test)]
     pub(super) fn transport_snapshot(
         &self,
-        id: &str,
+        key: &SessionKey,
     ) -> BTreeMap<SocketAddr, (u64, u64, u64, u64)> {
-        let slot = &self.slots[id];
+        let slot = &self.slots[key];
         let _ = slot.stream_metrics.snapshot(false, "observed", None);
         let mut paths = BTreeMap::new();
         slot.stream_metrics.state(|state| {
@@ -496,8 +539,8 @@ impl Pool {
         paths
     }
     #[cfg(test)]
-    pub(super) fn test_path_failed(&self, id: &str, address: SocketAddr) -> bool {
-        let health = self.slots[id].stream_health.lock().unwrap();
+    pub(super) fn test_path_failed(&self, key: &SessionKey, address: SocketAddr) -> bool {
+        let health = self.slots[key].stream_health.lock().unwrap();
         let Some(health) = health.as_ref() else {
             return true;
         };
@@ -556,18 +599,18 @@ impl Pool {
         }
     }
     #[cfg(test)]
-    pub(super) fn test_set_routes(&self, id: &str, routes: Vec<SocketAddr>) {
-        if let Some(updates) = self.slots[id].test_stream_updates.lock().unwrap().as_ref() {
+    pub(super) fn test_set_routes(&self, key: &SessionKey, routes: Vec<SocketAddr>) {
+        if let Some(updates) = self.slots[key].test_stream_updates.lock().unwrap().as_ref() {
             updates.send_replace(routes.clone());
         }
-        *self.slots[id].test_routes.lock().unwrap() = Some(routes);
+        *self.slots[key].test_routes.lock().unwrap() = Some(routes);
     }
     #[cfg(test)]
-    pub(super) async fn test_addresses(&self, id: &str) -> Vec<SocketAddr> {
-        if let Some(routes) = self.slots[id].test_routes.lock().unwrap().clone() {
+    pub(super) async fn test_addresses(&self, key: &SessionKey) -> Vec<SocketAddr> {
+        if let Some(routes) = self.slots[key].test_routes.lock().unwrap().clone() {
             return routes;
         }
-        let (updates, _) = self.route_watch(id).await.unwrap();
+        let (updates, _) = self.route_watch(key).await.unwrap();
         updates.borrow().clone()
     }
     fn refresh(&self, nodes: &[mesh::Node]) -> Option<Vec<mesh::Node>> {
@@ -628,7 +671,8 @@ impl Drop for Pool {
     }
 }
 
-fn reliable_policy(game_mode: bool) -> tunnel::Policy {
+fn reliable_policy(mode: SessionMode) -> tunnel::Policy {
+    let game_mode = mode == SessionMode::Game;
     let mut policy = tunnel::Policy {
         game_mode: false,
         native_return: true,
@@ -661,13 +705,26 @@ fn reliable_policy(game_mode: bool) -> tunnel::Policy {
     policy
 }
 
-pub(super) fn validate_tcp_forwards(forwards: &[Listener], socks: &[Listener]) -> Result<()> {
+pub(super) fn validate_listeners(
+    normal: &[Listener],
+    game: &[Listener],
+    forwards: &[Listener],
+) -> Result<BTreeSet<String>> {
+    let total = normal.len() + game.len() + forwards.len();
+    ensure!(
+        total > 0,
+        "configure at least one SOCKS5 or fixed TCP listener"
+    );
+    ensure!(
+        total <= mesh::MAX_SOURCE_LEASES,
+        "at most {} proxy sessions per process",
+        mesh::MAX_SOURCE_LEASES
+    );
     ensure!(
         forwards.len() <= crate::runtime::MAX_PATHS,
         "at most eight fixed TCP forwards"
     );
-    let mut addresses: BTreeSet<_> = socks.iter().map(|listener| listener.address).collect();
-    let mut exits = BTreeSet::new();
+    let mut fixed_exits = BTreeSet::new();
     for listener in forwards {
         ensure!(!listener.exit.is_empty(), "missing fixed TCP exit");
         ensure!(
@@ -675,17 +732,26 @@ pub(super) fn validate_tcp_forwards(forwards: &[Listener], socks: &[Listener]) -
             "fixed TCP listeners must use loopback addresses"
         );
         ensure!(
-            exits.insert(&listener.exit),
+            fixed_exits.insert(&listener.exit),
             "duplicate fixed TCP exit: {}",
             listener.exit
         );
+    }
+    let mut addresses = BTreeSet::new();
+    let mut wanted = BTreeSet::new();
+    for listener in normal.iter().chain(game).chain(forwards) {
         ensure!(
             listener.address.port() == 0 || addresses.insert(listener.address),
             "duplicate local listener address: {}",
             listener.address
         );
+        wanted.insert(listener.exit.clone());
     }
-    Ok(())
+    ensure!(
+        wanted.len() <= crate::runtime::MAX_PATHS,
+        "select at most eight mesh exits"
+    );
+    Ok(wanted)
 }
 
 struct FixedForwardConfig {
@@ -694,7 +760,6 @@ struct FixedForwardConfig {
     listener: Arc<TcpListener>,
     paths: usize,
     interface: Option<String>,
-    game_mode: bool,
     metrics: stats::Metrics,
 }
 
@@ -714,7 +779,7 @@ async fn fixed_forward_once(
     let lease_nodes = leases.nodes_sender();
     let latest = nodes_rx.borrow_and_update().clone();
     let _ = lease_nodes.send(Some(latest));
-    let mut policy = reliable_policy(config.game_mode);
+    let mut policy = reliable_policy(SessionMode::Normal);
     policy.proxy = false;
     policy.streams = true;
     let options = tunnel::ClientOptions {
@@ -820,41 +885,29 @@ pub async fn client(options: ClientOptions) -> Result<()> {
         (1..=crate::runtime::MAX_PATHS).contains(&options.paths),
         "invalid proxy path limit"
     );
-    let planned = listener_plan(&options.exits, options.listen, &options.socks5)?;
-    validate_tcp_forwards(&options.tcp_forward, &planned)?;
-    let wanted: BTreeSet<_> = options
-        .exits
-        .iter()
-        .chain(options.tcp_forward.iter().map(|listener| &listener.exit))
-        .cloned()
-        .collect();
-    ensure!(
-        wanted.len() <= crate::runtime::MAX_PATHS,
-        "select at most eight mesh exits"
-    );
+    let normal = listener_plan(&options.exits, options.listen, &options.socks5)?;
+    let game = listener_plan(
+        &options.game_exits,
+        options.game_listen,
+        &options.game_socks5,
+    )?;
+    let wanted = validate_listeners(&normal, &game, &options.tcp_forward)?;
     let initial_nodes = options.identity.cached_nodes();
-    let selected_exits = options.exits.clone();
     let fixed_identity = options.identity.clone();
     let fixed_interface = options.interface.clone();
-    let pool = Pool::new(
-        options.identity,
-        initial_nodes.clone(),
-        options.exits,
-        options.interface,
-        options.game_mode,
-    )?;
-    pool.path_limit
-        .store(options.paths, std::sync::atomic::Ordering::Relaxed);
     // Bind every requested port before touching the network so cold boots and
     // transient WAN outages keep local listeners bound and never crash-loop.
-    let mut listeners = Vec::with_capacity(planned.len());
-    for listener in planned {
-        listeners.push((
-            TcpListener::bind(listener.address).await.with_context(|| {
-                format!("bind SOCKS5 for {} at {}", listener.exit, listener.address)
-            })?,
-            listener.exit,
-        ));
+    let mut listeners = Vec::with_capacity(normal.len() + game.len());
+    let mut socks_addresses = BTreeMap::new();
+    for (mode, planned) in [(SessionMode::Normal, normal), (SessionMode::Game, game)] {
+        for listener in planned {
+            let key = SessionKey::new(listener.exit, mode);
+            let socket = TcpListener::bind(listener.address)
+                .await
+                .with_context(|| format!("bind {key} at {}", listener.address))?;
+            socks_addresses.insert(key.clone(), socket.local_addr()?);
+            listeners.push((socket, key));
+        }
     }
     let mut forwards = Vec::with_capacity(options.tcp_forward.len());
     for mapping in options.tcp_forward {
@@ -863,6 +916,14 @@ pub async fn client(options: ClientOptions) -> Result<()> {
         })?);
         forwards.push((mapping, listener));
     }
+    let pool = Pool::new(
+        options.identity,
+        initial_nodes.clone(),
+        socks_addresses.keys().cloned().collect(),
+        options.interface,
+    )?;
+    pool.path_limit
+        .store(options.paths, std::sync::atomic::Ordering::Relaxed);
     let (nodes_tx, nodes_rx) = tokio::sync::watch::channel(initial_nodes);
     let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
     let permits = Arc::new(Semaphore::new(crate::runtime::tunnel::tcp::MAX_TCP_FLOWS));
@@ -885,7 +946,6 @@ pub async fn client(options: ClientOptions) -> Result<()> {
                 listener,
                 paths: options.paths,
                 interface: fixed_interface.clone(),
-                game_mode: options.game_mode,
                 metrics,
             },
             nodes_rx.clone(),
@@ -897,19 +957,23 @@ pub async fn client(options: ClientOptions) -> Result<()> {
         let status_forwards = forward_status.clone();
         Some(crate::runtime::status_socket::spawn(
             path,
-            Arc::new(move || status_pool.status_json(&status_forwards)),
+            Arc::new(move || status_pool.status_json(&socks_addresses, &status_forwards)),
         )?)
     } else {
         None
     };
-    for (listener, exit) in listeners {
-        tracing::info!(address=%listener.local_addr()?, %exit, "SOCKS5 proxy ready");
+    for (listener, key) in listeners {
+        tracing::info!(address=%listener.local_addr()?, session=%key, "SOCKS5 proxy ready");
+        let early_reply = match key.mode {
+            SessionMode::Normal => options.socks5_early_reply,
+            SessionMode::Game => options.game_socks5_early_reply,
+        };
         tasks.spawn(listen(
             listener,
             pool.clone(),
-            exit,
+            key,
             permits.clone(),
-            options.socks5_early_reply,
+            early_reply,
         ));
     }
     let mut discovery: JoinSet<Result<()>> = JoinSet::new();
@@ -931,14 +995,14 @@ pub async fn client(options: ClientOptions) -> Result<()> {
                 .await
         });
     };
-    let spawn_warmups = |warmups: &mut JoinSet<()>, pool: &Arc<Pool>, exits: &[String]| {
-        for exit in exits {
-            if pool.has_exit(exit) && !pool.stream_running(exit) {
+    let spawn_warmups = |warmups: &mut JoinSet<()>, pool: &Arc<Pool>| {
+        for key in pool.slots.keys() {
+            if pool.has_exit(&key.exit) && !pool.stream_running(key) {
                 let pool = pool.clone();
-                let exit = exit.clone();
+                let key = key.clone();
                 warmups.spawn(async move {
-                    if let Err(error) = pool.prepare_stream(&exit).await {
-                        tracing::warn!(%exit, %error, "aggregate proxy exit unavailable");
+                    if let Err(error) = pool.prepare_stream(&key).await {
+                        tracing::warn!(session=%key, %error, "aggregate proxy session unavailable");
                     }
                 });
             }
@@ -946,7 +1010,7 @@ pub async fn client(options: ClientOptions) -> Result<()> {
     };
     // Warm up exits already known from the persistent node cache immediately
     // while fresh discovery runs in parallel.
-    spawn_warmups(&mut warmups, &pool, &selected_exits);
+    spawn_warmups(&mut warmups, &pool);
     spawn_discovery(&mut discovery, &pool);
     let mut bootstrap_backoff = Duration::from_secs(1);
     let mut next_discovery = tokio::time::Instant::now() + Duration::from_secs(15);
@@ -965,28 +1029,31 @@ pub async fn client(options: ClientOptions) -> Result<()> {
                     && diagnostics.as_ref().is_none_or(|task| task.is_finished())
                 {
                     let metrics: Vec<_> = pool.slots.iter()
-                        .map(|(exit, slot)| (exit.clone(), slot.stream_metrics.clone()))
+                        .map(|(key, slot)| (key.clone(), slot.stream_metrics.clone()))
                         .collect();
                     // JSON encoding and debug output must not occupy a network
                     // worker. One bounded job serves every selected exit; a slow
                     // sink skips ticks instead of queuing diagnostic work.
                     diagnostics = Some(tokio::task::spawn_blocking(move || {
-                        for (exit, metrics) in metrics {
+                        for (key, metrics) in metrics {
                             if let Ok(snapshot) = metrics.snapshot(false, "observed", None) {
-                                tracing::debug!(%exit, %snapshot, "proxy aggregate statistics");
+                                tracing::debug!(session=%key, %snapshot, "proxy aggregate statistics");
                             }
                         }
                     }));
                 }
             },
-            result = tasks.join_next() => { result.context("proxy listeners stopped")???; bail!("proxy listener stopped"); }
+            result = tasks.join_next(), if !tasks.is_empty() => {
+                result.context("proxy listeners stopped")???;
+                bail!("proxy listener stopped");
+            }
             _ = forward_tasks.join_next(), if !forward_tasks.is_empty() => {}
             _ = warmups.join_next(), if !warmups.is_empty() => {}
             _ = tokio::time::sleep_until(next_discovery), if discovery.is_empty() => {
                 spawn_discovery(&mut discovery, &pool);
             }
             _ = stream_nodes.changed() => {
-                spawn_warmups(&mut warmups, &pool, &selected_exits);
+                spawn_warmups(&mut warmups, &pool);
             }
             Some(result) = discovery.join_next(), if !discovery.is_empty() => {
                 let missing: Vec<_> = wanted.iter().filter(|exit| !pool.has_exit(exit)).collect();
@@ -996,7 +1063,7 @@ pub async fn client(options: ClientOptions) -> Result<()> {
                     if !matches!(result, Ok(Ok(()))) {
                         tracing::debug!(?result, "periodic mesh discovery unavailable");
                     }
-                    spawn_warmups(&mut warmups, &pool, &selected_exits);
+                    spawn_warmups(&mut warmups, &pool);
                 } else {
                     tracing::warn!(
                         ?missing, ?result, retry_secs = bootstrap_backoff.as_secs(),
@@ -1026,7 +1093,7 @@ pub async fn client(options: ClientOptions) -> Result<()> {
 pub(super) async fn listen(
     listener: TcpListener,
     pool: Arc<Pool>,
-    exit: String,
+    key: SessionKey,
     permits: Arc<Semaphore>,
     early_reply: bool,
 ) -> Result<()> {
@@ -1037,10 +1104,11 @@ pub(super) async fn listen(
                 let (tcp, _) = accepted?;
                 let Ok(permit) = permits.clone().try_acquire_owned() else { continue; };
                 tcp.set_nodelay(true)?;
-                let pool = pool.clone(); let exit = exit.clone();
+                let pool = pool.clone();
+                let key = key.clone();
                 tasks.spawn(async move {
                     let _permit = permit;
-                    if let Err(error) = super::socks::serve(tcp, pool, &exit, early_reply).await { tracing::debug!(%error, %exit, "SOCKS5 client closed"); }
+                    if let Err(error) = super::socks::serve(tcp, pool, &key, early_reply).await { tracing::debug!(%error, session=%key, "SOCKS5 client closed"); }
                 });
             }
             _ = tasks.join_next(), if !tasks.is_empty() => {}
@@ -1052,6 +1120,10 @@ pub(super) async fn listen(
 mod lifecycle_tests {
     use super::*;
     use std::path::Path as FsPath;
+
+    fn normal(exit: &str) -> SessionKey {
+        SessionKey::new(exit, SessionMode::Normal)
+    }
 
     fn pool(root: &FsPath) -> Arc<Pool> {
         let server = root.join("server");
@@ -1076,9 +1148,8 @@ mod lifecycle_tests {
                 alternate: None,
                 incarnation: 0,
             }],
-            vec!["exit".into()],
+            vec![normal("exit")],
             None,
-            false,
         )
         .unwrap()
     }
@@ -1162,7 +1233,7 @@ mod lifecycle_tests {
         .unwrap();
         let outgoing = outgoing.unwrap();
         let _incoming = incoming.unwrap();
-        let slot = &pool.slots["exit"];
+        let slot = &pool.slots[&normal("exit")];
         slot.stream_metrics
             .register("active", 0, 0, stats::FORWARD, &outgoing);
         slot.stream_metrics
@@ -1171,14 +1242,14 @@ mod lifecycle_tests {
                 path.peer_socket = "127.0.0.1:9".into();
             });
         assert_eq!(
-            pool.transport_snapshot("exit")
+            pool.transport_snapshot(&normal("exit"))
                 .keys()
                 .copied()
                 .collect::<Vec<_>>(),
             [address]
         );
         outgoing.close(0u32.into(), b"test closed path");
-        assert!(pool.transport_snapshot("exit").is_empty());
+        assert!(pool.transport_snapshot(&normal("exit")).is_empty());
         client.close(0u32.into(), b"test complete");
         server.close(0u32.into(), b"test complete");
     }
@@ -1201,7 +1272,7 @@ mod lifecycle_tests {
             observed.store(true, Ordering::Release);
             Ok(())
         });
-        let slot = &pool.slots["exit"];
+        let slot = &pool.slots[&normal("exit")];
         *slot.aggregate.lock().await = Some(Aggregate {
             connector,
             task: Some(runtime),
@@ -1262,9 +1333,8 @@ mod lifecycle_tests {
         let pool = Pool::new(
             identity.clone(),
             nodes.clone(),
-            vec!["a".into(), "b".into()],
+            vec![normal("a"), normal("b")],
             None,
-            false,
         )
         .unwrap();
         let mut finished = Vec::new();
@@ -1293,7 +1363,7 @@ mod lifecycle_tests {
             })
             .await
             .unwrap_or_else(|_| panic!("cleanup guard for {exit} did not publish its relay lease"));
-            let slot = &pool.slots[exit];
+            let slot = &pool.slots[&normal(exit)];
             *slot.routes.lock().await = Some(Routes {
                 updates,
                 _guard: guard,
@@ -1325,7 +1395,7 @@ mod lifecycle_tests {
 
         // The shutdown owner must suspend on the second exit after starting
         // cleanup for the first. Keep an external Pool Arc throughout.
-        let second = pool.slots["b"].aggregate.lock().await;
+        let second = pool.slots[&normal("b")].aggregate.lock().await;
         let waiting_pool = pool.clone();
         let waiter = tokio::spawn(async move { waiting_pool.shutdown().await });
         timeout(Duration::from_secs(3), closed)

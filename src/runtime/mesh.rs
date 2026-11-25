@@ -49,7 +49,7 @@ const SYNC_EVERY: Duration = Duration::from_secs(5);
 // server re-announces itself through its saved peers or `--join`.
 const FORGET_AFTER: Duration = Duration::from_secs(10 * 60);
 const RECONNECT_EVERY: Duration = Duration::from_secs(60);
-const MAX_SOURCE_LEASES: usize = 16;
+pub(super) const MAX_SOURCE_LEASES: usize = 16;
 const MAX_RELEASED_REQUESTS: usize = MAX_NODES * MAX_SOURCE_LEASES;
 // Control connections have their own budget, separate from data paths.
 const CONTROL_CONNECTIONS: usize = 256;

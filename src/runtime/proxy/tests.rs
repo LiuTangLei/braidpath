@@ -1,3 +1,4 @@
+use super::client::{SessionKey, SessionMode};
 use super::protocol::*;
 use super::*;
 use crate::runtime::{mesh, stats};
@@ -7,6 +8,10 @@ use tokio::{
     sync::Semaphore,
     time::timeout,
 };
+
+fn normal(exit: &str) -> SessionKey {
+    SessionKey::new(exit, SessionMode::Normal)
+}
 
 struct Task<T>(tokio::task::JoinHandle<T>);
 impl<T> Drop for Task<T> {
@@ -88,7 +93,7 @@ async fn local_listener_capacity(
     let task = Task(tokio::spawn(client::listen(
         listen,
         pool,
-        exit.to_owned(),
+        normal(exit),
         Arc::new(Semaphore::new(capacity)),
         false,
     )));
@@ -243,7 +248,6 @@ fn ambiguous_or_unusable_socks_listener_plans_are_rejected() {
     let exits = ["a".into(), "b".into()];
     let base = "127.0.0.1:1080".parse().unwrap();
     for overrides in [
-        vec!["missing=127.0.0.1:2080"],
         vec!["a=127.0.0.1:2080", "a=127.0.0.1:2081"],
         vec!["a=127.0.0.1:1081"],
         vec!["a=127.0.0.1:2080", "b=127.0.0.1:2080"],
@@ -251,7 +255,7 @@ fn ambiguous_or_unusable_socks_listener_plans_are_rejected() {
         let overrides: Vec<Listener> = overrides.into_iter().map(|s| s.parse().unwrap()).collect();
         assert!(client::listener_plan(&exits, base, &overrides).is_err());
     }
-    assert!(client::listener_plan(&[], base, &[]).is_err());
+    assert!(client::listener_plan(&[], base, &[]).unwrap().is_empty());
     assert!(client::listener_plan(&["a".into(), "a".into()], base, &[]).is_err());
     assert!(client::listener_plan(&exits, "0.0.0.0:1080".parse().unwrap(), &[]).is_err());
     assert!(client::listener_plan(&exits, "127.0.0.1:65535".parse().unwrap(), &[]).is_err());
@@ -267,9 +271,8 @@ async fn separate_tcp_listeners_pin_exits_half_close_and_share_connections() {
     let pool = client::Pool::new(
         identity.clone(),
         vec![node("a", a), node("b", b)],
-        vec!["a".into(), "b".into()],
+        vec![normal("a"), normal("b")],
         None,
-        false,
     )
     .unwrap();
     let (listen_a, _listen_a) = local_listener(pool.clone(), "a").await;
@@ -338,9 +341,8 @@ async fn socks_tcp_negotiates_larger_records_without_changing_byte_budgets() {
     let pool = client::Pool::new(
         identity.clone(),
         vec![node("a", at)],
-        vec!["a".into()],
+        vec![normal("a")],
         None,
-        false,
     )
     .unwrap();
     let (listen, _listener) = local_listener(pool.clone(), "a").await;
@@ -402,9 +404,8 @@ async fn default_ordered_udp_carries_arbitrary_ports_and_large_datagrams_over_ag
     let pool = client::Pool::new(
         identity.clone(),
         vec![node("a", at)],
-        vec!["a".into()],
+        vec![normal("a")],
         None,
-        false,
     )
     .unwrap();
     let first_target = udp_socket("127.0.0.1:0".parse().unwrap()).await.unwrap();
@@ -428,7 +429,7 @@ async fn default_ordered_udp_carries_arbitrary_ports_and_large_datagrams_over_ag
     let _listener = Task(tokio::spawn(client::listen(
         listener,
         pool,
-        "a".into(),
+        normal("a"),
         Arc::new(Semaphore::new(2)),
         false,
     )));
@@ -478,9 +479,8 @@ async fn ordered_udp_handles_domain_refusal_and_releases_resources() {
     let pool = client::Pool::new(
         identity.clone(),
         vec![node("a", at)],
-        vec!["a".into()],
+        vec![normal("a")],
         None,
-        false,
     )
     .unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -488,7 +488,7 @@ async fn ordered_udp_handles_domain_refusal_and_releases_resources() {
     let _listener = Task(tokio::spawn(client::listen(
         listener,
         pool,
-        "a".into(),
+        normal("a"),
         Arc::new(Semaphore::new(4)),
         false,
     )));
@@ -531,9 +531,8 @@ async fn ordered_udp_supports_domain_and_reopens_after_peer_close() {
     let pool = client::Pool::new(
         identity.clone(),
         vec![node("a", at)],
-        vec!["a".into()],
+        vec![normal("a")],
         None,
-        false,
     )
     .unwrap();
     let echo_sock = udp_socket("127.0.0.1:0".parse().unwrap()).await.unwrap();
@@ -550,7 +549,7 @@ async fn ordered_udp_supports_domain_and_reopens_after_peer_close() {
     let _listener = Task(tokio::spawn(client::listen(
         listener,
         pool,
-        "a".into(),
+        normal("a"),
         Arc::new(Semaphore::new(4)),
         false,
     )));
@@ -585,9 +584,8 @@ async fn separate_udp_listeners_pin_exits_fragment_and_release_independently() {
     let pool = client::Pool::new(
         identity.clone(),
         vec![node("a", at), node("b", b)],
-        vec!["a".into(), "b".into()],
+        vec![normal("a"), normal("b")],
         None,
-        false,
     )
     .unwrap();
     let (listen, _listen) = local_listener(pool.clone(), "a").await;
@@ -681,9 +679,8 @@ async fn private_destination_and_unsupported_command_are_rejected() {
     let pool = client::Pool::new(
         identity.clone(),
         vec![node("a", at)],
-        vec!["a".into()],
+        vec![normal("a")],
         None,
-        false,
     )
     .unwrap();
     let (listen, _listen) = local_listener(pool, "a").await;
@@ -708,9 +705,8 @@ async fn tcp_connect_failure_is_reported_before_socks_success() {
     let pool = client::Pool::new(
         identity.clone(),
         vec![node("a", at)],
-        vec!["a".into()],
+        vec![normal("a")],
         None,
-        false,
     )
     .unwrap();
     let (listen, _listener) = local_listener(pool.clone(), "a").await;
@@ -758,9 +754,8 @@ async fn aggregate_proxy_rejects_bad_credentials_and_wrong_exit_before_target_co
         let pool = client::Pool::new(
             client_identity,
             vec![node(exit, at)],
-            vec![exit.into()],
+            vec![normal(exit)],
             None,
-            false,
         )
         .unwrap();
         let (listen, listener) = local_listener(pool.clone(), exit).await;
@@ -819,8 +814,7 @@ async fn aggregate_proxy_requires_the_advertised_stream_capability() {
             .iter()
             .any(|f| f == "proxy-stream-v3")
     );
-    let pool =
-        client::Pool::new(identity, vec![node("a", at)], vec!["a".into()], None, false).unwrap();
+    let pool = client::Pool::new(identity, vec![node("a", at)], vec![normal("a")], None).unwrap();
     let (listen, _listener) = local_listener(pool.clone(), "a").await;
     let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let (_, code, _) = timeout(
@@ -874,9 +868,8 @@ async fn failed_exit_never_falls_back_and_other_listener_keeps_serving() {
     let pool = client::Pool::new(
         identity.clone(),
         vec![node("a", a), node("b", b)],
-        vec!["a".into(), "b".into()],
+        vec![normal("a"), normal("b")],
         None,
-        false,
     )
     .unwrap();
     let (listen_a, _listener_a) = local_listener(pool.clone(), "a").await;
@@ -946,13 +939,12 @@ async fn one_tcp_connection_uses_multiple_servers_and_survives_a_relay_stopping(
     let pool = client::Pool::new(
         identity.clone(),
         vec![node("a", a), node("b", b), node("c", c)],
-        vec!["a".into()],
+        vec![normal("a")],
         None,
-        false,
     )
     .unwrap();
     timeout(Duration::from_secs(5), async {
-        while pool.test_addresses("a").await.len() < 3 {
+        while pool.test_addresses(&normal("a")).await.len() < 3 {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
@@ -1038,9 +1030,8 @@ async fn aggregate_client_reset_reclaims_tcp_and_payload_resources() {
     let pool = client::Pool::new(
         identity.clone(),
         vec![node("a", a)],
-        vec!["a".into()],
+        vec![normal("a")],
         None,
-        false,
     )
     .unwrap();
     let (listen, _listener) = local_listener(pool, "a").await;
@@ -1096,9 +1087,8 @@ async fn data_blackhole_is_quarantined_and_rejoins_the_same_tcp_flow_after_recov
     let pool = client::Pool::new(
         identity.clone(),
         vec![node("a", a)],
-        vec!["a".into()],
+        vec![normal("a")],
         None,
-        false,
     )
     .unwrap();
     let front = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -1119,14 +1109,14 @@ async fn data_blackhole_is_quarantined_and_rejoins_the_same_tcp_flow_after_recov
             }
         }
     }));
-    pool.test_set_routes("a", vec![a, via]);
+    pool.test_set_routes(&normal("a"), vec![a, via]);
     assert!(
-        pool.test_path_failed("a", via),
+        pool.test_path_failed(&normal("a"), via),
         "an unpublished path is not ready"
     );
-    pool.prepare_stream("a").await.unwrap();
+    pool.prepare_stream(&normal("a")).await.unwrap();
     timeout(Duration::from_secs(3), async {
-        while pool.test_path_failed("a", via) {
+        while pool.test_path_failed(&normal("a"), via) {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
@@ -1169,7 +1159,7 @@ async fn data_blackhole_is_quarantined_and_rejoins_the_same_tcp_flow_after_recov
     .unwrap();
     blocked.store(true, Ordering::Release);
     timeout(Duration::from_secs(6), async {
-        while !pool.test_path_failed("a", via) {
+        while !pool.test_path_failed(&normal("a"), via) {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
@@ -1177,7 +1167,7 @@ async fn data_blackhole_is_quarantined_and_rejoins_the_same_tcp_flow_after_recov
     .expect("blackholed route continued receiving new data work");
     blocked.store(false, Ordering::Release);
     timeout(Duration::from_secs(10), async {
-        while pool.test_path_failed("a", via) {
+        while pool.test_path_failed(&normal("a"), via) {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
@@ -1226,13 +1216,12 @@ async fn aggregate_shutdown_releases_optional_leases_and_flow_admission_credit()
     let pool = client::Pool::new(
         identity.clone(),
         vec![node("a", a), node("b", b)],
-        vec!["a".into()],
+        vec![normal("a")],
         None,
-        false,
     )
     .unwrap();
     timeout(Duration::from_secs(3), async {
-        while pool.test_addresses("a").await.len() < 2 {
+        while pool.test_addresses(&normal("a")).await.len() < 2 {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
@@ -1261,9 +1250,8 @@ async fn queued_stream_bytes_are_charged_and_reset_reclaims_them_with_downlink_b
     let pool = client::Pool::new(
         identity.clone(),
         vec![node("a", at)],
-        vec!["a".into()],
+        vec![normal("a")],
         None,
-        false,
     )
     .unwrap();
     let front = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -1290,7 +1278,7 @@ async fn queued_stream_bytes_are_charged_and_reset_reclaims_them_with_downlink_b
             }
         }
     }));
-    pool.test_set_routes("a", vec![via]);
+    pool.test_set_routes(&normal("a"), vec![via]);
     let (listen, _listener) = local_listener(pool.clone(), "a").await;
     let (target, _echo) = echo().await;
     let (mut tcp, status, _) = socks(listen, TCP, Address::Ip(target)).await;
@@ -1348,9 +1336,8 @@ async fn socks_tcp_and_udp_connect_when_only_a_mesh_relay_can_reach_the_exit() {
     let pool = client::Pool::new(
         identity.clone(),
         vec![node("a", direct), node("b", relay)],
-        vec!["a".into()],
+        vec![normal("a")],
         None,
-        false,
     )
     .unwrap();
     let (listen, _listener) = local_listener(pool.clone(), "a").await;
@@ -1402,11 +1389,13 @@ async fn socks_tcp_and_udp_connect_when_only_a_mesh_relay_can_reach_the_exit() {
     .await
     .unwrap();
 
-    let routes = pool.test_addresses("a").await;
+    let routes = pool.test_addresses(&normal("a")).await;
     assert_eq!(routes.len(), 2);
     assert_eq!(routes[0], direct);
     assert_eq!(
-        pool.transport_snapshot("a").into_keys().collect::<Vec<_>>(),
+        pool.transport_snapshot(&normal("a"))
+            .into_keys()
+            .collect::<Vec<_>>(),
         vec![routes[1]]
     );
     assert!(
@@ -1430,17 +1419,16 @@ async fn prepared_paths_do_not_open_targets_and_cold_relays_do_not_hold_download
     let pool = client::Pool::new(
         identity.clone(),
         vec![node("a", at)],
-        vec!["a".into()],
+        vec![normal("a")],
         None,
-        false,
     )
     .unwrap();
     let blackhole = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let cold = blackhole.local_addr().unwrap();
-    pool.test_set_routes("a", vec![at, cold]);
-    pool.prepare_stream("a").await.unwrap();
+    pool.test_set_routes(&normal("a"), vec![at, cold]);
+    pool.prepare_stream(&normal("a")).await.unwrap();
     timeout(Duration::from_secs(2), async {
-        while pool.transport_snapshot("a").len() != 1 {
+        while pool.transport_snapshot(&normal("a")).len() != 1 {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
     })
@@ -1467,13 +1455,13 @@ async fn prepared_paths_do_not_open_targets_and_cold_relays_do_not_hold_download
     })
     .await
     .expect("download waited for an unready optional path");
-    pool.test_set_routes("a", vec![at]);
-    assert_eq!(pool.test_addresses("a").await, [at]);
+    pool.test_set_routes(&normal("a"), vec![at]);
+    assert_eq!(pool.test_addresses(&normal("a")).await, [at]);
     drop(listener);
     drop(send);
     pool.shutdown().await;
     empty(&identity, at).await;
-    assert!(pool.transport_snapshot("a").is_empty());
+    assert!(pool.transport_snapshot(&normal("a")).is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1488,15 +1476,14 @@ async fn failed_proxy_relay_is_reported_and_replaced_by_another_server() {
     let pool = client::Pool::new(
         identity.clone(),
         vec![node("a", a), node("b", b), node("c", c), node("d", d)],
-        vec!["a".into()],
+        vec![normal("a")],
         None,
-        false,
     )
     .unwrap();
     pool.set_path_limit(3);
     let original = timeout(Duration::from_secs(5), async {
         loop {
-            let routes = pool.test_addresses("a").await;
+            let routes = pool.test_addresses(&normal("a")).await;
             if routes.len() == 3 {
                 break routes;
             }
@@ -1505,9 +1492,9 @@ async fn failed_proxy_relay_is_reported_and_replaced_by_another_server() {
     })
     .await
     .unwrap();
-    pool.prepare_stream("a").await.unwrap();
+    pool.prepare_stream(&normal("a")).await.unwrap();
     timeout(Duration::from_secs(3), async {
-        while pool.transport_snapshot("a").len() != 3 {
+        while pool.transport_snapshot(&normal("a")).len() != 3 {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
@@ -1535,11 +1522,11 @@ async fn failed_proxy_relay_is_reported_and_replaced_by_another_server() {
             let mut reply = [0; 1024];
             tcp.read_exact(&mut reply).await.unwrap();
             assert_eq!(reply, [71; 1024]);
-            let routes = pool.test_addresses("a").await;
+            let routes = pool.test_addresses(&normal("a")).await;
             if routes.len() == 3
                 && routes.iter().any(|p| !original.contains(p))
                 && pool
-                    .transport_snapshot("a")
+                    .transport_snapshot(&normal("a"))
                     .keys()
                     .all(|p| routes.contains(p))
             {
@@ -1569,21 +1556,20 @@ async fn one_tcp_upload_repairs_loss_without_duplicating_target_bytes() {
     let pool = client::Pool::new(
         identity.clone(),
         vec![node("a", a), node("b", b), node("c", c)],
-        vec!["a".into()],
+        vec![normal("a")],
         None,
-        false,
     )
     .unwrap();
     timeout(Duration::from_secs(4), async {
-        while pool.test_addresses("a").await.len() < 3 {
+        while pool.test_addresses(&normal("a")).await.len() < 3 {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await
     .unwrap();
-    pool.prepare_stream("a").await.unwrap();
+    pool.prepare_stream(&normal("a")).await.unwrap();
     timeout(Duration::from_secs(3), async {
-        while pool.transport_snapshot("a").len() != 3 {
+        while pool.transport_snapshot(&normal("a")).len() != 3 {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
@@ -1677,8 +1663,8 @@ async fn single_tcp_external_route_diagnostic() {
         let root = tempfile::tempdir().unwrap();
         let identity = mesh::ClientIdentity::open(root.path().join("client"), &case.connection_key).unwrap();
         let nodes = identity.discover(case.bootstrap).await.unwrap();
-        let pool = client::Pool::new(identity.clone(), nodes, vec![case.exit.clone()], None, false).unwrap();
-        pool.test_set_routes(&case.exit, case.routes);
+        let pool = client::Pool::new(identity.clone(), nodes, vec![normal(&case.exit)], None).unwrap();
+        pool.test_set_routes(&normal(&case.exit), case.routes);
         let (listen, listener) = local_listener(pool.clone(), &case.exit).await;
         let (mut tcp, status, _) = socks(listen, TCP, Address::Ip(case.target)).await;
         assert_eq!(status, 0);
@@ -1715,9 +1701,8 @@ async fn live_lanes_deliver_interactive_turns_before_batch_completion_or_tcp_eof
     let pool = client::Pool::new(
         identity.clone(),
         vec![node("a", a)],
-        vec!["a".into()],
+        vec![normal("a")],
         None,
-        false,
     )
     .unwrap();
     let (listen, listener) = local_listener(pool.clone(), "a").await;
@@ -1772,9 +1757,8 @@ async fn idle_streaming_flows_do_not_starve_an_active_flow_and_all_release() {
     let pool = client::Pool::new(
         identity.clone(),
         vec![node("a", a)],
-        vec!["a".into()],
+        vec![normal("a")],
         None,
-        false,
     )
     .unwrap();
     let (listen, listener) = local_listener_capacity(
@@ -1830,15 +1814,23 @@ async fn game_socks_download_and_fragmented_udp_share_one_aggregate_session() {
     let root = tempfile::tempdir().unwrap();
     let (at, _server, server_metrics) = start_metered(root.path(), "a", None, true).await;
     let identity = identity(root.path(), "game-socks");
+    let game = SessionKey::new("a", SessionMode::Game);
     let pool = client::Pool::new(
         identity.clone(),
         vec![node("a", at)],
-        vec!["a".into()],
+        vec![game.clone()],
         None,
-        true,
     )
     .unwrap();
-    let (listen, listener) = local_listener(pool.clone(), "a").await;
+    let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listen = socket.local_addr().unwrap();
+    let listener = Task(tokio::spawn(client::listen(
+        socket,
+        pool.clone(),
+        game.clone(),
+        Arc::new(Semaphore::new(16)),
+        false,
+    )));
     let destination = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let endpoint = destination.local_addr().unwrap();
     let echo = Task(tokio::spawn(async move {
@@ -1919,7 +1911,7 @@ async fn game_socks_download_and_fragmented_udp_share_one_aggregate_session() {
         udp
     );
     assert_eq!(delivered, expected);
-    let stream_metrics = pool.test_stream_metrics("a");
+    let stream_metrics = pool.test_stream_metrics(&game);
     let observed = timeout(Duration::from_secs(3), async {
         loop {
             let mut shared_session = None;
@@ -2016,6 +2008,9 @@ async fn one_client_serves_fixed_exits_and_socks_tcp_udp_with_exit_failure_isola
         exits: vec!["a".into()],
         listen: socks_at,
         socks5: vec![],
+        game_exits: vec![],
+        game_listen: "127.0.0.1:0".parse().unwrap(),
+        game_socks5: vec![],
         tcp_forward: vec![
             Listener {
                 exit: "a".into(),
@@ -2029,7 +2024,7 @@ async fn one_client_serves_fixed_exits_and_socks_tcp_udp_with_exit_failure_isola
         paths: 2,
         interface: None,
         socks5_early_reply: false,
-        game_mode: false,
+        game_socks5_early_reply: false,
         status_socket: None,
     })));
     timeout(Duration::from_secs(5), async {
@@ -2162,8 +2157,83 @@ fn fixed_forward_plans_reject_exposure_and_conflicting_listeners() {
             },
         ],
     ] {
-        assert!(client::validate_tcp_forwards(&forwards, &socks).is_err());
+        assert!(client::validate_listeners(&socks, &[], &forwards).is_err());
     }
+}
+
+#[test]
+fn all_listener_modes_share_address_and_session_limits() {
+    let base = "127.0.0.1:1080".parse().unwrap();
+    let exits: Vec<_> = (0..8).map(|index| format!("node-{index}")).collect();
+    let normal = client::listener_plan(&exits, base, &[]).unwrap();
+    let game = client::listener_plan(&exits, "127.0.0.1:1090".parse().unwrap(), &[]).unwrap();
+    let forward = "node-0=127.0.0.1:2090".parse::<Listener>().unwrap();
+
+    assert_eq!(
+        client::validate_listeners(&normal, &game, &[])
+            .unwrap()
+            .len(),
+        8
+    );
+    assert!(client::validate_listeners(&normal, &game, &[forward]).is_err());
+    assert!(client::validate_listeners(&normal, &normal, &[]).is_err());
+    assert!(client::validate_listeners(&normal[..1], &game[..1], &game[..1]).is_err());
+    assert!(client::validate_listeners(&[], &[], &[]).is_err());
+
+    let explicit = "node-0=127.0.0.1:0".parse::<Listener>().unwrap();
+    let game = client::listener_plan(&[], base, std::slice::from_ref(&explicit)).unwrap();
+    assert_eq!(game, std::slice::from_ref(&explicit));
+    assert!(client::validate_listeners(&[], &game, &[]).is_ok());
+    assert!(client::validate_listeners(&[], &[], &[explicit]).is_ok());
+}
+
+#[tokio::test]
+async fn fixed_only_proxy_client_serves_without_any_socks_listeners() {
+    let root = tempfile::tempdir().unwrap();
+    let root = root.path();
+    let (target, _echo) = echo().await;
+    let (server, _server, _) = start_metered_target(root, "a", None, true, Some(target)).await;
+    let reservation = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = reservation.local_addr().unwrap();
+    let identity = identity(root, "fixed-only");
+    drop(reservation);
+    let mut process = Task(tokio::spawn(client(ClientOptions {
+        identity,
+        connect: vec![server],
+        exits: vec![],
+        listen: address,
+        socks5: vec![],
+        game_exits: vec![],
+        game_listen: address,
+        game_socks5: vec![],
+        tcp_forward: vec![Listener {
+            exit: "a".into(),
+            address,
+        }],
+        paths: 1,
+        interface: None,
+        socks5_early_reply: true,
+        game_socks5_early_reply: true,
+        status_socket: None,
+    })));
+    timeout(Duration::from_secs(8), async {
+        let mut stream = loop {
+            tokio::select! {
+                result = &mut process.0 => panic!("fixed-only client exited: {result:?}"),
+                result = TcpStream::connect(address) => {
+                    if let Ok(stream) = result { break stream; }
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
+        stream.write_all(b"fixed only").await.unwrap();
+        stream.shutdown().await.unwrap();
+        let mut reply = Vec::new();
+        stream.read_to_end(&mut reply).await.unwrap();
+        assert_eq!(reply, b"fixed onlyFIN");
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2177,21 +2247,20 @@ async fn default_ordered_udp_survives_single_path_failure_within_same_associatio
     let pool = client::Pool::new(
         identity.clone(),
         vec![node("a", a), node("b", b), node("c", c)],
-        vec!["a".into()],
+        vec![normal("a")],
         None,
-        false,
     )
     .unwrap();
     timeout(Duration::from_secs(5), async {
-        while pool.test_addresses("a").await.len() < 3 {
+        while pool.test_addresses(&normal("a")).await.len() < 3 {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await
     .unwrap();
-    pool.prepare_stream("a").await.unwrap();
+    pool.prepare_stream(&normal("a")).await.unwrap();
     timeout(Duration::from_secs(3), async {
-        while pool.transport_snapshot("a").len() != 3 {
+        while pool.transport_snapshot(&normal("a")).len() != 3 {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
@@ -2256,9 +2325,8 @@ async fn ordered_udp_flows_do_not_consume_tcp_flow_permits() {
     let pool = client::Pool::new(
         identity.clone(),
         vec![node("a", at)],
-        vec!["a".into()],
+        vec![normal("a")],
         None,
-        false,
     )
     .unwrap();
     let (listen, _listener) = local_listener(pool.clone(), "a").await;
@@ -2322,9 +2390,8 @@ async fn proxy_native_upload_handles_slow_target_backpressure_without_stalling_i
     let pool = client::Pool::new(
         identity.clone(),
         vec![node("a", at)],
-        vec!["a".into()],
+        vec![normal("a")],
         None,
-        false,
     )
     .unwrap();
     let (listen, _listener) = local_listener(pool.clone(), "a").await;
@@ -2428,16 +2495,15 @@ async fn concurrent_cold_socks_streams_coalesce_with_background_warmup() {
     let pool = client::Pool::new(
         identity.clone(),
         vec![node("a", at)],
-        vec!["a".into()],
+        vec![normal("a")],
         None,
-        false,
     )
     .unwrap();
     let (listen, _listener) = local_listener(pool.clone(), "a").await;
     let (target, _echo) = echo().await;
     let warmup = {
         let pool = pool.clone();
-        tokio::spawn(async move { pool.prepare_stream("a").await })
+        tokio::spawn(async move { pool.prepare_stream(&normal("a")).await })
     };
     let mut clients = tokio::task::JoinSet::new();
     for i in 0..4u8 {
@@ -2458,7 +2524,7 @@ async fn concurrent_cold_socks_streams_coalesce_with_background_warmup() {
         res.unwrap();
     }
     let mut sessions = 0;
-    pool.test_stream_metrics("a")
+    pool.test_stream_metrics(&normal("a"))
         .state(|state| sessions = state.sessions.len());
     assert_eq!(
         sessions, 1,

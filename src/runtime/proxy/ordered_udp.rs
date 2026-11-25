@@ -1,5 +1,9 @@
 //! Preserve UDP message boundaries over the aggregate's reliable byte stream.
-use super::{client::Pool, protocol::*, *};
+use super::{
+    client::{Pool, SessionKey},
+    protocol::*,
+    *,
+};
 use crate::runtime::tunnel::StreamTarget;
 use std::{
     io,
@@ -215,7 +219,7 @@ pub(crate) async fn connect(
 
 pub(super) async fn forward(
     pool: &Pool,
-    exit: &str,
+    key: &SessionKey,
     target: Address,
     relay: &super::socks::Relay,
     first_payload: Vec<u8>,
@@ -229,7 +233,7 @@ pub(super) async fn forward(
         (Vec::new(), Some(first_framed))
     };
     let (flow, stream, bridge, header) = timeout(CONNECT_TIMEOUT, async {
-        let connector = pool.prepare_stream(exit).await?;
+        let connector = pool.prepare_stream(key).await?;
         let mut header = vec![0, 0, 0];
         target.encode(&mut header);
         let flow = connector.open_ordered_udp(target.into(), initial).await?;

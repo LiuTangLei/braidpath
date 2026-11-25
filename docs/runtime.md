@@ -425,10 +425,10 @@ bidirectional echo after all configured paths are ready.
 ## Traffic modes
 
 The unified `proxy-client` uses bidirectional native HTTP/3 streams for bulk
-TCP. Ordinary SOCKS5 UDP (`--game-mode off`) uses reliable, ordered streams
-per destination across the aggregate. Game UDP (`--game-mode on`) uses the
-deadline-bound DATAGRAM lane alongside bulk TCP. Remove `--ordered-udp-port PORT`
-from service definitions. Upgrade servers first, then clients.
+TCP. Ordinary SOCKS5 listeners use reliable, ordered UDP streams per destination.
+Game listeners (`--game-exit` or `--game-socks5`) use the deadline-bound DATAGRAM
+lane alongside bulk TCP. Each listener's mode selects its own aggregate session
+and relay leases, including when ordinary and Game listeners use the same exit.
 
 The `client` and `mesh-client` commands select the mixed policy with
 `--game-mode --native-return-stream` and a TCP-capable entry. Every path in a
@@ -455,7 +455,7 @@ The Game sender returns to input selection between bulk drain steps when UDP
 input is ready. It also yields after a one-millisecond drain slice so the
 socket and path writers can run while bulk data stays writable.
 
-Game mode trades bandwidth and bulk shares for timely UDP. It conflicts with explicit codec/deadline overrides. Aggregate and group caps remain active. Automatic startup measures fresh delivery and can reduce short-upload performance. For latency-sensitive sessions that share the link with bulk transfers, start with explicit client and server ceilings sized to the link and check UDP delivery and tail latency under competing traffic. The low-level client flag is separate from the unified client’s `--game-mode on|off` selector. These mechanisms do not establish a latency or throughput result for a particular network; use same-target, bounded paired measurements of delivery, loss, jitter and competing TCP traffic.
+Game mode trades bandwidth and bulk shares for timely UDP. The low-level client's `--game-mode` flag conflicts with explicit codec and deadline overrides. Aggregate and group caps remain active. Automatic startup measures fresh delivery and can reduce short-upload performance. For latency-sensitive sessions that share the link with bulk transfers, start with explicit client and server ceilings sized to the link and check UDP delivery and tail latency under competing traffic. Use same-target paired measurements of delivery, loss, jitter and competing TCP traffic.
 
 Reliable Game TCP bulk uses its stream acknowledgments and retransmissions without proactive bulk parity. UDP retains its three protection copies, and short TCP/control records retain their separate protection policy.
 
