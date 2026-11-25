@@ -765,10 +765,11 @@ impl Connection {
         conn.wake();
     }
 
-    /// Cap packet pacing in bytes per second. `None` restores controller pacing.
-    pub fn set_max_pacing_rate(&self, bytes_per_second: Option<u64>) {
+    /// Cap packet pacing in bytes per second for the sampled path epoch.
+    /// Stale updates are ignored. `None` restores controller pacing.
+    pub fn set_max_pacing_rate(&self, path_epoch: u64, bytes_per_second: Option<u64>) {
         let mut conn = self.0.state.lock("set_max_pacing_rate");
-        conn.inner.set_max_pacing_rate(bytes_per_second);
+        conn.inner.set_max_pacing_rate(path_epoch, bytes_per_second);
         conn.wake();
     }
 

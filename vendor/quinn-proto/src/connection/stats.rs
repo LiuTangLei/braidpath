@@ -134,6 +134,12 @@ impl std::fmt::Debug for FrameStats {
 #[derive(Debug, Default, Copy, Clone)]
 #[non_exhaustive]
 pub struct PathStats {
+    /// Changes when the active path is replaced, restored or explicitly reset.
+    pub pacing_epoch: u64,
+    /// External packet pacing cap for this path, in bytes per second.
+    pub max_pacing_rate: Option<u64>,
+    /// Send attempts delayed by pacing with an external cap below the native rate.
+    pub capped_pacing_delays: u64,
     /// Current best estimate of this connection's latency (round-trip-time)
     pub rtt: Duration,
     /// Minimum RTT seen on this path, ignoring ack delay

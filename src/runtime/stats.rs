@@ -299,6 +299,8 @@ pub struct Quinn {
     pub congestion_window_bytes: u64,
     /// Controller-reported pacing target in bits/s, not observed delivery capacity.
     pub pacing_rate_bps: Option<u64>,
+    pub download_pacing_cap_bps: Option<u64>,
+    pub capped_pacing_delays: u64,
     /// Native controller phase, not inferred from a smaller congestion window.
     pub native_rtt_probe: bool,
     /// Payload bytes currently available for another outgoing QUIC datagram.
@@ -349,6 +351,8 @@ impl Quinn {
             smoothed_rtt_ms: conn.rtt().as_secs_f64() * 1000.,
             congestion_window_bytes: q.path.cwnd,
             pacing_rate_bps: conn.congestion_state().metrics().pacing_rate,
+            download_pacing_cap_bps: q.path.max_pacing_rate.map(|rate| rate.saturating_mul(8)),
+            capped_pacing_delays: q.path.capped_pacing_delays,
             native_rtt_probe: conn.probing_rtt_hint(),
             datagram_send_buffer_space_bytes: conn.datagram_send_buffer_space() as u64,
             sent_packets: q.path.sent_packets,

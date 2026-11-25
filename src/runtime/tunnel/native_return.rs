@@ -325,6 +325,7 @@ impl AckService {
 
 #[derive(Clone, Copy)]
 struct PaceSample {
+    capped_delays: u64,
     at: u64,
     acked: u64,
     sent: u64,
@@ -333,6 +334,8 @@ struct PaceSample {
 
 #[derive(Default)]
 struct DownloadPace {
+    path_epoch: u64,
+    last_busy_at: u64,
     start: Option<PaceSample>,
     limit: Option<u64>,
     idle_since: Option<u64>,
@@ -359,22 +362,24 @@ impl DownloadPace {
             return None;
         }
         self.idle_since = None;
+        let window = rtt_us.saturating_mul(2).max(250_000);
+        if sample.at.saturating_sub(self.last_busy_at) > window.saturating_mul(4) {
+            self.start = None;
+        }
+        self.last_busy_at = sample.at;
         let start = *self.start.get_or_insert(sample);
         let elapsed = sample.at.saturating_sub(start.at);
-        let window = rtt_us.saturating_mul(2).max(250_000);
         if elapsed < window {
-            return None;
-        }
-        self.start = Some(sample);
-        if elapsed > window.saturating_mul(4) {
             return None;
         }
         let sent = sample.sent.saturating_sub(start.sent);
         let lost = sample.lost.saturating_sub(start.lost);
         let delivered = sample.acked.saturating_sub(start.acked);
         if sent < 128 || delivered < 2 * PAYLOAD as u64 {
+            // Accumulate evidence on slow paths while observations remain fresh.
             return None;
         }
+        self.start = Some(sample);
         let service = delivered.saturating_mul(1_000_000) / elapsed;
         // Allow packet headers and occasional retransmissions. After the path
         // settles, probe for capacity using the same qualified delivery sample.
@@ -382,10 +387,19 @@ impl DownloadPace {
             let ceiling = service.saturating_mul(5) / 4;
             Some(self.limit.map_or(ceiling, |limit| limit.min(ceiling)))
         } else if let Some(limit) = self.limit
-            && lost.saturating_mul(100) <= sent.saturating_mul(3)
-            && service.saturating_mul(5) >= limit.saturating_mul(4)
+            && (sample.capped_delays.saturating_sub(start.capped_delays) >= 4
+                || service.saturating_mul(5) >= limit.saturating_mul(4))
         {
-            Some((limit.saturating_mul(5) / 4).min(crate::runtime::MAX_RATE_BPS / 8))
+            let step = if lost.saturating_mul(100) <= sent.saturating_mul(3) {
+                limit / 4
+            } else {
+                limit / 10
+            };
+            Some(
+                limit
+                    .saturating_add(step)
+                    .min(crate::runtime::MAX_RATE_BPS / 8),
+            )
         } else {
             self.limit
         };
@@ -558,9 +572,16 @@ impl Credit {
         let ack_progress = acked_delta >= PAYLOAD as u64;
         self.acked = acked;
         let written = writer.written_bytes();
+        if self.download_pace.path_epoch != stats.path.pacing_epoch {
+            self.download_pace = DownloadPace {
+                path_epoch: stats.path.pacing_epoch,
+                ..Default::default()
+            };
+        }
         if initial_window == INITIAL_SEND_WINDOW
             && let Some(limit) = self.download_pace.observe(
                 PaceSample {
+                    capped_delays: stats.path.capped_pacing_delays,
                     at: now_us,
                     acked,
                     sent: stats.path.sent_packets,
@@ -571,7 +592,7 @@ impl Credit {
                 written,
             )
         {
-            conn.set_max_pacing_rate(limit);
+            conn.set_max_pacing_rate(stats.path.pacing_epoch, limit);
         }
         self.delivery.observe(
             now_us,
@@ -2115,6 +2136,7 @@ mod tests {
         let mut sample = |at, acked, sent, lost, retained| {
             pace.observe(
                 PaceSample {
+                    capped_delays: 0,
                     at,
                     acked,
                     sent,
@@ -2141,6 +2163,38 @@ mod tests {
         assert_eq!(sample(3_599_999, 3_750_000, 3_000, 450, 0), None);
         assert_eq!(sample(3_600_000, 3_750_000, 3_000, 450, 0), Some(None));
     }
+    #[test]
+    fn capped_download_accumulates_small_samples_and_probes_through_moderate_loss() {
+        let mut pace = DownloadPace::default();
+        let busy = 4 * PAYLOAD as u64;
+        let mut sample = PaceSample {
+            capped_delays: 0,
+            at: 0,
+            acked: 0,
+            sent: 0,
+            lost: 0,
+        };
+        let mut step = |acked, sent, lost, delays| {
+            sample.capped_delays += delays;
+            sample.at += 300_000;
+            sample.acked += acked;
+            sample.sent += sent;
+            sample.lost += lost;
+            pace.observe(sample, 150_000, busy, INITIAL_SEND_WINDOW)
+        };
+        assert_eq!(step(0, 0, 0, 0), None);
+        assert_eq!(step(92_160, 140, 35, 0), Some(Some(384_000)));
+        // Each interval is too small for a fresh 128-packet rate sample.
+        assert_eq!(step(100_000, 96, 0, 0), None);
+        assert_eq!(step(100_000, 96, 0, 0), Some(Some(480_000)));
+        // A busy recovered path with persistent 5% loss can probe cautiously.
+        assert_eq!(step(125_000, 100, 5, 0), None);
+        assert_eq!(step(125_000, 100, 5, 0), Some(Some(528_000)));
+        // ACK batching leaves measured service below 80% of the cap, but the
+        // sender had data and repeatedly had to wait for the external pacer.
+        assert_eq!(step(80_000, 150, 0, 6), Some(Some(660_000)));
+    }
+
     use crate::runtime::wire::Record;
     #[test]
     fn native_udp_prefers_a_nearby_healthy_route_without_hiding_fallbacks() {

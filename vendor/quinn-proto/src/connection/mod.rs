@@ -143,7 +143,6 @@ pub struct Connection {
     /// This is only populated for the server case, and if known
     local_ip: Option<IpAddr>,
     path: PathData,
-    max_pacing_rate: Option<u64>,
     /// Incremented every time we see a new path
     ///
     /// Stored separately from `path.generation` to account for aborted migrations
@@ -349,7 +348,6 @@ impl Connection {
             app_limited: false,
             receiving_ecn: false,
             total_authed_packets: 0,
-            max_pacing_rate: None,
 
             streams: StreamsState::new(
                 side,
@@ -627,7 +625,8 @@ impl Connection {
                     // Check whether the next datagram is blocked by pacing
                     let smoothed_rtt = self.path.rtt.get();
                     let rate = self.path.congestion.pacing_rate();
-                    self.path.pacing.set_rate(match self.max_pacing_rate {
+                    let cap = self.stats.path.max_pacing_rate;
+                    self.path.pacing.set_rate(match cap {
                         Some(limit) => Some(rate.map_or(limit, |rate| rate.min(limit))),
                         None => rate,
                     });
@@ -638,6 +637,14 @@ impl Connection {
                         self.path.congestion.window(),
                         now,
                     ) {
+                        // A full congestion window was checked above. Only mark a
+                        // limited flight when the external cap actually delayed sending.
+                        if cap.zip(rate).is_some_and(|(cap, native)| cap < native) {
+                            self.stats.path.capped_pacing_delays += 1;
+                            self.path
+                                .congestion
+                                .on_app_limited(self.path.in_flight.bytes);
+                        }
                         self.timers.set(Timer::Pacing, delay);
                         congestion_blocked = true;
                         // Loss probes should be subject to pacing, even though
@@ -1236,6 +1243,7 @@ impl Connection {
                     debug!("path validation failed");
                     if let Some((_, prev)) = self.prev_path.take() {
                         self.path = prev;
+                        self.reset_pacing_limit();
                     }
                     self.path.challenge = None;
                     self.path.challenge_pending = false;
@@ -1453,6 +1461,7 @@ impl Connection {
     /// configuration in the [`TransportConfig`].
     pub fn path_changed(&mut self, now: Instant) {
         self.path.reset(now, &self.config);
+        self.reset_pacing_limit();
         self.datagrams().drop_oversized();
     }
 
@@ -1482,9 +1491,17 @@ impl Connection {
         self.streams.set_send_window(send_window);
     }
 
-    /// Cap packet pacing in bytes per second. `None` restores controller pacing.
-    pub fn set_max_pacing_rate(&mut self, bytes_per_second: Option<u64>) {
-        self.max_pacing_rate = bytes_per_second.filter(|&rate| rate != 0);
+    /// Cap packet pacing in bytes per second for the sampled path epoch.
+    /// Stale updates are ignored. `None` restores controller pacing.
+    pub fn set_max_pacing_rate(&mut self, path_epoch: u64, bytes_per_second: Option<u64>) {
+        if path_epoch == self.stats.path.pacing_epoch {
+            self.stats.path.max_pacing_rate = bytes_per_second.filter(|&rate| rate != 0);
+        }
+    }
+
+    fn reset_pacing_limit(&mut self) {
+        self.stats.path.pacing_epoch = self.stats.path.pacing_epoch.wrapping_add(1);
+        self.stats.path.max_pacing_rate = None;
     }
 
     /// See [`TransportConfig::receive_window()`]
@@ -3126,6 +3143,7 @@ impl Connection {
         let prev_pto = self.pto(SpaceId::Data);
 
         let mut prev = mem::replace(&mut self.path, new_path);
+        self.reset_pacing_limit();
         self.datagrams().drop_oversized();
         // Don't clobber the original path if the previous one hasn't been validated yet
         if prev.challenge.is_none() {
@@ -3144,6 +3162,7 @@ impl Connection {
 
     /// Handle a change in the local address, i.e. an active migration
     pub fn local_address_changed(&mut self) {
+        self.reset_pacing_limit();
         self.update_rem_cid();
         self.ping();
     }

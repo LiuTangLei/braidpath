@@ -4182,6 +4182,10 @@ fn path_changes_unblock_oversized_datagrams() {
         }
         while pair.server_conn_mut(server_ch).poll().is_some() {}
 
+        let epoch = pair.server_conn_mut(server_ch).stats().path.pacing_epoch;
+        let conn = pair.server_conn_mut(server_ch);
+        conn.set_max_pacing_rate(epoch, Some(100_000));
+        assert_eq!(conn.stats().path.max_pacing_rate, Some(100_000));
         pair.mtu = 1200;
         if migrate {
             pair.client
@@ -4209,6 +4213,11 @@ fn path_changes_unblock_oversized_datagrams() {
             let now = pair.time;
             pair.server_conn_mut(server_ch).path_changed(now);
         }
+
+        let conn = pair.server_conn_mut(server_ch);
+        assert_ne!(conn.stats().path.pacing_epoch, epoch);
+        conn.set_max_pacing_rate(epoch, Some(100_000));
+        assert_eq!(conn.stats().path.max_pacing_rate, None);
 
         assert!(pair.server_datagrams(server_ch).max_size().unwrap() < old_max);
         assert_eq!(
