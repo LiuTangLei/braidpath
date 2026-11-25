@@ -848,6 +848,16 @@ impl StreamsState {
         (self.buffered_data, unsent)
     }
 
+    pub(crate) fn bidirectional_ack_gap_span(&self) -> u64 {
+        self.send
+            .iter()
+            .filter(|(id, _)| id.dir() == Dir::Bi)
+            .filter_map(|(_, stream)| stream.as_ref())
+            .map(|stream| stream.pending.ack_gap_span())
+            .max()
+            .unwrap_or(0)
+    }
+
     pub(crate) fn send_buffer_empty(&self) -> bool {
         self.buffered_data == 0
     }
@@ -1123,6 +1133,10 @@ mod tests {
         };
         server.retransmit(suffix.clone());
         assert_eq!(server.received_ack_of(suffix.clone()), 7);
+        assert_eq!(
+            server.send[&id].as_ref().unwrap().pending.ack_gap_span(),
+            23
+        );
         assert_eq!(server.received_ack_of(suffix), 0);
         assert_eq!(
             server.received_ack_of(frame::StreamMeta {
@@ -1150,6 +1164,7 @@ mod tests {
             0,
             "partial prefix keeps the original Bytes allocation"
         );
+        assert_eq!(server.send[&id].as_ref().unwrap().pending.ack_gap_span(), 0);
         server.received_ack_of(frame::StreamMeta {
             id,
             offsets: 23..24,

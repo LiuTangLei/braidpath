@@ -2971,6 +2971,7 @@ async fn sender_with_inputs(
                 &mut native_queue,
                 &paths,
                 &native_credit,
+                metrics.direction == stats::RETURN,
                 silent,
                 &mut native_cursor,
                 &mut pacer,

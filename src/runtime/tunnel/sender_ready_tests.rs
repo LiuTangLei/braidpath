@@ -411,6 +411,7 @@ async fn native_return_avoids_an_open_but_unresponsive_path_and_reuses_it_after_
             &mut queue,
             &paths,
             &Default::default(),
+            true,
             silent,
             &mut cursor,
             &mut pacer,

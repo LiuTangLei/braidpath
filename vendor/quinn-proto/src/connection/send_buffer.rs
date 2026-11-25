@@ -207,6 +207,12 @@ impl SendBuffer {
         self.offset - self.unsent
     }
 
+    /// Offset span from the oldest outstanding byte through the highest selective ACK.
+    pub(super) fn ack_gap_span(&self) -> u64 {
+        let base = self.offset - self.unacked_len as u64;
+        self.acks.max().map_or(0, |end| end + 1 - base)
+    }
+
     /// Bytes still retained from application writes, including acknowledged data
     pub(super) fn buffered(&self) -> u64 {
         (self.unacked_len + self.front_trimmed) as u64

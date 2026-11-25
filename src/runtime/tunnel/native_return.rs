@@ -387,7 +387,8 @@ impl DownloadPace {
             let ceiling = service.saturating_mul(5) / 4;
             Some(self.limit.map_or(ceiling, |limit| limit.min(ceiling)))
         } else if let Some(limit) = self.limit
-            && (sample.capped_delays.saturating_sub(start.capped_delays) >= 4
+            && ((sample.capped_delays.saturating_sub(start.capped_delays) >= 4
+                && service.saturating_mul(2) >= limit)
                 || service.saturating_mul(5) >= limit.saturating_mul(4))
         {
             let step = if lost.saturating_mul(100) <= sent.saturating_mul(3) {
@@ -482,16 +483,45 @@ fn service_bound_capped(conn: &quinn::Connection, window_cap: u64) -> u64 {
     }
 }
 
+fn download_arrival_delay_us(
+    rtt_us: u64,
+    min_rtt_us: u64,
+    in_flight: u64,
+    service_per_ms: u64,
+    ack_gap_span: u64,
+) -> u64 {
+    let base = min_rtt_us.min(rtt_us);
+    let service = service_per_ms.max(1);
+    // Allow normal BBR ProbeBW 1.25x flight without charging phantom queue;
+    // price excess flight above 1.25x BDP before RTT samples catch up.
+    let bdp = service.saturating_mul(base) / 800;
+    let excess_us = in_flight.saturating_sub(bdp).saturating_mul(1_000) / service;
+    let gap_wait = if ack_gap_span > PAYLOAD as u64 {
+        base / 2
+    } else {
+        0
+    };
+    (base / 2)
+        .saturating_add((rtt_us - base).max(excess_us))
+        .saturating_add(gap_wait)
+}
+
+fn download_runway(service_per_ms: u64) -> u64 {
+    let record = (PAYLOAD + HEADER_BYTES) as u64;
+    service_per_ms
+        .saturating_mul(45)
+        .clamp(2 * record, 24 * record)
+}
+
 fn path_completion_rank(
     probing: bool,
-    rtt_us: u64,
+    delay_us: u64,
     queued_bytes: u64,
     next_bytes: u64,
     service_bytes_per_ms: u64,
     cold_unmeasured: bool,
     best_service_bytes_per_ms: u64,
 ) -> (bool, u64) {
-    let delay_us = rtt_us / 2;
     // A freshly joined path starts at initial cwnd and would otherwise look
     // artificially tiny until its sibling completely fills its 2-4 MiB buffer.
     // Give a cold idle path one bounded probe-level service floor while it has
@@ -893,9 +923,14 @@ impl Credit {
             if severe_loss {
                 self.loss_cautious_until_us = now_us.saturating_add(LOSS_CAUTIOUS_US);
             }
+            let cap = if exercised_slow {
+                bdp_floor.min(slow_window)
+            } else {
+                bdp_floor
+            };
             let step = (self.current / 2).clamp(SEND_WINDOW_GROWTH, SEND_WINDOW_MAX_GROWTH / 2);
             (self.current + step)
-                .min(bdp_floor)
+                .min(cap)
                 .max(retained_floor)
                 .min(cwnd_cap)
         } else if self.current < retained_floor && !can_grow {
@@ -1161,10 +1196,12 @@ pub(super) fn enqueue(item: QueuedRecord, queue: &mut outbound::Queue) {
 
 /// Uses the same aggregate/group credit as datagrams. Each successful pop
 /// rotates logical flows, and a full path never blocks an available sibling.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn drain(
     queue: &mut outbound::Queue,
     paths: &[OutPath],
     credits: &[Credit; super::MAX_PATHS],
+    download: bool,
     silent: u8,
     cursor: &mut usize,
     pacer: &mut outbound::Pacer,
@@ -1179,6 +1216,9 @@ pub(super) fn drain(
         probing: bool,
         rtt_us: u64,
         queued_us: u64,
+        arrival_us: u64,
+        rank_cap: u64,
+        ext_cap: u64,
         cwnd: u64,
         retained: u64,
         staged: u64,
@@ -1202,7 +1242,12 @@ pub(super) fn drain(
             continue;
         }
         let id = usize::from(path.id);
-        let (retained, unsent) = path.conn.stream_send_buffer_bytes();
+        let rank_download = download && paths.len() >= 2;
+        let backlog = rank_download.then(|| path.conn.stream_send_backlog());
+        let (retained, unsent) = backlog.map_or_else(
+            || path.conn.stream_send_buffer_bytes(),
+            |s| (s.retained, s.unsent),
+        );
         let cwnd = path.conn.cwnd_hint();
         let staged = ((writer.tx.max_capacity() - writer.tx.capacity()) * PAYLOAD) as u64;
         let probing = path.conn.probing_rtt_hint();
@@ -1257,11 +1302,32 @@ pub(super) fn drain(
             service = service.min(ceiling);
             idle_probe_service = idle_probe_service.min(ceiling);
         }
+        let (arrival_us, rank_cap, ext_cap) = if let Some(backlog) = backlog {
+            let native_rate = path.conn.pacing_rate_bps_hint().unwrap_or(u64::MAX) / 8_000;
+            let ext_cap = backlog.pacing_cap.unwrap_or(u64::MAX) / 1_000;
+            let rank_cap = native_rate.min(ext_cap).max(1);
+            (
+                download_arrival_delay_us(
+                    raw_rtt_us,
+                    min_rtt_us,
+                    backlog.in_flight,
+                    idle_probe_service.min(rank_cap),
+                    backlog.ack_gap_span,
+                ),
+                rank_cap,
+                ext_cap.max(1),
+            )
+        } else {
+            (rtt_us / 2, u64::MAX, u64::MAX)
+        };
         snapshots[id] = PathSnapshot {
             active: true,
             probing,
             rtt_us,
             queued_us,
+            arrival_us,
+            rank_cap,
+            ext_cap,
             cwnd,
             retained,
             staged,
@@ -1273,11 +1339,11 @@ pub(super) fn drain(
         };
         active_native += 1;
         if !probing {
-            best_service = best_service.max(idle_probe_service);
+            best_service = best_service.max(idle_probe_service.min(rank_cap));
         }
     }
     let mut local_dispatched = [0u64; super::MAX_PATHS];
-    let mut deferred_rescues = 0;
+    let mut deferred_flows = 0;
     for _ in 0..16 {
         let Some(front) = queue.front(false) else {
             break;
@@ -1304,23 +1370,25 @@ pub(super) fn drain(
             .map(|n| (*cursor + n) % paths.len())
             .collect();
         let mut path_ranks: [(bool, u64); super::MAX_PATHS] = [(true, u64::MAX); super::MAX_PATHS];
+        let mut runway_capped = [false; super::MAX_PATHS];
+        let mut runway_blocked = false;
+        let mut best_ect_us = u64::MAX;
         let mut straggler_limit_us = u64::MAX;
         let has_non_avoid = avoid_path.is_some() && active_native >= 2;
         if active_native >= 2 {
             // In-order TCP delivery waits for the oldest record, and interactive
             // responses larger than the DATAGRAM bypass should avoid a deeply
             // queued or RTT-probing sibling path. Rank 2+ paths by estimated
-            // completion time using batch-start snapshot backlog (`retained + staged`)
+            // completion time using the batch-start snapshot of queued bytes
             // plus `local_dispatched` so each record is counted once.
-            let mut best_ect_us = u64::MAX;
             for path in paths.iter() {
                 let id = usize::from(path.id);
                 let snap = snapshots[id];
                 if !snap.active {
                     continue;
                 }
-                let queued = snap
-                    .retained
+                let transport_queue = if download { snap.unsent } else { snap.retained };
+                let queued = transport_queue
                     .saturating_add(snap.staged)
                     .saturating_add(local_dispatched[id]);
                 let total_written = snap.written.saturating_add(local_dispatched[id]);
@@ -1331,19 +1399,33 @@ pub(super) fn drain(
                     snap.idle_probe_service
                 } else {
                     snap.service
-                };
+                }
+                .min(snap.rank_cap);
                 let rank = path_completion_rank(
                     snap.probing,
-                    snap.rtt_us,
+                    snap.arrival_us,
                     queued,
                     front.data.len() as u64,
                     rank_service,
                     cold,
-                    best_service,
+                    best_service.min(snap.ext_cap),
                 );
                 path_ranks[id] = rank;
                 if !rank.0 && (!has_non_avoid || Some(path.id) != avoid_path) {
                     best_ect_us = best_ect_us.min(rank.1);
+                }
+                // Leave the original bulk record unbound once an already-warmed path
+                // has a full paced runway, while preserving `best_ect_us` so a full
+                // fast path still prevents spilling onto a genuinely slow straggler.
+                if download
+                    && avoid_path.is_none()
+                    && front.data.len() >= PAYLOAD / 2
+                    && total_written >= INITIAL_SEND_WINDOW
+                    && queued.saturating_add(front.data.len() as u64)
+                        > download_runway(rank_service)
+                {
+                    runway_capped[id] = true;
+                    runway_blocked = true;
                 }
             }
             if best_ect_us < u64::MAX {
@@ -1353,12 +1435,12 @@ pub(super) fn drain(
                 let path = &paths[i];
                 let avoided = Some(path.id) == avoid_path;
                 let Some(writer) = &path.native_return else {
-                    return (true, true, true, u64::MAX);
+                    return (true, true, true, true, u64::MAX);
                 };
                 let full = writer.tx.capacity() == 0;
                 let id = usize::from(path.id);
                 let (probing, ect) = path_ranks[id];
-                (avoided, full, probing, ect)
+                (avoided, runway_capped[id], full, probing, ect)
             });
         }
         let ready = order.into_iter().find_map(|i| {
@@ -1368,20 +1450,41 @@ pub(super) fn drain(
                 return None;
             }
             if active_native >= 2 {
+                if path_ranks[id].1 == u64::MAX || runway_capped[id] {
+                    return None;
+                }
                 if has_non_avoid && Some(path.id) == avoid_path {
                     return None;
                 }
                 if straggler_limit_us < u64::MAX {
                     let (probing, ect) = path_ranks[id];
-                    if snapshots[id].service.saturating_mul(3) < best_service
-                        && snapshots[id].queued_us > 250_000
+                    let service = snapshots[id].service.min(snapshots[id].rank_cap);
+                    let max_queue_us = if download && service < 8_000 {
+                        120_000
+                    } else {
+                        250_000
+                    };
+                    if service.saturating_mul(3) < best_service
+                        && snapshots[id].queued_us > max_queue_us
                     {
                         return None;
                     }
-                    let path_limit_us = if best_service >= 2_000
-                        && snapshots[id].service.saturating_mul(2) < best_service
-                    {
-                        straggler_limit_us.min(420_000)
+                    let path_limit_us = if service.saturating_mul(2) < best_service {
+                        if download && service < 8_000 {
+                            let limit = best_ect_us
+                                .saturating_mul(3)
+                                .div_ceil(2)
+                                .saturating_add(60_000);
+                            if best_service >= 2_000 {
+                                limit.min(260_000)
+                            } else {
+                                limit
+                            }
+                        } else if best_service >= 2_000 {
+                            straggler_limit_us.min(420_000)
+                        } else {
+                            straggler_limit_us
+                        }
                     } else {
                         straggler_limit_us
                     };
@@ -1402,15 +1505,15 @@ pub(super) fn drain(
             ))
         });
         let Some((i, permit, reachable, written_bytes)) = ready else {
-            // A rescue can wait for its sibling without holding up other flows.
-            deferred_rescues += 1;
-            if !has_non_avoid || deferred_rescues >= queue.original_flows() {
+            // A deferred bulk record or rescue must leave other flows eligible.
+            deferred_flows += 1;
+            if !(has_non_avoid || runway_blocked) || deferred_flows >= queue.original_flows() {
                 break;
             }
             queue.rotate_original();
             continue;
         };
-        deferred_rescues = 0;
+        deferred_flows = 0;
         let pending = queue.pop(false).expect("native queue front");
         let id = usize::from(paths[i].id);
         let len = pending.data.len() as u64;
@@ -1751,7 +1854,7 @@ impl MixedWrites {
                     && unsent <= SLOW_PATH_BACKLOG_THRESHOLD;
                 let rank = path_completion_rank(
                     path.conn.probing_rtt_hint(),
-                    path.conn.rtt_hint().as_micros() as u64,
+                    path.conn.rtt_hint().as_micros() as u64 / 2,
                     queued,
                     next_bytes,
                     self.mixed_path_service(path),
@@ -1938,6 +2041,9 @@ pub(super) async fn write(
     mut stream: h3::server::RequestStream<h3_quinn::SendStream<Bytes>, Bytes>,
     mut input: Reader,
 ) {
+    if let Some(ready) = &input.ready {
+        conn.set_stream_unsent_notify(ready.clone());
+    }
     let mut flight = None;
     loop {
         let Some(mut part) = (tokio::select! {
@@ -2193,6 +2299,9 @@ mod tests {
         // ACK batching leaves measured service below 80% of the cap, but the
         // sender had data and repeatedly had to wait for the external pacer.
         assert_eq!(step(80_000, 150, 0, 6), Some(Some(660_000)));
+        // Once the cap is already >2x measured delivery, incidental burst-bucket
+        // delays must not keep ratcheting the ceiling into an unpaced overshoot.
+        assert_eq!(step(80_000, 150, 0, 6), None);
     }
 
     use crate::runtime::wire::Record;
@@ -2793,13 +2902,28 @@ mod tests {
         }
     }
     #[test]
+    fn download_delay_prices_inflight_and_selective_acks_separately() {
+        let delay = |flight, gap| download_arrival_delay_us(125_000, 100_000, flight, 5_000, gap);
+        assert_eq!(delay(500_000, 0), 75_000);
+        assert_eq!(delay(625_000, 0), 75_000);
+        assert_eq!(delay(1_125_000, 0), 150_000);
+        assert_eq!(delay(1_125_000, 2 * PAYLOAD as u64), 200_000);
+        assert_eq!(download_runway(100), 2 * (PAYLOAD + HEADER_BYTES) as u64);
+        assert_eq!(download_runway(5_000), 225_000);
+        assert_eq!(
+            download_runway(20_000),
+            24 * (PAYLOAD + HEADER_BYTES) as u64
+        );
+    }
+
+    #[test]
     fn single_download_backlog_rank_accounts_for_queue_and_probing() {
-        let fast_clear = path_completion_rank(false, 100_000, 0, 32_768, 12_500, false, 12_500);
+        let fast_clear = path_completion_rank(false, 50_000, 0, 32_768, 12_500, false, 12_500);
         let fast_backlogged =
-            path_completion_rank(false, 100_000, 512 * 1024, 32_768, 12_500, false, 12_500);
-        let medium_clear = path_completion_rank(false, 110_000, 0, 32_768, 8_000, false, 12_500);
-        let slow_clear = path_completion_rank(false, 120_000, 0, 32_768, 2_000, false, 12_500);
-        let fast_probing = path_completion_rank(true, 100_000, 0, 32_768, 12_500, false, 12_500);
+            path_completion_rank(false, 50_000, 512 * 1024, 32_768, 12_500, false, 12_500);
+        let medium_clear = path_completion_rank(false, 55_000, 0, 32_768, 8_000, false, 12_500);
+        let slow_clear = path_completion_rank(false, 60_000, 0, 32_768, 2_000, false, 12_500);
+        let fast_probing = path_completion_rank(true, 50_000, 0, 32_768, 12_500, false, 12_500);
         assert!(fast_clear < medium_clear);
         assert!(medium_clear < slow_clear);
         assert!(medium_clear < fast_backlogged);
@@ -2808,13 +2932,13 @@ mod tests {
 
     #[test]
     fn cold_idle_sibling_gets_bounded_warmup_floor_when_primary_builds_backlog() {
-        let primary_clear = path_completion_rank(false, 40_000, 0, 32_768, 25_000, false, 25_000);
+        let primary_clear = path_completion_rank(false, 20_000, 0, 32_768, 25_000, false, 25_000);
         let primary_queued =
-            path_completion_rank(false, 40_000, 512 * 1024, 32_768, 25_000, false, 25_000);
+            path_completion_rank(false, 20_000, 512 * 1024, 32_768, 25_000, false, 25_000);
         // Freshly joined path has tiny initial cwnd (service=200 B/ms) and 60 ms RTT.
-        let cold_idle = path_completion_rank(false, 60_000, 0, 32_768, 200, true, 25_000);
+        let cold_idle = path_completion_rank(false, 30_000, 0, 32_768, 200, true, 25_000);
         let cold_already_queued =
-            path_completion_rank(false, 60_000, 32_768, 32_768, 200, true, 25_000);
+            path_completion_rank(false, 30_000, 32_768, 32_768, 200, true, 25_000);
         // While primary is uncongested, primary stays preferred.
         assert!(primary_clear < cold_idle);
         // Once primary builds meaningful backlog (~21 ms), cold idle sibling wins
@@ -2891,6 +3015,7 @@ mod tests {
             &mut queue,
             &paths,
             &Default::default(),
+            true,
             0,
             &mut cursor,
             &mut pacer,
@@ -2970,6 +3095,7 @@ mod tests {
                         queue,
                         &paths,
                         &Default::default(),
+                        true,
                         0,
                         &mut cursor,
                         &mut pacer,
@@ -2997,8 +3123,98 @@ mod tests {
     #[tokio::test]
     async fn native_drain_counts_intra_batch_dispatched_bytes_once() {
         let pair = super::super::sender_ready_tests::Pair::connect().await;
-        // Share one connection's exact cwnd/RTT so any rank difference comes
-        // strictly from queued byte accounting (`staged + local_dispatched`).
+        for download in [false, true] {
+            // Share one connection's exact cwnd/RTT so any rank difference comes
+            // strictly from queued byte accounting (`staged + local_dispatched`).
+            let mut p0 = pair.path();
+            let mut p1 = pair.path();
+            p0.id = 0;
+            p1.id = 1;
+            let (w0, mut r0) = channel();
+            let (w1, mut r1) = channel();
+            w0.written_bytes
+                .store(INITIAL_SEND_WINDOW, Ordering::Relaxed);
+            w1.written_bytes
+                .store(INITIAL_SEND_WINDOW, Ordering::Relaxed);
+            p0.native_return = Some(w0);
+            p1.native_return = Some(w1);
+            let paths = [p0, p1];
+            // Pre-stage 2 records (64 KiB) on path 1 while path 0 starts empty.
+            let tx1 = &paths[1].native_return.as_ref().unwrap().tx;
+            let held_p1 = [tx1.try_reserve().unwrap(), tx1.try_reserve().unwrap()];
+
+            let mut queue = outbound::Queue::default();
+            for seq in 0..3u64 {
+                let mut data = encoded().to_vec();
+                data[8..16].copy_from_slice(&seq.to_be_bytes());
+                queue
+                    .push(outbound::Pending {
+                        game_datagram: false,
+                        data: data.into(),
+                        created: Instant::now(),
+                        record_id: Some(seq),
+                        flow: Some(stream::data_flow(21)),
+                        block: None,
+                        small: false,
+                        hold: None,
+                    })
+                    .ok()
+                    .unwrap();
+            }
+            let mut cursor = 0;
+            let mut pacer = outbound::Pacer::for_sender(500_000_000, BURST * 4);
+            let mut groups =
+                std::array::from_fn(|_| outbound::Pacer::for_sender(500_000_000, BURST * 4));
+            pacer.refill(2_000_000);
+            for g in &mut groups {
+                g.refill(2_000_000);
+            }
+            let credits = std::array::from_fn(|_| {
+                let mut c = Credit::default();
+                c.delivery.ceiling_bytes_per_ms = Some(1_000);
+                c
+            });
+            drain(
+                &mut queue,
+                &paths,
+                &credits,
+                download,
+                0,
+                &mut cursor,
+                &mut pacer,
+                &mut groups,
+            );
+            assert_eq!(queue.is_empty(), !download);
+            // Path 0 must receive 2 records (reaching 64 KiB) before path 1 (already
+            // holding 64 KiB staged) receives the 3rd; double-counting `staged` +
+            // `local_dispatched` would have diverted the 2nd record to path 1.
+            assert!(r0.rx.try_recv().is_ok());
+            assert!(r0.rx.try_recv().is_ok());
+            assert!(r0.rx.try_recv().is_err());
+            assert_eq!(r1.rx.try_recv().is_ok(), !download);
+            assert!(r1.rx.try_recv().is_err());
+            drop(held_p1);
+            if download {
+                // Both runways were full. Once reservations clear the third original can move.
+                drain(
+                    &mut queue,
+                    &paths,
+                    &credits,
+                    true,
+                    0,
+                    &mut cursor,
+                    &mut pacer,
+                    &mut groups,
+                );
+                assert!(queue.is_empty());
+                assert_eq!(r0.rx.len() + r1.rx.len(), 1);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn download_runway_on_fast_path_preserves_best_ect_and_blocks_slow_straggler() {
+        let pair = super::super::sender_ready_tests::Pair::connect().await;
         let mut p0 = pair.path();
         let mut p1 = pair.path();
         p0.id = 0;
@@ -3006,34 +3222,37 @@ mod tests {
         let (w0, mut r0) = channel();
         let (w1, mut r1) = channel();
         w0.written_bytes
-            .store(COLD_BULK_MIN_BYTES * 2, Ordering::Relaxed);
+            .store(INITIAL_SEND_WINDOW, Ordering::Relaxed);
         w1.written_bytes
-            .store(COLD_BULK_MIN_BYTES * 2, Ordering::Relaxed);
+            .store(INITIAL_SEND_WINDOW, Ordering::Relaxed);
         p0.native_return = Some(w0);
         p1.native_return = Some(w1);
         let paths = [p0, p1];
-        // Pre-stage 2 records (64 KiB) on path 1 while path 0 starts empty.
+        // Fill fast path 0's 2-record runway (at 700 B/ms) while slow path 1 (200 B/ms)
+        // holds 1 record: still within path 1's 2-record runway floor, but slower than
+        // path 0's ECT limit.
+        let tx0 = &paths[0].native_return.as_ref().unwrap().tx;
+        let held_p0 = [tx0.try_reserve().unwrap(), tx0.try_reserve().unwrap()];
         let tx1 = &paths[1].native_return.as_ref().unwrap().tx;
-        let held_p1 = [tx1.try_reserve().unwrap(), tx1.try_reserve().unwrap()];
+        let _held_p1 = tx1.try_reserve().unwrap();
 
         let mut queue = outbound::Queue::default();
-        for seq in 0..3u64 {
-            let mut data = encoded().to_vec();
-            data[8..16].copy_from_slice(&seq.to_be_bytes());
-            queue
-                .push(outbound::Pending {
-                    game_datagram: false,
-                    data: data.into(),
-                    created: Instant::now(),
-                    record_id: Some(seq),
-                    flow: Some(stream::data_flow(21)),
-                    block: None,
-                    small: false,
-                    hold: None,
-                })
-                .ok()
-                .unwrap();
-        }
+        queue
+            .push(outbound::Pending {
+                game_datagram: false,
+                data: encoded(),
+                created: Instant::now(),
+                record_id: Some(7),
+                flow: Some(stream::data_flow(21)),
+                block: None,
+                small: false,
+                hold: None,
+            })
+            .ok()
+            .unwrap();
+        let mut credits: [Credit; super::super::MAX_PATHS] = Default::default();
+        credits[0].delivery.ceiling_bytes_per_ms = Some(700);
+        credits[1].delivery.ceiling_bytes_per_ms = Some(200);
         let mut cursor = 0;
         let mut pacer = outbound::Pacer::for_sender(500_000_000, BURST * 4);
         let mut groups =
@@ -3045,22 +3264,34 @@ mod tests {
         drain(
             &mut queue,
             &paths,
-            &Default::default(),
+            &credits,
+            true,
+            0,
+            &mut cursor,
+            &mut pacer,
+            &mut groups,
+        );
+        assert!(
+            !queue.is_empty(),
+            "record must stay unbound rather than spilling onto slow straggler"
+        );
+        assert!(r0.rx.try_recv().is_err());
+        assert!(r1.rx.try_recv().is_err());
+
+        drop(held_p0);
+        drain(
+            &mut queue,
+            &paths,
+            &credits,
+            true,
             0,
             &mut cursor,
             &mut pacer,
             &mut groups,
         );
         assert!(queue.is_empty());
-        // Path 0 must receive 2 records (reaching 64 KiB) before path 1 (already
-        // holding 64 KiB staged) receives the 3rd; double-counting `staged` +
-        // `local_dispatched` would have diverted the 2nd record to path 1.
         assert!(r0.rx.try_recv().is_ok());
-        assert!(r0.rx.try_recv().is_ok());
-        assert!(r0.rx.try_recv().is_err());
-        assert!(r1.rx.try_recv().is_ok());
         assert!(r1.rx.try_recv().is_err());
-        drop(held_p1);
     }
 
     #[tokio::test]
@@ -3110,6 +3341,7 @@ mod tests {
             &mut queue,
             &paths,
             &Default::default(),
+            true,
             0,
             &mut cursor,
             &mut pacer,

@@ -6,7 +6,7 @@ use std::{
     net::{IpAddr, SocketAddr},
     pin::Pin,
     sync::{
-        Arc,
+        Arc, OnceLock,
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     task::{Context, Poll, Waker, ready},
@@ -305,6 +305,21 @@ impl Future for ConnectionDriver {
 /// [`Connection::close()`]: Connection::close
 #[derive(Debug, Clone)]
 pub struct Connection(ConnectionRef);
+
+/// Sender-side path state sampled under one connection lock.
+#[derive(Clone, Copy, Debug)]
+pub struct StreamSendBacklog {
+    /// STREAM storage still retained by Quinn.
+    pub retained: u64,
+    /// STREAM bytes awaiting first packetization.
+    pub unsent: u64,
+    /// External pacing limit in bytes per second.
+    pub pacing_cap: Option<u64>,
+    /// Congestion-controlled packet bytes in flight on this path.
+    pub in_flight: u64,
+    /// Largest selective-ACK offset span above a bidirectional stream's first hole.
+    pub ack_gap_span: u64,
+}
 
 impl Connection {
     /// Initiate a new outgoing unidirectional stream.
@@ -664,6 +679,25 @@ impl Connection {
             .lock("stream_send_buffer_bytes")
             .inner
             .stream_send_buffer_bytes()
+    }
+
+    /// Snapshot of STREAM backlog and current path delivery estimates.
+    pub fn stream_send_backlog(&self) -> StreamSendBacklog {
+        let state = self.0.state.lock("stream_send_backlog");
+        let (retained, unsent) = state.inner.stream_send_buffer_bytes();
+        let (in_flight, ack_gap_span) = state.inner.stream_delivery_pressure();
+        StreamSendBacklog {
+            retained,
+            unsent,
+            pacing_cap: state.inner.max_pacing_rate(),
+            in_flight,
+            ack_gap_span,
+        }
+    }
+
+    /// Register an external waker notified as STREAM frames packetize unsent bytes.
+    pub fn set_stream_unsent_notify(&self, notify: Arc<Notify>) {
+        let _ = self.0.shared.stream_unsent_notify.set(notify);
     }
 
     /// Current state of the congestion control algorithm, for debugging purposes
@@ -1107,6 +1141,7 @@ pub(crate) struct Shared {
     datagram_received: Notify,
     datagrams_unblocked: Notify,
     datagrams_drained: Notify,
+    stream_unsent_notify: OnceLock<Arc<Notify>>,
     hints: Hints,
     closed: Notify,
     /// Number of live handles that can used to initiate or handle I/O; excludes the driver
@@ -1129,6 +1164,7 @@ struct Hints {
     probing_rtt: AtomicBool,
     acks: AtomicU64,
     eliciting: AtomicU64,
+    stream_tx_notified: AtomicU64,
 }
 
 pub(crate) struct State {
@@ -1407,6 +1443,17 @@ impl State {
         hints.acks.store(stats.frame_rx.acks, Ordering::Release);
         if hints.datagram_space.swap(space, Ordering::AcqRel) < space {
             shared.datagrams_drained.notify_waiters();
+        }
+        if let Some(notify) = shared.stream_unsent_notify.get() {
+            let prev = hints.stream_tx_notified.load(Ordering::Relaxed);
+            let cur = stats.frame_tx.stream;
+            if cur > prev
+                && (cur.saturating_sub(prev) >= 12
+                    || self.inner.stream_send_buffer_bytes().1 == 0)
+            {
+                hints.stream_tx_notified.store(cur, Ordering::Relaxed);
+                notify.notify_one();
+            }
         }
     }
 

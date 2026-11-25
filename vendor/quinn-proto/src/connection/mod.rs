@@ -1326,6 +1326,12 @@ impl Connection {
         self.streams.send_buffer_bytes()
     }
 
+    /// Current path packet bytes in flight and largest outstanding selective-ACK
+    /// span on a bidirectional stream. The two counters use different units of work.
+    pub fn stream_delivery_pressure(&self) -> (u64, u64) {
+        (self.path.in_flight.bytes, self.streams.bidirectional_ack_gap_span())
+    }
+
     /// Whether no unacknowledged STREAM data remains in connection send storage.
     pub fn stream_send_buffer_empty(&self) -> bool {
         self.streams.send_buffer_empty()
@@ -1497,6 +1503,11 @@ impl Connection {
         if path_epoch == self.stats.path.pacing_epoch {
             self.stats.path.max_pacing_rate = bytes_per_second.filter(|&rate| rate != 0);
         }
+    }
+
+    /// External pacing limit on the current path, in bytes per second.
+    pub fn max_pacing_rate(&self) -> Option<u64> {
+        self.stats.path.max_pacing_rate
     }
 
     fn reset_pacing_limit(&mut self) {
