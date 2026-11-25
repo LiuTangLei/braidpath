@@ -79,6 +79,13 @@ ACKs take at most one copy at any level: each is superseded by the next, and on
 an asymmetric uplink their extra copies add to the reverse load that causes loss. The copies carry identical authenticated repair bytes and one
 block ID; the receiver delivers once. Delayed originals remain duplicates.
 
+Ordinary SOCKS5 UDP carries each destination on a reliable ordered stream.
+When automatic bulk FEC is active, or an interactive record needs another
+attempt, each interactive UDP stream fragment can use independent small-record
+protection up to the stream DATAGRAM payload limit. This applies on every
+destination port. The receiver deduplicates repairs before delivering the UDP
+message. Large transfers continue on the native stream path.
+
 Only an actually admitted original authorizes its own generated/queued copies.
 They cannot borrow bulk credit or fund bulk repair. Auto additionally caps repair
 admission for this class at min(aggregate rate / 4, 1 Mbit/s), a 2400-byte maximum

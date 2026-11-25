@@ -229,7 +229,9 @@ impl RecordEncoder {
                 // message's interactive fragments independently so loss of
                 // one does not delay the whole message until stream recovery.
                 let protected_stream = self.native_streams
-                    && (self.game_mode || super::tcp::is_ordered_udp_data(record.flow))
+                    && (self.game_mode
+                        || (super::tcp::is_ordered_udp_data(record.flow)
+                            && (*k != 0 || attempt > 1)))
                     && interactive_tcp
                     && record.payload.len() <= crate::runtime::MAX_STREAM_PAYLOAD;
                 let control = gaming
@@ -746,6 +748,22 @@ mod tests {
             id: 1,
             payload: vec![3; 950],
         };
+        // A clean link keeps the ordinary uncoded original for nested QUIC.
+        assert_eq!(
+            encoder
+                .encode_attempt_ingress(&r, now, 1, now, true)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            encoder
+                .encode_attempt_ingress(&r, now, 2, now, true)
+                .unwrap()
+                .len(),
+            2
+        );
+        encoder.set_fec(32).unwrap();
         let symbols = encoder
             .encode_attempt_ingress(&r, now, 1, now, true)
             .unwrap();
@@ -756,6 +774,7 @@ mod tests {
             r.payload
         );
         assert!(receiver.receive(&symbols[0].data, now).unwrap().is_empty());
+        encoder.set_fec(0).unwrap();
         for (flow, interactive) in [
             (r.flow, false),
             (stream::data_flow(1), true),
