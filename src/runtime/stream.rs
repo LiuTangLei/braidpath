@@ -703,9 +703,13 @@ impl Sender {
         if !self.lost.remove(&start) {
             self.unschedule(start);
         }
-        let tail = self.segments[&start].clone();
+        // Both children await fresh admission. Neither belongs to the carrier
+        // which accepted the original record.
+        let head = self.segments.get_mut(&start).expect("segment");
+        head.reliable = None;
+        let tail = head.clone();
         let cut = start + maximum as u64;
-        self.segments.get_mut(&start).expect("segment").end = cut;
+        head.end = cut;
         self.segments.insert(cut, tail);
         self.pmtu_splits += 1;
         self.lost.insert(start);
@@ -1694,6 +1698,36 @@ mod tests {
             small.len(),
             crate::runtime::MAX_STREAM_PAYLOAD - DATA_HEADER
         );
+    }
+
+    #[test]
+    fn splitting_a_native_record_releases_its_writer_and_admission_timer() {
+        let at = Instant::now();
+        let mut sender = Sender::new(false);
+        sender.push(&[0; 4096]);
+        let whole = sender.poll_transmit_reliable(at, RELIABLE_PAYLOAD).unwrap();
+        sender.admitted_reliable(
+            whole.start,
+            whole.transmission,
+            0,
+            Duration::from_millis(80),
+            at,
+            Arc::new(AtomicBool::new(true)),
+        );
+        assert!(sender.split_for_payload(0, 1024));
+        let first = sender.poll_transmit_sized(at, DATA_HEADER + 1024).unwrap();
+        sender.admitted_reliable(
+            first.start,
+            first.transmission,
+            1,
+            Duration::from_millis(90),
+            at,
+            Arc::new(AtomicBool::new(true)),
+        );
+        assert!(sender.repeated.is_empty());
+        assert!(sender.fresh[UNKNOWN_PATH].is_empty());
+        assert!(sender.segments[&1024].reliable.is_none());
+        assert_eq!(sender.reliable_flight.len(), 1);
     }
 
     #[test]
