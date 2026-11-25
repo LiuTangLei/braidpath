@@ -224,6 +224,13 @@ impl PacketBuilder {
         };
 
         let congestion_state = if ack_eliciting {
+            // A locally imposed pacing limit cannot establish a lower link
+            // capacity. Mark these flights at transmit time for delivery sampling.
+            if conn.max_pacing_rate.is_some_and(|limit| {
+                conn.path.congestion.pacing_rate().is_some_and(|rate| limit < rate)
+            }) {
+                conn.path.congestion.on_app_limited(conn.path.in_flight.bytes);
+            }
             conn.path
                 .congestion
                 .on_packet_sent(now, conn.path.in_flight.bytes)

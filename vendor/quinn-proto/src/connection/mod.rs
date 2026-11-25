@@ -143,6 +143,7 @@ pub struct Connection {
     /// This is only populated for the server case, and if known
     local_ip: Option<IpAddr>,
     path: PathData,
+    max_pacing_rate: Option<u64>,
     /// Incremented every time we see a new path
     ///
     /// Stored separately from `path.generation` to account for aborted migrations
@@ -348,6 +349,7 @@ impl Connection {
             app_limited: false,
             receiving_ecn: false,
             total_authed_packets: 0,
+            max_pacing_rate: None,
 
             streams: StreamsState::new(
                 side,
@@ -624,9 +626,11 @@ impl Connection {
 
                     // Check whether the next datagram is blocked by pacing
                     let smoothed_rtt = self.path.rtt.get();
-                    self.path
-                        .pacing
-                        .set_rate(self.path.congestion.pacing_rate());
+                    let rate = self.path.congestion.pacing_rate();
+                    self.path.pacing.set_rate(match self.max_pacing_rate {
+                        Some(limit) => Some(rate.map_or(limit, |rate| rate.min(limit))),
+                        None => rate,
+                    });
                     if let Some(delay) = self.path.pacing.delay(
                         smoothed_rtt,
                         bytes_to_send,
@@ -1476,6 +1480,11 @@ impl Connection {
     /// See [`TransportConfig::send_window()`]
     pub fn set_send_window(&mut self, send_window: u64) {
         self.streams.set_send_window(send_window);
+    }
+
+    /// Cap packet pacing in bytes per second. `None` restores controller pacing.
+    pub fn set_max_pacing_rate(&mut self, bytes_per_second: Option<u64>) {
+        self.max_pacing_rate = bytes_per_second.filter(|&rate| rate != 0);
     }
 
     /// See [`TransportConfig::receive_window()`]

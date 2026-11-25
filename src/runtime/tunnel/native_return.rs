@@ -323,6 +323,80 @@ impl AckService {
     }
 }
 
+#[derive(Clone, Copy)]
+struct PaceSample {
+    at: u64,
+    acked: u64,
+    sent: u64,
+    lost: u64,
+}
+
+#[derive(Default)]
+struct DownloadPace {
+    start: Option<PaceSample>,
+    limit: Option<u64>,
+    idle_since: Option<u64>,
+}
+
+impl DownloadPace {
+    /// Only sustained STREAM traffic qualifies. Measure unique payload ACKs over
+    /// several RTTs so ACK compression and brief producer gaps cannot set a cap.
+    fn observe(
+        &mut self,
+        sample: PaceSample,
+        rtt_us: u64,
+        retained: u64,
+        written: u64,
+    ) -> Option<Option<u64>> {
+        if retained < 2 * PAYLOAD as u64 || written < INITIAL_SEND_WINDOW {
+            self.start = None;
+            let idle = *self.idle_since.get_or_insert(sample.at);
+            if sample.at.saturating_sub(idle) >= ack_ceiling_idle_reset_us(rtt_us)
+                && self.limit.take().is_some()
+            {
+                return Some(None);
+            }
+            return None;
+        }
+        self.idle_since = None;
+        let start = *self.start.get_or_insert(sample);
+        let elapsed = sample.at.saturating_sub(start.at);
+        let window = rtt_us.saturating_mul(2).max(250_000);
+        if elapsed < window {
+            return None;
+        }
+        self.start = Some(sample);
+        if elapsed > window.saturating_mul(4) {
+            return None;
+        }
+        let sent = sample.sent.saturating_sub(start.sent);
+        let lost = sample.lost.saturating_sub(start.lost);
+        let delivered = sample.acked.saturating_sub(start.acked);
+        if sent < 128 || delivered < 2 * PAYLOAD as u64 {
+            return None;
+        }
+        let service = delivered.saturating_mul(1_000_000) / elapsed;
+        // Allow packet headers and occasional retransmissions. After the path
+        // settles, probe for capacity using the same qualified delivery sample.
+        let next = if lost.saturating_mul(100) >= sent.saturating_mul(12) {
+            let ceiling = service.saturating_mul(5) / 4;
+            Some(self.limit.map_or(ceiling, |limit| limit.min(ceiling)))
+        } else if let Some(limit) = self.limit
+            && lost.saturating_mul(100) <= sent.saturating_mul(3)
+            && service.saturating_mul(5) >= limit.saturating_mul(4)
+        {
+            Some((limit.saturating_mul(5) / 4).min(crate::runtime::MAX_RATE_BPS / 8))
+        } else {
+            self.limit
+        };
+        if self.limit == next {
+            return None;
+        }
+        self.limit = next;
+        Some(next)
+    }
+}
+
 /// Keep startup/backpressure bounded by measured native `cwnd` and severe loss.
 /// Idle intervals (zero buffered stream bytes) must never crush earned or
 /// initial `send_window` on keepalive loss or opposite-direction RTT inflation;
@@ -338,6 +412,7 @@ pub(super) struct Credit {
     loss_window_lost: u64,
     acked: u64,
     delivery: AckService,
+    download_pace: DownloadPace,
     current: u64,
     max_cwnd: u64,
     last_cwnd_growth_us: u64,
@@ -447,6 +522,7 @@ impl Credit {
                 loss_window_lost: stats.path.lost_packets,
                 acked: stats.stream_payload_bytes_acked,
                 delivery: AckService::default(),
+                download_pace: DownloadPace::default(),
                 current: initial_window,
                 max_cwnd: stats.path.cwnd,
                 last_cwnd_growth_us: 0,
@@ -481,6 +557,22 @@ impl Credit {
         let acked_delta = acked.saturating_sub(self.acked);
         let ack_progress = acked_delta >= PAYLOAD as u64;
         self.acked = acked;
+        let written = writer.written_bytes();
+        if initial_window == INITIAL_SEND_WINDOW
+            && let Some(limit) = self.download_pace.observe(
+                PaceSample {
+                    at: now_us,
+                    acked,
+                    sent: stats.path.sent_packets,
+                    lost: stats.path.lost_packets,
+                },
+                rtt_us,
+                retained,
+                written,
+            )
+        {
+            conn.set_max_pacing_rate(limit);
+        }
         self.delivery.observe(
             now_us,
             rtt_us,
@@ -521,7 +613,7 @@ impl Credit {
                 ack_progress,
                 retained,
                 unsent,
-                bulk_written: writer.written_bytes(),
+                bulk_written: written,
                 initial_window,
                 faster_route: own_service.saturating_mul(3) < best_service,
             },
@@ -2016,6 +2108,39 @@ impl Decoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn download_pacing_uses_fresh_stream_delivery_and_recovers_while_busy() {
+        let mut pace = DownloadPace::default();
+        let mut sample = |at, acked, sent, lost, retained| {
+            pace.observe(
+                PaceSample {
+                    at,
+                    acked,
+                    sent,
+                    lost,
+                },
+                100_000,
+                retained,
+                INITIAL_SEND_WINDOW,
+            )
+        };
+        let busy = 4 * PAYLOAD as u64;
+        assert_eq!(sample(0, 0, 0, 0, busy), None);
+        // An old interval after suspension must not cap a fresh path.
+        assert_eq!(sample(2_000_000, 1_200_000, 1_000, 240, busy), None);
+        assert_eq!(
+            sample(2_300_000, 2_400_000, 2_000, 450, busy),
+            Some(Some(5_000_000))
+        );
+        assert_eq!(
+            sample(2_600_000, 3_750_000, 3_000, 450, busy),
+            Some(Some(6_250_000))
+        );
+        assert_eq!(sample(2_800_000, 3_750_000, 3_000, 450, 0), None);
+        assert_eq!(sample(3_599_999, 3_750_000, 3_000, 450, 0), None);
+        assert_eq!(sample(3_600_000, 3_750_000, 3_000, 450, 0), Some(None));
+    }
     use crate::runtime::wire::Record;
     #[test]
     fn native_udp_prefers_a_nearby_healthy_route_without_hiding_fallbacks() {

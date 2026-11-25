@@ -765,6 +765,13 @@ impl Connection {
         conn.wake();
     }
 
+    /// Cap packet pacing in bytes per second. `None` restores controller pacing.
+    pub fn set_max_pacing_rate(&self, bytes_per_second: Option<u64>) {
+        let mut conn = self.0.state.lock("set_max_pacing_rate");
+        conn.inner.set_max_pacing_rate(bytes_per_second);
+        conn.wake();
+    }
+
     /// See [`proto::TransportConfig::receive_window()`]
     pub fn set_receive_window(&self, receive_window: VarInt) {
         let mut conn = self.0.state.lock("set_receive_window");
