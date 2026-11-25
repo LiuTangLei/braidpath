@@ -358,6 +358,12 @@ struct Segment {
     reliable: Option<Arc<AtomicBool>>,
 }
 
+/// Native segments share the reachability flag of the writer which owns them.
+struct CarrierFlight {
+    reachable: Arc<AtomicBool>,
+    offsets: BTreeSet<u64>,
+}
+
 /// One reliable sending half. Data offsets start at zero.
 ///
 /// A transmission is lost once it is older than the reorder threshold and a
@@ -378,7 +384,7 @@ pub struct Sender {
     acked: u64,
     segments: BTreeMap<u64, Segment>,
     fresh: [BTreeSet<(Instant, u64)>; MAX_PATHS + 1],
-    reliable_flight: BTreeSet<u64>,
+    reliable_flight: Vec<CarrierFlight>,
     repeated: BTreeSet<(Instant, u64)>,
     lost: BTreeSet<u64>,
     rack: Option<Instant>,
@@ -437,7 +443,7 @@ impl Sender {
             acked: 0,
             segments: BTreeMap::new(),
             fresh: Default::default(),
-            reliable_flight: BTreeSet::new(),
+            reliable_flight: Vec::new(),
             repeated: BTreeSet::new(),
             lost: BTreeSet::new(),
             rack: None,
@@ -572,10 +578,21 @@ impl Sender {
         (base * 2u32.pow(self.probe_count.min(6))).min(MAX_PTO)
     }
     fn unschedule(&mut self, start: u64) {
-        if self.reliable_flight.remove(&start) {
+        let segment = &self.segments[&start];
+        if let Some(owner) = &segment.reliable {
+            if let Some(i) = self
+                .reliable_flight
+                .iter()
+                .position(|f| Arc::ptr_eq(&f.reachable, owner))
+            {
+                let offsets = &mut self.reliable_flight[i].offsets;
+                offsets.remove(&start);
+                if offsets.is_empty() {
+                    self.reliable_flight.swap_remove(i);
+                }
+            }
             return;
         }
-        let segment = &self.segments[&start];
         match segment.deadline {
             Some(at) => self.repeated.remove(&(at, start)),
             None => self.fresh[segment.path].remove(&(segment.sent_at, start)),
@@ -908,7 +925,6 @@ impl Sender {
         }
         self.transport_rtt[path] = rtt.max(Duration::from_millis(1));
         let threshold = self.path_threshold(path, at);
-        let is_reliable = reliable.is_some();
         let segment = self.segments.get_mut(&start).expect("admitted segment");
         segment.local_retry_pending = false;
         segment.path = path;
@@ -916,9 +932,20 @@ impl Sender {
         segment.sent_at = at;
         segment.expected_ack_rtt = expected_ack_rtt;
         segment.reliable = reliable;
-        if is_reliable {
+        if let Some(owner) = &segment.reliable {
             segment.deadline = None;
-            self.reliable_flight.insert(start);
+            if let Some(flight) = self
+                .reliable_flight
+                .iter_mut()
+                .find(|f| Arc::ptr_eq(&f.reachable, owner))
+            {
+                flight.offsets.insert(start);
+            } else {
+                self.reliable_flight.push(CarrierFlight {
+                    reachable: owner.clone(),
+                    offsets: BTreeSet::from([start]),
+                });
+            }
             self.probe_at.get_or_insert(at);
             if self.fin_sent {
                 self.schedule_head_probe(at);
@@ -1233,17 +1260,13 @@ impl Sender {
         ))
     }
     fn detect_losses(&mut self, now: Instant) {
+        // Poll each actual writer once. Reconnects can leave two generations
+        // of the same path slot in flight, with independent ownership.
         let failed: Vec<_> = self
             .reliable_flight
             .iter()
-            .copied()
-            .filter(|start| {
-                !self.segments[start]
-                    .reliable
-                    .as_ref()
-                    .expect("reliable flight")
-                    .load(Ordering::Acquire)
-            })
+            .filter(|f| !f.reachable.load(Ordering::Acquire))
+            .flat_map(|f| f.offsets.iter().copied())
             .collect();
         for start in failed {
             self.mark_lost(start);
@@ -1670,6 +1693,35 @@ mod tests {
         assert_eq!(
             small.len(),
             crate::runtime::MAX_STREAM_PAYLOAD - DATA_HEADER
+        );
+    }
+
+    #[test]
+    fn same_slot_replacement_releases_only_the_failed_writers_offsets() {
+        let at = Instant::now();
+        let old = Arc::new(AtomicBool::new(true));
+        let new = Arc::new(AtomicBool::new(true));
+        let mut sender = Sender::new(false);
+        for owner in [&old, &new, &old, &new] {
+            sender.push(&[0; 1024]);
+            let t = sender.poll_transmit_reliable(at, RELIABLE_PAYLOAD).unwrap();
+            sender.admitted_reliable(
+                t.start,
+                t.transmission,
+                0,
+                Duration::from_millis(80),
+                at,
+                owner.clone(),
+            );
+        }
+        old.store(false, Ordering::Release);
+        sender.detect_losses(at);
+        assert_eq!(sender.lost, BTreeSet::from([0, 2048]));
+        assert_eq!(sender.reliable_flight.len(), 1);
+        assert!(Arc::ptr_eq(&sender.reliable_flight[0].reachable, &new));
+        assert_eq!(
+            sender.reliable_flight[0].offsets,
+            BTreeSet::from([1024, 3072])
         );
     }
 
