@@ -138,6 +138,11 @@ target sees.
 | Reset | Socket errors, violations, connect failure (10 s), or 30 s without acknowledgment progress send RESET (twice) and close the local socket with RST, never FIN. Frames for a closed stream are answered with RESET. A new session epoch resets all streams. |
 | Limits | 512 concurrent streams per host, shared across sessions; 120 s tombstones prevent late frames from reopening a closed stream. |
 
+On ordinary native TCP flows, admission of the first outbound data record can
+trigger a window ACK before any response bytes arrive. The receiver advertises
+its current host-budget share. If the offer is lost or arrives before the peer
+knows the stream, subsequent data ACKs carry the window.
+
 Each direction shares a 32 MiB retained-byte allowance and 65,536 retained-credit
 slots per host. A flow also keeps 128 KiB and 128 private credit slots for forward
 progress, so other stalled flows cannot prevent its cumulative-hole repair.

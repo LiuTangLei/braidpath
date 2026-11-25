@@ -1371,6 +1371,14 @@ impl Default for Receiver {
     }
 }
 impl Receiver {
+    /// Offer receive credit with the opening flight, before the first response.
+    /// A lost offer is repeated by the normal ACK for incoming data.
+    pub(crate) fn request_opening_credit(&mut self) {
+        if self.last_ack.is_none() && self.cumulative == 0 {
+            self.ack_now = true;
+        }
+    }
+
     /// Limit reverse traffic when many established downloads are active.
     /// FIN, open probes, and window updates keep their immediate ACKs.
     pub(crate) fn set_bulk_ack_spacing(&mut self, shared: bool) {

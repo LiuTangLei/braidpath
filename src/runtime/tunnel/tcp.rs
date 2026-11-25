@@ -1657,6 +1657,13 @@ impl Mux {
         for sent in self.gauge.take_sent() {
             let (id, start, transmission) = sent.identity;
             if let Some(s) = self.streams.get_mut(&id) {
+                if start == 0
+                    && self.native_return
+                    && self.game_events.is_none()
+                    && id & ORDERED_UDP_STREAM == 0
+                {
+                    s.recv.request_opening_credit();
+                }
                 if let Some(reliable) = sent.reliable {
                     s.send.admitted_reliable_with_ect(
                         start,
@@ -2869,6 +2876,45 @@ mod tests {
             flow: stream::data_flow(id),
             id: 1,
             payload: frame.encode(),
+        }
+    }
+
+    #[test]
+    fn native_tcp_offers_budgeted_credit_once_when_the_open_is_admitted() {
+        for (native, game, id, expect_offer) in [
+            (true, false, 1, true),
+            (true, false, ADDRESSED | 1, true),
+            (true, false, ADDRESSED | ORDERED_UDP_STREAM | 1, false),
+            (true, true, 1, false),
+            (false, false, 1, false),
+        ] {
+            let mut policy = test_policy();
+            policy.native_return = native;
+            policy.game_mode = game;
+            let mut mux = Mux::new(
+                Listeners::default(),
+                Targets::default(),
+                &policy,
+                stats::Metrics::new("open-credit").scope("test", stats::FORWARD),
+            );
+            assert!(mux.open(id, false));
+            let now = Instant::now();
+            let window = mux.window();
+            for attempt in 1..=2 {
+                let open = mux.gauge.hold(id, 0, attempt, 10, true, false);
+                open.admitted(0, Duration::from_millis(100), now);
+                mux.admissions();
+                let ack = mux.streams.get_mut(&id).unwrap().recv.take_ack(now, window);
+                if expect_offer && attempt == 1 {
+                    let ack = ack.expect("opening credit");
+                    assert_eq!((ack.cumulative, ack.limit), (0, window));
+                    let mut peer = stream::Sender::new(false);
+                    assert!(peer.on_ack(&ack, now).is_some());
+                    assert_eq!(peer.limit(), window);
+                } else {
+                    assert!(ack.is_none());
+                }
+            }
         }
     }
 
