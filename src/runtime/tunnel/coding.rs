@@ -136,7 +136,7 @@ enum Mode {
 pub(super) struct RecordEncoder {
     mode: Mode,
     game_mode: bool,
-    mixed_policy: bool,
+    native_streams: bool,
     fragments: bool,
     // Only one block per coding lane can be open. Keep its ingress clock even
     // if many immediate small blocks evict its sender scheduling metadata.
@@ -172,7 +172,7 @@ impl RecordEncoder {
         Ok(Self {
             mode,
             game_mode: policy.game_mode,
-            mixed_policy: policy.game_mode && policy.native_return,
+            native_streams: policy.native_return,
             fragments: policy.max_message_bytes > crate::runtime::MAX_PAYLOAD,
             clocks: [None; 2],
         })
@@ -225,11 +225,15 @@ impl RecordEncoder {
                 // size cutoff. Short records get independent immediate blocks.
                 let gaming =
                     self.game_mode && super::super::stream::stream_id(record.flow).is_none();
-                let protected_tcp = self.mixed_policy
+                // Ordinary UDP uses reliable byte offsets. Cover a sparse
+                // message's interactive fragments independently so loss of
+                // one does not delay the whole message until stream recovery.
+                let protected_stream = self.native_streams
+                    && (self.game_mode || super::tcp::is_ordered_udp_data(record.flow))
                     && interactive_tcp
                     && record.payload.len() <= crate::runtime::MAX_STREAM_PAYLOAD;
                 let control = gaming
-                    || protected_tcp
+                    || protected_stream
                     || (!fragmented
                         && (record.payload.len() <= 128
                             || record.flow
@@ -242,7 +246,7 @@ impl RecordEncoder {
                     // over the next packet. Immediate copies protect its tail
                     // even when clean bulk and superseding ACKs need no FEC.
                     let interactive = gaming
-                        || protected_tcp
+                        || protected_stream
                         || (super::super::stream::stream_id(record.flow).is_some()
                             && !super::super::stream::is_ack_flow(record.flow)
                             && record.payload.len() <= 128);
@@ -724,6 +728,48 @@ mod tests {
         };
         assert_eq!(e.encode(&ack, now).unwrap().len(), 1);
         assert_eq!(e.encode(&record(3, 1000), now).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn ordinary_udp_fragments_recover_once_without_protecting_ordinary_tcp_bulk() {
+        use crate::runtime::stream;
+        let mut p = policy(super::super::super::automatic_fec::AUTO, 0, false);
+        p.native_return = true;
+        p.proxy = true;
+        p.receiver_feedback = true;
+        let mut encoder = RecordEncoder::new(&p).unwrap();
+        encoder.set_fec(0).unwrap();
+        let now = Instant::now();
+        let id = (1 << 28) | (1 << 26) | 1;
+        let mut r = Record {
+            flow: stream::data_flow(id),
+            id: 1,
+            payload: vec![3; 950],
+        };
+        let symbols = encoder
+            .encode_attempt_ingress(&r, now, 1, now, true)
+            .unwrap();
+        assert_eq!(symbols.len(), 2);
+        let mut receiver = Receiver::with_repair_wait(Duration::from_millis(100));
+        assert_eq!(
+            receiver.receive(&symbols[1].data, now).unwrap()[0].payload,
+            r.payload
+        );
+        assert!(receiver.receive(&symbols[0].data, now).unwrap().is_empty());
+        for (flow, interactive) in [
+            (r.flow, false),
+            (stream::data_flow(1), true),
+            (stream::ack_flow(id), true),
+        ] {
+            r.flow = flow;
+            assert_eq!(
+                encoder
+                    .encode_attempt_ingress(&r, now, 1, now, interactive)
+                    .unwrap()
+                    .len(),
+                1
+            );
+        }
     }
 
     #[test]

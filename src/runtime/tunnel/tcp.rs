@@ -420,6 +420,11 @@ const ADDRESSED: u32 = 1 << 28;
 /// Stream identifiers with this bit carry an ordered reliable UDP destination
 /// billed against `MAX_UDP_FLOWS` instead of `MAX_TCP_FLOWS`.
 const ORDERED_UDP_STREAM: u32 = 1 << 26;
+
+pub(super) fn is_ordered_udp_data(flow: u32) -> bool {
+    stream::stream_id(flow).is_some_and(|id| id & ORDERED_UDP_STREAM != 0)
+        && !stream::is_ack_flow(flow)
+}
 /// Address header prefix for a reliable, length-prefixed UDP destination.
 const ORDERED_UDP: u8 = 9;
 /// A stream with at most this much unacknowledged data is latency-bound, not
