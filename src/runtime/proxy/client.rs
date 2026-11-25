@@ -926,7 +926,8 @@ pub async fn client(options: ClientOptions) -> Result<()> {
         .store(options.paths, std::sync::atomic::Ordering::Relaxed);
     let (nodes_tx, nodes_rx) = tokio::sync::watch::channel(initial_nodes);
     let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
-    let permits = Arc::new(Semaphore::new(crate::runtime::tunnel::tcp::MAX_TCP_FLOWS));
+    let normal_permits = Arc::new(Semaphore::new(tunnel::tcp::MAX_TCP_FLOWS));
+    let game_permits = Arc::new(Semaphore::new(tunnel::tcp::MAX_TCP_FLOWS));
     let forward_status = Arc::new(Mutex::new(BTreeMap::new()));
     let mut tasks = JoinSet::new();
     let mut forward_tasks = JoinSet::new();
@@ -964,9 +965,9 @@ pub async fn client(options: ClientOptions) -> Result<()> {
     };
     for (listener, key) in listeners {
         tracing::info!(address=%listener.local_addr()?, session=%key, "SOCKS5 proxy ready");
-        let early_reply = match key.mode {
-            SessionMode::Normal => options.socks5_early_reply,
-            SessionMode::Game => options.game_socks5_early_reply,
+        let (permits, early_reply) = match key.mode {
+            SessionMode::Normal => (&normal_permits, options.socks5_early_reply),
+            SessionMode::Game => (&game_permits, options.game_socks5_early_reply),
         };
         tasks.spawn(listen(
             listener,
