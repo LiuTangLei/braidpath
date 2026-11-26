@@ -442,6 +442,13 @@ impl RepairBudget {
             .as_ref()
             .is_none_or(|pacer| pacer.available(bytes + 80))
     }
+    pub(super) fn small_can_repair_within(&self, bytes: usize, wait: Duration) -> bool {
+        self.small.as_ref().is_some_and(|pacer| {
+            let refill = wait.as_secs_f64() * pacer.rate as f64 / 8.0;
+            (pacer.tokens + refill).min(pacer.burst) >= (bytes + 80) as f64
+        })
+    }
+
     pub fn small_repair_admitted(&mut self, bytes: usize) {
         if let Some(pacer) = &mut self.small {
             pacer.spend(bytes + 80);

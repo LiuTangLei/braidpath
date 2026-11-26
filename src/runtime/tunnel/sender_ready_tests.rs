@@ -2209,6 +2209,111 @@ async fn mixed_small_copy_uses_its_own_bounded_admission_credit_on_wider_http_st
     assert!(!accounting.groups[2].available(9601 - spent));
 }
 
+#[test]
+fn retry_parity_waits_for_existing_credit_only_after_original_admission() {
+    let mut accounting = Accounting::new();
+    let policy = &mut accounting.policy;
+    policy.fec = automatic_fec::AUTO;
+    policy.native_return = true;
+    policy.proxy = true;
+    policy.queue_ms = 20;
+    let created = Instant::now();
+    let flow = stream::data_flow(tcp::ORDERED_UDP_STREAM | 1);
+    let record = Record {
+        id: 1,
+        flow,
+        payload: stream::Frame::Data {
+            offset: 0,
+            fin: false,
+            data: vec![7; 990],
+        }
+        .encode(),
+    };
+    let gauge = Arc::new(outbound::Gauge::default());
+    let hold = gauge.hold(
+        tcp::ORDERED_UDP_STREAM | 1,
+        0,
+        2,
+        record.payload.len(),
+        true,
+        false,
+    );
+    let mut encoder = coding::RecordEncoder::new(policy).unwrap();
+    encode_input(
+        QueuedRecord {
+            record,
+            created,
+            hold: Some(hold),
+        },
+        &mut encoder,
+        policy,
+        &mut accounting.queue,
+        &mut accounting.blocks,
+        &accounting.scope,
+    );
+    let original = accounting.queue.pop(false).unwrap();
+    let parity = accounting.queue.front(true).unwrap();
+    let bytes = repair_frame_floor(policy, parity);
+    let block = parity.block.unwrap();
+    let budget = &mut accounting.budget;
+    budget.enable_small_rate(1_000_000);
+    assert_eq!(
+        waiting_udp_retry_copy(policy, budget, &accounting.blocks, parity, created),
+        None
+    );
+    accounting.blocks.get_mut(&block).unwrap().paths = 1;
+    budget_admitted(
+        policy,
+        budget,
+        &mut accounting.blocks,
+        &original,
+        1_024,
+        &accounting.scope,
+    );
+    assert!(!repair_allowed(
+        policy,
+        budget,
+        &accounting.blocks,
+        parity,
+        bytes
+    ));
+    assert_eq!(
+        waiting_udp_retry_copy(policy, budget, &accounting.blocks, parity, created),
+        Some(block)
+    );
+    assert_eq!(
+        waiting_udp_retry_copy(
+            policy,
+            budget,
+            &accounting.blocks,
+            parity,
+            created + UDP_RETRY_COPY_WAIT
+        ),
+        None
+    );
+
+    budget.refill_small(10_000);
+    assert!(repair_allowed(
+        policy,
+        budget,
+        &accounting.blocks,
+        parity,
+        bytes
+    ));
+    budget_admitted(
+        policy,
+        budget,
+        &mut accounting.blocks,
+        parity,
+        bytes,
+        &accounting.scope,
+    );
+    assert_eq!(
+        waiting_udp_retry_copy(policy, budget, &accounting.blocks, parity, created),
+        None
+    );
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn cold_small_copy_is_authorized_only_by_its_actual_original_admission() {
     let pair = Pair::connect().await;

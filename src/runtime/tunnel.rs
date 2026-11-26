@@ -715,6 +715,13 @@ struct QueuedRecord {
     hold: Option<Arc<outbound::Hold>>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SmallCopyClass {
+    Ordinary,
+    Acknowledgment,
+    UdpRetry,
+}
+
 #[derive(Clone)]
 struct BlockSend {
     created: Instant,
@@ -724,8 +731,8 @@ struct BlockSend {
     locally_rejected_originals: u32,
     small_repair_limit: usize,
     small_repair_reserved: usize,
-    /// The block's original is a reliable-stream acknowledgment.
-    acknowledgment: bool,
+    /// Keeps the ACK reserve and the first UDP retry's short wait disjoint.
+    small_copy_class: SmallCopyClass,
     /// Game UDP copies may wait for existing rate credit until their deadline.
     game_datagram: bool,
     /// Accepted original plus accepted copies; fits the existing metadata padding.
@@ -899,7 +906,7 @@ fn enqueue_coded_symbol(
                 locally_rejected_originals: 0,
                 small_repair_limit: 0,
                 small_repair_reserved: 0,
-                acknowledgment: false,
+                small_copy_class: SmallCopyClass::Ordinary,
                 game_datagram: false,
                 game_admissions: 0,
             })
@@ -929,12 +936,25 @@ fn enqueue_coded_symbol(
             .game_datagram = true;
     }
     if let Some(block) = block
+        && policy.is_some_and(|p| p.separate_udp_carrier() && p.fec == automatic_fec::AUTO)
+        && flow.is_some_and(tcp::is_ordered_udp_data)
+        && small
+        && hold
+            .as_ref()
+            .is_some_and(|h| h.interactive() && h.encoding_attempt() == 2)
+    {
+        blocks
+            .get_mut(&block)
+            .expect("block inserted")
+            .small_copy_class = SmallCopyClass::UdpRetry;
+    }
+    if let Some(block) = block
         && flow.is_some_and(stream::is_ack_flow)
     {
         blocks
             .get_mut(&block)
             .expect("block inserted")
-            .acknowledgment = true;
+            .small_copy_class = SmallCopyClass::Acknowledgment;
     }
     metrics.update(|d| {
         if let Some(id) = record_id {
@@ -1108,12 +1128,44 @@ fn repair_allowed(
     }
 }
 
+const UDP_RETRY_COPY_WAIT: Duration = Duration::from_millis(12);
+
+/// Keep the oldest eligible retry block in the repair queue when all copies
+/// are blocked by the small token bucket. Other blocked blocks still retire,
+/// and the normal repair selector can always send an affordable block.
+fn waiting_udp_retry_copy(
+    policy: &Policy,
+    budget: &outbound::RepairBudget,
+    blocks: &BTreeMap<u64, BlockSend>,
+    pending: &outbound::Pending,
+    now: Instant,
+) -> Option<u64> {
+    let block = pending.block?;
+    let meta = blocks.get(&block)?;
+    let frame_bytes = repair_frame_floor(policy, pending);
+    let elapsed = now.saturating_duration_since(pending.created);
+    let remaining = UDP_RETRY_COPY_WAIT
+        .min(policy.symbol_lifetime(pending))
+        .saturating_sub(elapsed);
+    (meta.small_copy_class == SmallCopyClass::UdpRetry
+        && meta.paths != 0
+        && meta.small_repair_reserved >= frame_bytes
+        && !remaining.is_zero()
+        && !budget.small_can_repair(frame_bytes)
+        && budget.small_can_repair_within(frame_bytes, remaining))
+    .then_some(block)
+}
+
 /// A bulk download acknowledges continuously: its acknowledgment copies alone
 /// can exhaust the small-copy rate, and each is superseded by the next one.
 /// They spend only credit above one datagram, which stays available for the
 /// first records of new and interactive streams.
 fn small_copy_reserve(meta: &BlockSend) -> usize {
-    if meta.acknowledgment { 1200 } else { 0 }
+    if meta.small_copy_class == SmallCopyClass::Acknowledgment {
+        1200
+    } else {
+        0
+    }
 }
 
 fn repair_frame_floor(policy: &Policy, pending: &outbound::Pending) -> usize {
@@ -1226,6 +1278,11 @@ fn budget_admitted(
             let meta = meta.expect("admitted small repair block");
             assert!(meta.paths != 0 && meta.small_repair_reserved >= frame_bytes);
             meta.small_repair_reserved -= frame_bytes;
+            if meta.small_copy_class == SmallCopyClass::UdpRetry {
+                tracing::debug!(target: "braidpath::ordered_udp_repair", block=pending.block.unwrap(),
+                    "ordinary UDP retry first parity admitted");
+                meta.small_copy_class = SmallCopyClass::Ordinary;
+            }
             budget.small_repair_admitted(frame_bytes);
             metrics.update(|d| {
                 d.symbols.mixed_small_repair_admitted_bytes += frame_bytes as u64;
@@ -3223,7 +3280,22 @@ async fn sender_with_inputs(
                 if blocked_repair {
                     break;
                 }
-                // A repair with no admitted-original credit cannot hold the queue.
+                // Wait briefly for one useful parity block without extending
+                // its TTL or the lifetime of any other blocked repair.
+                if paths.len() > 1
+                    && let Some(block) = queue.front(true).and_then(|front| {
+                        waiting_udp_retry_copy(&policy, &budget, &blocks, front, now)
+                    })
+                {
+                    // No eligible originals remain. If a different block can
+                    // be retired first, keep the candidate in the queue.
+                    if !queue.promote_ready_repair(|pending| pending.block != Some(block)) {
+                        tracing::debug!(target: "braidpath::ordered_udp_repair", block,
+                            "ordinary UDP retry parity waiting for earned credit");
+                        break;
+                    }
+                }
+                // Missing original credit is never repaired by waiting.
                 if let Some(skipped) = queue.pop(true) {
                     if now.saturating_duration_since(skipped.created)
                         >= policy.symbol_lifetime(&skipped)
