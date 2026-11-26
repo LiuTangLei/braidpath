@@ -4070,12 +4070,9 @@ mod tests {
         let send = &mut mux.streams.get_mut(&id).unwrap().send;
         let now = Instant::now();
         let mut offset = 0;
-        for size in [
-            768,
-            stream::MAX_SEGMENT,
-            stream::MAX_SEGMENT,
-            stream::MAX_SEGMENT,
-        ] {
+        let segment = stream::MAX_SEGMENT as u64;
+        let distant = 768 + 33 * segment;
+        for size in std::iter::once(768).chain(std::iter::repeat_n(stream::MAX_SEGMENT, 34)) {
             send.push(&vec![7; size]);
             let sent = send.poll_transmit(now).unwrap();
             send.admitted(
@@ -4087,10 +4084,20 @@ mod tests {
             );
             offset += size as u64;
         }
+        let ack = stream::Ack {
+            cumulative: 0,
+            limit: stream::INITIAL_WINDOW,
+            duplicate_bytes: 0,
+            ranges: vec![(768 + 3 * segment, distant)],
+        };
+        assert!(
+            send.on_ack(&ack, now + Duration::from_millis(100))
+                .is_some()
+        );
         let later = now + Duration::from_millis(300);
         send.on_timeout(later);
         send.push(&vec![9; 80 * 1024]);
-        let _queued_bulk =
+        let queued_bulk =
             mux.gauge
                 .hold(2, 0, 1, MIN_QUEUED + native_return::PAYLOAD, false, false);
         let (tx, mut rx) = mpsc::channel(8);
@@ -4104,7 +4111,7 @@ mod tests {
             },
             later,
         );
-        for expected in [0, 768, 768 + stream::MAX_SEGMENT as u64] {
+        for expected in [0, 768, 768 + segment, 768 + 2 * segment] {
             let repair = rx.try_recv().expect("repair near the cumulative hole");
             let hold = repair.hold.unwrap();
             assert!(hold.interactive());
@@ -4118,7 +4125,7 @@ mod tests {
             rx.try_recv().is_err(),
             "the rest waits behind the bulk watermark"
         );
-        drop(_queued_bulk);
+        drop(queued_bulk);
         mux.pump(
             &mut Out {
                 game_tx: None,
@@ -4139,7 +4146,7 @@ mod tests {
         let Some(Frame::Data { offset, .. }) = Frame::decode(&repair.record.payload) else {
             panic!("expected UDP repair");
         };
-        assert_eq!(offset, 768 + 2 * stream::MAX_SEGMENT as u64);
+        assert_eq!(offset, distant);
         let bulk = rx.try_recv().expect("new bulk uses the native carrier");
         assert!(bulk.record.payload.len() > crate::runtime::MAX_PAYLOAD);
         assert!(!bulk.hold.unwrap().interactive());

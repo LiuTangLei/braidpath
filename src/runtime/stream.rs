@@ -359,6 +359,14 @@ struct Segment {
     reliable: Option<Arc<AtomicBool>>,
 }
 
+impl Segment {
+    /// A local requeue preserves the already selected first repair round.
+    fn first_datagram_repair_ready(&self) -> bool {
+        self.admitted_on_datagram
+            && self.network_transmissions == 1 + u32::from(self.local_retry_pending)
+    }
+}
+
 /// Native segments share the reachability flag of the writer which owns them.
 struct CarrierFlight {
     reachable: Arc<AtomicBool>,
@@ -647,6 +655,7 @@ impl Sender {
             local_retry_pending: false,
             reliable: None,
         });
+        let first_datagram_repair = !probe && segment.first_datagram_repair_ready();
         let local_retry = !probe && std::mem::take(&mut segment.local_retry_pending);
         let previous_path =
             (segment.path != UNKNOWN_PATH && !local_retry).then_some(segment.path as u8);
@@ -693,9 +702,7 @@ impl Sender {
             start,
             transmission,
             network_attempt: segment.network_transmissions,
-            first_datagram_repair: !probe
-                && segment.network_transmissions == 2
-                && segment.admitted_on_datagram,
+            first_datagram_repair,
             retransmission: transmission > 1,
             tail_probe: probe,
             head_copy: false,
@@ -1164,7 +1171,7 @@ impl Sender {
     /// The next transmit may use the mux reserve if it repairs a short piece
     /// close enough to the cumulative gap to release the next UDP datagram.
     pub(crate) fn short_udp_repair_ready(&self, now: Instant, payload: usize) -> bool {
-        let (start, segment) = if let Some(&start) = self.lost.first() {
+        let (start, segment, first_datagram_repair) = if let Some(&start) = self.lost.first() {
             let segment = &self.segments[&start];
             if segment.network_transmissions == 0
                 || (segment.local_retry_pending
@@ -1172,23 +1179,30 @@ impl Sender {
             {
                 return false;
             }
-            (start, segment)
+            (start, segment, segment.first_datagram_repair_ready())
         } else if let Some((start, _)) = self.head_copy_ready() {
-            (start, &self.segments[&start])
+            (start, &self.segments[&start], false)
         } else if self.head_probe_due
             && let Some((start, due)) = self.head_probe_deadline()
             && now >= due
         {
-            (start, &self.segments[&start])
+            (start, &self.segments[&start], false)
         } else {
             return false;
         };
         let fin = u64::from(self.fin.is_some_and(|offset| segment.end == offset + 1));
         let end = segment.end - fin;
-        // Cover the head plus two following datagram-sized pieces during
-        // clustered loss. Leave the rest of a bulk flight on the native lane.
-        let near_head = 3 * payload.saturating_sub(DATA_HEADER) as u64;
-        end - start + DATA_HEADER as u64 <= payload as u64 && end - self.base <= near_head
+        // Parallel TCP writers can keep the producer above its watermark over
+        // a whole burst. Let first repairs for the missing DATAGRAM prefix
+        // compete in the existing reserve, up to one native record of offsets.
+        // Keep the smaller range for extra copies and repeated repairs.
+        let maximum_ahead = if first_datagram_repair {
+            RELIABLE_PAYLOAD - DATA_HEADER
+        } else {
+            3 * payload.saturating_sub(DATA_HEADER)
+        };
+        end - start + DATA_HEADER as u64 <= payload as u64
+            && end - self.base <= maximum_ahead as u64
     }
 
     pub(crate) fn head_probe_is_reliable(&self) -> bool {
