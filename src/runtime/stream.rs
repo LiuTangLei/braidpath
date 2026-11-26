@@ -1148,6 +1148,29 @@ impl Sender {
         .then_some((start, s.end))
     }
 
+    /// The next transmit must be a network repair of the cumulative gap and
+    /// fit one datagram to use the mux's reserved interactive capacity.
+    pub(crate) fn short_head_repair_ready(&self, now: Instant, payload: usize) -> bool {
+        let (start, segment) = if let Some(&start) = self.lost.first() {
+            let segment = &self.segments[&start];
+            if segment.local_retry_pending || segment.network_transmissions == 0 {
+                return false;
+            }
+            (start, segment)
+        } else if let Some((start, _)) = self.head_copy_ready() {
+            (start, &self.segments[&start])
+        } else if self.head_probe_due
+            && let Some((start, due)) = self.head_probe_deadline()
+            && now >= due
+        {
+            (start, &self.segments[&start])
+        } else {
+            return false;
+        };
+        let fin = u64::from(self.fin.is_some_and(|offset| segment.end == offset + 1));
+        start == self.base && segment.end - start - fin + DATA_HEADER as u64 <= payload as u64
+    }
+
     pub(crate) fn head_probe_is_reliable(&self) -> bool {
         self.lost.is_empty()
             && self.head_copy_ready().is_none()

@@ -2006,11 +2006,17 @@ impl Mux {
             let id = self.turns.pop_front().expect("turn");
             self.turns.push_back(id);
             let s = self.streams.get_mut(&id).expect("stream turn");
+            let ordered_udp =
+                self.native_return && self.game_events.is_none() && id & ORDERED_UDP_STREAM != 0;
             if self.gauge.queued() >= limit
                 && s.send.written() - s.send.retained_from() > interactive_cap
             {
-                idle += 1;
-                continue;
+                if !ordered_udp || !s.send.short_head_repair_ready(now, super::MAX_PAYLOAD) {
+                    idle += 1;
+                    continue;
+                }
+                tracing::debug!(target: "braidpath::ordered_udp_repair", flow = id,
+                    "short UDP repair admitted above bulk watermark");
             }
             let before_splits = s.send.pmtu_splits;
             let reliable_rescue = self.native_return && s.send.head_probe_is_reliable();
@@ -2042,9 +2048,7 @@ impl Mux {
             // A short UDP repair can unblock all later datagrams. Keep it on
             // the interactive lane even if the flow filled up after its loss.
             let interactive = interactive
-                || (self.native_return
-                    && self.game_events.is_none()
-                    && id & ORDERED_UDP_STREAM != 0
+                || (ordered_udp
                     && t.retransmission
                     && !t.local_retry
                     && t.start == s.send.retained_from()
@@ -3963,7 +3967,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn short_udp_head_repair_bypasses_its_flows_native_backlog() {
+    async fn short_udp_head_repair_bypasses_a_full_native_watermark() {
         let id = ADDRESSED | ORDERED_UDP_STREAM | 1;
         let mut policy = proxy_policy();
         policy.native_return = true;
@@ -3986,17 +3990,18 @@ mod tests {
         send.on_timeout(later);
         send.push(&vec![9; 80 * 1024]);
         assert!(send.written() - send.retained_from() > INTERACTIVE_BYTES);
+        let queued_bulk =
+            mux.gauge
+                .hold(2, 0, 1, MIN_QUEUED + native_return::PAYLOAD, false, false);
         let (tx, mut rx) = mpsc::channel(8);
-        mux.pump(
-            &mut Out {
-                game_tx: None,
-                tx: &tx,
-                next_id: &mut 0,
-                scope: &scope,
-                small_threshold: 0,
-            },
-            later,
-        );
+        let mut out = Out {
+            game_tx: None,
+            tx: &tx,
+            next_id: &mut 0,
+            scope: &scope,
+            small_threshold: 0,
+        };
+        mux.pump(&mut out, later);
         let repair = rx.try_recv().expect("head repair");
         let hold = repair.hold.unwrap();
         assert!(hold.interactive());
@@ -4006,6 +4011,9 @@ mod tests {
         };
         assert_eq!(offset, 0);
         assert_eq!(data, original);
+        assert!(rx.try_recv().is_err(), "bulk watermark remains in force");
+        drop(queued_bulk);
+        mux.pump(&mut out, later);
         let bulk = rx.try_recv().expect("native backlog");
         assert!(bulk.record.payload.len() > crate::runtime::MAX_PAYLOAD);
         assert!(!bulk.hold.unwrap().interactive());
