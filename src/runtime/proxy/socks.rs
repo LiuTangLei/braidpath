@@ -116,11 +116,30 @@ impl Relay {
     }
 }
 
-const UDP_QUEUE: usize = 64;
+const UDP_QUEUE: usize = 128;
+const UDP_LARGE_QUEUE: usize = 64;
+// Let MTU-sized bursts use the extra slots without doubling the worst-case
+// buffering of large reassembled UDP messages.
+const UDP_BURST_PACKET_BYTES: usize = 1536;
 
 struct RouteEntry {
     send: mpsc::Sender<Vec<u8>>,
     last_used: Instant,
+}
+
+impl RouteEntry {
+    fn enqueue(&self, payload: &[u8]) -> bool {
+        if payload.len() > UDP_BURST_PACKET_BYTES
+            && self.send.capacity() <= UDP_QUEUE - UDP_LARGE_QUEUE
+        {
+            return false;
+        }
+        let Ok(slot) = self.send.try_reserve() else {
+            return false;
+        };
+        slot.send(payload.to_vec());
+        true
+    }
 }
 
 async fn udp(mut tcp: TcpStream, pool: Arc<Pool>, key: &SessionKey, port: u16) -> Result<()> {
@@ -194,7 +213,7 @@ async fn udp(mut tcp: TcpStream, pool: Arc<Pool>, key: &SessionKey, port: u16) -
                     });
                 } else if let Some(entry) = ordered.get_mut(&address) {
                     entry.last_used = now;
-                    if entry.send.try_send(payload.to_vec()).is_err() {
+                    if !entry.enqueue(payload) {
                         ordered_drops += 1;
                     }
                 }
@@ -203,4 +222,33 @@ async fn udp(mut tcp: TcpStream, pool: Arc<Pool>, key: &SessionKey, port: u16) -
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn udp_queue_accepts_a_short_burst_while_retaining_its_large_packet_limit() {
+        let (send, mut receive) = mpsc::channel(UDP_QUEUE);
+        let route = RouteEntry {
+            send,
+            last_used: Instant::now(),
+        };
+        let large = vec![0; UDP_BURST_PACKET_BYTES + 1];
+        for _ in 0..UDP_LARGE_QUEUE {
+            assert!(route.enqueue(&large));
+        }
+        assert!(!route.enqueue(&large));
+        for sequence in 0..11 {
+            assert!(route.enqueue(&[sequence; 88]));
+        }
+        for _ in 0..UDP_LARGE_QUEUE {
+            assert_eq!(receive.try_recv().unwrap(), large);
+        }
+        for sequence in 0..11 {
+            assert_eq!(receive.try_recv().unwrap(), [sequence; 88]);
+        }
+        assert!(receive.try_recv().is_err());
+    }
 }
