@@ -2039,6 +2039,16 @@ impl Mux {
             }
             idle = 0;
             let payload = t.frame.encode();
+            // A short UDP repair can unblock all later datagrams. Keep it on
+            // the interactive lane even if the flow filled up after its loss.
+            let interactive = interactive
+                || (self.native_return
+                    && self.game_events.is_none()
+                    && id & ORDERED_UDP_STREAM != 0
+                    && t.retransmission
+                    && !t.local_retry
+                    && t.start == s.send.retained_from()
+                    && payload.len() <= super::MAX_PAYLOAD);
             self.stats.local_small_retry_frames +=
                 u64::from(t.local_retry && payload.len() <= super::LATENCY_RECORD_BYTES);
             let hold = (t.transmission > 0).then(|| {
@@ -3950,6 +3960,55 @@ mod tests {
                 "both carriers must retain producer progress for {direction}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn short_udp_head_repair_bypasses_its_flows_native_backlog() {
+        let id = ADDRESSED | ORDERED_UDP_STREAM | 1;
+        let mut policy = proxy_policy();
+        policy.native_return = true;
+        let scope = stats::Metrics::new("peer").scope("ordered-udp-head-repair", stats::FORWARD);
+        let mut mux = Mux::new(
+            Listeners::default(),
+            Targets::default(),
+            &policy,
+            scope.clone(),
+        );
+        mux.set_payload_limit(native_return::PAYLOAD);
+        assert!(mux.open(id, false));
+        let send = &mut mux.streams.get_mut(&id).unwrap().send;
+        let now = Instant::now();
+        let original = [7; 768];
+        send.push(&original);
+        let sent = send.poll_transmit(now).unwrap();
+        send.admitted(0, sent.transmission, 0, Duration::from_millis(100), now);
+        let later = now + Duration::from_millis(300);
+        send.on_timeout(later);
+        send.push(&vec![9; 80 * 1024]);
+        assert!(send.written() - send.retained_from() > INTERACTIVE_BYTES);
+        let (tx, mut rx) = mpsc::channel(8);
+        mux.pump(
+            &mut Out {
+                game_tx: None,
+                tx: &tx,
+                next_id: &mut 0,
+                scope: &scope,
+                small_threshold: 0,
+            },
+            later,
+        );
+        let repair = rx.try_recv().expect("head repair");
+        let hold = repair.hold.unwrap();
+        assert!(hold.interactive());
+        assert_eq!(hold.avoid_path(), Some(0));
+        let Some(Frame::Data { offset, data, .. }) = Frame::decode(&repair.record.payload) else {
+            panic!("expected UDP repair");
+        };
+        assert_eq!(offset, 0);
+        assert_eq!(data, original);
+        let bulk = rx.try_recv().expect("native backlog");
+        assert!(bulk.record.payload.len() > crate::runtime::MAX_PAYLOAD);
+        assert!(!bulk.hold.unwrap().interactive());
     }
 
     #[tokio::test(flavor = "current_thread")]
