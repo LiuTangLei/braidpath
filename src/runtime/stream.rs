@@ -1152,9 +1152,9 @@ impl Sender {
         .then_some((start, s.end))
     }
 
-    /// The next transmit must be a network repair of the cumulative gap and
-    /// fit one datagram to use the mux's reserved interactive capacity.
-    pub(crate) fn short_head_repair_ready(&self, now: Instant, payload: usize) -> bool {
+    /// The next transmit may use the mux reserve if it repairs a short piece
+    /// close enough to the cumulative gap to release the next UDP datagram.
+    pub(crate) fn short_udp_repair_ready(&self, now: Instant, payload: usize) -> bool {
         let (start, segment) = if let Some(&start) = self.lost.first() {
             let segment = &self.segments[&start];
             if segment.network_transmissions == 0
@@ -1175,7 +1175,11 @@ impl Sender {
             return false;
         };
         let fin = u64::from(self.fin.is_some_and(|offset| segment.end == offset + 1));
-        start == self.base && segment.end - start - fin + DATA_HEADER as u64 <= payload as u64
+        let end = segment.end - fin;
+        // Cover the head plus two following datagram-sized pieces during
+        // clustered loss. Leave the rest of a bulk flight on the native lane.
+        let near_head = 3 * payload.saturating_sub(DATA_HEADER) as u64;
+        end - start + DATA_HEADER as u64 <= payload as u64 && end - self.base <= near_head
     }
 
     pub(crate) fn head_probe_is_reliable(&self) -> bool {
