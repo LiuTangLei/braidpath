@@ -2008,15 +2008,15 @@ impl Mux {
             let s = self.streams.get_mut(&id).expect("stream turn");
             let ordered_udp =
                 self.native_return && self.game_events.is_none() && id & ORDERED_UDP_STREAM != 0;
-            if self.gauge.queued() >= limit
-                && s.send.written() - s.send.retained_from() > interactive_cap
-            {
-                if !ordered_udp || !s.send.short_head_repair_ready(now, super::MAX_PAYLOAD) {
-                    idle += 1;
-                    continue;
-                }
-                tracing::debug!(target: "braidpath::ordered_udp_repair", flow = id,
-                    "short UDP repair admitted above bulk watermark");
+            // A known short hole keeps its lane when the local queue has to
+            // retry the repair. Local retries still carry no path penalty.
+            let interactive_repair =
+                ordered_udp && s.send.short_head_repair_ready(now, super::MAX_PAYLOAD);
+            let above_bulk_watermark = self.gauge.queued() >= limit
+                && s.send.written() - s.send.retained_from() > interactive_cap;
+            if above_bulk_watermark && !interactive_repair {
+                idle += 1;
+                continue;
             }
             let before_splits = s.send.pmtu_splits;
             let reliable_rescue = self.native_return && s.send.head_probe_is_reliable();
@@ -2045,14 +2045,7 @@ impl Mux {
             }
             idle = 0;
             let payload = t.frame.encode();
-            // A short UDP repair can unblock all later datagrams. Keep it on
-            // the interactive lane even if the flow filled up after its loss.
-            let interactive = interactive
-                || (ordered_udp
-                    && t.retransmission
-                    && !t.local_retry
-                    && t.start == s.send.retained_from()
-                    && payload.len() <= super::MAX_PAYLOAD);
+            let interactive = interactive || interactive_repair;
             self.stats.local_small_retry_frames +=
                 u64::from(t.local_retry && payload.len() <= super::LATENCY_RECORD_BYTES);
             let hold = (t.transmission > 0).then(|| {
@@ -2076,6 +2069,10 @@ impl Mux {
                 // The unadmitted hold reports this transmission as dropped.
                 self.blocked_until = Some(now + RETRY_FULL);
                 break;
+            }
+            if above_bulk_watermark {
+                tracing::debug!(target: "braidpath::ordered_udp_repair", flow = id,
+                    local_retry = t.local_retry, "short UDP repair admitted above bulk watermark");
             }
             self.stats.segments_sent += 1;
             self.stats.tail_probes_queued += u64::from(t.tail_probe);
@@ -4011,6 +4008,18 @@ mod tests {
         };
         assert_eq!(offset, 0);
         assert_eq!(data, original);
+        assert!(rx.try_recv().is_err(), "bulk watermark remains in force");
+        let attempt = hold.transmission();
+        drop(hold);
+        let send = &mut mux.streams.get_mut(&id).unwrap().send;
+        assert!(send.locally_dropped(0, attempt));
+        mux.pump(&mut out, later);
+        let retry = rx.try_recv().expect("short repair still fits the reserve");
+        assert_eq!(retry.record.payload, repair.record.payload);
+        let retry = retry.hold.unwrap();
+        assert!(retry.interactive() && retry.local_retry());
+        assert_eq!(retry.avoid_path(), None);
+        assert_eq!(retry.avoid_mask(), 0);
         assert!(rx.try_recv().is_err(), "bulk watermark remains in force");
         drop(queued_bulk);
         mux.pump(&mut out, later);

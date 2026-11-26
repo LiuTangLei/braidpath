@@ -1153,7 +1153,10 @@ impl Sender {
     pub(crate) fn short_head_repair_ready(&self, now: Instant, payload: usize) -> bool {
         let (start, segment) = if let Some(&start) = self.lost.first() {
             let segment = &self.segments[&start];
-            if segment.local_retry_pending || segment.network_transmissions == 0 {
+            if segment.network_transmissions == 0
+                || (segment.local_retry_pending
+                    && (segment.network_transmissions < 2 || segment.tried_paths == 0))
+            {
                 return false;
             }
             (start, segment)
