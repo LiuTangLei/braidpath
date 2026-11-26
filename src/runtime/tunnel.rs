@@ -2406,6 +2406,9 @@ async fn sender_with_inputs(
             if let Some(writer) = &path.native_return {
                 let path_reachable = path.open() && !liveness[usize::from(path.id)].silent();
                 writer.set_reachable(path_reachable);
+                if let Some(udp) = &path.native_udp {
+                    udp.set_reachable(path_reachable);
+                }
                 if mixed_writes.is_none() {
                     let initial_window = if metrics.direction == stats::FORWARD {
                         native_return::INITIAL_UPLOAD_SEND_WINDOW
@@ -4932,19 +4935,22 @@ async fn server_connection(
                                         cover_response(&mut stream,false,request_deadline).await?;
                                         continue;
                                     }
-                                    let (writer, reader) =
-                                        native_return::channel_with_notify(session.native_writable.clone());
+
                                     timeout(Duration::from_secs(5),
                                         stream.send_response(Response::builder().status(200).body(())?)
                                     ).await??;
                                     let (send, mut recv) = stream.split();
-                                    {
+                                    let reader = {
                                         let mut active = session.paths.lock().expect("paths lock");
                                         let path = active.iter_mut().find(|path| {
                                             path.id == *pid && path.conn.stable_id() == conn.stable_id()
                                         }).context("native UDP carrier path replaced")?;
+                                        let (writer, reader) = path.native_return.as_ref()
+                                            .context("native TCP carrier missing")?
+                                            .companion(session.native_writable.clone());
                                         path.native_udp = Some(writer);
-                                    }
+                                        reader
+                                    };
                                     let ingress = native_return::Ingress::new(
                                         session.native_ingress[usize::from(*pid)].tx.clone(),
                                     );
@@ -6219,7 +6225,8 @@ async fn client_session(
                             (None, None)
                         };
                         let (udp_writer, udp_body) = if let Some(request) = value.udp_request {
-                            let (tx, rx) = native_return::channel_with_notify(native_writable.clone());
+                            let (tx, rx) = upload_writer.as_ref().expect("native TCP carrier")
+                                .companion(native_writable.clone());
                             (Some(tx), Some((request, rx)))
                         } else {
                             (None, None)

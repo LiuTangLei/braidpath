@@ -78,6 +78,7 @@ async fn native_body_backpressure_keeps_reading_datagrams() {
         tx,
         ingress,
         None,
+        None,
         true,
         Arc::new(AtomicU64::new(0)),
         metrics.scope("backpressure", stats::RETURN),

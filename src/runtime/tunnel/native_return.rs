@@ -1034,6 +1034,15 @@ pub(super) struct Writer {
     loss_permille: Arc<AtomicU64>,
 }
 impl Writer {
+    /// Keep transport credit and loss observations per connection, with an
+    /// independent writer queue and recovery ownership for each body.
+    pub(super) fn companion(&self, ready: Option<Arc<Notify>>) -> (Self, Reader) {
+        let (mut writer, reader) = writer_channel(PATH_QUEUE, ready);
+        writer.written_bytes = self.written_bytes.clone();
+        writer.loss_permille = self.loss_permille.clone();
+        (writer, reader)
+    }
+
     pub(super) fn set_reachable(&self, reachable: bool) {
         self.reachable
             .store(reachable && !self.tx.is_closed(), Ordering::Release);
