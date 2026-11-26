@@ -42,6 +42,8 @@ const MAX_FLOWS: usize = 64;
 const WIRE_QUEUE: usize = 4096;
 const SESSION_IDLE_GRACE: Duration = Duration::from_secs(120);
 const SESSION_PATH: &str = "/session";
+const UDP_CARRIER_PATH: &str = "/session/udp";
+const UDP_CARRIER_HEADER: &str = "braidpath-udp-carrier";
 pub(crate) const STREAM_ALPN: &[u8] = b"braidpath-stream/2";
 pub(crate) const NATIVE_RETURN_WINDOW: u32 = native_return::RECEIVE_WINDOW;
 // An authenticated stream/2 owner is discarding this epoch, rather than
@@ -113,6 +115,21 @@ pub struct Policy {
     pub queue_ms: u64,
 }
 impl Policy {
+    fn separate_udp_carrier(&self) -> bool {
+        self.native_return && self.proxy && !self.game_mode
+    }
+
+    fn confirm_udp_carrier(&self, headers: &http::HeaderMap) -> Result<()> {
+        let mut values = headers.get_all(UDP_CARRIER_HEADER).iter();
+        let expected = self.separate_udp_carrier().then_some("1");
+        ensure!(
+            values.next().map(|value| value.to_str()).transpose()? == expected
+                && values.next().is_none(),
+            "native UDP carrier not negotiated"
+        );
+        Ok(())
+    }
+
     pub(crate) fn enable_game(&mut self) {
         self.game_mode = true;
         self.adaptive = true;
@@ -376,6 +393,7 @@ struct OutPath {
     stream: u64,
     stream_payload: usize,
     native_return: Option<native_return::Writer>,
+    native_udp: Option<native_return::Writer>,
     quality: Arc<Mutex<quality::State>>,
     capacity_probe: Arc<Mutex<capacity_probe::State>>,
     capacity_probe_enabled: bool,
@@ -384,6 +402,14 @@ struct OutPath {
 }
 
 impl OutPath {
+    fn native_writer(&self, ordered_udp: bool) -> Option<&native_return::Writer> {
+        if ordered_udp {
+            self.native_udp.as_ref()
+        } else {
+            self.native_return.as_ref()
+        }
+    }
+
     fn open(&self) -> bool {
         !self.conn.is_closed()
     }
@@ -4749,6 +4775,7 @@ async fn server_connection(
     let mut request: Option<h3::server::RequestStream<h3_quinn::RecvStream, Bytes>> = None;
     let mut response_send = None;
     let mut return_tasks = JoinSet::new();
+    let mut udp_carrier_joined = false;
     // Our clients send their first request within their 8-second (data) or
     // 4-second (control) attempt deadline. Unclassified connections hold the
     // small pending budget, so release it soon after that.
@@ -4894,6 +4921,56 @@ async fn server_connection(
                                     }
                                     continue;
                                 }
+                                if req.method()==Method::POST && req.uri().path()==UDP_CARRIER_PATH {
+                                    // An auxiliary body belongs to the existing authenticated QUIC
+                                    // path. It allocates no session, path slot, or new identity.
+                                    let Some((_, session, pid, _, _, _)) = &joined else {
+                                        cover_response(&mut stream,false,request_deadline).await?;
+                                        continue;
+                                    };
+                                    if !session.policy.separate_udp_carrier() || udp_carrier_joined {
+                                        cover_response(&mut stream,false,request_deadline).await?;
+                                        continue;
+                                    }
+                                    let (writer, reader) =
+                                        native_return::channel_with_notify(session.native_writable.clone());
+                                    timeout(Duration::from_secs(5),
+                                        stream.send_response(Response::builder().status(200).body(())?)
+                                    ).await??;
+                                    let (send, mut recv) = stream.split();
+                                    {
+                                        let mut active = session.paths.lock().expect("paths lock");
+                                        let path = active.iter_mut().find(|path| {
+                                            path.id == *pid && path.conn.stable_id() == conn.stable_id()
+                                        }).context("native UDP carrier path replaced")?;
+                                        path.native_udp = Some(writer);
+                                    }
+                                    let ingress = native_return::Ingress::new(
+                                        session.native_ingress[usize::from(*pid)].tx.clone(),
+                                    );
+                                    let udp_conn = conn.clone();
+                                    return_tasks.spawn(native_return::write(conn.clone(),send,reader));
+                                    return_tasks.spawn(async move {
+                                        let result = async {
+                                            let mut decoder = native_return::Decoder::default();
+                                            while let Some(mut body) = recv.recv_data().await? {
+                                                decoder.deliver_udp(&mut body, &ingress).await?;
+                                            }
+                                            decoder.finish()
+                                        }.await;
+                                        if let Err(error) = result {
+                                            tracing::debug!(%error, "native UDP request body failed");
+                                        }
+                                        udp_conn.close(0u32.into(), b"native UDP request closed");
+                                    });
+                                    if let Some(ready) = &session.native_writable {
+                                        ready.notify_one();
+                                    }
+                                    udp_carrier_joined = true;
+                                    tracing::debug!(target: "braidpath::native_udp", path = *pid, "native UDP carrier joined");
+                                    diagnostic.enter("established","connected");
+                                    continue;
+                                }
                                 if req.method()!=Method::POST || req.uri().path()!=SESSION_PATH {
                                     let ok=req.method()==Method::GET && req.uri().path()=="/";
                                     let deadline=if joined.is_none(){admission_deadline}else{tokio::time::Instant::now()+Duration::from_secs(5)};
@@ -4995,6 +5072,8 @@ async fn server_connection(
                                 ensure!(!native_return || streams || proxy,"return stream requires TCP profile");
                                 let policy=Policy{game_mode,native_return,max_message_bytes,streams,proxy,
             fec_repairs,small_fec_bytes,mixed_fec,probe_guided_recovery,capacity_probe_bps,adaptive:quality_schedule==Some("adaptive"),latency_target_ms,group_rates,quality_schedule:quality_schedule.is_some(),receiver_feedback:feedback.is_some(),fec:parse_fec(header("braidpath-fec")?).map_err(anyhow::Error::msg)?,redundancy:header("braidpath-redundancy")?.parse()?,rate,block_ms:header("braidpath-block-ms")?.parse()?,queue_ms:header("braidpath-queue-ms")?.parse()?};policy.validate()?;
+                                policy.confirm_udp_carrier(req.headers())?;
+                                let separate_udp_carrier = policy.separate_udp_carrier();
                                 if policy.fec==automatic_fec::AUTO {ensure!(req.headers().get_all("braidpath-auto-small").iter().count()==1 && req.headers().get("braidpath-auto-small").is_some_and(|v|v=="1"),"automatic small protection not negotiated");}
                                 let rejoin=req.headers().get("braidpath-rejoin").is_some_and(|v|v=="1");
                                 let stream_id=stream.id().into_inner();
@@ -5036,7 +5115,7 @@ async fn server_connection(
                                                 stream: stream_id,
                                                 feedback: session.policy.receiver_feedback,
                                                 game_quality: (session.policy.game_mode && session.policy.receiver_feedback).then(|| quality.clone()),
-                                            })),stream:stream_id,stream_payload,native_return:return_writer,quality,capacity_probe:Arc::new(Mutex::new(capacity_probe::State::new(generation))),capacity_probe_enabled:capacity_probe_bps>0,epoch:Instant::now(),probe_reply:Arc::new(Mutex::new(None))});
+                                            })),stream:stream_id,stream_payload,native_return:return_writer,native_udp:None,quality,capacity_probe:Arc::new(Mutex::new(capacity_probe::State::new(generation))),capacity_probe_enabled:capacity_probe_bps>0,epoch:Instant::now(),probe_reply:Arc::new(Mutex::new(None))});
                                             *session.empty_since.lock().expect("empty time lock")=None;
                                         }
                                         Some((session, return_reader))
@@ -5068,6 +5147,9 @@ async fn server_connection(
                                 if streams {response=response.header("braidpath-streams","2");}
                                 if proxy {response=response.header("braidpath-proxy","2");}
                                 response=response.header(MODE_HEADER,mode_value(game_mode,native_return));
+                                if separate_udp_carrier {
+                                    response=response.header(UDP_CARRIER_HEADER,"1");
+                                }
                                 if fec_repairs==2 {response=response.header("braidpath-fec-repairs","2");}
                                 if capacity_probe_bps>0 {response=response.header("braidpath-capacity-probe-bps",capacity_probe_bps).header("braidpath-capacity-probe-format",capacity_probe::FORMAT);}
                                 if probe_guided_recovery {response=response.header("braidpath-probe-guided-recovery","1");}
@@ -5100,6 +5182,8 @@ async fn server_connection(
                                 let ingress = session.native_ingress[usize::from(*pid)].clone();
                                 let admission = async {
                                     while let Some(record) = upload_decoder.next(&mut body)? {
+                                        ensure!(!session.policy.separate_udp_carrier() || !record.ordered_udp(),
+                                            "UDP data on the native TCP carrier");
                                         let incoming = native_return::Incoming::new(
                                             record,
                                             ingress.slots.clone(),
@@ -5249,6 +5333,7 @@ struct Rejoined {
     bound_ifindex: Option<u32>,
     driver: H3Client,
     request: H3Request,
+    udp_request: Option<H3Request>,
     send: H3Send,
 }
 
@@ -6056,8 +6141,8 @@ async fn client_session(
                                 connected=timeout(Duration::from_secs(8),
                                     connect_path(&endpoint,config.remote,&name,&token,&sid,id as u8,config.group,generation,rejoin,&policy,exit.as_deref(),&mut diagnostic))=>connected??
                             };
-                            let (conn,stream,driver,request,send,stream_payload)=connected;
-                            Ok(Some(Rejoined{endpoint,conn,stream,stream_payload,bound_ifindex,driver,request,send}))
+                            let (conn,stream,driver,request,udp_request,send,stream_payload)=connected;
+                            Ok(Some(Rejoined{endpoint,conn,stream,stream_payload,bound_ifindex,driver,request,udp_request,send}))
                         }.await;
                         let attempt=match attempt {
                             Ok(None)=>return,
@@ -6133,13 +6218,19 @@ async fn client_session(
                         } else {
                             (None, None)
                         };
+                        let (udp_writer, udp_body) = if let Some(request) = value.udp_request {
+                            let (tx, rx) = native_return::channel_with_notify(native_writable.clone());
+                            (Some(tx), Some((request, rx)))
+                        } else {
+                            (None, None)
+                        };
                         {
                             let mut active=paths.lock().expect("paths lock");
                             for old in active.iter().filter(|p|p.id==pid) {old.conn.close(0u32.into(),b"path replaced");}
                             active.retain(|p|p.id!=pid);
                             let quality = Arc::new(Mutex::new(quality::State::new(generation)));
                             active.push(OutPath{id:pid,group:configs[id].group,conn:value.conn.clone(),stream:value.stream,stream_payload:value.stream_payload,
-                                native_return:upload_writer,writer:writer::Writer::spawn(&value.conn, Some(writer::Observations {
+                                native_return:upload_writer,native_udp:udp_writer,writer:writer::Writer::spawn(&value.conn, Some(writer::Observations {
                                     scope: forward.clone(),
                                     path: trace::PathKey { path_id: pid, generation, connection_id: value.conn.stable_id() as u64 },
                                     stream: value.stream,
@@ -6151,7 +6242,7 @@ async fn client_session(
                         }
                         if let Some(old)=endpoints[id].replace(value.endpoint) {old.close(0u32.into(),b"path replaced");}
                         tasks.spawn(drive_client_path(value.conn,value.stream,value.driver,value.request,value.send,diagnostic,pid,generation,
-                            wire_tx.clone(),native_ingress[id].clone(),upload_reader,options.policy.native_return,ingress_drops.clone(),returning.clone(),forward.clone(),paths.clone(),options.policy.receiver_feedback,value.stream_payload,observation_notify.clone()));
+                            wire_tx.clone(),native_ingress[id].clone(),upload_reader,udp_body,options.policy.native_return,ingress_drops.clone(),returning.clone(),forward.clone(),paths.clone(),options.policy.receiver_feedback,value.stream_payload,observation_notify.clone()));
                         configs[id].rejected=false;
                         has_session=true;
                         if let Some(connector)=&options.stream_connector {
@@ -6287,6 +6378,7 @@ async fn drive_client_path(
     tx: mpsc::Sender<(u8, Bytes)>,
     native_ingress: native_return::Ingress,
     upload_reader: Option<native_return::Reader>,
+    udp_body: Option<(H3Request, native_return::Reader)>,
     native_return: bool,
     ingress_drops: Arc<AtomicU64>,
     returning: Scope,
@@ -6310,6 +6402,27 @@ async fn drive_client_path(
     } else {
         Some(request_send)
     };
+    let separate_udp_carrier = udp_body.is_some();
+    if let Some((request, writer)) = udp_body {
+        let (send, mut recv) = request.split();
+        let ingress = native_return::Ingress::new(native_ingress.tx.clone());
+        let udp_conn = conn.clone();
+        upload_tasks.spawn(native_return::write_client(conn.clone(), send, writer));
+        upload_tasks.spawn(async move {
+            let result = async {
+                let mut decoder = native_return::Decoder::default();
+                while let Some(mut body) = recv.recv_data().await? {
+                    decoder.deliver_udp(&mut body, &ingress).await?;
+                }
+                decoder.finish()
+            }
+            .await;
+            if let Err(error) = result {
+                tracing::debug!(%error, "native UDP response body failed");
+            }
+            udp_conn.close(0u32.into(), b"native UDP response closed");
+        });
+    }
     let trace_key = trace::PathKey {
         path_id: pid,
         generation,
@@ -6409,6 +6522,10 @@ async fn drive_client_path(
             // across DATAGRAM reads when native admission has to wait.
             let admission = async {
                 while let Some(record) = decoder.next(&mut body)? {
+                    ensure!(
+                        !separate_udp_carrier || !record.ordered_udp(),
+                        "UDP data on the native TCP carrier"
+                    );
                     if let Some(reader) = &native_reader {
                         reader.lock().expect("native profile lock").record();
                     }
@@ -6512,7 +6629,15 @@ async fn connect_path(
     policy: &Policy,
     exit: Option<&str>,
     diagnostic: &mut stats::ConnectionTrace,
-) -> Result<(quinn::Connection, u64, H3Client, H3Request, H3Send, usize)> {
+) -> Result<(
+    quinn::Connection,
+    u64,
+    H3Client,
+    H3Request,
+    Option<H3Request>,
+    H3Send,
+    usize,
+)> {
     macro_rules! admit {
         ($conn:expr) => {
             admit_path(
@@ -6569,7 +6694,15 @@ async fn admit_path(
     policy: &Policy,
     exit: Option<&str>,
     diagnostic: &mut stats::ConnectionTrace,
-) -> Result<(quinn::Connection, u64, H3Client, H3Request, H3Send, usize)> {
+) -> Result<(
+    quinn::Connection,
+    u64,
+    H3Client,
+    H3Request,
+    Option<H3Request>,
+    H3Send,
+    usize,
+)> {
     diagnostic.enter("http3", "datagram_capacity");
     ensure!(
         conn.max_datagram_size().is_some_and(|n| n
@@ -6677,9 +6810,21 @@ async fn admit_path(
         MODE_HEADER,
         mode_value(policy.game_mode, policy.native_return),
     );
+    if policy.separate_udp_carrier() {
+        req = req.header(UDP_CARRIER_HEADER, "1");
+    }
     let req = req.body(())?;
-    // Sent without waiting for peer SETTINGS, so that 0-RTT saves its round trip.
+    // Send both headers before awaiting the main response. The auxiliary
+    // request follows the authenticated request on the same connection.
     let mut stream = send.send_request(req).await?;
+    let mut udp_request = if policy.separate_udp_carrier() {
+        Some(
+            send.send_request(Request::post(format!("https://{name}{UDP_CARRIER_PATH}")).body(())?)
+                .await?,
+        )
+    } else {
+        None
+    };
     let response = tokio::select! {e=driver.wait_idle()=>bail!("HTTP/3 closed during admission: {e}"),r=stream.recv_response()=>r?};
     // Check before 410 handling: an old or different exit must never trigger
     // an automatic fresh epoch with shared cluster credentials.
@@ -6717,6 +6862,17 @@ async fn admit_path(
         .into());
     }
     confirm_mode(response.headers(), policy)?;
+    policy.confirm_udp_carrier(response.headers())?;
+    if let Some(udp) = &mut udp_request {
+        let response = tokio::select! {
+            e=driver.wait_idle()=>bail!("HTTP/3 closed during native UDP admission: {e}"),
+            r=udp.recv_response()=>r?,
+        };
+        ensure!(
+            response.status() == StatusCode::OK,
+            "native UDP carrier rejected"
+        );
+    }
     diagnostic.enter("http3", "peer_settings");
     // Poll the driver so peer SETTINGS are processed before datagrams are used.
     tokio::select! {
@@ -6834,6 +6990,7 @@ async fn admit_path(
         stream.id().into_inner(),
         driver,
         stream,
+        udp_request,
         send,
         stream_payload,
     ))

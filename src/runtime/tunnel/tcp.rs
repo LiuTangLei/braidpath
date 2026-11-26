@@ -419,7 +419,7 @@ const RETRY_FULL: Duration = Duration::from_millis(1);
 const ADDRESSED: u32 = 1 << 28;
 /// Stream identifiers with this bit carry an ordered reliable UDP destination
 /// billed against `MAX_UDP_FLOWS` instead of `MAX_TCP_FLOWS`.
-const ORDERED_UDP_STREAM: u32 = 1 << 26;
+pub(super) const ORDERED_UDP_STREAM: u32 = 1 << 26;
 
 pub(super) fn is_ordered_udp_data(flow: u32) -> bool {
     stream::stream_id(flow).is_some_and(|id| id & ORDERED_UDP_STREAM != 0)

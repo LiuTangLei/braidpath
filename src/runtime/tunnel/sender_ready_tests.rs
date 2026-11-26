@@ -186,6 +186,7 @@ impl Pair {
     pub(super) fn path(&self) -> OutPath {
         OutPath {
             native_return: None,
+            native_udp: None,
             id: 0,
             group: 2,
             conn: self.outgoing.clone(),

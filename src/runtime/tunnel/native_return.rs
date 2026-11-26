@@ -4,7 +4,7 @@
 //! resets and UDP retain the datagram carrier. Offsets and the existing stream
 //! credit remain authoritative, including recovery after a path disappears.
 use super::{OutPath, QueuedRecord, outbound, stream};
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use std::{
     sync::{
@@ -1231,6 +1231,7 @@ pub(super) fn drain(
     let mut snapshots = [PathSnapshot::default(); super::MAX_PATHS];
     let mut active_native = 0usize;
     let mut best_service = 0u64;
+    let mut has_udp_carrier = false;
     for path in paths.iter() {
         if !path.open() || silent & (1 << path.id) != 0 {
             continue;
@@ -1241,6 +1242,7 @@ pub(super) fn drain(
         if !writer.reachable.load(Ordering::Acquire) {
             continue;
         }
+        has_udp_carrier |= path.native_udp.is_some();
         let id = usize::from(path.id);
         let rank_download = download && paths.len() >= 2;
         let backlog = rank_download.then(|| path.conn.stream_send_backlog());
@@ -1249,7 +1251,11 @@ pub(super) fn drain(
             |s| (s.retained, s.unsent),
         );
         let cwnd = path.conn.cwnd_hint();
-        let staged = ((writer.tx.max_capacity() - writer.tx.capacity()) * PAYLOAD) as u64;
+        let staged = (std::iter::once(writer)
+            .chain(path.native_udp.iter())
+            .map(|writer| writer.tx.max_capacity() - writer.tx.capacity())
+            .sum::<usize>()
+            * PAYLOAD) as u64;
         let probing = path.conn.probing_rtt_hint();
         let raw_rtt_us = path.conn.rtt_hint().as_micros() as u64;
         let min_rtt_us = path.conn.min_rtt_hint().as_micros() as u64;
@@ -1348,6 +1354,7 @@ pub(super) fn drain(
         let Some(front) = queue.front(false) else {
             break;
         };
+        let ordered_udp = front.flow.is_some_and(super::tcp::is_ordered_udp_data);
         let avoid_path = front.hold.as_ref().and_then(|hold| hold.avoid_path());
         if let Some(avoid) = avoid_path {
             let healthy_rescue_sibling = paths.iter().any(|p| {
@@ -1434,7 +1441,7 @@ pub(super) fn drain(
             order.sort_by_cached_key(|&i| {
                 let path = &paths[i];
                 let avoided = Some(path.id) == avoid_path;
-                let Some(writer) = &path.native_return else {
+                let Some(writer) = path.native_writer(ordered_udp) else {
                     return (true, true, true, true, u64::MAX);
                 };
                 let full = writer.tx.capacity() == 0;
@@ -1493,7 +1500,7 @@ pub(super) fn drain(
                     }
                 }
             }
-            let writer = path.native_return.as_ref()?;
+            let writer = path.native_writer(ordered_udp)?;
             if !writer.reachable.load(Ordering::Acquire) {
                 return None;
             }
@@ -1507,7 +1514,9 @@ pub(super) fn drain(
         let Some((i, permit, reachable, written_bytes)) = ready else {
             // A deferred bulk record or rescue must leave other flows eligible.
             deferred_flows += 1;
-            if !(has_non_avoid || runway_blocked) || deferred_flows >= queue.original_flows() {
+            if !(has_non_avoid || runway_blocked || has_udp_carrier)
+                || deferred_flows >= queue.original_flows()
+            {
                 break;
             }
             queue.rotate_original();
@@ -2176,11 +2185,34 @@ pub(super) struct Decoded {
     pub record_id: u64,
 }
 
+impl Decoded {
+    pub(super) fn ordered_udp(&self) -> bool {
+        super::tcp::is_ordered_udp_data(stream::data_flow(self.stream_id))
+    }
+}
+
 #[derive(Default)]
 pub(super) struct Decoder {
     partial: BytesMut,
 }
 impl Decoder {
+    pub(super) async fn deliver_udp(
+        &mut self,
+        body: &mut impl Buf,
+        ingress: &Ingress,
+    ) -> Result<()> {
+        while let Some(record) = self.next(body)? {
+            ensure!(record.ordered_udp(), "TCP data on the native UDP carrier");
+            let incoming = Incoming::new(record, ingress.slots.clone()).await?;
+            ingress
+                .tx
+                .send(incoming)
+                .await
+                .context("native UDP receiver closed")?;
+        }
+        Ok(())
+    }
+
     /// Reads at most one bounded frame; DATA boundaries are not record boundaries.
     pub fn next(&mut self, input: &mut impl Buf) -> Result<Option<Decoded>> {
         loop {
@@ -2973,6 +3005,69 @@ mod tests {
         let mut bad = encoded().to_vec();
         bad[16] = 2;
         assert!(Decoder::default().next(&mut Bytes::from(bad)).is_err());
+    }
+
+    #[tokio::test]
+    async fn ordered_udp_uses_its_carrier_while_tcp_writer_is_full() {
+        let pair = super::super::sender_ready_tests::Pair::connect().await;
+        let mut path = pair.path();
+        let (tcp, tcp_reader) = mixed_channel();
+        let (udp, mut udp_reader) = mixed_channel();
+        path.native_return = Some(tcp);
+        path.native_udp = Some(udp);
+        let paths = [path];
+        let _tcp_slot = paths[0]
+            .native_return
+            .as_ref()
+            .unwrap()
+            .tx
+            .try_reserve()
+            .unwrap();
+        let mut queue = outbound::Queue::default();
+        let udp_id = super::super::tcp::ORDERED_UDP_STREAM | 17;
+        for (index, id) in [(1, 17), (2, udp_id)] {
+            let flow = stream::data_flow(id);
+            let mut data = encoded().to_vec();
+            data[4..8].copy_from_slice(&flow.to_be_bytes());
+            queue
+                .push(outbound::Pending {
+                    game_datagram: false,
+                    data: data.into(),
+                    created: Instant::now(),
+                    record_id: Some(index),
+                    flow: Some(flow),
+                    block: None,
+                    small: false,
+                    hold: None,
+                })
+                .ok()
+                .unwrap();
+        }
+        let mut pacer = outbound::Pacer::for_sender(100_000_000, BURST);
+        let mut groups = std::array::from_fn(|_| outbound::Pacer::for_sender(100_000_000, BURST));
+        pacer.refill(1_000_000);
+        for group in &mut groups {
+            group.refill(1_000_000);
+        }
+        drain(
+            &mut queue,
+            &paths,
+            &Default::default(),
+            true,
+            0,
+            &mut 0,
+            &mut pacer,
+            &mut groups,
+        );
+        assert_eq!(queue.front(false).unwrap().record_id, Some(1));
+        assert!(tcp_reader.rx.is_empty());
+        let mut part = udp_reader.rx.try_recv().expect("independent UDP writer");
+        let (tx, mut rx) = mpsc::channel(1);
+        let ingress = Ingress::new(tx);
+        let mut decoder = Decoder::default();
+        decoder.deliver_udp(&mut part.data, &ingress).await.unwrap();
+        assert_eq!(rx.try_recv().unwrap().decoded.stream_id, udp_id);
+        assert!(decoder.deliver_udp(&mut encoded(), &ingress).await.is_err());
     }
 
     #[tokio::test]
