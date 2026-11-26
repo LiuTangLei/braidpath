@@ -2045,7 +2045,11 @@ impl Mux {
             }
             idle = 0;
             let payload = t.frame.encode();
-            let interactive = interactive || interactive_repair;
+            // A short DATAGRAM's first repair can escape the native writer's
+            // in-order backlog, while only near-head repairs use the mux reserve.
+            let interactive = interactive
+                || interactive_repair
+                || (ordered_udp && t.first_datagram_repair && payload.len() <= super::MAX_PAYLOAD);
             self.stats.local_small_retry_frames +=
                 u64::from(t.local_retry && payload.len() <= super::LATENCY_RECORD_BYTES);
             let hold = (t.transmission > 0).then(|| {
@@ -4114,6 +4118,31 @@ mod tests {
             rx.try_recv().is_err(),
             "the rest waits behind the bulk watermark"
         );
+        drop(_queued_bulk);
+        mux.pump(
+            &mut Out {
+                game_tx: None,
+                tx: &tx,
+                next_id: &mut 0,
+                scope: &scope,
+                small_threshold: 0,
+            },
+            later,
+        );
+        let repair = rx
+            .try_recv()
+            .expect("first repair of a later short DATAGRAM");
+        assert!(
+            repair.hold.unwrap().interactive(),
+            "first repair stays on DATAGRAM"
+        );
+        let Some(Frame::Data { offset, .. }) = Frame::decode(&repair.record.payload) else {
+            panic!("expected UDP repair");
+        };
+        assert_eq!(offset, 768 + 2 * stream::MAX_SEGMENT as u64);
+        let bulk = rx.try_recv().expect("new bulk uses the native carrier");
+        assert!(bulk.record.payload.len() > crate::runtime::MAX_PAYLOAD);
+        assert!(!bulk.hold.unwrap().interactive());
     }
 
     #[tokio::test(flavor = "current_thread")]

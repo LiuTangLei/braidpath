@@ -348,6 +348,7 @@ struct Segment {
     expected_ack_rtt: Duration,
     transmissions: u32,
     network_transmissions: u32,
+    admitted_on_datagram: bool,
     /// Consecutive retransmissions without any acknowledgment progress between them.
     stalls: u32,
     /// Backed-off deadline while stalled; otherwise timed from `sent_at`.
@@ -420,6 +421,8 @@ pub struct Transmit {
     pub transmission: u32,
     /// The network send round. Local requeues and extra copies share it.
     pub(crate) network_attempt: u32,
+    /// Repair an original DATAGRAM once on the same carrier class.
+    pub(crate) first_datagram_repair: bool,
     pub retransmission: bool,
     pub tail_probe: bool,
     pub head_copy: bool,
@@ -637,6 +640,7 @@ impl Sender {
             expected_ack_rtt: Duration::ZERO,
             transmissions: 0,
             network_transmissions: 0,
+            admitted_on_datagram: false,
             stalls: 0,
             deadline: None,
             probe_transmission: None,
@@ -689,6 +693,9 @@ impl Sender {
             start,
             transmission,
             network_attempt: segment.network_transmissions,
+            first_datagram_repair: !probe
+                && segment.network_transmissions == 2
+                && segment.admitted_on_datagram,
             retransmission: transmission > 1,
             tail_probe: probe,
             head_copy: false,
@@ -832,6 +839,7 @@ impl Sender {
                 start: self.next,
                 transmission: 0,
                 network_attempt: 0,
+                first_datagram_repair: false,
                 retransmission: false,
                 tail_probe: false,
                 head_copy: false,
@@ -941,6 +949,7 @@ impl Sender {
         segment.tried_paths |= 1 << path;
         segment.sent_at = at;
         segment.expected_ack_rtt = expected_ack_rtt;
+        segment.admitted_on_datagram = reliable.is_none();
         segment.reliable = reliable;
         if let Some(owner) = &segment.reliable {
             segment.deadline = None;
