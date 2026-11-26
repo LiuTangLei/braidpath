@@ -2318,7 +2318,10 @@ mod tests {
             SendStream { id, state, pending: &mut pending, conn_state: &conn_state }.write(data)
         };
 
-        assert_eq!(write(&mut server, tcp, &[0; 128]), Ok(128));
+        // SendBuffer retains a partly acknowledged backing chunk, so make
+        // the prefix a separate allocation to observe an actual storage release.
+        assert_eq!(write(&mut server, tcp, &[0; 16]), Ok(16));
+        assert_eq!(write(&mut server, tcp, &[0; 112]), Ok(112));
         assert_eq!(write(&mut server, tcp, &[0]), Err(WriteError::Blocked));
         assert_eq!(write(&mut server, udp, &[0]), Err(WriteError::Blocked));
         assert_eq!(server.poll(), None);
