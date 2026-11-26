@@ -426,6 +426,11 @@ bidirectional echo after all configured paths are ready.
 
 The unified `proxy-client` uses bidirectional native HTTP/3 streams for bulk
 TCP. Ordinary SOCKS5 listeners use reliable, ordered UDP streams per destination.
+Bulk ordinary UDP uses a separate bidirectional HTTP/3 request on each
+authenticated path. Its writer has room for one native record beyond the shared
+local storage limit. Both bodies share the path's QUIC connection, peer flow
+control, congestion control, and rate budgets. Both endpoints must negotiate
+the native UDP carrier during ordinary proxy admission.
 Game listeners (`--game-exit` or `--game-socks5`) use the deadline-bound DATAGRAM
 lane alongside bulk TCP. Each listener's mode selects its own aggregate session
 and relay leases, including when ordinary and Game listeners use the same exit.
