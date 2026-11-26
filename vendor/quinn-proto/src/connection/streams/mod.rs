@@ -240,7 +240,7 @@ impl<'a> SendStream<'a> {
             return Err(WriteError::Blocked);
         }
 
-        let limit = self.state.write_limit();
+        let limit = self.state.write_limit_for(self.id);
 
         let max_send_data = self.state.max_send_data(self.id);
 

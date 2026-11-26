@@ -799,6 +799,13 @@ impl Connection {
         conn.wake();
     }
 
+    /// Add a bounded amount of local send storage for one stream.
+    pub fn reserve_stream_send_window(&self, id: proto::StreamId, bytes: u64) {
+        let mut conn = self.0.state.lock("reserve_stream_send_window");
+        conn.inner.reserve_stream_send_window(id, bytes);
+        conn.wake();
+    }
+
     /// Cap packet pacing in bytes per second for the sampled path epoch.
     /// Stale updates are ignored. `None` restores controller pacing.
     pub fn set_max_pacing_rate(&self, path_epoch: u64, bytes_per_second: Option<u64>) {

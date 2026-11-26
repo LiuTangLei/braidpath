@@ -1170,6 +1170,12 @@ fn writer_channel(queue: usize, ready: Option<Arc<Notify>>) -> (Writer, Reader) 
     )
 }
 
+pub(super) fn reserve_udp_carrier(conn: &quinn::Connection, stream: u64) {
+    let id = quinn::VarInt::from_u64(stream).expect("valid HTTP/3 stream ID");
+    // One full native record and its length/HTTP3 framing.
+    conn.reserve_stream_send_window(id.into(), (PAYLOAD + HEADER_BYTES + 16) as u64);
+}
+
 pub(super) fn data(flow: u32, payload: &[u8]) -> bool {
     stream::stream_id(flow).is_some() && !stream::is_ack_flow(flow) && payload.first() == Some(&0)
 }

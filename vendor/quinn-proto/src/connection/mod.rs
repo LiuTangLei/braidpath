@@ -1497,6 +1497,12 @@ impl Connection {
         self.streams.set_send_window(send_window);
     }
 
+    /// Add a bounded amount of local send storage for one stream.
+    /// Peer flow control and congestion control still apply to its writes.
+    pub fn reserve_stream_send_window(&mut self, id: StreamId, bytes: u64) {
+        self.streams.reserve_stream_send_window(id, bytes);
+    }
+
     /// Cap packet pacing in bytes per second for the sampled path epoch.
     /// Stale updates are ignored. `None` restores controller pacing.
     pub fn set_max_pacing_rate(&mut self, path_epoch: u64, bytes_per_second: Option<u64>) {

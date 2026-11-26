@@ -127,6 +127,8 @@ pub struct StreamsState {
     ///
     /// Note this may be less than `buffered_data` if the user has set a new value.
     pub(super) send_window: u64,
+    /// One body that may use additional local send storage.
+    reserved_send: Option<(StreamId, u64)>,
     /// Configured upper bound for how much unacked data the peer can send us per stream
     pub(super) stream_receive_window: u64,
 
@@ -180,6 +182,7 @@ impl StreamsState {
             data_recvd: 0,
             buffered_data: 0,
             send_window,
+            reserved_send: None,
             stream_receive_window: stream_receive_window.into(),
             initial_max_stream_data_uni: 0u32.into(),
             initial_max_stream_data_bidi_local: 0u32.into(),
@@ -809,7 +812,7 @@ impl StreamsState {
             })?;
         }
 
-        let write_limit = self.write_limit();
+        let write_limit = self.write_limit_for(id);
         let max_send_data = self.max_send_data(id);
         if let Some(ss) = self
             .send
@@ -862,11 +865,35 @@ impl StreamsState {
         self.buffered_data == 0
     }
 
-    /// Returns the maximum amount of data this is allowed to be written on the connection
+    /// Remaining peer credit and shared local storage for ordinary writers.
     pub(crate) fn write_limit(&self) -> u64 {
-        (self.max_data - self.data_sent)
-            // `send_window` can be set after construction to something *less* than `buffered_data`
-            .min(self.send_window.saturating_sub(self.buffered_data))
+        let reserved_used = self.reserved_send.and_then(|(id, limit)| {
+            let stream = self.send.get(&id)?.as_ref()?;
+            Some(stream.pending.buffered().min(limit))
+        }).unwrap_or(0);
+        let shared = self.buffered_data.saturating_sub(reserved_used);
+        (self.max_data - self.data_sent).min(self.send_window.saturating_sub(shared))
+    }
+
+    pub(crate) fn write_limit_for(&self, id: StreamId) -> u64 {
+        match self.reserved_send {
+            Some((reserved, extra)) if reserved == id => (self.max_data - self.data_sent).min(
+                self.send_window.saturating_add(extra).saturating_sub(self.buffered_data),
+            ),
+            _ => self.write_limit(),
+        }
+    }
+
+    pub(crate) fn reserve_stream_send_window(&mut self, id: StreamId, bytes: u64) {
+        self.reserved_send = (bytes != 0).then_some((id, bytes));
+    }
+
+    fn unblock_stream(&mut self, id: StreamId) -> Option<StreamEvent> {
+        let stream = self.send.get_mut(&id)?.as_mut()?;
+        debug_assert!(stream.connection_blocked);
+        stream.connection_blocked = false;
+        (stream.is_writable() && stream.max_data > stream.offset())
+            .then_some(StreamEvent::Writable { id })
     }
 
     /// Yield stream events
@@ -878,18 +905,17 @@ impl StreamsState {
 
         if self.write_limit() > 0 {
             while let Some(id) = self.connection_blocked.pop() {
-                let stream = match self.send.get_mut(&id).and_then(|s| s.as_mut()) {
-                    None => continue,
-                    Some(s) => s,
-                };
-
-                debug_assert!(stream.connection_blocked);
-                stream.connection_blocked = false;
-
-                // If it's no longer sensible to write to a stream (even to detect an error) then don't
-                // report it.
-                if stream.is_writable() && stream.max_data > stream.offset() {
-                    return Some(StreamEvent::Writable { id });
+                if let Some(writable) = self.unblock_stream(id) {
+                    return Some(writable);
+                }
+            }
+        } else if let Some((id, _)) = self.reserved_send {
+            if self.write_limit_for(id) > 0 {
+                if let Some(index) = self.connection_blocked.iter().position(|&blocked| blocked == id) {
+                    self.connection_blocked.swap_remove(index);
+                    if let Some(writable) = self.unblock_stream(id) {
+                        return Some(writable);
+                    }
                 }
             }
         }
@@ -2271,6 +2297,44 @@ mod tests {
         assert_eq!(stream.write(&data), Ok(initial_send_len));
         assert_eq!(stream.write(&data), Ok(initial_send_len));
         assert_eq!(stream.write(&data), Err(WriteError::Blocked));
+    }
+
+    #[test]
+    fn reserved_body_can_write_while_shared_send_window_is_full() {
+        let mut server = make(Side::Server);
+        server.set_send_window(128);
+        server.set_params(&TransportParameters {
+            initial_max_data: VarInt::MAX,
+            initial_max_stream_data_uni: VarInt::MAX,
+            initial_max_streams_uni: VarInt::from_u32(2),
+            ..TransportParameters::default()
+        });
+        let conn_state = ConnState::Established;
+        let mut streams = Streams { state: &mut server, conn_state: &conn_state };
+        let tcp = streams.open(Dir::Uni).unwrap();
+        let udp = streams.open(Dir::Uni).unwrap();
+        let mut pending = Retransmits::default();
+        let mut write = |state: &mut StreamsState, id, data: &[u8]| {
+            SendStream { id, state, pending: &mut pending, conn_state: &conn_state }.write(data)
+        };
+
+        assert_eq!(write(&mut server, tcp, &[0; 128]), Ok(128));
+        assert_eq!(write(&mut server, tcp, &[0]), Err(WriteError::Blocked));
+        assert_eq!(write(&mut server, udp, &[0]), Err(WriteError::Blocked));
+        assert_eq!(server.poll(), None);
+
+        server.reserve_stream_send_window(udp, 32);
+        assert_eq!(server.poll(), Some(StreamEvent::Writable { id: udp }));
+        assert_eq!(server.poll(), None);
+        assert_eq!(write(&mut server, udp, &[0; 33]), Ok(32));
+        assert_eq!(write(&mut server, udp, &[0]), Err(WriteError::Blocked));
+        assert_eq!(write(&mut server, tcp, &[0]), Err(WriteError::Blocked));
+
+        server.received_ack_of(frame::StreamMeta { id: tcp, offsets: 0..16, fin: false });
+        assert_eq!(server.write_limit(), 16);
+        assert_eq!(write(&mut server, tcp, &[0; 16]), Ok(16));
+        assert_eq!(server.buffered_data, 160);
+        assert_eq!(server.write_limit_for(udp), 0);
     }
 
     #[test]

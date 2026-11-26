@@ -4939,6 +4939,7 @@ async fn server_connection(
                                     timeout(Duration::from_secs(5),
                                         stream.send_response(Response::builder().status(200).body(())?)
                                     ).await??;
+                                    native_return::reserve_udp_carrier(&conn, stream.id().into_inner());
                                     let (send, mut recv) = stream.split();
                                     let reader = {
                                         let mut active = session.paths.lock().expect("paths lock");
@@ -6879,6 +6880,7 @@ async fn admit_path(
             response.status() == StatusCode::OK,
             "native UDP carrier rejected"
         );
+        native_return::reserve_udp_carrier(&conn, udp.id().into_inner());
     }
     diagnostic.enter("http3", "peer_settings");
     // Poll the driver so peer SETTINGS are processed before datagrams are used.
