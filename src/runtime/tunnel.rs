@@ -794,7 +794,7 @@ fn encode_input(
         });
         return;
     }
-    let attempt = hold.as_ref().map_or(1, |h| h.transmission());
+    let attempt = hold.as_ref().map_or(1, |h| h.encoding_attempt());
     let interactive_tcp = hold.as_ref().is_some_and(|hold| hold.interactive());
     match encoder.encode_attempt_ingress(&record, Instant::now(), attempt, created, interactive_tcp)
     {

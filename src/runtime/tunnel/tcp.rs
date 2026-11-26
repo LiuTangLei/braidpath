@@ -2058,6 +2058,11 @@ impl Mux {
                     id,
                     t.start,
                     t.transmission,
+                    if ordered_udp {
+                        t.network_attempt
+                    } else {
+                        t.transmission
+                    },
                     payload.len(),
                     interactive,
                     t.local_retry,
@@ -4016,10 +4021,26 @@ mod tests {
         mux.pump(&mut out, later);
         let retry = rx.try_recv().expect("short repair still fits the reserve");
         assert_eq!(retry.record.payload, repair.record.payload);
-        let retry = retry.hold.unwrap();
-        assert!(retry.interactive() && retry.local_retry());
-        assert_eq!(retry.avoid_path(), None);
-        assert_eq!(retry.avoid_mask(), 0);
+        let retry_hold = retry.hold.as_ref().unwrap();
+        assert!(retry_hold.interactive() && retry_hold.local_retry());
+        assert_eq!(retry_hold.avoid_path(), None);
+        assert_eq!(retry_hold.avoid_mask(), 0);
+        let mut coding_policy = policy.clone();
+        coding_policy.fec = crate::runtime::automatic_fec::AUTO;
+        coding_policy.redundancy = 30;
+        let mut encoder = super::super::coding::RecordEncoder::new(&coding_policy).unwrap();
+        encoder.set_fec(0).unwrap();
+        let mut coded = crate::runtime::outbound::Queue::default();
+        super::super::encode_input(
+            retry,
+            &mut encoder,
+            &coding_policy,
+            &mut coded,
+            &mut Default::default(),
+            &scope,
+        );
+        assert_eq!(coded.len(), 2, "a local requeue adds no FEC repair copies");
+        drop(coded);
         assert!(rx.try_recv().is_err(), "bulk watermark remains in force");
         drop(queued_bulk);
         mux.pump(&mut out, later);

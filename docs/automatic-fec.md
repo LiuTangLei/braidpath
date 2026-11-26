@@ -81,10 +81,12 @@ block ID; the receiver delivers once. Delayed originals remain duplicates.
 
 Ordinary SOCKS5 UDP carries each destination on a reliable ordered stream.
 When automatic bulk FEC is active, or an interactive record needs another
-attempt, each interactive UDP stream fragment can use independent small-record
-protection up to the stream DATAGRAM payload limit. This applies on every
-destination port. The receiver deduplicates repairs before delivering the UDP
-message. Large transfers continue on the native stream path.
+network attempt, each interactive UDP stream fragment can use independent
+small-record protection up to the stream DATAGRAM payload limit. This applies on
+every destination port. A local requeue or an extra recovery copy shares the
+current network attempt for protection selection. The receiver deduplicates
+repairs before delivering the UDP message. Large transfers continue on the
+native stream path.
 
 Only an actually admitted original authorizes its own generated/queued copies.
 They cannot borrow bulk credit or fund bulk repair. Auto additionally caps repair

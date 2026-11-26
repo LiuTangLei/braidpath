@@ -105,6 +105,7 @@ impl Gauge {
             stream,
             start,
             transmission,
+            transmission,
             bytes,
             interactive,
             local_retry,
@@ -118,6 +119,7 @@ impl Gauge {
         stream: u32,
         start: u64,
         transmission: u32,
+        encoding_attempt: u32,
         bytes: usize,
         interactive: bool,
         local_retry: bool,
@@ -128,6 +130,7 @@ impl Gauge {
         Arc::new(Hold {
             gauge: self.clone(),
             identity: (stream, start, transmission),
+            encoding_attempt,
             bytes,
             interactive,
             local_retry,
@@ -142,6 +145,7 @@ impl Gauge {
 pub struct Hold {
     gauge: Arc<Gauge>,
     identity: (u32, u64, u32),
+    encoding_attempt: u32,
     bytes: usize,
     /// The stream has little outstanding data: send it on the earliest path.
     interactive: bool,
@@ -156,6 +160,9 @@ pub struct Hold {
 impl Hold {
     pub fn transmission(&self) -> u32 {
         self.identity.2
+    }
+    pub(crate) fn encoding_attempt(&self) -> u32 {
+        self.encoding_attempt
     }
     pub fn interactive(&self) -> bool {
         self.interactive

@@ -3395,6 +3395,7 @@ async fn small_stream_retry_escapes_fast_lossy_small_mask_anchor() {
             1,
             0,
             2,
+            2,
             payload.len(),
             true,
             false,
@@ -3436,6 +3437,7 @@ async fn small_stream_retry_escapes_fast_lossy_small_mask_anchor() {
         hold: Some(gauge.hold_with_avoid_mask(
             1,
             0,
+            3,
             3,
             payload.len(),
             true,
