@@ -374,6 +374,7 @@ struct CarrierFlight {
 /// exponentially backed-off connection timer.
 pub struct Sender {
     pub(crate) pmtu_splits: u64,
+    pub(crate) ordered_udp_gap_repair: bool,
     buffer: VecDeque<u8>,
     base: u64,
     written: u64,
@@ -433,6 +434,7 @@ impl Sender {
     pub fn new(open: bool) -> Self {
         Self {
             pmtu_splits: 0,
+            ordered_udp_gap_repair: false,
             buffer: VecDeque::new(),
             base: 0,
             written: 0,
@@ -952,7 +954,7 @@ impl Sender {
             }
             self.probe_at.get_or_insert(at);
             if self.fin_sent {
-                self.schedule_head_probe(at);
+                self.schedule_head_probe(at, false);
             }
         } else if segment.stalls == 0 {
             segment.deadline = None;
@@ -1031,6 +1033,28 @@ impl Sender {
                 delivered.push(self.segments.remove(&key).expect("covered segment"));
             }
         }
+        // Only new first-transmission deliveries on the missing record's own
+        // path are evidence for a short datagram flight. Other paths can
+        // routinely overtake it while it is healthy.
+        let small_udp_hole = self.ordered_udp_gap_repair
+            && !ack.ranges.is_empty()
+            && self.written.saturating_sub(cumulative) <= HEAD_PROBE_MIN_FLIGHT
+            && self.segments.get(&cumulative).is_some_and(|head| {
+                head.reliable.is_none()
+                    && head.path != UNKNOWN_PATH
+                    && delivered
+                        .iter()
+                        .filter(|s| {
+                            s.path == head.path
+                                && s.sent_at > head.sent_at
+                                && s.end > head.end
+                                && s.network_transmissions == 1
+                                && s.probe_transmission.is_none()
+                                && s.reliable.is_none()
+                        })
+                        .nth(2)
+                        .is_some()
+            });
         let progressed = !delivered.is_empty() || cumulative > self.acked || raised;
         let mut newest_sample: Option<Instant> = None;
         let mut path_samples: [Option<Instant>; MAX_PATHS] = [None; MAX_PATHS];
@@ -1088,7 +1112,7 @@ impl Sender {
             self.probe_at = Some(now);
         }
         self.detect_losses(now);
-        self.schedule_head_probe(now);
+        self.schedule_head_probe(now, small_udp_hole);
         Some((released, spurious))
     }
     fn unschedule_delivered(&mut self, start: u64) {
@@ -1146,7 +1170,7 @@ impl Sender {
         .then_some((start, at))
     }
 
-    fn schedule_head_probe(&mut self, now: Instant) {
+    fn schedule_head_probe(&mut self, now: Instant, small_udp_hole: bool) {
         if self.head_probe_deadline().is_some() {
             return;
         }
@@ -1223,7 +1247,7 @@ impl Sender {
             self.head_probe = Some((start, segment.transmissions, at));
             return;
         }
-        if self.written - self.base <= HEAD_PROBE_MIN_FLIGHT {
+        if self.written - self.base <= HEAD_PROBE_MIN_FLIGHT && !small_udp_hole {
             return;
         }
         let rtt = self.transport_rtt[segment.path].max(Duration::from_millis(1));
@@ -1233,6 +1257,10 @@ impl Sender {
         // timer and admission budgets remain intact if either copy is lost.
         let at = (now + (rtt / 4).clamp(Duration::from_millis(10), Duration::from_millis(50)))
             .max(self.last_head_probe.map_or(now, |last| last + rtt));
+        if small_udp_hole {
+            tracing::debug!(target: "braidpath::ordered_udp_repair", offset = start,
+                path = segment.path, "short UDP gap probe scheduled");
+        }
         self.head_probe = Some((start, segment.transmissions, at));
     }
 
@@ -2459,6 +2487,61 @@ mod tests {
             probe_at,
         );
         assert_eq!(sender.next_deadline(probe_at), Some(loss_at));
+    }
+
+    #[test]
+    fn short_ordered_udp_hole_uses_new_same_path_deliveries_once() {
+        let now = Instant::now();
+        let rtt = Duration::from_millis(100);
+        for (udp, route, newer, expect) in [
+            (true, 0, 3, true),
+            (true, 0, 2, false),
+            (true, 1, 3, false),
+            (false, 0, 3, false),
+        ] {
+            let mut sender = Sender::new(false);
+            sender.ordered_udp_gap_repair = udp;
+            // A previously reordered flight has raised the ordinary loss threshold.
+            sender.reorder = REORDER_MAX;
+            sender.push(&vec![7; 4 * MAX_SEGMENT]);
+            for i in 0..4 {
+                let at = now + Duration::from_millis(i);
+                let t = sender.poll_transmit(at).unwrap();
+                sender.admitted(
+                    t.start,
+                    t.transmission,
+                    if i == 0 { 0 } else { route },
+                    rtt,
+                    at,
+                );
+            }
+            let ack = Ack {
+                cumulative: 0,
+                limit: INITIAL_WINDOW,
+                duplicate_bytes: 0,
+                ranges: vec![(MAX_SEGMENT as u64, ((newer + 1) * MAX_SEGMENT) as u64)],
+            };
+            let received = now + rtt;
+            sender.on_ack(&ack, received).unwrap();
+            sender.on_ack(&ack, received).unwrap();
+            assert_eq!(sender.head_probe_deadline().is_some(), expect);
+            let regular_repair = sender.fresh_deadline(now, sender.path_threshold(0, received));
+            if !udp {
+                assert!(regular_repair >= now + Duration::from_millis(195));
+                sender.on_timeout(regular_repair);
+                let t = sender.poll_transmit(regular_repair).unwrap();
+                assert!(t.retransmission && !t.head_copy && t.start == 0);
+            }
+            if expect {
+                let (offset, at) = sender.head_probe_deadline().unwrap();
+                assert_eq!(offset, 0);
+                assert_eq!(at, received + rtt / 4);
+                assert!(sender.on_timeout(at));
+                let copy = sender.poll_transmit(at).unwrap();
+                assert!(copy.head_copy && !copy.tail_probe && copy.start == 0);
+                assert!(sender.poll_transmit(at).is_none());
+            }
+        }
     }
 
     fn bulk_hole(now: Instant, missing: usize) -> Sender {

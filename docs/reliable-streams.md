@@ -188,6 +188,11 @@ cancels the copy, and each stream allows at most one such probe per RTT. This
 does not declare loss or move the original loss timer; a dropped probe leaves
 ordinary recovery live. Existing admission and memory budgets also cover it.
 
+Ordinary ordered UDP also uses this probe when at most 64 KiB remains
+outstanding and a single selective ACK newly covers three later DATAGRAM
+segments sent once on the missing segment's own path. This lets a short burst
+repair its first missing segment while keeping the same timer and copy budget.
+
 Shared forward-loss trials count paths with qualified finalized data intervals.
 Idle connected paths do not vote against congestion on active routes. At least
 two measured routes are required when multiple routes are connected, and two

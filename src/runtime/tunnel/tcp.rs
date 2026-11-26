@@ -1015,7 +1015,10 @@ impl Mux {
         true
     }
     fn open_lease(&mut self, id: u32, open: bool, lease: Arc<Lease>) {
-        self.streams.insert(id, Stream::new(open, lease));
+        let mut stream = Stream::new(open, lease);
+        stream.send.ordered_udp_gap_repair =
+            id & ORDERED_UDP_STREAM != 0 && self.native_return && self.game_events.is_none();
+        self.streams.insert(id, stream);
         self.turns.push_back(id);
         self.stats.opened += 1;
     }
