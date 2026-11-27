@@ -25,6 +25,8 @@ pub(super) struct SendBuffer {
     acks: RangeSet,
     /// Previously transmitted ranges deemed lost
     retransmits: RangeSet,
+    /// Total bytes in the ranges waiting to be packetized again.
+    retransmit_bytes: u64,
 }
 
 impl SendBuffer {
@@ -116,6 +118,7 @@ impl SendBuffer {
             if end != range.end {
                 self.retransmits.insert(end..range.end);
             }
+            self.retransmit_bytes -= end - range.start;
             return (range.start..end, encode_length);
         }
 
@@ -176,7 +179,15 @@ impl SendBuffer {
     /// Queue a range of sent but unacknowledged data to be retransmitted
     pub(super) fn retransmit(&mut self, range: Range<u64>) {
         debug_assert!(range.end <= self.unsent, "unsent data can't be lost");
-        self.retransmits.insert(range);
+        if !range.is_empty() {
+            let bytes = range.end - range.start;
+            let overlap: u64 = self
+                .retransmits
+                .replace(range)
+                .map(|part| part.end - part.start)
+                .sum();
+            self.retransmit_bytes += bytes - overlap;
+        }
     }
 
     pub(super) fn retransmit_all_for_0rtt(&mut self) {
@@ -207,6 +218,11 @@ impl SendBuffer {
         self.offset - self.unsent
     }
 
+    /// Queued STREAM retransmissions, excluding currently in-flight copies.
+    pub(super) fn retransmit_bytes(&self) -> u64 {
+        self.retransmit_bytes
+    }
+
     /// Offset span from the oldest outstanding byte through the highest selective ACK.
     pub(super) fn ack_gap_span(&self) -> u64 {
         let base = self.offset - self.unacked_len as u64;
@@ -222,6 +238,28 @@ impl SendBuffer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retransmit_work_counts_overlapping_ranges_only_once() {
+        let mut buf = SendBuffer::new();
+        buf.write(Bytes::from_static(&[0; 128]));
+        assert_eq!(buf.poll_transmit(256).0, 0..128);
+        buf.retransmit(0..32);
+        buf.retransmit(16..48);
+        buf.retransmit(6..10);
+        buf.retransmit(64..70);
+        buf.retransmit(70..70);
+        assert_eq!(buf.retransmit_bytes(), 54);
+        let consumed = buf.poll_transmit(24).0;
+        assert_eq!(consumed.start, 0);
+        assert_eq!(buf.retransmit_bytes(), 54 - consumed.end);
+        buf.retransmit(consumed);
+        assert_eq!(buf.retransmit_bytes(), 54);
+        assert_eq!(buf.poll_transmit(256).0, 0..48);
+        assert_eq!(buf.retransmit_bytes(), 6);
+        buf.discard();
+        assert_eq!(buf.retransmit_bytes(), 0);
+    }
 
     #[test]
     fn fragment_with_length() {

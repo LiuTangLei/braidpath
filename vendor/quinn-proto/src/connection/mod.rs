@@ -1332,6 +1332,11 @@ impl Connection {
         (self.path.in_flight.bytes, self.streams.bidirectional_ack_gap_span())
     }
 
+    /// STREAM bytes queued for retransmission on the stream with reserved storage.
+    pub fn reserved_stream_retransmit_bytes(&self) -> u64 {
+        self.streams.reserved_stream_retransmit_bytes()
+    }
+
     /// Whether no unacknowledged STREAM data remains in connection send storage.
     pub fn stream_send_buffer_empty(&self) -> bool {
         self.streams.send_buffer_empty()
@@ -1706,7 +1711,12 @@ impl Connection {
         }
 
         for frame in info.stream_frames {
-            self.stats.stream_payload_bytes_acked += self.streams.received_ack_of(frame);
+            let reserved = self.streams.is_reserved_send(frame.id);
+            let delivered = self.streams.received_ack_of(frame);
+            self.stats.stream_payload_bytes_acked += delivered;
+            if reserved {
+                self.stats.reserved_stream_payload_bytes_acked += delivered;
+            }
         }
     }
 

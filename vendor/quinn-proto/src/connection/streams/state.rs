@@ -861,6 +861,16 @@ impl StreamsState {
             .unwrap_or(0)
     }
 
+    pub(crate) fn reserved_stream_retransmit_bytes(&self) -> u64 {
+        self.reserved_send
+            .and_then(|(id, _)| self.send.get(&id)?.as_ref())
+            .map_or(0, |stream| stream.pending.retransmit_bytes())
+    }
+
+    pub(crate) fn is_reserved_send(&self, id: StreamId) -> bool {
+        self.reserved_send.is_some_and(|(reserved, _)| reserved == id)
+    }
+
     pub(crate) fn send_buffer_empty(&self) -> bool {
         self.buffered_data == 0
     }

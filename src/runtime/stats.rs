@@ -326,6 +326,10 @@ pub struct Quinn {
     pub ack_frame_bytes_tx: u64,
     pub stream_send_buffer_bytes: u64,
     pub stream_unsent_bytes: u64,
+    #[serde(default)]
+    pub udp_retransmit_queue_bytes: u64,
+    #[serde(default)]
+    pub udp_stream_payload_bytes_acked: u64,
     pub http_datagram_frames_pending: u64,
     pub game_datagrams_selection_delay: [u64; 6],
     pub http_datagram_frames_buffer_evicted: u64,
@@ -343,7 +347,8 @@ pub struct Quinn {
 impl Quinn {
     fn sample(conn: &quinn::Connection) -> Self {
         let q = conn.stats();
-        let (stream_send_buffer_bytes, stream_unsent_bytes) = conn.stream_send_buffer_bytes();
+        let (stream_send_buffer_bytes, stream_unsent_bytes, udp_retransmit_queue_bytes) =
+            conn.stream_send_buffer_and_retransmit_bytes();
         Self {
             lost_packets: q.path.lost_packets,
             congestion_events: q.path.congestion_events,
@@ -370,6 +375,8 @@ impl Quinn {
             ack_frame_bytes_tx: q.ack_frame_bytes_tx,
             stream_send_buffer_bytes,
             stream_unsent_bytes,
+            udp_retransmit_queue_bytes,
+            udp_stream_payload_bytes_acked: q.reserved_stream_payload_bytes_acked,
             http_datagram_frames_pending: q.datagrams_pending,
             game_datagrams_selection_delay: q.datagrams_selection_delay,
             http_datagram_frames_buffer_evicted: q.datagrams_buffer_evicted,

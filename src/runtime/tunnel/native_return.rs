@@ -328,8 +328,10 @@ struct PaceSample {
     capped_delays: u64,
     at: u64,
     acked: u64,
+    udp_acked: u64,
     sent: u64,
     lost: u64,
+    recovering_udp: bool,
 }
 
 #[derive(Default)]
@@ -337,6 +339,7 @@ struct DownloadPace {
     path_epoch: u64,
     last_busy_at: u64,
     start: Option<PaceSample>,
+    recovery_start: Option<PaceSample>,
     limit: Option<u64>,
     idle_since: Option<u64>,
 }
@@ -353,6 +356,7 @@ impl DownloadPace {
     ) -> Option<Option<u64>> {
         if retained < 2 * PAYLOAD as u64 || written < INITIAL_SEND_WINDOW {
             self.start = None;
+            self.recovery_start = None;
             let idle = *self.idle_since.get_or_insert(sample.at);
             if sample.at.saturating_sub(idle) >= ack_ceiling_idle_reset_us(rtt_us)
                 && self.limit.take().is_some()
@@ -365,8 +369,14 @@ impl DownloadPace {
         let window = rtt_us.saturating_mul(2).max(250_000);
         if sample.at.saturating_sub(self.last_busy_at) > window.saturating_mul(4) {
             self.start = None;
+            self.recovery_start = None;
         }
         self.last_busy_at = sample.at;
+        if let Some(next) = self.probe_udp_recovery(sample, window) {
+            self.start = Some(sample);
+            self.limit = Some(next);
+            return Some(Some(next));
+        }
         let start = *self.start.get_or_insert(sample);
         let elapsed = sample.at.saturating_sub(start.at);
         if elapsed < window {
@@ -407,7 +417,52 @@ impl DownloadPace {
         if self.limit == next {
             return None;
         }
+        self.recovery_start = None;
         self.limit = next;
+        Some(next)
+    }
+
+    fn probe_udp_recovery(&mut self, sample: PaceSample, window: u64) -> Option<u64> {
+        // A deeply capped path cannot provide the normal 128-packet sample
+        // quickly enough to drain older UDP records after delivery resumes.
+        const DEEP_CAP: u64 = 500_000;
+        const MAX_PROBE_RATE: u64 = 1_500_000;
+        let Some(limit) = self.limit.filter(|&rate| rate < MAX_PROBE_RATE) else {
+            self.recovery_start = None;
+            return None;
+        };
+        if !sample.recovering_udp {
+            self.recovery_start = None;
+            return None;
+        }
+        let start = *self.recovery_start.get_or_insert(sample);
+        if sample.lost != start.lost {
+            self.recovery_start = Some(sample);
+            return None;
+        }
+        let elapsed = sample.at.saturating_sub(start.at);
+        let delivered = sample.udp_acked.saturating_sub(start.udp_acked);
+        let minimum_delivery = limit.saturating_mul(elapsed) / 2_000_000;
+        if elapsed < window
+            || delivered < minimum_delivery.max(16 * 1024)
+            || sample.capped_delays.saturating_sub(start.capped_delays) < 4
+        {
+            return None;
+        }
+        self.recovery_start = Some(sample);
+        let next = if limit < DEEP_CAP {
+            limit.saturating_mul(2).min(DEEP_CAP)
+        } else {
+            limit.saturating_add(limit / 2).min(MAX_PROBE_RATE)
+        };
+        tracing::debug!(
+            target: "braidpath::udp_recovery",
+            previous_bps = limit * 8,
+            next_bps = next * 8,
+            delivered,
+            elapsed_us = elapsed,
+            "probing ordinary UDP recovery"
+        );
         Some(next)
     }
 }
@@ -596,7 +651,7 @@ impl Credit {
         let rtt = conn.rtt_hint();
         let rtt_us = rtt.as_micros().min(u128::from(u64::MAX)) as u64;
         let queued_ms = rtt.saturating_sub(conn.min_rtt_hint()).as_secs_f64() * 1000.0;
-        let (retained, unsent) = conn.stream_send_buffer_bytes();
+        let (retained, unsent, udp_retransmit) = conn.stream_send_buffer_and_retransmit_bytes();
         let acked = stats.stream_payload_bytes_acked;
         let acked_delta = acked.saturating_sub(self.acked);
         let ack_progress = acked_delta >= PAYLOAD as u64;
@@ -614,8 +669,11 @@ impl Credit {
                     capped_delays: stats.path.capped_pacing_delays,
                     at: now_us,
                     acked,
+                    udp_acked: stats.reserved_stream_payload_bytes_acked,
                     sent: stats.path.sent_packets,
                     lost: stats.path.lost_packets,
+                    recovering_udp: udp_retransmit >= 2 * PAYLOAD as u64
+                        && queued_ms <= target_ms as f64,
                 },
                 rtt_us,
                 retained,
@@ -2294,6 +2352,8 @@ mod tests {
                     acked,
                     sent,
                     lost,
+                    recovering_udp: false,
+                    udp_acked: 0,
                 },
                 100_000,
                 retained,
@@ -2326,6 +2386,8 @@ mod tests {
             acked: 0,
             sent: 0,
             lost: 0,
+            recovering_udp: false,
+            udp_acked: 0,
         };
         let mut step = |acked, sent, lost, delays| {
             sample.capped_delays += delays;
@@ -2349,6 +2411,65 @@ mod tests {
         // Once the cap is already >2x measured delivery, incidental burst-bucket
         // delays must not keep ratcheting the ceiling into an unpaced overshoot.
         assert_eq!(step(80_000, 150, 0, 6), None);
+    }
+
+    #[test]
+    fn udp_recovery_probes_a_deep_cap_after_fresh_unqueued_delivery() {
+        let mut pace = DownloadPace {
+            limit: Some(105_140),
+            ..Default::default()
+        };
+        let mut sample = PaceSample {
+            capped_delays: 0,
+            at: 0,
+            acked: 0,
+            sent: 0,
+            lost: 0,
+            recovering_udp: true,
+            udp_acked: 0,
+        };
+        let mut step = |at, acked, udp_acked, sent, lost, delays, recovering_udp| {
+            sample.at = at;
+            sample.acked += acked;
+            sample.udp_acked += udp_acked;
+            sample.sent += sent;
+            sample.lost += lost;
+            sample.capped_delays += delays;
+            sample.recovering_udp = recovering_udp;
+            pace.observe(sample, 80_000, 8 * PAYLOAD as u64, INITIAL_SEND_WINDOW)
+        };
+        assert_eq!(step(0, 0, 0, 0, 0, 0, true), None);
+        // ACKs for another stream cannot establish UDP recovery.
+        assert_eq!(step(300_000, 28_000, 0, 26, 0, 50, true), None);
+        assert_eq!(step(400_000, 10_000, 10_000, 8, 1, 22, true), None);
+        assert_eq!(step(600_000, 21_000, 21_000, 17, 0, 43, true), None);
+        assert_eq!(
+            step(700_000, 10_000, 10_000, 8, 0, 22, true),
+            Some(Some(210_280))
+        );
+        assert_eq!(step(1_000_000, 28_000, 28_000, 30, 0, 40, false), None);
+        assert_eq!(step(1_100_000, 12_000, 12_000, 11, 0, 15, true), None);
+        assert_eq!(step(1_400_000, 33_000, 33_000, 31, 0, 0, true), None);
+        assert_eq!(
+            step(1_500_000, 20_000, 20_000, 18, 0, 25, true),
+            Some(Some(420_560))
+        );
+        assert_eq!(
+            step(1_800_000, 80_000, 80_000, 120, 0, 40, true),
+            Some(Some(500_000))
+        );
+        assert_eq!(
+            step(2_100_000, 130_000, 130_000, 139, 0, 42, true),
+            Some(Some(750_000))
+        );
+        assert_eq!(
+            step(2_400_000, 170_000, 170_000, 161, 0, 44, true),
+            Some(Some(1_125_000))
+        );
+        assert_eq!(
+            step(2_700_000, 238_000, 238_000, 240, 0, 45, true),
+            Some(Some(1_500_000))
+        );
     }
 
     use crate::runtime::wire::Record;
