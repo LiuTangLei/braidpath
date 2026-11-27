@@ -377,6 +377,8 @@ struct CarrierFlight {
 pub(crate) struct PacedUdpPath<'a> {
     pub owner: &'a Arc<AtomicBool>,
     pub rtt: Duration,
+    pub min_rtt: Duration,
+    pub capped_flight: bool,
     pub retransmit_wait: Duration,
     pub copy_queue_wait: Option<Duration>,
 }
@@ -1255,12 +1257,27 @@ impl Sender {
         let Some(original) = paths[head.path] else {
             return;
         };
+        let queue_delay = original.rtt.saturating_sub(original.min_rtt);
+        let congested = original.capped_flight
+            && queue_delay >= (2 * original.min_rtt).max(Duration::from_millis(150));
+        let original_wait = if congested {
+            // A filled downstream queue waits before QUIC declares loss.
+            // Count measured excess RTT without waiting for retransmit bytes.
+            original.retransmit_wait.max(queue_delay)
+        } else {
+            original.retransmit_wait
+        };
+        let age_rtt = if congested {
+            original.min_rtt
+        } else {
+            original.rtt
+        };
         if deadline <= now
             || !Arc::ptr_eq(
                 head.reliable.as_ref().expect("native UDP head"),
                 original.owner,
             )
-            || now.saturating_duration_since(head.sent_at) < original.rtt * 2
+            || now.saturating_duration_since(head.sent_at) < age_rtt * 2
         {
             return;
         }
@@ -1280,7 +1297,7 @@ impl Sender {
         let Some((sibling_rtt, copy_delay)) = sibling else {
             return;
         };
-        if original.retransmit_wait <= copy_delay.saturating_add(Duration::from_millis(20))
+        if original_wait <= copy_delay.saturating_add(Duration::from_millis(20))
             || self.last_head_probe.is_some_and(|last| {
                 now.saturating_duration_since(last)
                     < (2 * sibling_rtt)
@@ -1293,6 +1310,7 @@ impl Sender {
         tracing::debug!(target: "braidpath::udp_recovery",
             offset = start, path = head.path,
             retransmit_wait_ms = original.retransmit_wait.as_millis() as u64,
+            queue_delay_ms = queue_delay.as_millis() as u64, congested,
             sibling_rtt_ms = sibling_rtt.as_millis() as u64,
             sibling_copy_delay_ms = copy_delay.as_millis() as u64,
             advance_ms = deadline.saturating_duration_since(now).as_millis() as u64,
@@ -3809,12 +3827,16 @@ mod tests {
         paths[0] = Some(PacedUdpPath {
             owner: &other_generation,
             rtt: direct_rtt,
+            min_rtt: direct_rtt,
+            capped_flight: false,
             retransmit_wait: Duration::from_millis(350),
             copy_queue_wait: None,
         });
         paths[1] = Some(PacedUdpPath {
             owner: &relay,
             rtt: relay_rtt,
+            min_rtt: relay_rtt,
+            capped_flight: false,
             retransmit_wait: Duration::ZERO,
             copy_queue_wait: Some(Duration::from_millis(50)),
         });
@@ -3833,6 +3855,12 @@ mod tests {
         sender.expedite_paced_udp_head(now, &paths);
         assert_eq!(sender.head_probe_deadline(), Some((0, original_due)));
         sender.last_head_probe = None;
+        let original = paths[0].as_mut().unwrap();
+        original.retransmit_wait = Duration::ZERO;
+        original.rtt = Duration::from_millis(1_200);
+        sender.expedite_paced_udp_head(now, &paths);
+        assert_eq!(sender.head_probe_deadline(), Some((0, original_due)));
+        paths[0].as_mut().unwrap().capped_flight = true;
         sender.expedite_paced_udp_head(now, &paths);
         assert_eq!(sender.head_probe_deadline(), Some((0, now)));
         assert!(sender.on_timeout(now));

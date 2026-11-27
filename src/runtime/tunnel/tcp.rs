@@ -1921,6 +1921,8 @@ impl Mux {
             hints[usize::from(path.id)] = Some(stream::PacedUdpPath {
                 owner,
                 rtt,
+                min_rtt: path.conn.min_rtt_hint().max(Duration::from_millis(20)),
+                capped_flight: backlog.pacing_cap.is_some() && backlog.in_flight > 0,
                 retransmit_wait,
                 copy_queue_wait,
             });
