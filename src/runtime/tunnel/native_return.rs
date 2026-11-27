@@ -405,7 +405,11 @@ impl DownloadPace {
             self.recovery_start = None;
             self.start = None;
         }
-        if retained < 2 * PAYLOAD as u64 || written < INITIAL_SEND_WINDOW {
+        // Ordinary UDP uses its own native writer. Its acknowledged bytes
+        // establish a bulk transfer even when the TCP writer is unused.
+        let udp_bulk =
+            sample.udp_retained >= 2 * PAYLOAD as u64 && sample.udp_acked >= COLD_BULK_MIN_BYTES;
+        if retained < 2 * PAYLOAD as u64 || (!udp_bulk && written < INITIAL_SEND_WINDOW) {
             self.start = None;
             self.recovery_start = None;
             let idle = *self.idle_since.get_or_insert(sample.at);
@@ -417,7 +421,8 @@ impl DownloadPace {
             return None;
         }
         self.idle_since = None;
-        let window = rtt_us.saturating_mul(2).max(250_000);
+        let sampling_rtt = if udp_bulk { sample.min_rtt_us } else { rtt_us };
+        let window = sampling_rtt.saturating_mul(2).max(250_000);
         if sample.at.saturating_sub(self.last_busy_at) > window.saturating_mul(4) {
             self.start = None;
             self.recovery_start = None;
@@ -436,7 +441,10 @@ impl DownloadPace {
         let sent = sample.sent.saturating_sub(start.sent);
         let lost = sample.lost.saturating_sub(start.lost);
         let delivered = sample.acked.saturating_sub(start.acked);
-        if sent < 128 || delivered < 2 * PAYLOAD as u64 {
+        let udp_delivered = sample.udp_acked.saturating_sub(start.udp_acked);
+        let qualified_udp =
+            udp_bulk && udp_delivered >= 16 * 1024 && udp_delivered.saturating_mul(2) >= delivered;
+        if !qualified_udp && (sent < 128 || delivered < 2 * PAYLOAD as u64) {
             // Accumulate evidence on slow paths while observations remain fresh.
             return None;
         }
@@ -444,7 +452,21 @@ impl DownloadPace {
         let service = delivered.saturating_mul(1_000_000) / elapsed;
         // Allow packet headers and occasional retransmissions. After the path
         // settles, probe for capacity using the same qualified delivery sample.
-        let next = if lost.saturating_mul(100) >= sent.saturating_mul(12) {
+        let udp_queue_budget = (sample.min_rtt_us / 2).max(75_000);
+        let next = if qualified_udp
+            && start.queued_us >= udp_queue_budget
+            && sample.queued_us >= udp_queue_budget
+        {
+            // Healthy ACK progress can coexist with a deep queue. Use the
+            // demonstrated service until the accumulated flight drains.
+            let ceiling = (service.saturating_mul(7) / 8).max(1);
+            let limit = self.limit.map_or(ceiling, |limit| limit.min(ceiling));
+            if self.limit != Some(limit) {
+                tracing::debug!(target: "braidpath::udp_recovery", cap_bps=limit * 8,
+                    queued_us=sample.queued_us, "braked standing ordinary UDP queue");
+            }
+            Some(limit)
+        } else if sent >= 128 && lost.saturating_mul(100) >= sent.saturating_mul(12) {
             let ceiling = service.saturating_mul(5) / 4;
             Some(self.limit.map_or(ceiling, |limit| limit.min(ceiling)))
         } else if let Some(limit) = self.limit
@@ -2499,6 +2521,29 @@ mod tests {
         assert_eq!(sample(3_599_999, 3_750_000, 3_000, 450, 0), None);
         assert_eq!(sample(3_600_000, 3_750_000, 3_000, 450, 0), Some(None));
     }
+    #[test]
+    fn dedicated_udp_delivery_brakes_a_standing_queue_without_tcp_writes() {
+        let mut pace = DownloadPace::default();
+        let busy = 4 * PAYLOAD as u64;
+        let mut sample = PaceSample {
+            acked: 512 * 1024,
+            udp_acked: 512 * 1024,
+            udp_retained: busy,
+            min_rtt_us: 100_000,
+            ..Default::default()
+        };
+        assert_eq!(pace.observe(sample, 100_000, busy, 0), None);
+        for expected in [None, Some(Some(175_000))] {
+            sample.at += 250_000;
+            sample.acked += 50_000;
+            sample.udp_acked += 50_000;
+            sample.sent += 48;
+            sample.queued_us = 200_000;
+            assert_eq!(pace.observe(sample, 300_000, busy, 0), expected);
+        }
+        assert!(!pace.delivery_limited_recovery);
+    }
+
     #[test]
     fn capped_download_accumulates_small_samples_and_probes_through_moderate_loss() {
         let mut pace = DownloadPace::default();
