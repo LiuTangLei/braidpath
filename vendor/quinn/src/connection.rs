@@ -313,6 +313,8 @@ pub struct StreamSendBacklog {
     pub retained: u64,
     /// STREAM bytes awaiting first packetization.
     pub unsent: u64,
+    /// Retransmissions queued on the stream with reserved send storage.
+    pub reserved_retransmit: u64,
     /// External pacing limit in bytes per second.
     pub pacing_cap: Option<u64>,
     /// Congestion-controlled packet bytes in flight on this path.
@@ -696,6 +698,7 @@ impl Connection {
         StreamSendBacklog {
             retained,
             unsent,
+            reserved_retransmit: state.inner.reserved_stream_retransmit_bytes(),
             pacing_cap: state.inner.max_pacing_rate(),
             in_flight,
             ack_gap_span,

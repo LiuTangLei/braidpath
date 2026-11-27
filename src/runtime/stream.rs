@@ -373,6 +373,14 @@ struct CarrierFlight {
     offsets: BTreeSet<u64>,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct PacedUdpPath<'a> {
+    pub owner: &'a Arc<AtomicBool>,
+    pub rtt: Duration,
+    pub retransmit_wait: Duration,
+    pub can_rescue: bool,
+}
+
 /// One reliable sending half. Data offsets start at zero.
 ///
 /// A transmission is lost once it is older than the reorder threshold and a
@@ -1225,6 +1233,69 @@ impl Sender {
             && segment.probe_transmission.is_none()
             && !self.lost.contains(&start))
         .then_some((start, at))
+    }
+
+    pub(crate) fn has_paced_udp_head(&self) -> bool {
+        self.ordered_udp_gap_repair
+            && self
+                .head_probe_deadline()
+                .is_some_and(|(start, _)| self.segments[&start].reliable.is_some())
+    }
+
+    pub(crate) fn expedite_paced_udp_head(
+        &mut self,
+        now: Instant,
+        paths: &[Option<PacedUdpPath<'_>>; MAX_PATHS],
+    ) {
+        if !self.has_paced_udp_head() {
+            return;
+        }
+        let (start, deadline) = self.head_probe_deadline().expect("armed UDP head");
+        let head = &self.segments[&start];
+        let Some(original) = paths[head.path] else {
+            return;
+        };
+        if deadline <= now
+            || !Arc::ptr_eq(
+                head.reliable.as_ref().expect("native UDP head"),
+                original.owner,
+            )
+            || now.saturating_duration_since(head.sent_at) < original.rtt * 2
+        {
+            return;
+        }
+        let sibling = paths
+            .iter()
+            .enumerate()
+            .filter_map(|(id, path)| {
+                let path = path.as_ref()?;
+                let newer = self.path_rtt[id].newest_transmission?;
+                (id != head.path
+                    && path.can_rescue
+                    && newer > head.sent_at
+                    && now.saturating_duration_since(newer) <= path.rtt * 3)
+                    .then_some(path.rtt)
+            })
+            .min();
+        let Some(sibling_rtt) = sibling else {
+            return;
+        };
+        if original.retransmit_wait <= sibling_rtt + Duration::from_millis(20)
+            || self.last_head_probe.is_some_and(|last| {
+                now.saturating_duration_since(last)
+                    < (2 * sibling_rtt)
+                        .clamp(Duration::from_millis(260), Duration::from_millis(500))
+            })
+        {
+            return;
+        }
+        self.head_probe = Some((start, head.transmissions, now));
+        tracing::debug!(target: "braidpath::udp_recovery",
+            offset = start, path = head.path,
+            retransmit_wait_ms = original.retransmit_wait.as_millis() as u64,
+            sibling_rtt_ms = sibling_rtt.as_millis() as u64,
+            advance_ms = deadline.saturating_duration_since(now).as_millis() as u64,
+            "expedited paced UDP head probe");
     }
 
     fn schedule_head_probe(&mut self, now: Instant, small_udp_hole: bool) {
@@ -3683,6 +3754,93 @@ mod tests {
         // Local queue drops before any network admission must not trigger
         // exponential network stall backoff on the first actual transmission.
         assert_eq!(sender.segments[&0].stalls, 0);
+    }
+
+    #[test]
+    fn paced_udp_head_rescue_requires_a_current_owner_and_recent_sibling_delivery() {
+        let start = Instant::now();
+        let mut sender = Sender::new(false);
+        sender.ordered_udp_gap_repair = true;
+        let chunk = RELIABLE_PAYLOAD - DATA_HEADER;
+        sender.push(&vec![9; 2 * chunk]);
+        let direct = Arc::new(AtomicBool::new(true));
+        let relay = Arc::new(AtomicBool::new(true));
+        let other_generation = Arc::new(AtomicBool::new(true));
+        let direct_rtt = Duration::from_millis(80);
+        let relay_rtt = Duration::from_millis(130);
+        let head = sender
+            .poll_transmit_reliable(start, RELIABLE_PAYLOAD)
+            .unwrap();
+        sender.admitted_reliable_with_ect(
+            head.start,
+            head.transmission,
+            0,
+            direct_rtt,
+            Duration::from_millis(410),
+            start,
+            direct.clone(),
+        );
+        let next_sent = start + Duration::from_millis(10);
+        let next = sender
+            .poll_transmit_reliable(next_sent, RELIABLE_PAYLOAD)
+            .unwrap();
+        sender.admitted_reliable(
+            next.start,
+            next.transmission,
+            1,
+            relay_rtt,
+            next_sent,
+            relay.clone(),
+        );
+        let now = start + Duration::from_millis(200);
+        sender
+            .on_ack(
+                &Ack {
+                    limit: INITIAL_WINDOW,
+                    ranges: vec![(next.start, sender.next)],
+                    ..Default::default()
+                },
+                now,
+            )
+            .unwrap();
+        let (_, original_due) = sender.head_probe_deadline().unwrap();
+        let mut paths = [None; MAX_PATHS];
+        paths[0] = Some(PacedUdpPath {
+            owner: &other_generation,
+            rtt: direct_rtt,
+            retransmit_wait: Duration::from_millis(350),
+            can_rescue: false,
+        });
+        paths[1] = Some(PacedUdpPath {
+            owner: &relay,
+            rtt: relay_rtt,
+            retransmit_wait: Duration::ZERO,
+            can_rescue: true,
+        });
+        sender.expedite_paced_udp_head(now, &paths);
+        assert_eq!(sender.head_probe_deadline(), Some((0, original_due)));
+        paths[0].as_mut().unwrap().owner = &direct;
+        let sample = sender.path_rtt[1].newest_transmission.take();
+        sender.expedite_paced_udp_head(now, &paths);
+        assert_eq!(sender.head_probe_deadline(), Some((0, original_due)));
+        sender.path_rtt[1].newest_transmission = sample;
+        sender.last_head_probe = Some(now - Duration::from_millis(150));
+        sender.expedite_paced_udp_head(now, &paths);
+        assert_eq!(sender.head_probe_deadline(), Some((0, original_due)));
+        sender.last_head_probe = None;
+        sender.expedite_paced_udp_head(now, &paths);
+        assert_eq!(sender.head_probe_deadline(), Some((0, now)));
+        assert!(sender.on_timeout(now));
+        let copy = sender
+            .poll_transmit_reliable(now, RELIABLE_PAYLOAD)
+            .unwrap();
+        assert!(copy.head_copy);
+        assert_eq!((copy.start, copy.avoid_path), (0, Some(0)));
+        assert!(
+            sender
+                .poll_transmit_reliable(now, RELIABLE_PAYLOAD)
+                .is_none()
+        );
     }
 
     #[test]

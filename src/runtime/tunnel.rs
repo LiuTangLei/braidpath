@@ -4370,6 +4370,9 @@ async fn session_loop(
         let credit_changed = native_credit.as_ref().map(|credit| credit.notified());
         if let Some(mux) = streams.as_mut() {
             mux.service_io();
+            if session.policy.native_return && !session.policy.game_mode {
+                mux.expedite_paced_udp_heads(&session.paths);
+            }
             mux.set_payload_limit(if session.policy.native_return {
                 native_return::PAYLOAD
             } else {

@@ -772,6 +772,7 @@ pub(super) struct Mux {
     datagram_lifetime: Duration,
     max_message_bytes: usize,
     next_game_delay_log: Instant,
+    next_paced_udp_check: Instant,
 }
 
 impl Mux {
@@ -822,6 +823,7 @@ impl Mux {
             datagram_lifetime: policy.datagram_lifetime(),
             max_message_bytes: policy.max_message_bytes,
             next_game_delay_log: now,
+            next_paced_udp_check: now,
         }
     }
     /// Accepts local connections; the peer connects each stream onward.
@@ -1857,6 +1859,54 @@ impl Mux {
                     }
                 }
             }
+        }
+    }
+
+    pub(super) fn expedite_paced_udp_heads(&mut self, paths: &super::Paths) {
+        let now = Instant::now();
+        if now < self.next_paced_udp_check {
+            return;
+        }
+        self.next_paced_udp_check = now + Duration::from_millis(40);
+        if !self.streams.values().any(|s| s.send.has_paced_udp_head()) {
+            return;
+        }
+        let paths = paths.lock().expect("paths lock");
+        if paths.len() < 2 {
+            return;
+        }
+        let mut hints = [None; super::MAX_PATHS];
+        for path in paths.iter() {
+            let Some(writer) = path.native_writer(true) else {
+                continue;
+            };
+            let owner = writer.recovery_owner();
+            if !owner.load(Ordering::Acquire) || !path.open() {
+                continue;
+            }
+            let backlog = path.conn.stream_send_backlog();
+            let rtt = path.conn.rtt_hint().max(Duration::from_millis(20));
+            let retransmit_wait = backlog
+                .pacing_cap
+                .filter(|_| backlog.reserved_retransmit >= 2 * native_return::PAYLOAD as u64)
+                .map_or(Duration::ZERO, |cap| {
+                    Duration::from_micros(
+                        backlog.reserved_retransmit.saturating_mul(1_000_000) / cap.max(1),
+                    )
+                });
+            hints[usize::from(path.id)] = Some(stream::PacedUdpPath {
+                owner,
+                rtt,
+                retransmit_wait,
+                can_rescue: writer.tx.capacity() > 0
+                    && writer.loss_permille() < 120
+                    && !path.conn.probing_rtt_hint()
+                    && backlog.reserved_retransmit == 0
+                    && backlog.unsent <= 2 * native_return::PAYLOAD as u64,
+            });
+        }
+        for s in self.streams.values_mut() {
+            s.send.expedite_paced_udp_head(now, &hints);
         }
     }
 

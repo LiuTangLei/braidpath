@@ -1163,6 +1163,10 @@ impl Writer {
     pub(super) fn loss_permille(&self) -> u64 {
         self.loss_permille.load(Ordering::Relaxed)
     }
+
+    pub(super) fn recovery_owner(&self) -> &Arc<AtomicBool> {
+        &self.reachable
+    }
 }
 pub(super) struct Reader {
     pub(super) rx: mpsc::Receiver<WritePart>,
