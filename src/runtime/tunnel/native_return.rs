@@ -342,9 +342,47 @@ struct DownloadPace {
     recovery_start: Option<PaceSample>,
     limit: Option<u64>,
     idle_since: Option<u64>,
+    last_udp_delivery: Option<(u64, u64)>,
 }
 
 impl DownloadPace {
+    fn brake_udp_ack_drought(
+        &mut self,
+        now_us: u64,
+        udp_acked: u64,
+        udp_retransmit: u64,
+        min_rtt_us: u64,
+    ) -> Option<Option<u64>> {
+        let (last_acked, delivery_us) = self.last_udp_delivery.unwrap_or((0, now_us));
+        if udp_acked != last_acked {
+            self.last_udp_delivery = Some((udp_acked, now_us));
+            return None;
+        }
+        let min_rtt_us = min_rtt_us.max(20_000);
+        let age_us = now_us.saturating_sub(delivery_us);
+        if udp_acked == 0
+            || udp_retransmit < 2 * PAYLOAD as u64
+            || age_us < min_rtt_us.saturating_mul(2).max(120_000)
+        {
+            return None;
+        }
+
+        // Allow roughly one initial QUIC flight per baseline round trip
+        // until fresh delivery gives the regular recovery controller a sample.
+        let limit = 12_000 * 1_000_000 / min_rtt_us;
+        if self.limit.is_some_and(|current| current <= limit) {
+            return None;
+        }
+        let limit = limit.max(1);
+        self.limit = Some(limit);
+        self.start = None;
+        self.recovery_start = None;
+        tracing::debug!(target: "braidpath::udp_recovery",
+            cap_bps = limit * 8, ack_age_us = age_us, udp_retransmit,
+            "paced down ordinary UDP retransmits during ACK drought");
+        Some(Some(limit))
+    }
+
     /// Only sustained STREAM traffic qualifies. Measure unique payload ACKs over
     /// several RTTs so ACK compression and brief producer gaps cannot set a cap.
     fn observe(
@@ -664,21 +702,31 @@ impl Credit {
             };
         }
         if initial_window == INITIAL_SEND_WINDOW
-            && let Some(limit) = self.download_pace.observe(
-                PaceSample {
-                    capped_delays: stats.path.capped_pacing_delays,
-                    at: now_us,
-                    acked,
-                    udp_acked: stats.reserved_stream_payload_bytes_acked,
-                    sent: stats.path.sent_packets,
-                    lost: stats.path.lost_packets,
-                    recovering_udp: udp_retransmit >= 2 * PAYLOAD as u64
-                        && queued_ms <= target_ms as f64,
-                },
-                rtt_us,
-                retained,
-                written,
-            )
+            && let Some(limit) = self
+                .download_pace
+                .brake_udp_ack_drought(
+                    now_us,
+                    stats.reserved_stream_payload_bytes_acked,
+                    udp_retransmit,
+                    conn.min_rtt_hint().as_micros().min(u128::from(u64::MAX)) as u64,
+                )
+                .or_else(|| {
+                    self.download_pace.observe(
+                        PaceSample {
+                            capped_delays: stats.path.capped_pacing_delays,
+                            at: now_us,
+                            acked,
+                            udp_acked: stats.reserved_stream_payload_bytes_acked,
+                            sent: stats.path.sent_packets,
+                            lost: stats.path.lost_packets,
+                            recovering_udp: udp_retransmit >= 2 * PAYLOAD as u64
+                                && queued_ms <= target_ms as f64,
+                        },
+                        rtt_us,
+                        retained,
+                        written,
+                    )
+                })
         {
             conn.set_max_pacing_rate(stats.path.pacing_epoch, limit);
         }
@@ -2411,6 +2459,43 @@ mod tests {
         // Once the cap is already >2x measured delivery, incidental burst-bucket
         // delays must not keep ratcheting the ceiling into an unpaced overshoot.
         assert_eq!(step(80_000, 150, 0, 6), None);
+    }
+
+    #[test]
+    fn udp_ack_drought_caps_an_active_retry_queue_before_new_delivery() {
+        let mut pace = DownloadPace {
+            limit: Some(13_000_000),
+            ..Default::default()
+        };
+        let backlog = 1_200_000;
+        let acked = 14_095_587;
+        assert_eq!(pace.brake_udp_ack_drought(0, acked, 0, 80_000), None);
+        assert_eq!(
+            pace.brake_udp_ack_drought(159_999, acked, backlog, 80_000),
+            None
+        );
+        assert_eq!(pace.brake_udp_ack_drought(160_000, acked, 0, 80_000), None);
+        assert_eq!(
+            pace.brake_udp_ack_drought(160_000, acked, backlog, 80_000),
+            Some(Some(150_000))
+        );
+        assert_eq!(
+            pace.brake_udp_ack_drought(260_000, acked, backlog, 80_000),
+            None
+        );
+        pace.limit = Some(400_000);
+        assert_eq!(
+            pace.brake_udp_ack_drought(300_000, acked + 1, backlog, 80_000),
+            None
+        );
+        assert_eq!(
+            pace.brake_udp_ack_drought(400_000, acked + 1, backlog, 80_000),
+            None
+        );
+
+        let mut tcp = DownloadPace::default();
+        assert_eq!(tcp.brake_udp_ack_drought(0, 0, 0, 80_000), None);
+        assert_eq!(tcp.brake_udp_ack_drought(300_000, 0, 0, 80_000), None);
     }
 
     #[test]
