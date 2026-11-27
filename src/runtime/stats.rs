@@ -347,8 +347,8 @@ pub struct Quinn {
 impl Quinn {
     fn sample(conn: &quinn::Connection) -> Self {
         let q = conn.stats();
-        let (stream_send_buffer_bytes, stream_unsent_bytes, udp_retransmit_queue_bytes) =
-            conn.stream_send_buffer_and_retransmit_bytes();
+        let (stream_send_buffer_bytes, stream_unsent_bytes, _, udp_retransmit_queue_bytes) =
+            conn.stream_send_buffer_snapshot();
         Self {
             lost_packets: q.path.lost_packets,
             congestion_events: q.path.congestion_events,

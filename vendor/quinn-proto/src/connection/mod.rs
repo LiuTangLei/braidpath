@@ -1337,6 +1337,11 @@ impl Connection {
         self.streams.reserved_stream_retransmit_bytes()
     }
 
+    /// Retained bytes and pending retransmissions on the reserved send stream.
+    pub fn reserved_stream_send_buffers(&self) -> (u64, u64) {
+        self.streams.reserved_stream_send_buffers()
+    }
+
     /// Whether no unacknowledged STREAM data remains in connection send storage.
     pub fn stream_send_buffer_empty(&self) -> bool {
         self.streams.send_buffer_empty()

@@ -683,11 +683,12 @@ impl Connection {
             .stream_send_buffer_bytes()
     }
 
-    /// Return retained, unsent, and reserved STREAM retransmit bytes.
-    pub fn stream_send_buffer_and_retransmit_bytes(&self) -> (u64, u64, u64) {
-        let state = self.0.state.lock("stream_send_buffer_and_retransmit_bytes");
+    /// Retained and unsent STREAM bytes, then retained and retransmit bytes on the reserved stream.
+    pub fn stream_send_buffer_snapshot(&self) -> (u64, u64, u64, u64) {
+        let state = self.0.state.lock("stream_send_buffer_snapshot");
         let (retained, unsent) = state.inner.stream_send_buffer_bytes();
-        (retained, unsent, state.inner.reserved_stream_retransmit_bytes())
+        let (reserved_retained, reserved_retransmit) = state.inner.reserved_stream_send_buffers();
+        (retained, unsent, reserved_retained, reserved_retransmit)
     }
 
     /// Snapshot of STREAM backlog and current path delivery estimates.
