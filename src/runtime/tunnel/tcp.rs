@@ -1894,15 +1894,35 @@ impl Mux {
                         backlog.reserved_retransmit.saturating_mul(1_000_000) / cap.max(1),
                     )
                 });
+            let room = writer.tx.capacity();
+            let copy_queue_wait = if room > 0
+                && writer.loss_permille() < 120
+                && !path.conn.probing_rtt_hint()
+                && backlog.reserved_retransmit == 0
+            {
+                let staged =
+                    (writer.tx.max_capacity() - room) as u64 * native_return::PAYLOAD as u64;
+                let queued = backlog.unsent.saturating_add(staged);
+                if queued == 0 {
+                    Some(Duration::ZERO)
+                } else {
+                    let external_bps = backlog
+                        .pacing_cap
+                        .map_or(u64::MAX, |cap| cap.saturating_mul(8));
+                    path.conn.pacing_rate_bps_hint().map(|bps| {
+                        Duration::from_micros(
+                            queued.saturating_mul(8_000_000) / bps.min(external_bps).max(1),
+                        )
+                    })
+                }
+            } else {
+                None
+            };
             hints[usize::from(path.id)] = Some(stream::PacedUdpPath {
                 owner,
                 rtt,
                 retransmit_wait,
-                can_rescue: writer.tx.capacity() > 0
-                    && writer.loss_permille() < 120
-                    && !path.conn.probing_rtt_hint()
-                    && backlog.reserved_retransmit == 0
-                    && backlog.unsent <= 2 * native_return::PAYLOAD as u64,
+                copy_queue_wait,
             });
         }
         for s in self.streams.values_mut() {

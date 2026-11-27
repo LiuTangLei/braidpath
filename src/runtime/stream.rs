@@ -378,7 +378,7 @@ pub(crate) struct PacedUdpPath<'a> {
     pub owner: &'a Arc<AtomicBool>,
     pub rtt: Duration,
     pub retransmit_wait: Duration,
-    pub can_rescue: bool,
+    pub copy_queue_wait: Option<Duration>,
 }
 
 /// One reliable sending half. Data offsets start at zero.
@@ -1269,18 +1269,18 @@ impl Sender {
             .enumerate()
             .filter_map(|(id, path)| {
                 let path = path.as_ref()?;
+                let queue_wait = path.copy_queue_wait?;
                 let newer = self.path_rtt[id].newest_transmission?;
                 (id != head.path
-                    && path.can_rescue
                     && newer > head.sent_at
                     && now.saturating_duration_since(newer) <= path.rtt * 3)
-                    .then_some(path.rtt)
+                    .then_some((path.rtt, path.rtt.saturating_add(queue_wait)))
             })
-            .min();
-        let Some(sibling_rtt) = sibling else {
+            .min_by_key(|&(_, copy_delay)| copy_delay);
+        let Some((sibling_rtt, copy_delay)) = sibling else {
             return;
         };
-        if original.retransmit_wait <= sibling_rtt + Duration::from_millis(20)
+        if original.retransmit_wait <= copy_delay.saturating_add(Duration::from_millis(20))
             || self.last_head_probe.is_some_and(|last| {
                 now.saturating_duration_since(last)
                     < (2 * sibling_rtt)
@@ -1294,6 +1294,7 @@ impl Sender {
             offset = start, path = head.path,
             retransmit_wait_ms = original.retransmit_wait.as_millis() as u64,
             sibling_rtt_ms = sibling_rtt.as_millis() as u64,
+            sibling_copy_delay_ms = copy_delay.as_millis() as u64,
             advance_ms = deadline.saturating_duration_since(now).as_millis() as u64,
             "expedited paced UDP head probe");
     }
@@ -3809,13 +3810,13 @@ mod tests {
             owner: &other_generation,
             rtt: direct_rtt,
             retransmit_wait: Duration::from_millis(350),
-            can_rescue: false,
+            copy_queue_wait: None,
         });
         paths[1] = Some(PacedUdpPath {
             owner: &relay,
             rtt: relay_rtt,
             retransmit_wait: Duration::ZERO,
-            can_rescue: true,
+            copy_queue_wait: Some(Duration::from_millis(50)),
         });
         sender.expedite_paced_udp_head(now, &paths);
         assert_eq!(sender.head_probe_deadline(), Some((0, original_due)));
@@ -3824,6 +3825,10 @@ mod tests {
         sender.expedite_paced_udp_head(now, &paths);
         assert_eq!(sender.head_probe_deadline(), Some((0, original_due)));
         sender.path_rtt[1].newest_transmission = sample;
+        paths[0].as_mut().unwrap().retransmit_wait = Duration::from_millis(190);
+        sender.expedite_paced_udp_head(now, &paths);
+        assert_eq!(sender.head_probe_deadline(), Some((0, original_due)));
+        paths[0].as_mut().unwrap().retransmit_wait = Duration::from_millis(350);
         sender.last_head_probe = Some(now - Duration::from_millis(150));
         sender.expedite_paced_udp_head(now, &paths);
         assert_eq!(sender.head_probe_deadline(), Some((0, original_due)));
