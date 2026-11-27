@@ -689,6 +689,13 @@ fn path_completion_rank(
 }
 
 impl Credit {
+    pub(super) fn udp_recovery_rate(&self) -> Option<u64> {
+        self.download_pace
+            .delivery_limited_recovery
+            .then_some(self.download_pace.limit)
+            .flatten()
+    }
+
     pub(super) fn observe(
         &mut self,
         conn: &quinn::Connection,
@@ -1573,7 +1580,13 @@ pub(super) fn drain(
             for path in paths.iter() {
                 let id = usize::from(path.id);
                 let snap = snapshots[id];
-                if !snap.active {
+                if !snap.active
+                    || (ordered_udp
+                        && path
+                            .native_udp
+                            .as_ref()
+                            .is_none_or(|writer| !writer.reachable.load(Ordering::Acquire)))
+                {
                     continue;
                 }
                 let transport_queue = if download { snap.unsent } else { snap.retained };

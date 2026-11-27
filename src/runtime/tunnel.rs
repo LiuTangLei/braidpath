@@ -2463,9 +2463,6 @@ async fn sender_with_inputs(
             if let Some(writer) = &path.native_return {
                 let path_reachable = path.open() && !liveness[usize::from(path.id)].silent();
                 writer.set_reachable(path_reachable);
-                if let Some(udp) = &path.native_udp {
-                    udp.set_reachable(path_reachable);
-                }
                 if mixed_writes.is_none() {
                     let initial_window = if metrics.direction == stats::FORWARD {
                         native_return::INITIAL_UPLOAD_SEND_WINDOW
@@ -2504,6 +2501,50 @@ async fn sender_with_inputs(
             } else {
                 policy.rate
             });
+        }
+        let udp_recovery_pending = metrics.direction == stats::RETURN
+            && mixed_writes.is_none()
+            && paths.iter().any(|path| {
+                native_credit[usize::from(path.id)]
+                    .udp_recovery_rate()
+                    .is_some()
+            });
+        let sibling_udp_service = if udp_recovery_pending {
+            paths
+                .iter()
+                .filter(|path| {
+                    let id = usize::from(path.id);
+                    path.native_udp
+                        .as_ref()
+                        .is_some_and(|writer| !writer.tx.is_closed())
+                        && path.open()
+                        && !liveness[id].silent()
+                        && !path.conn.probing_rtt_hint()
+                        && native_credit[id].udp_recovery_rate().is_none()
+                        && native_credit[id].loss_permille() < 120
+                })
+                .map(|path| native_credit[usize::from(path.id)].effective_service(&path.conn))
+                .max()
+                .unwrap_or_default()
+        } else {
+            0
+        };
+        for path in paths.iter().filter(|path| path.native_udp.is_some()) {
+            let id = usize::from(path.id);
+            let udp = path.native_udp.as_ref().expect("dedicated UDP writer");
+            // Reuse the mux's existing loss recovery for records already
+            // owned by a badly slowed UDP writer. The QUIC connection and
+            // normal stream writer remain available for their own recovery.
+            let migrate_udp = native_credit[id]
+                .udp_recovery_rate()
+                .is_some_and(|bytes_per_sec| {
+                    sibling_udp_service >= bytes_per_sec.div_ceil(1_000).saturating_mul(4)
+                });
+            if migrate_udp && udp.recovery_owner().load(Ordering::Acquire) {
+                tracing::debug!(target: "braidpath::udp_recovery", path=path.id, sibling_udp_service,
+                    "reassigning paced UDP records to a healthier route");
+            }
+            udp.set_reachable(path.open() && !liveness[id].silent() && !migrate_udp);
         }
         if observation_schedule
             .as_mut()
