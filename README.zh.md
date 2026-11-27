@@ -10,7 +10,7 @@ BraidPath 是一个从零构建的 Rust 多路径传输项目，结合 **前向�
 
 “Braid” 是编织：把多条不完美的路径编成一条更稳定的连接。
 
-> **BraidPath 0.7.3** 使用原生 HTTP/3 流双向传输大流量 TCP，普通 SOCKS5 UDP 按目的地有序交付。详见[版本说明](docs/releases/v0.7.3.md)。
+> **BraidPath 0.7.4** 为普通 SOCKS5 UDP 分配独立的 HTTP/3 路径流，改善断路恢复和持续排队。详见[版本说明](docs/releases/v0.7.4.md)。
 
 每个选定出口提供一个本地 SOCKS5 入口，默认使用四条协同路径。配置见[代理与分布式运行指南](docs/mesh.md)，模式选择见[流量策略](docs/runtime.md#traffic-modes)。
 

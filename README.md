@@ -10,7 +10,7 @@ BraidPath is a Rust multipath transport project combining **forward error correc
 
 “Braid” means weaving several imperfect paths into a more resilient connection.
 
-> **BraidPath 0.7.3** carries bulk TCP in both directions over native HTTP/3 streams. Ordinary SOCKS5 UDP uses ordered delivery per destination. See the [release notes](docs/releases/v0.7.3.md).
+> **BraidPath 0.7.4** gives ordinary SOCKS5 UDP a dedicated HTTP/3 stream per path and improves recovery from path outages and sustained queues. See the [release notes](docs/releases/v0.7.4.md).
 
 Each selected exit provides a local SOCKS5 listener, with four cooperating paths by default. Configure [proxy and distributed-server mode](docs/mesh.md), then select the [traffic policy](docs/runtime.md#traffic-modes) for the workload.
 
